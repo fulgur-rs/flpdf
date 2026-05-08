@@ -1,9 +1,10 @@
-use crate::{Object, ObjectRef};
+use crate::{Object, ObjectRef, XrefOffset};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub enum CacheEntry {
     Unresolved { offset: u64 },
+    Compressed { stream: u32, index: u32 },
     Resolved(Object),
     Missing,
     Reserved,
@@ -16,10 +17,19 @@ pub struct ObjectCache {
 }
 
 impl ObjectCache {
-    pub fn from_offsets(offsets: &BTreeMap<ObjectRef, u64>) -> Self {
+    pub fn from_offsets(offsets: &BTreeMap<ObjectRef, XrefOffset>) -> Self {
         let entries = offsets
             .iter()
-            .map(|(object_ref, offset)| (*object_ref, CacheEntry::Unresolved { offset: *offset }))
+            .map(|(object_ref, offset)| {
+                let entry = match offset {
+                    XrefOffset::Offset(offset) => CacheEntry::Unresolved { offset: *offset },
+                    XrefOffset::Compressed { stream, index } => CacheEntry::Compressed {
+                        stream: *stream,
+                        index: *index,
+                    },
+                };
+                (*object_ref, entry)
+            })
             .collect();
         Self { entries }
     }

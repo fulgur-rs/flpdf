@@ -1,4 +1,4 @@
-use crate::{Dictionary, Error, Object, ObjectRef, Result};
+use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 
 pub fn parse_object(input: &[u8]) -> Result<Object> {
     let mut parser = Parser::new(input);
@@ -49,6 +49,15 @@ impl<'a> Parser<'a> {
             Some(b'[') => self.array(),
             Some(b'/') => self.name().map(Object::Name),
             Some(b'(') => self.literal_string().map(Object::String),
+            Some(b'.') => self.real(),
+            Some(b'-' | b'+')
+                if self
+                    .input
+                    .get(self.pos + 1)
+                    .is_some_and(|byte| *byte == b'.') =>
+            {
+                self.real()
+            }
             Some(b't') if self.take_keyword(b"true") => Ok(Object::Boolean(true)),
             Some(b'f') if self.take_keyword(b"false") => Ok(Object::Boolean(false)),
             Some(b'n') if self.take_keyword(b"null") => Ok(Object::Null),
@@ -64,12 +73,53 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             if self.starts_with(b">>") {
                 self.pos += 2;
+                self.skip_ws();
+                if self.starts_with(b"stream") {
+                    return self.stream_from_dict(dict);
+                }
                 return Ok(Object::Dictionary(dict));
             }
             let key = self.name()?;
             let value = self.object()?;
             dict.insert(key, value);
         }
+    }
+
+    fn stream_from_dict(&mut self, dict: Dictionary) -> Result<Object> {
+        let Some(length) = dict.get("Length") else {
+            return Err(Error::parse(self.pos, "missing stream length"));
+        };
+        let Object::Integer(length) = length else {
+            return Err(Error::parse(self.pos, "stream /Length is not integer"));
+        };
+        if *length < 0 {
+            return Err(Error::parse(self.pos, "stream /Length is negative"));
+        }
+
+        self.expect_keyword_for_indirect(b"stream")?;
+        if self.peek() == Some(b'\r') {
+            self.pos += 1;
+            if self.peek() == Some(b'\n') {
+                self.pos += 1;
+            }
+        } else if self.peek() == Some(b'\n') {
+            self.pos += 1;
+        }
+
+        let length = u64::try_from(*length)
+            .map_err(|_| Error::parse(self.pos, "stream /Length does not fit u64"))?
+            as usize;
+        if self.pos + length > self.input.len() {
+            return Err(Error::parse(self.pos, "stream data exceeds input"));
+        }
+
+        let data = self.input[self.pos..self.pos + length].to_vec();
+        self.pos += length;
+
+        self.skip_ws();
+        self.expect_keyword_for_indirect(b"endstream")?;
+
+        Ok(Object::Stream(Stream::new(dict, data)))
     }
 
     fn array(&mut self) -> Result<Object> {
@@ -86,8 +136,15 @@ impl<'a> Parser<'a> {
     }
 
     fn number_or_ref(&mut self) -> Result<Object> {
+        let start = self.pos;
         let first = self.integer()?;
         let saved = self.pos;
+        if self.peek() == Some(b'.') {
+            return self.real_with_integer_prefix(start);
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            return self.parse_real_exponent(start);
+        }
         self.skip_ws();
         if let Ok(second) = self.integer() {
             self.skip_ws();
@@ -102,6 +159,54 @@ impl<'a> Parser<'a> {
         }
         self.pos = saved;
         Ok(Object::Integer(first))
+    }
+
+    fn real(&mut self) -> Result<Object> {
+        let start = self.pos;
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.pos += 1;
+        }
+        if self.peek() != Some(b'.') {
+            return Err(Error::parse(start, "expected real number"));
+        }
+        self.pos += 1;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        self.parse_real_exponent(start)
+    }
+
+    fn real_with_integer_prefix(&mut self, start: usize) -> Result<Object> {
+        if self.peek() != Some(b'.') {
+            return Err(Error::parse(start, "expected decimal point"));
+        }
+        self.pos += 1;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        self.parse_real_exponent(start)
+    }
+
+    fn parse_real_exponent(&mut self, start: usize) -> Result<Object> {
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let exponent_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if exponent_start == self.pos {
+                return Err(Error::parse(start, "invalid real"));
+            }
+        }
+
+        let text = std::str::from_utf8(&self.input[start..self.pos])
+            .map_err(|_| Error::parse(start, "real is not utf-8"))?;
+        text.parse::<f64>()
+            .map(Object::Real)
+            .map_err(|_| Error::parse(start, "invalid real"))
     }
 
     fn integer(&mut self) -> Result<i64> {

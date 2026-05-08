@@ -3,3 +3,4 @@
 .dolt/
 *.db
 .beads-credential-key
+.beads/issues.jsonl

@@ -1,4 +1,4 @@
-use crate::parser::Parser;
+use crate::parser::{parse_indirect_object, Parser};
 use crate::{Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -7,8 +7,14 @@ use std::io::{Read, Seek, SeekFrom};
 pub struct LoadedXref {
     pub version: String,
     pub startxref: u64,
-    pub entries: BTreeMap<ObjectRef, u64>,
+    pub entries: BTreeMap<ObjectRef, XrefOffset>,
     pub trailer: Dictionary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrefOffset {
+    Offset(u64),
+    Compressed { stream: u32, index: u32 },
 }
 
 pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
@@ -21,16 +27,27 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
     let xref_pos =
         usize::try_from(startxref).map_err(|_| Error::parse(0, "startxref does not fit usize"))?;
 
-    if !bytes
+    if bytes
         .get(xref_pos..)
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
-        return Err(Error::Unsupported(
-            "xref streams are not supported in the first milestone".to_string(),
-        ));
+        let mut cursor = ByteCursor::new(&bytes, xref_pos + 4);
+        let (entries, trailer) = parse_xref_table(&mut cursor, &bytes)?;
+        Ok(LoadedXref {
+            version,
+            startxref,
+            entries,
+            trailer,
+        })
+    } else {
+        parse_xref_stream(&bytes, xref_pos, startxref, version)
     }
+}
 
-    let mut cursor = ByteCursor::new(&bytes, xref_pos + 4);
+fn parse_xref_table(
+    cursor: &mut ByteCursor<'_>,
+    bytes: &[u8],
+) -> Result<(BTreeMap<ObjectRef, XrefOffset>, Dictionary)> {
     let mut entries = BTreeMap::new();
     loop {
         cursor.skip_ws();
@@ -50,7 +67,10 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
             let in_use = cursor.read_byte()?;
             cursor.skip_line();
             if in_use == b'n' {
-                entries.insert(ObjectRef::new(first + index, generation), offset);
+                entries.insert(
+                    ObjectRef::new(first + index, generation),
+                    XrefOffset::Offset(offset),
+                );
             }
         }
     }
@@ -63,9 +83,43 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
             return Err(Error::parse(
                 cursor.pos + parser.position(),
                 "trailer is not a dictionary",
+            ));
+        }
+    };
+
+    Ok((entries, trailer))
+}
+
+fn parse_xref_stream(
+    bytes: &[u8],
+    xref_pos: usize,
+    startxref: u64,
+    version: String,
+) -> Result<LoadedXref> {
+    let (_, object) = parse_indirect_object(&bytes[xref_pos..])?;
+    let stream = match object {
+        Object::Stream(stream) => stream,
+        _ => {
+            return Err(Error::Unsupported(
+                "xref stream expected an indirect object stream".to_string(),
             ))
         }
     };
+
+    let trailer = stream.dict;
+    let size = parse_non_negative_u64(
+        trailer
+            .get("Size")
+            .ok_or(Error::Missing("XRef stream /Size"))?,
+        "/Size",
+    )?;
+    let size = u32::try_from(size).map_err(|_| Error::parse(0, "/Size does not fit u32"))?;
+
+    let widths = parse_xref_widths(&trailer)?;
+    let index = parse_xref_index(&trailer, size)?;
+    let ranges = build_xref_ranges(index)?;
+    let mut cursor = ByteCursor::new(&stream.data, 0);
+    let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
 
     Ok(LoadedXref {
         version,
@@ -73,6 +127,147 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
         entries,
         trailer,
     })
+}
+
+type XrefWidths = (usize, usize, usize);
+
+fn parse_xref_widths(trailer: &Dictionary) -> Result<XrefWidths> {
+    let Object::Array(values) = trailer.get("W").ok_or(Error::Missing("XRef stream /W"))? else {
+        return Err(Error::parse(0, "/W must be array"));
+    };
+
+    if values.len() != 3 {
+        return Err(Error::parse(0, "/W must contain three integers"));
+    }
+
+    let w0 = parse_usize(parse_non_negative_u64(&values[0], "/W[0]")?, "/W[0]")?;
+    let w1 = parse_usize(parse_non_negative_u64(&values[1], "/W[1]")?, "/W[1]")?;
+    let w2 = parse_usize(parse_non_negative_u64(&values[2], "/W[2]")?, "/W[2]")?;
+
+    Ok((w0, w1, w2))
+}
+
+fn parse_xref_index(trailer: &Dictionary, size: u32) -> Result<Vec<u32>> {
+    match trailer.get("Index") {
+        None => Ok(vec![0, size]),
+        Some(Object::Array(values)) => {
+            if values.len() % 2 != 0 {
+                return Err(Error::parse(
+                    0,
+                    "/Index must contain an even number of integers",
+                ));
+            }
+
+            let mut index = Vec::with_capacity(values.len());
+            for value in values {
+                let integer = parse_non_negative_u64(value, "/Index")?;
+                index.push(
+                    integer
+                        .try_into()
+                        .map_err(|_| Error::parse(0, "xref /Index value must fit u32"))?,
+                );
+            }
+            Ok(index)
+        }
+        _ => Err(Error::parse(0, "/Index must be array")),
+    }
+}
+
+fn build_xref_ranges(index: Vec<u32>) -> Result<Vec<(u32, u32)>> {
+    let mut ranges = Vec::with_capacity(index.len() / 2);
+    for chunk in index.chunks_exact(2) {
+        if chunk[1] == 0 {
+            continue;
+        }
+        ranges.push((chunk[0], chunk[1]));
+    }
+    Ok(ranges)
+}
+
+fn parse_xref_entries(
+    cursor: &mut ByteCursor<'_>,
+    size: u32,
+    ranges: &[(u32, u32)],
+    widths: XrefWidths,
+) -> Result<BTreeMap<ObjectRef, XrefOffset>> {
+    let (w0, w1, w2) = widths;
+    let entry_width = w0 + w1 + w2;
+    if entry_width == 0 {
+        return Err(Error::parse(0, "invalid cross-reference stream widths"));
+    }
+
+    let mut entries = BTreeMap::new();
+    for &(start, count) in ranges {
+        let start =
+            usize::try_from(start).map_err(|_| Error::parse(0, "object number too large"))?;
+        let count = usize::try_from(count).map_err(|_| Error::parse(0, "range count too large"))?;
+
+        for index in 0..count {
+            if start + index >= usize::try_from(size).unwrap_or(usize::MAX) {
+                return Err(Error::parse(0, "xref range exceeds /Size"));
+            }
+
+            if cursor.pos + entry_width > cursor.bytes.len() {
+                return Err(Error::parse(cursor.pos, "xref stream data truncated"));
+            }
+
+            let object_type = if w0 == 0 {
+                1
+            } else {
+                let value = cursor.read_be_u64(w0)?;
+                u8::try_from(value).map_err(|_| {
+                    Error::parse(cursor.pos, "xref stream object type does not fit u8")
+                })?
+            };
+            let field1 = if w1 == 0 { 0 } else { cursor.read_be_u64(w1)? };
+            let field2 = if w2 == 0 { 0 } else { cursor.read_be_u64(w2)? };
+
+            let object_number = (start + index) as u32;
+            match object_type {
+                0 => {}
+                1 => {
+                    let generation = u16::try_from(field2)
+                        .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
+                    entries.insert(
+                        ObjectRef::new(object_number, generation),
+                        XrefOffset::Offset(field1),
+                    );
+                }
+                2 => {
+                    let stream = u32::try_from(field1).map_err(|_| {
+                        Error::parse(0, "xref stream object number does not fit u32")
+                    })?;
+                    let index = u32::try_from(field2)
+                        .map_err(|_| Error::parse(0, "xref stream index does not fit u32"))?;
+                    entries.insert(
+                        ObjectRef::new(object_number, 0),
+                        XrefOffset::Compressed { stream, index },
+                    );
+                }
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "unsupported xref entry type {object_type}"
+                    )))
+                }
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_non_negative_u64(value: &Object, name: &str) -> Result<u64> {
+    let Object::Integer(integer) = value else {
+        return Err(Error::parse(0, format!("{name} is not integer")));
+    };
+    if *integer < 0 {
+        return Err(Error::parse(0, format!("{name} is negative")));
+    }
+    Ok(*integer as u64)
+}
+
+fn parse_usize(value: u64, name: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| Error::parse(0, format!("{name} does not fit usize")))
 }
 
 fn parse_header(bytes: &[u8]) -> Result<String> {
@@ -156,6 +351,19 @@ impl<'a> ByteCursor<'a> {
         self.read_fixed(width)?
             .parse::<u64>()
             .map_err(|_| Error::parse(self.pos, "invalid fixed-width u64"))
+    }
+
+    fn read_be_u64(&mut self, width: usize) -> Result<u64> {
+        if self.pos + width > self.bytes.len() {
+            return Err(Error::parse(self.pos, "unexpected end of stream field"));
+        }
+
+        let mut value = 0u64;
+        for _ in 0..width {
+            value = (value << 8) | u64::from(self.bytes[self.pos]);
+            self.pos += 1;
+        }
+        Ok(value)
     }
 
     fn read_fixed_u16(&mut self, width: usize) -> Result<u16> {

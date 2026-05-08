@@ -16,7 +16,7 @@ pub use object::{Dictionary, Object, ObjectRef, Stream};
 pub use parser::parse_object;
 pub use reader::Pdf;
 pub use writer::write_pdf;
-pub use xref::{load_xref_and_trailer, LoadedXref};
+pub use xref::{load_xref_and_trailer, LoadedXref, XrefOffset};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
