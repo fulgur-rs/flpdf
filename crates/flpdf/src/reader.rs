@@ -38,6 +38,25 @@ impl<R: Read + Seek> Pdf<R> {
         self.trailer.get_ref("Root")
     }
 
+    pub fn linearized_hint_ref(&mut self) -> Result<Option<ObjectRef>> {
+        let candidate = ObjectRef::new(1, 0);
+        let object = self.resolve(candidate)?;
+        let Object::Dictionary(dict) = object else {
+            return Ok(None);
+        };
+
+        let Some(linearized) = dict.get("Linearized") else {
+            return Ok(None);
+        };
+
+        Ok(match linearized {
+            Object::Integer(value) if *value > 0 => Some(candidate),
+            Object::Real(value) if value.is_finite() && *value > 0.0 => Some(candidate),
+            Object::Boolean(value) if *value => Some(candidate),
+            _ => None,
+        })
+    }
+
     pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
         match self.cache.entry(object_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => Ok(object),
