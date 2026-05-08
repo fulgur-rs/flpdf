@@ -67,3 +67,63 @@ fn parses_dictionary_with_stream() {
     );
     assert_eq!(stream.data, b"hello".to_vec());
 }
+
+#[test]
+fn parses_hex_string() {
+    let object = parse_object(b"<48656C6C6F>").unwrap();
+    assert_eq!(object, Object::String(b"Hello".to_vec()));
+}
+
+#[test]
+fn parses_escaped_name() {
+    let object = parse_object(b"/Hello#20World").unwrap();
+    assert_eq!(object, Object::Name(b"Hello World".to_vec()));
+}
+
+#[test]
+fn parses_literal_string_escapes_and_octal() {
+    let object = parse_object(b"(Hello\\nWorld\\041)").unwrap();
+    assert_eq!(object, Object::String(b"Hello\nWorld!".to_vec()));
+}
+
+#[test]
+fn parses_literal_string_newline_continuation() {
+    let object = parse_object(b"(a\\\nb)").unwrap();
+    assert_eq!(object, Object::String(b"ab".to_vec()));
+}
+
+#[test]
+fn parses_dictionary_with_odd_whitespace() {
+    let object = parse_object(b"[ 1\t0\r\n2\t3 ]").unwrap();
+    assert_eq!(
+        object,
+        Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(0),
+            Object::Integer(2),
+            Object::Integer(3)
+        ])
+    );
+}
+
+#[test]
+fn parses_true_false_null_boundaries() {
+    assert_eq!(parse_object(b"true").unwrap(), Object::Boolean(true));
+    assert_eq!(parse_object(b"false").unwrap(), Object::Boolean(false));
+    assert_eq!(parse_object(b"null").unwrap(), Object::Null);
+    assert!(parse_object(b"truex").is_err());
+    assert!(parse_object(b"null?").is_err());
+}
+
+#[test]
+fn skips_comments_between_tokens() {
+    let object = parse_object(b"[1%comment\n2% again\n 3]").unwrap();
+    assert_eq!(
+        object,
+        Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(2),
+            Object::Integer(3)
+        ])
+    );
+}

@@ -38,7 +38,7 @@ impl Object {
         Self::Reference(object_ref)
     }
 
-    pub(crate) fn write_pdf(&self, out: &mut Vec<u8>) {
+    pub fn write_pdf(&self, out: &mut Vec<u8>) {
         match self {
             Object::Null => out.extend_from_slice(b"null"),
             Object::Boolean(value) => {

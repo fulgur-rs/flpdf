@@ -49,6 +49,7 @@ impl<'a> Parser<'a> {
             Some(b'[') => self.array(),
             Some(b'/') => self.name().map(Object::Name),
             Some(b'(') => self.literal_string().map(Object::String),
+            Some(b'<') => self.hex_string().map(Object::String),
             Some(b'.') => self.real(),
             Some(b'-' | b'+')
                 if self
@@ -120,6 +121,38 @@ impl<'a> Parser<'a> {
         self.expect_keyword_for_indirect(b"endstream")?;
 
         Ok(Object::Stream(Stream::new(dict, data)))
+    }
+
+    fn hex_string(&mut self) -> Result<Vec<u8>> {
+        self.expect_byte(b'<')?;
+        let mut value = Vec::new();
+        let mut first_nibble: Option<u8> = None;
+
+        while let Some(byte) = self.peek() {
+            if byte == b'>' {
+                self.pos += 1;
+                if first_nibble.is_some() {
+                    return Err(Error::parse(self.pos, "hex string has odd length"));
+                }
+                return Ok(value);
+            }
+
+            let nibble = match hex_value(byte) {
+                Some(byte) => byte,
+                None => return Err(Error::parse(self.pos, "invalid hex string")),
+            };
+
+            self.pos += 1;
+
+            if let Some(high) = first_nibble {
+                value.push((high << 4) | nibble);
+                first_nibble = None;
+            } else {
+                first_nibble = Some(nibble);
+            }
+        }
+
+        Err(Error::parse(self.pos, "unterminated hex string"))
     }
 
     fn array(&mut self) -> Result<Object> {
@@ -245,31 +278,125 @@ impl<'a> Parser<'a> {
 
     fn name(&mut self) -> Result<Vec<u8>> {
         self.expect_byte(b'/')?;
-        let start = self.pos;
+        let mut value = Vec::new();
         while let Some(byte) = self.peek() {
             if is_delimiter(byte) || is_ws(byte) {
                 break;
             }
-            self.pos += 1;
+            if byte == b'#' {
+                let pos = self.pos;
+                self.pos += 1;
+                let high = self
+                    .peek()
+                    .and_then(hex_value)
+                    .ok_or_else(|| Error::parse(pos, "invalid name escape"))?;
+                self.pos += 1;
+                let low = self
+                    .peek()
+                    .and_then(hex_value)
+                    .ok_or_else(|| Error::parse(pos, "invalid name escape"))?;
+                self.pos += 1;
+                value.push((high << 4) | low);
+            } else {
+                value.push(byte);
+                self.pos += 1;
+            }
         }
-        if start == self.pos {
-            return Err(Error::parse(start, "empty name"));
+        if value.is_empty() {
+            return Err(Error::parse(self.pos, "empty name"));
         }
-        Ok(self.input[start..self.pos].to_vec())
+        Ok(value)
     }
 
     fn literal_string(&mut self) -> Result<Vec<u8>> {
         self.expect_byte(b'(')?;
-        let start = self.pos;
+        let mut value = Vec::new();
+        let mut depth = 0;
         while let Some(byte) = self.peek() {
-            if byte == b')' {
-                let value = self.input[start..self.pos].to_vec();
+            if byte == b'(' {
+                depth += 1;
+                value.push(byte);
                 self.pos += 1;
-                return Ok(value);
+                continue;
             }
+
+            if byte == b')' {
+                if depth == 0 {
+                    self.pos += 1;
+                    return Ok(value);
+                }
+                depth -= 1;
+                value.push(byte);
+                self.pos += 1;
+                continue;
+            }
+
+            if byte == b'\\' {
+                self.pos += 1;
+                match self.peek() {
+                    Some(b'n') => {
+                        value.push(b'\n');
+                        self.pos += 1;
+                    }
+                    Some(b'r') => {
+                        value.push(b'\r');
+                        self.pos += 1;
+                    }
+                    Some(b't') => {
+                        value.push(b'\t');
+                        self.pos += 1;
+                    }
+                    Some(b'b') => {
+                        value.push(0x08);
+                        self.pos += 1;
+                    }
+                    Some(b'f') => {
+                        value.push(0x0c);
+                        self.pos += 1;
+                    }
+                    Some(b'(' | b')' | b'\\') => {
+                        value.push(self.peek().unwrap_or_default());
+                        self.pos += 1;
+                    }
+                    Some(b'\r') => {
+                        self.pos += 1;
+                        if self.peek() == Some(b'\n') {
+                            self.pos += 1;
+                        }
+                    }
+                    Some(b'\n') => {
+                        self.pos += 1;
+                    }
+                    Some(byte @ b'0'..=b'7') => {
+                        let first = byte;
+                        let mut value_byte = first - b'0';
+                        self.pos += 1;
+                        for _ in 0..2 {
+                            if let Some(next) = self.peek() {
+                                if matches!(next, b'0'..=b'7') {
+                                    value_byte = (value_byte << 3) | (next - b'0');
+                                    self.pos += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        value.push(value_byte);
+                    }
+                    Some(_) => {
+                        value.push(self.peek().unwrap_or_default());
+                        self.pos += 1;
+                    }
+                    None => return Err(Error::parse(self.pos, "unterminated literal string")),
+                }
+                continue;
+            }
+
             self.pos += 1;
+            value.push(byte);
         }
-        Err(Error::parse(start, "unterminated literal string"))
+
+        Err(Error::parse(self.pos, "unterminated literal string"))
     }
 
     pub(crate) fn skip_ws(&mut self) {
@@ -332,4 +459,13 @@ fn is_delimiter(byte: u8) -> bool {
         byte,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
     )
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
