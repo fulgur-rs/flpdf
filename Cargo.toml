@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/flpdf",
+    "crates/flpdf-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

@@ -1,0 +1,18 @@
+[package]
+name = "flpdf-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "flpdf"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+flpdf = { path = "../flpdf" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true

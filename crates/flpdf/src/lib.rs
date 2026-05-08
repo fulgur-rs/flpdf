@@ -1,0 +1,23 @@
+pub mod cache;
+pub mod check;
+pub mod diagnostics;
+pub mod error;
+pub mod object;
+pub mod parser;
+pub mod reader;
+pub mod writer;
+pub mod xref;
+
+pub use cache::{CacheEntry, ObjectCache};
+pub use check::{check_reader, CheckReport};
+pub use diagnostics::{Diagnostic, Diagnostics, Severity};
+pub use error::{Error, Result};
+pub use object::{Dictionary, Object, ObjectRef, Stream};
+pub use parser::parse_object;
+pub use reader::Pdf;
+pub use writer::write_pdf;
+pub use xref::{load_xref_and_trailer, LoadedXref};
+
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
