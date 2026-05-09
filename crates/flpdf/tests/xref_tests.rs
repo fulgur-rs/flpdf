@@ -169,6 +169,90 @@ fn parses_xref_stream_with_compressed_entries() {
 }
 
 #[test]
+fn loads_previous_xref_stream_entries_for_omitted_objects() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(obj1);
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_xref_entries =
+        build_encoded_xref_stream_entries(&[(0, 0, 0), (1, obj1_offset, 0), (2, 12, 0), (0, 0, 0)]);
+
+    let previous_xref_object = make_xref_stream_object(2, 4, None, 1, &previous_xref_entries);
+    bytes.extend_from_slice(&previous_xref_object);
+
+    let latest_xref_offset = bytes.len() as u64;
+    let latest_xref_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (0, 0, 0),
+        (1, latest_xref_offset, 0),
+    ]);
+
+    let latest_xref_object =
+        make_xref_stream_object(3, 4, Some(previous_xref_offset), 1, &latest_xref_entries);
+    bytes.extend_from_slice(&latest_xref_object);
+
+    bytes.extend_from_slice(format!("startxref\n{latest_xref_offset}\n%%EOF\n").as_bytes());
+
+    let mut reader = Cursor::new(bytes);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
+
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 12,
+            index: 0
+        })
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(obj1_offset))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefOffset::Offset(latest_xref_offset))
+    );
+}
+
+fn build_encoded_xref_stream_entries(entries: &[(u8, u64, u64)]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(entries.len() * 7);
+    for &(entry_type, field1, field2) in entries {
+        encoded.push(entry_type);
+        encoded.extend_from_slice(&field1.to_be_bytes()[4..]);
+        encoded.extend_from_slice(&field2.to_be_bytes()[6..]);
+    }
+    encoded
+}
+
+fn make_xref_stream_object(
+    object_number: u32,
+    size: u32,
+    prev_offset: Option<u64>,
+    root_ref_number: u32,
+    entries: &[u8],
+) -> Vec<u8> {
+    let prev = prev_offset
+        .map(|offset| format!(" /Prev {offset}"))
+        .unwrap_or_default();
+
+    let mut object = format!(
+        "{} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {}{} >>\nstream\n",
+        object_number,
+        entries.len(),
+        prev
+    )
+    .into_bytes();
+    object.extend_from_slice(entries);
+
+    // Keep stream data trivially decodable with no postprocessing.
+    object.extend_from_slice(b"\nendstream\nendobj\n");
+    object
+}
+
+#[test]
 fn best_effort_recovers_from_corrupt_xref_data() {
     let bytes = corrupt_xref_pdf();
 
