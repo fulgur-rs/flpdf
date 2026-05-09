@@ -128,7 +128,10 @@ fn qpdf_split_and_merge_matrix_roundtrip_still_parsable() {
         merged.to_str().unwrap(),
     ]);
 
-    let expected_merged = load_lines("merge-one-plus-two-pages.txt")[0].clone();
+    let expected_merged = load_lines("merge-one-plus-two-pages.txt")
+        .first()
+        .cloned()
+        .expect("golden file merge-one-plus-two-pages.txt should not be empty");
     assert_eq!(
         run_qpdf(&["--show-npages", merged.to_str().unwrap()]),
         expected_merged

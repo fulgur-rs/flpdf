@@ -469,7 +469,15 @@ fn load_page_sequence(input: Option<PathBuf>) -> CliResult<PageSequence> {
 
     let mut seen = BTreeSet::new();
     let mut pages = Vec::new();
-    collect_pages(&mut pdf, pages_ref, &mut seen, &mut pages)?;
+    const MAX_PAGE_TREE_DEPTH: usize = 100;
+    collect_pages(
+        &mut pdf,
+        pages_ref,
+        &mut seen,
+        &mut pages,
+        0,
+        MAX_PAGE_TREE_DEPTH,
+    )?;
 
     Ok((pdf, pages))
 }
@@ -479,7 +487,17 @@ fn collect_pages(
     node: ObjectRef,
     seen: &mut BTreeSet<ObjectRef>,
     pages: &mut Vec<ObjectRef>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if depth >= max_depth {
+        return Err(format!(
+            "page tree depth exceeds maximum of {} at {}",
+            max_depth, node
+        )
+        .into());
+    }
+
     if !seen.insert(node) {
         return Ok(());
     }
@@ -501,7 +519,7 @@ fn collect_pages(
         if let Some(Object::Array(kids)) = dict.get("Kids") {
             for kid in kids {
                 if let Object::Reference(reference) = kid {
-                    collect_pages(pdf, *reference, seen, pages)?;
+                    collect_pages(pdf, *reference, seen, pages, depth + 1, max_depth)?;
                 }
             }
         }
