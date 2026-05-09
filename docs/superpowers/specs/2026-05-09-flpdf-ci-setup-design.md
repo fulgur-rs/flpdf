@@ -19,7 +19,7 @@ Add automated CI for the Rust workspace so every change to the main branch and p
 ## CI Design Options
 
 1) **Recommended (adopted): Single workflow with two jobs**
-   - `quality` job on `ubuntu-latest` runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features`.
+   - `quality` job on `ubuntu-latest` runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
    - `test` job on Linux and Windows runs `cargo test --workspace --all-targets --all-features`.
    - Pros: fast signal, good platform coverage, explicit quality gate before tests.
    - Cons: does not cover macOS.
@@ -37,8 +37,8 @@ Add automated CI for the Rust workspace so every change to the main branch and p
 ## Implementation Plan
 
 - Add `.github/workflows/ci.yml`.
-- Use `dtolnay/rust-toolchain@stable` with `rustfmt` and `clippy` components.
-- Enable dependency caching via `Swatinem/rust-cache@v2` for faster runs.
+- Use `dtolnay/rust-toolchain` (pinned to SHA in CI) with `rustfmt` and `clippy` components.
+- Enable dependency caching via `Swatinem/rust-cache` (pinned to SHA in CI) for faster runs.
 - Keep strict, deterministic checks for review-friendly failures.
 
 ## Error and Quality Handling
