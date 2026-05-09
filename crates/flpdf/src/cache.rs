@@ -44,6 +44,7 @@ impl ObjectCache {
     }
 
     pub fn set_resolved(&mut self, object_ref: ObjectRef, object: Object) {
+        self.deleted_refs.remove(&object_ref);
         self.entries
             .insert(object_ref, CacheEntry::Resolved(object));
     }

@@ -323,6 +323,62 @@ fn write_pdf_deletes_object_with_free_incremental_xref_entry() {
 }
 
 #[test]
+fn set_object_after_delete_keeps_object_live() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Old true >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", object_offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &object_offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            object_offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+
+    let object_ref = ObjectRef::new(3, 0);
+    let replacement = parse_object(b"<< /Replacement true >>").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.delete_object(object_ref);
+    pdf.set_object(object_ref, replacement.clone());
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(latest_entries.get(&3), Some(&b'n'));
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    assert_eq!(reopened.resolve(object_ref).unwrap(), replacement);
+}
+
+#[test]
 fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
