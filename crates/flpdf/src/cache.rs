@@ -1,5 +1,5 @@
 use crate::{Object, ObjectRef, XrefOffset};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 pub enum CacheEntry {
@@ -14,6 +14,7 @@ pub enum CacheEntry {
 #[derive(Debug, Clone, Default)]
 pub struct ObjectCache {
     entries: BTreeMap<ObjectRef, CacheEntry>,
+    deleted_refs: BTreeSet<ObjectRef>,
 }
 
 impl ObjectCache {
@@ -32,7 +33,10 @@ impl ObjectCache {
                 (*object_ref, entry)
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            deleted_refs: BTreeSet::new(),
+        }
     }
 
     pub fn entry(&self, object_ref: ObjectRef) -> Option<&CacheEntry> {
@@ -40,8 +44,18 @@ impl ObjectCache {
     }
 
     pub fn set_resolved(&mut self, object_ref: ObjectRef, object: Object) {
+        self.deleted_refs.remove(&object_ref);
         self.entries
             .insert(object_ref, CacheEntry::Resolved(object));
+    }
+
+    pub fn set_deleted(&mut self, object_ref: ObjectRef) {
+        self.entries.insert(object_ref, CacheEntry::Deleted);
+        self.deleted_refs.insert(object_ref);
+    }
+
+    pub(crate) fn deleted_refs(&self) -> Vec<ObjectRef> {
+        self.deleted_refs.iter().copied().collect()
     }
 
     pub(crate) fn entries(&self) -> &BTreeMap<ObjectRef, CacheEntry> {

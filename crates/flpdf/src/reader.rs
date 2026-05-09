@@ -114,6 +114,18 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.set_resolved(object_ref, object);
     }
 
+    pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        if object_ref.number == 0
+            || matches!(
+                self.cache.entry(object_ref),
+                Some(CacheEntry::Deleted | CacheEntry::Missing)
+            )
+        {
+            return;
+        }
+        self.cache.set_deleted(object_ref);
+    }
+
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
@@ -137,6 +149,10 @@ impl<R: Read + Seek> Pdf<R> {
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn deleted_object_refs(&self) -> Vec<ObjectRef> {
+        self.cache.deleted_refs()
     }
 
     pub fn object_refs(&self) -> Vec<ObjectRef> {

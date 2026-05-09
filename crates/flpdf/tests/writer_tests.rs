@@ -5,9 +5,10 @@ use flpdf::{
     ObjectRef, Pdf, XrefForm, XrefOffset,
 };
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::io::{BufReader, Cursor};
+use std::process::Command;
 
 #[test]
 fn rewrites_minimal_pdf_to_valid_pdf() {
@@ -235,6 +236,191 @@ fn write_pdf_emits_only_touched_objects() {
     assert_eq!(&output[..source.len()], &source[..]);
     assert_eq!(count_substrings(&output, b"1 0 obj"), 2);
     assert_eq!(count_substrings(&output, b"2 0 obj"), 1);
+}
+
+#[test]
+fn write_pdf_deletes_object_with_free_incremental_xref_entry() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Deleted false >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", object_offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &object_offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            object_offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+
+    let deleted_ref = ObjectRef::new(3, 0);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.delete_object(deleted_ref);
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(latest_entries.get(&3), Some(&b'f'));
+    let latest_generations = parse_last_xref_generations(&output);
+    assert_eq!(latest_generations.get(&3), Some(&1));
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    assert_eq!(reopened.resolve(deleted_ref).unwrap(), Object::Null);
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(0, 65535)),
+        Some(&XrefOffset::Free { next: 3 })
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(3, 1)),
+        Some(&XrefOffset::Free { next: 0 })
+    );
+
+    if is_qpdf_available() {
+        let path =
+            std::env::temp_dir().join(format!("flpdf-delete-object-{}.pdf", std::process::id()));
+        fs::write(&path, &output).unwrap();
+        let qpdf = Command::new("qpdf")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to invoke qpdf: {err}"));
+        let _ = fs::remove_file(&path);
+        assert!(
+            qpdf.status.success(),
+            "qpdf failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+    }
+}
+
+#[test]
+fn set_object_after_delete_keeps_object_live() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Old true >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", object_offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &object_offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            object_offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+
+    let object_ref = ObjectRef::new(3, 0);
+    let replacement = parse_object(b"<< /Replacement true >>").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.delete_object(object_ref);
+    pdf.set_object(object_ref, replacement.clone());
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(latest_entries.get(&3), Some(&b'n'));
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    assert_eq!(reopened.resolve(object_ref).unwrap(), replacement);
+}
+
+#[test]
+fn delete_object_ignores_existing_free_tombstone() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n");
+    bytes.extend_from_slice(b"0000000002 65535 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", object_offsets[0]).as_bytes());
+    bytes.extend_from_slice(b"0000000000 00001 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", object_offsets[1]).as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.delete_object(ObjectRef::new(2, 1));
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 1)),
+        Some(&XrefOffset::Free { next: 0 })
+    );
 }
 
 #[test]
@@ -676,6 +862,13 @@ fn write_pdf_preserves_xref_stream_free_tombstones() {
 
     let latest_entries = parse_last_xref_entries(&output);
     assert_eq!(latest_entries.get(&2), Some(&b'f'));
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 1)),
+        Some(&XrefOffset::Free { next: 0 })
+    );
 }
 
 #[test]
@@ -1105,6 +1298,14 @@ fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
     }
 
     count
+}
+
+fn is_qpdf_available() -> bool {
+    Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn parse_startxref(bytes: &[u8]) -> u64 {

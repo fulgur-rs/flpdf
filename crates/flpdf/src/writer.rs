@@ -15,14 +15,20 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     let source_offsets = build_source_offsets(pdf.source_xref_offsets());
     let source_xref_offsets = build_source_xref_offsets(pdf.source_xref_entries());
-    let (touched_object_refs, touched_objstm_members) = collect_touched_object_refs(pdf);
+    let (touched_object_refs, deleted_object_refs, touched_objstm_members) =
+        collect_touched_object_refs(pdf);
     let mut xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
+    let deleted_table_entries = build_deleted_table_entries(pdf, &deleted_object_refs);
     let rewritten_stream_offsets =
         write_updated_object_streams(&mut bytes, pdf, &touched_objstm_members)?;
     xref_offsets.extend(rewritten_stream_offsets);
-    let final_offsets = merge_source_and_touched_offsets(&source_offsets, &xref_offsets);
-    let final_xref_offsets =
-        merge_source_and_touched_offsets_for_xref_stream(&source_xref_offsets, &xref_offsets);
+    let final_offsets =
+        merge_source_and_touched_offsets(&source_offsets, &xref_offsets, &deleted_table_entries);
+    let final_xref_offsets = merge_source_and_touched_offsets_for_xref_stream(
+        &source_xref_offsets,
+        &xref_offsets,
+        &deleted_object_refs,
+    );
     let mut object_count = match pdf.last_xref_form() {
         XrefForm::Table => resolve_object_count(pdf.trailer().get("Size"), &final_offsets),
         XrefForm::Stream => {
@@ -64,11 +70,19 @@ type RewrittenObjStmMembers = BTreeMap<ObjectRef, BTreeSet<ObjectRef>>;
 
 fn collect_touched_object_refs<R: Read + Seek>(
     pdf: &Pdf<R>,
-) -> (Vec<ObjectRef>, RewrittenObjStmMembers) {
+) -> (Vec<ObjectRef>, Vec<ObjectRef>, RewrittenObjStmMembers) {
     let mut touched = BTreeSet::new();
+    let mut deleted = BTreeSet::new();
     let mut objstm_touched: BTreeMap<ObjectRef, BTreeSet<ObjectRef>> = BTreeMap::new();
 
+    for object_ref in pdf.deleted_object_refs() {
+        deleted.insert(object_ref);
+    }
+
     for object_ref in pdf.resolved_object_refs() {
+        if deleted.contains(&object_ref) {
+            continue;
+        }
         if let Some((stream_ref, _index)) = pdf.compressed_parent(object_ref) {
             objstm_touched
                 .entry(stream_ref)
@@ -80,7 +94,17 @@ fn collect_touched_object_refs<R: Read + Seek>(
         touched.insert(object_ref);
     }
 
-    (touched.into_iter().collect(), objstm_touched)
+    (
+        touched.into_iter().collect(),
+        deleted.into_iter().collect(),
+        objstm_touched,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum XrefTableEntry {
+    InUse { generation: u16, offset: usize },
+    Free { generation: u16, next: u32 },
 }
 
 fn write_incremental_objects<R: Read + Seek>(
@@ -278,10 +302,37 @@ fn write_object(
 fn merge_source_and_touched_offsets(
     source_offsets: &BTreeMap<u32, (u16, usize)>,
     touched_offsets: &BTreeMap<u32, (u16, usize)>,
-) -> BTreeMap<u32, (u16, usize)> {
-    let mut merged = source_offsets.clone();
+    deleted_entries: &BTreeMap<u32, (u16, u32)>,
+) -> BTreeMap<u32, XrefTableEntry> {
+    let mut merged = source_offsets
+        .iter()
+        .map(|(number, (generation, offset))| {
+            (
+                *number,
+                XrefTableEntry::InUse {
+                    generation: *generation,
+                    offset: *offset,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for (number, (generation, offset)) in touched_offsets {
-        merged.insert(*number, (*generation, *offset));
+        merged.insert(
+            *number,
+            XrefTableEntry::InUse {
+                generation: *generation,
+                offset: *offset,
+            },
+        );
+    }
+    for (number, (generation, next)) in deleted_entries {
+        merged.insert(
+            *number,
+            XrefTableEntry::Free {
+                generation: *generation,
+                next: *next,
+            },
+        );
     }
     merged
 }
@@ -289,12 +340,81 @@ fn merge_source_and_touched_offsets(
 fn merge_source_and_touched_offsets_for_xref_stream(
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
     touched_offsets: &BTreeMap<u32, (u16, usize)>,
+    deleted_object_refs: &[ObjectRef],
 ) -> BTreeMap<u32, (u16, XrefOffset)> {
     let mut merged = source_offsets.clone();
     for (number, (generation, offset)) in touched_offsets {
         merged.insert(*number, (*generation, XrefOffset::Offset(*offset as u64)));
     }
+    for (number, (generation, next)) in build_deleted_entries(source_offsets, deleted_object_refs) {
+        merged.insert(number, (generation, XrefOffset::Free { next }));
+    }
     merged
+}
+
+fn build_deleted_table_entries<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    deleted_object_refs: &[ObjectRef],
+) -> BTreeMap<u32, (u16, u32)> {
+    let source_offsets = build_source_xref_offsets(pdf.source_xref_entries());
+    build_deleted_entries(&source_offsets, deleted_object_refs)
+}
+
+fn build_deleted_entries(
+    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    deleted_object_refs: &[ObjectRef],
+) -> BTreeMap<u32, (u16, u32)> {
+    if deleted_object_refs.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut deleted_refs = deleted_object_refs.to_vec();
+    deleted_refs.sort_by_key(|object_ref| object_ref.number);
+    deleted_refs.dedup_by_key(|object_ref| object_ref.number);
+
+    let mut entries = BTreeMap::new();
+    let first_deleted = deleted_refs[0].number;
+    entries.insert(0, (65535, first_deleted));
+
+    deleted_refs
+        .iter()
+        .enumerate()
+        .for_each(|(index, object_ref)| {
+            let next = deleted_refs
+                .get(index + 1)
+                .map(|next_ref| next_ref.number)
+                .unwrap_or_else(|| source_free_head(source_offsets));
+            entries.insert(
+                object_ref.number,
+                (
+                    incremented_generation(current_generation(source_offsets, *object_ref)),
+                    next,
+                ),
+            );
+        });
+
+    entries
+}
+
+fn source_free_head(source_offsets: &BTreeMap<u32, (u16, XrefOffset)>) -> u32 {
+    match source_offsets.get(&0) {
+        Some((_, XrefOffset::Free { next })) => *next,
+        _ => 0,
+    }
+}
+
+fn current_generation(
+    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    object_ref: ObjectRef,
+) -> u16 {
+    source_offsets
+        .get(&object_ref.number)
+        .map(|(generation, _)| *generation)
+        .unwrap_or(object_ref.generation)
+}
+
+fn incremented_generation(generation: u16) -> u16 {
+    generation.saturating_add(1)
 }
 
 fn next_xref_stream_object_number(
@@ -342,7 +462,7 @@ fn build_source_offsets(entries: Vec<(ObjectRef, u64)>) -> BTreeMap<u32, (u16, u
 
 fn resolve_object_count(
     declared_size: Option<&crate::Object>,
-    source_offsets: &BTreeMap<u32, (u16, usize)>,
+    source_offsets: &BTreeMap<u32, XrefTableEntry>,
 ) -> usize {
     let max_object_number = source_offsets.keys().next_back().copied().unwrap_or(0) as usize;
     let declared = declared_size
@@ -372,11 +492,15 @@ fn resolve_xref_stream_object_count(
 
 fn write_incremental_xref(
     bytes: &mut Vec<u8>,
-    source_offsets: &BTreeMap<u32, (u16, usize)>,
+    source_offsets: &BTreeMap<u32, XrefTableEntry>,
 ) -> Result<usize> {
     let xref_offset = bytes.len();
     bytes.extend_from_slice(b"xref\n0 1\n");
-    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    let (free_generation, free_next) = match source_offsets.get(&0) {
+        Some(XrefTableEntry::Free { generation, next }) => (*generation, *next),
+        _ => (65535, 0),
+    };
+    bytes.extend_from_slice(format!("{free_next:010} {free_generation:05} f \n").as_bytes());
 
     let mut object_numbers: Vec<u32> = source_offsets.keys().copied().filter(|n| *n > 0).collect();
     if object_numbers.is_empty() {
@@ -398,13 +522,20 @@ fn write_incremental_xref(
         let count = end - start + 1;
         bytes.extend_from_slice(format!("{} {}\n", start, count).as_bytes());
         for object_number in start..=end {
-            let (generation, offset) = source_offsets.get(&object_number).ok_or_else(|| {
+            let entry = source_offsets.get(&object_number).ok_or_else(|| {
                 crate::Error::Unsupported(
                     "incremental xref subsection is missing object entry".to_string(),
                 )
             })?;
 
-            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
+            match entry {
+                XrefTableEntry::InUse { generation, offset } => {
+                    bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
+                }
+                XrefTableEntry::Free { generation, next } => {
+                    bytes.extend_from_slice(format!("{next:010} {generation:05} f \n").as_bytes())
+                }
+            }
         }
 
         i += 1;
