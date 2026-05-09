@@ -140,7 +140,12 @@ fn merge_previous_xref_sections(
         let previous = parse_xref_from_start(bytes, previous_pos, offset, version)?;
 
         for (object_ref, xref_offset) in previous.entries {
-            entries.entry(object_ref).or_insert(xref_offset);
+            if !entries
+                .keys()
+                .any(|entry_ref| entry_ref.number == object_ref.number)
+            {
+                entries.insert(object_ref, xref_offset);
+            }
         }
 
         previous_offset = parse_previous_xref_offset(&previous.trailer);
