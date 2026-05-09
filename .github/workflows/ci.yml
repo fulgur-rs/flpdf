@@ -54,5 +54,30 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets --all-features
+      - name: Run tests in required order
+        run: |
+          set -euo pipefail
+
+          echo "[ci] cargo test -p flpdf --test reader_tests"
+          cargo test -p flpdf --test reader_tests
+
+          echo "[ci] cargo test -p flpdf --test xref_tests"
+          cargo test -p flpdf --test xref_tests
+
+          echo "[ci] cargo test -p flpdf --test check_tests"
+          cargo test -p flpdf --test check_tests
+
+          echo "[ci] cargo test -p flpdf --test writer_tests"
+          cargo test -p flpdf --test writer_tests
+
+          echo "[ci] cargo test -p flpdf-cli --test cli_tests"
+          cargo test -p flpdf-cli --test cli_tests
+
+          echo "[ci] cargo test -p flpdf-cli --test compat_matrix_tests"
+          cargo test -p flpdf-cli --test compat_matrix_tests
+
+          echo "[ci] cargo test -p flpdf"
+          cargo test -p flpdf
+
+          echo "[ci] cargo test"
+          cargo test
