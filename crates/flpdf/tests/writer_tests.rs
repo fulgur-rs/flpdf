@@ -65,6 +65,125 @@ fn write_pdf_preserves_source_bytes() {
 }
 
 #[test]
+fn write_pdf_twice_builds_valid_prev_chain() {
+    let source_bytes = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let source_startxref = parse_startxref(&source_bytes);
+    let mut generations = Vec::new();
+
+    let mut source = source_bytes;
+
+    for _ in 0..3 {
+        let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+        let mut output = Vec::new();
+        write_pdf(&mut pdf, &mut output).unwrap();
+
+        let report = check_reader(Cursor::new(&output)).unwrap();
+        assert!(
+            report.valid,
+            "generation {} diagnostics: {:?}",
+            generations.len(),
+            report.diagnostics.entries()
+        );
+
+        generations.push(output.clone());
+
+        source = output.clone();
+    }
+
+    let mut prior_size = None;
+    let mut prior_startxref = source_startxref;
+    let mut prior_generations = None;
+
+    for (generation, bytes) in generations.iter().enumerate() {
+        let current_startxref = parse_startxref(bytes);
+        let parsed = Pdf::open(Cursor::new(bytes)).unwrap();
+        let current_generations = parse_last_xref_generations(bytes);
+        let trailer = parsed.trailer();
+
+        let prev = trailer.get("Prev");
+        let Some(Object::Integer(previous_xref)) = prev else {
+            panic!("generation {generation} is missing trailer /Prev")
+        };
+
+        assert_eq!(
+            *previous_xref as u64, prior_startxref,
+            "generation {generation} /Prev mismatch"
+        );
+
+        let size = trailer
+            .get("Size")
+            .and_then(as_integer)
+            .expect("generation trailer missing integer /Size");
+        if let Some(previous_size) = prior_size {
+            assert!(
+                size >= previous_size,
+                "generation {generation} reduced /Size from {previous_size} to {size}",
+            );
+        }
+
+        prior_size = Some(size);
+        prior_startxref = current_startxref;
+
+        if let Some(previous_generations) = prior_generations.as_ref() {
+            for (object_number, previous_generation) in previous_generations {
+                if let Some(current_generation) = current_generations.get(object_number) {
+                    assert!(
+                        current_generation >= previous_generation,
+                        "generation {object_number} decreased from {previous_generation} to {current_generation} in generation {generation}",
+                    );
+                }
+            }
+        }
+
+        prior_generations = Some(current_generations);
+    }
+}
+
+#[test]
+fn write_pdf_rewriting_chain_is_self_consistent_on_open() {
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut snapshots = Vec::new();
+    let mut current = source;
+
+    for _ in 0..2 {
+        let mut pdf = Pdf::open(Cursor::new(current.clone())).unwrap();
+        let mut output = Vec::new();
+        write_pdf(&mut pdf, &mut output).unwrap();
+        snapshots.push(output.clone());
+        current = output;
+    }
+
+    let mut chain = Vec::<u64>::new();
+
+    for generation in (1..snapshots.len()).rev() {
+        let current = &snapshots[generation];
+        let previous = &snapshots[generation - 1];
+
+        let pdf = Pdf::open(Cursor::new(current)).unwrap();
+        let prev = pdf
+            .trailer()
+            .get("Prev")
+            .and_then(as_integer)
+            .expect("trailer missing /Prev") as u64;
+
+        chain.push(prev);
+        assert_eq!(prev, parse_startxref(previous));
+
+        let report = check_reader(Cursor::new(current)).unwrap();
+        assert!(
+            report.valid,
+            "rewritten generation {generation} diagnostics: {:?}",
+            report.diagnostics.entries()
+        );
+    }
+
+    assert!(
+        !chain.is_empty(),
+        "expected /Prev values while validating rewritten chain",
+    );
+}
+
+#[test]
 fn write_pdf_emits_only_touched_objects() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut object_offsets = Vec::new();
@@ -420,6 +539,106 @@ fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
     }
 
     count
+}
+
+fn parse_startxref(bytes: &[u8]) -> u64 {
+    let marker = b"startxref";
+    let eof = bytes
+        .windows(b"%%EOF".len())
+        .rposition(|window| window == b"%%EOF")
+        .unwrap_or(bytes.len());
+    let search = &bytes[..eof];
+
+    let Some(pos) = search
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+    else {
+        panic!("missing startxref marker")
+    };
+
+    let mut cursor = pos + marker.len();
+    while cursor < search.len() && search[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    let start = cursor;
+    while cursor < search.len() && search[cursor].is_ascii_digit() {
+        cursor += 1;
+    }
+
+    if start == cursor {
+        panic!("missing startxref offset")
+    }
+
+    let value = std::str::from_utf8(&search[start..cursor]).unwrap();
+    value.parse::<u64>().unwrap()
+}
+
+fn parse_last_xref_generations(bytes: &[u8]) -> BTreeMap<u32, u16> {
+    let rendered = String::from_utf8_lossy(bytes);
+    let xref_pos = if let Some(pos) = rendered.rfind("\nxref\n") {
+        pos
+    } else if let Some(pos) = rendered.rfind("xref\n") {
+        pos.saturating_sub(1)
+    } else {
+        panic!("missing xref section");
+    };
+
+    let section_pos = if &rendered[xref_pos + 1..xref_pos + 6] == "xref\n" {
+        xref_pos + 1
+    } else {
+        panic!("missing xref section");
+    };
+
+    let mut lines = rendered[section_pos + 5..].lines();
+    let mut generations = BTreeMap::new();
+
+    while let Some(section) = lines.next() {
+        if section == "trailer" {
+            break;
+        }
+
+        let mut fields = section.split_whitespace();
+        let start: u32 = fields
+            .next()
+            .unwrap_or_else(|| panic!("invalid xref subsection header: {section}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid xref start token {section}"));
+        let count: u32 = fields
+            .next()
+            .unwrap_or_else(|| panic!("missing xref count for start {start}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid xref count token {section}"));
+
+        for index in 0..count {
+            let entry_line = lines
+                .next()
+                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
+            let mut entry_fields = entry_line.split_whitespace();
+
+            let _ = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
+            let generation: u16 = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing generation in xref subsection {start} {count}"))
+                .parse()
+                .unwrap_or_else(|_| {
+                    panic!("invalid generation in xref subsection {start} {count}")
+                });
+
+            generations.insert(start + index, generation);
+        }
+    }
+
+    generations
+}
+
+fn as_integer(object: &Object) -> Option<i64> {
+    match object {
+        Object::Integer(value) => Some(*value),
+        _ => None,
+    }
 }
 
 fn parse_last_xref_entries(bytes: &[u8]) -> BTreeMap<u32, u8> {

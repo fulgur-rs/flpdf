@@ -24,7 +24,7 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
         pdf,
         &root_ref,
         object_count,
-        pdf.startxref(),
+        pdf.previous_xref_offset(),
         xref_offset,
     )?;
 
@@ -111,10 +111,12 @@ fn resolve_object_count(
     source_offsets: &BTreeMap<u32, (u16, usize)>,
 ) -> usize {
     let max_object_number = source_offsets.keys().next_back().copied().unwrap_or(0) as usize;
-    let declared = match declared_size {
-        Some(crate::Object::Integer(size)) if *size > 0 => *size as usize,
-        _ => 0,
-    };
+    let declared = declared_size
+        .and_then(|size| match size {
+            crate::Object::Integer(value) => usize::try_from(*value).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
 
     declared.max(max_object_number.saturating_add(1)).max(1)
 }
