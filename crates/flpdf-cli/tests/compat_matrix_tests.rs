@@ -128,7 +128,10 @@ fn qpdf_split_and_merge_matrix_roundtrip_still_parsable() {
         merged.to_str().unwrap(),
     ]);
 
-    let expected_merged = load_lines("merge-one-plus-two-pages.txt")[0].clone();
+    let expected_merged = load_lines("merge-one-plus-two-pages.txt")
+        .first()
+        .cloned()
+        .expect("golden file merge-one-plus-two-pages.txt should not be empty");
     assert_eq!(
         run_qpdf(&["--show-npages", merged.to_str().unwrap()]),
         expected_merged
@@ -159,16 +162,19 @@ fn is_qpdf_available() -> bool {
 }
 
 fn run_qpdf(args: &[&str]) -> String {
-    String::from_utf8(
-        ShellCommand::new("qpdf")
-            .args(args)
-            .output()
-            .unwrap_or_else(|err| panic!("failed to invoke qpdf: {err}"))
-            .stdout,
-    )
-    .unwrap_or_else(|err| panic!("qpdf output was not utf8: {err}"))
-    .trim()
-    .to_string()
+    let output = ShellCommand::new("qpdf")
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to invoke qpdf: {err}"));
+    assert!(
+        output.status.success(),
+        "qpdf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|err| panic!("qpdf output was not utf8: {err}"))
+        .trim()
+        .to_string()
 }
 
 fn run_qpdf_with_args(args: &[&str]) {

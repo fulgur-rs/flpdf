@@ -5,6 +5,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
+type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+type PageSequence = (Pdf<BufReader<File>>, Vec<ObjectRef>);
+
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
@@ -181,7 +184,18 @@ fn run_show_metadata(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::E
                         .unwrap_or_else(|| String::from("Unknown"));
                     println!("Metadata: stream ({}) {}", metadata_ref, kind);
                     println!("  length: {}", stream.data.len());
-                    println!("  preview: {}", String::from_utf8_lossy(&stream.data));
+                    const MAX_METADATA_PREVIEW_BYTES: usize = 1000;
+                    let preview_len = stream.data.len().min(MAX_METADATA_PREVIEW_BYTES);
+                    let preview = String::from_utf8_lossy(&stream.data[..preview_len]);
+                    if stream.data.len() > MAX_METADATA_PREVIEW_BYTES {
+                        println!(
+                            "  preview: {} (truncated, total {} bytes)",
+                            preview,
+                            stream.data.len()
+                        );
+                    } else {
+                        println!("  preview: {}", preview);
+                    }
                 }
                 Object::Dictionary(dict) => {
                     println!("Metadata: dictionary {}", metadata_ref);
@@ -222,8 +236,18 @@ fn run_show_outline(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
     println!("Outline:");
     let mut counter = 1usize;
     let mut visited = BTreeSet::new();
+    const MAX_OUTLINE_DEPTH: usize = 100;
     if let Some(first) = outline_root.get_ref("First") {
-        dump_outline_items(&mut pdf, first, 0, &mut visited, &mut counter)?;
+        if let Err(error) = dump_outline_items(
+            &mut pdf,
+            first,
+            0,
+            &mut visited,
+            &mut counter,
+            MAX_OUTLINE_DEPTH,
+        ) {
+            eprintln!("Warning: {error}");
+        }
     }
     if counter == 1 {
         println!("  <empty>");
@@ -245,7 +269,17 @@ fn run_show_fonts(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Erro
 
     let mut seen_nodes = BTreeSet::new();
     let mut font_refs: BTreeMap<Vec<u8>, Object> = BTreeMap::new();
-    collect_font_resources(&mut pdf, pages_ref, &mut seen_nodes, &mut font_refs)?;
+    const MAX_PAGE_TREE_DEPTH: usize = 100;
+    if let Err(error) = collect_font_resources(
+        &mut pdf,
+        pages_ref,
+        &mut seen_nodes,
+        &mut font_refs,
+        0,
+        MAX_PAGE_TREE_DEPTH,
+    ) {
+        eprintln!("Warning: {error}");
+    }
 
     println!("Fonts:");
     if font_refs.is_empty() {
@@ -315,9 +349,26 @@ fn dump_outline_items(
     depth: usize,
     visited: &mut BTreeSet<ObjectRef>,
     counter: &mut usize,
+    max_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if depth >= max_depth {
+        return Err(format!(
+            "outline depth exceeds maximum of {} at {}",
+            max_depth, start
+        )
+        .into());
+    }
+
     let mut current = Some(start);
     while let Some(current_ref) = current {
+        if depth >= max_depth {
+            return Err(format!(
+                "outline depth exceeds maximum of {} at {}",
+                max_depth, current_ref
+            )
+            .into());
+        }
+
         if !visited.insert(current_ref) {
             break;
         }
@@ -337,7 +388,7 @@ fn dump_outline_items(
         *counter += 1;
 
         if let Some(first) = dict.get_ref("First") {
-            dump_outline_items(pdf, first, depth + 1, visited, counter)?;
+            dump_outline_items(pdf, first, depth + 1, visited, counter, max_depth)?;
         }
 
         current = dict.get_ref("Next");
@@ -351,7 +402,17 @@ fn collect_font_resources(
     node: ObjectRef,
     seen: &mut BTreeSet<ObjectRef>,
     fonts: &mut BTreeMap<Vec<u8>, Object>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if depth >= max_depth {
+        return Err(format!(
+            "page tree depth exceeds maximum of {} at {}",
+            max_depth, node
+        )
+        .into());
+    }
+
     if !seen.insert(node) {
         return Ok(());
     }
@@ -373,7 +434,7 @@ fn collect_font_resources(
         if let Some(Object::Array(kids)) = dict.get("Kids") {
             for kid in kids {
                 if let Object::Reference(reference) = kid {
-                    collect_font_resources(pdf, *reference, seen, fonts)?;
+                    collect_font_resources(pdf, *reference, seen, fonts, depth + 1, max_depth)?;
                 }
             }
         }
@@ -381,8 +442,31 @@ fn collect_font_resources(
     }
 
     if node_type.as_slice() == b"Page" {
-        if let Some(Object::Dictionary(resources)) = dict.get("Resources") {
-            if let Some(Object::Dictionary(fonts_dict)) = resources.get("Font") {
+        let resources = match dict.get("Resources") {
+            Some(Object::Dictionary(resources)) => Some(resources.clone()),
+            Some(Object::Reference(reference)) => {
+                if let Ok(Object::Dictionary(resources)) = pdf.resolve(*reference) {
+                    Some(resources)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(resources) = resources {
+            let fonts_dict = match resources.get("Font") {
+                Some(Object::Dictionary(fonts_dict)) => Some(fonts_dict.clone()),
+                Some(Object::Reference(reference)) => {
+                    if let Ok(Object::Dictionary(fonts_dict)) = pdf.resolve(*reference) {
+                        Some(fonts_dict)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(fonts_dict) = fonts_dict {
                 for (font_name, value) in fonts_dict.iter() {
                     if let Object::Reference(font_ref) = value {
                         if let Ok(font_obj) = pdf.resolve(*font_ref) {
@@ -397,15 +481,13 @@ fn collect_font_resources(
     Ok(())
 }
 
-fn open_pdf(input: &PathBuf) -> Result<Pdf<BufReader<File>>, Box<dyn std::error::Error>> {
+fn open_pdf(input: &PathBuf) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input)?;
     let pdf = Pdf::open(BufReader::new(file))?;
     Ok(pdf)
 }
 
-fn load_page_sequence(
-    input: Option<PathBuf>,
-) -> Result<(Pdf<BufReader<File>>, Vec<ObjectRef>), Box<dyn std::error::Error>> {
+fn load_page_sequence(input: Option<PathBuf>) -> CliResult<PageSequence> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
@@ -420,7 +502,15 @@ fn load_page_sequence(
 
     let mut seen = BTreeSet::new();
     let mut pages = Vec::new();
-    collect_pages(&mut pdf, pages_ref, &mut seen, &mut pages)?;
+    const MAX_PAGE_TREE_DEPTH: usize = 100;
+    collect_pages(
+        &mut pdf,
+        pages_ref,
+        &mut seen,
+        &mut pages,
+        0,
+        MAX_PAGE_TREE_DEPTH,
+    )?;
 
     Ok((pdf, pages))
 }
@@ -430,7 +520,17 @@ fn collect_pages(
     node: ObjectRef,
     seen: &mut BTreeSet<ObjectRef>,
     pages: &mut Vec<ObjectRef>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if depth >= max_depth {
+        return Err(format!(
+            "page tree depth exceeds maximum of {} at {}",
+            max_depth, node
+        )
+        .into());
+    }
+
     if !seen.insert(node) {
         return Ok(());
     }
@@ -452,7 +552,7 @@ fn collect_pages(
         if let Some(Object::Array(kids)) = dict.get("Kids") {
             for kid in kids {
                 if let Object::Reference(reference) = kid {
-                    collect_pages(pdf, *reference, seen, pages)?;
+                    collect_pages(pdf, *reference, seen, pages, depth + 1, max_depth)?;
                 }
             }
         }
