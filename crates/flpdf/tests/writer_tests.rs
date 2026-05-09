@@ -785,6 +785,83 @@ fn write_pdf_rewrites_flate_object_stream_member_and_recomputes_first() {
 }
 
 #[test]
+fn write_pdf_rewrites_member_declared_in_extended_object_stream() {
+    let source = objstm_extends_chain_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Integer(42)
+    );
+    pdf.set_object(ObjectRef::new(2, 0), Object::Integer(43));
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let output_text = String::from_utf8_lossy(&output);
+    assert!(output_text.contains("/Extends 4 0 R"));
+
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    assert_eq!(
+        rewritten.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Integer(43)
+    );
+    assert_eq!(
+        rewritten.resolve(ObjectRef::new(3, 0)).unwrap(),
+        Object::Integer(99)
+    );
+}
+
+#[test]
+fn write_pdf_rewrites_unresolved_member_declared_in_extended_object_stream() {
+    let source = objstm_extends_chain_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    pdf.set_object(ObjectRef::new(2, 0), Object::Integer(43));
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    assert_eq!(
+        rewritten.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Integer(43)
+    );
+    assert_eq!(
+        rewritten.resolve(ObjectRef::new(3, 0)).unwrap(),
+        Object::Integer(99)
+    );
+}
+
+#[test]
+fn write_pdf_preserves_extends_when_rewriting_extension_stream_member() {
+    let source = objstm_extends_chain_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    pdf.set_object(ObjectRef::new(3, 0), Object::Integer(100));
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    let Object::Stream(extension_stream) = rewritten.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected rewritten extension object stream");
+    };
+    assert_eq!(
+        extension_stream.dict.get_ref("Extends"),
+        Some(ObjectRef::new(4, 0))
+    );
+    assert_eq!(
+        rewritten.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Integer(42)
+    );
+    assert_eq!(
+        rewritten.resolve(ObjectRef::new(3, 0)).unwrap(),
+        Object::Integer(100)
+    );
+}
+
+#[test]
 fn write_pdf_rewrites_null_object_revision() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
@@ -1377,6 +1454,28 @@ fn append_xref_stream_entry_w4(entries: &mut Vec<u8>, entry_type: u8, field1: u3
     entries.push(entry_type);
     entries.extend_from_slice(&field1.to_be_bytes());
     entries.extend_from_slice(&field2.to_be_bytes());
+}
+
+fn objstm_extends_chain_pdf() -> Vec<u8> {
+    decode_hex_fixture(include_str!(
+        "../../../tests/fixtures/compat/objstm-extends-chain.pdf.hex"
+    ))
+}
+
+fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+    let digits: Vec<u8> = hex
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    assert!(digits.len().is_multiple_of(2));
+
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(pair, 16).unwrap()
+        })
+        .collect()
 }
 
 fn linearized_fixture_pdf() -> Vec<u8> {

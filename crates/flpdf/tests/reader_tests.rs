@@ -139,6 +139,42 @@ fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
     );
 }
 
+#[test]
+fn resolves_compressed_entry_declared_in_extended_object_stream() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(objstm_extends_chain_pdf())).unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Integer(42)
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        Object::Integer(99)
+    );
+}
+
+fn objstm_extends_chain_pdf() -> Vec<u8> {
+    decode_hex_fixture(include_str!(
+        "../../../tests/fixtures/compat/objstm-extends-chain.pdf.hex"
+    ))
+}
+
+fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+    let digits: Vec<u8> = hex
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    assert!(digits.len().is_multiple_of(2));
+
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(pair, 16).unwrap()
+        })
+        .collect()
+}
+
 fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
     let bytes_u24 = value.to_be_bytes();
     bytes.extend_from_slice(&bytes_u24[1..]);
