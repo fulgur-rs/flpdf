@@ -1,5 +1,5 @@
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 
 pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
@@ -12,10 +12,13 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
         bytes.push(b'\n');
     }
 
-    let source_offsets = build_source_offsets(pdf.xref_offsets());
+    let source_offsets = build_source_offsets(pdf.source_xref_offsets());
     let object_count = resolve_object_count(pdf.trailer().get("Size"), &source_offsets);
+    let touched_object_refs = collect_touched_object_refs(&source_offsets, pdf);
+    let xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
+    let final_offsets = merge_source_and_touched_offsets(&source_offsets, &xref_offsets);
 
-    let xref_offset = write_incremental_xref(&mut bytes, &source_offsets, object_count)?;
+    let xref_offset = write_incremental_xref(&mut bytes, &final_offsets, object_count)?;
     write_incremental_trailer(
         &mut bytes,
         pdf,
@@ -27,6 +30,71 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     out.write_all(&bytes)?;
     Ok(())
+}
+
+fn collect_touched_object_refs<R: Read + Seek>(
+    source_offsets: &BTreeMap<u32, (u16, usize)>,
+    pdf: &Pdf<R>,
+) -> Vec<ObjectRef> {
+    let mut touched = BTreeSet::new();
+    for object_ref in pdf.resolved_object_refs() {
+        if source_offsets
+            .get(&object_ref.number)
+            .is_some_and(|(generation, _)| *generation == object_ref.generation)
+        {
+            touched.insert(object_ref);
+        }
+    }
+
+    touched.into_iter().collect()
+}
+
+fn write_incremental_objects<R: Read + Seek>(
+    bytes: &mut Vec<u8>,
+    pdf: &mut Pdf<R>,
+    touched_object_refs: &[ObjectRef],
+) -> Result<BTreeMap<u32, (u16, usize)>> {
+    let mut updated_offsets = BTreeMap::new();
+
+    for object_ref in touched_object_refs {
+        let object = pdf.resolve(*object_ref)?;
+        let Some(offset) = write_object(bytes, *object_ref, &object)? else {
+            continue;
+        };
+        updated_offsets.insert(object_ref.number, (object_ref.generation, offset));
+    }
+
+    Ok(updated_offsets)
+}
+
+fn write_object(
+    bytes: &mut Vec<u8>,
+    object_ref: ObjectRef,
+    object: &Object,
+) -> Result<Option<usize>> {
+    if let Object::Null = object {
+        return Ok(None);
+    }
+
+    let offset = bytes.len();
+    bytes.extend_from_slice(
+        format!("{} {} obj\n", object_ref.number, object_ref.generation).as_bytes(),
+    );
+    object.write_pdf(bytes);
+    bytes.extend_from_slice(b"\nendobj\n");
+
+    Ok(Some(offset))
+}
+
+fn merge_source_and_touched_offsets(
+    source_offsets: &BTreeMap<u32, (u16, usize)>,
+    touched_offsets: &BTreeMap<u32, (u16, usize)>,
+) -> BTreeMap<u32, (u16, usize)> {
+    let mut merged = source_offsets.clone();
+    for (number, (generation, offset)) in touched_offsets {
+        merged.insert(*number, (*generation, *offset));
+    }
+    merged
 }
 
 fn build_source_offsets(entries: Vec<(ObjectRef, u64)>) -> BTreeMap<u32, (u16, usize)> {

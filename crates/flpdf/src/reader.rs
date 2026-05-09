@@ -13,6 +13,7 @@ pub struct Pdf<R: Read + Seek> {
     startxref: u64,
     repair_diagnostics: Diagnostics,
     cache: ObjectCache,
+    source_xref_offsets: Vec<(ObjectRef, u64)>,
 }
 
 impl<R: Read + Seek> Pdf<R> {
@@ -38,6 +39,14 @@ impl<R: Read + Seek> Pdf<R> {
         } else {
             load_xref_and_trailer(&mut reader)?
         };
+        let source_xref_offsets = loaded
+            .entries
+            .iter()
+            .filter_map(|(object_ref, offset)| match offset {
+                crate::XrefOffset::Offset(offset) => Some((*object_ref, *offset)),
+                crate::XrefOffset::Compressed { .. } => None,
+            })
+            .collect();
         let cache = ObjectCache::from_offsets(&loaded.entries);
         Ok(Self {
             reader,
@@ -46,6 +55,7 @@ impl<R: Read + Seek> Pdf<R> {
             startxref: loaded.startxref,
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
+            source_xref_offsets,
         })
     }
 
@@ -61,20 +71,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.startxref
     }
 
-    pub(crate) fn xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
-        self.cache
-            .entries()
-            .iter()
-            .map(|(object_ref, entry)| (*object_ref, entry))
-            .filter_map(|(object_ref, entry)| match entry {
-                crate::cache::CacheEntry::Unresolved { offset } => Some((object_ref, *offset)),
-                crate::cache::CacheEntry::Resolved(_)
-                | crate::cache::CacheEntry::Compressed { .. }
-                | crate::cache::CacheEntry::Missing
-                | crate::cache::CacheEntry::Reserved
-                | crate::cache::CacheEntry::Deleted => None,
-            })
-            .collect()
+    pub(crate) fn source_xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
+        self.source_xref_offsets.clone()
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
@@ -86,6 +84,20 @@ impl<R: Read + Seek> Pdf<R> {
 
     pub fn resolved_count(&self) -> usize {
         self.cache.resolved_count()
+    }
+
+    pub(crate) fn resolved_object_refs(&self) -> Vec<ObjectRef> {
+        self.cache
+            .entries()
+            .iter()
+            .filter_map(|(object_ref, entry)| {
+                if matches!(entry, crate::cache::CacheEntry::Resolved(_)) {
+                    Some(*object_ref)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn object_refs(&self) -> Vec<ObjectRef> {

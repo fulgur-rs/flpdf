@@ -64,6 +64,54 @@ fn write_pdf_preserves_source_bytes() {
 }
 
 #[test]
+fn write_pdf_emits_only_touched_objects() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", object_offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &object_offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            object_offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+
+    let source = bytes;
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+    let _ = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    assert!(output.len() > source.len());
+    assert_eq!(&output[..source.len()], &source[..]);
+    assert_eq!(count_substrings(&output, b"1 0 obj"), 2);
+    assert_eq!(count_substrings(&output, b"2 0 obj"), 1);
+}
+
+#[test]
 fn rewrites_pdf_with_real_numbers() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"%PDF-1.7\n");
@@ -247,6 +295,24 @@ fn writes_qdf_with_object_generations() {
     assert!(rendered.contains("1 3 obj"));
     assert!(rendered.contains("3 0 obj"));
     assert!(rendered.contains(" 00003 n"));
+}
+
+fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(position) = haystack[start..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        count += 1;
+        start += position + needle.len();
+    }
+
+    count
 }
 
 fn linearized_fixture_pdf() -> Vec<u8> {
