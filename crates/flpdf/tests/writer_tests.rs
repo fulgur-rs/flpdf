@@ -304,7 +304,7 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
     } else {
         assert!(!xref.contains_key(&2));
     }
-    assert!(!xref.contains_key(&4));
+    assert_eq!(xref.get(&4), Some(&b'n'));
 }
 
 #[test]
@@ -431,6 +431,116 @@ fn write_pdf_rewrites_xref_stream_input_as_xref_stream_output() {
     );
     assert_eq!(actual_prev, Some(expected_prev));
     assert_eq!(&output[..source.len()], &source[..]);
+}
+
+#[test]
+fn write_pdf_uses_non_colliding_xref_stream_object_number_for_new_objects() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 255);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, source_xref_offset as u32, 0);
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        parse_object(b"<< /Generated true >>").unwrap(),
+    );
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert!(loaded.entries.contains_key(&ObjectRef::new(4, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(5, 0)));
+}
+
+#[test]
+fn write_pdf_preserves_xref_stream_trailer_metadata_and_declared_size() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"6 0 obj\n<< /Producer (flpdf-test) >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 255);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, source_xref_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[2] as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 10 /Root 1 0 R /Info 6 0 R /ID [<0011> <2233>] /W [1 3 1] /Index [0 4 6 1] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(as_integer(loaded.trailer.get("Size").unwrap()), Some(10));
+    assert_eq!(loaded.trailer.get_ref("Info"), Some(ObjectRef::new(6, 0)));
+    assert!(loaded.trailer.get("ID").is_some());
 }
 
 #[test]

@@ -15,12 +15,6 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     let source_offsets = build_source_offsets(pdf.source_xref_offsets());
     let source_xref_offsets = build_source_xref_offsets(pdf.source_xref_entries());
-    let mut object_count = match pdf.last_xref_form() {
-        XrefForm::Table => resolve_object_count(pdf.trailer().get("Size"), &source_offsets),
-        XrefForm::Stream => {
-            resolve_xref_stream_object_count(pdf.trailer().get("Size"), &source_xref_offsets)
-        }
-    };
     let (touched_object_refs, touched_objstm_members) = collect_touched_object_refs(pdf);
     let mut xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
     let rewritten_stream_offsets =
@@ -29,21 +23,27 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
     let final_offsets = merge_source_and_touched_offsets(&source_offsets, &xref_offsets);
     let final_xref_offsets =
         merge_source_and_touched_offsets_for_xref_stream(&source_xref_offsets, &xref_offsets);
+    let mut object_count = match pdf.last_xref_form() {
+        XrefForm::Table => resolve_object_count(pdf.trailer().get("Size"), &final_offsets),
+        XrefForm::Stream => {
+            resolve_xref_stream_object_count(pdf.trailer().get("Size"), &final_xref_offsets)
+        }
+    };
 
     let xref_offset = match pdf.last_xref_form() {
         XrefForm::Table => write_incremental_xref(&mut bytes, &final_offsets)?,
         XrefForm::Stream => {
-            let xref_object_number = u32::try_from(object_count).map_err(|_| {
-                crate::Error::Unsupported("xref object number does not fit u32".to_string())
-            })?;
+            let xref_object_number = next_xref_stream_object_number(&final_xref_offsets)?;
+            object_count = object_count.max(xref_object_number as usize + 1);
             let xref_offset = write_incremental_xref_stream(
                 &mut bytes,
+                pdf.trailer(),
                 &final_xref_offsets,
                 &root_ref,
                 xref_object_number,
+                object_count,
                 pdf.previous_xref_offset(),
             )?;
-            object_count = object_count.saturating_add(1);
             xref_offset
         }
     };
@@ -297,6 +297,18 @@ fn merge_source_and_touched_offsets_for_xref_stream(
     merged
 }
 
+fn next_xref_stream_object_number(
+    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+) -> Result<u32> {
+    source_offsets
+        .keys()
+        .copied()
+        .next_back()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("xref object number does not fit u32".to_string()))
+}
+
 fn build_source_xref_offsets(
     source_offsets: BTreeMap<ObjectRef, XrefOffset>,
 ) -> BTreeMap<u32, (u16, XrefOffset)> {
@@ -403,9 +415,11 @@ fn write_incremental_xref(
 
 fn write_incremental_xref_stream(
     bytes: &mut Vec<u8>,
+    trailer: &Dictionary,
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
     root_ref: &ObjectRef,
     xref_object_number: u32,
+    object_count: usize,
     previous_xref_offset: u64,
 ) -> Result<usize> {
     let xref_offset = bytes.len();
@@ -453,8 +467,10 @@ fn write_incremental_xref_stream(
         index_array.push(Object::Integer(i64::from(*count)));
     }
 
-    let size = offset_size(&object_numbers)?;
-    let mut stream_dict = Dictionary::new();
+    let size = i64::try_from(object_count)
+        .map_err(|_| crate::Error::Unsupported("xref stream /Size does not fit i64".to_string()))?;
+    let mut stream_dict = trailer.clone();
+    strip_incremental_trailer_keys(&mut stream_dict);
     stream_dict.insert("Type", Object::Name(b"XRef".to_vec()));
     stream_dict.insert("Size", Object::Integer(size));
     stream_dict.insert(
@@ -529,18 +545,6 @@ fn build_xref_stream_bytes(
     Ok(stream_data)
 }
 
-fn offset_size(object_numbers: &[u32]) -> Result<i64> {
-    let size = object_numbers
-        .iter()
-        .copied()
-        .next_back()
-        .ok_or_else(|| crate::Error::Unsupported("xref stream has no object offsets".to_string()))?
-        .saturating_add(1)
-        .max(1);
-
-    Ok(i64::from(size))
-}
-
 fn write_incremental_trailer<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     pdf: &Pdf<R>,
@@ -564,6 +568,11 @@ fn write_incremental_trailer<R: Read + Seek>(
     trailer.write_pdf(bytes);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
+}
+
+fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
+    strip_xref_stream_trailer_keys(trailer);
+    trailer.remove("Prev");
 }
 
 fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
