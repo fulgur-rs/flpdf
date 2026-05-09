@@ -71,6 +71,10 @@ impl<R: Read + Seek> Pdf<R> {
         self.startxref
     }
 
+    pub(crate) fn previous_xref_offset(&self) -> u64 {
+        self.startxref
+    }
+
     pub(crate) fn source_xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
         self.source_xref_offsets.clone()
     }
