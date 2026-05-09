@@ -2,6 +2,7 @@ pub mod cache;
 pub mod check;
 pub mod diagnostics;
 pub mod error;
+pub mod filters;
 pub mod object;
 pub mod parser;
 pub mod reader;
