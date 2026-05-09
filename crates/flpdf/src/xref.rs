@@ -1,6 +1,6 @@
 use crate::parser::{parse_indirect_object, Parser};
 use crate::{filters, Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Debug, Clone)]
@@ -49,39 +49,108 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
-    let loaded = if bytes
+    let mut loaded = match parse_xref_from_start(&bytes, xref_pos, startxref, &version) {
+        Ok(loaded) => loaded,
+        Err(error) if allow_repair => {
+            parse_errors.push(error);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, parse_errors);
+        }
+        Err(error) => return Err(error),
+    };
+
+    if let Err(error) = merge_previous_xref_sections(
+        &bytes,
+        &version,
+        &mut loaded.entries,
+        &loaded.trailer,
+        allow_repair,
+    ) {
+        if allow_repair {
+            parse_errors.push(error);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, parse_errors);
+        }
+        return Err(error);
+    }
+
+    if !parse_errors.is_empty() {
+        loaded.repair_diagnostics.push(Diagnostic::warning(
+            format_repair_diagnostic(parse_errors),
+            Some(startxref),
+        ));
+    }
+
+    Ok(loaded)
+}
+
+fn parse_xref_from_start(
+    bytes: &[u8],
+    xref_pos: usize,
+    startxref: u64,
+    version: &str,
+) -> Result<LoadedXref> {
+    if bytes
         .get(xref_pos..)
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
-        let mut cursor = ByteCursor::new(&bytes, xref_pos + 4);
-        let result = parse_xref_table(&mut cursor, &bytes);
-        match result {
-            Ok((entries, trailer)) => Ok(LoadedXref {
-                version: version.clone(),
-                startxref,
-                entries,
-                trailer,
-                repair_diagnostics: Diagnostics::default(),
-            }),
-            Err(error) if allow_repair => {
-                parse_errors.push(error);
-                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, parse_errors)
-            }
-            Err(error) => Err(error),
-        }
-    } else {
-        let result = parse_xref_stream(&bytes, xref_pos, startxref, version.clone());
-        match result {
-            Ok(loaded) => Ok(loaded),
-            Err(error) if allow_repair => {
-                parse_errors.push(error);
-                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, parse_errors)
-            }
-            Err(error) => Err(error),
-        }
-    };
+        let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
+        let (entries, trailer) = parse_xref_table(&mut cursor, bytes)?;
+        return Ok(LoadedXref {
+            version: version.to_string(),
+            startxref,
+            entries,
+            trailer,
+            repair_diagnostics: Diagnostics::default(),
+        });
+    }
 
-    loaded
+    parse_xref_stream(bytes, xref_pos, startxref, version.to_string())
+}
+
+fn merge_previous_xref_sections(
+    bytes: &[u8],
+    version: &str,
+    entries: &mut BTreeMap<ObjectRef, XrefOffset>,
+    trailer: &Dictionary,
+    allow_repair: bool,
+) -> Result<()> {
+    let mut visited = HashSet::new();
+    let mut previous_offset = parse_previous_xref_offset(trailer);
+
+    while let Some(offset) = previous_offset {
+        let previous_pos = usize::try_from(offset)
+            .map_err(|_| Error::parse(0, "xref /Prev does not fit usize"))?;
+
+        if !visited.insert(offset) {
+            return if allow_repair {
+                Ok(())
+            } else {
+                Err(Error::parse(0, "xref /Prev is circular"))
+            };
+        }
+
+        let previous = match parse_xref_from_start(bytes, previous_pos, offset, version) {
+            Ok(previous) => previous,
+            Err(error) if allow_repair => {
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        for (object_ref, xref_offset) in previous.entries {
+            entries.entry(object_ref).or_insert(xref_offset);
+        }
+
+        previous_offset = parse_previous_xref_offset(&previous.trailer);
+    }
+
+    Ok(())
+}
+
+fn parse_previous_xref_offset(trailer: &Dictionary) -> Option<u64> {
+    trailer
+        .get("Prev")
+        .and_then(|offset| parse_non_negative_u64(offset, "/Prev").ok())
+        .and_then(|offset| if offset == 0 { None } else { Some(offset) })
 }
 
 fn recover_xref_from_linear_scan(
