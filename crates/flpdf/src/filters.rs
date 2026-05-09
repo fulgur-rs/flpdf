@@ -15,8 +15,9 @@ pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 fn decode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
     match filter {
         None => Ok(stream_data.to_vec()),
-        Some(Object::Name(filter_name)) => apply_single_filter_decode(filter_name, stream_data)
-            .map_err(|message| Error::Unsupported(message)),
+        Some(Object::Name(filter_name)) => {
+            apply_single_filter_decode(filter_name, stream_data).map_err(Error::Unsupported)
+        }
         Some(Object::Array(filters)) => {
             let mut decoded = stream_data.to_vec();
             for filter in filters {
@@ -26,7 +27,7 @@ fn decode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) 
                     ));
                 };
                 decoded = apply_single_filter_decode(filter_name, &decoded)
-                    .map_err(|message| Error::Unsupported(message))?;
+                    .map_err(Error::Unsupported)?;
             }
             Ok(decoded)
         }
@@ -40,8 +41,9 @@ fn decode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) 
 fn encode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
     match filter {
         None => Ok(stream_data.to_vec()),
-        Some(Object::Name(filter_name)) => apply_single_filter_encode(filter_name, stream_data)
-            .map_err(|message| Error::Unsupported(message)),
+        Some(Object::Name(filter_name)) => {
+            apply_single_filter_encode(filter_name, stream_data).map_err(Error::Unsupported)
+        }
         Some(Object::Array(filters)) => {
             let mut encoded = stream_data.to_vec();
             for filter in filters {
@@ -51,7 +53,7 @@ fn encode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) 
                     ));
                 };
                 encoded = apply_single_filter_encode(filter_name, &encoded)
-                    .map_err(|message| Error::Unsupported(message))?;
+                    .map_err(Error::Unsupported)?;
             }
             Ok(encoded)
         }
