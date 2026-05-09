@@ -159,11 +159,22 @@ fn is_token_boundary(index: usize, bytes: &[u8]) -> bool {
         return true;
     }
 
-    match bytes[index - 1] {
-        b'\0' | b'\t' | b'\n' | b'\r' | b' ' | b'\x0c' | b'[' | b']' | b'<' | b'>' | b'('
-        | b')' | b'/' => true,
-        _ => false,
-    }
+    matches!(
+        bytes[index - 1],
+        b'\0'
+            | b'\t'
+            | b'\n'
+            | b'\r'
+            | b' '
+            | b'\x0c'
+            | b'['
+            | b']'
+            | b'<'
+            | b'>'
+            | b'('
+            | b')'
+            | b'/',
+    )
 }
 
 fn parse_xref_table(
