@@ -163,7 +163,18 @@ fn run_show_metadata(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::E
                         .unwrap_or_else(|| String::from("Unknown"));
                     println!("Metadata: stream ({}) {}", metadata_ref, kind);
                     println!("  length: {}", stream.data.len());
-                    println!("  preview: {}", String::from_utf8_lossy(&stream.data));
+                    const MAX_METADATA_PREVIEW_BYTES: usize = 1000;
+                    let preview_len = stream.data.len().min(MAX_METADATA_PREVIEW_BYTES);
+                    let preview = String::from_utf8_lossy(&stream.data[..preview_len]);
+                    if stream.data.len() > MAX_METADATA_PREVIEW_BYTES {
+                        println!(
+                            "  preview: {} (truncated, total {} bytes)",
+                            preview,
+                            stream.data.len()
+                        );
+                    } else {
+                        println!("  preview: {}", preview);
+                    }
                 }
                 Object::Dictionary(dict) => {
                     println!("Metadata: dictionary {}", metadata_ref);

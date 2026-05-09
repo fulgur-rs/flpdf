@@ -162,7 +162,7 @@ fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
     bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
     bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
     for &offset in &offsets {
-        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+        bytes.extend_from_slice(format!("{:010} 00000 n\n", offset).as_bytes());
     }
     bytes.extend_from_slice(
         format!(
