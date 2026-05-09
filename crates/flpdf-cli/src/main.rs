@@ -40,21 +40,21 @@ fn main() {
     let args = Args::parse();
 
     let result = if let Some(object_ref) = args.dump_object.as_deref() {
-        run_dump_object(args.input, object_ref)
+        run_dump_object(args.input, args.repair, object_ref)
     } else if args.show_info {
-        run_show_info(args.input)
+        run_show_info(args.input, args.repair)
     } else if args.show_catalog {
-        run_show_catalog(args.input)
+        run_show_catalog(args.input, args.repair)
     } else if args.show_metadata {
-        run_show_metadata(args.input)
+        run_show_metadata(args.input, args.repair)
     } else if args.show_outline {
-        run_show_outline(args.input)
+        run_show_outline(args.input, args.repair)
     } else if args.show_fonts {
-        run_show_fonts(args.input)
+        run_show_fonts(args.input, args.repair)
     } else if args.show_npages {
-        run_show_npages(args.input)
+        run_show_npages(args.input, args.repair)
     } else if args.show_pages {
-        run_show_pages(args.input)
+        run_show_pages(args.input, args.repair)
     } else if args.check {
         run_check(args.input)
     } else {
@@ -109,13 +109,13 @@ fn run_rewrite(
 
 fn run_dump_object(
     input: Option<PathBuf>,
+    repair: bool,
     object_ref: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
     let object_ref = parse_object_ref(object_ref)?;
 
-    let file = File::open(input)?;
-    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let mut pdf = open_pdf(&input, repair)?;
     let object = pdf.resolve(object_ref)?;
 
     if matches!(object, Object::Null) {
@@ -132,9 +132,9 @@ fn run_dump_object(
     Ok(())
 }
 
-fn run_show_info(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_info(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input)?;
+    let mut pdf = open_pdf(&input, repair)?;
     let info_ref = pdf
         .trailer()
         .get_ref("Info")
@@ -153,18 +153,24 @@ fn run_show_info(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn run_show_catalog(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_catalog(
+    input: Option<PathBuf>,
+    repair: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input)?;
+    let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
     println!("Catalog: {}", object_to_pdf(&catalog));
     Ok(())
 }
 
-fn run_show_metadata(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_metadata(
+    input: Option<PathBuf>,
+    repair: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input)?;
+    let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
 
@@ -216,9 +222,12 @@ fn run_show_metadata(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn run_show_outline(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_outline(
+    input: Option<PathBuf>,
+    repair: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input)?;
+    let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
     let Object::Dictionary(catalog) = catalog else {
@@ -255,9 +264,9 @@ fn run_show_outline(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn run_show_fonts(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_fonts(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input)?;
+    let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
     let Object::Dictionary(catalog) = catalog else {
@@ -311,14 +320,14 @@ fn run_show_fonts(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn run_show_npages(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let (_pdf, pages) = load_page_sequence(input)?;
+fn run_show_npages(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pdf, pages) = load_page_sequence(input, repair)?;
     println!("{}", pages.len());
     Ok(())
 }
 
-fn run_show_pages(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut pdf, pages) = load_page_sequence(input)?;
+fn run_show_pages(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut pdf, pages) = load_page_sequence(input, repair)?;
     for (index, page_ref) in pages.iter().enumerate() {
         let page = pdf.resolve(*page_ref)?;
         let Object::Dictionary(dict) = page else {
@@ -481,15 +490,19 @@ fn collect_font_resources(
     Ok(())
 }
 
-fn open_pdf(input: &PathBuf) -> CliResult<Pdf<BufReader<File>>> {
+fn open_pdf(input: &PathBuf, repair: bool) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input)?;
-    let pdf = Pdf::open(BufReader::new(file))?;
+    let pdf = if repair {
+        Pdf::open_with_repair(BufReader::new(file))?
+    } else {
+        Pdf::open(BufReader::new(file))?
+    };
     Ok(pdf)
 }
 
-fn load_page_sequence(input: Option<PathBuf>) -> CliResult<PageSequence> {
+fn load_page_sequence(input: Option<PathBuf>, repair: bool) -> CliResult<PageSequence> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input)?;
+    let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
     let Object::Dictionary(catalog) = catalog else {

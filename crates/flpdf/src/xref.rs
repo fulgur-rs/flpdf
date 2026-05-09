@@ -31,17 +31,21 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     reader.read_to_end(&mut bytes)?;
 
     let version = parse_header(&bytes)?;
+    let mut parse_errors = Vec::new();
     let startxref = match parse_startxref(&bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
-            let _ = error;
+            parse_errors.push(error);
             0
         }
         Err(error) => return Err(error),
     };
     let xref_pos = match usize::try_from(startxref) {
         Ok(xref_pos) => xref_pos,
-        Err(_) if allow_repair => 0,
+        Err(_) if allow_repair => {
+            parse_errors.push(Error::parse(0, "startxref does not fit usize"));
+            0
+        }
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
@@ -60,7 +64,8 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
                 repair_diagnostics: Diagnostics::default(),
             }),
             Err(error) if allow_repair => {
-                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, error)
+                parse_errors.push(error);
+                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, parse_errors)
             }
             Err(error) => Err(error),
         }
@@ -69,7 +74,8 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
         match result {
             Ok(loaded) => Ok(loaded),
             Err(error) if allow_repair => {
-                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, error)
+                parse_errors.push(error);
+                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, parse_errors)
             }
             Err(error) => Err(error),
         }
@@ -82,17 +88,14 @@ fn recover_xref_from_linear_scan(
     bytes: &[u8],
     version: String,
     startxref: u64,
-    parse_error: Error,
+    parse_errors: Vec<Error>,
 ) -> Result<LoadedXref> {
     let entries = recover_xref_entries(bytes)?;
     let trailer = recover_trailer(bytes)?;
 
     let mut repair_diagnostics = Diagnostics::default();
     repair_diagnostics.push(Diagnostic::warning(
-        format!(
-            "xref parsing failed ({}) and was repaired by linear object scan",
-            parse_error
-        ),
+        format_repair_diagnostic(parse_errors),
         Some(startxref),
     ));
 
@@ -116,6 +119,19 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>>
         if bytes[cursor].is_ascii_digit() && is_token_boundary(cursor, bytes) {
             if let Ok((object_ref, _)) = parse_indirect_object(&bytes[cursor..]) {
                 entries.insert(object_ref, XrefOffset::Offset(cursor as u64));
+                if let Ok((_object_ref, Object::Stream(stream))) =
+                    parse_indirect_object(&bytes[cursor..])
+                {
+                    if let Some(Object::Name(type_name)) = stream.dict.get("Type") {
+                        if type_name.as_slice() == b"ObjStm" {
+                            recover_compressed_offsets_from_objstm(
+                                &mut entries,
+                                _object_ref,
+                                &stream,
+                            );
+                        }
+                    }
+                }
                 cursor = cursor.saturating_add(1);
                 continue;
             }
@@ -131,6 +147,77 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>>
     }
 
     Ok(entries)
+}
+
+fn recover_compressed_offsets_from_objstm(
+    entries: &mut BTreeMap<ObjectRef, XrefOffset>,
+    stream_ref: ObjectRef,
+    stream: &crate::Stream,
+) {
+    let object_count =
+        match parse_non_negative_u64(stream.dict.get("N").unwrap_or(&Object::Integer(0)), "/N") {
+            Ok(count) => match usize::try_from(count) {
+                Ok(count) => count,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+
+    let mut cursor = Parser::new(&stream.data);
+    for index in 0..object_count {
+        let number = match cursor.integer_for_indirect() {
+            Ok(number) => match parse_non_negative_i64(number, "ObjStm object number") {
+                Ok(number) => number,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let object_ref = match u32::try_from(number) {
+            Ok(object_ref) => ObjectRef::new(object_ref, 0),
+            Err(_) => return,
+        };
+
+        match cursor.integer_for_indirect() {
+            Ok(offset) => {
+                if parse_non_negative_i64(offset, "ObjStm object offset").is_err() {
+                    return;
+                }
+                entries.entry(object_ref).or_insert(XrefOffset::Compressed {
+                    stream: stream_ref.number,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                });
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
+    if value < 0 {
+        return Err(Error::parse(0, format!("{name} is negative")));
+    }
+    Ok(value as u64)
+}
+
+fn format_repair_diagnostic(parse_errors: Vec<Error>) -> String {
+    match parse_errors.len() {
+        0 => String::from("xref parsing failed and was repaired by linear object scan"),
+        1 => format!(
+            "xref parsing failed ({}) and was repaired by linear object scan",
+            parse_errors[0]
+        ),
+        _ => {
+            let mut message =
+                String::from("xref parsing failed and was repaired by linear object scan: ");
+            for (index, error) in parse_errors.iter().enumerate() {
+                if index > 0 {
+                    message.push_str("; ");
+                }
+                message.push_str(&error.to_string());
+            }
+            message
+        }
+    }
 }
 
 fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
