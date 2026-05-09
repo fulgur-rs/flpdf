@@ -14,11 +14,11 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     let source_offsets = build_source_offsets(pdf.source_xref_offsets());
     let object_count = resolve_object_count(pdf.trailer().get("Size"), &source_offsets);
-    let touched_object_refs = collect_touched_object_refs(&source_offsets, pdf);
+    let touched_object_refs = collect_touched_object_refs(pdf);
     let xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
     let final_offsets = merge_source_and_touched_offsets(&source_offsets, &xref_offsets);
 
-    let xref_offset = write_incremental_xref(&mut bytes, &final_offsets, object_count)?;
+    let xref_offset = write_incremental_xref(&mut bytes, &final_offsets)?;
     write_incremental_trailer(
         &mut bytes,
         pdf,
@@ -32,18 +32,10 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
     Ok(())
 }
 
-fn collect_touched_object_refs<R: Read + Seek>(
-    source_offsets: &BTreeMap<u32, (u16, usize)>,
-    pdf: &Pdf<R>,
-) -> Vec<ObjectRef> {
+fn collect_touched_object_refs<R: Read + Seek>(pdf: &Pdf<R>) -> Vec<ObjectRef> {
     let mut touched = BTreeSet::new();
     for object_ref in pdf.resolved_object_refs() {
-        if source_offsets
-            .get(&object_ref.number)
-            .is_some_and(|(generation, _)| *generation == object_ref.generation)
-        {
-            touched.insert(object_ref);
-        }
+        touched.insert(object_ref);
     }
 
     touched.into_iter().collect()
@@ -72,10 +64,6 @@ fn write_object(
     object_ref: ObjectRef,
     object: &Object,
 ) -> Result<Option<usize>> {
-    if let Object::Null = object {
-        return Ok(None);
-    }
-
     let offset = bytes.len();
     bytes.extend_from_slice(
         format!("{} {} obj\n", object_ref.number, object_ref.generation).as_bytes(),
@@ -134,19 +122,41 @@ fn resolve_object_count(
 fn write_incremental_xref(
     bytes: &mut Vec<u8>,
     source_offsets: &BTreeMap<u32, (u16, usize)>,
-    object_count: usize,
 ) -> Result<usize> {
     let xref_offset = bytes.len();
-    bytes.extend_from_slice(format!("xref\n0 {}\n", object_count).as_bytes());
+    bytes.extend_from_slice(b"xref\n0 1\n");
     bytes.extend_from_slice(b"0000000000 65535 f \n");
 
-    for number in 1..object_count {
-        match source_offsets.get(&(number as u32)) {
-            Some((generation, offset)) => {
-                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
-            }
-            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+    let mut object_numbers: Vec<u32> = source_offsets.keys().copied().filter(|n| *n > 0).collect();
+    if object_numbers.is_empty() {
+        return Ok(xref_offset);
+    }
+
+    object_numbers.sort_unstable();
+
+    let mut i = 0;
+    while i < object_numbers.len() {
+        let start = object_numbers[i];
+        let mut end = start;
+
+        while i + 1 < object_numbers.len() && object_numbers[i + 1] == end + 1 {
+            i += 1;
+            end = object_numbers[i];
         }
+
+        let count = end - start + 1;
+        bytes.extend_from_slice(format!("{} {}\n", start, count).as_bytes());
+        for object_number in start..=end {
+            let (generation, offset) = source_offsets.get(&object_number).ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "incremental xref subsection is missing object entry".to_string(),
+                )
+            })?;
+
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
+        }
+
+        i += 1;
     }
 
     Ok(xref_offset)
