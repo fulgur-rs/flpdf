@@ -70,6 +70,66 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
     Ok(())
 }
 
+pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Err(crate::Error::Missing("/Root"));
+    };
+
+    let mut object_refs = pdf.object_refs();
+    object_refs.sort_by_key(|object_ref| (object_ref.number, object_ref.generation));
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"%PDF-1.7\n");
+
+    let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
+    for object_ref in &object_refs {
+        let object = pdf.resolve(*object_ref)?;
+        if offsets
+            .insert(object_ref.number, (object_ref.generation, bytes.len()))
+            .is_some()
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "duplicate object number {} in xref table",
+                object_ref.number
+            )));
+        }
+        bytes.extend_from_slice(
+            format!("{} {} obj\n", object_ref.number, object_ref.generation).as_bytes(),
+        );
+        object.write_pdf(&mut bytes);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    let object_count = object_refs
+        .iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1) as usize;
+
+    bytes.extend_from_slice(format!("xref\n0 {}\n", object_count).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..object_count {
+        match offsets.get(&(number as u32)) {
+            Some((generation, offset)) => {
+                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
+            }
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+
+    let mut trailer = Dictionary::new();
+    trailer.insert("Size", Object::Integer(object_count as i64));
+    trailer.insert("Root", Object::Reference(root_ref));
+    bytes.extend_from_slice(b"trailer\n");
+    trailer.write_pdf(&mut bytes);
+    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    out.write_all(&bytes)?;
+    Ok(())
+}
+
 fn collect_refs(
     object: &Object,
     old_to_new: &mut BTreeMap<ObjectRef, ObjectRef>,

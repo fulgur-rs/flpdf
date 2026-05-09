@@ -49,4 +49,8 @@ impl ObjectCache {
             .filter(|entry| matches!(entry, CacheEntry::Resolved(_)))
             .count()
     }
+
+    pub fn object_refs(&self) -> Vec<ObjectRef> {
+        self.entries.keys().copied().collect()
+    }
 }

@@ -1,5 +1,7 @@
-use clap::Parser;
-use flpdf::{check_reader, write_pdf, CheckReport, Diagnostic, Object, ObjectRef, Pdf, Severity};
+use clap::{Args as ClapArgs, Parser, Subcommand};
+use flpdf::{
+    check_reader, write_pdf, write_qdf, CheckReport, Diagnostic, Object, ObjectRef, Pdf, Severity,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::BufReader;
@@ -11,7 +13,11 @@ type PageSequence = (Pdf<BufReader<File>>, Vec<ObjectRef>);
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    // Legacy options kept for compatibility.
     #[arg(long)]
     check: bool,
     #[arg(long)]
@@ -36,10 +42,66 @@ struct Args {
     output: Option<PathBuf>,
 }
 
-fn main() {
-    let args = Args::parse();
+#[derive(Debug, Subcommand)]
+enum Commands {
+    #[command(about = "Validate PDF structure and report diagnostics")]
+    Check(CheckCommand),
+    #[command(name = "dump-object", about = "Dump one indirect object as PDF syntax")]
+    DumpObject(DumpObjectCommand),
+    #[command(about = "Show page structure summary or detail")]
+    Pages(PagesCommand),
+    #[command(about = "Write a qdf-style raw dump into a file")]
+    Qdf(QdfCommand),
+    #[command(about = "Rewrite the input PDF to a normalized output")]
+    Rewrite(RewriteCommand),
+}
 
-    let result = if let Some(object_ref) = args.dump_object.as_deref() {
+#[derive(Debug, ClapArgs)]
+struct CheckCommand {
+    input: PathBuf,
+    #[arg(long)]
+    repair: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+struct DumpObjectCommand {
+    object_ref: String,
+    input: PathBuf,
+    #[arg(long)]
+    repair: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+struct PagesCommand {
+    input: PathBuf,
+    #[arg(long)]
+    count: bool,
+    #[arg(long)]
+    repair: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+struct QdfCommand {
+    input: PathBuf,
+    output: PathBuf,
+    #[arg(long)]
+    repair: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+struct RewriteCommand {
+    input: PathBuf,
+    output: PathBuf,
+    #[arg(long)]
+    repair: bool,
+}
+
+fn main() {
+    let args = Cli::parse();
+
+    let result = if let Some(command) = args.command {
+        run_command(command)
+    } else if let Some(object_ref) = args.dump_object.as_deref() {
         run_dump_object(args.input, args.repair, object_ref)
     } else if args.show_info {
         run_show_info(args.input, args.repair)
@@ -64,6 +126,22 @@ fn main() {
     if let Err(error) = result {
         eprintln!("flpdf: {error}");
         std::process::exit(2);
+    }
+}
+
+fn run_command(command: Commands) -> CliResult<()> {
+    match command {
+        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair),
+        Commands::DumpObject(cmd) => run_dump_object(Some(cmd.input), cmd.repair, &cmd.object_ref),
+        Commands::Pages(cmd) => {
+            if cmd.count {
+                run_show_npages(Some(cmd.input), cmd.repair)
+            } else {
+                run_show_pages(Some(cmd.input), cmd.repair)
+            }
+        }
+        Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair),
+        Commands::Rewrite(cmd) => run_rewrite(Some(cmd.input), Some(cmd.output), cmd.repair),
     }
 }
 
@@ -101,6 +179,20 @@ fn run_rewrite(
 
     let mut out = File::create(output)?;
     write_pdf(&mut pdf, &mut out)?;
+    Ok(())
+}
+
+fn run_qdf(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = input.ok_or("missing input file")?;
+    let output = output.ok_or("missing output file")?;
+    let mut pdf = open_pdf(&input, repair)?;
+
+    let mut out = File::create(output)?;
+    write_qdf(&mut pdf, &mut out)?;
     Ok(())
 }
 

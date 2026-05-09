@@ -1,4 +1,4 @@
-use flpdf::{check_reader, write_pdf, Object, ObjectRef, Pdf};
+use flpdf::{check_reader, write_pdf, write_qdf, Object, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 
@@ -155,6 +155,52 @@ fn rewrites_repaired_pdf_in_best_effort_mode() {
         "diagnostics: {:?}",
         report.diagnostics.entries()
     );
+}
+
+#[test]
+fn writes_qdf_with_object_generations() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 3 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Type /Orphan >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", 4).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f\n");
+    bytes.extend_from_slice(format!("{:010} 00003 n\n", offsets[0]).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n\n", offsets[1]).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n\n", offsets[2]).as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 3 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(rendered.contains("1 3 obj"));
+    assert!(rendered.contains("3 0 obj"));
+    assert!(rendered.contains(" 00003 n"));
 }
 
 fn linearized_fixture_pdf() -> Vec<u8> {
