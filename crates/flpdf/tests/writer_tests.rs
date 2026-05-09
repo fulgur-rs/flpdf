@@ -116,3 +116,76 @@ fn rewrites_pdf_with_real_number_fixture() {
         report.diagnostics.entries()
     );
 }
+
+#[test]
+fn rewrites_linearized_pdf_preserving_hint_object() {
+    let input = linearized_fixture_pdf();
+    let mut pdf = Pdf::open(Cursor::new(input)).unwrap();
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let output_text = String::from_utf8_lossy(&output);
+    assert!(output_text.contains(" /Linearized "));
+    assert!(output_text.contains("1 0 obj"));
+
+    let report = check_reader(Cursor::new(output)).unwrap();
+    assert!(
+        report.valid,
+        "diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+fn linearized_fixture_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Linearized 1 /L 100 /E 0 /N 1 /T 1 >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Type /Pages /Count 1 /Kids [4 0 R] >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 595.28 841.89] /Contents 5 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"5 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    let object_count = offsets.len() + 1;
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 2 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            object_count
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}

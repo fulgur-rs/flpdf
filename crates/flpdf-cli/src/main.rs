@@ -5,6 +5,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
+type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+type PageSequence = (Pdf<BufReader<File>>, Vec<ObjectRef>);
+
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
@@ -23,6 +26,10 @@ struct Args {
     show_outline: bool,
     #[arg(long)]
     show_fonts: bool,
+    #[arg(long)]
+    show_npages: bool,
+    #[arg(long)]
+    show_pages: bool,
     input: Option<PathBuf>,
     output: Option<PathBuf>,
 }
@@ -42,6 +49,10 @@ fn main() {
         run_show_outline(args.input)
     } else if args.show_fonts {
         run_show_fonts(args.input)
+    } else if args.show_npages {
+        run_show_npages(args.input)
+    } else if args.show_pages {
+        run_show_pages(args.input)
     } else if args.check {
         run_check(args.input)
     } else {
@@ -290,6 +301,38 @@ fn run_show_fonts(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn run_show_npages(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pdf, pages) = load_page_sequence(input)?;
+    println!("{}", pages.len());
+    Ok(())
+}
+
+fn run_show_pages(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut pdf, pages) = load_page_sequence(input)?;
+    for (index, page_ref) in pages.iter().enumerate() {
+        let page = pdf.resolve(*page_ref)?;
+        let Object::Dictionary(dict) = page else {
+            continue;
+        };
+
+        println!("page {}: {}", index + 1, page_ref);
+        if let Some(media_box) = dict.get("MediaBox") {
+            println!("  media-box: {}", object_to_pdf(media_box));
+        }
+        if let Some(resources) = dict.get("Resources") {
+            println!("  resources: {}", object_to_pdf(resources));
+        }
+        if let Some(contents) = dict.get("Contents") {
+            println!("  contents: {}", object_to_pdf(contents));
+        }
+        if let Some(rotate) = dict.get("Rotate") {
+            println!("  rotate: {}", object_to_pdf(rotate));
+        }
+    }
+
+    Ok(())
+}
+
 fn dump_outline_items(
     pdf: &mut Pdf<BufReader<File>>,
     start: ObjectRef,
@@ -405,10 +448,71 @@ fn collect_font_resources(
     Ok(())
 }
 
-fn open_pdf(input: &PathBuf) -> Result<Pdf<BufReader<File>>, Box<dyn std::error::Error>> {
+fn open_pdf(input: &PathBuf) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input)?;
     let pdf = Pdf::open(BufReader::new(file))?;
     Ok(pdf)
+}
+
+fn load_page_sequence(input: Option<PathBuf>) -> CliResult<PageSequence> {
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input)?;
+    let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
+    let catalog = pdf.resolve(catalog_ref)?;
+    let Object::Dictionary(catalog) = catalog else {
+        return Err(format!("document catalog {} is not a dictionary", catalog_ref).into());
+    };
+
+    let pages_ref = catalog
+        .get_ref("Pages")
+        .ok_or("document pages tree missing")?;
+
+    let mut seen = BTreeSet::new();
+    let mut pages = Vec::new();
+    collect_pages(&mut pdf, pages_ref, &mut seen, &mut pages)?;
+
+    Ok((pdf, pages))
+}
+
+fn collect_pages(
+    pdf: &mut Pdf<BufReader<File>>,
+    node: ObjectRef,
+    seen: &mut BTreeSet<ObjectRef>,
+    pages: &mut Vec<ObjectRef>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !seen.insert(node) {
+        return Ok(());
+    }
+
+    let node_obj = pdf.resolve(node)?;
+    let Object::Dictionary(dict) = node_obj else {
+        return Ok(());
+    };
+
+    let node_type = dict
+        .get("Type")
+        .and_then(|value| match value {
+            Object::Name(value) => Some(value.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(Vec::new);
+
+    if node_type.as_slice() == b"Pages" {
+        if let Some(Object::Array(kids)) = dict.get("Kids") {
+            for kid in kids {
+                if let Object::Reference(reference) = kid {
+                    collect_pages(pdf, *reference, seen, pages)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if node_type.as_slice() == b"Page" {
+        pages.push(node);
+    }
+
+    Ok(())
 }
 
 fn object_to_pdf(object: &Object) -> String {
