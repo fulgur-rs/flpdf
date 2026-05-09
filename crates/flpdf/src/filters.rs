@@ -101,7 +101,13 @@ fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Re
         return Ok(stream_data.to_vec());
     }
 
-    if predictor != 12 {
+    if predictor == 2 {
+        return Err(Error::Unsupported(
+            "/DecodeParms /Predictor 2 is not supported for this stream type".to_string(),
+        ));
+    }
+
+    if !(10..=15).contains(&predictor) {
         return Err(Error::Unsupported(format!(
             "unsupported /DecodeParms /Predictor {predictor}"
         )));
@@ -157,11 +163,15 @@ fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Re
             "/DecodeParms /Predictor produced zero row width".to_string(),
         ));
     }
+    let bits_per_pixel = colors
+        .checked_mul(bits_per_component)
+        .ok_or_else(|| Error::Unsupported("/DecodeParms /Predictor overflow".to_string()))?;
+    let bytes_per_pixel = bits_per_pixel.div_ceil(8).max(1);
 
-    decode_png_predictor(stream_data, row_bytes)
+    decode_png_predictor(stream_data, row_bytes, bytes_per_pixel)
 }
 
-fn decode_png_predictor(bytes: &[u8], row_bytes: usize) -> Result<Vec<u8>> {
+fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) -> Result<Vec<u8>> {
     let row_size = row_bytes
         .checked_add(1)
         .ok_or_else(|| Error::Unsupported("PNG predictor row size overflow".to_string()))?;
@@ -179,7 +189,6 @@ fn decode_png_predictor(bytes: &[u8], row_bytes: usize) -> Result<Vec<u8>> {
         let filter = row[0];
         let raw = &row[1..];
         let mut current = vec![0u8; row_bytes];
-        let bytes_per_pixel = 1;
 
         for i in 0..row_bytes {
             let raw_byte = raw[i];

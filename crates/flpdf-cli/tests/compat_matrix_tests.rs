@@ -273,7 +273,6 @@ fn qpdf_incremental_object_stream_member_rewrite_stays_qpdf_compatible() {
     for candidate in candidates.drain(..) {
         let original = pdf.resolve(candidate).unwrap();
         if let Some(touched_object) = touch_object_for_regression(original) {
-            println!("touching candidate: {candidate:?}");
             pdf.set_object(candidate, touched_object);
             touched = Some(candidate);
             break;
@@ -282,16 +281,8 @@ fn qpdf_incremental_object_stream_member_rewrite_stays_qpdf_compatible() {
 
     let touched = touched.expect("unable to select a compressed object to touch");
     let output = tmp.path().join("objstm-output.pdf");
-    println!("writing object stream output: {output:?}");
     let mut out = File::create(&output).unwrap();
     write_pdf(&mut pdf, &mut out).unwrap();
-
-    let output_debug = Path::new("/tmp/compat-objstm-output-debug.pdf");
-    let source_debug = Path::new("/tmp/compat-objstm-source-debug.pdf");
-    fs::copy(&output, output_debug).unwrap();
-    fs::copy(&source, source_debug).unwrap();
-    println!("debug source: {source_debug:?}");
-    println!("debug output: {output_debug:?}");
 
     assert_eq!(qpdf_show_npages(&source), qpdf_show_npages(&output));
     qpdf_check(&output);
