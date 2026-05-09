@@ -87,3 +87,56 @@ fn linearized_fixture_pdf() -> Vec<u8> {
 
     bytes
 }
+
+#[test]
+fn check_reports_repaired_xref_warning() {
+    let input = corrupt_xref_pdf();
+    let report = check_reader(Cursor::new(input)).unwrap();
+
+    assert!(report.valid);
+    assert!(report
+        .diagnostics
+        .entries()
+        .iter()
+        .any(|entry| entry.severity == Severity::Warning
+            && entry.message.contains("repaired by linear object scan")));
+}
+
+fn corrupt_xref_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec();
+    let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n".to_vec();
+    let obj4 = b"4 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n".to_vec();
+
+    let mut offsets = Vec::new();
+    for object in &[obj1, obj2, obj3, obj4] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f\n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut corrupted = bytes;
+    let Some(pos) = corrupted.windows(4).position(|window| window == b"xref") else {
+        unreachable!("fixture should contain xref token")
+    };
+    if let Some(byte) = corrupted.get_mut(pos + 2) {
+        *byte = b'z';
+    }
+    corrupted
+}

@@ -27,6 +27,76 @@ fn rewrite_fixture_creates_output() {
 }
 
 #[test]
+fn rewrite_repaired_fixture_with_repair_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_pdf()).unwrap();
+
+    let output = temp.path().join("out.pdf");
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--repair",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
+fn show_info_with_repair_flag_handles_corrupt_xref() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--repair", "--show-info", input.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Title = (Corrupt fixture)"));
+}
+
+#[test]
+fn show_info_without_repair_rejects_corrupt_xref() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--show-info", input.to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn check_without_repair_rejects_corrupt_xref() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", input.to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn check_with_repair_accepts_corrupt_xref() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--repair", "--check", input.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PDF check succeeded"));
+}
+
+#[test]
 fn dump_object_accepts_ref_without_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--dump-object", "1 0", "../../tests/fixtures/minimal.pdf"])
@@ -112,6 +182,18 @@ fn show_fonts_prints_summary() {
 }
 
 #[test]
+fn show_fonts_prints_inline_dictionary_fonts() {
+    let fixture = fixture_with_inline_font_dictionary();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--show-fonts", fixture.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FDirect"))
+        .stdout(predicate::str::contains("type: /Font"));
+}
+
+#[test]
 fn show_npages_prints_total_pages() {
     let fixture = fixture_with_nested_pages();
 
@@ -187,7 +269,7 @@ fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
     bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
     bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
     for &offset in &offsets {
-        bytes.extend_from_slice(format!("{:010} 00000 n\n", offset).as_bytes());
+        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
     }
     bytes.extend_from_slice(
         format!(
@@ -200,6 +282,54 @@ fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
 
     let file = fixture.as_file_mut();
     file.write_all(&bytes).unwrap();
+
+    fixture
+}
+
+fn fixture_with_inline_font_dictionary() -> tempfile::NamedTempFile {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+
+    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+    let object2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n";
+    let object3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /FDirect << /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >> >> >> /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n";
+    let content_data = b"HelloPDF\n";
+    let object4 = format!(
+        "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        content_data.len(),
+        String::from_utf8_lossy(content_data)
+    )
+    .into_bytes();
+
+    let mut offsets = Vec::new();
+    let objects: Vec<Vec<u8>> = vec![
+        object1.to_vec(),
+        object2.to_vec(),
+        object3.to_vec(),
+        object4.to_vec(),
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    for object in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
+    for &offset in &offsets {
+        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            start_xref
+        )
+        .as_bytes(),
+    );
+
+    fixture.as_file_mut().write_all(&bytes).unwrap();
 
     fixture
 }
@@ -249,4 +379,85 @@ fn fixture_with_nested_pages() -> tempfile::NamedTempFile {
     fixture.write_all(&bytes).unwrap();
 
     fixture
+}
+
+fn corrupt_xref_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec();
+    let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n".to_vec();
+    let obj4 = b"4 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n".to_vec();
+
+    let mut offsets = Vec::new();
+    for object in &[obj1, obj2, obj3, obj4] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f\n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut corrupted = bytes;
+    let Some(pos) = corrupted.windows(4).position(|window| window == b"xref") else {
+        unreachable!("fixture should contain xref token")
+    };
+    if let Some(byte) = corrupted.get_mut(pos + 2) {
+        *byte = b'z';
+    }
+
+    corrupted
+}
+
+fn corrupt_xref_with_info_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Info 5 0 R >>\nendobj\n".to_vec();
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec();
+    let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n".to_vec();
+    let obj4 = b"4 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n".to_vec();
+    let obj5 = b"5 0 obj\n<< /Title (Corrupt fixture) /Creator (flpdf) >>\nendobj\n".to_vec();
+
+    let mut offsets = Vec::new();
+    for object in [&obj1, &obj2, &obj3, &obj4, &obj5] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f\n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut corrupted = bytes;
+    let Some(pos) = corrupted.windows(4).position(|window| window == b"xref") else {
+        unreachable!("fixture should contain xref token")
+    };
+    if let Some(byte) = corrupted.get_mut(pos + 2) {
+        *byte = b'z';
+    }
+
+    corrupted
 }
