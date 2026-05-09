@@ -1,23 +1,58 @@
+//! Lightweight document validator.
+//!
+//! Mirrors the surface of qpdf's `--check`: open the document (with the recovery path
+//! enabled), report parser warnings, and flag a few high-level invariants that would
+//! cause downstream tools to fail.
+
 use crate::{Diagnostic, Diagnostics, Pdf};
 use std::io::{Read, Seek};
 
+/// Result of [`check_reader`].
+///
+/// `valid` is `true` when no [`Diagnostic`] of severity `Error` was produced. Warnings
+/// alone (e.g. linearization advisories) do not flip the flag.
 #[derive(Debug, Clone)]
 pub struct CheckReport {
     pub valid: bool,
     pub diagnostics: Diagnostics,
 }
 
+/// Validate the document behind `reader` using the repair-enabled open path.
+///
+/// Errors during the strict parse are downgraded to a single error diagnostic so the
+/// caller always receives a report. Equivalent to `qpdf --check` (which also runs the
+/// recovery heuristics).
 pub fn check_reader<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
-    let mut pdf = match Pdf::open_with_repair(reader) {
-        Ok(pdf) => pdf,
-        Err(error) => {
-            let mut diagnostics = Diagnostics::default();
-            diagnostics.push(Diagnostic::error(error.to_string(), None));
-            return Ok(CheckReport {
-                valid: false,
-                diagnostics,
-            });
+    check_reader_inner(reader, true)
+}
+
+/// Validate the document behind `reader` without running the recovery heuristics.
+///
+/// A failed strict parse is propagated as a hard [`crate::Error`] rather than turned
+/// into a diagnostic; the caller is expected to handle the I/O error explicitly.
+/// Equivalent to `qpdf --check` without `--password=...`-style recovery toggles.
+pub fn check_reader_strict<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
+    check_reader_inner(reader, false)
+}
+
+fn check_reader_inner<R: Read + Seek>(
+    reader: R,
+    allow_repair: bool,
+) -> crate::Result<CheckReport> {
+    let mut pdf = if allow_repair {
+        match Pdf::open_with_repair(reader) {
+            Ok(pdf) => pdf,
+            Err(error) => {
+                let mut diagnostics = Diagnostics::default();
+                diagnostics.push(Diagnostic::error(error.to_string(), None));
+                return Ok(CheckReport {
+                    valid: false,
+                    diagnostics,
+                });
+            }
         }
+    } else {
+        Pdf::open(reader)?
     };
 
     let mut diagnostics = pdf.repair_diagnostics().clone();

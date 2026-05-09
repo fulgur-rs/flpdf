@@ -1,14 +1,13 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use flpdf::{
-    check_reader, write_pdf, write_qdf, CheckReport, Diagnostic, Object, ObjectRef, Pdf, Severity,
+    check_reader, check_reader_strict, fonts, outline, pages, write_pdf, write_qdf, Object,
+    ObjectRef, Pdf, Severity,
 };
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
-type PageSequence = (Pdf<BufReader<File>>, Vec<ObjectRef>);
 
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
@@ -145,13 +144,13 @@ fn run_command(command: Commands) -> CliResult<()> {
     }
 }
 
-fn run_check(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_check(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(input)?;
     let report = if repair {
         check_reader(BufReader::new(file))?
     } else {
-        check_reader_without_repair(BufReader::new(file))?
+        check_reader_strict(BufReader::new(file))?
     };
     for diagnostic in report.diagnostics.entries() {
         let label = match diagnostic.severity {
@@ -168,11 +167,7 @@ fn run_check(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::er
     }
 }
 
-fn run_rewrite(
-    input: Option<PathBuf>,
-    output: Option<PathBuf>,
-    repair: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_rewrite(input: Option<PathBuf>, output: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     let mut pdf = open_pdf(&input, repair)?;
@@ -182,11 +177,7 @@ fn run_rewrite(
     Ok(())
 }
 
-fn run_qdf(
-    input: Option<PathBuf>,
-    output: Option<PathBuf>,
-    repair: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_qdf(input: Option<PathBuf>, output: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     let mut pdf = open_pdf(&input, repair)?;
@@ -196,13 +187,9 @@ fn run_qdf(
     Ok(())
 }
 
-fn run_dump_object(
-    input: Option<PathBuf>,
-    repair: bool,
-    object_ref: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_dump_object(input: Option<PathBuf>, repair: bool, object_ref: &str) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let object_ref = parse_object_ref(object_ref)?;
+    let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf(&input, repair)?;
     let object = pdf.resolve(object_ref)?;
@@ -221,7 +208,7 @@ fn run_dump_object(
     Ok(())
 }
 
-fn run_show_info(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_info(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair)?;
     let info_ref = pdf
@@ -242,10 +229,7 @@ fn run_show_info(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn run_show_catalog(
-    input: Option<PathBuf>,
-    repair: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_catalog(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
@@ -254,10 +238,7 @@ fn run_show_catalog(
     Ok(())
 }
 
-fn run_show_metadata(
-    input: Option<PathBuf>,
-    repair: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_metadata(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
@@ -311,73 +292,46 @@ fn run_show_metadata(
     Ok(())
 }
 
-fn run_show_outline(
-    input: Option<PathBuf>,
-    repair: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_outline(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair)?;
-    let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog else {
-        return Err(format!("document catalog {} is not a dictionary", catalog_ref).into());
-    };
 
-    let outlines = catalog
-        .get_ref("Outlines")
-        .ok_or("document has no outlines")?;
-    let outline_root = pdf.resolve(outlines)?;
-    let Object::Dictionary(outline_root) = outline_root else {
-        return Err(format!("outlines object {} is not a dictionary", outlines).into());
+    let items = match outline::outline_items(&mut pdf) {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("Warning: {error}");
+            Vec::new()
+        }
     };
 
     println!("Outline:");
-    let mut counter = 1usize;
-    let mut visited = BTreeSet::new();
-    const MAX_OUTLINE_DEPTH: usize = 100;
-    if let Some(first) = outline_root.get_ref("First") {
-        if let Err(error) = dump_outline_items(
-            &mut pdf,
-            first,
-            0,
-            &mut visited,
-            &mut counter,
-            MAX_OUTLINE_DEPTH,
-        ) {
-            eprintln!("Warning: {error}");
-        }
-    }
-    if counter == 1 {
+    if items.is_empty() {
         println!("  <empty>");
+        return Ok(());
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        println!(
+            "{}{}: {}",
+            "  ".repeat(item.depth),
+            index + 1,
+            item.title
+        );
     }
     Ok(())
 }
 
-fn run_show_fonts(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_show_fonts(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair)?;
-    let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog else {
-        return Err(format!("document catalog {} is not a dictionary", catalog_ref).into());
-    };
-    let pages_ref = catalog
-        .get_ref("Pages")
-        .ok_or("document pages tree missing")?;
 
-    let mut seen_nodes = BTreeSet::new();
-    let mut font_refs: BTreeMap<Vec<u8>, Object> = BTreeMap::new();
-    const MAX_PAGE_TREE_DEPTH: usize = 100;
-    if let Err(error) = collect_font_resources(
-        &mut pdf,
-        pages_ref,
-        &mut seen_nodes,
-        &mut font_refs,
-        0,
-        MAX_PAGE_TREE_DEPTH,
-    ) {
-        eprintln!("Warning: {error}");
-    }
+    let font_refs = match fonts::font_entries(&mut pdf) {
+        Ok(font_refs) => font_refs,
+        Err(error) => {
+            eprintln!("Warning: {error}");
+            Default::default()
+        }
+    };
 
     println!("Fonts:");
     if font_refs.is_empty() {
@@ -409,15 +363,19 @@ fn run_show_fonts(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn st
     Ok(())
 }
 
-fn run_show_npages(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_pdf, pages) = load_page_sequence(input, repair)?;
+fn run_show_npages(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input, repair)?;
+    let pages = pages::page_refs(&mut pdf)?;
     println!("{}", pages.len());
     Ok(())
 }
 
-fn run_show_pages(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut pdf, pages) = load_page_sequence(input, repair)?;
-    for (index, page_ref) in pages.iter().enumerate() {
+fn run_show_pages(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input, repair)?;
+    let page_refs = pages::page_refs(&mut pdf)?;
+    for (index, page_ref) in page_refs.iter().enumerate() {
         let page = pdf.resolve(*page_ref)?;
         let Object::Dictionary(dict) = page else {
             continue;
@@ -441,156 +399,6 @@ fn run_show_pages(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn st
     Ok(())
 }
 
-fn dump_outline_items(
-    pdf: &mut Pdf<BufReader<File>>,
-    start: ObjectRef,
-    depth: usize,
-    visited: &mut BTreeSet<ObjectRef>,
-    counter: &mut usize,
-    max_depth: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if depth >= max_depth {
-        return Err(format!(
-            "outline depth exceeds maximum of {} at {}",
-            max_depth, start
-        )
-        .into());
-    }
-
-    let mut current = Some(start);
-    while let Some(current_ref) = current {
-        if depth >= max_depth {
-            return Err(format!(
-                "outline depth exceeds maximum of {} at {}",
-                max_depth, current_ref
-            )
-            .into());
-        }
-
-        if !visited.insert(current_ref) {
-            break;
-        }
-
-        let current_obj = pdf.resolve(current_ref)?;
-        let Object::Dictionary(dict) = current_obj else {
-            break;
-        };
-
-        let title = match dict.get("Title") {
-            Some(Object::String(value)) => String::from_utf8_lossy(value).to_string(),
-            Some(other) => object_to_pdf(other).to_string(),
-            None => String::from("<untitled>"),
-        };
-
-        println!("{}{}: {}", "  ".repeat(depth), counter, title);
-        *counter += 1;
-
-        if let Some(first) = dict.get_ref("First") {
-            dump_outline_items(pdf, first, depth + 1, visited, counter, max_depth)?;
-        }
-
-        current = dict.get_ref("Next");
-    }
-
-    Ok(())
-}
-
-fn collect_font_resources(
-    pdf: &mut Pdf<BufReader<File>>,
-    node: ObjectRef,
-    seen: &mut BTreeSet<ObjectRef>,
-    fonts: &mut BTreeMap<Vec<u8>, Object>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if depth >= max_depth {
-        return Err(format!(
-            "page tree depth exceeds maximum of {} at {}",
-            max_depth, node
-        )
-        .into());
-    }
-
-    if !seen.insert(node) {
-        return Ok(());
-    }
-
-    let node_obj = pdf.resolve(node)?;
-    let Object::Dictionary(dict) = node_obj else {
-        return Ok(());
-    };
-
-    let node_type = dict
-        .get("Type")
-        .and_then(|value| match value {
-            Object::Name(value) => Some(value.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(Vec::new);
-
-    if node_type.as_slice() == b"Pages" {
-        if let Some(Object::Array(kids)) = dict.get("Kids") {
-            for kid in kids {
-                if let Object::Reference(reference) = kid {
-                    collect_font_resources(pdf, *reference, seen, fonts, depth + 1, max_depth)?;
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    if node_type.as_slice() == b"Page" {
-        let resources = match dict.get("Resources") {
-            Some(Object::Dictionary(resources)) => Some(resources.clone()),
-            Some(Object::Reference(reference)) => {
-                if let Ok(Object::Dictionary(resources)) = pdf.resolve(*reference) {
-                    Some(resources)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        if let Some(resources) = resources {
-            let fonts_dict = match resources.get("Font") {
-                Some(Object::Dictionary(fonts_dict)) => Some(fonts_dict.clone()),
-                Some(Object::Reference(reference)) => {
-                    if let Ok(Object::Dictionary(fonts_dict)) = pdf.resolve(*reference) {
-                        Some(fonts_dict)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(fonts_dict) = fonts_dict {
-                for (font_name, value) in fonts_dict.iter() {
-                    match value {
-                        Object::Reference(font_ref) => {
-                            if let Ok(font_obj) = pdf.resolve(*font_ref) {
-                                fonts.insert(font_name.to_vec(), font_obj);
-                            }
-                        }
-                        Object::Dictionary(font_dict) => {
-                            fonts.insert(font_name.to_vec(), Object::Dictionary(font_dict.clone()));
-                        }
-                        Object::Stream(stream) => {
-                            fonts.insert(
-                                font_name.to_vec(),
-                                Object::Dictionary(stream.dict.clone()),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn open_pdf(input: &PathBuf, repair: bool) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input)?;
     let pdf = if repair {
@@ -606,128 +414,8 @@ fn open_pdf(input: &PathBuf, repair: bool) -> CliResult<Pdf<BufReader<File>>> {
     Ok(pdf)
 }
 
-fn check_reader_without_repair(
-    reader: BufReader<File>,
-) -> Result<CheckReport, Box<dyn std::error::Error>> {
-    let mut pdf = Pdf::open(reader)?;
-    let mut diagnostics = pdf.repair_diagnostics().clone();
-    if pdf.trailer().get_ref("Root").is_none() {
-        diagnostics.push(Diagnostic::error("trailer is missing /Root", None));
-    }
-    if pdf.linearized_hint_ref()?.is_some() {
-        diagnostics.push(Diagnostic::warning(
-            "linearized PDF detected: rewrite support preserves hint object but does not recompute linearization tables",
-            None,
-        ));
-    }
-
-    Ok(CheckReport {
-        valid: !diagnostics.has_errors(),
-        diagnostics,
-    })
-}
-
-fn load_page_sequence(input: Option<PathBuf>, repair: bool) -> CliResult<PageSequence> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
-    let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog else {
-        return Err(format!("document catalog {} is not a dictionary", catalog_ref).into());
-    };
-
-    let pages_ref = catalog
-        .get_ref("Pages")
-        .ok_or("document pages tree missing")?;
-
-    let mut seen = BTreeSet::new();
-    let mut pages = Vec::new();
-    const MAX_PAGE_TREE_DEPTH: usize = 100;
-    collect_pages(
-        &mut pdf,
-        pages_ref,
-        &mut seen,
-        &mut pages,
-        0,
-        MAX_PAGE_TREE_DEPTH,
-    )?;
-
-    Ok((pdf, pages))
-}
-
-fn collect_pages(
-    pdf: &mut Pdf<BufReader<File>>,
-    node: ObjectRef,
-    seen: &mut BTreeSet<ObjectRef>,
-    pages: &mut Vec<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if depth >= max_depth {
-        return Err(format!(
-            "page tree depth exceeds maximum of {} at {}",
-            max_depth, node
-        )
-        .into());
-    }
-
-    if !seen.insert(node) {
-        return Ok(());
-    }
-
-    let node_obj = pdf.resolve(node)?;
-    let Object::Dictionary(dict) = node_obj else {
-        return Ok(());
-    };
-
-    let node_type = dict
-        .get("Type")
-        .and_then(|value| match value {
-            Object::Name(value) => Some(value.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(Vec::new);
-
-    if node_type.as_slice() == b"Pages" {
-        if let Some(Object::Array(kids)) = dict.get("Kids") {
-            for kid in kids {
-                if let Object::Reference(reference) = kid {
-                    collect_pages(pdf, *reference, seen, pages, depth + 1, max_depth)?;
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    if node_type.as_slice() == b"Page" {
-        pages.push(node);
-    }
-
-    Ok(())
-}
-
 fn object_to_pdf(object: &Object) -> String {
     let mut out = Vec::new();
     object.write_pdf(&mut out);
     String::from_utf8_lossy(&out).to_string()
-}
-
-fn parse_object_ref(raw: &str) -> Result<flpdf::ObjectRef, String> {
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    if parts.len() != 2 && parts.len() != 3 {
-        return Err(format!("invalid object ref '{raw}'"));
-    }
-
-    if parts.len() == 3 && parts[2] != "R" {
-        return Err(format!("invalid object ref '{raw}'"));
-    }
-
-    let number = parts[0]
-        .parse::<u32>()
-        .map_err(|_| format!("invalid object number in '{raw}'"))?;
-    let generation = parts[1]
-        .parse::<u16>()
-        .map_err(|_| format!("invalid object generation in '{raw}'"))?;
-
-    Ok(flpdf::ObjectRef::new(number, generation))
 }

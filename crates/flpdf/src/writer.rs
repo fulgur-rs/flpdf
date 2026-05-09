@@ -3,6 +3,15 @@ use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefO
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 
+/// Write `pdf` as an incrementally-updated revision (qpdf's default `--object-streams=preserve` mode).
+///
+/// The original bytes are copied to `out` unchanged, then a single update section is
+/// appended for every object that has been mutated via [`Pdf::set_object`]. The xref
+/// table form (table vs. stream) is preserved from the input, so the output remains
+/// readable by older PDF consumers when the source used `xref` tables and stays
+/// compact when the source used cross-reference streams.
+///
+/// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
@@ -732,6 +741,17 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
     }
 }
 
+/// Write `pdf` as a flat, qdf-style dump (qpdf's `--qdf` form).
+///
+/// Every known object is rewritten in `(number, generation)` order with no compression
+/// applied, the cross-reference table is rebuilt as a classic `xref` section, and a
+/// minimal trailer pointing at `/Root` is emitted. The result is intended for human
+/// inspection, diffing, and reproducibility tests rather than smallest-on-disk output.
+///
+/// Returns [`crate::Error::Missing`] if the input has no `/Root`, and
+/// [`crate::Error::Unsupported`] if the same object number appears more than once in
+/// the cache (which would indicate a cross-reference table that we'd otherwise
+/// misrender).
 pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));

@@ -1,6 +1,23 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::str::FromStr;
 
+/// Indirect-object reference (`N G R` in PDF syntax).
+///
+/// `ObjectRef` is a thin value type: it identifies an object by `(number, generation)`
+/// and is what every other API in the crate uses to fetch, replace, or describe an object.
+///
+/// # Examples
+///
+/// ```
+/// use flpdf::ObjectRef;
+///
+/// let object_ref = ObjectRef::new(12, 0);
+/// assert_eq!(object_ref.to_string(), "12 0 R");
+///
+/// let parsed: ObjectRef = "12 0 R".parse().unwrap();
+/// assert_eq!(parsed, object_ref);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectRef {
     pub number: u32,
@@ -8,8 +25,44 @@ pub struct ObjectRef {
 }
 
 impl ObjectRef {
+    /// Construct an `ObjectRef` from a raw `(number, generation)` pair.
     pub fn new(number: u32, generation: u16) -> Self {
         Self { number, generation }
+    }
+
+    /// Parse `"N G"` or `"N G R"` (the textual form used by qpdf-style CLIs).
+    ///
+    /// Whitespace between tokens is collapsed and the trailing `R` is optional, mirroring
+    /// the indirect-reference syntax that qpdf accepts on its command line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use flpdf::ObjectRef;
+    ///
+    /// assert_eq!(ObjectRef::parse("12 0").unwrap(), ObjectRef::new(12, 0));
+    /// assert_eq!(ObjectRef::parse("12 0 R").unwrap(), ObjectRef::new(12, 0));
+    /// assert!(ObjectRef::parse("bad").is_err());
+    /// ```
+    pub fn parse(input: &str) -> std::result::Result<Self, ParseObjectRefError> {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        if parts.len() != 2 && parts.len() != 3 {
+            return Err(ParseObjectRefError::new(format!(
+                "invalid object ref '{input}'"
+            )));
+        }
+        if parts.len() == 3 && parts[2] != "R" {
+            return Err(ParseObjectRefError::new(format!(
+                "invalid object ref '{input}'"
+            )));
+        }
+        let number = parts[0].parse::<u32>().map_err(|_| {
+            ParseObjectRefError::new(format!("invalid object number in '{input}'"))
+        })?;
+        let generation = parts[1].parse::<u16>().map_err(|_| {
+            ParseObjectRefError::new(format!("invalid object generation in '{input}'"))
+        })?;
+        Ok(Self::new(number, generation))
     }
 }
 
@@ -19,6 +72,42 @@ impl fmt::Display for ObjectRef {
     }
 }
 
+impl FromStr for ObjectRef {
+    type Err = ParseObjectRefError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+/// Error returned when [`ObjectRef::parse`] / `<ObjectRef as FromStr>::from_str` cannot
+/// interpret an input string as an indirect-object reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseObjectRefError {
+    message: String,
+}
+
+impl ParseObjectRefError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ParseObjectRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseObjectRefError {}
+
+/// Direct PDF object value (ISO 32000-1 §7.3).
+///
+/// All node types in the PDF object graph are represented here. Indirect references
+/// are stored as [`Object::Reference`] until they are explicitly resolved with
+/// [`Pdf::resolve`](crate::Pdf::resolve).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object {
     Null,
@@ -34,10 +123,25 @@ pub enum Object {
 }
 
 impl Object {
+    /// Convenience constructor for [`Object::Reference`].
     pub fn reference(object_ref: ObjectRef) -> Self {
         Self::Reference(object_ref)
     }
 
+    /// Serialize this object into PDF syntax, appending to `out`.
+    ///
+    /// Strings whose bytes are all printable are emitted as literal `(...)` strings;
+    /// otherwise hex `<...>` strings are used. Streams are emitted as their dictionary
+    /// followed by `stream` ... `endstream`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use flpdf::{Object, ObjectRef};
+    /// let mut out = Vec::new();
+    /// Object::reference(ObjectRef::new(7, 0)).write_pdf(&mut out);
+    /// assert_eq!(out, b"7 0 R");
+    /// ```
     pub fn write_pdf(&self, out: &mut Vec<u8>) {
         match self {
             Object::Null => out.extend_from_slice(b"null"),
@@ -111,24 +215,35 @@ fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
     out.push(b'>');
 }
 
+/// PDF dictionary, keyed by raw byte slices (PDF names are arbitrary byte strings).
+///
+/// Backed by a `BTreeMap`, so iteration order is the lexicographic order of the keys —
+/// not the order entries were inserted in. Use [`get`](Self::get) /
+/// [`get_ref`](Self::get_ref) for typed access.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Dictionary {
     entries: BTreeMap<Vec<u8>, Object>,
 }
 
 impl Dictionary {
+    /// Create an empty dictionary.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Insert (or replace) `key` with `value`.
     pub fn insert(&mut self, key: impl AsRef<[u8]>, value: Object) {
         self.entries.insert(key.as_ref().to_vec(), value);
     }
 
+    /// Look up `key`. Returns `None` if the dictionary does not contain that name.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<&Object> {
         self.entries.get(key.as_ref())
     }
 
+    /// Like [`get`](Self::get) but returns the [`ObjectRef`] only when the value is an
+    /// indirect reference. Helpful when the spec mandates a reference and you want to
+    /// follow it without matching `Object::Reference` manually.
     pub fn get_ref(&self, key: impl AsRef<[u8]>) -> Option<ObjectRef> {
         match self.get(key) {
             Some(Object::Reference(object_ref)) => Some(*object_ref),
@@ -136,10 +251,12 @@ impl Dictionary {
         }
     }
 
+    /// Remove `key`, returning the previous value if any.
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Option<Object> {
         self.entries.remove(key.as_ref())
     }
 
+    /// Iterate `(name, value)` pairs in lexicographic order of names.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &Object)> {
         self.entries
             .iter()
@@ -158,6 +275,11 @@ impl Dictionary {
     }
 }
 
+/// PDF content stream: a dictionary plus an opaque byte payload.
+///
+/// `data` holds the raw, on-disk bytes — i.e. they are still encoded with whatever
+/// filter chain `dict["Filter"]` declares. Use [`crate::filters::decode_stream_data`]
+/// to obtain the decoded payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stream {
     pub dict: Dictionary,
@@ -165,6 +287,7 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Build a stream from its dictionary and its encoded payload.
     pub fn new(dict: Dictionary, data: Vec<u8>) -> Self {
         Self { dict, data }
     }

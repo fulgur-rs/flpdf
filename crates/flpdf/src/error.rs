@@ -1,7 +1,14 @@
 use thiserror::Error;
 
+/// Crate-wide [`std::result::Result`] specialization.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Errors produced by the public APIs of `flpdf`.
+///
+/// I/O failures bubble up via [`Error::Io`]. Structural problems (malformed tokens,
+/// unexpected types, depth limits, oversized fields) use [`Error::Parse`] or
+/// [`Error::Unsupported`]. [`Error::Missing`] is reserved for required dictionary
+/// entries that the spec mandates, e.g. `/Root` on the trailer.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -18,6 +25,7 @@ pub enum Error {
 }
 
 impl Error {
+    /// Convenience constructor for [`Error::Parse`].
     pub fn parse(offset: usize, message: impl Into<String>) -> Self {
         Self::Parse {
             offset,

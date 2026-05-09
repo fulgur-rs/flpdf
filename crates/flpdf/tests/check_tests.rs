@@ -1,4 +1,4 @@
-use flpdf::{check_reader, Severity};
+use flpdf::{check_reader, check_reader_strict, Severity};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 
@@ -86,6 +86,21 @@ fn linearized_fixture_pdf() -> Vec<u8> {
     );
 
     bytes
+}
+
+#[test]
+fn strict_check_propagates_corrupt_xref_as_error() {
+    let input = corrupt_xref_pdf();
+    let result = check_reader_strict(Cursor::new(input));
+    assert!(result.is_err(), "strict variant should not repair the xref");
+}
+
+#[test]
+fn strict_check_succeeds_on_clean_pdf() {
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let report = check_reader_strict(BufReader::new(file)).unwrap();
+    assert!(report.valid);
+    assert_eq!(report.diagnostics.entries().len(), 0);
 }
 
 #[test]
