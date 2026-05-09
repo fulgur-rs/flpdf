@@ -299,6 +299,65 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
 }
 
 #[test]
+fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let mut objects = Vec::new();
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut objects,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut objects,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, objects[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, objects[1] as u32, 0);
+
+    let xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&xref_entries).unwrap();
+    let compressed_xref = encoder.finish().unwrap();
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} /Filter /FlateDecode /XRefStm 123 >>\nstream\n",
+            compressed_xref.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&compressed_xref);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let source = bytes;
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let trailer_section = parse_last_trailer_section(&output);
+    assert!(!trailer_section.contains(" /Type /XRef"));
+    assert!(!trailer_section.contains(" /W ["));
+    assert!(!trailer_section.contains(" /Index ["));
+    assert!(!trailer_section.contains(" /Length "));
+    assert!(!trailer_section.contains(" /XRefStm "));
+}
+
+#[test]
 fn write_pdf_rewrites_flate_object_stream_member_and_recomputes_first() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
@@ -741,6 +800,23 @@ fn parse_last_xref_generations(bytes: &[u8]) -> BTreeMap<u32, u16> {
     }
 
     generations
+}
+
+fn parse_last_trailer_section(bytes: &[u8]) -> String {
+    let rendered = String::from_utf8_lossy(bytes);
+    let trailer_pos = rendered
+        .rfind("trailer")
+        .unwrap_or_else(|| panic!("missing trailer"));
+    let trailer_start = rendered[trailer_pos..]
+        .find("<<")
+        .map(|offset| trailer_pos + offset)
+        .unwrap_or_else(|| panic!("missing trailer dictionary"));
+    let startxref_pos = rendered[trailer_pos..]
+        .find("startxref")
+        .map(|offset| trailer_pos + offset)
+        .unwrap_or_else(|| panic!("missing startxref"));
+
+    rendered[trailer_start..startxref_pos].to_string()
 }
 
 fn as_integer(object: &Object) -> Option<i64> {

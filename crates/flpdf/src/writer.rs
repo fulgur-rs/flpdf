@@ -350,6 +350,7 @@ fn write_incremental_trailer<R: Read + Seek>(
     xref_offset: usize,
 ) -> Result<()> {
     let mut trailer = pdf.trailer().clone();
+    strip_xref_stream_trailer_keys(&mut trailer);
     trailer.insert("Size", Object::Integer(object_count as i64));
     trailer.insert("Root", Object::Reference(*root_ref));
     trailer.insert(
@@ -363,6 +364,27 @@ fn write_incremental_trailer<R: Read + Seek>(
     trailer.write_pdf(bytes);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
+}
+
+fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
+    let Some(Object::Name(type_name)) = trailer.get("Type") else {
+        return;
+    };
+    if type_name.as_slice() != b"XRef" {
+        return;
+    }
+
+    for key in [
+        "Type",
+        "W",
+        "Index",
+        "Length",
+        "Filter",
+        "DecodeParms",
+        "XRefStm",
+    ] {
+        trailer.remove(key);
+    }
 }
 
 pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
