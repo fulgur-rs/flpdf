@@ -2,7 +2,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_qdf, Object,
-    ObjectRef, Pdf, XrefForm,
+    ObjectRef, Pdf, XrefForm, XrefOffset,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -541,6 +541,68 @@ fn write_pdf_preserves_xref_stream_trailer_metadata_and_declared_size() {
     assert_eq!(as_integer(loaded.trailer.get("Size").unwrap()), Some(10));
     assert_eq!(loaded.trailer.get_ref("Info"), Some(ObjectRef::new(6, 0)));
     assert!(loaded.trailer.get("ID").is_some());
+}
+
+#[test]
+fn write_pdf_preserves_large_compressed_xref_stream_index() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"4 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let large_index = 70_000;
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry_w4(&mut xref_entries, 0, 0, 65535);
+    append_xref_stream_entry_w4(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry_w4(&mut xref_entries, 2, 4, large_index);
+    append_xref_stream_entry_w4(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+    append_xref_stream_entry_w4(&mut xref_entries, 1, object_offsets[2] as u32, 0);
+
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry_w4(&mut xref_entries, 1, source_xref_offset as u32, 0);
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 4] /Index [0 6] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 4,
+            index: large_index
+        })
+    );
 }
 
 #[test]
@@ -1309,6 +1371,12 @@ fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, 
     entries.push(entry_type);
     append_u24_be(entries, field1);
     entries.push(field2);
+}
+
+fn append_xref_stream_entry_w4(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u32) {
+    entries.push(entry_type);
+    entries.extend_from_slice(&field1.to_be_bytes());
+    entries.extend_from_slice(&field2.to_be_bytes());
 }
 
 fn linearized_fixture_pdf() -> Vec<u8> {

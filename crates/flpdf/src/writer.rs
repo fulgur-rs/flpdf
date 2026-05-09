@@ -478,7 +478,7 @@ fn write_incremental_xref_stream(
         Object::Array(vec![
             Object::Integer(1),
             Object::Integer(8),
-            Object::Integer(2),
+            Object::Integer(4),
         ]),
     );
     stream_dict.insert("Index", Object::Array(index_array));
@@ -528,15 +528,15 @@ fn build_xref_stream_bytes(
             match xref_offset {
                 XrefOffset::Free { next } => {
                     stream_data.extend_from_slice(&(u64::from(*next).to_be_bytes()[0..8]));
-                    stream_data.extend_from_slice(&u16::to_be_bytes(*generation)[0..2]);
+                    stream_data.extend_from_slice(&u32::from(*generation).to_be_bytes()[0..4]);
                 }
                 XrefOffset::Offset(offset) => {
                     stream_data.extend_from_slice(&((*offset).to_be_bytes()[0..8]));
-                    stream_data.extend_from_slice(&u16::to_be_bytes(*generation)[0..2]);
+                    stream_data.extend_from_slice(&u32::from(*generation).to_be_bytes()[0..4]);
                 }
                 XrefOffset::Compressed { stream, index } => {
                     stream_data.extend_from_slice(&(u64::from(*stream).to_be_bytes()[0..8]));
-                    stream_data.extend_from_slice(&u32::to_be_bytes(*index)[2..4]);
+                    stream_data.extend_from_slice(&u32::to_be_bytes(*index)[0..4]);
                 }
             }
         }
