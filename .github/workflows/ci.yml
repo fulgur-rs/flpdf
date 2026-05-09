@@ -55,6 +55,7 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
 
       - name: Run tests in required order
+        shell: bash
         run: |
           set -euo pipefail
 
