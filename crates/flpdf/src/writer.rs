@@ -367,15 +367,20 @@ fn write_incremental_trailer<R: Read + Seek>(
 }
 
 fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
-    let Some(Object::Name(type_name)) = trailer.get("Type") else {
-        return;
-    };
-    if type_name.as_slice() != b"XRef" {
+    let has_xref_stream_markers = matches!(trailer.get("Type"), Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef")
+        || trailer.get("XRefStm").is_some()
+        || trailer.get("W").is_some()
+        || trailer.get("Index").is_some();
+
+    if !has_xref_stream_markers {
         return;
     }
 
     for key in [
         "Type",
+        "F",
+        "FFilter",
+        "FDecodeParms",
         "W",
         "Index",
         "Length",
