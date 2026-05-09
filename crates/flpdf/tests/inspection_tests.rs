@@ -136,7 +136,7 @@ fn finalize_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
 
     let start_xref = bytes.len();
     write!(&mut bytes, "xref\n0 {}\n", objects.len() + 1).unwrap();
-    bytes.extend_from_slice(b"0000000000 65535 f\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
     for &offset in &offsets {
         writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
     }
