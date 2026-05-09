@@ -385,7 +385,10 @@ fn write_pdf_rewrites_flate_object_stream_member_and_recomputes_first() {
     )
     .expect("object stream /First should be integer");
     let parsed_first = usize::try_from(parsed_first).unwrap();
-    assert_eq!(decoded.len(), decoded.len());
+    assert!(
+        parsed_first <= decoded.len(),
+        "/First must fit in decoded stream"
+    );
     assert_eq!(
         parsed_first,
         parse_objstm_first_header_len(&decoded, parsed_first).len()
