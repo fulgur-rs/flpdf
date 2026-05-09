@@ -417,7 +417,7 @@ fn write_incremental_xref_stream(
     }
 
     let mut offsets = source_offsets.clone();
-    offsets.insert(0, (65535, XrefOffset::Offset(0)));
+    offsets.insert(0, (65535, XrefOffset::Free { next: 0 }));
     offsets.insert(
         xref_object_number,
         (
@@ -503,13 +503,17 @@ fn build_xref_stream_bytes(
             })?;
 
             let object_type = match (object_number, xref_offset) {
-                (0, _) => 0,
+                (0, _) | (_, XrefOffset::Free { .. }) => 0,
                 (_, XrefOffset::Compressed { .. }) => 2,
                 _ => 1,
             };
 
             stream_data.push(object_type);
             match xref_offset {
+                XrefOffset::Free { next } => {
+                    stream_data.extend_from_slice(&(u64::from(*next).to_be_bytes()[0..8]));
+                    stream_data.extend_from_slice(&u16::to_be_bytes(*generation)[0..2]);
+                }
                 XrefOffset::Offset(offset) => {
                     stream_data.extend_from_slice(&((*offset).to_be_bytes()[0..8]));
                     stream_data.extend_from_slice(&u16::to_be_bytes(*generation)[0..2]);

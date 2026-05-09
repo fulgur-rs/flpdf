@@ -22,6 +22,7 @@ impl ObjectCache {
             .iter()
             .map(|(object_ref, offset)| {
                 let entry = match offset {
+                    XrefOffset::Free { .. } => CacheEntry::Deleted,
                     XrefOffset::Offset(offset) => CacheEntry::Unresolved { offset: *offset },
                     XrefOffset::Compressed { stream, index } => CacheEntry::Compressed {
                         stream: *stream,

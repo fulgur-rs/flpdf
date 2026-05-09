@@ -15,6 +15,7 @@ pub struct LoadedXref {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XrefOffset {
+    Free { next: u32 },
     Offset(u64),
     Compressed { stream: u32, index: u32 },
 }
@@ -362,11 +363,24 @@ fn parse_xref_table(
             cursor.skip_ws();
             let in_use = cursor.read_byte()?;
             cursor.skip_line();
-            if in_use == b'n' {
-                entries.insert(
-                    ObjectRef::new(first + index, generation),
-                    XrefOffset::Offset(offset),
-                );
+            match in_use {
+                b'f' => {
+                    entries.insert(
+                        ObjectRef::new(first + index, generation),
+                        XrefOffset::Free {
+                            next: u32::try_from(offset).map_err(|_| {
+                                Error::parse(0, "free xref next object does not fit u32")
+                            })?,
+                        },
+                    );
+                }
+                b'n' => {
+                    entries.insert(
+                        ObjectRef::new(first + index, generation),
+                        XrefOffset::Offset(offset),
+                    );
+                }
+                _ => return Err(Error::parse(0, "xref table entry status is not f or n")),
             }
         }
     }
@@ -523,7 +537,16 @@ fn parse_xref_entries(
 
             let object_number = (start + index) as u32;
             match object_type {
-                0 => {}
+                0 => {
+                    let next = u32::try_from(field1)
+                        .map_err(|_| Error::parse(0, "free xref next object does not fit u32"))?;
+                    let generation = u16::try_from(field2)
+                        .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
+                    entries.insert(
+                        ObjectRef::new(object_number, generation),
+                        XrefOffset::Free { next },
+                    );
+                }
                 1 => {
                     let generation = u16::try_from(field2)
                         .map_err(|_| Error::parse(0, "generation does not fit u16"))?;

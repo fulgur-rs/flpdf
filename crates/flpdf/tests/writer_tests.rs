@@ -434,6 +434,79 @@ fn write_pdf_rewrites_xref_stream_input_as_xref_stream_output() {
 }
 
 #[test]
+fn write_pdf_preserves_xref_stream_free_tombstones() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Deleted false >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut first_xref_entries = Vec::new();
+    append_xref_stream_entry(&mut first_xref_entries, 0, 0, 255);
+    append_xref_stream_entry(&mut first_xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut first_xref_entries, 1, object_offsets[1] as u32, 0);
+    append_xref_stream_entry(&mut first_xref_entries, 1, object_offsets[2] as u32, 0);
+
+    let first_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut first_xref_entries, 1, first_xref_offset as u32, 0);
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 3 1] /Index [0 5] /Length {} >>\nstream\n",
+            first_xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&first_xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut tombstone_xref_entries = Vec::new();
+    append_xref_stream_entry(&mut tombstone_xref_entries, 0, 0, 1);
+    let tombstone_xref_offset = bytes.len();
+    append_xref_stream_entry(
+        &mut tombstone_xref_entries,
+        1,
+        tombstone_xref_offset as u32,
+        0,
+    );
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 3 1] /Index [2 1 5 1] /Length {} /Prev {} >>\nstream\n",
+            tombstone_xref_entries.len(),
+            first_xref_offset,
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&tombstone_xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{tombstone_xref_offset}\n%%EOF\n").as_bytes());
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(latest_entries.get(&2), Some(&b'f'));
+}
+
+#[test]
 fn write_pdf_rewrites_flate_object_stream_member_and_recomputes_first() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
@@ -903,18 +976,150 @@ fn as_integer(object: &Object) -> Option<i64> {
 }
 
 fn parse_last_xref_entries(bytes: &[u8]) -> BTreeMap<u32, u8> {
-    let mut cursor = Cursor::new(bytes);
-    let loaded =
-        load_xref_and_trailer(&mut cursor).expect("output should include a valid xref section");
-    let mut entries = BTreeMap::new();
-
-    for object_ref in loaded.entries.keys() {
-        entries.insert(object_ref.number, b'n');
+    let startxref = usize::try_from(parse_startxref(bytes)).unwrap();
+    if bytes[startxref..].starts_with(b"xref") {
+        return parse_last_xref_table_entries(bytes, startxref);
     }
 
-    entries.entry(0).or_insert(b'f');
+    let mut cursor = Cursor::new(bytes);
+    let loaded = load_xref_and_trailer(&mut cursor)
+        .expect("output should include a valid xref stream dictionary");
+    let stream_data = latest_xref_stream_data(bytes, startxref);
+    let (w0, w1, w2) = xref_stream_widths(&loaded.trailer);
+    let ranges = xref_stream_ranges(&loaded.trailer);
+    let entry_width = w0 + w1 + w2;
+    let mut entries = BTreeMap::new();
+
+    let mut pos = 0;
+    for (start, count) in ranges {
+        for index in 0..count {
+            let entry = &stream_data[pos..pos + entry_width];
+            let object_type = if w0 == 0 {
+                1
+            } else {
+                read_be_usize(&entry[..w0])
+            };
+
+            entries.insert(
+                start + index,
+                match object_type {
+                    0 => b'f',
+                    1 | 2 => b'n',
+                    other => panic!("unsupported xref stream entry type {other}"),
+                },
+            );
+            pos += entry_width;
+        }
+    }
 
     entries
+}
+
+fn parse_last_xref_table_entries(bytes: &[u8], startxref: usize) -> BTreeMap<u32, u8> {
+    let rendered = String::from_utf8_lossy(&bytes[startxref..]);
+    let mut lines = rendered[5..].lines();
+    let mut entries = BTreeMap::new();
+
+    while let Some(section) = lines.next() {
+        if section == "trailer" {
+            break;
+        }
+
+        let mut fields = section.split_whitespace();
+        let start: u32 = fields
+            .next()
+            .unwrap_or_else(|| panic!("invalid xref subsection header: {section}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid xref start token {section}"));
+        let count: u32 = fields
+            .next()
+            .unwrap_or_else(|| panic!("missing xref count for start {start}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid xref count token {section}"));
+
+        for index in 0..count {
+            let entry_line = lines
+                .next()
+                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
+            let mut entry_fields = entry_line.split_whitespace();
+            let _ = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
+            let _ = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing generation in xref subsection {start} {count}"));
+            let status = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing status in xref subsection {start} {count}"));
+
+            entries.insert(start + index, status.as_bytes()[0]);
+        }
+    }
+
+    entries
+}
+
+fn latest_xref_stream_data(bytes: &[u8], startxref: usize) -> &[u8] {
+    let tail = &bytes[startxref..];
+    let stream_marker = b"stream";
+    let stream_pos = tail
+        .windows(stream_marker.len())
+        .position(|window| window == stream_marker)
+        .unwrap_or_else(|| panic!("missing xref stream data"));
+    let mut data_start = startxref + stream_pos + stream_marker.len();
+    if bytes.get(data_start) == Some(&b'\r') {
+        data_start += 1;
+    }
+    if bytes.get(data_start) == Some(&b'\n') {
+        data_start += 1;
+    }
+    let end_marker = b"endstream";
+    let data_end = bytes[data_start..]
+        .windows(end_marker.len())
+        .position(|window| window == end_marker)
+        .map(|offset| data_start + offset)
+        .unwrap_or_else(|| panic!("missing xref endstream"));
+    let mut data_end = data_end;
+    while data_end > data_start && bytes[data_end - 1].is_ascii_whitespace() {
+        data_end -= 1;
+    }
+
+    &bytes[data_start..data_end]
+}
+
+fn xref_stream_widths(trailer: &flpdf::Dictionary) -> (usize, usize, usize) {
+    let Some(Object::Array(widths)) = trailer.get("W") else {
+        panic!("xref stream missing /W")
+    };
+    assert_eq!(widths.len(), 3);
+    (
+        as_integer(&widths[0]).unwrap() as usize,
+        as_integer(&widths[1]).unwrap() as usize,
+        as_integer(&widths[2]).unwrap() as usize,
+    )
+}
+
+fn xref_stream_ranges(trailer: &flpdf::Dictionary) -> Vec<(u32, u32)> {
+    if let Some(Object::Array(index)) = trailer.get("Index") {
+        return index
+            .chunks_exact(2)
+            .map(|chunk| {
+                (
+                    as_integer(&chunk[0]).unwrap() as u32,
+                    as_integer(&chunk[1]).unwrap() as u32,
+                )
+            })
+            .collect();
+    }
+
+    let size = as_integer(trailer.get("Size").expect("xref stream missing /Size")).unwrap() as u32;
+    vec![(0, size)]
+}
+
+fn read_be_usize(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .fold(0usize, |value, byte| (value << 8) | usize::from(*byte))
 }
 
 fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {

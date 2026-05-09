@@ -172,7 +172,7 @@ fn parses_xref_stream_with_compressed_entries() {
 }
 
 #[test]
-fn loads_previous_xref_stream_entries_for_omitted_objects() {
+fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let obj1 = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
@@ -205,10 +205,7 @@ fn loads_previous_xref_stream_entries_for_omitted_objects() {
 
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Compressed {
-            stream: 12,
-            index: 0
-        })
+        Some(&XrefOffset::Free { next: 0 })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),

@@ -48,6 +48,7 @@ impl<R: Read + Seek> Pdf<R> {
             .entries
             .iter()
             .filter_map(|(object_ref, offset)| match offset {
+                crate::XrefOffset::Free { .. } => None,
                 crate::XrefOffset::Offset(offset) => Some((*object_ref, *offset)),
                 crate::XrefOffset::Compressed { .. } => None,
             })
