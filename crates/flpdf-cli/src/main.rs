@@ -204,8 +204,18 @@ fn run_show_outline(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
     println!("Outline:");
     let mut counter = 1usize;
     let mut visited = BTreeSet::new();
+    const MAX_OUTLINE_DEPTH: usize = 100;
     if let Some(first) = outline_root.get_ref("First") {
-        dump_outline_items(&mut pdf, first, 0, &mut visited, &mut counter)?;
+        if let Err(error) = dump_outline_items(
+            &mut pdf,
+            first,
+            0,
+            &mut visited,
+            &mut counter,
+            MAX_OUTLINE_DEPTH,
+        ) {
+            eprintln!("Warning: {error}");
+        }
     }
     if counter == 1 {
         println!("  <empty>");
@@ -227,7 +237,17 @@ fn run_show_fonts(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Erro
 
     let mut seen_nodes = BTreeSet::new();
     let mut font_refs: BTreeMap<Vec<u8>, Object> = BTreeMap::new();
-    collect_font_resources(&mut pdf, pages_ref, &mut seen_nodes, &mut font_refs)?;
+    const MAX_PAGE_TREE_DEPTH: usize = 100;
+    if let Err(error) = collect_font_resources(
+        &mut pdf,
+        pages_ref,
+        &mut seen_nodes,
+        &mut font_refs,
+        0,
+        MAX_PAGE_TREE_DEPTH,
+    ) {
+        eprintln!("Warning: {error}");
+    }
 
     println!("Fonts:");
     if font_refs.is_empty() {
@@ -265,9 +285,26 @@ fn dump_outline_items(
     depth: usize,
     visited: &mut BTreeSet<ObjectRef>,
     counter: &mut usize,
+    max_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if depth >= max_depth {
+        return Err(format!(
+            "outline depth exceeds maximum of {} at {}",
+            max_depth, start
+        )
+        .into());
+    }
+
     let mut current = Some(start);
     while let Some(current_ref) = current {
+        if depth >= max_depth {
+            return Err(format!(
+                "outline depth exceeds maximum of {} at {}",
+                max_depth, current_ref
+            )
+            .into());
+        }
+
         if !visited.insert(current_ref) {
             break;
         }
@@ -287,7 +324,7 @@ fn dump_outline_items(
         *counter += 1;
 
         if let Some(first) = dict.get_ref("First") {
-            dump_outline_items(pdf, first, depth + 1, visited, counter)?;
+            dump_outline_items(pdf, first, depth + 1, visited, counter, max_depth)?;
         }
 
         current = dict.get_ref("Next");
@@ -301,7 +338,17 @@ fn collect_font_resources(
     node: ObjectRef,
     seen: &mut BTreeSet<ObjectRef>,
     fonts: &mut BTreeMap<Vec<u8>, Object>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if depth >= max_depth {
+        return Err(format!(
+            "page tree depth exceeds maximum of {} at {}",
+            max_depth, node
+        )
+        .into());
+    }
+
     if !seen.insert(node) {
         return Ok(());
     }
@@ -323,7 +370,7 @@ fn collect_font_resources(
         if let Some(Object::Array(kids)) = dict.get("Kids") {
             for kid in kids {
                 if let Object::Reference(reference) = kid {
-                    collect_font_resources(pdf, *reference, seen, fonts)?;
+                    collect_font_resources(pdf, *reference, seen, fonts, depth + 1, max_depth)?;
                 }
             }
         }
