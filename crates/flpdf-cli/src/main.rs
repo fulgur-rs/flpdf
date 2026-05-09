@@ -311,12 +311,7 @@ fn run_show_outline(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     }
 
     for (index, item) in items.iter().enumerate() {
-        println!(
-            "{}{}: {}",
-            "  ".repeat(item.depth),
-            index + 1,
-            item.title
-        );
+        println!("{}{}: {}", "  ".repeat(item.depth), index + 1, item.title);
     }
     Ok(())
 }

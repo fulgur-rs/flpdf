@@ -35,10 +35,7 @@ pub fn check_reader_strict<R: Read + Seek>(reader: R) -> crate::Result<CheckRepo
     check_reader_inner(reader, false)
 }
 
-fn check_reader_inner<R: Read + Seek>(
-    reader: R,
-    allow_repair: bool,
-) -> crate::Result<CheckReport> {
+fn check_reader_inner<R: Read + Seek>(reader: R, allow_repair: bool) -> crate::Result<CheckReport> {
     let mut pdf = if allow_repair {
         match Pdf::open_with_repair(reader) {
             Ok(pdf) => pdf,

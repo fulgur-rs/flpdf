@@ -56,9 +56,9 @@ impl ObjectRef {
                 "invalid object ref '{input}'"
             )));
         }
-        let number = parts[0].parse::<u32>().map_err(|_| {
-            ParseObjectRefError::new(format!("invalid object number in '{input}'"))
-        })?;
+        let number = parts[0]
+            .parse::<u32>()
+            .map_err(|_| ParseObjectRefError::new(format!("invalid object number in '{input}'")))?;
         let generation = parts[1].parse::<u16>().map_err(|_| {
             ParseObjectRefError::new(format!("invalid object generation in '{input}'"))
         })?;

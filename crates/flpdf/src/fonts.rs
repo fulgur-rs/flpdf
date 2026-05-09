@@ -136,10 +136,7 @@ fn collect_page_fonts<R: Read + Seek>(
                 fonts.insert(font_name.to_vec(), Object::Dictionary(font_dict.clone()));
             }
             Object::Stream(stream) => {
-                fonts.insert(
-                    font_name.to_vec(),
-                    Object::Dictionary(stream.dict.clone()),
-                );
+                fonts.insert(font_name.to_vec(), Object::Dictionary(stream.dict.clone()));
             }
             _ => {}
         }
