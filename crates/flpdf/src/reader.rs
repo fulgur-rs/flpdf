@@ -7,6 +7,26 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 
+/// Lazily parsed PDF document handle.
+///
+/// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
+/// table and the trailer; individual objects are parsed on first access via
+/// [`Pdf::resolve`]. The same handle is what every higher-level helper
+/// ([`crate::pages`], [`crate::outline`], [`crate::fonts`], [`crate::write_pdf`])
+/// consumes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{ObjectRef, Pdf};
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// println!("version {}", pdf.version());
+/// let catalog = pdf.resolve(pdf.root_ref().expect("root"))?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct Pdf<R: Read + Seek> {
     reader: R,
     version: String,
@@ -21,18 +41,26 @@ pub struct Pdf<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> Pdf<R> {
+    /// Open a document strictly: parse the cross-reference and trailer, but do not run
+    /// the recovery heuristics. Returns an [`Error`] if the document is malformed.
     pub fn open(reader: R) -> Result<Self> {
         Self::open_with_repair_mode(reader, false)
     }
 
+    /// Open a document, falling back to qpdf-style xref/trailer recovery when the
+    /// strict parse fails. Diagnostics from the recovery pass are stored on the handle
+    /// and exposed via [`Pdf::repair_diagnostics`].
     pub fn open_with_repair(reader: R) -> Result<Self> {
         Self::open_with_repair_mode(reader, true)
     }
 
+    /// Alias for [`Pdf::open_with_repair`].
     pub fn open_best_effort(reader: R) -> Result<Self> {
         Self::open_with_repair_mode(reader, true)
     }
 
+    /// Diagnostics emitted while opening the document — typically warnings from the
+    /// xref/trailer recovery path. Always non-empty when the parse hit a soft failure.
     pub fn repair_diagnostics(&self) -> &Diagnostics {
         &self.repair_diagnostics
     }
@@ -68,10 +96,14 @@ impl<R: Read + Seek> Pdf<R> {
         })
     }
 
+    /// PDF version header as written in the first line of the file (e.g. `"1.7"`).
     pub fn version(&self) -> &str {
         &self.version
     }
 
+    /// The trailer dictionary (or the dictionary attached to the trailing xref stream
+    /// for cross-reference-stream documents). This is where you'd reach for `/Root`,
+    /// `/Info`, `/Size`, `/ID`, etc.
     pub fn trailer(&self) -> &Dictionary {
         &self.trailer
     }
@@ -100,6 +132,11 @@ impl<R: Read + Seek> Pdf<R> {
         self.compressed_member_parents.get(&object_ref).copied()
     }
 
+    /// Replace `object_ref` with `object` in the in-memory object cache.
+    ///
+    /// The original on-disk bytes are not touched; an incremental rewrite via
+    /// [`crate::write_pdf`] will see the updated value when it walks the cache and emit
+    /// a new revision for the touched object.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
@@ -133,6 +170,8 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(bytes)
     }
 
+    /// Number of objects currently resolved in the cache. Useful when you want to
+    /// confirm that lazy resolution actually deferred work.
     pub fn resolved_count(&self) -> usize {
         self.cache.resolved_count()
     }
@@ -155,14 +194,21 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.deleted_refs()
     }
 
+    /// Every object reference known from the cross-reference table, including objects
+    /// that have not yet been parsed.
     pub fn object_refs(&self) -> Vec<ObjectRef> {
         self.cache.object_refs()
     }
 
+    /// `/Root` as listed in the trailer, when present.
     pub fn root_ref(&self) -> Option<ObjectRef> {
         self.trailer.get_ref("Root")
     }
 
+    /// Locate the linearization hint dictionary if this document is linearized
+    /// ("fast web view"). Returns `Ok(None)` for non-linearized documents.
+    ///
+    /// This resolves object `(1, 0)` and inspects its `/Linearized` entry.
     pub fn linearized_hint_ref(&mut self) -> Result<Option<ObjectRef>> {
         let candidate = ObjectRef::new(1, 0);
         let object = self.resolve(candidate)?;
@@ -182,6 +228,11 @@ impl<R: Read + Seek> Pdf<R> {
         })
     }
 
+    /// Resolve `object_ref` to its concrete value, parsing on demand.
+    ///
+    /// Resolution caches the result so subsequent calls are constant-time. Unknown,
+    /// freed, or compressed-but-broken entries return [`Object::Null`] rather than an
+    /// error, matching the behavior the PDF spec mandates for missing objects (§7.3.10).
     pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
         match self.cache.entry(object_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => Ok(object),
