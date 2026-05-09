@@ -1,84 +1,55 @@
-# Agent Instructions
+# Repository Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+## 1) Project shape
+- This is a Rust workspace with two crates:
+  - `crates/flpdf` (core PDF reader/writer library)
+  - `crates/flpdf-cli` (CLI that wraps the library)
+- `Cargo.toml` has workspace dependencies; `cargo` runs at repo root to affect both crates.
 
-## Quick Reference
+## 2) Entry points
+- Core API is exported from `crates/flpdf/src/lib.rs`.
+- CLI flags and commands are implemented in `crates/flpdf-cli/src/main.rs`.
+- `be aware`: CLI uses the same reader/writer paths as library, so regressions often surface in both `flpdf` and `flpdf-cli` test suites.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
-```
+## 3) Task tracking (mandatory)
+- Use `bd` for issue work. Start with `bd prime`.
+- Common workflow:
+  - `bd ready`
+  - `bd show <id>`
+  - `bd update <id> --claim`
+  - `bd close <id>`
+- At session end, push Beads state and git before handing off.
+- If a task should be split, use stacked PR flow (smaller dependent branches) instead of one large branch.
 
-## Non-Interactive Shell Commands
+## 4) Development commands
+- Build/verify order that usually saves time:
+  - `cargo fmt -- --check`
+  - `cargo test -p <crate> --test <name>`
+  - `cargo test -p <crate>`
+  - `cargo test` (workspace)
+- High-signal focused checks:
+  - `cargo test -p flpdf --test reader_tests`
+  - `cargo test -p flpdf --test xref_tests`
+  - `cargo test -p flpdf --test check_tests`
+  - `cargo test -p flpdf --test writer_tests`
+  - `cargo test -p flpdf-cli --test cli_tests`
+  - `cargo test -p flpdf-cli --test compat_matrix_tests` (skips if `qpdf` is not installed)
+- Quick integration smoke:
+  - `cargo run --bin flpdf -- --check tests/fixtures/minimal.pdf`
+  - `cargo run --bin flpdf -- tests/fixtures/minimal.pdf /tmp/out.pdf`
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+## 5) Test fixtures / helpers
+- Use real fixtures under `tests/fixtures/` and compatibility data under `tests/fixtures/compat` + `tests/fixtures/compat/golden`.
+- Temporary files in tests/fixtures are generally built as tiny synthetic PDFs with explicit xref+trailer offsets, so verify offsets and `/Root` when editing.
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+## 6) Repo conventions
+- Use non-interactive shell flags (`cp -f`, `mv -f`, `rm -f`, recursive `-rf`) to avoid hangs.
+- Do not edit `AGENTS.md`/`CLAUDE.md`/`docs/superpowers/...` unless instruction updates are needed.
+- `.beads/issues.jsonl` is tracked by Beads tooling and `.gitignore`d; avoid manual edits unless explicitly requested by issue workflow.
 
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
-
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
-```
-
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
-
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
-
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
-
-### Quick Reference
-
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
-
-## Session Completion
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
+## 7) Session close
+- Before finishing, ensure quality gates ran for changed code, then push both Beads and git:
+  - `bd dolt push`
+  - `git pull --rebase` (optional if already synced)
+  - `git push`
+- Do not hand off before remote push succeeds.
