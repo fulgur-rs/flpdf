@@ -5,6 +5,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
+type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+type PageSequence = (Pdf<BufReader<File>>, Vec<ObjectRef>);
+
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
@@ -445,15 +448,13 @@ fn collect_font_resources(
     Ok(())
 }
 
-fn open_pdf(input: &PathBuf) -> Result<Pdf<BufReader<File>>, Box<dyn std::error::Error>> {
+fn open_pdf(input: &PathBuf) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input)?;
     let pdf = Pdf::open(BufReader::new(file))?;
     Ok(pdf)
 }
 
-fn load_page_sequence(
-    input: Option<PathBuf>,
-) -> Result<(Pdf<BufReader<File>>, Vec<ObjectRef>), Box<dyn std::error::Error>> {
+fn load_page_sequence(input: Option<PathBuf>) -> CliResult<PageSequence> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
