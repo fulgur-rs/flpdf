@@ -148,14 +148,20 @@ fn rebuild_object_stream<R: Read + Seek>(
     let mut header_parser = Parser::new(&stream_data);
     let mut members = Vec::with_capacity(object_count);
     for _ in 0..object_count {
-        let number = parse_non_negative_i64_value(
+        let number = u32::try_from(parse_non_negative_i64_value(
             header_parser.integer_for_indirect()?,
             "object stream object number",
-        )? as u32;
-        let offset = parse_non_negative_i64_value(
+        )?)
+        .map_err(|_| {
+            crate::Error::Unsupported("object stream object number does not fit u32".to_string())
+        })?;
+        let offset = usize::try_from(parse_non_negative_i64_value(
             header_parser.integer_for_indirect()?,
             "object stream object offset",
-        )? as usize;
+        )?)
+        .map_err(|_| {
+            crate::Error::Unsupported("object stream object offset does not fit usize".to_string())
+        })?;
         members.push((number, offset));
     }
 

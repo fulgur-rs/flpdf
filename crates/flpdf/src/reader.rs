@@ -255,9 +255,13 @@ fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -
     }
 
     let start = first
-        + usize::try_from(object_offsets[target_index])
-            .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?;
-    if start > stream_object.data.len() {
+        .checked_add(
+            usize::try_from(object_offsets[target_index])
+                .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?,
+        )
+        .ok_or_else(|| Error::parse(0, "compressed object offset overflow"))?;
+
+    if start > stream_data.len() {
         return Err(Error::parse(0, "compressed object offset out of range"));
     }
 
