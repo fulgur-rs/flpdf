@@ -52,3 +52,5 @@
 # - linear.api-key
 # - github.org
 # - github.repo
+
+sync.remote: "https://github.com/fulgur-rs/beads-flpdf.git"
