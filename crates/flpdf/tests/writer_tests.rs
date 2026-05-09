@@ -92,10 +92,12 @@ fn write_pdf_twice_builds_valid_prev_chain() {
 
     let mut prior_size = None;
     let mut prior_startxref = source_startxref;
+    let mut prior_generations = None;
 
     for (generation, bytes) in generations.iter().enumerate() {
         let current_startxref = parse_startxref(bytes);
         let parsed = Pdf::open(Cursor::new(bytes)).unwrap();
+        let current_generations = parse_last_xref_generations(bytes);
         let trailer = parsed.trailer();
 
         let prev = trailer.get("Prev");
@@ -121,6 +123,19 @@ fn write_pdf_twice_builds_valid_prev_chain() {
 
         prior_size = Some(size);
         prior_startxref = current_startxref;
+
+        if let Some(previous_generations) = prior_generations.as_ref() {
+            for (object_number, previous_generation) in previous_generations {
+                if let Some(current_generation) = current_generations.get(object_number) {
+                    assert!(
+                        current_generation >= previous_generation,
+                        "generation {object_number} decreased from {previous_generation} to {current_generation} in generation {generation}",
+                    );
+                }
+            }
+        }
+
+        prior_generations = Some(current_generations);
     }
 }
 
@@ -528,7 +543,13 @@ fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
 
 fn parse_startxref(bytes: &[u8]) -> u64 {
     let marker = b"startxref";
-    let Some(pos) = bytes
+    let eof = bytes
+        .windows(b"%%EOF".len())
+        .rposition(|window| window == b"%%EOF")
+        .unwrap_or(bytes.len());
+    let search = &bytes[..eof];
+
+    let Some(pos) = search
         .windows(marker.len())
         .rposition(|window| window == marker)
     else {
@@ -536,12 +557,12 @@ fn parse_startxref(bytes: &[u8]) -> u64 {
     };
 
     let mut cursor = pos + marker.len();
-    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+    while cursor < search.len() && search[cursor].is_ascii_whitespace() {
         cursor += 1;
     }
 
     let start = cursor;
-    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+    while cursor < search.len() && search[cursor].is_ascii_digit() {
         cursor += 1;
     }
 
@@ -549,8 +570,68 @@ fn parse_startxref(bytes: &[u8]) -> u64 {
         panic!("missing startxref offset")
     }
 
-    let value = std::str::from_utf8(&bytes[start..cursor]).unwrap();
+    let value = std::str::from_utf8(&search[start..cursor]).unwrap();
     value.parse::<u64>().unwrap()
+}
+
+fn parse_last_xref_generations(bytes: &[u8]) -> BTreeMap<u32, u16> {
+    let rendered = String::from_utf8_lossy(bytes);
+    let xref_pos = if let Some(pos) = rendered.rfind("\nxref\n") {
+        pos
+    } else if let Some(pos) = rendered.rfind("xref\n") {
+        pos.saturating_sub(1)
+    } else {
+        panic!("missing xref section");
+    };
+
+    let section_pos = if &rendered[xref_pos + 1..xref_pos + 6] == "xref\n" {
+        xref_pos + 1
+    } else {
+        panic!("missing xref section");
+    };
+
+    let mut lines = rendered[section_pos + 5..].lines();
+    let mut generations = BTreeMap::new();
+
+    while let Some(section) = lines.next() {
+        if section == "trailer" {
+            break;
+        }
+
+        let mut fields = section.split_whitespace();
+        let start: u32 = fields
+            .next()
+            .unwrap_or_else(|| panic!("invalid xref subsection header: {section}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid xref start token {section}"));
+        let count: u32 = fields
+            .next()
+            .unwrap_or_else(|| panic!("missing xref count for start {start}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid xref count token {section}"));
+
+        for index in 0..count {
+            let entry_line = lines
+                .next()
+                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
+            let mut entry_fields = entry_line.split_whitespace();
+
+            let _ = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
+            let generation: u16 = entry_fields
+                .next()
+                .unwrap_or_else(|| panic!("missing generation in xref subsection {start} {count}"))
+                .parse()
+                .unwrap_or_else(|_| {
+                    panic!("invalid generation in xref subsection {start} {count}")
+                });
+
+            generations.insert(start + index, generation);
+        }
+    }
+
+    generations
 }
 
 fn as_integer(object: &Object) -> Option<i64> {
