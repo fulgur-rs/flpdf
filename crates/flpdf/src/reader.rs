@@ -1,23 +1,48 @@
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::parser::{parse_indirect_object, Parser};
-use crate::{load_xref_and_trailer, Dictionary, Error, Object, ObjectRef, Result};
+use crate::{
+    load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
+    Object, ObjectRef, Result,
+};
 use std::io::{Read, Seek, SeekFrom};
 
 pub struct Pdf<R: Read + Seek> {
     reader: R,
     version: String,
     trailer: Dictionary,
+    repair_diagnostics: Diagnostics,
     cache: ObjectCache,
 }
 
 impl<R: Read + Seek> Pdf<R> {
-    pub fn open(mut reader: R) -> Result<Self> {
-        let loaded = load_xref_and_trailer(&mut reader)?;
+    pub fn open(reader: R) -> Result<Self> {
+        Self::open_with_repair_mode(reader, false)
+    }
+
+    pub fn open_with_repair(reader: R) -> Result<Self> {
+        Self::open_with_repair_mode(reader, true)
+    }
+
+    pub fn open_best_effort(reader: R) -> Result<Self> {
+        Self::open_with_repair_mode(reader, true)
+    }
+
+    pub fn repair_diagnostics(&self) -> &Diagnostics {
+        &self.repair_diagnostics
+    }
+
+    fn open_with_repair_mode(mut reader: R, allow_repair: bool) -> Result<Self> {
+        let loaded = if allow_repair {
+            load_xref_and_trailer_with_repair(&mut reader, allow_repair)?
+        } else {
+            load_xref_and_trailer(&mut reader)?
+        };
         let cache = ObjectCache::from_offsets(&loaded.entries);
         Ok(Self {
             reader,
             version: loaded.version,
             trailer: loaded.trailer,
+            repair_diagnostics: loaded.repair_diagnostics,
             cache,
         })
     }
