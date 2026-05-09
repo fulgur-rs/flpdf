@@ -239,7 +239,7 @@ fn make_xref_stream_object(
         .unwrap_or_default();
 
     let mut object = format!(
-        "{} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 4] /Length {}{} >>\nstream\n",
+        "{} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {}{} >>\nstream\n",
         object_number,
         entries.len(),
         prev

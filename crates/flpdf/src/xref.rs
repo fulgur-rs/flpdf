@@ -130,9 +130,6 @@ fn merge_previous_xref_sections(
 
         let previous = match parse_xref_from_start(bytes, previous_pos, offset, version) {
             Ok(previous) => previous,
-            Err(error) if allow_repair => {
-                return Err(error);
-            }
             Err(error) => return Err(error),
         };
 
