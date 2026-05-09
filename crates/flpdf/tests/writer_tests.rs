@@ -65,6 +65,110 @@ fn write_pdf_preserves_source_bytes() {
 }
 
 #[test]
+fn write_pdf_twice_builds_valid_prev_chain() {
+    let source_bytes = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let source_startxref = parse_startxref(&source_bytes);
+    let mut generations = Vec::new();
+
+    let mut source = source_bytes;
+
+    for _ in 0..3 {
+        let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+        let mut output = Vec::new();
+        write_pdf(&mut pdf, &mut output).unwrap();
+
+        let report = check_reader(Cursor::new(&output)).unwrap();
+        assert!(
+            report.valid,
+            "generation {} diagnostics: {:?}",
+            generations.len(),
+            report.diagnostics.entries()
+        );
+
+        generations.push(output.clone());
+
+        source = output.clone();
+    }
+
+    let mut prior_size = None;
+    let mut prior_startxref = source_startxref;
+
+    for (generation, bytes) in generations.iter().enumerate() {
+        let current_startxref = parse_startxref(bytes);
+        let parsed = Pdf::open(Cursor::new(bytes)).unwrap();
+        let trailer = parsed.trailer();
+
+        let prev = trailer.get("Prev");
+        let Some(Object::Integer(previous_xref)) = prev else {
+            panic!("generation {generation} is missing trailer /Prev")
+        };
+
+        assert_eq!(
+            *previous_xref as u64, prior_startxref,
+            "generation {generation} /Prev mismatch"
+        );
+
+        let size = trailer
+            .get("Size")
+            .and_then(as_integer)
+            .expect("generation trailer missing integer /Size");
+        if let Some(previous_size) = prior_size {
+            assert!(
+                size >= previous_size,
+                "generation {generation} reduced /Size from {previous_size} to {size}",
+            );
+        }
+
+        prior_size = Some(size);
+        prior_startxref = current_startxref;
+    }
+}
+
+#[test]
+fn write_pdf_rewriting_chain_is_self_consistent_on_open() {
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut snapshots = Vec::new();
+    let mut current = source;
+
+    for _ in 0..2 {
+        let mut pdf = Pdf::open(Cursor::new(current.clone())).unwrap();
+        let mut output = Vec::new();
+        write_pdf(&mut pdf, &mut output).unwrap();
+        snapshots.push(output.clone());
+        current = output;
+    }
+
+    let mut chain = Vec::<u64>::new();
+
+    for generation in (1..snapshots.len()).rev() {
+        let current = &snapshots[generation];
+        let previous = &snapshots[generation - 1];
+
+        let pdf = Pdf::open(Cursor::new(current)).unwrap();
+        let prev = pdf
+            .trailer()
+            .get("Prev")
+            .and_then(as_integer)
+            .expect("trailer missing /Prev") as u64;
+
+        chain.push(prev);
+        assert_eq!(prev, parse_startxref(previous));
+
+        let report = check_reader(Cursor::new(current)).unwrap();
+        assert!(
+            report.valid,
+            "rewritten generation {generation} diagnostics: {:?}",
+            report.diagnostics.entries()
+        );
+    }
+
+    assert!(
+        !chain.is_empty(),
+        "expected /Prev values while validating rewritten chain",
+    );
+}
+
+#[test]
 fn write_pdf_emits_only_touched_objects() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut object_offsets = Vec::new();
@@ -420,6 +524,40 @@ fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
     }
 
     count
+}
+
+fn parse_startxref(bytes: &[u8]) -> u64 {
+    let marker = b"startxref";
+    let Some(pos) = bytes
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+    else {
+        panic!("missing startxref marker")
+    };
+
+    let mut cursor = pos + marker.len();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    let start = cursor;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+        cursor += 1;
+    }
+
+    if start == cursor {
+        panic!("missing startxref offset")
+    }
+
+    let value = std::str::from_utf8(&bytes[start..cursor]).unwrap();
+    value.parse::<u64>().unwrap()
+}
+
+fn as_integer(object: &Object) -> Option<i64> {
+    match object {
+        Object::Integer(value) => Some(*value),
+        _ => None,
+    }
 }
 
 fn parse_last_xref_entries(bytes: &[u8]) -> BTreeMap<u32, u8> {
