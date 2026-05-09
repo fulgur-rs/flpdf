@@ -379,6 +379,51 @@ fn set_object_after_delete_keeps_object_live() {
 }
 
 #[test]
+fn delete_object_ignores_existing_free_tombstone() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n");
+    bytes.extend_from_slice(b"0000000002 65535 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", object_offsets[0]).as_bytes());
+    bytes.extend_from_slice(b"0000000000 00001 f \n");
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", object_offsets[1]).as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.delete_object(ObjectRef::new(2, 1));
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 1)),
+        Some(&XrefOffset::Free { next: 0 })
+    );
+}
+
+#[test]
 fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 

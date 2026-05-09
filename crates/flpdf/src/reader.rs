@@ -115,6 +115,14 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        if object_ref.number == 0
+            || matches!(
+                self.cache.entry(object_ref),
+                Some(CacheEntry::Deleted | CacheEntry::Missing)
+            )
+        {
+            return;
+        }
         self.cache.set_deleted(object_ref);
     }
 
