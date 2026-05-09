@@ -299,6 +299,83 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
 }
 
 #[test]
+fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+
+    let xref_stream_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, xref_stream_offset as u32, 0);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&xref_entries).unwrap();
+    let encoded_xref = encoder.finish().unwrap();
+
+    let xref_offset = xref_stream_offset;
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Filter /FlateDecode /DecodeParms << >> /F (stream-fallback) /FFilter /FlateDecode /FDecodeParms << >> /Length {} /XRefStm 999 >>\nstream\n",
+            encoded_xref.len(),
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&encoded_xref);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let source = bytes;
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    let trailer = rewritten.trailer();
+    for leaked_key in [
+        "Type",
+        "Filter",
+        "DecodeParms",
+        "F",
+        "FFilter",
+        "FDecodeParms",
+        "Length",
+        "W",
+        "Index",
+        "XRefStm",
+    ] {
+        assert!(
+            trailer.get(leaked_key).is_none(),
+            "incremental trailer should remove xref-stream key {leaked_key}"
+        );
+    }
+    assert_eq!(trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert!(trailer.get("Size").is_some());
+    assert!(trailer.get("Prev").is_some());
+}
+
+#[test]
 fn write_pdf_rewrites_flate_object_stream_member_and_recomputes_first() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();

@@ -350,6 +350,22 @@ fn write_incremental_trailer<R: Read + Seek>(
     xref_offset: usize,
 ) -> Result<()> {
     let mut trailer = pdf.trailer().clone();
+    if matches!(
+        trailer.get("Type"),
+        Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef"
+    ) {
+        trailer.remove("Type");
+        trailer.remove("Filter");
+        trailer.remove("DecodeParms");
+        trailer.remove("F");
+        trailer.remove("FFilter");
+        trailer.remove("FDecodeParms");
+        trailer.remove("Length");
+        trailer.remove("W");
+        trailer.remove("Index");
+        trailer.remove("XRefStm");
+    }
+
     trailer.insert("Size", Object::Integer(object_count as i64));
     trailer.insert("Root", Object::Reference(*root_ref));
     trailer.insert(
