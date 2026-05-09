@@ -5,3 +5,4 @@
 .beads-credential-key
 .beads/issues.jsonl
 target/
+.worktrees/

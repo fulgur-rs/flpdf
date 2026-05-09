@@ -43,6 +43,10 @@ impl ObjectCache {
             .insert(object_ref, CacheEntry::Resolved(object));
     }
 
+    pub(crate) fn entries(&self) -> &BTreeMap<ObjectRef, CacheEntry> {
+        &self.entries
+    }
+
     pub fn resolved_count(&self) -> usize {
         self.entries
             .values()

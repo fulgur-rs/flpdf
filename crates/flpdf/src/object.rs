@@ -51,9 +51,11 @@ impl Object {
                 out.extend_from_slice(name);
             }
             Object::String(value) => {
-                out.push(b'(');
-                out.extend_from_slice(value);
-                out.push(b')');
+                if is_printable_string(value) {
+                    write_literal_string(out, value);
+                } else {
+                    write_hex_string(out, value);
+                }
             }
             Object::Array(values) => {
                 out.push(b'[');
@@ -79,6 +81,36 @@ impl Object {
     }
 }
 
+fn is_printable_string(value: &[u8]) -> bool {
+    value.iter().all(|byte| {
+        (0x20..=0x7e).contains(byte) && !matches!(*byte, b'(' | b')' | b'\\' | b'\r' | b'\n')
+    })
+}
+
+fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
+    out.push(b'(');
+    for byte in value {
+        match byte {
+            b'\\' | b'(' | b')' => {
+                out.push(b'\\');
+                out.push(*byte);
+            }
+            _ => out.push(*byte),
+        }
+    }
+    out.push(b')');
+}
+
+fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(b'<');
+    for byte in value {
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0x0f) as usize]);
+    }
+    out.push(b'>');
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Dictionary {
     entries: BTreeMap<Vec<u8>, Object>,
@@ -102,6 +134,10 @@ impl Dictionary {
             Some(Object::Reference(object_ref)) => Some(*object_ref),
             _ => None,
         }
+    }
+
+    pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Option<Object> {
+        self.entries.remove(key.as_ref())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &Object)> {
