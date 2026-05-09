@@ -18,6 +18,52 @@ fn rewrites_minimal_pdf_to_valid_pdf() {
 }
 
 #[test]
+fn write_pdf_preserves_source_bytes() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Marker (SENTINEL-UNTOUCHED) >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", object_offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &object_offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            object_offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+
+    let source = bytes;
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    assert!(output.len() > source.len());
+    assert_eq!(&output[..source.len()], &source[..]);
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(rendered.contains(&format!("/Prev {}", startxref)));
+}
+
+#[test]
 fn rewrites_pdf_with_real_numbers() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"%PDF-1.7\n");

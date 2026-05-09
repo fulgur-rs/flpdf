@@ -1,5 +1,5 @@
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
@@ -7,66 +7,104 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
         return Err(crate::Error::Missing("/Root"));
     };
 
-    let linearized_hint = pdf.linearized_hint_ref()?;
+    let mut bytes = pdf.source_bytes()?;
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
 
-    let mut queue = VecDeque::new();
-    let mut old_to_new = BTreeMap::from([(root_ref, root_ref)]);
-    queue.push_back(root_ref);
+    let source_offsets = build_source_offsets(pdf.xref_offsets());
+    let object_count = resolve_object_count(pdf.trailer().get("Size"), &source_offsets);
 
-    if let Some(linearized_ref) = linearized_hint {
-        if old_to_new.insert(linearized_ref, linearized_ref).is_none() {
-            queue.push_back(linearized_ref);
+    let xref_offset = write_incremental_xref(&mut bytes, &source_offsets, object_count)?;
+    write_incremental_trailer(
+        &mut bytes,
+        pdf,
+        &root_ref,
+        object_count,
+        pdf.startxref(),
+        xref_offset,
+    )?;
+
+    out.write_all(&bytes)?;
+    Ok(())
+}
+
+fn build_source_offsets(entries: Vec<(ObjectRef, u64)>) -> BTreeMap<u32, (u16, usize)> {
+    let mut source_offsets = BTreeMap::new();
+
+    for (object_ref, xref_offset) in entries {
+        let next = source_offsets
+            .get(&object_ref.number)
+            .copied()
+            .map(|(generation, _)| generation)
+            .unwrap_or(0);
+
+        if object_ref.generation >= next {
+            source_offsets.insert(
+                object_ref.number,
+                (object_ref.generation, xref_offset as usize),
+            );
         }
     }
 
-    let mut objects = Vec::new();
-    let mut offsets = BTreeMap::new();
+    source_offsets
+}
 
-    while let Some(old_ref) = queue.pop_front() {
-        let object = pdf.resolve(old_ref)?;
-        collect_refs(&object, &mut old_to_new, &mut queue);
-        objects.push((old_ref, object));
-    }
+fn resolve_object_count(
+    declared_size: Option<&crate::Object>,
+    source_offsets: &BTreeMap<u32, (u16, usize)>,
+) -> usize {
+    let max_object_number = source_offsets.keys().next_back().copied().unwrap_or(0) as usize;
+    let declared = match declared_size {
+        Some(crate::Object::Integer(size)) if *size > 0 => *size as usize,
+        _ => 0,
+    };
 
-    objects.sort_by_key(|(object_ref, _)| object_ref.number);
+    declared.max(max_object_number.saturating_add(1)).max(1)
+}
 
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"%PDF-1.7\n");
-
-    for (old_ref, object) in &objects {
-        let new_ref = old_to_new[old_ref];
-        offsets.insert(new_ref.number, bytes.len());
-        bytes.extend_from_slice(format!("{} 0 obj\n", new_ref.number).as_bytes());
-        let rewritten = rewrite_refs(object, &old_to_new);
-        rewritten.write_pdf(&mut bytes);
-        bytes.extend_from_slice(b"\nendobj\n");
-    }
-
+fn write_incremental_xref(
+    bytes: &mut Vec<u8>,
+    source_offsets: &BTreeMap<u32, (u16, usize)>,
+    object_count: usize,
+) -> Result<usize> {
     let xref_offset = bytes.len();
-    let object_count = objects
-        .iter()
-        .map(|(object_ref, _)| object_ref.number)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1) as usize;
-
     bytes.extend_from_slice(format!("xref\n0 {}\n", object_count).as_bytes());
     bytes.extend_from_slice(b"0000000000 65535 f \n");
+
     for number in 1..object_count {
-        match offsets.get(&(number as u32)) {
-            Some(offset) => bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+        match source_offsets.get(&(number as u32)) {
+            Some((generation, offset)) => {
+                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
+            }
             None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
         }
     }
 
-    let mut trailer = Dictionary::new();
-    trailer.insert("Size", Object::Integer(object_count as i64));
-    trailer.insert("Root", Object::Reference(old_to_new[&root_ref]));
-    bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(&mut bytes);
-    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    Ok(xref_offset)
+}
 
-    out.write_all(&bytes)?;
+fn write_incremental_trailer<R: Read + Seek>(
+    bytes: &mut Vec<u8>,
+    pdf: &Pdf<R>,
+    root_ref: &ObjectRef,
+    object_count: usize,
+    previous_xref_offset: u64,
+    xref_offset: usize,
+) -> Result<()> {
+    let mut trailer = pdf.trailer().clone();
+    trailer.insert("Size", Object::Integer(object_count as i64));
+    trailer.insert("Root", Object::Reference(*root_ref));
+    trailer.insert(
+        "Prev",
+        Object::Integer(previous_xref_offset.try_into().map_err(|_| {
+            crate::Error::Unsupported("startxref offset does not fit i64".to_string())
+        })?),
+    );
+
+    bytes.extend_from_slice(b"trailer\n");
+    trailer.write_pdf(bytes);
+    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
 }
 
@@ -128,66 +166,4 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     out.write_all(&bytes)?;
     Ok(())
-}
-
-fn collect_refs(
-    object: &Object,
-    old_to_new: &mut BTreeMap<ObjectRef, ObjectRef>,
-    queue: &mut VecDeque<ObjectRef>,
-) {
-    match object {
-        Object::Reference(object_ref) => {
-            if !old_to_new.contains_key(object_ref) {
-                old_to_new.insert(*object_ref, *object_ref);
-                queue.push_back(*object_ref);
-            }
-        }
-        Object::Array(values) => values
-            .iter()
-            .for_each(|value| collect_refs(value, old_to_new, queue)),
-        Object::Dictionary(dict) => dict
-            .iter()
-            .for_each(|(_, value)| collect_refs(value, old_to_new, queue)),
-        Object::Stream(stream) => stream
-            .dict
-            .iter()
-            .for_each(|(_, value)| collect_refs(value, old_to_new, queue)),
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::Name(_)
-        | Object::String(_) => {}
-    }
-}
-
-fn rewrite_refs(object: &Object, old_to_new: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
-    match object {
-        Object::Reference(object_ref) => old_to_new
-            .get(object_ref)
-            .copied()
-            .map(Object::Reference)
-            .unwrap_or(Object::Null),
-        Object::Array(values) => Object::Array(
-            values
-                .iter()
-                .map(|value| rewrite_refs(value, old_to_new))
-                .collect(),
-        ),
-        Object::Dictionary(dict) => {
-            let mut rewritten = Dictionary::new();
-            for (key, value) in dict.iter() {
-                rewritten.insert(key, rewrite_refs(value, old_to_new));
-            }
-            Object::Dictionary(rewritten)
-        }
-        Object::Stream(stream) => Object::Stream(crate::Stream::new(
-            match rewrite_refs(&Object::Dictionary(stream.dict.clone()), old_to_new) {
-                Object::Dictionary(dict) => dict,
-                _ => Dictionary::new(),
-            },
-            stream.data.clone(),
-        )),
-        other => other.clone(),
-    }
 }

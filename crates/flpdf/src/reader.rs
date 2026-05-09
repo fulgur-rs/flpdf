@@ -10,6 +10,7 @@ pub struct Pdf<R: Read + Seek> {
     reader: R,
     version: String,
     trailer: Dictionary,
+    startxref: u64,
     repair_diagnostics: Diagnostics,
     cache: ObjectCache,
 }
@@ -42,6 +43,7 @@ impl<R: Read + Seek> Pdf<R> {
             reader,
             version: loaded.version,
             trailer: loaded.trailer,
+            startxref: loaded.startxref,
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
         })
@@ -53,6 +55,33 @@ impl<R: Read + Seek> Pdf<R> {
 
     pub fn trailer(&self) -> &Dictionary {
         &self.trailer
+    }
+
+    pub(crate) fn startxref(&self) -> u64 {
+        self.startxref
+    }
+
+    pub(crate) fn xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
+        self.cache
+            .entries()
+            .iter()
+            .map(|(object_ref, entry)| (*object_ref, entry))
+            .filter_map(|(object_ref, entry)| match entry {
+                crate::cache::CacheEntry::Unresolved { offset } => Some((object_ref, *offset)),
+                crate::cache::CacheEntry::Resolved(_)
+                | crate::cache::CacheEntry::Compressed { .. }
+                | crate::cache::CacheEntry::Missing
+                | crate::cache::CacheEntry::Reserved
+                | crate::cache::CacheEntry::Deleted => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
+        self.reader.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        self.reader.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     pub fn resolved_count(&self) -> usize {
