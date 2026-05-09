@@ -19,7 +19,7 @@ pub use reader::Pdf;
 pub use writer::{write_pdf, write_qdf};
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    LoadedXref, XrefOffset,
+    LoadedXref, XrefForm, XrefOffset,
 };
 
 pub fn version() -> &'static str {

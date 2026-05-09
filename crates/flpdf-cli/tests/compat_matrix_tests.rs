@@ -1,9 +1,9 @@
 use assert_cmd::Command;
-use flpdf::{write_pdf, Object, ObjectRef, Pdf};
+use flpdf::{load_xref_and_trailer, write_pdf, Object, ObjectRef, Pdf, XrefForm};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 use tempfile::tempdir;
@@ -204,6 +204,34 @@ fn qpdf_incremental_rewrite_of_xref_stream_input_preserves_structure() {
 
     assert_eq!(qpdf_show_npages(&source), qpdf_show_npages(&output));
     qpdf_check(&output);
+}
+
+#[test]
+fn qpdf_incremental_xref_stream_form_round_trips() {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let tmp = tempdir().unwrap();
+    let source = qpdf_with_object_streams(&tmp.path().join("qpdf-xref-roundtrip"), "one-page.pdf");
+    let source_bytes = fs::read(&source).unwrap();
+    assert!(bytes_use_xref_stream(&source_bytes));
+
+    let output = tmp.path().join("qpdf-xref-roundtrip-rewrite.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([source.to_str().unwrap(), output.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let rewritten = fs::read(&output).unwrap();
+    assert!(bytes_use_xref_stream(&rewritten));
+    assert_eq!(qpdf_show_npages(&source), qpdf_show_npages(&output));
+    qpdf_check(&output);
+
+    let mut cursor = Cursor::new(&rewritten);
+    let loaded = load_xref_and_trailer(&mut cursor).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
 }
 
 #[test]
