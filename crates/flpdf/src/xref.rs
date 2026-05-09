@@ -9,6 +9,7 @@ pub struct LoadedXref {
     pub startxref: u64,
     pub entries: BTreeMap<ObjectRef, XrefOffset>,
     pub trailer: Dictionary,
+    pub last_xref_form: XrefForm,
     pub repair_diagnostics: Diagnostics,
 }
 
@@ -16,6 +17,12 @@ pub struct LoadedXref {
 pub enum XrefOffset {
     Offset(u64),
     Compressed { stream: u32, index: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrefForm {
+    Table,
+    Stream,
 }
 
 pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
@@ -99,6 +106,7 @@ fn parse_xref_from_start(
             startxref,
             entries,
             trailer,
+            last_xref_form: XrefForm::Table,
             repair_diagnostics: Diagnostics::default(),
         });
     }
@@ -167,6 +175,7 @@ fn recover_xref_from_linear_scan(
         startxref,
         entries,
         trailer,
+        last_xref_form: XrefForm::Table,
         repair_diagnostics,
     })
 }
@@ -414,6 +423,7 @@ fn parse_xref_stream(
         startxref,
         entries,
         trailer,
+        last_xref_form: XrefForm::Stream,
         repair_diagnostics: Diagnostics::default(),
     })
 }

@@ -1,6 +1,9 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use flpdf::{check_reader, filters, parse_object, write_pdf, write_qdf, Object, ObjectRef, Pdf};
+use flpdf::{
+    check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_qdf, Object,
+    ObjectRef, Pdf, XrefForm,
+};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
@@ -290,11 +293,17 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
     let mut output = Vec::new();
     write_pdf(&mut pdf, &mut output).unwrap();
 
+    let mut reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
     let xref = parse_last_xref_entries(&output);
     assert_eq!(xref.get(&0), Some(&b'f'));
     assert_eq!(xref.get(&1), Some(&b'n'));
     assert_eq!(xref.get(&3), Some(&b'n'));
-    assert!(!xref.contains_key(&2));
+    if matches!(loaded.last_xref_form, XrefForm::Stream) {
+        assert_eq!(xref.get(&2), Some(&b'n'));
+    } else {
+        assert!(!xref.contains_key(&2));
+    }
     assert!(!xref.contains_key(&4));
 }
 
@@ -355,6 +364,73 @@ fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
     assert!(!trailer_section.contains(" /Index ["));
     assert!(!trailer_section.contains(" /Length "));
     assert!(!trailer_section.contains(" /XRefStm "));
+}
+
+#[test]
+fn write_pdf_rewrites_xref_stream_input_as_xref_stream_output() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, source_xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let source = bytes;
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+    let root_ref = pdf.root_ref().expect("expected /Root");
+    let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref).unwrap() else {
+        panic!("root should be a dictionary");
+    };
+    root_dict.insert("FlpdfRegression", Object::Boolean(true));
+    pdf.set_object(root_ref, Object::Dictionary(root_dict));
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    let expected_prev = i64::try_from(source_xref_offset).unwrap();
+    let actual_prev = as_integer(
+        loaded
+            .trailer
+            .get("Prev")
+            .expect("expected /Prev in xref stream"),
+    );
+    assert_eq!(actual_prev, Some(expected_prev));
+    assert_eq!(&output[..source.len()], &source[..]);
 }
 
 #[test]
@@ -827,59 +903,16 @@ fn as_integer(object: &Object) -> Option<i64> {
 }
 
 fn parse_last_xref_entries(bytes: &[u8]) -> BTreeMap<u32, u8> {
-    let rendered = String::from_utf8_lossy(bytes);
-    let xref_pos = if let Some(pos) = rendered.rfind("\nxref\n") {
-        pos
-    } else if let Some(pos) = rendered.rfind("xref\n") {
-        pos.saturating_sub(1)
-    } else {
-        panic!("missing xref section");
-    };
-
-    let section_pos = if &rendered[xref_pos + 1..xref_pos + 6] == "xref\n" {
-        xref_pos + 1
-    } else {
-        panic!("missing xref section");
-    };
-    let mut lines = rendered[section_pos + 5..].lines();
+    let mut cursor = Cursor::new(bytes);
+    let loaded =
+        load_xref_and_trailer(&mut cursor).expect("output should include a valid xref section");
     let mut entries = BTreeMap::new();
 
-    while let Some(section) = lines.next() {
-        if section == "trailer" {
-            break;
-        }
-
-        let mut fields = section.split_whitespace();
-        let start: u32 = fields
-            .next()
-            .unwrap_or_else(|| panic!("invalid xref subsection header: {section}"))
-            .parse()
-            .unwrap_or_else(|_| panic!("invalid xref start token {section}"));
-        let count: u32 = fields
-            .next()
-            .unwrap_or_else(|| panic!("missing xref count for start {start}"))
-            .parse()
-            .unwrap_or_else(|_| panic!("invalid xref count token {section}"));
-
-        for index in 0..count {
-            let entry_line = lines
-                .next()
-                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
-            let mut entry_fields = entry_line.split_whitespace();
-
-            let _ = entry_fields
-                .next()
-                .unwrap_or_else(|| panic!("missing offset in xref subsection {start} {count}"));
-            let _ = entry_fields
-                .next()
-                .unwrap_or_else(|| panic!("missing generation in xref subsection {start} {count}"));
-            let status = entry_fields
-                .next()
-                .unwrap_or_else(|| panic!("missing status in xref subsection {start} {count}"));
-
-            entries.insert(start + index, status.as_bytes()[0]);
-        }
+    for object_ref in loaded.entries.keys() {
+        entries.insert(object_ref.number, b'n');
     }
+
+    entries.entry(0).or_insert(b'f');
 
     entries
 }

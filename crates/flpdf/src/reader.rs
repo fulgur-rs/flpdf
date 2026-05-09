@@ -2,7 +2,7 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::parser::{parse_indirect_object, Parser};
 use crate::{
     load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
-    Object, ObjectRef, Result,
+    Object, ObjectRef, Result, XrefForm, XrefOffset,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -12,10 +12,12 @@ pub struct Pdf<R: Read + Seek> {
     version: String,
     trailer: Dictionary,
     startxref: u64,
+    last_xref_form: XrefForm,
     repair_diagnostics: Diagnostics,
     cache: ObjectCache,
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
+    source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
 }
 
 impl<R: Read + Seek> Pdf<R> {
@@ -41,6 +43,7 @@ impl<R: Read + Seek> Pdf<R> {
         } else {
             load_xref_and_trailer(&mut reader)?
         };
+        let source_xref_entries = loaded.entries.clone();
         let source_xref_offsets = loaded
             .entries
             .iter()
@@ -55,10 +58,12 @@ impl<R: Read + Seek> Pdf<R> {
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
+            last_xref_form: loaded.last_xref_form,
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
             compressed_member_parents: BTreeMap::new(),
             source_xref_offsets,
+            source_xref_entries,
         })
     }
 
@@ -78,8 +83,16 @@ impl<R: Read + Seek> Pdf<R> {
         self.startxref()
     }
 
+    pub(crate) fn last_xref_form(&self) -> XrefForm {
+        self.last_xref_form
+    }
+
     pub(crate) fn source_xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
         self.source_xref_offsets.clone()
+    }
+
+    pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefOffset> {
+        self.source_xref_entries.clone()
     }
 
     pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
