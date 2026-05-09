@@ -4,3 +4,4 @@
 *.db
 .beads-credential-key
 .beads/issues.jsonl
+target/
