@@ -59,6 +59,10 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.resolved_count()
     }
 
+    pub fn object_refs(&self) -> Vec<ObjectRef> {
+        self.cache.object_refs()
+    }
+
     pub fn root_ref(&self) -> Option<ObjectRef> {
         self.trailer.get_ref("Root")
     }

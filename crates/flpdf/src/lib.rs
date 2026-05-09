@@ -15,7 +15,7 @@ pub use error::{Error, Result};
 pub use object::{Dictionary, Object, ObjectRef, Stream};
 pub use parser::parse_object;
 pub use reader::Pdf;
-pub use writer::write_pdf;
+pub use writer::{write_pdf, write_qdf};
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
     LoadedXref, XrefOffset,

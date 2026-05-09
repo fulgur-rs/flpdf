@@ -47,6 +47,102 @@ fn rewrite_repaired_fixture_with_repair_flag() {
 }
 
 #[test]
+fn check_subcommand_succeeds() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["check", "../../tests/fixtures/minimal.pdf"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PDF check succeeded"));
+}
+
+#[test]
+fn pages_subcommand_prints_each_page() {
+    let fixture = fixture_with_nested_pages();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["pages", fixture.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("page 1: 3 0 R"))
+        .stdout(predicate::str::contains("page 2: 6 0 R"));
+}
+
+#[test]
+fn pages_subcommand_prints_count() {
+    let fixture = fixture_with_nested_pages();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["pages", "--count", fixture.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+}
+
+#[test]
+fn dump_object_subcommand_accepts_ref() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["dump-object", "1 0", "../../tests/fixtures/minimal.pdf"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/Type /Catalog"));
+}
+
+#[test]
+fn qdf_subcommand_rewrites_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "qdf",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
+fn qdf_subcommand_dumps_all_objects() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = fixture_with_orphan_object();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "qdf",
+        fixture.path().to_str().unwrap(),
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let rendered = std::fs::read_to_string(&output).unwrap();
+    assert!(rendered.contains("5 0 obj"));
+}
+
+#[test]
+fn rewrite_subcommand_rewrites_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
 fn show_info_with_repair_flag_handles_corrupt_xref() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("corrupt.pdf");
@@ -311,6 +407,56 @@ fn fixture_with_inline_font_dictionary() -> tempfile::NamedTempFile {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     for object in &objects {
         offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
+    for &offset in &offsets {
+        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            start_xref
+        )
+        .as_bytes(),
+    );
+
+    fixture.as_file_mut().write_all(&bytes).unwrap();
+
+    fixture
+}
+
+fn fixture_with_orphan_object() -> tempfile::NamedTempFile {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+
+    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+    let object2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n";
+    let object3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n";
+    let content_data = b"Hello PDF";
+    let object4 = format!(
+        "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        content_data.len(),
+        String::from_utf8_lossy(content_data)
+    )
+    .into_bytes();
+    let object5 = b"5 0 obj\n<< /Type /Orphan >>\nendobj\n";
+
+    let objects = vec![
+        object1.to_vec(),
+        object2.to_vec(),
+        object3.to_vec(),
+        object4,
+        object5.to_vec(),
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len() + 1);
+    for object in &objects {
+        offsets.push(bytes.len() as u32);
         bytes.extend_from_slice(object);
     }
 
