@@ -72,6 +72,31 @@ fn show_info_without_repair_rejects_corrupt_xref() {
 }
 
 #[test]
+fn check_without_repair_rejects_corrupt_xref() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", input.to_str().unwrap()])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn check_with_repair_accepts_corrupt_xref() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--repair", "--check", input.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PDF check succeeded"));
+}
+
+#[test]
 fn dump_object_accepts_ref_without_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--dump-object", "1 0", "../../tests/fixtures/minimal.pdf"])
@@ -154,6 +179,18 @@ fn show_fonts_prints_summary() {
         .success()
         .stdout(predicate::str::contains("F1"))
         .stdout(predicate::str::contains("F2"));
+}
+
+#[test]
+fn show_fonts_prints_inline_dictionary_fonts() {
+    let fixture = fixture_with_inline_font_dictionary();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--show-fonts", fixture.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FDirect"))
+        .stdout(predicate::str::contains("type: /Font"));
 }
 
 #[test]
@@ -245,6 +282,54 @@ fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
 
     let file = fixture.as_file_mut();
     file.write_all(&bytes).unwrap();
+
+    fixture
+}
+
+fn fixture_with_inline_font_dictionary() -> tempfile::NamedTempFile {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+
+    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+    let object2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n";
+    let object3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /FDirect << /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >> >> >> /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n";
+    let content_data = b"HelloPDF\n";
+    let object4 = format!(
+        "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        content_data.len(),
+        String::from_utf8_lossy(content_data)
+    )
+    .into_bytes();
+
+    let mut offsets = Vec::new();
+    let objects: Vec<Vec<u8>> = vec![
+        object1.to_vec(),
+        object2.to_vec(),
+        object3.to_vec(),
+        object4.to_vec(),
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    for object in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
+    for &offset in &offsets {
+        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            start_xref
+        )
+        .as_bytes(),
+    );
+
+    fixture.as_file_mut().write_all(&bytes).unwrap();
 
     fixture
 }

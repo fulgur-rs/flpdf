@@ -1,5 +1,5 @@
 use clap::Parser;
-use flpdf::{check_reader, write_pdf, Object, ObjectRef, Pdf, Severity};
+use flpdf::{check_reader, write_pdf, CheckReport, Diagnostic, Object, ObjectRef, Pdf, Severity};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::BufReader;
@@ -56,7 +56,7 @@ fn main() {
     } else if args.show_pages {
         run_show_pages(args.input, args.repair)
     } else if args.check {
-        run_check(args.input)
+        run_check(args.input, args.repair)
     } else {
         run_rewrite(args.input, args.output, args.repair)
     };
@@ -67,10 +67,14 @@ fn main() {
     }
 }
 
-fn run_check(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_check(input: Option<PathBuf>, repair: bool) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(input)?;
-    let report = check_reader(BufReader::new(file))?;
+    let report = if repair {
+        check_reader(BufReader::new(file))?
+    } else {
+        check_reader_without_repair(BufReader::new(file))?
+    };
     for diagnostic in report.diagnostics.entries() {
         let label = match diagnostic.severity {
             Severity::Warning => "warning",
@@ -93,15 +97,8 @@ fn run_rewrite(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
-    let file = File::open(input)?;
-    let mut pdf = if repair {
-        Pdf::open_with_repair(BufReader::new(file))?
-    } else {
-        Pdf::open(BufReader::new(file))?
-    };
-    for diagnostic in pdf.repair_diagnostics().entries() {
-        eprintln!("warning: {}", diagnostic.message);
-    }
+    let mut pdf = open_pdf(&input, repair)?;
+
     let mut out = File::create(output)?;
     write_pdf(&mut pdf, &mut out)?;
     Ok(())
@@ -477,10 +474,22 @@ fn collect_font_resources(
             };
             if let Some(fonts_dict) = fonts_dict {
                 for (font_name, value) in fonts_dict.iter() {
-                    if let Object::Reference(font_ref) = value {
-                        if let Ok(font_obj) = pdf.resolve(*font_ref) {
-                            fonts.insert(font_name.to_vec(), font_obj);
+                    match value {
+                        Object::Reference(font_ref) => {
+                            if let Ok(font_obj) = pdf.resolve(*font_ref) {
+                                fonts.insert(font_name.to_vec(), font_obj);
+                            }
                         }
+                        Object::Dictionary(font_dict) => {
+                            fonts.insert(font_name.to_vec(), Object::Dictionary(font_dict.clone()));
+                        }
+                        Object::Stream(stream) => {
+                            fonts.insert(
+                                font_name.to_vec(),
+                                Object::Dictionary(stream.dict.clone()),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -497,7 +506,33 @@ fn open_pdf(input: &PathBuf, repair: bool) -> CliResult<Pdf<BufReader<File>>> {
     } else {
         Pdf::open(BufReader::new(file))?
     };
+
+    for diagnostic in pdf.repair_diagnostics().entries() {
+        eprintln!("warning: {}", diagnostic.message);
+    }
+
     Ok(pdf)
+}
+
+fn check_reader_without_repair(
+    reader: BufReader<File>,
+) -> Result<CheckReport, Box<dyn std::error::Error>> {
+    let mut pdf = Pdf::open(reader)?;
+    let mut diagnostics = pdf.repair_diagnostics().clone();
+    if pdf.trailer().get_ref("Root").is_none() {
+        diagnostics.push(Diagnostic::error("trailer is missing /Root", None));
+    }
+    if pdf.linearized_hint_ref()?.is_some() {
+        diagnostics.push(Diagnostic::warning(
+            "linearized PDF detected: rewrite support preserves hint object but does not recompute linearization tables",
+            None,
+        ));
+    }
+
+    Ok(CheckReport {
+        valid: !diagnostics.has_errors(),
+        diagnostics,
+    })
 }
 
 fn load_page_sequence(input: Option<PathBuf>, repair: bool) -> CliResult<PageSequence> {
