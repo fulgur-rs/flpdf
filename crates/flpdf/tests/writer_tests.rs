@@ -333,7 +333,7 @@ fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
 
     bytes.extend_from_slice(
         format!(
-            "3 0 obj\n<< /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} /Filter /FlateDecode /F 10 /FFilter /FlateDecode /FDecodeParms <<>> /XRefStm 123 >>\nstream\n",
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} /Filter /FlateDecode /F 10 /FFilter /FlateDecode /FDecodeParms <<>> /XRefStm 123 >>\nstream\n",
             compressed_xref.len()
         )
         .as_bytes(),
