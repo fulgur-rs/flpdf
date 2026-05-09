@@ -128,10 +128,7 @@ fn merge_previous_xref_sections(
             };
         }
 
-        let previous = match parse_xref_from_start(bytes, previous_pos, offset, version) {
-            Ok(previous) => previous,
-            Err(error) => return Err(error),
-        };
+        let previous = parse_xref_from_start(bytes, previous_pos, offset, version)?;
 
         for (object_ref, xref_offset) in previous.entries {
             entries.entry(object_ref).or_insert(xref_offset);
