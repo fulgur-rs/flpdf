@@ -4,7 +4,7 @@ use crate::{
     load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
     Object, ObjectRef, Result, XrefForm, XrefOffset,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 
 pub struct Pdf<R: Read + Seek> {
@@ -104,8 +104,12 @@ impl<R: Read + Seek> Pdf<R> {
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
+            let stream_ref = ObjectRef::new(stream, 0);
+            let (parent_ref, parent_index) = self
+                .compressed_parent_for_entry(stream_ref, index)
+                .unwrap_or((stream_ref, index));
             self.compressed_member_parents
-                .insert(object_ref, (ObjectRef::new(stream, 0), index));
+                .insert(object_ref, (parent_ref, parent_index));
         }
         self.cache.set_resolved(object_ref, object);
     }
@@ -214,24 +218,101 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(Object::Null);
         };
 
-        let object = parse_object_stream_entry(&stream_object, index)?;
+        let (parent_ref, parent_index, object) =
+            self.parse_object_stream_chain_entry(stream_ref, &stream_object, index)?;
         self.compressed_member_parents
-            .insert(object_ref, (stream_ref, index));
+            .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object.clone());
         Ok(object)
+    }
+
+    fn parse_object_stream_chain_entry(
+        &mut self,
+        stream_ref: ObjectRef,
+        stream_object: &crate::Stream,
+        target_index: u32,
+    ) -> Result<(ObjectRef, u32, Object)> {
+        let (member_stream_ref, member_index, member_stream) =
+            self.object_stream_chain_member(stream_ref, stream_object, target_index)?;
+        let object = parse_object_stream_entry(&member_stream, member_index)?;
+        Ok((member_stream_ref, member_index, object))
+    }
+
+    fn compressed_parent_for_entry(
+        &mut self,
+        stream_ref: ObjectRef,
+        target_index: u32,
+    ) -> Result<(ObjectRef, u32)> {
+        let stream_object = self.resolve(stream_ref)?;
+        let Object::Stream(stream_object) = stream_object else {
+            return Err(Error::parse(0, "compressed parent is not an object stream"));
+        };
+        let (parent_ref, parent_index, _) =
+            self.object_stream_chain_member(stream_ref, &stream_object, target_index)?;
+        Ok((parent_ref, parent_index))
+    }
+
+    fn object_stream_chain_member(
+        &mut self,
+        stream_ref: ObjectRef,
+        stream_object: &crate::Stream,
+        target_index: u32,
+    ) -> Result<(ObjectRef, u32, crate::Stream)> {
+        let mut streams = Vec::new();
+        self.collect_object_stream_chain(
+            stream_ref,
+            stream_object,
+            &mut streams,
+            &mut BTreeSet::new(),
+        )?;
+
+        let target_index = usize::try_from(target_index)
+            .map_err(|_| Error::parse(0, "compressed object index does not fit usize"))?;
+        let mut remaining = target_index;
+        for (member_stream_ref, member_stream) in streams {
+            let member_count = object_stream_count(&member_stream)?;
+            if remaining < member_count {
+                let member_index = u32::try_from(remaining)
+                    .map_err(|_| Error::parse(0, "compressed object index does not fit u32"))?;
+                return Ok((member_stream_ref, member_index, member_stream));
+            }
+            remaining -= member_count;
+        }
+
+        Err(Error::parse(
+            0,
+            "compressed object index out of range for object stream chain",
+        ))
+    }
+
+    fn collect_object_stream_chain(
+        &mut self,
+        stream_ref: ObjectRef,
+        stream_object: &crate::Stream,
+        streams: &mut Vec<(ObjectRef, crate::Stream)>,
+        seen: &mut BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        if !seen.insert(stream_ref) {
+            return Err(Error::parse(0, "object stream /Extends cycle"));
+        }
+
+        if let Some(parent_ref) = stream_object.dict.get_ref("Extends") {
+            let parent_object = self.resolve(parent_ref)?;
+            let Object::Stream(parent_stream) = parent_object else {
+                return Err(Error::parse(0, "object stream /Extends is not a stream"));
+            };
+            self.collect_object_stream_chain(parent_ref, &parent_stream, streams, seen)?;
+        }
+
+        streams.push((stream_ref, stream_object.clone()));
+        Ok(())
     }
 }
 
 fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -> Result<Object> {
     let stream_data = crate::filters::decode_stream_data(&stream_object.dict, &stream_object.data)?;
 
-    let stream_object_count = parse_non_negative_i64(
-        stream_object
-            .dict
-            .get("N")
-            .ok_or(Error::Missing("Object stream /N"))?,
-        "Object stream /N",
-    )?;
+    let stream_object_count = object_stream_count(stream_object)?;
     let stream_data_first = parse_non_negative_i64(
         stream_object
             .dict
@@ -240,8 +321,7 @@ fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -
         "Object stream /First",
     )?;
 
-    let object_count = usize::try_from(stream_object_count)
-        .map_err(|_| Error::parse(0, "Object stream /N does not fit usize"))?;
+    let object_count = stream_object_count;
     let first = usize::try_from(stream_data_first)
         .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
 
@@ -281,6 +361,17 @@ fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -
 
     let mut object_parser = Parser::new(&stream_data[start..]);
     object_parser.object()
+}
+
+fn object_stream_count(stream_object: &crate::Stream) -> Result<usize> {
+    usize::try_from(parse_non_negative_i64(
+        stream_object
+            .dict
+            .get("N")
+            .ok_or(Error::Missing("Object stream /N"))?,
+        "Object stream /N",
+    )?)
+    .map_err(|_| Error::parse(0, "Object stream /N does not fit usize"))
 }
 
 fn parse_non_negative_i64(value: &crate::Object, context: &str) -> Result<i64> {
