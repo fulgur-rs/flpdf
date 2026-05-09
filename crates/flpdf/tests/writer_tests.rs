@@ -130,7 +130,7 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
 
     let object_stream_body = b"2 0 7";
     add_object(
-        &format!(
+        format!(
             "3 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
             object_stream_body.len()
         )
@@ -440,12 +440,7 @@ fn parse_last_xref_entries(bytes: &[u8]) -> BTreeMap<u32, u8> {
     let mut lines = rendered[section_pos + 5..].lines();
     let mut entries = BTreeMap::new();
 
-    loop {
-        let section = match lines.next() {
-            Some(line) => line,
-            None => break,
-        };
-
+    while let Some(section) = lines.next() {
         if section == "trailer" {
             break;
         }
