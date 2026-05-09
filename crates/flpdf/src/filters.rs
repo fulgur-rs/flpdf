@@ -165,7 +165,7 @@ fn decode_png_predictor(bytes: &[u8], row_bytes: usize) -> Result<Vec<u8>> {
     let row_size = row_bytes
         .checked_add(1)
         .ok_or_else(|| Error::Unsupported("PNG predictor row size overflow".to_string()))?;
-    if bytes.len() % row_size != 0 {
+    if !bytes.len().is_multiple_of(row_size) {
         return Err(Error::Unsupported(
             "corrupt PNG predictor stream".to_string(),
         ));

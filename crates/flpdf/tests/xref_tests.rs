@@ -177,12 +177,8 @@ fn loads_previous_xref_stream_entries_for_omitted_objects() {
     bytes.extend_from_slice(obj1);
 
     let previous_xref_offset = bytes.len() as u64;
-    let previous_xref_entries = build_encoded_xref_stream_entries(&[
-        (0, 0, 0),
-        (1, obj1_offset as u64, 0),
-        (2, 12, 0),
-        (0, 0, 0),
-    ]);
+    let previous_xref_entries =
+        build_encoded_xref_stream_entries(&[(0, 0, 0), (1, obj1_offset, 0), (2, 12, 0), (0, 0, 0)]);
 
     let previous_xref_object = make_xref_stream_object(2, 4, None, 1, &previous_xref_entries);
     bytes.extend_from_slice(&previous_xref_object);
@@ -252,7 +248,7 @@ fn make_xref_stream_object(
     object.extend_from_slice(entries);
 
     // Keep stream data trivially decodable with no postprocessing.
-    object.extend_from_slice(format!("\nendstream\nendobj\n").as_bytes());
+    object.extend_from_slice(b"\nendstream\nendobj\n");
     object
 }
 
