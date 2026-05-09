@@ -432,8 +432,32 @@ fn collect_font_resources(
     }
 
     if node_type.as_slice() == b"Page" {
-        if let Some(Object::Dictionary(resources)) = dict.get("Resources") {
-            if let Some(Object::Dictionary(fonts_dict)) = resources.get("Font") {
+        let resources = match dict.get("Resources") {
+            Some(Object::Dictionary(resources)) => Some(resources.clone()),
+            Some(Object::Reference(reference)) => {
+                if let Ok(Object::Dictionary(resources)) = pdf.resolve(*reference) {
+                    Some(resources)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(resources) = resources {
+            let fonts_dict = match resources.get("Font") {
+                Some(Object::Dictionary(fonts_dict)) => Some(fonts_dict.clone()),
+                Some(Object::Reference(reference)) => {
+                    if let Ok(Object::Dictionary(fonts_dict)) = pdf.resolve(*reference) {
+                        Some(fonts_dict)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(fonts_dict) = fonts_dict {
                 for (font_name, value) in fonts_dict.iter() {
                     if let Object::Reference(font_ref) = value {
                         if let Ok(font_obj) = pdf.resolve(*font_ref) {
