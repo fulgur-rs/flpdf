@@ -1,4 +1,5 @@
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::parser::Parser;
+use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 
@@ -14,8 +15,11 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     let source_offsets = build_source_offsets(pdf.source_xref_offsets());
     let object_count = resolve_object_count(pdf.trailer().get("Size"), &source_offsets);
-    let touched_object_refs = collect_touched_object_refs(pdf);
-    let xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
+    let (touched_object_refs, touched_objstm_members) = collect_touched_object_refs(pdf);
+    let mut xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
+    let rewritten_stream_offsets =
+        write_updated_object_streams(&mut bytes, pdf, &touched_objstm_members)?;
+    xref_offsets.extend(rewritten_stream_offsets);
     let final_offsets = merge_source_and_touched_offsets(&source_offsets, &xref_offsets);
 
     let xref_offset = write_incremental_xref(&mut bytes, &final_offsets)?;
@@ -32,13 +36,27 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
     Ok(())
 }
 
-fn collect_touched_object_refs<R: Read + Seek>(pdf: &Pdf<R>) -> Vec<ObjectRef> {
+type RewrittenObjStmMembers = BTreeMap<ObjectRef, BTreeSet<ObjectRef>>;
+
+fn collect_touched_object_refs<R: Read + Seek>(
+    pdf: &Pdf<R>,
+) -> (Vec<ObjectRef>, RewrittenObjStmMembers) {
     let mut touched = BTreeSet::new();
+    let mut objstm_touched: BTreeMap<ObjectRef, BTreeSet<ObjectRef>> = BTreeMap::new();
+
     for object_ref in pdf.resolved_object_refs() {
+        if let Some((stream_ref, _index)) = pdf.compressed_parent(object_ref) {
+            objstm_touched
+                .entry(stream_ref)
+                .or_default()
+                .insert(object_ref);
+            continue;
+        }
+
         touched.insert(object_ref);
     }
 
-    touched.into_iter().collect()
+    (touched.into_iter().collect(), objstm_touched)
 }
 
 fn write_incremental_objects<R: Read + Seek>(
@@ -57,6 +75,165 @@ fn write_incremental_objects<R: Read + Seek>(
     }
 
     Ok(updated_offsets)
+}
+
+fn write_updated_object_streams<R: Read + Seek>(
+    bytes: &mut Vec<u8>,
+    pdf: &mut Pdf<R>,
+    members_by_stream: &RewrittenObjStmMembers,
+) -> Result<BTreeMap<u32, (u16, usize)>> {
+    let mut updated_offsets = BTreeMap::new();
+
+    for (stream_ref, member_refs) in members_by_stream {
+        let stream_object = pdf.resolve(*stream_ref)?;
+        let Object::Stream(stream) = stream_object else {
+            return Err(crate::Error::Unsupported(format!(
+                "object {} is not an object stream",
+                stream_ref.number
+            )));
+        };
+
+        let (rebuilt_data, rebuilt_first) = rebuild_object_stream(&stream, member_refs, pdf)?;
+
+        let mut stream_dict = stream.dict.clone();
+        stream_dict.insert(
+            "First",
+            Object::Integer(i64::try_from(rebuilt_first).map_err(|_| {
+                crate::Error::Unsupported("object stream /First too large".to_string())
+            })?),
+        );
+        stream_dict.insert(
+            "Length",
+            Object::Integer(i64::try_from(rebuilt_data.len()).map_err(|_| {
+                crate::Error::Unsupported("object stream /Length too large".to_string())
+            })?),
+        );
+
+        let rebuilt_stream = Object::Stream(crate::Stream::new(stream_dict, rebuilt_data));
+        let offset = write_object(bytes, *stream_ref, &rebuilt_stream)?
+            .expect("writing object always returns an offset");
+        updated_offsets.insert(stream_ref.number, (stream_ref.generation, offset));
+    }
+
+    Ok(updated_offsets)
+}
+
+fn rebuild_object_stream<R: Read + Seek>(
+    stream: &crate::Stream,
+    updated_members: &BTreeSet<ObjectRef>,
+    pdf: &mut Pdf<R>,
+) -> Result<(Vec<u8>, usize)> {
+    let stream_data = filters::decode_stream_data(&stream.dict, &stream.data)?;
+
+    let object_count = usize::try_from(parse_non_negative_i64(
+        stream
+            .dict
+            .get("N")
+            .ok_or(crate::Error::Missing("Object stream /N"))?,
+        "Object stream /N",
+    )?)
+    .map_err(|_| crate::Error::Unsupported("Object stream /N does not fit usize".to_string()))?;
+
+    let first = usize::try_from(parse_non_negative_i64(
+        stream
+            .dict
+            .get("First")
+            .ok_or(crate::Error::Missing("Object stream /First"))?,
+        "Object stream /First",
+    )?)
+    .map_err(|_| {
+        crate::Error::Unsupported("Object stream /First does not fit usize".to_string())
+    })?;
+
+    let mut header_parser = Parser::new(&stream_data);
+    let mut members = Vec::with_capacity(object_count);
+    for _ in 0..object_count {
+        let number = u32::try_from(parse_non_negative_i64_value(
+            header_parser.integer_for_indirect()?,
+            "object stream object number",
+        )?)
+        .map_err(|_| {
+            crate::Error::Unsupported("object stream object number does not fit u32".to_string())
+        })?;
+        let offset = usize::try_from(parse_non_negative_i64_value(
+            header_parser.integer_for_indirect()?,
+            "object stream object offset",
+        )?)
+        .map_err(|_| {
+            crate::Error::Unsupported("object stream object offset does not fit usize".to_string())
+        })?;
+        members.push((number, offset));
+    }
+
+    let mut decoded_members = Vec::with_capacity(object_count);
+    for (index, (number, offset)) in members.iter().enumerate() {
+        let start = first.checked_add(*offset).ok_or_else(|| {
+            crate::Error::Unsupported("object stream offset overflow".to_string())
+        })?;
+        let end = if index + 1 < members.len() {
+            first.checked_add(members[index + 1].1).ok_or_else(|| {
+                crate::Error::Unsupported("object stream offset overflow".to_string())
+            })?
+        } else {
+            stream_data.len()
+        };
+
+        if start > end || end > stream_data.len() {
+            return Err(crate::Error::parse(
+                0,
+                "compressed object offset out of range",
+            ));
+        }
+
+        let object_ref = ObjectRef::new(*number, 0);
+        let object = if updated_members.contains(&object_ref) {
+            pdf.resolve(object_ref)?
+        } else {
+            let mut parser = Parser::new(&stream_data[start..end]);
+            parser.object()?
+        };
+
+        decoded_members.push((object_ref, object));
+    }
+
+    let mut header = Vec::new();
+    let mut body = Vec::new();
+    let mut object_offsets = Vec::with_capacity(decoded_members.len());
+
+    for (_, object) in &decoded_members {
+        object_offsets.push(body.len());
+        object.write_pdf(&mut body);
+        body.push(b'\n');
+    }
+
+    for ((object_ref, _), offset) in decoded_members.iter().zip(object_offsets.iter()) {
+        header.extend_from_slice(format!("{} {} ", object_ref.number, offset).as_bytes());
+    }
+
+    let rebuilt_first = header.len();
+
+    let mut rebuilt_data = header;
+    rebuilt_data.extend_from_slice(&body);
+
+    let encoded = filters::encode_stream_data(&stream.dict, &rebuilt_data)?;
+    Ok((encoded, rebuilt_first))
+}
+
+fn parse_non_negative_i64(value: &crate::Object, context: &str) -> Result<i64> {
+    let crate::Object::Integer(integer) = value else {
+        return Err(crate::Error::parse(0, format!("{context} is not integer")));
+    };
+    if *integer < 0 {
+        return Err(crate::Error::parse(0, format!("{context} is negative")));
+    }
+    Ok(*integer)
+}
+
+fn parse_non_negative_i64_value(value: i64, context: &str) -> Result<i64> {
+    if value < 0 {
+        return Err(crate::Error::parse(0, format!("{context} is negative")));
+    }
+    Ok(value)
 }
 
 fn write_object(

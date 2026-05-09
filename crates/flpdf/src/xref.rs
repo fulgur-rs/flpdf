@@ -1,5 +1,5 @@
 use crate::parser::{parse_indirect_object, Parser};
-use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
+use crate::{filters, Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -154,6 +154,10 @@ fn recover_compressed_offsets_from_objstm(
     stream_ref: ObjectRef,
     stream: &crate::Stream,
 ) {
+    let Ok(decoded_data) = crate::filters::decode_stream_data(&stream.dict, &stream.data) else {
+        return;
+    };
+
     let object_count =
         match parse_non_negative_u64(stream.dict.get("N").unwrap_or(&Object::Integer(0)), "/N") {
             Ok(count) => match usize::try_from(count) {
@@ -163,7 +167,7 @@ fn recover_compressed_offsets_from_objstm(
             Err(_) => return,
         };
 
-    let mut cursor = Parser::new(&stream.data);
+    let mut cursor = Parser::new(&decoded_data);
     for index in 0..object_count {
         let number = match cursor.integer_for_indirect() {
             Ok(number) => match parse_non_negative_i64(number, "ObjStm object number") {
@@ -326,7 +330,7 @@ fn parse_xref_stream(
         }
     };
 
-    let trailer = stream.dict;
+    let trailer = stream.dict.clone();
     let size = parse_non_negative_u64(
         trailer
             .get("Size")
@@ -338,7 +342,8 @@ fn parse_xref_stream(
     let widths = parse_xref_widths(&trailer)?;
     let index = parse_xref_index(&trailer, size)?;
     let ranges = build_xref_ranges(index)?;
-    let mut cursor = ByteCursor::new(&stream.data, 0);
+    let stream_data = filters::decode_stream_data(&stream.dict, &stream.data)?;
+    let mut cursor = ByteCursor::new(&stream_data, 0);
     let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
 
     Ok(LoadedXref {

@@ -1,6 +1,9 @@
-use flpdf::{Object, ObjectRef, Pdf};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use flpdf::{parse_object, Object, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::BufReader;
+use std::io::Write;
 
 #[test]
 fn opens_pdf_without_resolving_all_objects() {
@@ -79,9 +82,90 @@ fn resolves_compressed_entry_from_xref_stream() {
     );
 }
 
+#[test]
+fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>| {
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &mut bytes);
+
+    let member1 = format!("<< /Type /Packed /Payload ({}) >>", "A".repeat(400),).into_bytes();
+    let member2 = format!("<< /Type /Packed /Payload ({}) >>", "B".repeat(420),).into_bytes();
+
+    let (stream_data, first) = encode_flate_objstm(&[(2, &member1[..]), (3, &member2[..])]);
+    let obj_stream_offset = bytes.len();
+    let obj_stream = format!(
+        "4 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {} /Filter /FlateDecode >>\nstream\n",
+        first,
+        stream_data.len(),
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&obj_stream);
+    bytes.extend_from_slice(&stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 1);
+    append_xref_stream_entry(&mut xref_entries, 1, obj_stream_offset as u32, 0);
+
+    let xref_stream_object = format!(
+        "5 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 3 1] /Index [0 5] /Length {} >>\nstream\n",
+        xref_entries.len()
+    )
+    .into_bytes();
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(&xref_stream_object);
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        parse_object(&member1).unwrap()
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        parse_object(&member2).unwrap()
+    );
+}
+
 fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
     let bytes_u24 = value.to_be_bytes();
     bytes.extend_from_slice(&bytes_u24[1..]);
+}
+
+fn encode_flate_objstm(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+    let mut header = String::new();
+    let mut body = Vec::new();
+
+    for (index, (number, object_data)) in members.iter().enumerate() {
+        let offset = body.len();
+        header.push_str(&format!("{} {} ", number, offset));
+        body.extend_from_slice(object_data);
+        if index + 1 < members.len() {
+            body.push(b'\n');
+        }
+    }
+
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(header.as_bytes());
+    decoded.extend_from_slice(&body);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&decoded).unwrap();
+    let encoded = encoder.finish().unwrap();
+
+    (encoded, header.len())
 }
 
 fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {

@@ -4,6 +4,7 @@ use crate::{
     load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
     Object, ObjectRef, Result,
 };
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
 pub struct Pdf<R: Read + Seek> {
@@ -13,6 +14,7 @@ pub struct Pdf<R: Read + Seek> {
     startxref: u64,
     repair_diagnostics: Diagnostics,
     cache: ObjectCache,
+    compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
 }
 
@@ -55,6 +57,7 @@ impl<R: Read + Seek> Pdf<R> {
             startxref: loaded.startxref,
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
+            compressed_member_parents: BTreeMap::new(),
             source_xref_offsets,
         })
     }
@@ -77,6 +80,20 @@ impl<R: Read + Seek> Pdf<R> {
 
     pub(crate) fn source_xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
         self.source_xref_offsets.clone()
+    }
+
+    pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
+        self.compressed_member_parents.get(&object_ref).copied()
+    }
+
+    pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
+        if let Some(CacheEntry::Compressed { stream, index }) =
+            self.cache.entry(object_ref).cloned()
+        {
+            self.compressed_member_parents
+                .insert(object_ref, (ObjectRef::new(stream, 0), index));
+        }
+        self.cache.set_resolved(object_ref, object);
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
@@ -184,12 +201,16 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let object = parse_object_stream_entry(&stream_object, index)?;
+        self.compressed_member_parents
+            .insert(object_ref, (stream_ref, index));
         self.cache.set_resolved(object_ref, object.clone());
         Ok(object)
     }
 }
 
 fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -> Result<Object> {
+    let stream_data = crate::filters::decode_stream_data(&stream_object.dict, &stream_object.data)?;
+
     let stream_object_count = parse_non_negative_i64(
         stream_object
             .dict
@@ -210,7 +231,7 @@ fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -
     let first = usize::try_from(stream_data_first)
         .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
 
-    let mut header_parser = Parser::new(&stream_object.data);
+    let mut header_parser = Parser::new(&stream_data);
     let mut object_offsets = Vec::with_capacity(object_count);
     for _ in 0..object_count {
         let _object_number = parse_non_negative_u64(
@@ -234,13 +255,17 @@ fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -
     }
 
     let start = first
-        + usize::try_from(object_offsets[target_index])
-            .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?;
-    if start > stream_object.data.len() {
+        .checked_add(
+            usize::try_from(object_offsets[target_index])
+                .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?,
+        )
+        .ok_or_else(|| Error::parse(0, "compressed object offset overflow"))?;
+
+    if start > stream_data.len() {
         return Err(Error::parse(0, "compressed object offset out of range"));
     }
 
-    let mut object_parser = Parser::new(&stream_object.data[start..]);
+    let mut object_parser = Parser::new(&stream_data[start..]);
     object_parser.object()
 }
 

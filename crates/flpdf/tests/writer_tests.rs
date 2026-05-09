@@ -1,6 +1,9 @@
-use flpdf::{check_reader, write_pdf, write_qdf, Object, ObjectRef, Pdf};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use flpdf::{check_reader, filters, parse_object, write_pdf, write_qdf, Object, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Write;
 use std::io::{BufReader, Cursor};
 
 #[test]
@@ -293,6 +296,112 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
     assert_eq!(xref.get(&3), Some(&b'n'));
     assert!(!xref.contains_key(&2));
     assert!(!xref.contains_key(&4));
+}
+
+#[test]
+fn write_pdf_rewrites_flate_object_stream_member_and_recomputes_first() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+
+    let member_2_source =
+        parse_object(format!("<< /Type /Packed /Payload ({}) >>", "A".repeat(400)).as_bytes())
+            .unwrap();
+    let member_2_rewritten =
+        parse_object(format!("<< /Type /Packed /Payload ({}) >>", "A".repeat(401)).as_bytes())
+            .unwrap();
+    let member_3_source =
+        parse_object(format!("<< /Type /Packed /Payload ({}) >>", "B".repeat(420)).as_bytes())
+            .unwrap();
+
+    let mut member2 = Vec::new();
+    member_2_source.write_pdf(&mut member2);
+    let mut member3 = Vec::new();
+    member_3_source.write_pdf(&mut member3);
+    let (stream_data, first) = build_flate_objstm_payload(&[(2, &member2[..]), (3, &member3[..])]);
+    let obj_stream_offset = bytes.len();
+
+    let obj_stream = format!(
+        "4 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {} /Filter /FlateDecode >>\nstream\n",
+        first,
+        stream_data.len()
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&obj_stream);
+    bytes.extend_from_slice(&stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 1);
+    append_xref_stream_entry(&mut xref_entries, 1, obj_stream_offset as u32, 0);
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 3 1] /Index [0 5] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(pdf.resolve(ObjectRef::new(2, 0)).unwrap(), member_2_source);
+    pdf.set_object(ObjectRef::new(2, 0), member_2_rewritten.clone());
+
+    let mut output = Vec::new();
+    write_pdf(&mut pdf, &mut output).unwrap();
+
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    let Object::Stream(rewritten_obj_stream) = rewritten.resolve(ObjectRef::new(4, 0)).unwrap()
+    else {
+        panic!("expected object stream object");
+    };
+
+    let decoded =
+        filters::decode_stream_data(&rewritten_obj_stream.dict, &rewritten_obj_stream.data)
+            .unwrap();
+    let parsed_first = as_integer(
+        rewritten_obj_stream
+            .dict
+            .get("First")
+            .expect("object stream missing /First"),
+    )
+    .expect("object stream /First should be integer");
+    let parsed_first = usize::try_from(parsed_first).unwrap();
+    assert!(
+        parsed_first <= decoded.len(),
+        "/First must fit in decoded stream"
+    );
+    assert_eq!(
+        parsed_first,
+        parse_objstm_first_header_len(&decoded, parsed_first).len()
+    );
+
+    let members = parse_objstm_members(&decoded, parsed_first);
+    assert_eq!(members[0].0, 2);
+    assert_eq!(members[1].0, 3);
+
+    let first_member = parse_objstm_member(&decoded, parsed_first, &members, 0);
+    let second_member = parse_objstm_member(&decoded, parsed_first, &members, 1);
+    assert_eq!(first_member, member_2_rewritten);
+    assert_eq!(second_member, member_3_source);
 }
 
 #[test]
@@ -702,6 +811,74 @@ fn parse_last_xref_entries(bytes: &[u8]) -> BTreeMap<u32, u8> {
 fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
     let bytes_u24 = value.to_be_bytes();
     bytes.extend_from_slice(&bytes_u24[1..]);
+}
+
+fn build_flate_objstm_payload(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+    let mut header = String::new();
+    let mut body = Vec::new();
+
+    for (index, (number, object_data)) in members.iter().enumerate() {
+        let offset = body.len();
+        header.push_str(&format!("{} {} ", number, offset));
+        body.extend_from_slice(object_data);
+        if index + 1 < members.len() {
+            body.push(b'\n');
+        }
+    }
+
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(header.as_bytes());
+    decoded.extend_from_slice(&body);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&decoded).unwrap();
+    let encoded = encoder.finish().unwrap();
+
+    (encoded, header.len())
+}
+
+fn parse_objstm_first_header_len(decoded: &[u8], declared_first: usize) -> &[u8] {
+    &decoded[..declared_first]
+}
+
+fn parse_objstm_members(decoded: &[u8], first: usize) -> Vec<(u32, usize)> {
+    let header = std::str::from_utf8(&decoded[..first]).unwrap();
+    let tokens: Vec<&str> = header.split_whitespace().map(str::trim).collect();
+    let mut members = Vec::new();
+
+    for pair in tokens.chunks(2) {
+        assert_eq!(pair.len(), 2);
+        let number = pair[0].parse().unwrap();
+        let offset = pair[1].parse().unwrap();
+        members.push((number, offset));
+    }
+
+    members
+}
+
+fn parse_objstm_member(
+    decoded: &[u8],
+    first: usize,
+    members: &[(u32, usize)],
+    index: usize,
+) -> Object {
+    let (number, start) = members[index];
+    let start = first + start;
+    let end = if index + 1 < members.len() {
+        first + members[index + 1].1
+    } else {
+        decoded.len()
+    };
+    let _ = number;
+    parse_object(trim_right_ws(&decoded[start..end])).unwrap()
+}
+
+fn trim_right_ws(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |idx| idx + 1);
+    &bytes[..end]
 }
 
 fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
