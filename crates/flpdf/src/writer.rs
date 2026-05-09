@@ -511,27 +511,11 @@ fn build_xref_stream_bytes(
             stream_data.push(object_type);
             match xref_offset {
                 XrefOffset::Offset(offset) => {
-                    stream_data.extend_from_slice(
-                        &(u64::try_from(*offset)
-                            .map_err(|_| {
-                                crate::Error::Unsupported(
-                                    "xref stream object offset does not fit u64".to_string(),
-                                )
-                            })?
-                            .to_be_bytes()[0..8]),
-                    );
+                    stream_data.extend_from_slice(&((*offset).to_be_bytes()[0..8]));
                     stream_data.extend_from_slice(&u16::to_be_bytes(*generation)[0..2]);
                 }
                 XrefOffset::Compressed { stream, index } => {
-                    stream_data.extend_from_slice(
-                        &(u64::try_from(*stream)
-                            .map_err(|_| {
-                                crate::Error::Unsupported(
-                                    "xref stream object stream number does not fit u64".to_string(),
-                                )
-                            })?
-                            .to_be_bytes()[0..8]),
-                    );
+                    stream_data.extend_from_slice(&(u64::from(*stream).to_be_bytes()[0..8]));
                     stream_data.extend_from_slice(&u32::to_be_bytes(*index)[2..4]);
                 }
             }
@@ -550,8 +534,7 @@ fn offset_size(object_numbers: &[u32]) -> Result<i64> {
         .saturating_add(1)
         .max(1);
 
-    i64::try_from(size)
-        .map_err(|_| crate::Error::Unsupported("xref stream /Size does not fit i64".to_string()))
+    Ok(i64::from(size))
 }
 
 fn write_incremental_trailer<R: Read + Seek>(
