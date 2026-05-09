@@ -12,6 +12,8 @@ struct Args {
     #[arg(long)]
     check: bool,
     #[arg(long)]
+    repair: bool,
+    #[arg(long)]
     dump_object: Option<String>,
     #[arg(long)]
     show_info: bool,
@@ -53,7 +55,7 @@ fn main() {
     } else if args.check {
         run_check(args.input)
     } else {
-        run_rewrite(args.input, args.output)
+        run_rewrite(args.input, args.output, args.repair)
     };
 
     if let Err(error) = result {
@@ -84,11 +86,19 @@ fn run_check(input: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 fn run_rewrite(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    repair: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     let file = File::open(input)?;
-    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let mut pdf = if repair {
+        Pdf::open_with_repair(BufReader::new(file))?
+    } else {
+        Pdf::open(BufReader::new(file))?
+    };
+    for diagnostic in pdf.repair_diagnostics().entries() {
+        eprintln!("warning: {}", diagnostic.message);
+    }
     let mut out = File::create(output)?;
     write_pdf(&mut pdf, &mut out)?;
     Ok(())

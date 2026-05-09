@@ -1,5 +1,5 @@
 use crate::parser::{parse_indirect_object, Parser};
-use crate::{Dictionary, Error, Object, ObjectRef, Result};
+use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -9,6 +9,7 @@ pub struct LoadedXref {
     pub startxref: u64,
     pub entries: BTreeMap<ObjectRef, XrefOffset>,
     pub trailer: Dictionary,
+    pub repair_diagnostics: Diagnostics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,29 +19,150 @@ pub enum XrefOffset {
 }
 
 pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
+    load_xref_and_trailer_with_repair(reader, false)
+}
+
+pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
+    reader: &mut R,
+    allow_repair: bool,
+) -> Result<LoadedXref> {
     let mut bytes = Vec::new();
     reader.seek(SeekFrom::Start(0))?;
     reader.read_to_end(&mut bytes)?;
 
     let version = parse_header(&bytes)?;
-    let startxref = parse_startxref(&bytes)?;
-    let xref_pos =
-        usize::try_from(startxref).map_err(|_| Error::parse(0, "startxref does not fit usize"))?;
+    let startxref = match parse_startxref(&bytes) {
+        Ok(offset) => offset,
+        Err(error) if allow_repair => {
+            let _ = error;
+            0
+        }
+        Err(error) => return Err(error),
+    };
+    let xref_pos = match usize::try_from(startxref) {
+        Ok(xref_pos) => xref_pos,
+        Err(_) if allow_repair => 0,
+        Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
+    };
 
-    if bytes
+    let loaded = if bytes
         .get(xref_pos..)
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
         let mut cursor = ByteCursor::new(&bytes, xref_pos + 4);
-        let (entries, trailer) = parse_xref_table(&mut cursor, &bytes)?;
-        Ok(LoadedXref {
-            version,
-            startxref,
-            entries,
-            trailer,
-        })
+        let result = parse_xref_table(&mut cursor, &bytes);
+        match result {
+            Ok((entries, trailer)) => Ok(LoadedXref {
+                version: version.clone(),
+                startxref,
+                entries,
+                trailer,
+                repair_diagnostics: Diagnostics::default(),
+            }),
+            Err(error) if allow_repair => {
+                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, error)
+            }
+            Err(error) => Err(error),
+        }
     } else {
-        parse_xref_stream(&bytes, xref_pos, startxref, version)
+        let result = parse_xref_stream(&bytes, xref_pos, startxref, version.clone());
+        match result {
+            Ok(loaded) => Ok(loaded),
+            Err(error) if allow_repair => {
+                recover_xref_from_linear_scan(&bytes, version.clone(), startxref, error)
+            }
+            Err(error) => Err(error),
+        }
+    };
+
+    loaded
+}
+
+fn recover_xref_from_linear_scan(
+    bytes: &[u8],
+    version: String,
+    startxref: u64,
+    parse_error: Error,
+) -> Result<LoadedXref> {
+    let entries = recover_xref_entries(bytes)?;
+    let trailer = recover_trailer(bytes)?;
+
+    let mut repair_diagnostics = Diagnostics::default();
+    repair_diagnostics.push(Diagnostic::warning(
+        format!(
+            "xref parsing failed ({}) and was repaired by linear object scan",
+            parse_error
+        ),
+        Some(startxref),
+    ));
+
+    Ok(LoadedXref {
+        version,
+        startxref,
+        entries,
+        trailer,
+        repair_diagnostics,
+    })
+}
+
+pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
+    load_xref_and_trailer_with_repair(reader, true)
+}
+
+fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>> {
+    let mut entries = BTreeMap::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_digit() && is_token_boundary(cursor, bytes) {
+            if let Ok((object_ref, _)) = parse_indirect_object(&bytes[cursor..]) {
+                entries.insert(object_ref, XrefOffset::Offset(cursor as u64));
+                cursor = cursor.saturating_add(1);
+                continue;
+            }
+        }
+        cursor = cursor.saturating_add(1);
+    }
+
+    if entries.is_empty() {
+        return Err(Error::parse(
+            0,
+            "unable to recover xref entries by linear scan",
+        ));
+    }
+
+    Ok(entries)
+}
+
+fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
+    let marker = b"trailer";
+    let Some(pos) = bytes
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+    else {
+        return Err(Error::parse(0, "trailer dictionary not found"));
+    };
+
+    let mut cursor = ByteCursor::new(bytes, pos + marker.len());
+    cursor.skip_ws();
+    let mut parser = Parser::new(&bytes[cursor.pos..]);
+    match parser.object()? {
+        Object::Dictionary(trailer) => Ok(trailer),
+        _ => Err(Error::parse(
+            cursor.pos + parser.position(),
+            "trailer dictionary is not a dictionary",
+        )),
+    }
+}
+
+fn is_token_boundary(index: usize, bytes: &[u8]) -> bool {
+    if index == 0 {
+        return true;
+    }
+
+    match bytes[index - 1] {
+        b'\0' | b'\t' | b'\n' | b'\r' | b' ' | b'\x0c' | b'[' | b']' | b'<' | b'>' | b'('
+        | b')' | b'/' => true,
+        _ => false,
     }
 }
 
@@ -126,6 +248,7 @@ fn parse_xref_stream(
         startxref,
         entries,
         trailer,
+        repair_diagnostics: Diagnostics::default(),
     })
 }
 
