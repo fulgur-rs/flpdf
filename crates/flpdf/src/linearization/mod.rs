@@ -6,6 +6,7 @@
 
 pub mod hint_page;
 pub mod hint_shared;
+pub mod hint_stream;
 pub mod part1;
 pub mod plan;
 pub mod renumber;
@@ -14,6 +15,7 @@ pub use hint_page::{bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHi
 pub use hint_shared::{
     SharedGroupEntry, SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,
 };
+pub use hint_stream::{encode_hint_stream, HintStreamBuilder, HintStreamBytes};
 pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
 pub use renumber::RenumberMap;
