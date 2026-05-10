@@ -162,21 +162,47 @@ fn compute_closure<R: Read + Seek>(
         if is_pages_node || is_page_leaf {
             if let Object::Dictionary(dict) = &obj {
                 for (k, v) in dict.iter() {
-                    // Skip /Kids (Pages → sibling pages) and /Parent
-                    // (Page/Pages → ancestor) to avoid pulling in the
-                    // page-tree structure itself.  Following /Parent picks
-                    // up the parent Pages-dict object, which qpdf does not
-                    // count toward this page's object_count — the result
-                    // is "object count mismatch: hint = N+1; computed = N".
-                    //
-                    // For PDFs where /Resources or /MediaBox are inherited
-                    // from an ancestor /Pages node, the inherited keys are
-                    // not pulled into the page's closure here.  This is a
-                    // limitation that affects pages that genuinely rely on
-                    // inherited resources; our test fixtures all define
-                    // /Resources and /MediaBox on the page leaf so the
-                    // current behaviour is correct for them.
-                    if k == b"Kids" || k == b"Parent" {
+                    if k == b"Kids" {
+                        // Pages → sibling pages — never follow.
+                        continue;
+                    }
+                    if k == b"Parent" {
+                        // Walk the parent /Pages dict for inherited
+                        // /Resources, /MediaBox, /Rotate, etc., but DO
+                        // NOT add the parent object itself to the
+                        // closure.  Adding it would inflate this page's
+                        // object_count beyond what qpdf computes from the
+                        // linearized layout (qpdf never counts ancestor
+                        // /Pages dicts in any page's object_count).
+                        //
+                        // The walk follows non-/Kids, non-/Parent keys of
+                        // the parent and descends into ref values
+                        // recursively via the queue.  /Kids and /Parent
+                        // on the parent are suppressed here to avoid
+                        // pulling sibling pages or recursing into
+                        // grandparents — for pages that genuinely
+                        // inherit from multi-level page trees, multi-level
+                        // ancestor walking can be added later.
+                        let mut parent_refs = Vec::new();
+                        collect_direct_refs(v, &mut parent_refs);
+                        for parent_ref in parent_refs {
+                            if let Ok(Object::Dictionary(parent_dict)) =
+                                pdf.resolve(parent_ref)
+                            {
+                                for (pk, pv) in parent_dict.iter() {
+                                    if pk == b"Kids" || pk == b"Parent" {
+                                        continue;
+                                    }
+                                    let mut refs = Vec::new();
+                                    collect_direct_refs(pv, &mut refs);
+                                    for r in refs {
+                                        if !visited.contains(&r) {
+                                            queue.push_back(r);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
                     let mut refs = Vec::new();

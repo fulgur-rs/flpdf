@@ -286,17 +286,24 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // counts (up to 10 decimal digits).
     const T_BACKSCAN_WINDOW: usize = 32;
     let search_start = t_usize.saturating_sub(T_BACKSCAN_WINDOW);
-    let window = &file_bytes[search_start..=t_usize];
+    // Extend the window 3 bytes past `t_usize` so a `/T` that points exactly
+    // at the start of `xref` (Annex F convention) can still find all four
+    // bytes of the keyword in the slice.
+    let window_end = (t_usize + 4).min(file_bytes.len());
+    let window = &file_bytes[search_start..window_end];
     // Match `xref` only as a standalone token (whitespace-bounded).  A naive
     // substring search would false-positively match the `xref` inside the
     // `startxref` keyword which sits in the trailer near the end of the file.
+    // Boundary checks use absolute `file_bytes` positions so the slice edges
+    // are not mistaken for file boundaries.
     let found_xref = window.windows(4).enumerate().any(|(i, w)| {
         if w != b"xref" {
             return false;
         }
-        let prev_ok = i == 0 || is_pdf_whitespace(window[i - 1]);
-        let next = i + 4;
-        let next_ok = next == window.len() || is_pdf_whitespace(window[next]);
+        let absolute = search_start + i;
+        let prev_ok = absolute == 0 || is_pdf_whitespace(file_bytes[absolute - 1]);
+        let next = absolute + 4;
+        let next_ok = next >= file_bytes.len() || is_pdf_whitespace(file_bytes[next]);
         prev_ok && next_ok
     });
     if !found_xref {
