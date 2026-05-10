@@ -298,8 +298,11 @@ impl LinearizationPlan {
         // Step 4: compute closures for pages 2..N and find shared objects
         // ----------------------------------------------------------------
         // For each object in the first-page closure, record which other
-        // pages (by 0-based index) also reference it.
+        // pages (by 0-based index) also reference it.  Closures are retained
+        // so Step 7 can populate per-page object_count without re-walking.
         let mut shared_page_indices: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
+        let mut other_page_closures: Vec<Vec<ObjectRef>> =
+            Vec::with_capacity(page_refs.len().saturating_sub(1));
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
             let closure = compute_closure(pdf, page_ref)?;
@@ -311,6 +314,7 @@ impl LinearizationPlan {
                         .insert(page_idx as u32);
                 }
             }
+            other_page_closures.push(closure);
         }
 
         // ----------------------------------------------------------------
@@ -350,11 +354,27 @@ impl LinearizationPlan {
             .map(|&r| PageHintEntry::placeholder(r))
             .collect();
 
-        // Fill page-1 hint: first_object_index = 0 (Part 2 comes first);
+        // Fill page-0 hint: first_object_index = 0 (Part 2 comes first);
         // object_count = number of Part-2 objects.
         if !page_hints.is_empty() {
             page_hints[0].first_object_index = 0;
             page_hints[0].object_count = part2_objects.len() as u32;
+        }
+
+        // Fill page-i (i >= 1) hint: object_count = size of that page's
+        // closure.  This is an over-approximation — it includes objects
+        // shared with page 0 (Part 3) and with other pages — but it is
+        // strictly non-zero, which matches Annex F's expectation that every
+        // page has at least its own page object plus content stream.
+        // Refining this to an "exclusive to this page" count (parallel to
+        // the page-0 / Part 2 definition) is a follow-up; without it the
+        // Page Offset Hint Table least/delta calculations would otherwise
+        // be derived from placeholder zeros.
+        for (i, closure) in other_page_closures.into_iter().enumerate() {
+            let page_idx = i + 1; // skip(1) above started page indexing at 1
+            if page_idx < page_hints.len() {
+                page_hints[page_idx].object_count = closure.len() as u32;
+            }
         }
 
         // ----------------------------------------------------------------
