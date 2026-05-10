@@ -5,5 +5,7 @@
 //! the types here are pure data that downstream writer subtasks consume.
 
 pub mod plan;
+pub mod renumber;
 
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
+pub use renumber::RenumberMap;
