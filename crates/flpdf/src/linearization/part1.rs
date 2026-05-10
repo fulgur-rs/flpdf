@@ -132,6 +132,14 @@ pub struct Part1Bytes {
     pub bytes: Vec<u8>,
     /// Byte positions of every numeric placeholder in `bytes`.
     pub placeholders: Part1Placeholders,
+    /// Byte offset within `bytes` of the `1 0 obj` token (i.e. the start of
+    /// object 1's body, after the file header).  The linearized writer needs
+    /// this for the Part 1 xref subsection's offset entry.
+    ///
+    /// Exposed instead of having callers hardcode the header length so that
+    /// changes to the header format (PDF version bump, binary marker change)
+    /// do not silently break downstream xref entries.
+    pub obj1_offset: usize,
 }
 
 impl Part1Bytes {
@@ -167,6 +175,9 @@ impl Part1Bytes {
         // ------------------------------------------------------------------
         // Object 1: linearization parameter dictionary
         // ------------------------------------------------------------------
+        // Capture the absolute offset of the `1 0 obj` token so callers do
+        // not need to compute the header length out of band.
+        let obj1_offset = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\n");
         bytes.extend_from_slice(b"<< /Linearized 1 /L ");
 
@@ -233,6 +244,7 @@ impl Part1Bytes {
         Self {
             bytes,
             placeholders,
+            obj1_offset,
         }
     }
 
@@ -453,6 +465,31 @@ mod tests {
         assert_eq!(
             byte_between, b' ',
             "there must be a space between /H[0] and /H[1] placeholders"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. obj1_offset matches the actual position of "1 0 obj" in bytes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn obj1_offset_matches_token_position() {
+        let p1 = build_part1();
+        let token = b"1 0 obj";
+        let found = p1
+            .bytes
+            .windows(token.len())
+            .position(|w| w == token)
+            .expect("Part 1 must contain the `1 0 obj` token");
+        assert_eq!(
+            p1.obj1_offset, found,
+            "Part1Bytes::obj1_offset must point at the start of `1 0 obj`"
+        );
+        // Also verify the slice at that offset starts with the token
+        // (catches the off-by-one case where obj1_offset points one byte
+        // past the start).
+        assert!(
+            p1.bytes[p1.obj1_offset..].starts_with(token),
+            "bytes[obj1_offset..] must start with `1 0 obj`"
         );
     }
 }
