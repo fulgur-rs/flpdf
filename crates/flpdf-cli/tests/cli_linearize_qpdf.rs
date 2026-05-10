@@ -1,26 +1,23 @@
 //! Round-trip linearization tests using qpdf as an external oracle.
 //!
-//! Test matrix:
-//! (a) `flpdf rewrite --linearize` on plain fixtures → `qpdf --check-linearization` must
-//!     accept the output (exit 0 with no errors).  Currently the hint table produced by
-//!     flpdf has a length mismatch so qpdf exits 3 (warnings) instead; this is categorised
-//!     as a known failure and attributed to issue **flpdf-k8h**.
+//! # Test matrix
 //!
-//! (b) `flpdf rewrite` (without `--linearize`) of an already-linearized PDF must produce a
-//!     *non-linearized* output (qpdf "is not linearized").  **This sub-case MUST PASS.**
+//! - **(a)** `flpdf rewrite --linearize` on plain fixtures → `qpdf --check-linearization`
+//!   must accept the output.  qpdf currently reports a "hint table length mismatch"
+//!   warning on every fixture; this specific message — and only this message — is
+//!   classified as a known issue.  *Any other* qpdf warning text causes the test to
+//!   fail, so the oracle keeps catching new regressions.
+//! - **(b)** `flpdf rewrite` (without `--linearize`) of an already-linearized PDF must
+//!   produce a *non-linearized* output.  **This sub-case MUST PASS.**
+//! - **(c)** `flpdf check-linearization`'s Pass-vs-Fail verdict must agree with qpdf's.
+//!   Verdict mismatches now hard-fail (the previous lenient behaviour was tracked as
+//!   flpdf-0dl, which has been fixed).
 //!
-//! (c) The verdict of `flpdf check-linearization` is compared against `qpdf
-//!     --check-linearization`.  Mismatches (e.g. flpdf is too lenient) are categorised and
-//!     attributed to **flpdf-0dl**.
-//!
-//! # Known issues
-//! - **flpdf-k8h** – `LinearizationPlan.page_hints[i].object_count = 0` for i >= 1; hint
-//!   table is incomplete, so qpdf reports a "hint table length mismatch" on every fixture.
-//! - **flpdf-ws2** – `page_refs` / `compute_closure` silent fallback; may affect multi-page
-//!   closures.
-//! - **flpdf-0dl** – `check_linearization` is too lenient; flpdf may report OK when qpdf
-//!   reports warnings or errors.
-//! - **flpdf-yr8** – additional hardening tracked separately.
+//! # Active known fingerprint
+//! - **`hint table length mismatch`** — flpdf's writer / hint stream encoder produces
+//!   `/H` values that disagree with qpdf's recomputed table length.  Tracked as a
+//!   follow-up to flpdf-k8h (which addressed the per-page object_count placeholder
+//!   but not the surrounding length encoding).
 //!
 //! Tests requiring qpdf are skipped silently in environments where qpdf is not installed.
 
@@ -240,6 +237,24 @@ impl CaseResult {
     }
 }
 
+/// Classify a qpdf `Warn` message in the (a) matrix into a [`CaseResult`].
+///
+/// Only **explicitly enumerated** warning fingerprints are accepted as known
+/// issues; any other warning text surfaces as a `Fail` so the oracle keeps
+/// catching new regressions instead of silently absorbing them under a
+/// previously-tracked label.
+fn classify_qpdf_warning(label: &str, msg: &str) -> CaseResult {
+    if msg.contains("hint table length mismatch") {
+        CaseResult::known(
+            label.to_string(),
+            "linearization hint table /H mismatch (post-k8h: writer/encoder length)",
+            "qpdf exit 3 with warnings",
+        )
+    } else {
+        CaseResult::fail(label.to_string(), format!("unexpected qpdf warning: {msg}"))
+    }
+}
+
 fn print_summary(results: &[CaseResult]) {
     println!();
     println!("=== cli_linearize_qpdf test summary ===");
@@ -296,19 +311,7 @@ fn linearize_qpdf_check_matrix() {
             Verdict::Pass => {
                 results.push(CaseResult::pass(*label));
             }
-            Verdict::Warn(msg) => {
-                // hint table length mismatch → known flpdf-k8h
-                let category = if msg.contains("hint table length mismatch") {
-                    "flpdf-k8h (multi-page hint table object_count placeholder)"
-                } else {
-                    "flpdf-k8h or unknown hint issue"
-                };
-                results.push(CaseResult::known(
-                    *label,
-                    category,
-                    "qpdf exit 3 with warnings",
-                ));
-            }
+            Verdict::Warn(msg) => results.push(classify_qpdf_warning(label, msg)),
             Verdict::Fail(msg) => {
                 results.push(CaseResult::fail(*label, format!("qpdf hard fail: {msg}")));
             }
@@ -434,24 +437,36 @@ fn verdict_match_flpdf_vs_qpdf() {
         if fv_pass == qv_pass {
             results.push(CaseResult::pass(label));
         } else {
-            // flpdf accepts but qpdf rejects (or vice versa).
+            // flpdf-0dl (validator over-leniency) is closed.  A verdict
+            // mismatch is now a real regression — neither checker should
+            // accept what the other rejects.
             let detail = format!(
-                "flpdf={:?} qpdf={:?}",
+                "flpdf={} qpdf={}",
                 if fv_pass { "Pass/Warn" } else { "Fail" },
                 if qv_pass { "Pass/Warn" } else { "Fail" }
             );
-            results.push(CaseResult::known(
+            results.push(CaseResult::fail(
                 label,
-                "flpdf-0dl",
-                format!("verdict mismatch: {detail}"),
+                format!("verdict mismatch between flpdf and qpdf: {detail}"),
             ));
         }
     }
 
     print_summary(&results);
 
-    // (c) failures are categorised, not asserted — the spec says mismatches are
-    // allowed to be known issues.  No panic here.
+    // After flpdf-0dl was fixed, mismatches must surface as failures so the
+    // oracle catches divergence between the two implementations.
+    let mismatches: Vec<&CaseResult> = results
+        .iter()
+        .filter(|r| matches!(r.status, CaseStatus::Fail))
+        .collect();
+    if !mismatches.is_empty() {
+        let msgs: Vec<_> = mismatches.iter().map(|r| r.label.as_str()).collect();
+        panic!(
+            "(c) verdict mismatches between flpdf and qpdf (regressions): {:?}",
+            msgs
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,5 +527,41 @@ fn non_linear_collapse_multi_page() {
         failures.is_empty(),
         "(b) non-linear collapse MUST PASS for all fixtures, failing: {:?}",
         failures
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test-of-test: classification of qpdf warnings
+// ---------------------------------------------------------------------------
+
+/// Asserts that an *unknown* qpdf warning is classified as Fail, not as a
+/// known issue.  Without this discipline the oracle silently swallows
+/// regressions — the original concern in flpdf-23w.
+#[test]
+fn classify_unknown_warning_fails() {
+    let r = classify_qpdf_warning("(a) test", "some unrelated qpdf warning text");
+    assert!(
+        matches!(r.status, CaseStatus::Fail),
+        "unknown qpdf warning must be CaseStatus::Fail, got {:?}",
+        r.reason
+    );
+    assert!(
+        r.reason.contains("unexpected qpdf warning"),
+        "reason text should name it as unexpected, got: {}",
+        r.reason
+    );
+}
+
+/// Asserts that the only currently-tracked warning fingerprint maps to
+/// CaseStatus::KnownIssue.
+#[test]
+fn classify_hint_table_warning_is_known() {
+    let r = classify_qpdf_warning(
+        "(a) test",
+        "WARNING: file: hint table length mismatch detected",
+    );
+    assert!(
+        matches!(r.status, CaseStatus::KnownIssue),
+        "the hint-table-length-mismatch fingerprint must remain known"
     );
 }
