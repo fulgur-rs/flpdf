@@ -657,7 +657,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn partial_first_page_section_entries_is_three() {
+    fn partial_first_page_section_entries_is_four() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
