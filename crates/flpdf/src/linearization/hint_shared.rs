@@ -196,6 +196,15 @@ impl SharedObjectHintTable {
     /// * All header numeric fields are `0`.
     /// * `groups` is empty (M = 0).
     /// * `objects` is empty.
+    ///
+    /// # Panics
+    ///
+    /// When `shared_hints` is non-empty, panics if `part3_objects` is empty
+    /// or if its first entry is not present in `renumber` — both indicate a
+    /// malformed `LinearizationPlan` / `RenumberMap` pair that the caller
+    /// must construct consistently.  Silently writing
+    /// `first_object_number = 0` would emit a header pointing at PDF
+    /// object 0 (the free-list head), which is invalid.
     pub fn from_plan(plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
         let shared_count = plan.shared_hints.len() as u32;
 
@@ -223,13 +232,34 @@ impl SharedObjectHintTable {
         //
         // This is the new (linearized) object number of the first Part-3
         // object as assigned by the renumber map.
+        //
+        // Fail fast on plan/renumber inconsistency: shared_count > 0 implies
+        // at least one shared object, which means part3_objects must be
+        // non-empty AND its first entry must be in the renumber map.
+        // Silently writing 0 here would emit a malformed Shared Object Hint
+        // Table header (object number 0 is reserved for the free-list head).
         // ------------------------------------------------------------------
-        let first_object_number = plan
-            .part3_objects
-            .first()
-            .and_then(|r| renumber.new_for_original(*r))
-            .map(|r| r.number)
-            .unwrap_or(0);
+        debug_assert_eq!(
+            plan.part3_objects.len(),
+            plan.shared_hints.len(),
+            "shared_hints and part3_objects must remain aligned"
+        );
+        let first_part3 = plan.part3_objects.first().unwrap_or_else(|| {
+            panic!(
+                "non-empty shared_hints ({} entries) requires non-empty part3_objects \
+                 (plan invariant violated)",
+                shared_count
+            )
+        });
+        let first_object_number = renumber
+            .new_for_original(*first_part3)
+            .unwrap_or_else(|| {
+                panic!(
+                    "first Part-3 object {first_part3:?} not found in RenumberMap \
+                     (plan/renumber inconsistency)"
+                )
+            })
+            .number;
 
         // ------------------------------------------------------------------
         // Step 2: count how many shared objects reference page 0 (first page).
