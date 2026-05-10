@@ -31,7 +31,7 @@
 //! The four parts are always disjoint (invariant preserved by construction).
 
 use crate::{Object, ObjectRef, Pdf};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -136,21 +136,21 @@ fn collect_direct_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
 /// included in the closure, but the *sibling pages* hanging off `/Kids` are
 /// not pulled in. The `/Parent` chain is therefore followed at most until the
 /// root Pages node without capturing other pages.
-fn compute_closure<R: Read + Seek>(pdf: &mut Pdf<R>, root: ObjectRef) -> Vec<ObjectRef> {
+fn compute_closure<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    root: ObjectRef,
+) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
-    let mut queue: Vec<ObjectRef> = vec![root];
+    let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
 
-    while let Some(current) = queue.pop() {
+    while let Some(current) = queue.pop_front() {
         if !visited.insert(current) {
             continue;
         }
         order.push(current);
 
-        let obj = match pdf.resolve(current) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
+        let obj = pdf.resolve(current)?;
 
         // Special-case /Pages nodes: skip /Kids to avoid pulling sibling pages.
         let is_pages_node = matches!(&obj, Object::Dictionary(d)
@@ -166,7 +166,7 @@ fn compute_closure<R: Read + Seek>(pdf: &mut Pdf<R>, root: ObjectRef) -> Vec<Obj
                     collect_direct_refs(v, &mut refs);
                     for r in refs {
                         if !visited.contains(&r) {
-                            queue.push(r);
+                            queue.push_back(r);
                         }
                     }
                 }
@@ -176,13 +176,13 @@ fn compute_closure<R: Read + Seek>(pdf: &mut Pdf<R>, root: ObjectRef) -> Vec<Obj
             collect_direct_refs(&obj, &mut refs);
             for r in refs {
                 if !visited.contains(&r) {
-                    queue.push(r);
+                    queue.push_back(r);
                 }
             }
         }
     }
 
-    order
+    Ok(order)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ impl LinearizationPlan {
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
         let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
-            compute_closure(pdf, first_page)
+            compute_closure(pdf, first_page)?
         } else {
             Vec::new()
         };
@@ -302,7 +302,7 @@ impl LinearizationPlan {
         let mut shared_page_indices: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref);
+            let closure = compute_closure(pdf, page_ref)?;
             for obj_ref in &closure {
                 if first_page_set.contains(obj_ref) {
                     shared_page_indices
@@ -520,11 +520,11 @@ mod tests {
 
         // Page 1 content stream
         let off6 = pdf.len() as u64;
-        pdf.extend_from_slice(b"6 0 obj\n<< /Length 7 >>\nstream\nBT ET\nendstream\nendobj\n");
+        pdf.extend_from_slice(b"6 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
 
         // Page 2 content stream
         let off7 = pdf.len() as u64;
-        pdf.extend_from_slice(b"7 0 obj\n<< /Length 7 >>\nstream\nBT ET\nendstream\nendobj\n");
+        pdf.extend_from_slice(b"7 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
 
         // Font (shared)
         let off8 = pdf.len() as u64;
