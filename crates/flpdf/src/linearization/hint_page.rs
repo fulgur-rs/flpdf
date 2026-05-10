@@ -264,10 +264,11 @@ impl PageOffsetHintTable {
     /// `object_count_minus_least`; unlike byte-offset placeholders they are
     /// not back-patched, so a placeholder zero would bake an incorrect
     /// header / entries into the table).  Also panics if the plan has zero
-    /// pages, or if a `shared_hint.object_ref` is not present in `renumber`
-    /// — these all indicate a malformed `LinearizationPlan` / `RenumberMap`
-    /// pair that the caller is expected to construct consistently.
-    pub fn from_plan(plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
+    /// pages — these all indicate a malformed `LinearizationPlan` that the
+    /// caller is expected to construct consistently.  The `_renumber` parameter
+    /// is retained for API stability (the `RenumberMap` is no longer needed
+    /// internally since `shared_object_ids` are now 0-based hint table indices).
+    pub fn from_plan(plan: &LinearizationPlan, _renumber: &RenumberMap) -> Self {
         assert!(
             !plan.page_hints.is_empty(),
             "PageOffsetHintTable::from_plan requires at least one page in the plan"
@@ -297,25 +298,13 @@ impl PageOffsetHintTable {
         // list page i in their referencing_pages.
         // ------------------------------------------------------------------
         let mut shared_counts: Vec<u32> = vec![0u32; page_count];
-        // Also collect, per page, the list of new object numbers for shared
-        // objects referencing that page (in shared_hints order).
+        // Collect, per page, the list of 0-based indices into plan.shared_hints
+        // for shared objects referencing that page.  Per qpdf's checkHPageOffset
+        // algorithm, shared_identifiers are interpreted as indices into the
+        // shared object hint table (not as new object numbers).
         let mut shared_ids_per_page: Vec<Vec<u32>> = vec![Vec::new(); page_count];
 
-        for shared_hint in &plan.shared_hints {
-            // Resolve the new (linearized) object number for this shared object.
-            // Synthesizing 0 on a miss would leave shared_object_ids inconsistent
-            // with bits_shared_object_id (which is computed from successfully
-            // mapped IDs only), so fail fast on a malformed plan/renumber pair.
-            let new_number = renumber
-                .new_for_original(shared_hint.object_ref)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "shared hint object {:?} not found in RenumberMap (plan/renumber inconsistency)",
-                        shared_hint.object_ref
-                    )
-                })
-                .number;
-
+        for (shared_idx, shared_hint) in plan.shared_hints.iter().enumerate() {
             for &page_idx in &shared_hint.referencing_pages {
                 let idx = page_idx as usize;
                 // Out-of-range page indexes indicate plan corruption (a
@@ -330,7 +319,7 @@ impl PageOffsetHintTable {
                     page_count
                 );
                 shared_counts[idx] += 1;
-                shared_ids_per_page[idx].push(new_number);
+                shared_ids_per_page[idx].push(shared_idx as u32);
             }
         }
 
@@ -343,15 +332,10 @@ impl PageOffsetHintTable {
         let greatest_shared_count = shared_counts.iter().copied().max().unwrap_or(0);
 
         // ------------------------------------------------------------------
-        // Step 3: compute the greatest shared object identifier (new number).
+        // Step 3: compute the greatest shared object identifier (0-based index
+        // into the shared hint table, matching qpdf's checkHPageOffset semantics).
         // ------------------------------------------------------------------
-        let greatest_shared_id = plan
-            .shared_hints
-            .iter()
-            .filter_map(|h| renumber.new_for_original(h.object_ref))
-            .map(|r| r.number as u64)
-            .max()
-            .unwrap_or(0);
+        let greatest_shared_id = plan.shared_hints.len().saturating_sub(1) as u64;
 
         // ------------------------------------------------------------------
         // Step 4: build the header.
@@ -462,14 +446,16 @@ mod tests {
 
     /// Two-page plan:
     ///
-    /// Part 2 (page 0 exclusive): [3 0 R, 6 0 R]  → object_count includes Part-3
-    /// Part 3 (shared):           [5 0 R, 8 0 R]
-    /// Part 4 (remaining):        [4 0 R, 7 0 R]
+    /// Part 2 (page 0 exclusive): [3 0 R, 6 0 R]  → new numbers 2, 3
+    /// Part 3 (shared):           [5 0 R, 8 0 R]  → new numbers 4, 5
+    /// Part 4 (remaining):        [4 0 R, 7 0 R]  → new numbers 6, 7
     /// Page 0: page_ref = 3 0 R, object_count = 4 (2 Part-2 + 2 Part-3)
     /// Page 1: page_ref = 4 0 R, object_count = 5
-    /// Shared hints:
-    ///   5 0 R → referencing_pages [1]   (page 0 owns via physical layout, not hint ref)
-    ///   8 0 R → referencing_pages [1]
+    /// Shared hints (part2 first, then part3):
+    ///   3 0 R (idx 0) → referencing_pages []   (part2, page 0 owns by layout)
+    ///   6 0 R (idx 1) → referencing_pages []   (part2, page 0 owns by layout)
+    ///   5 0 R (idx 2) → referencing_pages [1]  (part3, page 0 owns via layout; page 1 references)
+    ///   8 0 R (idx 3) → referencing_pages [1]  (part3, page 1 references)
     fn two_page_plan_with_shared() -> LinearizationPlan {
         LinearizationPlan {
             part1_objects: vec![],
@@ -493,6 +479,16 @@ mod tests {
                 },
             ],
             shared_hints: vec![
+                // part2 entries (referencing_pages = [] — page 0 owns by physical layout)
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(3, 0),
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(6, 0),
+                    referencing_pages: vec![],
+                },
+                // part3 entries (page 0 owns physically; only pages 1..N listed here)
                 SharedObjectHintEntry {
                     object_ref: ObjectRef::new(5, 0),
                     referencing_pages: vec![1], // page 0 owns via physical layout
@@ -707,14 +703,15 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // Part-2 objects: 3 0 R → new 2, 6 0 R → new 3
-        // Part-3 objects: 5 0 R → new 4, 8 0 R → new 5
-        // greatest shared id = 5 → bits_needed(5) = 3
-        assert_eq!(table.header.bits_shared_object_id, 3);
+        // shared_hints has 4 entries (indices 0..3).
+        // greatest shared id = 4 - 1 = 3 → bits_needed(3) = 2
+        // Per qpdf's checkHPageOffset, shared_identifiers are 0-based indices
+        // into the shared object hint table, not new object numbers.
+        assert_eq!(table.header.bits_shared_object_id, 2);
     }
 
     #[test]
-    fn two_page_shared_object_ids_are_new_numbers() {
+    fn two_page_shared_object_ids_are_hint_indices() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
@@ -725,13 +722,15 @@ mod tests {
             "page 0 must not list shared identifiers"
         );
 
-        // Page 1 references both shared objects — new numbers 4 and 5.
+        // Page 1 references part3 entries (indices 2 and 3 in shared_hints).
+        // shared_hints: [3 0 R (idx 0), 6 0 R (idx 1), 5 0 R (idx 2), 8 0 R (idx 3)]
+        // Page 1 has referencing_pages = [1] for entries at idx 2 and 3.
         let mut ids1 = table.entries[1].shared_object_ids.clone();
         ids1.sort_unstable();
         assert_eq!(
             ids1,
-            vec![4, 5],
-            "page 1 shared object ids must be new numbers 4 and 5"
+            vec![2, 3],
+            "page 1 shared object ids must be 0-based indices 2 and 3 into shared_hints"
         );
     }
 

@@ -526,9 +526,21 @@ impl LinearizationPlan {
         // so page 0 "has" them by physical position without needing a hint
         // table reference.  Only pages 1..N that also use these objects appear
         // in `referencing_pages`.
-        let shared_hints: Vec<SharedObjectHintEntry> = part3_objects
-            .iter()
-            .map(|&obj_ref| {
+        // Per qpdf's checkHSharedObject algorithm, the shared object hint table
+        // must start at the first object of the first-page section (part2[0] =
+        // page dict) and cover ALL first-page section objects before the truly
+        // shared (part3) objects.  So when there are any part3 objects we
+        // prepend part2 entries (referencing_pages = [] since page 0 physically
+        // owns them) before the part3 entries.  When part3 is empty we keep
+        // shared_hints empty (no shared objects at all).
+        let shared_hints: Vec<SharedObjectHintEntry> = if part3_objects.is_empty() {
+            Vec::new()
+        } else {
+            let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
+                object_ref: obj_ref,
+                referencing_pages: vec![],
+            });
+            let part3_entries = part3_objects.iter().map(|&obj_ref| {
                 let pages: Vec<u32> = shared_page_indices
                     .get(&obj_ref)
                     .map(|s| s.iter().copied().collect())
@@ -539,8 +551,9 @@ impl LinearizationPlan {
                     object_ref: obj_ref,
                     referencing_pages: pages,
                 }
-            })
-            .collect();
+            });
+            part2_entries.chain(part3_entries).collect()
+        };
 
         Ok(Self {
             part1_objects: Vec::new(),
@@ -929,29 +942,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // 7. Shared font hint entries include page 1 but NOT page 0.
     //
-    //    Per qpdf's Annex F layout, shared objects are physically written
-    //    inside the first-page section (before /E), so page 0 implicitly
-    //    "owns" them by physical position.  The hint table's referencing_pages
-    //    only lists pages 1..N that also use these objects via the shared
-    //    object section hint.
+    //    Per qpdf's Annex F layout, the shared hint table starts with all
+    //    first-page section (part2) objects (referencing_pages = []) followed
+    //    by the truly shared (part3) objects that carry cross-page references.
+    //    Part3 entries must reference pages 1..N that use them; page 0 owns
+    //    them by physical position so it must NOT appear in referencing_pages.
     // -----------------------------------------------------------------------
     #[test]
     fn shared_hints_reference_correct_pages() {
         let mut pdf = open_two_page_shared_font();
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
 
-        // Every shared hint must reference page 1 (the second page uses it)
-        // but must NOT reference page 0 (first page owns shared objects by
-        // physical layout, not hint table reference).
-        for hint in &plan.shared_hints {
+        let part2_len = plan.part2_objects.len();
+
+        // Part2 entries (indices 0..part2_len) must have empty referencing_pages.
+        for hint in &plan.shared_hints[..part2_len] {
+            assert!(
+                hint.referencing_pages.is_empty(),
+                "part2 shared hint for {} must have empty referencing_pages",
+                hint.object_ref
+            );
+        }
+
+        // Part3 entries (indices part2_len..) must reference page 1 but NOT page 0.
+        for hint in &plan.shared_hints[part2_len..] {
             assert!(
                 !hint.referencing_pages.contains(&0),
-                "shared hint for {} must NOT reference page 0 (physical ownership via first-page section)",
+                "part3 shared hint for {} must NOT reference page 0 (physical ownership via first-page section)",
                 hint.object_ref
             );
             assert!(
                 hint.referencing_pages.contains(&1),
-                "shared hint for {} must reference page 1 (second page)",
+                "part3 shared hint for {} must reference page 1 (second page)",
                 hint.object_ref
             );
         }
