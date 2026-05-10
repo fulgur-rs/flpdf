@@ -169,9 +169,7 @@ impl Part1Bytes {
         // new number 1 would silently produce a duplicate `1 0 obj` definition
         // in the linearized output and corrupt the xref.
         debug_assert!(
-            renumber
-                .original_for_new(crate::ObjectRef::new(1, 0))
-                .is_none(),
+            renumber.slot_one_is_reserved(),
             "Part1Bytes::build: RenumberMap allocated object number 1 to a \
              plan object — slot 1 must remain reserved for the linearization \
              parameter dictionary"
