@@ -68,24 +68,36 @@ fn qpdf_available() -> bool {
 }
 
 /// Skip-if-missing helper for qpdf-dependent tests.  Returns `true` when the
-/// caller should *return early* (qpdf is missing AND we are not on CI).
+/// caller should *return early* (qpdf is missing AND this environment is
+/// allowed to skip).
 ///
-/// On CI (`CI` env var set), missing qpdf is a hard failure: the oracle
-/// tests are the only thing that catches regressions in flpdf's hint stream
-/// against an external tool, so silently skipping them on CI would leave a
-/// blind spot.
+/// On Linux CI (`CI` env var set, non-Windows) missing qpdf is a hard
+/// failure: the oracle tests are the only thing that catches regressions in
+/// flpdf's hint stream against an external tool, so silently skipping them
+/// would leave a blind spot.  CI installs qpdf via `apt-get` for this.
+///
+/// On Windows CI we do *not* install qpdf yet (choco's qpdf surfaces an
+/// unrelated runtime error on existing writer_tests output, tracked
+/// separately), so qpdf-dependent tests skip silently there.  Locally
+/// (no CI env var) tests also skip silently.
 #[must_use]
 fn skip_if_qpdf_missing() -> bool {
     if qpdf_available() {
         return false;
     }
-    if std::env::var_os("CI").is_some() {
+    let on_ci = std::env::var_os("CI").is_some();
+    let on_windows = cfg!(target_os = "windows");
+    if on_ci && !on_windows {
         panic!(
-            "qpdf is required for cli_linearize_qpdf tests on CI; \
+            "qpdf is required for cli_linearize_qpdf tests on CI (Linux); \
              install qpdf in the workflow before running this test suite"
         );
     }
-    eprintln!("skipping: qpdf not available (set CI=1 to make this a hard failure)");
+    eprintln!(
+        "skipping: qpdf not available (target_os={}, CI={})",
+        std::env::consts::OS,
+        on_ci
+    );
     true
 }
 
