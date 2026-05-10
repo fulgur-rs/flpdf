@@ -215,6 +215,7 @@ mod tests {
             root_ref: Some(ObjectRef::new(1, 0)),
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             shared_hints: vec![],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -227,6 +228,7 @@ mod tests {
             hint_stream_length: 567,
             first_page_object_new_num: 2,
             end_of_first_page_offset: 9876,
+            last_xref_keyword_offset: 49990,
             last_xref_offset: 50000,
             page_count: 1,
             part1_placeholders: part1.placeholders.clone(),

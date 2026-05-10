@@ -262,13 +262,20 @@ impl SharedObjectHintTable {
             .number;
 
         // ------------------------------------------------------------------
-        // Step 2: count how many shared objects reference page 0 (first page).
+        // Step 2: count shared objects that are physically in the first-page
+        // section (before /E).
+        //
+        // Per qpdf's Annex F layout, ALL Part-3 (shared) objects are written
+        // inside the first-page section.  The `first_page_entries` field in
+        // the Shared Object Hint Table header records how many shared objects
+        // reside in the first-page section (Annex F Part 3 / before /E).
+        // Since ALL shared objects are in the first-page section, this equals
+        // section_entries.  Setting it to fewer would tell readers that some
+        // shared objects are in Part 8 (after the remaining pages), which would
+        // produce the "part 8 is empty but nshared_total > nshared_first_page"
+        // qpdf warning.
         // ------------------------------------------------------------------
-        let first_page_entries = plan
-            .shared_hints
-            .iter()
-            .filter(|h| h.referencing_pages.contains(&0))
-            .count() as u32;
+        let first_page_entries = shared_count; // all shared objects are in the first-page section
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
@@ -364,6 +371,7 @@ mod tests {
                 byte_length: 0,
             }],
             shared_hints: vec![],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -410,6 +418,7 @@ mod tests {
                     referencing_pages: vec![0, 1],
                 },
             ],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -465,6 +474,7 @@ mod tests {
                     referencing_pages: vec![1],
                 },
             ],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -520,15 +530,17 @@ mod tests {
     }
 
     #[test]
-    fn two_page_first_page_entries_both_referenced() {
+    fn two_page_first_page_entries_equals_section_entries() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // Both shared objects reference page 0.
+        // All shared objects are in the first-page section (before /E).
+        // first_page_entries must equal section_entries so qpdf doesn't
+        // expect a non-empty Part 8.
         assert_eq!(
             table.header.first_page_entries, 2,
-            "both shared objects reference page 0 → first_page_entries must be 2"
+            "all shared objects are in first-page section → first_page_entries must equal section_entries (2)"
         );
     }
 
@@ -633,17 +645,17 @@ mod tests {
     }
 
     #[test]
-    fn partial_first_page_first_page_entries_is_two() {
+    fn partial_first_page_first_page_entries_equals_section_entries() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // 20 0 R → [0, 1]: references page 0 ✓
-        // 21 0 R → [0]: references page 0 ✓
-        // 22 0 R → [1]: does NOT reference page 0 ✗
+        // All shared objects (3) are physically in the first-page section.
+        // first_page_entries must equal section_entries = 3 so that qpdf
+        // does not expect a non-empty Part 8.
         assert_eq!(
-            table.header.first_page_entries, 2,
-            "only 2 out of 3 shared objects reference page 0"
+            table.header.first_page_entries, 3,
+            "all 3 shared objects are in first-page section → first_page_entries must be 3"
         );
     }
 

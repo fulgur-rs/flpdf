@@ -249,18 +249,33 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     }
 
     // -----------------------------------------------------------------------
-    // 7. /T must point to `xref` keyword
+    // 7. /T must be within the last cross-reference table.
+    //
+    // Different PDF producers use slightly different /T conventions:
+    // - ISO 32000-1 Annex F: /T = byte offset of the xref keyword itself
+    // - qpdf convention: /T = byte offset just before the first xref entry
+    //   (i.e. offset of the last '\n' in the "xref\n0 N\n" header)
+    //
+    // We accept any /T that is within the xref section header (i.e. the xref
+    // keyword is reachable by scanning backwards within a small window).
     // -----------------------------------------------------------------------
     let t_obj = param_dict.get("T").cloned().unwrap_or(Object::Null);
     let t_val = as_u64(&t_obj, "T")?;
-    if t_val + 4 > file_len {
+    if t_val as usize + 4 > file_bytes.len() {
         fail!("/T ({t_val}) is too close to end of file to contain xref keyword");
     }
-    let t_bytes = &file_bytes[t_val as usize..t_val as usize + 4];
-    if t_bytes != b"xref" {
+    // Allow /T to be within a 16-byte window past the xref keyword.
+    // This accommodates both the ISO convention (/T = xref keyword) and
+    // the qpdf convention (/T = first_entry_pos - 1 = xref + header_len - 1).
+    let t_usize = t_val as usize;
+    let search_start = t_usize.saturating_sub(16);
+    let found_xref = file_bytes[search_start..=t_usize]
+        .windows(4)
+        .any(|w| w == b"xref");
+    if !found_xref {
         fail!(
-            "/T ({t_val}) does not point to xref keyword (found {:?})",
-            String::from_utf8_lossy(t_bytes)
+            "/T ({t_val}) is not within the last cross-reference section \
+             (no xref keyword found in the 16-byte window before /T)"
         );
     }
 
