@@ -228,33 +228,32 @@ impl SharedObjectHintTable {
         // ------------------------------------------------------------------
         // Step 1: first object number in the shared objects section.
         //
-        // This is the new (linearized) object number of the first Part-3
-        // object as assigned by the renumber map.
+        // Per qpdf's checkHSharedObject algorithm, the shared object hint table
+        // starts at the first object of the first-page section (= shared_hints[0],
+        // which is the page dict = part2[0]).  qpdf walks cur_object starting
+        // from pages[0].getObjectID() (= /O = the page dict new number), so
+        // first_object_number must point to part2[0], not to part3[0].
         //
         // Fail fast on plan/renumber inconsistency: shared_count > 0 implies
-        // at least one shared object, which means part3_objects must be
-        // non-empty AND its first entry must be in the renumber map.
-        // Silently writing 0 here would emit a malformed Shared Object Hint
+        // at least one shared object, which means shared_hints must be non-empty
+        // AND its first entry must be in the renumber map.  Silently writing
+        // first_object_number = 0 would emit a malformed Shared Object Hint
         // Table header (object number 0 is reserved for the free-list head).
         // ------------------------------------------------------------------
-        debug_assert_eq!(
-            plan.part3_objects.len(),
-            plan.shared_hints.len(),
-            "shared_hints and part3_objects must remain aligned"
-        );
-        let first_part3 = plan.part3_objects.first().unwrap_or_else(|| {
+        let first_shared = plan.shared_hints.first().unwrap_or_else(|| {
             panic!(
-                "non-empty shared_hints ({} entries) requires non-empty part3_objects \
+                "non-empty shared_hints ({} entries) requires non-empty shared_hints vec \
                  (plan invariant violated)",
                 shared_count
             )
         });
         let first_object_number = renumber
-            .new_for_original(*first_part3)
+            .new_for_original(first_shared.object_ref)
             .unwrap_or_else(|| {
                 panic!(
-                    "first Part-3 object {first_part3:?} not found in RenumberMap \
-                     (plan/renumber inconsistency)"
+                    "first shared object {:?} not found in RenumberMap \
+                     (plan/renumber inconsistency)",
+                    first_shared.object_ref
                 )
             })
             .number;
@@ -386,7 +385,9 @@ mod tests {
     /// Pages:
     ///   page 0: page_ref = 3 0 R
     ///   page 1: page_ref = 4 0 R
-    /// Shared hints:
+    /// Shared hints (part2 entries first, then part3 entries):
+    ///   3 0 R → referencing_pages []   (part2, page 0 owns by layout)
+    ///   6 0 R → referencing_pages []   (part2, page 0 owns by layout)
     ///   5 0 R → referencing_pages [0, 1]
     ///   8 0 R → referencing_pages [0, 1]
     fn two_page_shared_both_pages() -> LinearizationPlan {
@@ -412,6 +413,16 @@ mod tests {
                 },
             ],
             shared_hints: vec![
+                // part2 entries (referencing_pages = [] — page 0 owns by physical layout)
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(3, 0),
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(6, 0),
+                    referencing_pages: vec![],
+                },
+                // part3 entries (truly cross-page shared objects)
                 SharedObjectHintEntry {
                     object_ref: ObjectRef::new(5, 0),
                     referencing_pages: vec![0, 1],
@@ -433,7 +444,8 @@ mod tests {
     /// Pages:
     ///   page 0: page_ref = 10 0 R
     ///   page 1: page_ref = 30 0 R
-    /// Shared hints:
+    /// Shared hints (part2 first, then part3):
+    ///   10 0 R → referencing_pages []   (part2, page 0 owns by layout)
     ///   20 0 R → referencing_pages [0, 1]
     ///   21 0 R → referencing_pages [0]
     ///   22 0 R → referencing_pages [1]        ← NOT referenced from page 0
@@ -464,6 +476,12 @@ mod tests {
                 },
             ],
             shared_hints: vec![
+                // part2 entry (referencing_pages = [] — page 0 owns by physical layout)
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(10, 0),
+                    referencing_pages: vec![],
+                },
+                // part3 entries (truly cross-page shared objects)
                 SharedObjectHintEntry {
                     object_ref: ObjectRef::new(20, 0),
                     referencing_pages: vec![0, 1],
@@ -527,8 +545,8 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
         assert_eq!(
-            table.header.section_entries, 2,
-            "section_entries must equal plan.shared_hints.len()"
+            table.header.section_entries, 4,
+            "section_entries must equal plan.shared_hints.len() (2 part2 + 2 part3 = 4)"
         );
     }
 
@@ -542,8 +560,8 @@ mod tests {
         // first_page_entries must equal section_entries so qpdf doesn't
         // expect a non-empty Part 8.
         assert_eq!(
-            table.header.first_page_entries, 2,
-            "all shared objects are in first-page section → first_page_entries must equal section_entries (2)"
+            table.header.first_page_entries, 4,
+            "all shared objects are in first-page section → first_page_entries must equal section_entries (4)"
         );
     }
 
@@ -553,11 +571,12 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // Part 2: [3 0 R → new 2, 6 0 R → new 3]
-        // Part 3: [5 0 R → new 4, ...]
+        // shared_hints[0] = 3 0 R (part2[0] = page dict) → new number 2
+        // Per qpdf's checkHSharedObject, the table starts at the first-page
+        // section's first object (the page dict), not at part3[0].
         assert_eq!(
-            table.header.first_object_number, 4,
-            "first Part-3 object (5 0 R) must map to new number 4"
+            table.header.first_object_number, 2,
+            "shared_hints[0] (3 0 R = part2[0] = page dict) must map to new number 2"
         );
     }
 
@@ -585,8 +604,8 @@ mod tests {
             "1-group model must have exactly 1 group"
         );
         assert_eq!(
-            table.groups[0].object_count, 2,
-            "group must contain all 2 shared objects"
+            table.groups[0].object_count, 4,
+            "group must contain all 4 shared objects (2 part2 + 2 part3)"
         );
     }
 
@@ -644,8 +663,8 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
         assert_eq!(
-            table.header.section_entries, 3,
-            "section_entries must equal total shared hints count (3)"
+            table.header.section_entries, 4,
+            "section_entries must equal total shared hints count (1 part2 + 3 part3 = 4)"
         );
     }
 
@@ -655,12 +674,12 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // All shared objects (3) are physically in the first-page section.
-        // first_page_entries must equal section_entries = 3 so that qpdf
+        // All shared objects (4 = 1 part2 + 3 part3) are physically in the first-page section.
+        // first_page_entries must equal section_entries = 4 so that qpdf
         // does not expect a non-empty Part 8.
         assert_eq!(
-            table.header.first_page_entries, 3,
-            "all 3 shared objects are in first-page section → first_page_entries must be 3"
+            table.header.first_page_entries, 4,
+            "all 4 shared objects are in first-page section → first_page_entries must be 4"
         );
     }
 
@@ -671,7 +690,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
         assert_eq!(table.groups.len(), 1);
-        assert_eq!(table.groups[0].object_count, 3);
+        assert_eq!(table.groups[0].object_count, 4);
     }
 
     #[test]
@@ -690,11 +709,12 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // Part 2: [10 0 R → new 2]
-        // Part 3: [20 0 R → new 3, ...]
+        // shared_hints[0] = 10 0 R (part2[0] = page dict) → new number 2
+        // Per qpdf's checkHSharedObject, the table starts at the first-page
+        // section's first object (the page dict), not at part3[0].
         assert_eq!(
-            table.header.first_object_number, 3,
-            "first Part-3 object (20 0 R) must map to new number 3"
+            table.header.first_object_number, 2,
+            "shared_hints[0] (10 0 R = part2[0] = page dict) must map to new number 2"
         );
     }
 
@@ -704,6 +724,6 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        assert_eq!(table.objects.len(), 3);
+        assert_eq!(table.objects.len(), 4);
     }
 }

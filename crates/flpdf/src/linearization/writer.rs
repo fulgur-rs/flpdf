@@ -662,38 +662,46 @@ pub fn write_linearized<R: Read + Seek>(
         }
 
         // Shared object table fields.
-        if !plan.part3_objects.is_empty() {
-            // Collect Part 3 byte lengths in plan order.
-            let part3_lens: Vec<u64> = plan
-                .part3_objects
+        //
+        // The shared hint table covers all plan.shared_hints entries (part2
+        // entries first, then part3 entries).  Per qpdf's checkHSharedObject,
+        // the table starts at the first-page section's first object (part2[0] =
+        // page dict), so we use shared_hints[0] for the location field.
+        if !plan.shared_hints.is_empty() {
+            // Collect byte lengths for all shared hint entries in plan order.
+            let shared_section_lens: Vec<u64> = plan
+                .shared_hints
                 .iter()
-                .map(|orig| {
+                .map(|h| {
                     renumber
-                        .new_for_original(*orig)
+                        .new_for_original(h.object_ref)
                         .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
                         .unwrap_or(0) as u64
                 })
                 .collect();
 
-            let least = part3_lens.iter().copied().min().unwrap_or(0);
-            let max = part3_lens.iter().copied().max().unwrap_or(0);
+            let least = shared_section_lens.iter().copied().min().unwrap_or(0);
+            let max = shared_section_lens.iter().copied().max().unwrap_or(0);
             so_table.header.least_length = least;
             so_table.header.bits_length_delta = bits_needed(max.saturating_sub(least));
 
-            // Location of first Part-3 object.
+            // Location of first shared section object (= shared_hints[0] = part2[0] = page dict).
             //
             // The probe-pass xref_offsets already account for the hint stream
             // object bytes (it is written inline in do_write_pass before Part 2/3
             // objects).  Do NOT apply adjusted_offset here — that would add
             // hint_stream_obj_total_len a second time and produce an offset
             // that is too large by exactly the hint stream size.
-            let first_part3_orig = plan.part3_objects[0];
-            let first_part3_new_num = renumber
-                .new_for_original(first_part3_orig)
+            let first_shared_orig = plan.shared_hints[0].object_ref;
+            let first_shared_new_num = renumber
+                .new_for_original(first_shared_orig)
                 .map(|r| r.number)
                 .unwrap_or(0);
-            let first_part3_off = xref_offsets.get(&first_part3_new_num).copied().unwrap_or(0);
-            so_table.header.location = first_part3_off as u64;
+            let first_shared_off = xref_offsets
+                .get(&first_shared_new_num)
+                .copied()
+                .unwrap_or(0);
+            so_table.header.location = first_shared_off as u64;
 
             // Per-object length_minus_least.  group_offset is no longer a
             // per-entry field (see hint_stream::encode_shared_object_entries:
@@ -701,15 +709,15 @@ pub fn write_linearized<R: Read + Seek>(
             // and was previously emitting an extra 32 bits per entry that
             // qpdf misinterpreted as the next entry's length delta).
             // `nobjects_minus_one` stays at 0 from `from_plan`.
-            for (i, _orig) in plan.part3_objects.iter().enumerate() {
+            for (i, _hint) in plan.shared_hints.iter().enumerate() {
                 if i < so_table.objects.len() {
                     so_table.objects[i].length_minus_least =
-                        (part3_lens[i].saturating_sub(least)) as u32;
+                        (shared_section_lens[i].saturating_sub(least)) as u32;
                 }
             }
-            // first_part3_off retained as a debug crosscheck against the
+            // first_shared_off retained as a debug crosscheck against the
             // probe pass, but no longer fed into per-entry fields.
-            let _ = first_part3_off;
+            let _ = first_shared_off;
         }
 
         // Re-encode hint stream with patched tables.

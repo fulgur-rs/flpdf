@@ -3,21 +3,17 @@
 //! # Test matrix
 //!
 //! - **(a)** `flpdf rewrite --linearize` on plain fixtures → `qpdf --check-linearization`
-//!   must accept the output.  qpdf currently reports a "hint table length mismatch"
-//!   warning on every fixture; this specific message — and only this message — is
-//!   classified as a known issue.  *Any other* qpdf warning text causes the test to
-//!   fail, so the oracle keeps catching new regressions.
+//!   must accept the output with **no warnings**.  Any qpdf warning causes the test to
+//!   fail, keeping the oracle strict against regressions.
 //! - **(b)** `flpdf rewrite` (without `--linearize`) of an already-linearized PDF must
 //!   produce a *non-linearized* output.  **This sub-case MUST PASS.**
 //! - **(c)** `flpdf check-linearization`'s Pass-vs-Fail verdict must agree with qpdf's.
 //!   Verdict mismatches now hard-fail (the previous lenient behaviour was tracked as
 //!   flpdf-0dl, which has been fixed).
 //!
-//! # Active known fingerprint
-//! - **`hint table length mismatch`** — flpdf's writer / hint stream encoder produces
-//!   `/H` values that disagree with qpdf's recomputed table length.  Tracked as a
-//!   follow-up to flpdf-k8h (which addressed the per-page object_count placeholder
-//!   but not the surrounding length encoding).
+//! # Known fingerprints
+//! None — all previously tracked flpdf-b82 shared-object hint table warnings have been
+//! resolved.  The KNOWN list is empty; any new qpdf warning will immediately hard-fail.
 //!
 //! Tests requiring qpdf are skipped silently in environments where qpdf is not installed.
 
@@ -280,51 +276,16 @@ impl CaseResult {
 /// beads issue so reviewers can trace the underlying bug.
 fn classify_qpdf_warning(label: &str, msg: &str) -> CaseResult {
     const KNOWN: &[(&str, &str, &str)] = &[
-        // /H[1] mismatch — defensive entry; the writer now emits the total
-        // indirect-object byte length, so this should not normally fire.
-        (
-            "hint table length mismatch",
-            "flpdf-b82",
-            "linearization writer / hint stream length disagreement",
-        ),
-        // /T value mismatch — back-patcher writes a cross-reference offset
-        // qpdf does not agree with.  Surfaced once /H[1] was fixed.
-        (
-            "space before first xref item (/T) mismatch",
-            "flpdf-b82",
-            "/T back-patch disagrees with qpdf-computed offset",
-        ),
-        // Bit-stream overflow — Critical finding 3215150191 on PR #31:
-        // hint tables are encoded with placeholder zero offsets/lengths,
-        // so bit widths derived from incomplete data produce a stream that
-        // qpdf runs out of bits while reading.
-        (
-            "overflow reading bit stream",
-            "flpdf-b82",
-            "hint stream encoded before byte-dependent fields are real",
-        ),
-        // Cascading effect of the shared-length mismatch — qpdf cannot
-        // resolve all entries when its `cur_object` walker drifts past
-        // the last shared object.  Listed BEFORE the broader needle below
-        // so it wins when both substrings would match.
-        (
-            "unable to get object for item in shared objects hint table",
-            "flpdf-b82",
-            "follow-on of the shared-length mismatch above",
-        ),
-        // Shared-object length mismatch — qpdf computes shared-object byte
-        // lengths via xref-numbered lookup using `lengthNextN`.  flpdf's
-        // hint values agree with the file xref but qpdf's `computed` value
-        // diverges (often pointing at the next page object).  Narrow needle
-        // so it matches `shared object N length mismatch` only — a broader
-        // `"shared object"` would shadow the earlier specific entry above
-        // and could absorb future, unrelated shared-object warnings as
-        // known issues.
-        (
-            "length mismatch:",
-            "flpdf-b82",
-            "shared object length disagrees with qpdf's lengthNextN computation",
-        ),
+        // All flpdf-b82 shared-object hint table warnings have been fixed:
+        // - "shared object N length mismatch" — fixed by including part2 entries
+        //   in shared_hints and using them for location/length back-patching.
+        // - "unable to get object for item in shared objects hint table" — fixed
+        //   by the same change (table now starts at page dict = part2[0]).
+        // - "overflow reading bit stream" / "hint table length mismatch" — fixed
+        //   upstream by the convergence loop and proper back-patching.
+        // - "space before first xref item (/T) mismatch" — fixed upstream.
+        //
+        // No KNOWN fingerprints remain.  Any qpdf warning will hard-fail the test.
     ];
 
     for (needle, issue, detail) in KNOWN {
@@ -633,16 +594,19 @@ fn classify_unknown_warning_fails() {
     );
 }
 
-/// Asserts that the only currently-tracked warning fingerprint maps to
-/// CaseStatus::KnownIssue.
+/// Asserts that the previously-tracked "hint table length mismatch" fingerprint
+/// (flpdf-b82) is no longer exempted — all such warnings must now hard-fail.
+/// This confirms the KNOWN list is truly empty and the oracle is strict.
 #[test]
 fn classify_hint_table_warning_is_known() {
     let r = classify_qpdf_warning(
         "(a) test",
         "WARNING: file: hint table length mismatch detected",
     );
+    // flpdf-b82 is fixed: "hint table length mismatch" is no longer a known
+    // issue.  Any qpdf warning (including this one) must now Fail.
     assert!(
-        matches!(r.status, CaseStatus::KnownIssue),
-        "the hint-table-length-mismatch fingerprint must remain known"
+        matches!(r.status, CaseStatus::Fail),
+        "hint-table-length-mismatch is no longer a known issue — must be Fail"
     );
 }
