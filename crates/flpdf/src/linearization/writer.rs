@@ -188,9 +188,9 @@ fn write_part1_xref_and_trailer(
     trailer.insert("Root", Object::Reference(catalog_new_ref));
     bytes.extend_from_slice(b"trailer\n");
     trailer.write_pdf(bytes);
-    // startxref points to object 1's absolute offset (not this xref's offset)
-    // per Annex F.  Readers use it to locate the param dict.
-    bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", obj1_offset).as_bytes());
+    // startxref points to the xref keyword offset of this Part 1 xref section.
+    // PDF spec §7.5.5 requires startxref to be the byte offset of the xref keyword.
+    bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", xref_offset).as_bytes());
 
     xref_offset
 }
@@ -335,8 +335,25 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Part 3 (Annex F): first-page body — Plan.part2_objects
     // ------------------------------------------------------------------
-    // The first-page object (/O) is the first Part-2 object (new number 2).
-    let first_page_object_new_num: u32 = 2; // always the first Part-2 object
+    // Derive the first-page page object's new number (/O in the param dict)
+    // from the RenumberMap using the page_ref stored in page_hints[0].
+    // Hardcoding 2 would be wrong when the renumber ordering differs.
+    let first_page_object_new_num: u32 = {
+        let first_page_hint = plan.page_hints.first().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "linearization plan has no page hints (empty document?)".to_string(),
+            )
+        })?;
+        let new_ref = renumber
+            .new_for_original(first_page_hint.page_ref)
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "first-page page_ref {} has no renumber entry",
+                    first_page_hint.page_ref,
+                ))
+            })?;
+        new_ref.number
+    };
 
     for original_ref in &plan.part2_objects {
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
@@ -671,5 +688,123 @@ mod tests {
                 "offset for object {num} does not point to '{expected}'"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. HIGH fix: Part 1 startxref value equals the offset of the first
+    //     `xref` keyword in the file (not obj1's offset).
+    //
+    //     PDF §7.5.5: startxref shall give the byte offset of the xref keyword.
+    //     Before the fix, the value was obj1_offset (= 15), which pointed to
+    //     `1 0 obj`, causing parsers to fail finding the xref table.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn part1_startxref_points_to_xref_keyword() {
+        let doc = build_linearized();
+        let bytes = &doc.bytes;
+
+        // Find the byte offset of the first `xref` keyword in the file.
+        let first_xref_offset = bytes
+            .windows(4)
+            .position(|w| w == b"xref")
+            .expect("linearized output must contain at least one xref keyword");
+
+        // Locate `startxref\n` in Part 1 (before any `xref` that is *not* the
+        // Part 1 xref, i.e. search only up to the Part 6 xref).
+        // We scan for b"startxref\n" and take the first occurrence.
+        let startxref_needle = b"startxref\n";
+        let startxref_pos = bytes
+            .windows(startxref_needle.len())
+            .position(|w| w == startxref_needle)
+            .expect("linearized output must contain startxref");
+
+        // Read the decimal number immediately after "startxref\n".
+        let value_start = startxref_pos + startxref_needle.len();
+        let value_end = bytes[value_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| value_start + p)
+            .expect("startxref value must be terminated by newline");
+        let value_str =
+            std::str::from_utf8(&bytes[value_start..value_end]).expect("startxref value is UTF-8");
+        let part1_startxref_value: usize = value_str
+            .trim()
+            .parse()
+            .expect("startxref value must be a decimal integer");
+
+        assert_eq!(
+            part1_startxref_value, first_xref_offset,
+            "Part 1 startxref ({part1_startxref_value}) must equal the offset of the \
+             first xref keyword ({first_xref_offset}), not the offset of `1 0 obj`"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. HIGH fix: Pdf::open can re-parse the linearized output (regression).
+    //
+    //     Although the main xref at Part 6 is what most parsers use, this
+    //     confirms the overall file structure is well-formed enough to round-trip.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn linearized_output_is_parseable() {
+        let doc = build_linearized();
+        Pdf::open(Cursor::new(doc.bytes))
+            .expect("linearized output must be parseable by Pdf::open");
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. MEDIUM fix: first_page_object_new_num is derived from renumber map,
+    //     not hardcoded to 2.
+    //
+    //     For the single-page fixture (page 0 → obj 3 0 R), RenumberMap assigns
+    //     new number 2 to that page ref (first Part-2 object).  The derived value
+    //     must match the xref_offsets entry for that new number.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn first_page_object_new_num_matches_xref_offsets() {
+        let doc = build_linearized();
+        let num = doc.offsets.first_page_object_new_num;
+        // The new number must appear in xref_offsets.
+        assert!(
+            doc.offsets.xref_offsets.contains_key(&num),
+            "first_page_object_new_num ({num}) must be present in xref_offsets"
+        );
+        // Bytes at that offset must start with "<num> 0 obj".
+        let offset = doc.offsets.xref_offsets[&num];
+        let expected = format!("{num} 0 obj");
+        let window = &doc.bytes[offset..offset + expected.len()];
+        assert_eq!(
+            window,
+            expected.as_bytes(),
+            "offset for first_page_object_new_num ({num}) must point to '{expected}'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. MEDIUM fix: first_page_object_new_num equals renumber.new_for_original
+    //     applied to page_hints[0].page_ref.
+    //
+    //     Verifies that the derive logic is consistent with the renumber map
+    //     even when the page object is not trivially the first part2 object.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn first_page_object_new_num_equals_renumber_of_page_ref() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        let expected_num = renumber
+            .new_for_original(plan.page_hints[0].page_ref)
+            .expect("page_hints[0].page_ref must have a renumber entry")
+            .number;
+
+        let mut pdf2 = open_tiny_pdf();
+        let doc = write_linearized(&plan, &renumber, &mut pdf2).expect("write_linearized");
+
+        assert_eq!(
+            doc.offsets.first_page_object_new_num,
+            expected_num,
+            "first_page_object_new_num must equal renumber.new_for_original(page_hints[0].page_ref)"
+        );
     }
 }
