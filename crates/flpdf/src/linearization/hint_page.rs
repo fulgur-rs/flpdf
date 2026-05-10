@@ -282,10 +282,19 @@ impl PageOffsetHintTable {
 
             for &page_idx in &shared_hint.referencing_pages {
                 let idx = page_idx as usize;
-                if idx < page_count {
-                    shared_counts[idx] += 1;
-                    shared_ids_per_page[idx].push(new_number);
-                }
+                // Out-of-range page indexes indicate plan corruption (a
+                // shared hint claims to be referenced by a page that doesn't
+                // exist).  Silently dropping them undercounts shared
+                // references and produces inconsistent hint table entries.
+                assert!(
+                    idx < page_count,
+                    "shared hint object {:?} references out-of-range page index {} (page_count={})",
+                    shared_hint.object_ref,
+                    page_idx,
+                    page_count
+                );
+                shared_counts[idx] += 1;
+                shared_ids_per_page[idx].push(new_number);
             }
         }
 

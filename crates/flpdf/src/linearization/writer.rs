@@ -110,47 +110,46 @@ pub struct LinearizedDocument {
 // ---------------------------------------------------------------------------
 
 /// Deep-clone `object`, replacing every `Reference(r)` with the renumbered
-/// equivalent from `renumber`.  References whose original number is not in the
-/// map are left unchanged (with a debug assertion so tests catch accidents).
+/// equivalent from `renumber`.  Returns an error if a reference cannot be
+/// mapped — leaving an un-renumbered reference in a renumbered file would
+/// produce a mixed old/new object number that the generated xref does not
+/// describe, silently corrupting the linearized output.
 ///
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
-fn renumber_object(object: &Object, renumber: &RenumberMap) -> Object {
+fn renumber_object(object: &Object, renumber: &RenumberMap) -> Result<Object> {
     match object {
-        Object::Reference(r) => {
-            if let Some(new_ref) = renumber.new_for_original(*r) {
-                Object::Reference(new_ref)
-            } else {
-                // Reference not in the map — leave as-is but flag in debug.
-                debug_assert!(
-                    false,
-                    "renumber_object: no mapping for {r} — emitting original reference"
-                );
-                Object::Reference(*r)
+        Object::Reference(r) => match renumber.new_for_original(*r) {
+            Some(new_ref) => Ok(Object::Reference(new_ref)),
+            None => Err(crate::Error::Unsupported(format!(
+                "linearization writer: reference {r} has no entry in RenumberMap \
+                 (planner / renumber inconsistency — would emit mixed old/new \
+                 object numbers)"
+            ))),
+        },
+        Object::Array(elements) => {
+            let mut renumbered = Vec::with_capacity(elements.len());
+            for e in elements {
+                renumbered.push(renumber_object(e, renumber)?);
             }
+            Ok(Object::Array(renumbered))
         }
-        Object::Array(elements) => Object::Array(
-            elements
-                .iter()
-                .map(|e| renumber_object(e, renumber))
-                .collect(),
-        ),
         Object::Dictionary(dict) => {
             let mut new_dict = Dictionary::new();
             for (key, value) in dict.iter() {
-                new_dict.insert(key, renumber_object(value, renumber));
+                new_dict.insert(key, renumber_object(value, renumber)?);
             }
-            Object::Dictionary(new_dict)
+            Ok(Object::Dictionary(new_dict))
         }
         Object::Stream(stream) => {
             // Renumber the dictionary; leave the stream data bytes alone.
             let mut new_dict = Dictionary::new();
             for (key, value) in stream.dict.iter() {
-                new_dict.insert(key, renumber_object(value, renumber));
+                new_dict.insert(key, renumber_object(value, renumber)?);
             }
-            Object::Stream(Stream::new(new_dict, stream.data.clone()))
+            Ok(Object::Stream(Stream::new(new_dict, stream.data.clone())))
         }
         // Scalar types contain no references — clone unchanged.
-        _ => object.clone(),
+        _ => Ok(object.clone()),
     }
 }
 
@@ -279,10 +278,21 @@ pub fn write_linearized<R: Read + Seek>(
     xref_offsets.insert(1, obj1_absolute_offset);
 
     // Determine the catalog's new object number (for the trailer's /Root).
-    let catalog_new_ref: ObjectRef = plan
-        .root_ref
-        .and_then(|orig| renumber.new_for_original(orig))
-        .unwrap_or_else(|| ObjectRef::new(2, 0)); // fallback — should always resolve
+    // Synthesizing a fallback like `2 0 R` would silently emit a bogus
+    // /Root and make a planner bug invisible — fail fast instead.
+    let catalog_orig = plan.root_ref.ok_or_else(|| {
+        crate::Error::Unsupported(
+            "linearization writer: plan.root_ref is None — \
+             cannot determine catalog reference for the trailer"
+                .to_string(),
+        )
+    })?;
+    let catalog_new_ref: ObjectRef = renumber.new_for_original(catalog_orig).ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "linearization writer: catalog {catalog_orig} is not in RenumberMap \
+             (planner / renumber inconsistency)"
+        ))
+    })?;
 
     // Write Part 1 xref subsection (object 1 only) + minimal trailer.
     // `total_count_for_part1` is the full object count so viewers can validate.
@@ -301,7 +311,7 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     let page_offset_table = PageOffsetHintTable::from_plan(plan, renumber);
     let shared_object_table = SharedObjectHintTable::from_plan(plan, renumber);
-    let hint_bytes = encode_hint_stream(&page_offset_table, &shared_object_table);
+    let hint_bytes = encode_hint_stream(&page_offset_table, &shared_object_table)?;
 
     let hint_stream_compressed = &hint_bytes.compressed;
     let shared_section_s = hint_bytes.shared_section_offset_in_uncompressed;
@@ -327,6 +337,11 @@ pub fn write_linearized<R: Read + Seek>(
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
     let hint_stream_offset = append_object(&mut bytes, hint_new_ref, &hint_stream_object);
     xref_offsets.insert(hint_stream_new_num, hint_stream_offset);
+    // /H[1] is the byte length of the *entire* hint stream indirect object —
+    // header (`N G obj\n`), dictionary, `stream\n…endstream\nendobj\n` —
+    // not just the compressed payload.  Capture that span here so the
+    // back-patcher writes a value qpdf can verify against the file layout.
+    let hint_stream_object_total_len = bytes.len() - hint_stream_offset;
 
     // ------------------------------------------------------------------
     // Part 3 (Annex F): first-page body — Plan.part2_objects
@@ -359,7 +374,7 @@ pub fn write_linearized<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve(*original_ref)?;
-        let renumbered = renumber_object(&object, renumber);
+        let renumbered = renumber_object(&object, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -378,7 +393,7 @@ pub fn write_linearized<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve(*original_ref)?;
-        let renumbered = renumber_object(&object, renumber);
+        let renumbered = renumber_object(&object, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -394,7 +409,7 @@ pub fn write_linearized<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve(*original_ref)?;
-        let renumbered = renumber_object(&object, renumber);
+        let renumbered = renumber_object(&object, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -425,7 +440,7 @@ pub fn write_linearized<R: Read + Seek>(
     let offsets = LinearizedOffsets {
         file_length,
         hint_stream_offset,
-        hint_stream_length: compressed_len,
+        hint_stream_length: hint_stream_object_total_len,
         first_page_object_new_num,
         end_of_first_page_offset,
         last_xref_offset,

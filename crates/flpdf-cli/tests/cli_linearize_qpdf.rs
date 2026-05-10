@@ -67,6 +67,28 @@ fn qpdf_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Skip-if-missing helper for qpdf-dependent tests.  Returns `true` when the
+/// caller should *return early* (qpdf is missing AND we are not on CI).
+///
+/// On CI (`CI` env var set), missing qpdf is a hard failure: the oracle
+/// tests are the only thing that catches regressions in flpdf's hint stream
+/// against an external tool, so silently skipping them on CI would leave a
+/// blind spot.
+#[must_use]
+fn skip_if_qpdf_missing() -> bool {
+    if qpdf_available() {
+        return false;
+    }
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "qpdf is required for cli_linearize_qpdf tests on CI; \
+             install qpdf in the workflow before running this test suite"
+        );
+    }
+    eprintln!("skipping: qpdf not available (set CI=1 to make this a hard failure)");
+    true
+}
+
 // ---------------------------------------------------------------------------
 // qpdf helpers
 // ---------------------------------------------------------------------------
@@ -242,17 +264,42 @@ impl CaseResult {
 /// Only **explicitly enumerated** warning fingerprints are accepted as known
 /// issues; any other warning text surfaces as a `Fail` so the oracle keeps
 /// catching new regressions instead of silently absorbing them under a
-/// previously-tracked label.
+/// previously-tracked label.  Each known fingerprint is attributed to a
+/// beads issue so reviewers can trace the underlying bug.
 fn classify_qpdf_warning(label: &str, msg: &str) -> CaseResult {
-    if msg.contains("hint table length mismatch") {
-        CaseResult::known(
-            label.to_string(),
-            "linearization hint table /H mismatch (post-k8h: writer/encoder length)",
-            "qpdf exit 3 with warnings",
-        )
-    } else {
-        CaseResult::fail(label.to_string(), format!("unexpected qpdf warning: {msg}"))
+    const KNOWN: &[(&str, &str, &str)] = &[
+        // /H[1] mismatch — defensive entry; the writer now emits the total
+        // indirect-object byte length, so this should not normally fire.
+        (
+            "hint table length mismatch",
+            "flpdf-b82",
+            "linearization writer / hint stream length disagreement",
+        ),
+        // /T value mismatch — back-patcher writes a cross-reference offset
+        // qpdf does not agree with.  Surfaced once /H[1] was fixed.
+        (
+            "space before first xref item (/T) mismatch",
+            "flpdf-b82",
+            "/T back-patch disagrees with qpdf-computed offset",
+        ),
+        // Bit-stream overflow — Critical finding 3215150191 on PR #31:
+        // hint tables are encoded with placeholder zero offsets/lengths,
+        // so bit widths derived from incomplete data produce a stream that
+        // qpdf runs out of bits while reading.
+        (
+            "overflow reading bit stream",
+            "flpdf-b82",
+            "hint stream encoded before byte-dependent fields are real",
+        ),
+    ];
+
+    for (needle, issue, detail) in KNOWN {
+        if msg.contains(needle) {
+            return CaseResult::known(label.to_string(), issue, *detail);
+        }
     }
+
+    CaseResult::fail(label.to_string(), format!("unexpected qpdf warning: {msg}"))
 }
 
 fn print_summary(results: &[CaseResult]) {
@@ -280,7 +327,7 @@ fn print_summary(results: &[CaseResult]) {
 
 #[test]
 fn linearize_qpdf_check_matrix() {
-    if !qpdf_available() {
+    if skip_if_qpdf_missing() {
         return;
     }
 
@@ -349,7 +396,7 @@ fn linearize_qpdf_check_matrix() {
 
 #[test]
 fn non_linear_collapse_from_qpdf_linearized() {
-    if !qpdf_available() {
+    if skip_if_qpdf_missing() {
         return;
     }
 
@@ -403,7 +450,7 @@ fn non_linear_collapse_from_qpdf_linearized() {
 
 #[test]
 fn verdict_match_flpdf_vs_qpdf() {
-    if !qpdf_available() {
+    if skip_if_qpdf_missing() {
         return;
     }
 
@@ -475,7 +522,7 @@ fn verdict_match_flpdf_vs_qpdf() {
 
 #[test]
 fn non_linear_collapse_multi_page() {
-    if !qpdf_available() {
+    if skip_if_qpdf_missing() {
         return;
     }
 
