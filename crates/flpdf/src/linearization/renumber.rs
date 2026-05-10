@@ -80,10 +80,13 @@ impl RenumberMap {
     /// 3. Continuing, Part-3 objects in plan order.
     /// 4. Then Part-4 objects in plan order.
     ///
-    /// # Panics (debug builds)
+    /// # Panics
     ///
-    /// Panics in debug builds if `plan.parts_are_disjoint()` is false, i.e.
-    /// the same original `ObjectRef` appears in more than one part.
+    /// * In debug builds, panics if `plan.parts_are_disjoint()` is false.
+    /// * In any build, panics if the same original `ObjectRef` appears more
+    ///   than once across parts (defence-in-depth against a broken plan whose
+    ///   `parts_are_disjoint()` would lie). A duplicate would silently corrupt
+    ///   the bijective `original ↔ new` mapping if not caught.
     pub fn from_plan(plan: &LinearizationPlan) -> Self {
         debug_assert!(
             plan.parts_are_disjoint(),
@@ -116,7 +119,13 @@ impl RenumberMap {
                 let new_number = by_new_number.len() as u32; // current length == next index == new number
                 let new_ref = ObjectRef::new(new_number, 0);
                 by_new_number.push(original);
-                by_original.insert(original, new_ref);
+                // Reject duplicates in release too — silent overwrite would
+                // break the bijective invariant used by reverse lookups and
+                // by the writer's renumber-during-serialize path.
+                assert!(
+                    by_original.insert(original, new_ref).is_none(),
+                    "duplicate original ObjectRef in LinearizationPlan: {original:?}"
+                );
             }
         }
 
@@ -141,9 +150,13 @@ impl RenumberMap {
     // -----------------------------------------------------------------------
 
     /// Return the original [`ObjectRef`] for a given new object number, or
-    /// `None` if the number is out of range or is one of the two sentinel slots
-    /// (0 = unused, 1 = param dict reservation).
+    /// `None` if the number is out of range, is one of the two sentinel slots
+    /// (0 = unused, 1 = param dict reservation), or carries a non-zero
+    /// generation (renumbered objects are always at generation 0).
     pub fn original_for_new(&self, new: ObjectRef) -> Option<ObjectRef> {
+        if new.generation != 0 {
+            return None;
+        }
         let idx = new.number as usize;
         if idx < 2 || idx >= self.by_new_number.len() {
             return None;
@@ -486,5 +499,25 @@ mod tests {
                 "all new object refs must have generation 0"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // original_for_new: generation guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn original_for_new_rejects_non_zero_generation() {
+        let plan = single_page_plan();
+        let rn = RenumberMap::from_plan(&plan);
+
+        // The renumber map only assigns gen 0; any query with non-zero gen
+        // must return None even if the number itself is in range.
+        assert_eq!(rn.original_for_new(ObjectRef::new(2, 1)), None);
+        assert_eq!(rn.original_for_new(ObjectRef::new(3, 99)), None);
+        // Sanity: gen 0 still works.
+        assert_eq!(
+            rn.original_for_new(ObjectRef::new(2, 0)),
+            Some(ObjectRef::new(3, 0))
+        );
     }
 }
