@@ -1,7 +1,11 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use flpdf::{
-    check_reader, check_reader_strict, fonts, outline, pages, write_pdf, write_qdf, Object,
-    ObjectRef, Pdf, Severity,
+    check_reader, check_reader_strict, fonts,
+    linearization::{
+        check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
+        RenumberMap,
+    },
+    outline, pages, write_pdf, write_qdf, Object, ObjectRef, Pdf, Severity,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -45,6 +49,11 @@ struct Cli {
 enum Commands {
     #[command(about = "Validate PDF structure and report diagnostics")]
     Check(CheckCommand),
+    #[command(
+        name = "check-linearization",
+        about = "Validate linearization structure (param dict, hint stream, offsets)"
+    )]
+    CheckLinearization(CheckLinearizationCommand),
     #[command(name = "dump-object", about = "Dump one indirect object as PDF syntax")]
     DumpObject(DumpObjectCommand),
     #[command(about = "Show page structure summary or detail")]
@@ -60,6 +69,12 @@ struct CheckCommand {
     input: PathBuf,
     #[arg(long)]
     repair: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+struct CheckLinearizationCommand {
+    /// Input PDF file to validate.
+    input: PathBuf,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -93,6 +108,9 @@ struct RewriteCommand {
     output: PathBuf,
     #[arg(long)]
     repair: bool,
+    /// Produce a linearized ("fast web view") output PDF.
+    #[arg(long)]
+    linearize: bool,
 }
 
 fn main() {
@@ -119,7 +137,7 @@ fn main() {
     } else if args.check {
         run_check(args.input, args.repair)
     } else {
-        run_rewrite(args.input, args.output, args.repair)
+        run_rewrite(args.input, args.output, args.repair, false)
     };
 
     if let Err(error) = result {
@@ -131,6 +149,21 @@ fn main() {
 fn run_command(command: Commands) -> CliResult<()> {
     match command {
         Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair),
+        Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
+            Ok(()) => {
+                println!("linearization OK");
+                Ok(())
+            }
+            Err(LinearizationCheckError::NotLinearized) => {
+                eprintln!("flpdf: not a linearized PDF: object 1 has no /Linearized key");
+                std::process::exit(1);
+            }
+            Err(LinearizationCheckError::InvalidParam { message }) => {
+                eprintln!("flpdf: linearization check failed: {message}");
+                std::process::exit(1);
+            }
+            Err(LinearizationCheckError::Io(e)) => Err(e.to_string().into()),
+        },
         Commands::DumpObject(cmd) => run_dump_object(Some(cmd.input), cmd.repair, &cmd.object_ref),
         Commands::Pages(cmd) => {
             if cmd.count {
@@ -140,7 +173,9 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair),
-        Commands::Rewrite(cmd) => run_rewrite(Some(cmd.input), Some(cmd.output), cmd.repair),
+        Commands::Rewrite(cmd) => {
+            run_rewrite(Some(cmd.input), Some(cmd.output), cmd.repair, cmd.linearize)
+        }
     }
 }
 
@@ -167,13 +202,31 @@ fn run_check(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     }
 }
 
-fn run_rewrite(input: Option<PathBuf>, output: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_rewrite(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+    linearize: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
-    let mut pdf = open_pdf(&input, repair)?;
 
-    let mut out = File::create(output)?;
-    write_pdf(&mut pdf, &mut out)?;
+    if linearize {
+        let mut pdf = open_pdf(&input, repair)?;
+        let plan = LinearizationPlan::from_pdf(&mut pdf)?;
+        let renumber = RenumberMap::from_plan(&plan);
+
+        // Re-open the PDF so `write_linearized` can seek/read objects independently.
+        let mut pdf2 = open_pdf(&input, repair)?;
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2)?;
+        doc.back_patch()?;
+
+        std::fs::write(&output, &doc.bytes)?;
+    } else {
+        let mut pdf = open_pdf(&input, repair)?;
+        let mut out = File::create(output)?;
+        write_pdf(&mut pdf, &mut out)?;
+    }
     Ok(())
 }
 
