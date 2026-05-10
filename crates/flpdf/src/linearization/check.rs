@@ -110,6 +110,11 @@ fn as_u64(obj: &Object, key: &str) -> std::result::Result<u64, LinearizationChec
     }
 }
 
+/// Return `true` if `b` is a PDF whitespace byte (ISO 32000-1 §7.2.3).
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
 fn debug_obj(obj: &Object) -> String {
     let mut buf = Vec::new();
     obj.write_pdf(&mut buf);
@@ -281,13 +286,23 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // counts (up to 10 decimal digits).
     const T_BACKSCAN_WINDOW: usize = 32;
     let search_start = t_usize.saturating_sub(T_BACKSCAN_WINDOW);
-    let found_xref = file_bytes[search_start..=t_usize]
-        .windows(4)
-        .any(|w| w == b"xref");
+    let window = &file_bytes[search_start..=t_usize];
+    // Match `xref` only as a standalone token (whitespace-bounded).  A naive
+    // substring search would false-positively match the `xref` inside the
+    // `startxref` keyword which sits in the trailer near the end of the file.
+    let found_xref = window.windows(4).enumerate().any(|(i, w)| {
+        if w != b"xref" {
+            return false;
+        }
+        let prev_ok = i == 0 || is_pdf_whitespace(window[i - 1]);
+        let next = i + 4;
+        let next_ok = next == window.len() || is_pdf_whitespace(window[next]);
+        prev_ok && next_ok
+    });
     if !found_xref {
         fail!(
             "/T ({t_val}) is not within the last cross-reference section \
-             (no xref keyword found in the backscan window before /T)"
+             (no xref keyword token found in the backscan window before /T)"
         );
     }
 
@@ -389,10 +404,6 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 /// a window would silently accept misaligned offsets — this strict parser
 /// requires the `obj` keyword to follow exactly after `<digits> <digits>`.
 fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
-    fn is_pdf_whitespace(b: u8) -> bool {
-        matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
-    }
-
     // Skip leading whitespace.
     let mut i = 0;
     while i < window.len() && is_pdf_whitespace(window[i]) {
