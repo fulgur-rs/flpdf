@@ -311,7 +311,7 @@ fn linearize_qpdf_check_matrix() {
             Verdict::Pass => {
                 results.push(CaseResult::pass(*label));
             }
-            Verdict::Warn(msg) => results.push(classify_qpdf_warning(*label, msg)),
+            Verdict::Warn(msg) => results.push(classify_qpdf_warning(label, msg)),
             Verdict::Fail(msg) => {
                 results.push(CaseResult::fail(*label, format!("qpdf hard fail: {msg}")));
             }
