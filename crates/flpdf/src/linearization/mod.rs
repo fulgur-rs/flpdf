@@ -5,6 +5,7 @@
 //! the types here are pure data that downstream writer subtasks consume.
 
 pub mod back_patch;
+pub mod check;
 pub mod hint_page;
 pub mod hint_shared;
 pub mod hint_stream;
@@ -14,6 +15,10 @@ pub mod renumber;
 pub mod writer;
 
 pub use back_patch::back_patch_param_dict;
+pub use check::{
+    check_linearization, check_linearization_bytes, check_linearization_path, CheckResult,
+    LinearizationCheckError,
+};
 pub use hint_page::{bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHintTable};
 pub use hint_shared::{
     SharedGroupEntry, SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,
