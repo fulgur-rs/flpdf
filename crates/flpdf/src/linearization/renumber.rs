@@ -197,6 +197,38 @@ impl RenumberMap {
         self.len() <= 1
     }
 
+    /// Returns `true` when slot 1 is still the reserved sentinel (i.e. no
+    /// plan object has been mapped to new object number 1).
+    ///
+    /// `original_for_new(ObjectRef::new(1, 0))` deliberately rejects any
+    /// `idx < 2` and returns `None` regardless of whether the slot is
+    /// reserved or not, so it cannot be used as a slot-1 collision check.
+    /// This helper inspects `by_new_number[1]` directly: it is `SENTINEL`
+    /// (number == 0) when the slot is intact, or a real `ObjectRef` if
+    /// `from_plan` has been modified to allocate plan objects starting at
+    /// new number 1.  Used by `Part1Bytes::build` to assert that slot 1
+    /// stays reserved for the linearization parameter dictionary.
+    pub fn slot_one_is_reserved(&self) -> bool {
+        matches!(
+            self.by_new_number.get(1),
+            Some(r) if r.number == 0 && r.generation == 0
+        )
+    }
+
+    /// The next object number that is NOT used by any plan object or by the
+    /// reserved param-dict slot.
+    ///
+    /// Use this when you need to allocate an extra object number (e.g. the
+    /// hint stream) that must not collide with the renumbered body objects.
+    /// Equivalent to `by_new_number.len() as u32` — the slot just past the
+    /// highest allocated number.  Returning this through a named helper makes
+    /// the contract explicit and decouples the writer from the internal
+    /// `len()` semantics (which returns "highest allocated number" — easy to
+    /// read off-by-one from).
+    pub fn next_free(&self) -> u32 {
+        self.by_new_number.len() as u32
+    }
+
     // -----------------------------------------------------------------------
     // Iteration
     // -----------------------------------------------------------------------
@@ -521,5 +553,52 @@ mod tests {
             rn.original_for_new(ObjectRef::new(2, 0)),
             Some(ObjectRef::new(3, 0))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // next_free helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn next_free_returns_slot_past_highest_allocated() {
+        let plan = single_page_plan();
+        let rn = RenumberMap::from_plan(&plan);
+        // single_page_plan: 3 plan objects + slot 0 (sentinel) + slot 1 (param dict)
+        // = highest allocated is 4, next_free should be 5.
+        assert_eq!(rn.len(), 4);
+        assert_eq!(rn.next_free(), 5);
+    }
+
+    #[test]
+    fn slot_one_is_reserved_after_from_plan() {
+        // The from_plan constructor pushes SENTINEL into slot 1 explicitly,
+        // so a freshly built map always has the slot reserved.
+        let plan = single_page_plan();
+        let rn = RenumberMap::from_plan(&plan);
+        assert!(rn.slot_one_is_reserved());
+    }
+
+    #[test]
+    fn slot_one_is_reserved_returns_false_when_overwritten() {
+        // Defensive: simulate a corrupted map where slot 1 has been
+        // overwritten with a real ObjectRef.  slot_one_is_reserved must
+        // detect this — that is the entire reason for the helper
+        // (`original_for_new(1, 0)` always returns None and so cannot).
+        let plan = single_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        rn.by_new_number[1] = ObjectRef::new(99, 0);
+        assert!(!rn.slot_one_is_reserved());
+    }
+
+    #[test]
+    fn next_free_does_not_collide_with_any_allocated() {
+        let plan = two_page_plan();
+        let rn = RenumberMap::from_plan(&plan);
+        let nf = rn.next_free();
+        // next_free is the slot AFTER the last allocated number — by design
+        // there is no original mapped to it.
+        assert!(rn.original_for_new(ObjectRef::new(nf, 0)).is_none());
+        // And it is one past `len()` (which itself is the highest allocated).
+        assert_eq!(nf, (rn.len() as u32) + 1);
     }
 }
