@@ -229,22 +229,75 @@ pub struct HintStreamBytes {
 // Page Offset Hint Table encoder (Annex F.3.1)
 // ---------------------------------------------------------------------------
 
-fn encode_page_offset_header(b: &mut HintStreamBuilder, t: &PageOffsetHintTable) {
+/// Verify that `value` fits in `slot_bits` and write it; otherwise return an
+/// `Unsupported` error.  `field_name` is included in the error so the caller
+/// can identify which Annex F field overflowed.
+fn write_bits_checked(
+    b: &mut HintStreamBuilder,
+    value: u64,
+    slot_bits: u32,
+    field_name: &str,
+) -> crate::Result<()> {
+    let max = if slot_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << slot_bits) - 1
+    };
+    if value > max {
+        return Err(crate::Error::Unsupported(format!(
+            "hint stream: {field_name} value {value} does not fit in {slot_bits}-bit Annex F slot \
+             (max {max}) — file likely exceeds 4 GiB or has a malformed plan"
+        )));
+    }
+    b.write_bits(value, slot_bits);
+    Ok(())
+}
+
+fn encode_page_offset_header(
+    b: &mut HintStreamBuilder,
+    t: &PageOffsetHintTable,
+) -> crate::Result<()> {
     let h = &t.header;
     // Items numbered as in Annex F.3.1, Table F.4.
-    b.write_bits(h.first_page_object_number as u64, 32); // item 1  (32-bit)
-    b.write_bits(h.location_of_first_page, 32); // item 2  (32-bit)
-    b.write_bits(h.bits_object_count_delta as u64, 16); // item 3  (16-bit)
-    b.write_bits(h.least_object_count as u64, 32); // item 4  (32-bit)
-    b.write_bits(h.bits_page_length_delta as u64, 16); // item 5  (16-bit)
-    b.write_bits(h.least_page_length, 32); // item 6  (32-bit)
-    b.write_bits(h.bits_shared_object_count as u64, 16); // item 7  (16-bit)
-    b.write_bits(h.bits_shared_object_id as u64, 16); // item 8  (16-bit)
-    b.write_bits(h.bits_numerator as u64, 16); // item 9  (16-bit)
-    b.write_bits(h.denominator as u64, 16); // item 10 (16-bit)
-    b.write_bits(h.bits_content_offset as u64, 16); // item 11 (16-bit)
-    b.write_bits(h.bits_content_length as u64, 16); // item 12 (16-bit)
-                                                    // Header total: 4×32 + 8×16 = 128 + 128 = 256 bits = 32 bytes (always aligned).
+    write_bits_checked(
+        b,
+        h.first_page_object_number as u64,
+        32,
+        "first_page_object_number",
+    )?;
+    write_bits_checked(b, h.location_of_first_page, 32, "location_of_first_page")?;
+    write_bits_checked(
+        b,
+        h.bits_object_count_delta as u64,
+        16,
+        "bits_object_count_delta",
+    )?;
+    write_bits_checked(b, h.least_object_count as u64, 32, "least_object_count")?;
+    write_bits_checked(
+        b,
+        h.bits_page_length_delta as u64,
+        16,
+        "bits_page_length_delta",
+    )?;
+    write_bits_checked(b, h.least_page_length, 32, "least_page_length")?;
+    write_bits_checked(
+        b,
+        h.bits_shared_object_count as u64,
+        16,
+        "bits_shared_object_count",
+    )?;
+    write_bits_checked(
+        b,
+        h.bits_shared_object_id as u64,
+        16,
+        "bits_shared_object_id",
+    )?;
+    write_bits_checked(b, h.bits_numerator as u64, 16, "bits_numerator")?;
+    write_bits_checked(b, h.denominator as u64, 16, "denominator")?;
+    write_bits_checked(b, h.bits_content_offset as u64, 16, "bits_content_offset")?;
+    write_bits_checked(b, h.bits_content_length as u64, 16, "bits_content_length")?;
+    // Header total: 4×32 + 8×16 = 128 + 128 = 256 bits = 32 bytes (always aligned).
+    Ok(())
 }
 
 fn encode_page_offset_entries(b: &mut HintStreamBuilder, t: &PageOffsetHintTable) {
@@ -281,17 +334,41 @@ fn encode_page_offset_entries(b: &mut HintStreamBuilder, t: &PageOffsetHintTable
 // Shared Object Hint Table encoder (Annex F.3.2)
 // ---------------------------------------------------------------------------
 
-fn encode_shared_object_header(b: &mut HintStreamBuilder, t: &SharedObjectHintTable) {
+fn encode_shared_object_header(
+    b: &mut HintStreamBuilder,
+    t: &SharedObjectHintTable,
+) -> crate::Result<()> {
     let h = &t.header;
     // Items numbered as in Annex F.3.2, Table F.9.
-    b.write_bits(h.first_object_number as u64, 32); // item 1  (32-bit)
-    b.write_bits(h.location, 32); // item 2  (32-bit)
-    b.write_bits(h.first_page_entries as u64, 32); // item 3  (32-bit)
-    b.write_bits(h.section_entries as u64, 32); // item 4  (32-bit)
-    b.write_bits(h.bits_group_object_count as u64, 16); // item 5  (16-bit)
-    b.write_bits(h.least_length, 32); // item 6  (32-bit)
-    b.write_bits(h.bits_length_delta as u64, 16); // item 7  (16-bit)
-                                                  // Header total: 5×32 + 2×16 = 160 + 32 = 192 bits = 24 bytes (always aligned).
+    write_bits_checked(
+        b,
+        h.first_object_number as u64,
+        32,
+        "shared.first_object_number",
+    )?;
+    write_bits_checked(b, h.location, 32, "shared.location")?;
+    write_bits_checked(
+        b,
+        h.first_page_entries as u64,
+        32,
+        "shared.first_page_entries",
+    )?;
+    write_bits_checked(b, h.section_entries as u64, 32, "shared.section_entries")?;
+    write_bits_checked(
+        b,
+        h.bits_group_object_count as u64,
+        16,
+        "shared.bits_group_object_count",
+    )?;
+    write_bits_checked(b, h.least_length, 32, "shared.least_length")?;
+    write_bits_checked(
+        b,
+        h.bits_length_delta as u64,
+        16,
+        "shared.bits_length_delta",
+    )?;
+    // Header total: 5×32 + 2×16 = 160 + 32 = 192 bits = 24 bytes (always aligned).
+    Ok(())
 }
 
 fn encode_shared_object_groups(b: &mut HintStreamBuilder, t: &SharedObjectHintTable) {
@@ -356,13 +433,13 @@ fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintT
 pub fn encode_hint_stream(
     page_offset: &PageOffsetHintTable,
     shared_object: &SharedObjectHintTable,
-) -> HintStreamBytes {
+) -> crate::Result<HintStreamBytes> {
     let mut builder = HintStreamBuilder::new();
 
     // -----------------------------------------------------------------------
     // Section 1: Page Offset Hint Table (starts at byte offset 0)
     // -----------------------------------------------------------------------
-    encode_page_offset_header(&mut builder, page_offset);
+    encode_page_offset_header(&mut builder, page_offset)?;
     // The 12-field header is exactly 256 bits = 32 bytes (already aligned).
     // We call align_to_byte for defensive correctness in case future changes
     // alter the field widths.
@@ -376,7 +453,7 @@ pub fn encode_hint_stream(
     // -----------------------------------------------------------------------
     let shared_section_offset = builder.byte_len();
 
-    encode_shared_object_header(&mut builder, shared_object);
+    encode_shared_object_header(&mut builder, shared_object)?;
     builder.align_to_byte();
     encode_shared_object_groups(&mut builder, shared_object);
     builder.align_to_byte();
@@ -407,11 +484,11 @@ pub fn encode_hint_stream(
         .finish()
         .expect("ZlibEncoder::finish on Vec<u8> must not fail");
 
-    HintStreamBytes {
+    Ok(HintStreamBytes {
         uncompressed,
         compressed,
         shared_section_offset_in_uncompressed: shared_section_offset,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +678,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let _ = encode_hint_stream(&po, &so); // must not panic
+        let _ = encode_hint_stream(&po, &so).expect("encode"); // must not panic
     }
 
     #[test]
@@ -610,7 +687,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(
             result.shared_section_offset_in_uncompressed > 0,
             "shared section must start after the page offset section"
@@ -623,7 +700,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(
             result.compressed.len() >= 2,
             "compressed output must have at least 2 bytes (zlib header)"
@@ -649,7 +726,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(
             result.shared_section_offset_in_uncompressed <= result.uncompressed.len(),
             "shared section offset must be within the uncompressed stream"
@@ -666,7 +743,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let _ = encode_hint_stream(&po, &so);
+        let _ = encode_hint_stream(&po, &so).expect("encode");
     }
 
     #[test]
@@ -675,7 +752,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(result.shared_section_offset_in_uncompressed > 0);
     }
 
@@ -685,7 +762,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(result.compressed.len() >= 2);
         assert_eq!(result.compressed[0], 0x78);
     }
@@ -696,13 +773,13 @@ mod tests {
         let renumber_s = RenumberMap::from_plan(&single_plan);
         let po_s = PageOffsetHintTable::from_plan(&single_plan, &renumber_s);
         let so_s = SharedObjectHintTable::from_plan(&single_plan, &renumber_s);
-        let single_result = encode_hint_stream(&po_s, &so_s);
+        let single_result = encode_hint_stream(&po_s, &so_s).expect("encode");
 
         let two_plan = two_page_plan_with_shared();
         let renumber_t = RenumberMap::from_plan(&two_plan);
         let po_t = PageOffsetHintTable::from_plan(&two_plan, &renumber_t);
         let so_t = SharedObjectHintTable::from_plan(&two_plan, &renumber_t);
-        let two_result = encode_hint_stream(&po_t, &so_t);
+        let two_result = encode_hint_stream(&po_t, &so_t).expect("encode");
 
         assert!(
             two_result.uncompressed.len() > single_result.uncompressed.len(),
@@ -720,7 +797,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
         // Even with no shared objects the shared section header is emitted,
         // so shared_section_offset_in_uncompressed must be > 0.
         assert!(result.shared_section_offset_in_uncompressed > 0);
@@ -749,7 +826,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
 
         assert_eq!(
             result.shared_section_offset_in_uncompressed, 32,
@@ -775,7 +852,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
         let so = SharedObjectHintTable::from_plan(&plan, &renumber);
-        let result = encode_hint_stream(&po, &so);
+        let result = encode_hint_stream(&po, &so).expect("encode");
 
         assert_eq!(
             result.uncompressed.len(),

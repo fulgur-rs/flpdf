@@ -54,6 +54,19 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
 
+      # qpdf is required by crates/flpdf-cli/tests/cli_linearize_qpdf.rs as
+      # an external oracle.  Install it on Linux so the oracle suite hard-
+      # fails on missing qpdf (skip_if_qpdf_missing).
+      #
+      # On Windows we deliberately do NOT install qpdf at the moment: the
+      # choco package surfaces an unrelated qpdf runtime error on existing
+      # writer_tests output (vector::_M_range_check) that is tracked
+      # separately.  The qpdf-dependent tests therefore skip silently on
+      # Windows runners and CI panic only fires on Linux.
+      - name: Install qpdf (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y qpdf
+
       - name: Run tests in required order
         shell: bash
         run: |

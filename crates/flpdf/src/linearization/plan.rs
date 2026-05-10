@@ -322,11 +322,21 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Maintain BFS order from first_page_closure for Part 2 (page dict
         // first, then resources, fonts, images, etc.).
+        //
+        // The page-1 dictionary itself is pinned to Part 2 even if another
+        // page directly references it; the linearization layout requires
+        // that the first page object live at the start of Part 2 (it is the
+        // anchor reached via /O in the parameter dict).  Without this pin
+        // a circular page-tree reference (or a deliberately-shared page
+        // dict) would silently demote the page object into Part 3.
+        let first_page_ref = page_refs.first().copied();
         let mut part2_objects: Vec<ObjectRef> = Vec::new();
         let mut part3_objects: Vec<ObjectRef> = Vec::new();
 
         for obj_ref in &first_page_closure {
-            if shared_page_indices.contains_key(obj_ref) {
+            if Some(*obj_ref) == first_page_ref {
+                part2_objects.push(*obj_ref);
+            } else if shared_page_indices.contains_key(obj_ref) {
                 part3_objects.push(*obj_ref);
             } else {
                 part2_objects.push(*obj_ref);

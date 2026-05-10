@@ -175,7 +175,13 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     let o_obj = param_dict.get("O").cloned().unwrap_or(Object::Null);
     let o_num = as_u64(&o_obj, "O")?;
-    let o_ref = ObjectRef::new(o_num as u32, 0);
+    // PDF object numbers are u32; an /O value beyond u32::MAX cannot refer to
+    // a real object — silently casting with `as u32` would wrap and look up
+    // the wrong slot, so reject up front.
+    let o_num_u32 = u32::try_from(o_num).map_err(|_| LinearizationCheckError::InvalidParam {
+        message: format!("/O ({o_num}) does not fit in u32 — invalid object number"),
+    })?;
+    let o_ref = ObjectRef::new(o_num_u32, 0);
     let o_object = pdf.resolve(o_ref).map_err(LinearizationCheckError::from)?;
     match &o_object {
         Object::Dictionary(d) => {
@@ -209,7 +215,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     let h_obj = param_dict.get("H").cloned().unwrap_or(Object::Null);
     // /H is [offset, length] or [[offset, length], [offset2, length2]]
-    let (h_offset, _h_length) = match &h_obj {
+    let (h_offset, h_length) = match &h_obj {
         Object::Array(arr) if arr.len() >= 2 => {
             let off = as_u64(&arr[0], "H[0]")?;
             let len = as_u64(&arr[1], "H[1]")?;
@@ -220,15 +226,18 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         }
     };
 
-    // Locate the hint stream object by scanning from h_offset for "N G obj".
-    // We do a lightweight check: the stream must be parseable and its
-    // /Filter must include /FlateDecode.
+    // Bounds: H[0] within file, H[0]+H[1] within file.
     if h_offset >= file_len {
         fail!("/H[0] offset ({h_offset}) is beyond file length ({file_len})");
     }
+    if h_offset.saturating_add(h_length) > file_len {
+        fail!("/H[0]+/H[1] ({h_offset}+{h_length}) extends beyond file length ({file_len})");
+    }
 
-    // Verify the hint stream is decodable.
-    check_hint_stream_at_offset(pdf, file_bytes, h_offset as usize)?;
+    // Verify the hint stream is decodable AND that /H[1] equals the byte
+    // length the parsed stream actually occupies.  Without this check, a
+    // back-patcher that miscomputes /H[1] silently passes here.
+    check_hint_stream_at_offset(pdf, file_bytes, h_offset as usize, h_length)?;
 
     // -----------------------------------------------------------------------
     // 6. /E must be less than file length
@@ -258,13 +267,17 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     Ok(())
 }
 
-/// Verify that the hint stream object at `offset` in `file_bytes` is a
-/// stream with `/Filter /FlateDecode` (or compatible) and that the compressed
-/// data can actually be decoded.
+/// Verify that the hint stream object at `offset` in `file_bytes`:
+///
+/// 1. Starts with a strict `N G obj` header at `offset`
+/// 2. Spans `expected_h_length` bytes (matching `/H[1]`)
+/// 3. Is a stream with `/Filter /FlateDecode` (or compatible) whose
+///    compressed data can actually be decoded.
 fn check_hint_stream_at_offset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     file_bytes: &[u8],
     offset: usize,
+    expected_h_length: u64,
 ) -> CheckResult {
     // /H[0] must point exactly at the `N G obj` header (after at most a few
     // leading whitespace bytes).  A loose scan that just searches for `obj`
@@ -281,6 +294,31 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
              (expected `N G obj`)"
         );
     };
+
+    // Compute the actual byte span of the indirect object: from `offset`
+    // through the `endobj` keyword (plus a single trailing newline if
+    // present, matching the canonical PDF whitespace).  This is what /H[1]
+    // is supposed to advertise.
+    let endobj_pos = file_bytes[offset..]
+        .windows(b"endobj".len())
+        .position(|w| w == b"endobj")
+        .map(|p| offset + p);
+    let Some(endobj_pos) = endobj_pos else {
+        fail!(
+            "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) has no endobj keyword"
+        );
+    };
+    let mut actual_end = endobj_pos + b"endobj".len();
+    if actual_end < file_bytes.len() && file_bytes[actual_end] == b'\n' {
+        actual_end += 1;
+    }
+    let actual_length = (actual_end - offset) as u64;
+    if actual_length != expected_h_length {
+        fail!(
+            "/H[1] ({expected_h_length}) does not match the actual hint stream byte length \
+             ({actual_length}) measured from offset {offset} to endobj"
+        );
+    }
 
     // Resolve the object via the Pdf handle.  Use the parsed generation so a
     // hint stream with a non-zero generation (e.g. after incremental update)
