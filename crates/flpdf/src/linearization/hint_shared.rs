@@ -278,16 +278,15 @@ impl SharedObjectHintTable {
         // Step 3: build header bit-width fields.
         //
         // bits_group_object_count: greatest objects-in-any-group.
-        // With 1-group model this equals shared_count.
         //
-        // bits_length_delta: since all lengths are 0 (placeholder) the delta
-        // is 0, so bits = 0.  The encoder re-derives this after back-patching.
-        // ------------------------------------------------------------------
         // Each shared object is its own group (one object per group), so the
         // greatest `nobjects_minus_one` is 0 across all groups, requiring 0
         // bits per Annex F.4.5 / qpdf nbits_nobjects.  Setting this to
         // `bits_needed(shared_count)` would be wrong: shared_count is the
         // *number of groups*, not the *largest group's object count*.
+        //
+        // bits_length_delta: since all lengths are 0 (placeholder) the delta
+        // is 0, so bits = 0.  The encoder re-derives this after back-patching.
         let bits_group_object_count: u32 = 0;
 
         let header = SharedObjectHeader {
@@ -301,11 +300,14 @@ impl SharedObjectHintTable {
         };
 
         // ------------------------------------------------------------------
-        // Step 4: build per-group entries (1-group model).
+        // Step 4: build per-group entries (1-object-per-group model).
+        //
+        // Each shared object forms its own group with object_count == 1.
+        // This matches the header's `bits_group_object_count = 0`
+        // (greatest nobjects_minus_one across groups is 0) and the
+        // per-object `nobjects_minus_one = 0` written below.
         // ------------------------------------------------------------------
-        let groups = vec![SharedGroupEntry {
-            object_count: shared_count,
-        }];
+        let groups = vec![SharedGroupEntry { object_count: 1 }; shared_count as usize];
 
         // ------------------------------------------------------------------
         // Step 5: build per-shared-object entries.
@@ -593,20 +595,23 @@ mod tests {
     }
 
     #[test]
-    fn two_page_one_group_with_correct_object_count() {
+    fn two_page_groups_one_per_shared_object() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
         assert_eq!(
             table.groups.len(),
-            1,
-            "1-group model must have exactly 1 group"
+            4,
+            "1-object-per-group model must have one group per shared object \
+             (2 part2 + 2 part3 = 4)"
         );
-        assert_eq!(
-            table.groups[0].object_count, 4,
-            "group must contain all 4 shared objects (2 part2 + 2 part3)"
-        );
+        for (i, group) in table.groups.iter().enumerate() {
+            assert_eq!(
+                group.object_count, 1,
+                "group {i} must contain exactly 1 object under 1-object-per-group model"
+            );
+        }
     }
 
     #[test]
@@ -684,13 +689,19 @@ mod tests {
     }
 
     #[test]
-    fn partial_first_page_group_has_three_objects() {
+    fn partial_first_page_groups_one_per_shared_object() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        assert_eq!(table.groups.len(), 1);
-        assert_eq!(table.groups[0].object_count, 4);
+        assert_eq!(
+            table.groups.len(),
+            4,
+            "1-object-per-group: 4 shared objects → 4 groups"
+        );
+        for group in &table.groups {
+            assert_eq!(group.object_count, 1);
+        }
     }
 
     #[test]
