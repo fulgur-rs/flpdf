@@ -40,7 +40,6 @@
 //! (sub-task 2.9) locates them by field name and overwrites them once the real
 //! byte offsets are available.
 
-use super::hint_page::bits_needed;
 use super::plan::LinearizationPlan;
 use super::renumber::RenumberMap;
 
@@ -119,33 +118,32 @@ pub struct SharedGroupEntry {
 /// * `length_minus_least` (item 2): byte length of this object minus
 ///   `header.least_length`.  Set to `0` (placeholder); back-patched by
 ///   sub-task 2.9.
-/// * `group_offset` (item 4): byte offset of this object from the location of
-///   the first object in the shared objects section.  Set to `0` (placeholder);
-///   back-patched by sub-task 2.9.
+/// * `nobjects_minus_one` (item 4): number of additional objects in this
+///   shared object's group, minus one.  In our 1-object-per-group model this
+///   is always `0`; encoded with `bits_group_object_count` bits, which is
+///   also `0` in our model so nothing is actually written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedObjectEntry {
-    /// Item 1 — Signature present flag.
-    ///
-    /// Always `false` in this implementation; signature computation (MD5) is
-    /// not performed.  When `false`, the 16-byte signature (item 3) is omitted
-    /// from the encoded stream.
-    pub signature_present: bool,
-
-    /// Item 2 — Byte length of this object minus `header.least_length`.
-    ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// Item 1 (encoded order) — Byte length of this object minus
+    /// `header.least_length`.  Populated by the writer in `from_plan`.
     pub length_minus_least: u32,
 
-    /// Item 3 — 16-byte MD5 signature of the object data.
+    /// Item 2 (encoded order) — Signature present flag.
+    ///
+    /// Always `false` in this implementation; signature computation (MD5) is
+    /// not performed.  When `false`, the 16-byte signature is omitted from
+    /// the encoded stream.
+    pub signature_present: bool,
+
+    /// Item 3 (encoded order) — 16-byte MD5 signature of the object data.
     ///
     /// Always `None` because `signature_present` is always `false`.
     pub signature: Option<[u8; 16]>,
 
-    /// Item 4 — Byte offset of this object from the location of the first
-    /// object in the shared objects section.
-    ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
-    pub group_offset: u32,
+    /// Item 4 (encoded order) — Number of additional objects in this group,
+    /// minus one.  Our writer always uses one object per group, so this is
+    /// always `0`.  Encoded with `bits_group_object_count` bits.
+    pub nobjects_minus_one: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +284,12 @@ impl SharedObjectHintTable {
         // bits_length_delta: since all lengths are 0 (placeholder) the delta
         // is 0, so bits = 0.  The encoder re-derives this after back-patching.
         // ------------------------------------------------------------------
-        let bits_group_object_count = bits_needed(shared_count as u64);
+        // Each shared object is its own group (one object per group), so the
+        // greatest `nobjects_minus_one` is 0 across all groups, requiring 0
+        // bits per Annex F.4.5 / qpdf nbits_nobjects.  Setting this to
+        // `bits_needed(shared_count)` would be wrong: shared_count is the
+        // *number of groups*, not the *largest group's object count*.
+        let bits_group_object_count: u32 = 0;
 
         let header = SharedObjectHeader {
             first_object_number,
@@ -316,10 +319,10 @@ impl SharedObjectHintTable {
             .shared_hints
             .iter()
             .map(|_hint| SharedObjectEntry {
+                length_minus_least: 0, // placeholder — populated by writer
                 signature_present: false,
-                length_minus_least: 0, // placeholder — back-patched by sub-task 2.9
                 signature: None,
-                group_offset: 0, // placeholder — back-patched by sub-task 2.9
+                nobjects_minus_one: 0, // 1-object-per-group model
             })
             .collect();
 
@@ -564,8 +567,10 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // 1-group model: 2 objects in group → bits_needed(2) = 2
-        assert_eq!(table.header.bits_group_object_count, 2);
+        // One object per group (we never group multiple shared objects
+        // together), so the greatest `nobjects_minus_one` across groups is
+        // 0 — bit width is 0 per Annex F.4.5 / qpdf nbits_nobjects.
+        assert_eq!(table.header.bits_group_object_count, 0);
     }
 
     #[test]
@@ -624,7 +629,7 @@ mod tests {
         assert_eq!(table.header.bits_length_delta, 0);
         for entry in &table.objects {
             assert_eq!(entry.length_minus_least, 0);
-            assert_eq!(entry.group_offset, 0);
+            assert_eq!(entry.nobjects_minus_one, 0);
         }
     }
 
@@ -675,8 +680,8 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // 3 objects in group → bits_needed(3) = 2
-        assert_eq!(table.header.bits_group_object_count, 2);
+        // 1-object-per-group model — see two_page_bits_group_object_count.
+        assert_eq!(table.header.bits_group_object_count, 0);
     }
 
     #[test]

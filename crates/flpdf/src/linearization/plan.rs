@@ -365,14 +365,17 @@ impl LinearizationPlan {
         }
 
         // ----------------------------------------------------------------
-        // Step 6: build Part 4 by removing Part 2 and Part 3 objects
-        // ----------------------------------------------------------------
+        // Step 6: build Part 4 by removing Part 2 and Part 3 objects.
+        //
+        // Provisional list — the final order (per-page private groups
+        // contiguous, then leftover globally-shared) is computed below in
+        // Step 7 once we know which objects belong to which page.
         let moved: BTreeSet<ObjectRef> = part2_objects
             .iter()
             .chain(&part3_objects)
             .copied()
             .collect();
-        let part4_objects: Vec<ObjectRef> = all_refs
+        let part4_provisional: Vec<ObjectRef> = all_refs
             .into_iter()
             .filter(|r| !moved.contains(r))
             .collect();
@@ -392,29 +395,49 @@ impl LinearizationPlan {
         // Page 0: private objects = Part 2 objects.
         let page0_private = part2_objects.clone();
 
-        // Fill page-0 hint: first_object_index = 0 (Part 2 comes first);
-        // object_count = Part-2 + Part-3 (shared) objects, because the first-page
-        // section physically contains both Part 2 (page-0 private) AND Part 3
-        // (shared) objects before /E.  qpdf's hint table checker verifies that
-        // object_count[0] accounts for all objects in the first-page section.
+        // Fill page-0 hint: first_object_index = 0; object_count = Part 2 +
+        // Part 3 (shared) objects, since the first-page section physically
+        // contains both before /E.  qpdf's hint-table checker validates
+        // object_count[0] against the count of objects in [first_page_offset,
+        // /E), which equals |Part 2| + |Part 3|.
         if !page_hints.is_empty() {
             page_hints[0].first_object_index = 0;
             page_hints[0].object_count = (page0_private.len() + part3_objects.len()) as u32;
         }
 
         // Per-page private object lists, page 0 first.
-        let mut per_page_private_objects: Vec<Vec<ObjectRef>> =
-            Vec::with_capacity(page_refs.len());
+        let mut per_page_private_objects: Vec<Vec<ObjectRef>> = Vec::with_capacity(page_refs.len());
         per_page_private_objects.push(page0_private);
 
-        // Pages 1..N: private objects are those in the page's closure that
-        // are not in Part 2 or Part 3 (i.e. exclusive to this page within Part 4).
-        // `object_count` is set to the private count (mirroring page 0's definition).
+        // Pages 1..N: private objects = closure(i) ∩ (reachable from exactly
+        // 1 page).  Excluding only part2_set / part3_set is too narrow:
+        // globally-shared objects like the Catalog or /Pages tree intermediate
+        // nodes are reachable from EVERY page, including page 0 (via the
+        // /Parent chain), so they sit in our part4_objects rather than
+        // part3_objects.  qpdf's per-page object_count and page_length only
+        // count objects exclusive to one page (it walks the file body forward
+        // from the page object and stops at the first non-exclusive object),
+        // so we mirror that by checking page-reach-count == 1.
+        let mut all_closures: Vec<Vec<ObjectRef>> = Vec::with_capacity(page_refs.len());
+        all_closures.push(first_page_closure.clone());
+        all_closures.extend(other_page_closures.iter().cloned());
+        let mut page_reach: BTreeMap<ObjectRef, u32> = BTreeMap::new();
+        for closure in &all_closures {
+            let unique: BTreeSet<ObjectRef> = closure.iter().copied().collect();
+            for r in unique {
+                *page_reach.entry(r).or_insert(0) += 1;
+            }
+        }
+
         for (i, closure) in other_page_closures.into_iter().enumerate() {
             let page_idx = i + 1; // skip(1) above started page indexing at 1
             let private: Vec<ObjectRef> = closure
                 .into_iter()
-                .filter(|r| !part2_set.contains(r) && !part3_set.contains(r))
+                .filter(|r| {
+                    !part2_set.contains(r)
+                        && !part3_set.contains(r)
+                        && page_reach.get(r).copied() == Some(1)
+                })
                 .collect();
             if page_idx < page_hints.len() {
                 // Use private count; guarantee at least 1 so hint table isn't all zeros.
@@ -423,6 +446,40 @@ impl LinearizationPlan {
             }
             per_page_private_objects.push(private);
         }
+
+        // ----------------------------------------------------------------
+        // Step 6b: order Part 4 so each page's private objects are
+        // contiguous in plan / write order.
+        //
+        // qpdf's per-page length validator walks the file body forward
+        // from the page object and stops at the first object that doesn't
+        // belong to that page.  If page 1's content stream is interleaved
+        // with page 2's page object, qpdf reports "page length mismatch".
+        // The hint table records the COUNT of private objects, so the
+        // writer must place them physically together.
+        //
+        // Order: per_page_private[1] then per_page_private[2] … then any
+        // leftover Part-4 objects (globally shared between pages 1..N but
+        // not page 0).
+        let mut placed: BTreeSet<ObjectRef> = BTreeSet::new();
+        let mut part4_objects: Vec<ObjectRef> = Vec::with_capacity(part4_provisional.len());
+        for privates in per_page_private_objects.iter().skip(1) {
+            for r in privates {
+                if placed.insert(*r) {
+                    part4_objects.push(*r);
+                }
+            }
+        }
+        for r in &part4_provisional {
+            if placed.insert(*r) {
+                part4_objects.push(*r);
+            }
+        }
+        debug_assert_eq!(
+            part4_objects.len(),
+            part4_provisional.len(),
+            "Part-4 reordering must preserve membership"
+        );
 
         // ----------------------------------------------------------------
         // Step 8: build shared_hints

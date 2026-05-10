@@ -334,24 +334,11 @@ impl PageOffsetHintTable {
             }
         }
 
-        // Per ISO 32000-1 Annex F.3.1 item 12: the Page Offset Hint Table entry
-        // for page 0 must list ALL Part-3 (shared) objects that are physically
-        // located in the first-page section.  These are the `first_page_entries`
-        // objects from the Shared Object Hint Table.  This is distinct from the
-        // Shared Object HT `referencing_pages`, which tracks which pages need to
-        // *download* shared objects (page 0 excluded since it owns them
-        // physically).  Without listing them here, the page 0 entry encodes
-        // shared_object_count=0 while the Shared Object HT header says
-        // first_page_entries>0, causing qpdf to misalign the bit-stream and
-        // misread all page entries.
-        if page_count > 0 && !plan.part3_objects.is_empty() {
-            for orig_ref in &plan.part3_objects {
-                if let Some(new_ref) = renumber.new_for_original(*orig_ref) {
-                    shared_ids_per_page[0].push(new_ref.number);
-                }
-            }
-            shared_counts[0] = shared_ids_per_page[0].len() as u32;
-        }
+        // qpdf rejects page 0 entries that list shared identifiers
+        // ("page 0 has shared identifier entries"): page 0 OWNS the shared
+        // objects physically (they sit before /E in the first-page section),
+        // so it does not need them in its hint-table entry.  Only pages
+        // 1..N list the shared identifiers they reference.
 
         let greatest_shared_count = shared_counts.iter().copied().max().unwrap_or(0);
 
@@ -386,13 +373,13 @@ impl PageOffsetHintTable {
         // ------------------------------------------------------------------
         let header = PageOffsetHeader {
             least_object_count,
-            location_of_first_page: 0,  // placeholder — back-patched by sub-task 2.9
+            location_of_first_page: 0, // placeholder — back-patched by sub-task 2.9
             bits_object_count_delta: bits_needed(object_count_delta),
-            least_page_length: 0,       // placeholder — back-patched by sub-task 2.9
-            bits_page_length_delta: 0,  // placeholder — re-derived by encoder after back-patch
-            least_content_offset: 0,    // placeholder — back-patched by sub-task 2.9
+            least_page_length: 0, // placeholder — back-patched by sub-task 2.9
+            bits_page_length_delta: 0, // placeholder — re-derived by encoder after back-patch
+            least_content_offset: 0, // placeholder — back-patched by sub-task 2.9
             bits_content_offset_delta: 0, // placeholder — re-derived by encoder after back-patch
-            least_content_length: 0,    // placeholder — back-patched by sub-task 2.9
+            least_content_length: 0, // placeholder — back-patched by sub-task 2.9
             bits_content_length_delta: 0, // placeholder — re-derived by encoder after back-patch
             bits_shared_object_count: bits_needed(greatest_shared_count as u64),
             bits_shared_object_id: bits_needed(greatest_shared_id),
@@ -696,10 +683,11 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // Page 0 lists ALL Part-3 objects in its Page Offset HT entry because
-        // they are physically located in the first-page section (first_page_entries).
-        // Page 1 references 2 shared objects (5 0 R and 8 0 R).
-        assert_eq!(table.entries[0].shared_object_count, 2);
+        // qpdf rejects "page 0 has shared identifier entries" — page 0 owns
+        // shared objects physically (they sit in the first-page section
+        // before /E) so its entry must NOT list shared identifiers.  Only
+        // pages 1..N list the shared objects they reference.
+        assert_eq!(table.entries[0].shared_object_count, 0);
         assert_eq!(table.entries[1].shared_object_count, 2);
     }
 
@@ -731,18 +719,13 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // Shared objects 5 0 R → new 4, 8 0 R → new 5.
-        // Page 0 lists all Part-3 objects (new numbers 4 and 5) because they
-        // are physically in the first-page section (first_page_entries).
-        // Page 1 also references both shared objects.
-        let mut ids0 = table.entries[0].shared_object_ids.clone();
-        ids0.sort_unstable();
-        assert_eq!(
-            ids0,
-            vec![4, 5],
-            "page 0 shared object ids must be new numbers 4 and 5 (Part-3 objects)"
+        // Page 0 must NOT list shared identifiers (qpdf rejects them).
+        assert!(
+            table.entries[0].shared_object_ids.is_empty(),
+            "page 0 must not list shared identifiers"
         );
 
+        // Page 1 references both shared objects — new numbers 4 and 5.
         let mut ids1 = table.entries[1].shared_object_ids.clone();
         ids1.sort_unstable();
         assert_eq!(

@@ -271,15 +271,9 @@ fn build_hint_stream_object(
 ) -> Object {
     let compressed_len = compressed_payload.len();
     let mut hint_dict = Dictionary::new();
-    hint_dict.insert(
-        "Length",
-        Object::Integer(compressed_len as i64),
-    );
+    hint_dict.insert("Length", Object::Integer(compressed_len as i64));
     hint_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    hint_dict.insert(
-        "S",
-        Object::Integer(shared_section_offset as i64),
-    );
+    hint_dict.insert("S", Object::Integer(shared_section_offset as i64));
     let _ = new_ref; // ref is used at call site via append_object
     Object::Stream(Stream::new(hint_dict, compressed_payload.to_vec()))
 }
@@ -291,6 +285,7 @@ fn build_hint_stream_object(
 ///
 /// `hint_compressed` is the compressed payload to use for the hint stream object.
 /// `hint_shared_section_offset` is the `/S` value (offset within the uncompressed stream).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -328,7 +323,8 @@ fn do_write_pass<R: Read + Seek>(
 
     // Hint stream object
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
-    let hint_obj = build_hint_stream_object(hint_new_ref, hint_compressed, hint_shared_section_offset);
+    let hint_obj =
+        build_hint_stream_object(hint_new_ref, hint_compressed, hint_shared_section_offset);
     let hint_stream_offset = append_object(&mut bytes, hint_new_ref, &hint_obj);
     xref_offsets.insert(hint_stream_new_num, hint_stream_offset);
     let hint_stream_obj_total_len = bytes.len() - hint_stream_offset;
@@ -347,10 +343,12 @@ fn do_write_pass<R: Read + Seek>(
         xref_offsets.insert(new_ref.number, offset);
     }
 
-    // Part 3 (Annex F) continued: shared objects (Plan.part3_objects) are written
-    // INSIDE the first-page section, before /E.  Per qpdf's Annex F layout,
-    // shared objects physically live in the first-page section so that a viewer
-    // can load page 0 by reading only up to /E.
+    // Part 3 (Annex F) continued: shared objects sit INSIDE the first-page
+    // section.  qpdf's hint table validator counts page 0's object_count
+    // as Part-2 + Part-3 (all objects before /E), and /E itself is the
+    // byte after the last shared object.  Putting shared objects after /E
+    // causes "/E mismatch" and "object count for page 0 = N; computed = M"
+    // warnings.
     for original_ref in &plan.part3_objects {
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
             return Err(crate::Error::Unsupported(format!(
@@ -364,7 +362,7 @@ fn do_write_pass<R: Read + Seek>(
         xref_offsets.insert(new_ref.number, offset);
     }
 
-    // /E: end of first-page section = after both Part-2 and Part-3 (shared) objects.
+    // /E: end of first-page section, AFTER both Part-2 and Part-3.
     let end_of_first_page_offset = bytes.len();
 
     // Part 5 (Annex F): remaining body — Plan.part4_objects
@@ -443,6 +441,10 @@ fn compute_byte_lengths(
 ///
 /// Probed offsets do NOT include the real hint stream; final offsets DO.
 /// The difference is exactly `hint_length` (the hint stream object byte length).
+///
+/// Currently unused — the writer uses `do_write_pass` returns directly — but
+/// kept here as a reference for future probe/final-pass refactoring.
+#[allow(dead_code)]
 fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize {
     if off >= hint_offset {
         off + hint_length
@@ -573,14 +575,15 @@ pub fn write_linearized<R: Read + Seek>(
         // Compute per-object byte lengths from this probe pass.
         // Use the xref keyword offset (not first_entry_offset) for length computation.
         // ------------------------------------------------------------------
-        let byte_lengths = compute_byte_lengths(&xref_offsets, last_xref_offset, hint_stream_new_num);
+        let byte_lengths =
+            compute_byte_lengths(&xref_offsets, last_xref_offset, hint_stream_new_num);
 
         // ------------------------------------------------------------------
         // Per-page byte lengths.
         //
-        // Page 0's byte length must include both Part-2 (private) and Part-3
-        // (shared) objects, because both live in the first-page section before /E.
-        // Pages 1..N use only their private objects (from per_page_private_objects).
+        // Page 0 owns the shared objects physically (they sit before /E),
+        // so its byte_length includes Part 2 + Part 3.  Pages 1..N use only
+        // their own private objects.
         // ------------------------------------------------------------------
         let part3_byte_len: u64 = plan
             .part3_objects
@@ -608,7 +611,6 @@ pub fn write_linearized<R: Read + Seek>(
                     })
                     .sum();
                 if page_idx == 0 {
-                    // Page 0 owns the shared objects physically (before /E).
                     private_len + part3_byte_len
                 } else {
                     private_len
@@ -680,21 +682,21 @@ pub fn write_linearized<R: Read + Seek>(
             let first_part3_off = xref_offsets.get(&first_part3_new_num).copied().unwrap_or(0);
             so_table.header.location = first_part3_off as u64;
 
-            // Per-object length_minus_least and group_offset.
-            // group_offset = byte offset of this object relative to the first Part-3 object.
-            for (i, orig) in plan.part3_objects.iter().enumerate() {
-                let new_num = renumber
-                    .new_for_original(*orig)
-                    .map(|r| r.number)
-                    .unwrap_or(0);
-                let obj_off = xref_offsets.get(&new_num).copied().unwrap_or(0);
+            // Per-object length_minus_least.  group_offset is no longer a
+            // per-entry field (see hint_stream::encode_shared_object_entries:
+            // it does not match Annex F.4.5 / qpdf's HSharedObjectEntry layout
+            // and was previously emitting an extra 32 bits per entry that
+            // qpdf misinterpreted as the next entry's length delta).
+            // `nobjects_minus_one` stays at 0 from `from_plan`.
+            for (i, _orig) in plan.part3_objects.iter().enumerate() {
                 if i < so_table.objects.len() {
                     so_table.objects[i].length_minus_least =
                         (part3_lens[i].saturating_sub(least)) as u32;
-                    so_table.objects[i].group_offset =
-                        (obj_off.saturating_sub(first_part3_off)) as u32;
                 }
             }
+            // first_part3_off retained as a debug crosscheck against the
+            // probe pass, but no longer fed into per-entry fields.
+            let _ = first_part3_off;
         }
 
         // Re-encode hint stream with patched tables.
@@ -702,57 +704,59 @@ pub fn write_linearized<R: Read + Seek>(
         let new_compressed = new_hint_bytes.compressed;
         let new_shared_s = new_hint_bytes.shared_section_offset_in_uncompressed;
 
-        // Check convergence.
-        let converged = new_compressed.len() == current_hint_compressed.len();
-
-        // Save this pass's output as the candidate final output.
-        final_bytes = bytes;
-        final_xref_offsets = xref_offsets;
+        // Save this pass's structural metadata (offsets, byte length).  The
+        // bytes themselves are *not* yet final — they were written using the
+        // previous iteration's hint stream.  We always do one more pass
+        // below with the freshly-patched stream so the saved bytes contain
+        // it; this is required even when the encoded length is identical
+        // (the bit content still changes per-iteration).
+        final_xref_offsets = xref_offsets.clone();
         final_hint_stream_offset = hint_stream_offset;
         final_hint_stream_obj_total_len = hint_stream_obj_total_len;
         final_end_of_first_page_offset = end_of_first_page_offset;
         final_last_xref_keyword_offset = last_xref_offset;
         final_last_xref_first_entry_offset = last_xref_first_entry_offset;
+        final_bytes = bytes; // overwritten below if we do a final pass
 
-        if converged || iter == max_iters - 1 {
-            if !converged {
-                // Did not converge — do one more final pass with the best tables.
-                current_hint_compressed = new_compressed;
-                current_hint_shared_s = new_shared_s;
-                let (
-                    bytes2,
-                    xref_offsets2,
-                    hint_off2,
-                    hint_len2,
-                    efp2,
-                    lxr2,
-                    lxr_first2,
-                ) = do_write_pass(
-                    plan,
-                    renumber,
-                    pdf,
-                    &part1,
-                    catalog_new_ref,
-                    hint_stream_new_num,
-                    total_count,
-                    info_new_ref,
-                    first_page_object_new_num,
-                    &current_hint_compressed,
-                    current_hint_shared_s,
-                )?;
-                final_bytes = bytes2;
-                final_xref_offsets = xref_offsets2;
-                final_hint_stream_offset = hint_off2;
-                final_hint_stream_obj_total_len = hint_len2;
-                final_end_of_first_page_offset = efp2;
-                final_last_xref_keyword_offset = lxr2;
-                final_last_xref_first_entry_offset = lxr_first2;
-            }
-            break;
-        }
+        let converged = new_compressed.len() == current_hint_compressed.len();
 
+        // Promote the freshly-patched stream as the next iteration input.
         current_hint_compressed = new_compressed;
         current_hint_shared_s = new_shared_s;
+
+        if converged || iter == max_iters - 1 {
+            // One last pass so the emitted hint stream object actually
+            // contains the patched bit-stream (not the previous iteration's).
+            let (
+                bytes_final,
+                xref_offsets_final,
+                hint_off_final,
+                hint_len_final,
+                efp_final,
+                lxr_final,
+                lxr_first_final,
+            ) = do_write_pass(
+                plan,
+                renumber,
+                pdf,
+                &part1,
+                catalog_new_ref,
+                hint_stream_new_num,
+                total_count,
+                info_new_ref,
+                first_page_object_new_num,
+                &current_hint_compressed,
+                current_hint_shared_s,
+            )?;
+            final_bytes = bytes_final;
+            final_xref_offsets = xref_offsets_final;
+            final_hint_stream_offset = hint_off_final;
+            final_hint_stream_obj_total_len = hint_len_final;
+            final_end_of_first_page_offset = efp_final;
+            final_last_xref_keyword_offset = lxr_final;
+            final_last_xref_first_entry_offset = lxr_first_final;
+            break;
+        }
     }
 
     // ------------------------------------------------------------------
