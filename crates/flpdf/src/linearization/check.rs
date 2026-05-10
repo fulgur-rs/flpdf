@@ -110,6 +110,11 @@ fn as_u64(obj: &Object, key: &str) -> std::result::Result<u64, LinearizationChec
     }
 }
 
+/// Return `true` if `b` is a PDF whitespace byte (ISO 32000-1 §7.2.3).
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
 fn debug_obj(obj: &Object) -> String {
     let mut buf = Vec::new();
     obj.write_pdf(&mut buf);
@@ -249,22 +254,134 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     }
 
     // -----------------------------------------------------------------------
-    // 7. /T must point to `xref` keyword
+    // 7. /T must be within the last cross-reference table.
+    //
+    // Different PDF producers use slightly different /T conventions:
+    // - ISO 32000-1 Annex F: /T = byte offset of the xref keyword itself
+    // - qpdf convention: /T = byte offset just before the first xref entry
+    //   (i.e. offset of the last '\n' in the "xref\n0 N\n" header)
+    //
+    // We accept any /T that is within the xref section header (i.e. the xref
+    // keyword is reachable by scanning backwards within a small window).
     // -----------------------------------------------------------------------
     let t_obj = param_dict.get("T").cloned().unwrap_or(Object::Null);
     let t_val = as_u64(&t_obj, "T")?;
-    if t_val + 4 > file_len {
+    // /T must fit in the platform's `usize` (matters on 32-bit targets where
+    // `u64 as usize` would silently truncate) and must leave at least 4 bytes
+    // before EOF for the `xref` keyword.  Use checked_add to avoid wrap-around
+    // overflow surprises in release builds.
+    let t_usize = usize::try_from(t_val).map_err(|_| LinearizationCheckError::InvalidParam {
+        message: format!("/T ({t_val}) does not fit in platform usize"),
+    })?;
+    if t_usize
+        .checked_add(4)
+        .is_none_or(|end| end > file_bytes.len())
+    {
         fail!("/T ({t_val}) is too close to end of file to contain xref keyword");
     }
-    let t_bytes = &file_bytes[t_val as usize..t_val as usize + 4];
-    if t_bytes != b"xref" {
+    // Allow /T to fall anywhere inside the cross-reference section header.
+    // The window covers both ISO convention (/T = xref keyword) and
+    // qpdf convention (/T = first_entry_pos - 1, ~= xref + header_len - 1).
+    // 32 bytes is enough for `xref\n0 N\n` headers up to u32-sized object
+    // counts (up to 10 decimal digits).
+    const T_BACKSCAN_WINDOW: usize = 32;
+    let search_start = t_usize.saturating_sub(T_BACKSCAN_WINDOW);
+    // Extend the window 3 bytes past `t_usize` so a `/T` that points exactly
+    // at the start of `xref` (Annex F convention) can still find all four
+    // bytes of the keyword in the slice.
+    let window_end = (t_usize + 4).min(file_bytes.len());
+    let window = &file_bytes[search_start..window_end];
+    // Match `xref` only as a standalone token (whitespace-bounded).  A naive
+    // substring search would false-positively match the `xref` inside the
+    // `startxref` keyword which sits in the trailer near the end of the file.
+    // Boundary checks use absolute `file_bytes` positions so the slice edges
+    // are not mistaken for file boundaries.
+    let xref_pos = window.windows(4).enumerate().find_map(|(i, w)| {
+        if w != b"xref" {
+            return None;
+        }
+        let absolute = search_start + i;
+        let prev_ok = absolute == 0 || is_pdf_whitespace(file_bytes[absolute - 1]);
+        let next = absolute + 4;
+        let next_ok = next >= file_bytes.len() || is_pdf_whitespace(file_bytes[next]);
+        if prev_ok && next_ok {
+            Some(absolute)
+        } else {
+            None
+        }
+    });
+    let Some(xref_pos) = xref_pos else {
         fail!(
-            "/T ({t_val}) does not point to xref keyword (found {:?})",
-            String::from_utf8_lossy(t_bytes)
+            "/T ({t_val}) is not within the last cross-reference section \
+             (no xref keyword token found in the backscan window before /T)"
+        );
+    };
+
+    // Tighten: /T must lie inside the xref subsection header itself
+    // (`xref\n<start> <count>\n`), i.e. in `[xref_pos, first_entry_pos)`.
+    // Without this, a /T that lands in the middle of the first xref entry
+    // (or further into the table) would silently pass.
+    let first_entry_pos = parse_xref_first_entry_pos(file_bytes, xref_pos).ok_or_else(|| {
+        LinearizationCheckError::InvalidParam {
+            message: format!(
+                "/T ({t_val}) backscan found `xref` at byte {xref_pos}, but the \
+                 subsection header (`<start> <count>\\n`) is malformed or truncated"
+            ),
+        }
+    })?;
+    if t_usize < xref_pos || t_usize >= first_entry_pos {
+        fail!(
+            "/T ({t_val}) is outside the xref subsection header range \
+             [{xref_pos}, {first_entry_pos}) — must point at the `xref` keyword \
+             or inside its subsection header line, not into the entries"
         );
     }
 
     Ok(())
+}
+
+/// Given the byte position of an `xref` keyword in `file_bytes`, parse the
+/// first subsection header (`xref\n<start> <count>\n`) and return the byte
+/// position of the *first* entry that follows it.
+///
+/// Returns `None` if the bytes after `xref_pos` do not match the expected
+/// shape `xref\n<digits> <digits>\n` within a small window.
+fn parse_xref_first_entry_pos(file_bytes: &[u8], xref_pos: usize) -> Option<usize> {
+    // Skip past `xref` keyword.
+    let mut i = xref_pos.checked_add(4)?;
+    // Skip the EOL (CR / LF / CRLF) immediately after `xref`.
+    while i < file_bytes.len() && is_pdf_whitespace(file_bytes[i]) {
+        i += 1;
+    }
+    // <start>
+    let digits1_start = i;
+    while i < file_bytes.len() && file_bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits1_start {
+        return None;
+    }
+    // single space
+    if i >= file_bytes.len() || file_bytes[i] != b' ' {
+        return None;
+    }
+    i += 1;
+    // <count>
+    let digits2_start = i;
+    while i < file_bytes.len() && file_bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits2_start {
+        return None;
+    }
+    // EOL after the header line.
+    if i >= file_bytes.len() || !is_pdf_whitespace(file_bytes[i]) {
+        return None;
+    }
+    while i < file_bytes.len() && is_pdf_whitespace(file_bytes[i]) {
+        i += 1;
+    }
+    Some(i)
 }
 
 /// Verify that the hint stream object at `offset` in `file_bytes`:
@@ -362,10 +479,6 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 /// a window would silently accept misaligned offsets — this strict parser
 /// requires the `obj` keyword to follow exactly after `<digits> <digits>`.
 fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
-    fn is_pdf_whitespace(b: u8) -> bool {
-        matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
-    }
-
     // Skip leading whitespace.
     let mut i = 0;
     while i < window.len() && is_pdf_whitespace(window[i]) {
@@ -588,5 +701,39 @@ mod tests {
     #[test]
     fn parse_obj_header_skips_leading_whitespace() {
         assert_eq!(parse_obj_header_at(b"  \n5 0 obj\n"), Some((5, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_xref_first_entry_pos: helper unit tests
+    // -----------------------------------------------------------------------
+    #[test]
+    fn parse_xref_first_entry_pos_basic() {
+        // `xref\n0 4\n` — header is 9 bytes (4 + 1 + 1 + 1 + 1 + 1).
+        let bytes = b"xref\n0 4\n0000000000 65535 f \n";
+        // xref keyword is at position 0; first entry starts after `xref\n0 4\n`.
+        assert_eq!(parse_xref_first_entry_pos(bytes, 0), Some(9));
+    }
+
+    #[test]
+    fn parse_xref_first_entry_pos_with_offset() {
+        // Same header preceded by some prefix bytes.
+        let bytes = b"prefix\nxref\n12 100\n0000000000 ...";
+        let xref_pos = bytes.windows(4).position(|w| w == b"xref").unwrap();
+        // header = `xref\n12 100\n` = 4 + 1 + 6 + 1 = 12 bytes.
+        let expected_first_entry = xref_pos + 12;
+        assert_eq!(
+            parse_xref_first_entry_pos(bytes, xref_pos),
+            Some(expected_first_entry)
+        );
+    }
+
+    #[test]
+    fn parse_xref_first_entry_pos_rejects_malformed() {
+        // No newline after `xref`.
+        assert_eq!(parse_xref_first_entry_pos(b"xrefjunk", 0), None);
+        // No <count>.
+        assert_eq!(parse_xref_first_entry_pos(b"xref\n0\n", 0), None);
+        // Truncated.
+        assert_eq!(parse_xref_first_entry_pos(b"xref\n0 ", 0), None);
     }
 }

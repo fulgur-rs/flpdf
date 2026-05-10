@@ -303,6 +303,28 @@ fn classify_qpdf_warning(label: &str, msg: &str) -> CaseResult {
             "flpdf-b82",
             "hint stream encoded before byte-dependent fields are real",
         ),
+        // Cascading effect of the shared-length mismatch — qpdf cannot
+        // resolve all entries when its `cur_object` walker drifts past
+        // the last shared object.  Listed BEFORE the broader needle below
+        // so it wins when both substrings would match.
+        (
+            "unable to get object for item in shared objects hint table",
+            "flpdf-b82",
+            "follow-on of the shared-length mismatch above",
+        ),
+        // Shared-object length mismatch — qpdf computes shared-object byte
+        // lengths via xref-numbered lookup using `lengthNextN`.  flpdf's
+        // hint values agree with the file xref but qpdf's `computed` value
+        // diverges (often pointing at the next page object).  Narrow needle
+        // so it matches `shared object N length mismatch` only — a broader
+        // `"shared object"` would shadow the earlier specific entry above
+        // and could absorb future, unrelated shared-object warnings as
+        // known issues.
+        (
+            "length mismatch:",
+            "flpdf-b82",
+            "shared object length disagrees with qpdf's lengthNextN computation",
+        ),
     ];
 
     for (needle, issue, detail) in KNOWN {

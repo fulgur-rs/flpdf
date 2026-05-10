@@ -152,14 +152,55 @@ fn compute_closure<R: Read + Seek>(
 
         let obj = pdf.resolve(current)?;
 
-        // Special-case /Pages nodes: skip /Kids to avoid pulling sibling pages.
+        // Determine whether this is a Pages node (intermediate page-tree node)
+        // or a Page leaf node.
         let is_pages_node = matches!(&obj, Object::Dictionary(d)
             if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages"));
+        let is_page_leaf = matches!(&obj, Object::Dictionary(d)
+            if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page"));
 
-        if is_pages_node {
+        if is_pages_node || is_page_leaf {
             if let Object::Dictionary(dict) = &obj {
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
+                        // Pages → sibling pages — never follow.
+                        continue;
+                    }
+                    if k == b"Parent" {
+                        // Walk the parent /Pages dict for inherited
+                        // /Resources, /MediaBox, /Rotate, etc., but DO
+                        // NOT add the parent object itself to the
+                        // closure.  Adding it would inflate this page's
+                        // object_count beyond what qpdf computes from the
+                        // linearized layout (qpdf never counts ancestor
+                        // /Pages dicts in any page's object_count).
+                        //
+                        // The walk follows non-/Kids, non-/Parent keys of
+                        // the parent and descends into ref values
+                        // recursively via the queue.  /Kids and /Parent
+                        // on the parent are suppressed here to avoid
+                        // pulling sibling pages or recursing into
+                        // grandparents — for pages that genuinely
+                        // inherit from multi-level page trees, multi-level
+                        // ancestor walking can be added later.
+                        let mut parent_refs = Vec::new();
+                        collect_direct_refs(v, &mut parent_refs);
+                        for parent_ref in parent_refs {
+                            if let Ok(Object::Dictionary(parent_dict)) = pdf.resolve(parent_ref) {
+                                for (pk, pv) in parent_dict.iter() {
+                                    if pk == b"Kids" || pk == b"Parent" {
+                                        continue;
+                                    }
+                                    let mut refs = Vec::new();
+                                    collect_direct_refs(pv, &mut refs);
+                                    for r in refs {
+                                        if !visited.contains(&r) {
+                                            queue.push_back(r);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
                     let mut refs = Vec::new();
@@ -244,6 +285,21 @@ pub struct LinearizationPlan {
     /// One entry per Part-3 object; `referencing_pages` lists the 0-based
     /// page indices (across all pages) that reach this object.
     pub shared_hints: Vec<SharedObjectHintEntry>,
+
+    /// Per-page private object lists for byte-length computation.
+    ///
+    /// `per_page_private_objects[i]` is the list of objects that belong
+    /// exclusively to page `i` (not shared with any other page):
+    ///
+    /// * For page 0: equal to `part2_objects`.
+    /// * For pages 1..N: the objects in that page's closure that are
+    ///   **not** in Part 2 or Part 3 (i.e. they are private to this page
+    ///   within Part 4).
+    ///
+    /// The writer uses these lists to compute `page_hints[i].byte_length`
+    /// and to populate the Page Offset Hint Table's `page_length_minus_least`
+    /// and `least_page_length` fields.
+    pub per_page_private_objects: Vec<Vec<ObjectRef>>,
 }
 
 impl LinearizationPlan {
@@ -344,67 +400,141 @@ impl LinearizationPlan {
         }
 
         // ----------------------------------------------------------------
-        // Step 6: build Part 4 by removing Part 2 and Part 3 objects
-        // ----------------------------------------------------------------
+        // Step 6: build Part 4 by removing Part 2 and Part 3 objects.
+        //
+        // Provisional list — the final order (per-page private groups
+        // contiguous, then leftover globally-shared) is computed below in
+        // Step 7 once we know which objects belong to which page.
         let moved: BTreeSet<ObjectRef> = part2_objects
             .iter()
             .chain(&part3_objects)
             .copied()
             .collect();
-        let part4_objects: Vec<ObjectRef> = all_refs
+        let part4_provisional: Vec<ObjectRef> = all_refs
             .into_iter()
             .filter(|r| !moved.contains(r))
             .collect();
 
         // ----------------------------------------------------------------
-        // Step 7: build page_hints
+        // Step 7: build page_hints and per_page_private_objects
         // ----------------------------------------------------------------
         let mut page_hints: Vec<PageHintEntry> = page_refs
             .iter()
             .map(|&r| PageHintEntry::placeholder(r))
             .collect();
 
-        // Fill page-0 hint: first_object_index = 0 (Part 2 comes first);
-        // object_count = number of Part-2 objects.
+        // For quick membership checks across all pages.
+        let part2_set: BTreeSet<ObjectRef> = part2_objects.iter().copied().collect();
+        let part3_set: BTreeSet<ObjectRef> = part3_objects.iter().copied().collect();
+
+        // Page 0: private objects = Part 2 objects.
+        let page0_private = part2_objects.clone();
+
+        // Fill page-0 hint: first_object_index = 0; object_count = Part 2 +
+        // Part 3 (shared) objects, since the first-page section physically
+        // contains both before /E.  qpdf's hint-table checker validates
+        // object_count[0] against the count of objects in [first_page_offset,
+        // /E), which equals |Part 2| + |Part 3|.
         if !page_hints.is_empty() {
             page_hints[0].first_object_index = 0;
-            page_hints[0].object_count = part2_objects.len() as u32;
+            page_hints[0].object_count = (page0_private.len() + part3_objects.len()) as u32;
         }
 
-        // Fill page-i (i >= 1) hint: object_count = size of that page's
-        // closure.  This is an over-approximation — it includes objects
-        // shared with page 0 (Part 3) and with other pages — but it is
-        // strictly non-zero, which matches Annex F's expectation that every
-        // page has at least its own page object plus content stream.
-        // Refining this to an "exclusive to this page" count (parallel to
-        // the page-0 / Part 2 definition) is a follow-up; without it the
-        // Page Offset Hint Table least/delta calculations would otherwise
-        // be derived from placeholder zeros.
-        for (i, closure) in other_page_closures.into_iter().enumerate() {
-            let page_idx = i + 1; // skip(1) above started page indexing at 1
-            if page_idx < page_hints.len() {
-                page_hints[page_idx].object_count = closure.len() as u32;
+        // Per-page private object lists, page 0 first.
+        let mut per_page_private_objects: Vec<Vec<ObjectRef>> = Vec::with_capacity(page_refs.len());
+        per_page_private_objects.push(page0_private);
+
+        // Pages 1..N: private objects = closure(i) ∩ (reachable from exactly
+        // 1 page).  Excluding only part2_set / part3_set is too narrow:
+        // globally-shared objects like the Catalog or /Pages tree intermediate
+        // nodes are reachable from EVERY page, including page 0 (via the
+        // /Parent chain), so they sit in our part4_objects rather than
+        // part3_objects.  qpdf's per-page object_count and page_length only
+        // count objects exclusive to one page (it walks the file body forward
+        // from the page object and stops at the first non-exclusive object),
+        // so we mirror that by checking page-reach-count == 1.
+        let mut all_closures: Vec<Vec<ObjectRef>> = Vec::with_capacity(page_refs.len());
+        all_closures.push(first_page_closure.clone());
+        all_closures.extend(other_page_closures.iter().cloned());
+        let mut page_reach: BTreeMap<ObjectRef, u32> = BTreeMap::new();
+        for closure in &all_closures {
+            let unique: BTreeSet<ObjectRef> = closure.iter().copied().collect();
+            for r in unique {
+                *page_reach.entry(r).or_insert(0) += 1;
             }
         }
+
+        for (i, closure) in other_page_closures.into_iter().enumerate() {
+            let page_idx = i + 1; // skip(1) above started page indexing at 1
+            let private: Vec<ObjectRef> = closure
+                .into_iter()
+                .filter(|r| {
+                    !part2_set.contains(r)
+                        && !part3_set.contains(r)
+                        && page_reach.get(r).copied() == Some(1)
+                })
+                .collect();
+            if page_idx < page_hints.len() {
+                // Use private count; guarantee at least 1 so hint table isn't all zeros.
+                let count = private.len().max(1) as u32;
+                page_hints[page_idx].object_count = count;
+            }
+            per_page_private_objects.push(private);
+        }
+
+        // ----------------------------------------------------------------
+        // Step 6b: order Part 4 so each page's private objects are
+        // contiguous in plan / write order.
+        //
+        // qpdf's per-page length validator walks the file body forward
+        // from the page object and stops at the first object that doesn't
+        // belong to that page.  If page 1's content stream is interleaved
+        // with page 2's page object, qpdf reports "page length mismatch".
+        // The hint table records the COUNT of private objects, so the
+        // writer must place them physically together.
+        //
+        // Order: per_page_private[1] then per_page_private[2] … then any
+        // leftover Part-4 objects (globally shared between pages 1..N but
+        // not page 0).
+        let mut placed: BTreeSet<ObjectRef> = BTreeSet::new();
+        let mut part4_objects: Vec<ObjectRef> = Vec::with_capacity(part4_provisional.len());
+        for privates in per_page_private_objects.iter().skip(1) {
+            for r in privates {
+                if placed.insert(*r) {
+                    part4_objects.push(*r);
+                }
+            }
+        }
+        for r in &part4_provisional {
+            if placed.insert(*r) {
+                part4_objects.push(*r);
+            }
+        }
+        debug_assert_eq!(
+            part4_objects.len(),
+            part4_provisional.len(),
+            "Part-4 reordering must preserve membership"
+        );
 
         // ----------------------------------------------------------------
         // Step 8: build shared_hints
         // ----------------------------------------------------------------
-        // page 1 (index 0) also references these objects (it is always in
-        // the referencing set for Part-3 objects).
+        // `referencing_pages` lists the 0-based page indices of the pages
+        // that reference this shared object VIA THE HINT TABLE.  Per qpdf's
+        // Annex F implementation, page 0 does NOT appear here — shared objects
+        // are physically owned by the first-page section (written before /E),
+        // so page 0 "has" them by physical position without needing a hint
+        // table reference.  Only pages 1..N that also use these objects appear
+        // in `referencing_pages`.
         let shared_hints: Vec<SharedObjectHintEntry> = part3_objects
             .iter()
             .map(|&obj_ref| {
-                let mut pages: Vec<u32> = shared_page_indices
+                let pages: Vec<u32> = shared_page_indices
                     .get(&obj_ref)
                     .map(|s| s.iter().copied().collect())
                     .unwrap_or_default();
-                // Page 1 (index 0) always references Part-3 objects (that's
-                // how they ended up in the first-page closure).
-                if !pages.contains(&0) {
-                    pages.push(0);
-                    pages.sort_unstable();
-                }
+                // Do NOT add page 0: shared objects are in the first-page
+                // section, so page 0 implicitly owns them by physical layout.
                 SharedObjectHintEntry {
                     object_ref: obj_ref,
                     referencing_pages: pages,
@@ -421,6 +551,7 @@ impl LinearizationPlan {
             root_ref,
             page_hints,
             shared_hints,
+            per_page_private_objects,
         })
     }
 
@@ -796,19 +927,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 7. Shared font hint entries include both page 0 and page 1.
+    // 7. Shared font hint entries include page 1 but NOT page 0.
+    //
+    //    Per qpdf's Annex F layout, shared objects are physically written
+    //    inside the first-page section (before /E), so page 0 implicitly
+    //    "owns" them by physical position.  The hint table's referencing_pages
+    //    only lists pages 1..N that also use these objects via the shared
+    //    object section hint.
     // -----------------------------------------------------------------------
     #[test]
     fn shared_hints_reference_correct_pages() {
         let mut pdf = open_two_page_shared_font();
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
 
-        // Every shared hint must reference page 0 (page 1 always references
-        // Part-3 objects by construction) AND page 1 (the second page).
+        // Every shared hint must reference page 1 (the second page uses it)
+        // but must NOT reference page 0 (first page owns shared objects by
+        // physical layout, not hint table reference).
         for hint in &plan.shared_hints {
             assert!(
-                hint.referencing_pages.contains(&0),
-                "shared hint for {} must reference page 0 (first page)",
+                !hint.referencing_pages.contains(&0),
+                "shared hint for {} must NOT reference page 0 (physical ownership via first-page section)",
                 hint.object_ref
             );
             assert!(
@@ -846,16 +984,20 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // 9. Page-1 hint entry has correct object_count after closure.
+    //
+    //    object_count[0] must include both Part-2 (page-0 private) and
+    //    Part-3 (shared) objects, because both live in the first-page section
+    //    (before /E) in the linearized file layout.
     // -----------------------------------------------------------------------
     #[test]
-    fn page1_hint_object_count_matches_part2() {
+    fn page1_hint_object_count_matches_part2_plus_part3() {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
 
         assert_eq!(
             plan.page_hints[0].object_count,
-            plan.part2_objects.len() as u32,
-            "page-1 hint object_count must match Part-2 length"
+            (plan.part2_objects.len() + plan.part3_objects.len()) as u32,
+            "page-0 hint object_count must match Part-2 + Part-3 length (all objects in first-page section)"
         );
     }
 

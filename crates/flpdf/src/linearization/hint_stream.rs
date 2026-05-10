@@ -35,22 +35,23 @@
 //!
 //! The hint-table headers use fixed widths that the spec defines per-item:
 //!
-//! ## Page Offset Header (Annex F.3.1, Table F.4)
+//! ## Page Offset Header (Annex F.3.1, Table F.4) — 13 items, 36 bytes
 //!
-//! | Item | Field | Bits |
-//! |------|-------|------|
-//! | 1 | `first_page_object_number` | 32 |
-//! | 2 | `location_of_first_page` | 32 |
-//! | 3 | `bits_object_count_delta` | 16 |
-//! | 4 | `least_object_count` | 32 |
-//! | 5 | `bits_page_length_delta` | 16 |
-//! | 6 | `least_page_length` | 32 |
-//! | 7 | `bits_shared_object_count` | 16 |
-//! | 8 | `bits_shared_object_id` | 16 |
-//! | 9 | `bits_numerator` | 16 |
-//! | 10 | `denominator` | 16 |
-//! | 11 | `bits_content_offset` | 16 |
-//! | 12 | `bits_content_length` | 16 |
+//! | Item | Bytes | Width | Field |
+//! |------|-------|-------|-------|
+//! | 1  | 0-3   | 32 | `least_object_count` |
+//! | 2  | 4-7   | 32 | `location_of_first_page` |
+//! | 3  | 8-9   | 16 | `bits_object_count_delta` |
+//! | 4  | 10-13 | 32 | `least_page_length` |
+//! | 5  | 14-15 | 16 | `bits_page_length_delta` |
+//! | 6  | 16-19 | 32 | `least_content_offset` |
+//! | 7  | 20-21 | 16 | `bits_content_offset_delta` |
+//! | 8  | 22-25 | 32 | `least_content_length` |
+//! | 9  | 26-27 | 16 | `bits_content_length_delta` |
+//! | 10 | 28-29 | 16 | `bits_shared_object_count` |
+//! | 11 | 30-31 | 16 | `bits_shared_object_id` |
+//! | 12 | 32-33 | 16 | `bits_numerator` |
+//! | 13 | 34-35 | 16 | `denominator` |
 //!
 //! ## Shared Object Header (Annex F.3.2, Table F.9)
 //!
@@ -259,75 +260,134 @@ fn encode_page_offset_header(
 ) -> crate::Result<()> {
     let h = &t.header;
     // Items numbered as in Annex F.3.1, Table F.4.
-    write_bits_checked(
-        b,
-        h.first_page_object_number as u64,
-        32,
-        "first_page_object_number",
-    )?;
+    // 5 × 32-bit fields + 8 × 16-bit fields = 5×4 + 8×2 = 36 bytes total.
+    //
+    // Item 1: least_object_count (32-bit)
+    write_bits_checked(b, h.least_object_count as u64, 32, "least_object_count")?;
+    // Item 2: location_of_first_page (32-bit)
     write_bits_checked(b, h.location_of_first_page, 32, "location_of_first_page")?;
+    // Item 3: bits_object_count_delta (16-bit)
     write_bits_checked(
         b,
         h.bits_object_count_delta as u64,
         16,
         "bits_object_count_delta",
     )?;
-    write_bits_checked(b, h.least_object_count as u64, 32, "least_object_count")?;
+    // Item 4: least_page_length (32-bit)
+    write_bits_checked(b, h.least_page_length, 32, "least_page_length")?;
+    // Item 5: bits_page_length_delta (16-bit)
     write_bits_checked(
         b,
         h.bits_page_length_delta as u64,
         16,
         "bits_page_length_delta",
     )?;
-    write_bits_checked(b, h.least_page_length, 32, "least_page_length")?;
+    // Item 6: least_content_offset (32-bit)
+    write_bits_checked(b, h.least_content_offset, 32, "least_content_offset")?;
+    // Item 7: bits_content_offset_delta (16-bit)
+    write_bits_checked(
+        b,
+        h.bits_content_offset_delta as u64,
+        16,
+        "bits_content_offset_delta",
+    )?;
+    // Item 8: least_content_length (32-bit)
+    write_bits_checked(b, h.least_content_length, 32, "least_content_length")?;
+    // Item 9: bits_content_length_delta (16-bit)
+    write_bits_checked(
+        b,
+        h.bits_content_length_delta as u64,
+        16,
+        "bits_content_length_delta",
+    )?;
+    // Item 10: bits_shared_object_count (16-bit)
     write_bits_checked(
         b,
         h.bits_shared_object_count as u64,
         16,
         "bits_shared_object_count",
     )?;
+    // Item 11: bits_shared_object_id (16-bit)
     write_bits_checked(
         b,
         h.bits_shared_object_id as u64,
         16,
         "bits_shared_object_id",
     )?;
+    // Item 12: bits_numerator (16-bit)
     write_bits_checked(b, h.bits_numerator as u64, 16, "bits_numerator")?;
+    // Item 13: denominator (16-bit)
     write_bits_checked(b, h.denominator as u64, 16, "denominator")?;
-    write_bits_checked(b, h.bits_content_offset as u64, 16, "bits_content_offset")?;
-    write_bits_checked(b, h.bits_content_length as u64, 16, "bits_content_length")?;
-    // Header total: 4×32 + 8×16 = 128 + 128 = 256 bits = 32 bytes (always aligned).
+    // Header total: 5×32 + 8×16 = 160 + 128 = 288 bits = 36 bytes (always aligned).
     Ok(())
 }
 
 fn encode_page_offset_entries(b: &mut HintStreamBuilder, t: &PageOffsetHintTable) {
     let h = &t.header;
-    for entry in &t.entries {
-        // Each per-page entry starts on a byte boundary (qpdf convention).
-        b.align_to_byte();
 
-        // item 1: object_count_minus_least
+    // qpdf reads the page-offset section in **column order** via
+    // `load_vector_int` / `load_vector_vector` with `skipToNextByte()` after
+    // each column.  The previous implementation wrote rows (each entry's
+    // fields followed by the next entry's fields) which qpdf cannot parse.
+    //
+    // Per `Lin::readHPageOffset` (qpdf libqpdf/QPDF_linearization.cc):
+    //   col 1: delta_nobjects        (bits_object_count_delta bits × N pages)
+    //   col 2: delta_page_length     (bits_page_length_delta bits × N pages)
+    //   col 3: nshared_objects       (bits_shared_object_count bits × N pages)
+    //   col 4: shared_identifiers    (variable — bits_shared_object_id bits × Σ nshared per page)
+    //   col 5: shared_numerators     (variable — bits_numerator bits × Σ nshared per page)
+    //   col 6: delta_content_offset  (bits_content_offset_delta bits × N pages)
+    //   col 7: delta_content_length  (bits_content_length_delta bits × N pages)
+    //   …with a byte alignment after each column.
+
+    // col 1
+    for entry in &t.entries {
         b.write_bits(
             entry.object_count_minus_least as u64,
             h.bits_object_count_delta,
         );
-        // item 2: page_length_minus_least
+    }
+    b.align_to_byte();
+
+    // col 2
+    for entry in &t.entries {
         b.write_bits(entry.page_length_minus_least, h.bits_page_length_delta);
-        // item 3: shared_object_count
+    }
+    b.align_to_byte();
+
+    // col 3
+    for entry in &t.entries {
         b.write_bits(entry.shared_object_count as u64, h.bits_shared_object_count);
-        // item 4: shared_object_ids (one per shared object reference)
+    }
+    b.align_to_byte();
+
+    // col 4: per-page shared identifiers (variable-length per page)
+    for entry in &t.entries {
         for &id in &entry.shared_object_ids {
             b.write_bits(id as u64, h.bits_shared_object_id);
         }
-        // item 5: shared_object_numerators (one per shared object reference)
+    }
+    b.align_to_byte();
+
+    // col 5: per-page shared numerators
+    for entry in &t.entries {
         for &num in &entry.shared_object_numerators {
             b.write_bits(num as u64, h.bits_numerator);
         }
-        // item 6: content_stream_offset
-        b.write_bits(entry.content_stream_offset, h.bits_content_offset);
-        // item 7: content_stream_length
-        b.write_bits(entry.content_stream_length, h.bits_content_length);
     }
+    b.align_to_byte();
+
+    // col 6
+    for entry in &t.entries {
+        b.write_bits(entry.content_stream_offset, h.bits_content_offset_delta);
+    }
+    b.align_to_byte();
+
+    // col 7
+    for entry in &t.entries {
+        b.write_bits(entry.content_stream_length, h.bits_content_length_delta);
+    }
+    b.align_to_byte();
 }
 
 // ---------------------------------------------------------------------------
@@ -380,15 +440,27 @@ fn encode_shared_object_groups(b: &mut HintStreamBuilder, t: &SharedObjectHintTa
 
 fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintTable) {
     let h = &t.header;
-    for entry in &t.objects {
-        // Each per-object entry starts on a byte boundary (qpdf convention).
-        b.align_to_byte();
 
-        // item 1: signature_present flag (1 bit)
-        b.write_bits(if entry.signature_present { 1 } else { 0 }, 1);
-        // item 2: length_minus_least
+    // qpdf reads shared-object entries column-wise (per `Lin::readHSharedObject`):
+    //   col 1: delta_group_length    (bits_length_delta bits × N entries)
+    //   col 2: signature_present     (1 bit × N entries)
+    //   col 3: nobjects_minus_one    (bits_group_object_count bits × N entries)
+    //   …with a byte alignment after each column.
+    //
+    // (Signatures, when present, are inline with the signature_present
+    // column per qpdf; we never emit signatures, so this is a no-op.)
+    //
+    // group_offset is NOT in the per-entry layout — see header `location`.
+
+    // col 1: delta_group_length
+    for entry in &t.objects {
         b.write_bits(entry.length_minus_least as u64, h.bits_length_delta);
-        // item 3: MD5 signature (16 bytes) — emitted only when signature_present is true
+    }
+    b.align_to_byte();
+
+    // col 2: signature_present (1 bit per entry, plus 128-bit signature if set)
+    for entry in &t.objects {
+        b.write_bits(if entry.signature_present { 1 } else { 0 }, 1);
         if entry.signature_present {
             if let Some(sig) = &entry.signature {
                 for &byte in sig {
@@ -396,11 +468,14 @@ fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintT
                 }
             }
         }
-        // item 4: group_offset
-        // The spec does not assign a fixed bit width for the group_offset field
-        // beyond saying it is a non-negative integer.  qpdf encodes it as 32 bits.
-        b.write_bits(entry.group_offset as u64, 32);
     }
+    b.align_to_byte();
+
+    // col 3: nobjects_minus_one
+    for entry in &t.objects {
+        b.write_bits(entry.nobjects_minus_one as u64, h.bits_group_object_count);
+    }
+    b.align_to_byte();
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +515,7 @@ pub fn encode_hint_stream(
     // Section 1: Page Offset Hint Table (starts at byte offset 0)
     // -----------------------------------------------------------------------
     encode_page_offset_header(&mut builder, page_offset)?;
-    // The 12-field header is exactly 256 bits = 32 bytes (already aligned).
+    // The 13-field header is exactly 288 bits = 36 bytes (already aligned).
     // We call align_to_byte for defensive correctness in case future changes
     // alter the field widths.
     builder.align_to_byte();
@@ -528,6 +603,7 @@ mod tests {
                 byte_length: 0,
             }],
             shared_hints: vec![],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -564,6 +640,7 @@ mod tests {
                     referencing_pages: vec![0, 1],
                 },
             ],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -810,18 +887,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn page_offset_header_size_is_32_bytes() {
+    fn page_offset_header_size_is_36_bytes() {
         // The header has:
-        //   4 × 32-bit fields = 128 bits
+        //   5 × 32-bit fields = 160 bits
         //   8 × 16-bit fields = 128 bits
-        //   Total = 256 bits = 32 bytes
+        //   Total = 288 bits = 36 bytes
         //
         // A single-page plan with all bit-widths = 0 (placeholders):
-        //   - Header: 32 bytes
+        //   - Header: 36 bytes
         //   - Entries: 1 entry, byte-aligned start (noop since header already aligned),
         //     then 0-bit fields → 0 bytes emitted in entries
         //   - align_to_byte after entries: noop
-        //   → shared section starts at byte 32
+        //   → shared section starts at byte 36
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
@@ -829,8 +906,8 @@ mod tests {
         let result = encode_hint_stream(&po, &so).expect("encode");
 
         assert_eq!(
-            result.shared_section_offset_in_uncompressed, 32,
-            "single-page plan with all-zero bit widths: shared section must start at byte 32"
+            result.shared_section_offset_in_uncompressed, 36,
+            "single-page plan with all-zero bit widths: shared section must start at byte 36"
         );
     }
 
@@ -847,7 +924,7 @@ mod tests {
         //
         // With no shared objects (degenerate), no groups or object entries
         // are emitted.  So the total uncompressed length is:
-        //   32 (page offset header) + 24 (shared object header) = 56 bytes.
+        //   36 (page offset header) + 24 (shared object header) = 60 bytes.
         let plan = single_page_plan(); // no shared objects
         let renumber = RenumberMap::from_plan(&plan);
         let po = PageOffsetHintTable::from_plan(&plan, &renumber);
@@ -856,8 +933,8 @@ mod tests {
 
         assert_eq!(
             result.uncompressed.len(),
-            56,
-            "single-page no-shared plan: uncompressed stream must be 56 bytes (32 + 24)"
+            60,
+            "single-page no-shared plan: uncompressed stream must be 60 bytes (36 + 24)"
         );
     }
 }

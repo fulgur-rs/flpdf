@@ -40,7 +40,6 @@
 //! (sub-task 2.9) locates them by field name and overwrites them once the real
 //! byte offsets are available.
 
-use super::hint_page::bits_needed;
 use super::plan::LinearizationPlan;
 use super::renumber::RenumberMap;
 
@@ -119,33 +118,32 @@ pub struct SharedGroupEntry {
 /// * `length_minus_least` (item 2): byte length of this object minus
 ///   `header.least_length`.  Set to `0` (placeholder); back-patched by
 ///   sub-task 2.9.
-/// * `group_offset` (item 4): byte offset of this object from the location of
-///   the first object in the shared objects section.  Set to `0` (placeholder);
-///   back-patched by sub-task 2.9.
+/// * `nobjects_minus_one` (item 4): number of additional objects in this
+///   shared object's group, minus one.  In our 1-object-per-group model this
+///   is always `0`; encoded with `bits_group_object_count` bits, which is
+///   also `0` in our model so nothing is actually written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedObjectEntry {
-    /// Item 1 — Signature present flag.
-    ///
-    /// Always `false` in this implementation; signature computation (MD5) is
-    /// not performed.  When `false`, the 16-byte signature (item 3) is omitted
-    /// from the encoded stream.
-    pub signature_present: bool,
-
-    /// Item 2 — Byte length of this object minus `header.least_length`.
-    ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// Item 1 (encoded order) — Byte length of this object minus
+    /// `header.least_length`.  Populated by the writer in `from_plan`.
     pub length_minus_least: u32,
 
-    /// Item 3 — 16-byte MD5 signature of the object data.
+    /// Item 2 (encoded order) — Signature present flag.
+    ///
+    /// Always `false` in this implementation; signature computation (MD5) is
+    /// not performed.  When `false`, the 16-byte signature is omitted from
+    /// the encoded stream.
+    pub signature_present: bool,
+
+    /// Item 3 (encoded order) — 16-byte MD5 signature of the object data.
     ///
     /// Always `None` because `signature_present` is always `false`.
     pub signature: Option<[u8; 16]>,
 
-    /// Item 4 — Byte offset of this object from the location of the first
-    /// object in the shared objects section.
-    ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
-    pub group_offset: u32,
+    /// Item 4 (encoded order) — Number of additional objects in this group,
+    /// minus one.  Our writer always uses one object per group, so this is
+    /// always `0`.  Encoded with `bits_group_object_count` bits.
+    pub nobjects_minus_one: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,13 +260,20 @@ impl SharedObjectHintTable {
             .number;
 
         // ------------------------------------------------------------------
-        // Step 2: count how many shared objects reference page 0 (first page).
+        // Step 2: count shared objects that are physically in the first-page
+        // section (before /E).
+        //
+        // Per qpdf's Annex F layout, ALL Part-3 (shared) objects are written
+        // inside the first-page section.  The `first_page_entries` field in
+        // the Shared Object Hint Table header records how many shared objects
+        // reside in the first-page section (Annex F Part 3 / before /E).
+        // Since ALL shared objects are in the first-page section, this equals
+        // section_entries.  Setting it to fewer would tell readers that some
+        // shared objects are in Part 8 (after the remaining pages), which would
+        // produce the "part 8 is empty but nshared_total > nshared_first_page"
+        // qpdf warning.
         // ------------------------------------------------------------------
-        let first_page_entries = plan
-            .shared_hints
-            .iter()
-            .filter(|h| h.referencing_pages.contains(&0))
-            .count() as u32;
+        let first_page_entries = shared_count; // all shared objects are in the first-page section
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
@@ -279,7 +284,12 @@ impl SharedObjectHintTable {
         // bits_length_delta: since all lengths are 0 (placeholder) the delta
         // is 0, so bits = 0.  The encoder re-derives this after back-patching.
         // ------------------------------------------------------------------
-        let bits_group_object_count = bits_needed(shared_count as u64);
+        // Each shared object is its own group (one object per group), so the
+        // greatest `nobjects_minus_one` is 0 across all groups, requiring 0
+        // bits per Annex F.4.5 / qpdf nbits_nobjects.  Setting this to
+        // `bits_needed(shared_count)` would be wrong: shared_count is the
+        // *number of groups*, not the *largest group's object count*.
+        let bits_group_object_count: u32 = 0;
 
         let header = SharedObjectHeader {
             first_object_number,
@@ -309,10 +319,10 @@ impl SharedObjectHintTable {
             .shared_hints
             .iter()
             .map(|_hint| SharedObjectEntry {
+                length_minus_least: 0, // placeholder — populated by writer
                 signature_present: false,
-                length_minus_least: 0, // placeholder — back-patched by sub-task 2.9
                 signature: None,
-                group_offset: 0, // placeholder — back-patched by sub-task 2.9
+                nobjects_minus_one: 0, // 1-object-per-group model
             })
             .collect();
 
@@ -364,6 +374,7 @@ mod tests {
                 byte_length: 0,
             }],
             shared_hints: vec![],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -410,6 +421,7 @@ mod tests {
                     referencing_pages: vec![0, 1],
                 },
             ],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -465,6 +477,7 @@ mod tests {
                     referencing_pages: vec![1],
                 },
             ],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -520,15 +533,17 @@ mod tests {
     }
 
     #[test]
-    fn two_page_first_page_entries_both_referenced() {
+    fn two_page_first_page_entries_equals_section_entries() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // Both shared objects reference page 0.
+        // All shared objects are in the first-page section (before /E).
+        // first_page_entries must equal section_entries so qpdf doesn't
+        // expect a non-empty Part 8.
         assert_eq!(
             table.header.first_page_entries, 2,
-            "both shared objects reference page 0 → first_page_entries must be 2"
+            "all shared objects are in first-page section → first_page_entries must equal section_entries (2)"
         );
     }
 
@@ -552,8 +567,10 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // 1-group model: 2 objects in group → bits_needed(2) = 2
-        assert_eq!(table.header.bits_group_object_count, 2);
+        // One object per group (we never group multiple shared objects
+        // together), so the greatest `nobjects_minus_one` across groups is
+        // 0 — bit width is 0 per Annex F.4.5 / qpdf nbits_nobjects.
+        assert_eq!(table.header.bits_group_object_count, 0);
     }
 
     #[test]
@@ -612,7 +629,7 @@ mod tests {
         assert_eq!(table.header.bits_length_delta, 0);
         for entry in &table.objects {
             assert_eq!(entry.length_minus_least, 0);
-            assert_eq!(entry.group_offset, 0);
+            assert_eq!(entry.nobjects_minus_one, 0);
         }
     }
 
@@ -633,17 +650,17 @@ mod tests {
     }
 
     #[test]
-    fn partial_first_page_first_page_entries_is_two() {
+    fn partial_first_page_first_page_entries_equals_section_entries() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // 20 0 R → [0, 1]: references page 0 ✓
-        // 21 0 R → [0]: references page 0 ✓
-        // 22 0 R → [1]: does NOT reference page 0 ✗
+        // All shared objects (3) are physically in the first-page section.
+        // first_page_entries must equal section_entries = 3 so that qpdf
+        // does not expect a non-empty Part 8.
         assert_eq!(
-            table.header.first_page_entries, 2,
-            "only 2 out of 3 shared objects reference page 0"
+            table.header.first_page_entries, 3,
+            "all 3 shared objects are in first-page section → first_page_entries must be 3"
         );
     }
 
@@ -663,8 +680,8 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // 3 objects in group → bits_needed(3) = 2
-        assert_eq!(table.header.bits_group_object_count, 2);
+        // 1-object-per-group model — see two_page_bits_group_object_count.
+        assert_eq!(table.header.bits_group_object_count, 0);
     }
 
     #[test]

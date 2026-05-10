@@ -279,6 +279,7 @@ mod tests {
             root_ref: Some(ObjectRef::new(1, 0)),
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             shared_hints: vec![],
+            per_page_private_objects: vec![],
         }
     }
 

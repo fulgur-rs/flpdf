@@ -8,8 +8,8 @@
 //!
 //! The hint table consists of:
 //!
-//! * A **header** with 12 integer items describing the ranges and bit widths
-//!   needed to encode the per-page entries.
+//! * A **header** with 13 integer items describing the ranges and bit widths
+//!   needed to encode the per-page entries (5 × 32-bit + 8 × 16-bit = 36 bytes).
 //! * **N per-page entries** (one per page), each with 7 items.
 //!
 //! # Back-patch discipline
@@ -27,14 +27,13 @@
 //! (sub-task 2.9) locates them by field name and overwrites them once the real
 //! byte offsets are available.
 //!
-//! # Object count for pages > 0
+//! # Object count
 //!
-//! `LinearizationPlan` computes the precise `object_count` only for page 0
-//! (= `part2_objects.len()`).  For pages 1..N the plan stores `0` as a
-//! placeholder (back-patched by the layout writer).  `from_plan` therefore
-//! uses `plan.page_hints[i].object_count` directly and may produce `0` for
-//! pages beyond the first.  Complete multi-page object counts will be filled
-//! in by a later subtask.
+//! `LinearizationPlan` computes `object_count` for page 0 as
+//! `part2_objects.len() + part3_objects.len()` — all objects in the
+//! first-page section (Part-2 private + Part-3 shared) written before `/E`.
+//! For pages 1..N the count reflects only the page-private objects in
+//! `per_page_private_objects[i]`.
 
 use super::plan::LinearizationPlan;
 use super::renumber::RenumberMap;
@@ -70,66 +69,101 @@ pub fn bits_needed(value: u64) -> u32 {
 // Header
 // ---------------------------------------------------------------------------
 
-/// Header for the Page Offset Hint Table (12 items per Annex F.3.1).
+/// Header for the Page Offset Hint Table (13 items per Annex F.3.1).
 ///
-/// Items are numbered 1–12 in the spec; field names here follow the spec text.
+/// Items are numbered 1–13 in the spec; field names here follow the spec text.
+/// The encoded format is 5 × 32-bit + 8 × 16-bit = **36 bytes** total.
+///
+/// ## Correct field order (5 × u32 + 8 × u16 = 36 bytes)
+///
+/// | Byte | Width | Item | Field |
+/// |------|-------|------|-------|
+/// | 0-3  | 32    | 1    | `least_object_count` |
+/// | 4-7  | 32    | 2    | `location_of_first_page` |
+/// | 8-9  | 16    | 3    | `bits_object_count_delta` |
+/// | 10-13| 32    | 4    | `least_page_length` |
+/// | 14-15| 16    | 5    | `bits_page_length_delta` |
+/// | 16-19| 32    | 6    | `least_content_offset` |
+/// | 20-21| 16    | 7    | `bits_content_offset_delta` |
+/// | 22-25| 32    | 8    | `least_content_length` |
+/// | 26-27| 16    | 9    | `bits_content_length_delta` |
+/// | 28-29| 16    | 10   | `bits_shared_object_count` |
+/// | 30-31| 16    | 11   | `bits_shared_object_id` |
+/// | 32-33| 16    | 12   | `bits_numerator` |
+/// | 34-35| 16    | 13   | `denominator` |
+///
+/// Note: `first_page_object_number` (the `/O` value) does **not** appear in
+/// the hint stream header — it belongs only in the linearization parameter
+/// dictionary.
 ///
 /// ## Back-patch fields
 ///
 /// * `location_of_first_page` (item 2): byte offset of the first page's page
 ///   object from the start of the file.  Set to `0` (placeholder); back-patched
 ///   by sub-task 2.9.
-/// * `least_page_length` (item 6): minimum page byte length across all pages.
+/// * `least_page_length` (item 4): minimum page byte length across all pages.
+///   Set to `0` (placeholder); back-patched by sub-task 2.9.
+/// * `least_content_offset` (item 6): minimum content stream offset.
+///   Set to `0` (placeholder); back-patched by sub-task 2.9.
+/// * `least_content_length` (item 8): minimum content stream length.
 ///   Set to `0` (placeholder); back-patched by sub-task 2.9.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOffsetHeader {
-    /// Item 1 — Object number of the first page's page object (new, linearized
-    /// object number, i.e. the `/O` value in the parameter dictionary).
-    pub first_page_object_number: u32,
+    /// Item 1 — Least number of objects in a page across all pages (32-bit).
+    pub least_object_count: u32,
 
     /// Item 2 — Byte offset of the first page's page object from the start of
-    /// the file.
+    /// the file (32-bit).
     ///
     /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
     pub location_of_first_page: u64,
 
     /// Item 3 — Bits needed to represent the difference between the greatest
-    /// and least number of objects in any page.
+    /// and least number of objects in any page (16-bit).
     pub bits_object_count_delta: u32,
 
-    /// Item 4 — Least number of objects in a page across all pages.
-    pub least_object_count: u32,
-
-    /// Item 5 — Bits needed to represent the difference between the greatest
-    /// and least page length in bytes.
-    pub bits_page_length_delta: u32,
-
-    /// Item 6 — Least page length in bytes.
+    /// Item 4 — Least page length in bytes (32-bit).
     ///
     /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
     pub least_page_length: u64,
 
-    /// Item 7 — Bits needed to represent the greatest number of shared object
-    /// references for any page.
+    /// Item 5 — Bits needed to represent the difference between the greatest
+    /// and least page length in bytes (16-bit).
+    pub bits_page_length_delta: u32,
+
+    /// Item 6 — Least content stream offset from the start of the page's data (32-bit).
+    ///
+    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    pub least_content_offset: u64,
+
+    /// Item 7 — Bits needed to represent the difference between the greatest
+    /// and least content stream offset (16-bit).
+    pub bits_content_offset_delta: u32,
+
+    /// Item 8 — Least content stream length in bytes (32-bit).
+    ///
+    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    pub least_content_length: u64,
+
+    /// Item 9 — Bits needed to represent the difference between the greatest
+    /// and least content stream length (16-bit).
+    pub bits_content_length_delta: u32,
+
+    /// Item 10 — Bits needed to represent the greatest number of shared object
+    /// references for any page (16-bit).
     pub bits_shared_object_count: u32,
 
-    /// Item 8 — Bits needed to represent the numerically greatest shared object
-    /// identifier used by the pages.
+    /// Item 11 — Bits needed to represent the numerically greatest shared object
+    /// identifier used by the pages (16-bit).
     pub bits_shared_object_id: u32,
 
-    /// Item 9 — Bits needed to represent the numerator of the fractional
-    /// position for each shared object reference.
+    /// Item 12 — Bits needed to represent the numerator of the fractional
+    /// position for each shared object reference (16-bit).
     pub bits_numerator: u32,
 
-    /// Item 10 — Denominator of the fractional position for each shared object
-    /// reference.  qpdf uses 1 (implementation-defined per spec).
+    /// Item 13 — Denominator of the fractional position for each shared object
+    /// reference (16-bit).  qpdf uses 4 (implementation-defined per spec).
     pub denominator: u32,
-
-    /// Item 11 — Bits needed to represent the greatest content stream offset.
-    pub bits_content_offset: u32,
-
-    /// Item 12 — Bits needed to represent the greatest content stream length.
-    pub bits_content_length: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,15 +225,16 @@ pub struct PageOffsetEntry {
 /// Complete Page Offset Hint Table: header + one entry per page.
 ///
 /// Constructed via [`PageOffsetHintTable::from_plan`].  All placeholder fields
-/// (`location_of_first_page`, `least_page_length`, per-page
-/// `page_length_minus_least`, `content_stream_offset`, `content_stream_length`)
+/// (`location_of_first_page`, `least_page_length`, `least_content_offset`,
+/// `least_content_length`, per-page `page_length_minus_least`,
+/// `content_stream_offset`, `content_stream_length`)
 /// are initialized to `0`; sub-task 2.9 back-patches them.
 ///
 /// The sub-task 2.7 encoder serializes this struct into the binary bit-packed
 /// format required by Annex F.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOffsetHintTable {
-    /// The 12-item header.
+    /// The 13-item header (36 bytes: 5 × 32-bit + 8 × 16-bit).
     pub header: PageOffsetHeader,
     /// One entry per page, in page order (page 0 = first page).
     pub entries: Vec<PageOffsetEntry>,
@@ -216,6 +251,8 @@ impl PageOffsetHintTable {
     ///
     /// * `header.location_of_first_page`
     /// * `header.least_page_length`
+    /// * `header.least_content_offset`
+    /// * `header.least_content_length`
     /// * `entry.page_length_minus_least` (all entries)
     /// * `entry.content_stream_offset` (all entries)
     /// * `entry.content_stream_length` (all entries)
@@ -227,10 +264,9 @@ impl PageOffsetHintTable {
     /// `object_count_minus_least`; unlike byte-offset placeholders they are
     /// not back-patched, so a placeholder zero would bake an incorrect
     /// header / entries into the table).  Also panics if the plan has zero
-    /// pages, or if a `page_ref` / `shared_hint.object_ref` is not present
-    /// in `renumber` — these all indicate a malformed `LinearizationPlan` /
-    /// `RenumberMap` pair that the caller is expected to construct
-    /// consistently.
+    /// pages, or if a `shared_hint.object_ref` is not present in `renumber`
+    /// — these all indicate a malformed `LinearizationPlan` / `RenumberMap`
+    /// pair that the caller is expected to construct consistently.
     pub fn from_plan(plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
         assert!(
             !plan.page_hints.is_empty(),
@@ -298,6 +334,12 @@ impl PageOffsetHintTable {
             }
         }
 
+        // qpdf rejects page 0 entries that list shared identifiers
+        // ("page 0 has shared identifier entries"): page 0 OWNS the shared
+        // objects physically (they sit before /E in the first-page section),
+        // so it does not need them in its hint-table entry.  Only pages
+        // 1..N list the shared identifiers they reference.
+
         let greatest_shared_count = shared_counts.iter().copied().max().unwrap_or(0);
 
         // ------------------------------------------------------------------
@@ -312,48 +354,37 @@ impl PageOffsetHintTable {
             .unwrap_or(0);
 
         // ------------------------------------------------------------------
-        // Step 4: first-page object new number (/O in the parameter dict).
-        // ------------------------------------------------------------------
-        // No fallback: an absent first page or a missing renumber entry
-        // means the plan/renumber pair is inconsistent — silently using
-        // "2" would put a wrong /O in the linearization parameter dict.
-        // The empty-plan case is already excluded by the assert above.
-        let first_page_ref = plan.page_hints[0].page_ref;
-        let first_page_object_number = renumber
-            .new_for_original(first_page_ref)
-            .unwrap_or_else(|| {
-                panic!(
-                    "first page {first_page_ref:?} not found in RenumberMap (plan/renumber inconsistency)"
-                )
-            })
-            .number;
-
-        // ------------------------------------------------------------------
-        // Step 5: build the header.
+        // Step 4: build the header.
         //
         // Byte-dependent fields are set to 0 (placeholder).
         // Bit-width fields are derived from the deltas and max values computed
         // above.
         //
-        // item 5 / bits_page_length_delta: since all page_length values are 0
-        // (placeholder) at this stage, the delta is 0 and bits = 0.  The
-        // back-patcher will update least_page_length and each
-        // page_length_minus_least; the encoder must re-derive bit widths at
-        // encode time using the final values.
+        // Note: `first_page_object_number` (the `/O` value in the param dict)
+        // does NOT appear in the hint stream header per Annex F.3.1.  It is
+        // stored separately in `LinearizedOffsets.first_page_object_new_num`.
+        //
+        // items 5 / bits_page_length_delta and 7 / bits_content_offset_delta
+        // and 9 / bits_content_length_delta: since all page_length and content
+        // values are 0 (placeholder) at this stage, the deltas are 0 and
+        // bits = 0.  The back-patcher will update the least_* fields and
+        // per-page entries; the encoder must re-derive bit widths at encode
+        // time using the final values.
         // ------------------------------------------------------------------
         let header = PageOffsetHeader {
-            first_page_object_number,
+            least_object_count,
             location_of_first_page: 0, // placeholder — back-patched by sub-task 2.9
             bits_object_count_delta: bits_needed(object_count_delta),
-            least_object_count,
+            least_page_length: 0, // placeholder — back-patched by sub-task 2.9
             bits_page_length_delta: 0, // placeholder — re-derived by encoder after back-patch
-            least_page_length: 0,      // placeholder — back-patched by sub-task 2.9
+            least_content_offset: 0, // placeholder — back-patched by sub-task 2.9
+            bits_content_offset_delta: 0, // placeholder — re-derived by encoder after back-patch
+            least_content_length: 0, // placeholder — back-patched by sub-task 2.9
+            bits_content_length_delta: 0, // placeholder — re-derived by encoder after back-patch
             bits_shared_object_count: bits_needed(greatest_shared_count as u64),
             bits_shared_object_id: bits_needed(greatest_shared_id),
             bits_numerator: 0, // numerators are all 0 (qpdf default), so 0 bits needed
-            denominator: 1,    // qpdf default; spec says implementation-defined
-            bits_content_offset: 0, // placeholder — re-derived by encoder after back-patch
-            bits_content_length: 0, // placeholder — re-derived by encoder after back-patch
+            denominator: 4,    // qpdf default; spec says implementation-defined
         };
 
         // ------------------------------------------------------------------
@@ -425,19 +456,20 @@ mod tests {
                 byte_length: 0,
             }],
             shared_hints: vec![],
+            per_page_private_objects: vec![],
         }
     }
 
     /// Two-page plan:
     ///
-    /// Part 2 (page 0 exclusive): [3 0 R, 6 0 R]  → object_count = 2 (min)
+    /// Part 2 (page 0 exclusive): [3 0 R, 6 0 R]  → object_count includes Part-3
     /// Part 3 (shared):           [5 0 R, 8 0 R]
     /// Part 4 (remaining):        [4 0 R, 7 0 R]
-    /// Page 0: page_ref = 3 0 R, object_count = 3
+    /// Page 0: page_ref = 3 0 R, object_count = 4 (2 Part-2 + 2 Part-3)
     /// Page 1: page_ref = 4 0 R, object_count = 5
     /// Shared hints:
-    ///   5 0 R → referencing_pages [0, 1]
-    ///   8 0 R → referencing_pages [0, 1]
+    ///   5 0 R → referencing_pages [1]   (page 0 owns via physical layout, not hint ref)
+    ///   8 0 R → referencing_pages [1]
     fn two_page_plan_with_shared() -> LinearizationPlan {
         LinearizationPlan {
             part1_objects: vec![],
@@ -450,7 +482,7 @@ mod tests {
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),
                     first_object_index: 0,
-                    object_count: 3,
+                    object_count: 4, // 2 Part-2 + 2 Part-3 = all objects in first-page section
                     byte_length: 0,
                 },
                 PageHintEntry {
@@ -463,13 +495,14 @@ mod tests {
             shared_hints: vec![
                 SharedObjectHintEntry {
                     object_ref: ObjectRef::new(5, 0),
-                    referencing_pages: vec![0, 1],
+                    referencing_pages: vec![1], // page 0 owns via physical layout
                 },
                 SharedObjectHintEntry {
                     object_ref: ObjectRef::new(8, 0),
-                    referencing_pages: vec![0, 1],
+                    referencing_pages: vec![1], // page 0 owns via physical layout
                 },
             ],
+            per_page_private_objects: vec![],
         }
     }
 
@@ -532,19 +565,6 @@ mod tests {
     }
 
     #[test]
-    fn single_page_first_page_object_number() {
-        let plan = single_page_plan();
-        let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber);
-
-        // page_ref = 3 0 R → new number 2 (first Part-2 object)
-        assert_eq!(
-            table.header.first_page_object_number, 2,
-            "first page object new number must be 2"
-        );
-    }
-
-    #[test]
     fn single_page_all_deltas_zero_so_bit_widths_zero() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
@@ -582,20 +602,22 @@ mod tests {
 
         assert_eq!(table.header.location_of_first_page, 0);
         assert_eq!(table.header.least_page_length, 0);
+        assert_eq!(table.header.least_content_offset, 0);
+        assert_eq!(table.header.least_content_length, 0);
         assert_eq!(table.entries[0].page_length_minus_least, 0);
         assert_eq!(table.entries[0].content_stream_offset, 0);
         assert_eq!(table.entries[0].content_stream_length, 0);
     }
 
     #[test]
-    fn single_page_denominator_is_one() {
+    fn single_page_denominator_is_four() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
         assert_eq!(
-            table.header.denominator, 1,
-            "denominator must be 1 (qpdf default)"
+            table.header.denominator, 4,
+            "denominator must be 4 (qpdf default)"
         );
     }
 
@@ -629,8 +651,8 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // min(3, 5) = 3
-        assert_eq!(table.header.least_object_count, 3);
+        // min(4, 5) = 4 (page 0 object_count = Part-2 + Part-3 = 2+2 = 4)
+        assert_eq!(table.header.least_object_count, 4);
     }
 
     #[test]
@@ -639,8 +661,8 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // delta = 5 - 3 = 2 → bits_needed(2) = 2
-        assert_eq!(table.header.bits_object_count_delta, 2);
+        // delta = 5 - 4 = 1 → bits_needed(1) = 1
+        assert_eq!(table.header.bits_object_count_delta, 1);
     }
 
     #[test]
@@ -649,10 +671,10 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // page 0: 3 - 3 = 0
+        // page 0: 4 - 4 = 0
         assert_eq!(table.entries[0].object_count_minus_least, 0);
-        // page 1: 5 - 3 = 2
-        assert_eq!(table.entries[1].object_count_minus_least, 2);
+        // page 1: 5 - 4 = 1
+        assert_eq!(table.entries[1].object_count_minus_least, 1);
     }
 
     #[test]
@@ -661,8 +683,11 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // Both pages reference 2 shared objects (5 0 R and 8 0 R).
-        assert_eq!(table.entries[0].shared_object_count, 2);
+        // qpdf rejects "page 0 has shared identifier entries" — page 0 owns
+        // shared objects physically (they sit in the first-page section
+        // before /E) so its entry must NOT list shared identifiers.  Only
+        // pages 1..N list the shared objects they reference.
+        assert_eq!(table.entries[0].shared_object_count, 0);
         assert_eq!(table.entries[1].shared_object_count, 2);
     }
 
@@ -694,16 +719,13 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // Shared objects 5 0 R → new 4, 8 0 R → new 5.
-        // Both pages reference both shared objects.
-        let mut ids0 = table.entries[0].shared_object_ids.clone();
-        ids0.sort_unstable();
-        assert_eq!(
-            ids0,
-            vec![4, 5],
-            "page 0 shared object ids must be new numbers 4 and 5"
+        // Page 0 must NOT list shared identifiers (qpdf rejects them).
+        assert!(
+            table.entries[0].shared_object_ids.is_empty(),
+            "page 0 must not list shared identifiers"
         );
 
+        // Page 1 references both shared objects — new numbers 4 and 5.
         let mut ids1 = table.entries[1].shared_object_ids.clone();
         ids1.sort_unstable();
         assert_eq!(
@@ -742,12 +764,12 @@ mod tests {
     }
 
     #[test]
-    fn two_page_denominator_is_one() {
+    fn two_page_denominator_is_four() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        assert_eq!(table.header.denominator, 1);
+        assert_eq!(table.header.denominator, 4);
     }
 
     #[test]
@@ -758,6 +780,8 @@ mod tests {
 
         assert_eq!(table.header.location_of_first_page, 0);
         assert_eq!(table.header.least_page_length, 0);
+        assert_eq!(table.header.least_content_offset, 0);
+        assert_eq!(table.header.least_content_length, 0);
         for entry in &table.entries {
             assert_eq!(entry.page_length_minus_least, 0);
             assert_eq!(entry.content_stream_offset, 0);
