@@ -10,6 +10,7 @@ pub mod hint_stream;
 pub mod part1;
 pub mod plan;
 pub mod renumber;
+pub mod writer;
 
 pub use hint_page::{bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHintTable};
 pub use hint_shared::{
@@ -19,3 +20,4 @@ pub use hint_stream::{encode_hint_stream, HintStreamBuilder, HintStreamBytes};
 pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
 pub use renumber::RenumberMap;
+pub use writer::{write_linearized, LinearizedDocument, LinearizedOffsets};
