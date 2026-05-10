@@ -220,12 +220,29 @@ impl PageOffsetHintTable {
     /// * `entry.content_stream_offset` (all entries)
     /// * `entry.content_stream_length` (all entries)
     ///
-    /// # Object count for pages > 0
+    /// # Panics
     ///
-    /// The plan only computes a precise `object_count` for page 0.  For pages
-    /// 1..N the plan stores `0` as a placeholder.  `from_plan` uses the plan
-    /// values as-is; a future subtask will fill in the remaining counts.
+    /// Panics if any `page_hints[i].object_count == 0` (these values feed
+    /// `least_object_count`, `bits_object_count_delta`, and per-entry
+    /// `object_count_minus_least`; unlike byte-offset placeholders they are
+    /// not back-patched, so a placeholder zero would bake an incorrect
+    /// header / entries into the table).  Also panics if the plan has zero
+    /// pages, or if a `page_ref` / `shared_hint.object_ref` is not present
+    /// in `renumber` — these all indicate a malformed `LinearizationPlan` /
+    /// `RenumberMap` pair that the caller is expected to construct
+    /// consistently.
     pub fn from_plan(plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
+        assert!(
+            !plan.page_hints.is_empty(),
+            "PageOffsetHintTable::from_plan requires at least one page in the plan"
+        );
+        assert!(
+            plan.page_hints.iter().all(|hint| hint.object_count > 0),
+            "PageOffsetHintTable::from_plan requires finalized per-page object counts \
+             (every page_hints[i].object_count must be > 0; ensure LinearizationPlan \
+             populates counts for all pages, not just page 0)"
+        );
+
         let page_count = plan.page_hints.len();
 
         // ------------------------------------------------------------------
@@ -250,10 +267,18 @@ impl PageOffsetHintTable {
 
         for shared_hint in &plan.shared_hints {
             // Resolve the new (linearized) object number for this shared object.
+            // Synthesizing 0 on a miss would leave shared_object_ids inconsistent
+            // with bits_shared_object_id (which is computed from successfully
+            // mapped IDs only), so fail fast on a malformed plan/renumber pair.
             let new_number = renumber
                 .new_for_original(shared_hint.object_ref)
-                .map(|r| r.number)
-                .unwrap_or(0);
+                .unwrap_or_else(|| {
+                    panic!(
+                        "shared hint object {:?} not found in RenumberMap (plan/renumber inconsistency)",
+                        shared_hint.object_ref
+                    )
+                })
+                .number;
 
             for &page_idx in &shared_hint.referencing_pages {
                 let idx = page_idx as usize;
@@ -280,12 +305,19 @@ impl PageOffsetHintTable {
         // ------------------------------------------------------------------
         // Step 4: first-page object new number (/O in the parameter dict).
         // ------------------------------------------------------------------
-        let first_page_object_number = plan
-            .page_hints
-            .first()
-            .and_then(|h| renumber.new_for_original(h.page_ref))
-            .map(|r| r.number)
-            .unwrap_or(2); // fallback to 2 (conventional default)
+        // No fallback: an absent first page or a missing renumber entry
+        // means the plan/renumber pair is inconsistent — silently using
+        // "2" would put a wrong /O in the linearization parameter dict.
+        // The empty-plan case is already excluded by the assert above.
+        let first_page_ref = plan.page_hints[0].page_ref;
+        let first_page_object_number = renumber
+            .new_for_original(first_page_ref)
+            .unwrap_or_else(|| {
+                panic!(
+                    "first page {first_page_ref:?} not found in RenumberMap (plan/renumber inconsistency)"
+                )
+            })
+            .number;
 
         // ------------------------------------------------------------------
         // Step 5: build the header.
