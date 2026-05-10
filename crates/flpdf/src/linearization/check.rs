@@ -261,21 +261,33 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     let t_obj = param_dict.get("T").cloned().unwrap_or(Object::Null);
     let t_val = as_u64(&t_obj, "T")?;
-    if t_val as usize + 4 > file_bytes.len() {
+    // /T must fit in the platform's `usize` (matters on 32-bit targets where
+    // `u64 as usize` would silently truncate) and must leave at least 4 bytes
+    // before EOF for the `xref` keyword.  Use checked_add to avoid wrap-around
+    // overflow surprises in release builds.
+    let t_usize = usize::try_from(t_val).map_err(|_| LinearizationCheckError::InvalidParam {
+        message: format!("/T ({t_val}) does not fit in platform usize"),
+    })?;
+    if t_usize
+        .checked_add(4)
+        .is_none_or(|end| end > file_bytes.len())
+    {
         fail!("/T ({t_val}) is too close to end of file to contain xref keyword");
     }
-    // Allow /T to be within a 16-byte window past the xref keyword.
-    // This accommodates both the ISO convention (/T = xref keyword) and
-    // the qpdf convention (/T = first_entry_pos - 1 = xref + header_len - 1).
-    let t_usize = t_val as usize;
-    let search_start = t_usize.saturating_sub(16);
+    // Allow /T to fall anywhere inside the cross-reference section header.
+    // The window covers both ISO convention (/T = xref keyword) and
+    // qpdf convention (/T = first_entry_pos - 1, ~= xref + header_len - 1).
+    // 32 bytes is enough for `xref\n0 N\n` headers up to u32-sized object
+    // counts (up to 10 decimal digits).
+    const T_BACKSCAN_WINDOW: usize = 32;
+    let search_start = t_usize.saturating_sub(T_BACKSCAN_WINDOW);
     let found_xref = file_bytes[search_start..=t_usize]
         .windows(4)
         .any(|w| w == b"xref");
     if !found_xref {
         fail!(
             "/T ({t_val}) is not within the last cross-reference section \
-             (no xref keyword found in the 16-byte window before /T)"
+             (no xref keyword found in the backscan window before /T)"
         );
     }
 

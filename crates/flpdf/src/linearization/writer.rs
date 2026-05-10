@@ -596,6 +596,19 @@ pub fn write_linearized<R: Read + Seek>(
             })
             .sum();
 
+        // Manually-constructed plans must keep `per_page_private_objects`
+        // aligned with `page_hints` (one entry per page).  A shorter list
+        // would silently leave some page-length hint fields unpatched —
+        // fail fast instead.
+        if plan.per_page_private_objects.len() != plan.page_hints.len() {
+            return Err(crate::Error::Unsupported(format!(
+                "linearization writer: per_page_private_objects length ({}) does not \
+                 match page_hints length ({}) — plan invariant violated",
+                plan.per_page_private_objects.len(),
+                plan.page_hints.len()
+            )));
+        }
+
         let per_page_byte_lengths: Vec<u64> = plan
             .per_page_private_objects
             .iter()

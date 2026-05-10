@@ -162,9 +162,20 @@ fn compute_closure<R: Read + Seek>(
         if is_pages_node || is_page_leaf {
             if let Object::Dictionary(dict) = &obj {
                 for (k, v) in dict.iter() {
-                    // Skip /Kids (Pages → sibling pages) and /Parent (Page/Pages → ancestor)
-                    // to avoid pulling in the page-tree structure.  Only page-private
-                    // resources (content streams, fonts, images) belong in a page's closure.
+                    // Skip /Kids (Pages → sibling pages) and /Parent
+                    // (Page/Pages → ancestor) to avoid pulling in the
+                    // page-tree structure itself.  Following /Parent picks
+                    // up the parent Pages-dict object, which qpdf does not
+                    // count toward this page's object_count — the result
+                    // is "object count mismatch: hint = N+1; computed = N".
+                    //
+                    // For PDFs where /Resources or /MediaBox are inherited
+                    // from an ancestor /Pages node, the inherited keys are
+                    // not pulled into the page's closure here.  This is a
+                    // limitation that affects pages that genuinely rely on
+                    // inherited resources; our test fixtures all define
+                    // /Resources and /MediaBox on the page leaf so the
+                    // current behaviour is correct for them.
                     if k == b"Kids" || k == b"Parent" {
                         continue;
                     }
