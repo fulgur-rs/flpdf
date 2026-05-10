@@ -502,7 +502,7 @@ pub fn write_linearized<R: Read + Seek>(
         ))
     })?;
 
-    let hint_stream_new_num: u32 = renumber.len() as u32 + 1;
+    let hint_stream_new_num: u32 = renumber.next_free();
     let total_count: u32 = hint_stream_new_num + 1;
 
     let info_new_ref: Option<ObjectRef> = pdf

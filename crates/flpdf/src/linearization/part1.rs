@@ -161,7 +161,22 @@ impl Part1Bytes {
     /// ```
     ///
     /// where each `XXXXXXXXXX` is a 10-digit zero placeholder.
-    pub fn build(_plan: &LinearizationPlan, _renumber: &RenumberMap) -> Self {
+    pub fn build(_plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
+        // Object 1 is reserved for the linearization parameter dictionary.
+        // The renumber map MUST keep slot 1 unmapped (its constructor reserves
+        // it via SENTINEL).  Asserting this here makes the contract explicit:
+        // a future change to RenumberMap that allocates a real plan object to
+        // new number 1 would silently produce a duplicate `1 0 obj` definition
+        // in the linearized output and corrupt the xref.
+        debug_assert!(
+            renumber
+                .original_for_new(crate::ObjectRef::new(1, 0))
+                .is_none(),
+            "Part1Bytes::build: RenumberMap allocated object number 1 to a \
+             plan object — slot 1 must remain reserved for the linearization \
+             parameter dictionary"
+        );
+
         let mut bytes: Vec<u8> = Vec::new();
 
         // ------------------------------------------------------------------

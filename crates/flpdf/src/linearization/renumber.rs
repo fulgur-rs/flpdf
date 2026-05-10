@@ -197,6 +197,20 @@ impl RenumberMap {
         self.len() <= 1
     }
 
+    /// The next object number that is NOT used by any plan object or by the
+    /// reserved param-dict slot.
+    ///
+    /// Use this when you need to allocate an extra object number (e.g. the
+    /// hint stream) that must not collide with the renumbered body objects.
+    /// Equivalent to `by_new_number.len() as u32` — the slot just past the
+    /// highest allocated number.  Returning this through a named helper makes
+    /// the contract explicit and decouples the writer from the internal
+    /// `len()` semantics (which returns "highest allocated number" — easy to
+    /// read off-by-one from).
+    pub fn next_free(&self) -> u32 {
+        self.by_new_number.len() as u32
+    }
+
     // -----------------------------------------------------------------------
     // Iteration
     // -----------------------------------------------------------------------
@@ -521,5 +535,31 @@ mod tests {
             rn.original_for_new(ObjectRef::new(2, 0)),
             Some(ObjectRef::new(3, 0))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // next_free helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn next_free_returns_slot_past_highest_allocated() {
+        let plan = single_page_plan();
+        let rn = RenumberMap::from_plan(&plan);
+        // single_page_plan: 3 plan objects + slot 0 (sentinel) + slot 1 (param dict)
+        // = highest allocated is 4, next_free should be 5.
+        assert_eq!(rn.len(), 4);
+        assert_eq!(rn.next_free(), 5);
+    }
+
+    #[test]
+    fn next_free_does_not_collide_with_any_allocated() {
+        let plan = two_page_plan();
+        let rn = RenumberMap::from_plan(&plan);
+        let nf = rn.next_free();
+        // next_free is the slot AFTER the last allocated number — by design
+        // there is no original mapped to it.
+        assert!(rn.original_for_new(ObjectRef::new(nf, 0)).is_none());
+        // And it is one past `len()` (which itself is the highest allocated).
+        assert_eq!(nf, (rn.len() as u32) + 1);
     }
 }
