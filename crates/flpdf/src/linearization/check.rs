@@ -92,10 +92,15 @@ macro_rules! fail {
 }
 
 /// Extract a non-negative integer value from a PDF `Object`.
+///
+/// `Object::Real` is accepted only when it carries an exact integer value
+/// (`r.fract() == 0.0`); fractional values like `/N 1.9` would otherwise be
+/// silently truncated and could spuriously satisfy integer invariants the
+/// checker is enforcing.
 fn as_u64(obj: &Object, key: &str) -> std::result::Result<u64, LinearizationCheckError> {
     match obj {
         Object::Integer(n) if *n >= 0 => Ok(*n as u64),
-        Object::Real(r) if r.is_finite() && *r >= 0.0 => Ok(*r as u64),
+        Object::Real(r) if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 => Ok(*r as u64),
         other => Err(LinearizationCheckError::InvalidParam {
             message: format!(
                 "/{key} is not a non-negative integer (got {})",
@@ -181,9 +186,14 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
                         String::from_utf8_lossy(type_name)
                     );
                 }
-            } else {
-                // No /Type key — acceptable if it is clearly a page dict
-                // (has /Parent or /MediaBox).  Be lenient here.
+            } else if d.get("Parent").is_none() && d.get("MediaBox").is_none() {
+                // Without /Type, require at least one of the structural keys
+                // every Page object must inherit (/Parent) or define (/MediaBox).
+                // Empty / unrelated dictionaries are not Page objects.
+                fail!(
+                    "/O ({o_num}) points to a dictionary with no /Type, /Parent or /MediaBox \
+                     — does not look like a Page object"
+                );
             }
         }
         Object::Null => {
@@ -248,7 +258,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     Ok(())
 }
 
-/// Verify that the hint stream object near `offset` in `file_bytes` is a
+/// Verify that the hint stream object at `offset` in `file_bytes` is a
 /// stream with `/Filter /FlateDecode` (or compatible) and that the compressed
 /// data can actually be decoded.
 fn check_hint_stream_at_offset<R: Read + Seek>(
@@ -256,28 +266,26 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
     file_bytes: &[u8],
     offset: usize,
 ) -> CheckResult {
-    // Find "N G obj" by scanning from offset for a space-separated pattern.
-    // We look for the sequence "<digits> <digits> obj" within a small window.
-    const SCAN_WINDOW: usize = 256;
+    // /H[0] must point exactly at the `N G obj` header (after at most a few
+    // leading whitespace bytes).  A loose scan that just searches for `obj`
+    // anywhere in a window would accept misaligned offsets that happen to
+    // sit near another object header — which is precisely the kind of
+    // corruption we want to detect.
+    const SCAN_WINDOW: usize = 64;
     let scan_end = (offset + SCAN_WINDOW).min(file_bytes.len());
     let window = &file_bytes[offset..scan_end];
 
-    // Find the `obj` keyword position.
-    let obj_pos = window.windows(3).position(|w| w == b"obj");
-    let Some(_obj_pos) = obj_pos else {
+    let Some((obj_num, obj_gen)) = parse_obj_header_at(window) else {
         fail!(
-            "/H[0] offset ({offset}) does not point to an indirect object (no 'obj' keyword found)"
+            "/H[0] offset ({offset}) does not point at an indirect object header \
+             (expected `N G obj`)"
         );
     };
 
-    // Parse the object number from the window.
-    let obj_num = parse_obj_number_at(window);
-    let Some(obj_num) = obj_num else {
-        fail!("/H[0] offset ({offset}) could not be parsed as an indirect object header");
-    };
-
-    // Resolve the object via the Pdf handle.
-    let hint_ref = ObjectRef::new(obj_num, 0);
+    // Resolve the object via the Pdf handle.  Use the parsed generation so a
+    // hint stream with a non-zero generation (e.g. after incremental update)
+    // is still locatable.
+    let hint_ref = ObjectRef::new(obj_num, obj_gen);
     let hint_obj = pdf
         .resolve(hint_ref)
         .map_err(LinearizationCheckError::from)?;
@@ -287,35 +295,90 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
             // Attempt to decode the compressed data.
             decode_stream_data(&stream.dict, &stream.data).map_err(|e| {
                 LinearizationCheckError::InvalidParam {
-                    message: format!("hint stream (object {obj_num}) could not be decoded: {e}"),
+                    message: format!(
+                        "hint stream (object {obj_num} {obj_gen}) could not be decoded: {e}"
+                    ),
                 }
             })?;
         }
         Object::Null => {
-            fail!("hint stream object {obj_num} (at /H[0] offset {offset}) does not exist");
+            fail!(
+                "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) does not exist"
+            );
         }
         _ => {
-            fail!("hint stream object {obj_num} (at /H[0] offset {offset}) is not a stream");
+            fail!(
+                "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) is not a stream"
+            );
         }
     }
 
     Ok(())
 }
 
-/// Parse the indirect object number from bytes that start at (or near) an
-/// indirect object header like `"N G obj"`.  Returns the number `N`, or `None`
-/// if the parse fails.
-fn parse_obj_number_at(window: &[u8]) -> Option<u32> {
+/// Parse a complete `N G obj` indirect object header at the start of
+/// `window` (after at most a small amount of leading PDF whitespace).
+///
+/// Returns `(N, G)` on success, `None` if the bytes do not look like an
+/// indirect object header.  A loose scan that picks up the first digits in
+/// a window would silently accept misaligned offsets — this strict parser
+/// requires the `obj` keyword to follow exactly after `<digits> <digits>`.
+fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
+    fn is_pdf_whitespace(b: u8) -> bool {
+        matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+    }
+
     // Skip leading whitespace.
-    let start = window.iter().position(|&b| b.is_ascii_digit())?;
-    // Read decimal digits.
-    let end = window[start..]
-        .iter()
-        .position(|&b| !b.is_ascii_digit())
-        .map(|p| start + p)
-        .unwrap_or(window.len());
-    let num_str = std::str::from_utf8(&window[start..end]).ok()?;
-    num_str.parse::<u32>().ok()
+    let mut i = 0;
+    while i < window.len() && is_pdf_whitespace(window[i]) {
+        i += 1;
+    }
+
+    // Object number digits.
+    let num_start = i;
+    while i < window.len() && window[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == num_start {
+        return None;
+    }
+    let obj_num: u32 = std::str::from_utf8(&window[num_start..i])
+        .ok()?
+        .parse()
+        .ok()?;
+
+    // Exactly one space (PDF allows any whitespace, but the canonical form is a
+    // single space and we don't need to be permissive here).
+    if i >= window.len() || !is_pdf_whitespace(window[i]) {
+        return None;
+    }
+    i += 1;
+
+    // Generation digits.
+    let gen_start = i;
+    while i < window.len() && window[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == gen_start {
+        return None;
+    }
+    let obj_gen: u16 = std::str::from_utf8(&window[gen_start..i])
+        .ok()?
+        .parse()
+        .ok()?;
+
+    // Whitespace before `obj`.
+    if i >= window.len() || !is_pdf_whitespace(window[i]) {
+        return None;
+    }
+    i += 1;
+
+    // The `obj` keyword.
+    if window.get(i..i + 3) != Some(b"obj") {
+        return None;
+    }
+
+    Some((obj_num, obj_gen))
 }
 
 // ---------------------------------------------------------------------------
@@ -438,5 +501,54 @@ mod tests {
             matches!(result, Err(LinearizationCheckError::InvalidParam { .. })),
             "tampered /L must yield InvalidParam, got {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // as_u64: fractional Real values must be rejected, not truncated
+    // -----------------------------------------------------------------------
+    #[test]
+    fn as_u64_rejects_fractional_real() {
+        let frac = Object::Real(1.9);
+        assert!(
+            matches!(
+                as_u64(&frac, "N"),
+                Err(LinearizationCheckError::InvalidParam { .. })
+            ),
+            "Real(1.9) must not be silently truncated to 1"
+        );
+    }
+
+    #[test]
+    fn as_u64_accepts_integer_valued_real() {
+        let exact = Object::Real(42.0);
+        assert_eq!(as_u64(&exact, "N").unwrap(), 42, "Real(42.0) is exact");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_obj_header_at: full N G obj parser
+    // -----------------------------------------------------------------------
+    #[test]
+    fn parse_obj_header_accepts_zero_generation() {
+        assert_eq!(parse_obj_header_at(b"3 0 obj\n<<>>"), Some((3, 0)));
+    }
+
+    #[test]
+    fn parse_obj_header_accepts_non_zero_generation() {
+        // Hint stream in a non-zero generation must be locatable.
+        assert_eq!(parse_obj_header_at(b"42 7 obj\n<<>>"), Some((42, 7)));
+    }
+
+    #[test]
+    fn parse_obj_header_rejects_partial_match() {
+        // Bytes that look like just a number — no `obj` keyword — must fail
+        // (loose scan would return Some(123) here, hiding misaligned offsets).
+        assert_eq!(parse_obj_header_at(b"123 4 not_an_obj\n"), None);
+        assert_eq!(parse_obj_header_at(b"123 4"), None);
+        assert_eq!(parse_obj_header_at(b"not digits"), None);
+    }
+
+    #[test]
+    fn parse_obj_header_skips_leading_whitespace() {
+        assert_eq!(parse_obj_header_at(b"  \n5 0 obj\n"), Some((5, 0)));
     }
 }
