@@ -1744,9 +1744,7 @@ fn build_flate_objstm_payload(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
 
 fn two_flate_objstm_pdf(first_members: [&Object; 2], second_members: [&Object; 2]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
-    let mut offsets = Vec::new();
-
-    offsets.push(bytes.len());
+    let offsets = [bytes.len()];
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
 
     let first_member_bytes: Vec<Vec<u8>> = first_members
