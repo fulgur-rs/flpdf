@@ -58,7 +58,9 @@ const MAX_PLACEHOLDER_VALUE: u64 = {
 ///
 /// # Panics
 ///
-/// Does not panic; placeholder range widths are validated before writing.
+/// Does not panic; placeholder range widths and value bounds are
+/// validated in a preflight pass before any byte is mutated, so an `Err`
+/// leaves `bytes` byte-wise unchanged.
 pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> Result<()> {
     // Defensive guard: all placeholder ranges must be valid before we start.
     if !offsets.part1_placeholders.all_valid() {
@@ -80,8 +82,21 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> R
         (&ph.n, u64::from(offsets.page_count), "/N"),
     ];
 
+    // -----------------------------------------------------------------------
+    // Pass 1: preflight all patches (range bounds + value overflow) before
+    // mutating any byte.  This guarantees that an Err leaves `bytes` byte-
+    // wise unchanged, so a caller that recovers from the error sees a
+    // consistent buffer.
+    // -----------------------------------------------------------------------
     for (range, value, key_name) in patches {
-        // Overflow check: value must fit in PLACEHOLDER_WIDTH digits.
+        if range.end > bytes.len() {
+            return Err(crate::Error::Unsupported(format!(
+                "back_patch_param_dict: {} placeholder range {:?} out of bounds for buffer length {}",
+                key_name,
+                range,
+                bytes.len()
+            )));
+        }
         if *value > MAX_PLACEHOLDER_VALUE {
             return Err(crate::Error::Unsupported(format!(
                 "back_patch_param_dict: {} value {} exceeds maximum \
@@ -89,17 +104,19 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> R
                 key_name, value, MAX_PLACEHOLDER_VALUE,
             )));
         }
+    }
 
-        // Format as exactly PLACEHOLDER_WIDTH decimal digits.
-        let formatted = format!("{:010}", value);
+    // -----------------------------------------------------------------------
+    // Pass 2: apply all writes.  After Pass 1 every range / value is known
+    // good, so this loop cannot fail.
+    // -----------------------------------------------------------------------
+    for (range, value, _key_name) in patches {
+        let formatted = format!("{value:0PLACEHOLDER_WIDTH$}");
         debug_assert_eq!(
             formatted.len(),
             PLACEHOLDER_WIDTH,
-            "formatted value '{}' must be exactly {PLACEHOLDER_WIDTH} bytes",
-            formatted,
+            "formatted value '{formatted}' must be exactly {PLACEHOLDER_WIDTH} bytes",
         );
-
-        // Write into the buffer.
         bytes[(*range).clone()].copy_from_slice(formatted.as_bytes());
     }
 
@@ -356,6 +373,30 @@ mod tests {
 
         let result = back_patch_param_dict(&mut bytes, &offsets);
         assert!(result.is_err(), "back_patch must Err on /T overflow");
+    }
+
+    /// Regression: when a late field overflows, no earlier placeholder
+    /// should have been written (preflight-then-write contract).
+    #[test]
+    fn overflow_on_late_field_leaves_bytes_unchanged() {
+        let plan = minimal_plan();
+        let renumber = RenumberMap::from_plan(&plan);
+        let part1 = Part1Bytes::build(&plan, &renumber);
+        let original = part1.bytes.clone();
+        let mut bytes = original.clone();
+
+        // All fields legal except /T (sixth in the patch list).
+        let mut offsets = minimal_offsets(&part1, 100);
+        offsets.file_length = 12345; // would normally write a non-zero /L
+        offsets.last_xref_offset = 10_000_000_000; // overflow on a late field
+
+        let result = back_patch_param_dict(&mut bytes, &offsets);
+        assert!(result.is_err(), "back_patch must Err on /T overflow");
+        assert_eq!(
+            bytes, original,
+            "overflow on a late field must NOT leave earlier placeholders mutated \
+             (preflight-then-write contract)"
+        );
     }
 
     // -----------------------------------------------------------------------
