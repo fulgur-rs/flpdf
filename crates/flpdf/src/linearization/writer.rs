@@ -669,16 +669,32 @@ pub fn write_linearized<R: Read + Seek>(
         // page dict), so we use shared_hints[0] for the location field.
         if !plan.shared_hints.is_empty() {
             // Collect byte lengths for all shared hint entries in plan order.
+            //
+            // Resolve renumber + probe-pass byte-length lookups strictly:
+            // a missing entry indicates a planner / renumber inconsistency or
+            // a probe-pass coverage bug, both of which would silently produce
+            // a hint table with `least_length = 0` / `header.location = 0` if
+            // we substituted zeros.  Bubble Err so the writer fails loudly
+            // and the caller can surface the broken plan.
             let shared_section_lens: Vec<u64> = plan
                 .shared_hints
                 .iter()
-                .map(|h| {
-                    renumber
-                        .new_for_original(h.object_ref)
-                        .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
-                        .unwrap_or(0) as u64
+                .map(|h| -> Result<u64> {
+                    let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "shared hint object {} has no renumber entry",
+                            h.object_ref
+                        ))
+                    })?;
+                    let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "shared hint object {} (new #{}) has no probed byte length",
+                            h.object_ref, new_ref.number
+                        ))
+                    })?;
+                    Ok(len as u64)
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             let least = shared_section_lens.iter().copied().min().unwrap_or(0);
             let max = shared_section_lens.iter().copied().max().unwrap_or(0);
@@ -695,12 +711,22 @@ pub fn write_linearized<R: Read + Seek>(
             let first_shared_orig = plan.shared_hints[0].object_ref;
             let first_shared_new_num = renumber
                 .new_for_original(first_shared_orig)
-                .map(|r| r.number)
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "first shared hint object {} has no renumber entry",
+                        first_shared_orig
+                    ))
+                })?
+                .number;
             let first_shared_off = xref_offsets
                 .get(&first_shared_new_num)
                 .copied()
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "first shared hint object (new #{}) has no probed offset",
+                        first_shared_new_num
+                    ))
+                })?;
             so_table.header.location = first_shared_off as u64;
 
             // Per-object length_minus_least.  group_offset is no longer a
@@ -715,9 +741,6 @@ pub fn write_linearized<R: Read + Seek>(
                         (shared_section_lens[i].saturating_sub(least)) as u32;
                 }
             }
-            // first_shared_off retained as a debug crosscheck against the
-            // probe pass, but no longer fed into per-entry fields.
-            let _ = first_shared_off;
         }
 
         // Re-encode hint stream with patched tables.
