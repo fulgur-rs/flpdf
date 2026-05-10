@@ -98,7 +98,8 @@ impl SharedObjectHintEntry {
 /// # Object disjointness
 ///
 /// The four part lists are disjoint by construction: at creation time Parts 1–3
-/// are empty and Part 4 contains every known non-zero-generation object.
+/// are empty and Part 4 contains every known object with a non-zero object
+/// number (the free-list head at object 0 is excluded per ISO 32000-1 §7.5.4).
 /// Subtask 2.2 will move objects from Part 4 into Parts 1–3; it should preserve
 /// this invariant.
 #[derive(Debug, Clone)]
@@ -148,14 +149,14 @@ impl LinearizationPlan {
     ///
     /// * Parts 1–3 are left empty (placeholder; subtask 2.2 fills them in).
     /// * Part 4 is initialised to every object known from the xref table
-    ///   (generation-0, non-zero-number objects only).
+    ///   (excluding only the free-list head at object 0).
     /// * `page_hints` contains one placeholder entry per page in document order.
     /// * `shared_hints` is empty (subtask 2.2 will populate it alongside Part 3).
     ///
-    /// The method may return an error if reading page references from the
-    /// document fails.
+    /// Returns an error if reading page references from the document fails.
     pub fn from_pdf<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Self> {
-        // Collect all object refs, excluding the free-entry object 0.
+        // Collect all object refs, excluding the free-list head at object 0
+        // (ISO 32000-1 §7.5.4: object 0 is always the head of the free list).
         let all_refs: Vec<ObjectRef> = pdf
             .object_refs()
             .into_iter()
@@ -165,9 +166,9 @@ impl LinearizationPlan {
         let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();
 
-        // Attempt to collect page refs; fall back to empty if the page tree
-        // is absent or malformed (graceful — error surfaced by higher layers).
-        let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf).unwrap_or_default();
+        // Propagate page-tree errors so a malformed /Pages does not silently
+        // produce an empty page_hints (which would corrupt downstream hint tables).
+        let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
 
         let page_hints: Vec<PageHintEntry> = page_refs
             .iter()
