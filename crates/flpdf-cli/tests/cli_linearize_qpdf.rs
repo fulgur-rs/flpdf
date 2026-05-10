@@ -15,7 +15,13 @@
 //! None — all previously tracked flpdf-b82 shared-object hint table warnings have been
 //! resolved.  The KNOWN list is empty; any new qpdf warning will immediately hard-fail.
 //!
-//! Tests requiring qpdf are skipped silently in environments where qpdf is not installed.
+//! When qpdf is not installed:
+//! - **Linux CI** (`CI` env var set, non-Windows): the test panics — qpdf is
+//!   treated as a hard requirement so missing it on CI is a build failure, not
+//!   a silent gap.  CI installs qpdf via `apt-get` so this branch normally
+//!   does not fire.
+//! - **Local runs and Windows CI**: prints a diagnostic message via
+//!   `eprintln!` and returns early (qpdf-dependent tests skip).
 
 use assert_cmd::Command as CargoCommand;
 use std::path::{Path, PathBuf};
@@ -74,8 +80,10 @@ fn qpdf_available() -> bool {
 ///
 /// On Windows CI we do *not* install qpdf yet (choco's qpdf surfaces an
 /// unrelated runtime error on existing writer_tests output, tracked
-/// separately), so qpdf-dependent tests skip silently there.  Locally
-/// (no CI env var) tests also skip silently.
+/// separately), so qpdf-dependent tests print a diagnostic via
+/// `eprintln!` and return early there.  Locally (no `CI` env var) tests
+/// behave the same way: a `skipping: ...` line is emitted on stderr and
+/// the test exits without exercising qpdf.
 #[must_use]
 fn skip_if_qpdf_missing() -> bool {
     if qpdf_available() {
