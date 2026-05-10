@@ -268,17 +268,13 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Part 1: header + linearization param dict + xref subsection
     // ------------------------------------------------------------------
-    // Object 1 starts at offset 0 in the Part 1 bytes, but Part 1 bytes
-    // includes the file header before object 1.  We need the absolute
-    // offset of the `1 0 obj` token within `bytes`.
+    // Object 1 lives inside Part 1 bytes after the file header.  Use the
+    // offset Part1Bytes already records so the writer is not coupled to
+    // the exact header format (PDF version line, binary marker length).
     let part1 = Part1Bytes::build(plan, renumber);
     let part1_placeholders = part1.placeholders.clone();
 
-    // The `1 0 obj` token starts after the two header lines:
-    //   "%PDF-1.7\n"      (9 bytes)
-    //   "%<4 binary bytes>\n"   (6 bytes)
-    // = 15 bytes.
-    let obj1_absolute_offset = 15; // fixed by Part1Bytes::build format
+    let obj1_absolute_offset = part1.obj1_offset;
     bytes.extend_from_slice(&part1.bytes);
     xref_offsets.insert(1, obj1_absolute_offset);
 
