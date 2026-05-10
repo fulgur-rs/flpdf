@@ -186,9 +186,7 @@ fn compute_closure<R: Read + Seek>(
                         let mut parent_refs = Vec::new();
                         collect_direct_refs(v, &mut parent_refs);
                         for parent_ref in parent_refs {
-                            if let Ok(Object::Dictionary(parent_dict)) =
-                                pdf.resolve(parent_ref)
-                            {
+                            if let Ok(Object::Dictionary(parent_dict)) = pdf.resolve(parent_ref) {
                                 for (pk, pv) in parent_dict.iter() {
                                     if pk == b"Kids" || pk == b"Parent" {
                                         continue;
