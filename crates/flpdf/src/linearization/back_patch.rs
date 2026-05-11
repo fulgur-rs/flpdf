@@ -213,6 +213,8 @@ mod tests {
             part4_objects: vec![ObjectRef::new(1, 0)],
             total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
+            pages_tree_ref: None,
+            info_ref: None,
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             shared_hints: vec![],
             per_page_private_objects: vec![],
