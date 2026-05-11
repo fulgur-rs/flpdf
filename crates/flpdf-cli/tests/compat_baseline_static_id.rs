@@ -85,10 +85,26 @@ const FIXTURES: &[FixtureEntry] = &[
 
 struct Row {
     fixture: &'static str,
+    flpdf_sha: String,
     flpdf_bytes: Option<usize>,
     golden_bytes: Option<usize>,
     verdict: RowVerdict,
     first_diff: String,
+}
+
+/// 64-bit FNV-1a hex digest of `bytes`. Stable across Rust versions and
+/// platforms, used as an output fingerprint so the baseline detects flpdf
+/// drift even when the verdict label and the length-mismatch / first-diff
+/// summary stay identical. Not cryptographic — FNV-1a is fine here because
+/// the corpus is tiny and an accidental collision would only mask one
+/// drift signal.
+fn fnv1a_64_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 enum RowVerdict {
@@ -116,8 +132,12 @@ impl RowVerdict {
 fn render_markdown(rows: &[Row]) -> String {
     let mut out = String::new();
     out.push_str("# Static-ID Baseline (flpdf vs qpdf --static-id)\n\n");
-    out.push_str("| fixture | flpdf bytes | golden bytes | verdict | first-diff |\n");
-    out.push_str("|---|---|---|---|---|\n");
+    out.push_str("`flpdf-sha` is a stable 64-bit FNV-1a fingerprint of flpdf's output.\n");
+    out.push_str("Changes to flpdf output (even those that keep the verdict label and the\n");
+    out.push_str("length / first-diff summary the same) flip this column and fail the\n");
+    out.push_str("baseline test, so silent drift is caught.\n\n");
+    out.push_str("| fixture | flpdf-sha | flpdf bytes | golden bytes | verdict | first-diff |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
     for row in rows {
         let flpdf_col = row
             .flpdf_bytes
@@ -128,8 +148,9 @@ fn render_markdown(rows: &[Row]) -> String {
             .map(|n| n.to_string())
             .unwrap_or_else(|| "-".to_string());
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             row.fixture,
+            row.flpdf_sha,
             flpdf_col,
             golden_col,
             row.verdict.as_str(),
@@ -172,6 +193,7 @@ fn static_id_baseline() {
         if !entry.has_golden {
             rows.push(Row {
                 fixture: entry.name,
+                flpdf_sha: "-".to_string(),
                 flpdf_bytes: None,
                 golden_bytes: None,
                 verdict: RowVerdict::Skip,
@@ -204,6 +226,7 @@ fn static_id_baseline() {
         if !result.status.success() {
             rows.push(Row {
                 fixture: entry.name,
+                flpdf_sha: "-".to_string(),
                 flpdf_bytes: None,
                 golden_bytes: Some(golden_bytes.len()),
                 verdict: RowVerdict::Fail,
@@ -237,17 +260,19 @@ fn static_id_baseline() {
 
         let (verdict, first_diff) = match cmp_result {
             ComparatorResult::Match => (RowVerdict::Match, "-".to_string()),
-            ComparatorResult::Diverge { reason } => {
-                // Re-format for baseline table: extract first-diff info.
-                let first_diff_col = if reason.contains("byte lengths differ") {
+            ComparatorResult::Diverge { .. } => {
+                // Branch on actual byte lengths rather than parsing the
+                // comparator's reason string — keeps this code resilient
+                // to wording changes in ByteComparator and avoids the
+                // edge case where a length-mismatch reason has been
+                // mistakenly fed into extract_first_diff_display.
+                let first_diff_col = if flpdf_bytes.len() != golden_bytes.len() {
                     format!(
                         "length mismatch (flpdf={} golden={})",
                         flpdf_bytes.len(),
                         golden_bytes.len()
                     )
                 } else {
-                    // "bytes differ at offset N (len=L): qpdf=0xAA flpdf=0xBB"
-                    // Re-emit as "offset N (0xAA vs 0xBB)" (golden vs flpdf).
                     extract_first_diff_display(&golden_bytes, &flpdf_bytes)
                 };
                 (RowVerdict::Diverge, first_diff_col)
@@ -255,8 +280,10 @@ fn static_id_baseline() {
             ComparatorResult::Skipped { reason } => (RowVerdict::Skip, reason),
         };
 
+        let flpdf_sha = fnv1a_64_hex(&flpdf_bytes);
         rows.push(Row {
             fixture: entry.name,
+            flpdf_sha,
             flpdf_bytes: Some(flpdf_bytes.len()),
             golden_bytes: Some(golden_bytes.len()),
             verdict,
