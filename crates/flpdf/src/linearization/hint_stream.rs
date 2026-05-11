@@ -607,7 +607,6 @@ mod tests {
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
-            part4_objects: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             total_object_count: 8,
             page_hints: vec![

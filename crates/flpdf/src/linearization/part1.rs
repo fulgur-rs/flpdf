@@ -286,7 +286,6 @@ mod tests {
         // Single page, no shared objects.
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(2, 0)],
-            part4_objects: vec![ObjectRef::new(1, 0)],
             part4_rest: vec![ObjectRef::new(1, 0)],
             total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),

@@ -136,8 +136,11 @@ impl RenumberMap {
         // Two sentinel slots are always reserved (param dict + hint stream).
         // The capacity hint is best-effort; the actual length is determined
         // by which optional refs are promotable.
-        let total_parts =
-            plan.part2_objects.len() + plan.part3_objects.len() + plan.part4_objects.len();
+        let total_parts = plan.part2_objects.len()
+            + plan.part3_objects.len()
+            + plan.part4_other_pages_private.len()
+            + plan.part4_other_pages_shared.len()
+            + plan.part4_rest.len();
         let capacity = total_parts + 3; // slots 0, param dict, hint stream
 
         let mut by_new_number: Vec<ObjectRef> = Vec::with_capacity(capacity);
@@ -372,7 +375,6 @@ mod tests {
     fn single_page_plan() -> LinearizationPlan {
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(2, 0)],
-            part4_objects: vec![ObjectRef::new(1, 0)],
             part4_rest: vec![ObjectRef::new(1, 0)],
             total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
@@ -403,12 +405,6 @@ mod tests {
         LinearizationPlan {
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
-            part4_objects: vec![
-                ObjectRef::new(4, 0),
-                ObjectRef::new(7, 0),
-                ObjectRef::new(1, 0),
-                ObjectRef::new(2, 0),
-            ],
             part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             part4_rest: vec![ObjectRef::new(1, 0), ObjectRef::new(2, 0)],
             total_object_count: 8,
@@ -550,7 +546,8 @@ mod tests {
     #[test]
     fn iter_layout_order_length_equals_plan_total() {
         let plan = two_page_plan();
-        let total = plan.part2_objects.len() + plan.part3_objects.len() + plan.part4_objects.len();
+        let total =
+            plan.part2_objects.len() + plan.part3_objects.len() + plan.part4_objects().len();
         let rn = RenumberMap::from_plan(&plan);
 
         let iter_len = rn.iter_in_layout_order().count();
@@ -566,7 +563,8 @@ mod tests {
     #[test]
     fn len_includes_param_dict_and_hint_reservations() {
         let plan = two_page_plan();
-        let total = plan.part2_objects.len() + plan.part3_objects.len() + plan.part4_objects.len();
+        let total =
+            plan.part2_objects.len() + plan.part3_objects.len() + plan.part4_objects().len();
         let rn = RenumberMap::from_plan(&plan);
 
         assert_eq!(
@@ -697,7 +695,6 @@ mod tests {
         // the promotion runs ahead of the natural iteration order.
         let plan = LinearizationPlan {
             part2_objects: vec![ObjectRef::new(2, 0)],
-            part4_objects: vec![catalog_ref, info_ref, pages_ref, other_part4],
             part4_rest: vec![catalog_ref, info_ref, pages_ref, other_part4],
             total_object_count: 5,
             root_ref: Some(catalog_ref),
@@ -741,7 +738,6 @@ mod tests {
         let pages_ref = ObjectRef::new(10, 0);
         let plan = LinearizationPlan {
             part2_objects: vec![pages_ref, ObjectRef::new(2, 0)],
-            part4_objects: vec![ObjectRef::new(3, 0)],
             part4_rest: vec![ObjectRef::new(3, 0)],
             total_object_count: 3,
             pages_tree_ref: Some(pages_ref), // in Part 2, not in part4_rest → skipped
@@ -768,7 +764,6 @@ mod tests {
         // dup appears in both part4_other_pages_private and part4_rest — disjoint violation.
         let plan = LinearizationPlan {
             part2_objects: vec![ObjectRef::new(2, 0)],
-            part4_objects: vec![dup, dup],
             part4_other_pages_private: vec![dup],
             part4_rest: vec![dup],
             total_object_count: 3,
