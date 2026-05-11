@@ -579,12 +579,16 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // shared_hints[0] = 3 0 R (part2[0] = page dict) → new number 2
-        // Per qpdf's checkHSharedObject, the table starts at the first-page
-        // section's first object (the page dict), not at part3[0].
+        // shared_hints[0] = 3 0 R (part2[0] = page dict). The header points at
+        // its renumbered slot, which depends on how many promotion slots
+        // precede Part 2 — assert against the lookup rather than a constant.
         assert_eq!(
-            table.header.first_object_number, 2,
-            "shared_hints[0] (3 0 R = part2[0] = page dict) must map to new number 2"
+            table.header.first_object_number,
+            renumber
+                .new_for_original(ObjectRef::new(3, 0))
+                .unwrap()
+                .number,
+            "shared_hints[0] (3 0 R = part2[0]) must match the page dict's renumber"
         );
     }
 
@@ -726,12 +730,16 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // shared_hints[0] = 10 0 R (part2[0] = page dict) → new number 2
-        // Per qpdf's checkHSharedObject, the table starts at the first-page
-        // section's first object (the page dict), not at part3[0].
+        // shared_hints[0] = 10 0 R (part2[0] = page dict). The plan has no
+        // promotable refs, so slots 1/2 are reserved for the param dict and
+        // hint stream; Part 2 starts at slot 3.
         assert_eq!(
-            table.header.first_object_number, 2,
-            "shared_hints[0] (10 0 R = part2[0] = page dict) must map to new number 2"
+            table.header.first_object_number,
+            renumber
+                .new_for_original(ObjectRef::new(10, 0))
+                .unwrap()
+                .number,
+            "shared_hints[0] (10 0 R = part2[0]) must match the page dict's renumber"
         );
     }
 

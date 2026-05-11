@@ -9,8 +9,9 @@
 //! ```text
 //! Annex F Part | Contents in this impl
 //! -------------|-------------------------------------------------------------------
-//! Part 1       | header + linearization param dict (object 1) with placeholders
-//!              | + Part 1 xref subsection (object 1 only) + trailer
+//! Part 1       | header + linearization param dict (`renumber.param_dict_ref()`)
+//!              | with placeholders + Part 1 xref subsection (param-dict obj only)
+//!              | + trailer
 //! Part 2       | hint stream object (compressed, with /Filter /FlateDecode /S …)
 //! Part 3       | first-page body — Plan.part2_objects with renumbered refs
 //! Part 4       | shared/catalog/info — Plan.part3_objects with renumbered refs
@@ -26,8 +27,13 @@
 //! - `Plan.part3_objects` → Annex F Part 4 (shared/catalog/info)
 //! - `Plan.part4_objects` → Annex F Part 5 (remaining body)
 //!
-//! The hint stream (Annex F Part 2) does **not** appear in the plan's object
-//! lists; its new object number is `renumber.len() + 1`.
+//! The param-dict and hint-stream object numbers are **dynamic** — the
+//! renumber map decides which slots they occupy. Use
+//! [`RenumberMap::param_dict_ref`] and [`RenumberMap::hint_stream_slot`]
+//! to query their actual positions; the writer reads both fields from
+//! the renumber map rather than assuming `1` and `renumber.len() + 1`.
+//! /Size in the trailer is `renumber.len() as u32 + 1` (the `total_count`
+//! local), which already accounts for both reserved slots.
 //!
 //! # 2-pass algorithm
 //!
@@ -183,23 +189,25 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
     offset
 }
 
-/// Write a Part 1 xref subsection (object 1 only) plus a minimal trailer, then
-/// return the `startxref` offset of this xref block.
+/// Write a Part 1 xref subsection (the linearization parameter dict only) plus
+/// a minimal trailer, then return the `startxref` offset of this xref block.
 ///
 /// The Part 1 xref is required by the linearized PDF spec so that a viewer can
 /// quickly locate the linearization parameter dict without parsing the whole
-/// file.  It covers only object 1; all other objects are recorded in Part 6.
+/// file.  It covers only the param-dict object (at whatever number the
+/// renumber map assigned it); all other objects are recorded in Part 6.
 fn write_part1_xref_and_trailer(
     bytes: &mut Vec<u8>,
-    obj1_offset: usize,
+    param_dict_offset: usize,
+    param_dict_obj_number: u32,
     total_object_count: u32,
     catalog_new_ref: ObjectRef,
 ) -> usize {
     let xref_offset = bytes.len();
 
-    // Subsection: object 1 only.
-    bytes.extend_from_slice(b"xref\n1 1\n");
-    bytes.extend_from_slice(format!("{:010} 00000 n \n", obj1_offset).as_bytes());
+    // Subsection: param dict object only.
+    bytes.extend_from_slice(format!("xref\n{param_dict_obj_number} 1\n").as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", param_dict_offset).as_bytes());
 
     // Minimal trailer for Part 1.
     let mut trailer = Dictionary::new();
@@ -311,12 +319,14 @@ fn do_write_pass<R: Read + Seek>(
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
 
     // Part 1
-    let obj1_absolute_offset = part1.obj1_offset;
+    let param_dict_obj_number = renumber.param_dict_ref().number;
+    let param_dict_absolute_offset = part1.obj1_offset;
     bytes.extend_from_slice(&part1.bytes);
-    xref_offsets.insert(1, obj1_absolute_offset);
+    xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
     write_part1_xref_and_trailer(
         &mut bytes,
-        obj1_absolute_offset,
+        param_dict_absolute_offset,
+        param_dict_obj_number,
         total_count,
         catalog_new_ref,
     );
@@ -409,12 +419,17 @@ fn compute_byte_lengths(
     xref_offsets: &BTreeMap<u32, usize>,
     last_xref_offset: usize,
     hint_stream_new_num: u32,
+    param_dict_new_num: u32,
 ) -> BTreeMap<u32, usize> {
     // Build a sorted list of (offset, new_number) pairs, plus a sentinel for
     // the last_xref_offset (= start of main xref, which terminates the body).
     let mut sorted: Vec<(usize, u32)> = xref_offsets
         .iter()
-        .filter(|(&num, _)| num != 1) // exclude param dict (Part 1, before hint)
+        // Exclude the param dict (Part 1, written before the hint stream).
+        // The slot is dynamic because the renumber map may promote /Pages,
+        // /Info, /Catalog ahead of it — hard-coding `1` here would skip the
+        // wrong object whenever the param dict moves.
+        .filter(|(&num, _)| num != param_dict_new_num)
         .map(|(&num, &off)| (off, num))
         .collect();
     sorted.sort_unstable();
@@ -463,10 +478,12 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// body parts) and a [`RenumberMap`] (which assigns the correct linearized
 /// object numbers), this function:
 ///
-/// 1. Emits Part 1: header + linearization param dict (object 1) with
-///    placeholder numeric values, followed by a one-object xref subsection
-///    and trailer.
-/// 2. Emits the hint stream object (Annex F Part 2).
+/// 1. Emits Part 1: header + linearization param dict (whose object number is
+///    `renumber.param_dict_ref().number` — typically 3 with the qpdf-aligned
+///    slot allocation, never assumed to be 1) with placeholder numeric values,
+///    followed by a one-object xref subsection and trailer.
+/// 2. Emits the hint stream object at `renumber.hint_stream_slot()` (Annex F
+///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
 /// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
 /// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
 /// 5. Emits the remaining body objects (`Plan.part4_objects` — Annex F Part 5).
@@ -502,8 +519,12 @@ pub fn write_linearized<R: Read + Seek>(
         ))
     })?;
 
-    let hint_stream_new_num: u32 = renumber.next_free();
-    let total_count: u32 = hint_stream_new_num + 1;
+    let hint_stream_new_num: u32 = renumber.hint_stream_slot();
+    // Highest object number actually used in the output: the largest slot in
+    // the renumber map (`len()` already returns that). Adding 1 yields the
+    // /Size value (count = highest_number + 1, because object numbering is
+    // 1-based and Size counts the unused free-list entry at 0).
+    let total_count: u32 = renumber.len() as u32 + 1;
 
     let info_new_ref: Option<ObjectRef> = pdf
         .trailer()
@@ -575,8 +596,12 @@ pub fn write_linearized<R: Read + Seek>(
         // Compute per-object byte lengths from this probe pass.
         // Use the xref keyword offset (not first_entry_offset) for length computation.
         // ------------------------------------------------------------------
-        let byte_lengths =
-            compute_byte_lengths(&xref_offsets, last_xref_offset, hint_stream_new_num);
+        let byte_lengths = compute_byte_lengths(
+            &xref_offsets,
+            last_xref_offset,
+            hint_stream_new_num,
+            renumber.param_dict_ref().number,
+        );
 
         // ------------------------------------------------------------------
         // Per-page byte lengths.
@@ -1015,20 +1040,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 10. xref_offsets[1] equals the obj1 absolute offset (15)
+    // 10. xref_offsets[param_dict_obj_number] equals byte 15 (after the two
+    //     header lines: %PDF-1.7 + binary marker).
     // -----------------------------------------------------------------------
     #[test]
-    fn xref_offsets_obj1_is_correct() {
+    fn xref_offsets_param_dict_is_at_byte_fifteen() {
         let doc = build_linearized();
-        let obj1_off = doc
+        // Whatever number the renumber map assigned the param dict, its
+        // xref offset is the position of the `N 0 obj` token immediately
+        // after the file header.
+        let param_dict_off = doc
             .offsets
             .xref_offsets
-            .get(&1)
+            .values()
             .copied()
+            .min()
             .unwrap_or(usize::MAX);
         assert_eq!(
-            obj1_off, 15,
-            "object 1 must start at byte 15 (after two header lines)"
+            param_dict_off, 15,
+            "the param dict (first object physically) must start at byte 15 \
+             (after %PDF-1.x and the binary marker)"
         );
     }
 
@@ -1195,5 +1226,35 @@ mod tests {
             expected_num,
             "first_page_object_new_num must equal renumber.new_for_original(page_hints[0].page_ref)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_byte_lengths excludes the param dict by its actual slot
+    // -----------------------------------------------------------------------
+    //
+    // The param dict sits before the hint stream and is not part of the
+    // body length budget. With the qpdf-aligned slot allocation the param
+    // dict number is dynamic, so the exclusion must be driven by the
+    // renumber map rather than the literal `1`.
+    #[test]
+    fn compute_byte_lengths_uses_dynamic_param_dict_slot() {
+        let mut offs: BTreeMap<u32, usize> = BTreeMap::new();
+        // Layout: obj 1 lives in the body at offset 100 (e.g. a promoted
+        // Pages tree), obj 3 is the param dict at offset 10, obj 5 is the
+        // hint stream at offset 50, obj 6 starts the first-page body at 200.
+        offs.insert(1, 100);
+        offs.insert(3, 10);
+        offs.insert(5, 50);
+        offs.insert(6, 200);
+
+        let lengths = compute_byte_lengths(&offs, 400, 5, 3);
+
+        // Obj 3 (the real param dict) is excluded.
+        assert!(!lengths.contains_key(&3));
+        // Obj 1 is NOT excluded any more — it is a regular body object.
+        // Its length runs to the next object's offset (obj 6 at 200).
+        assert_eq!(lengths.get(&1).copied(), Some(100));
+        // Obj 6 runs from offset 200 to last_xref_offset 400.
+        assert_eq!(lengths.get(&6).copied(), Some(200));
     }
 }
