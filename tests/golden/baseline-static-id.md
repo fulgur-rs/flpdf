@@ -1,4 +1,4 @@
-# Static-ID Baseline (flpdf vs qpdf --deterministic-id)
+# Static-ID Baseline (flpdf vs qpdf --static-id)
 
 | fixture | flpdf bytes | golden bytes | verdict | first-diff |
 |---|---|---|---|---|

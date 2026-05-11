@@ -115,7 +115,7 @@ impl RowVerdict {
 
 fn render_markdown(rows: &[Row]) -> String {
     let mut out = String::new();
-    out.push_str("# Static-ID Baseline (flpdf vs qpdf --deterministic-id)\n\n");
+    out.push_str("# Static-ID Baseline (flpdf vs qpdf --static-id)\n\n");
     out.push_str("| fixture | flpdf bytes | golden bytes | verdict | first-diff |\n");
     out.push_str("|---|---|---|---|---|\n");
     for row in rows {
