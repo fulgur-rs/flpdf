@@ -36,10 +36,14 @@ enum JsonNumber {
 
 impl JsonValue {
     /// Short human-readable representation, truncated to ~80 chars.
+    ///
+    /// Truncation uses `chars().take(...)` so non-ASCII values never panic
+    /// on a UTF-8 boundary.
     fn repr(&self) -> String {
         let s = self.repr_full();
         if s.len() > 80 {
-            format!("{}…", &s[..77])
+            let truncated: String = s.chars().take(77).collect();
+            format!("{truncated}…")
         } else {
             s
         }
@@ -56,6 +60,20 @@ impl JsonValue {
             JsonValue::Object(obj) => format!("{{…{} keys}}", obj.len()),
         }
     }
+}
+
+/// Append `raw` to `result` as UTF-8 text and clear `raw`. Invalid UTF-8 is
+/// recovered via `String::from_utf8_lossy` rather than dropped, so the parse
+/// continues even when the source contains malformed escapes.
+fn flush_raw_bytes(raw: &mut Vec<u8>, result: &mut String) {
+    if raw.is_empty() {
+        return;
+    }
+    match std::str::from_utf8(raw) {
+        Ok(s) => result.push_str(s),
+        Err(_) => result.push_str(&String::from_utf8_lossy(raw)),
+    }
+    raw.clear();
 }
 
 struct JsonParser<'a> {
@@ -138,51 +156,62 @@ impl<'a> JsonParser<'a> {
     fn parse_string(&mut self) -> Result<String, String> {
         self.expect(b'"')?;
         let mut result = String::new();
+        // Accumulate raw unescaped bytes so multi-byte UTF-8 sequences
+        // (e.g. `é`, kanji, emoji) survive round-tripping. Pushing each
+        // raw byte directly as `char` would split them into ill-formed
+        // single-byte chars.
+        let mut raw = Vec::<u8>::new();
         loop {
             match self.advance() {
                 None => return Err("unterminated string".to_string()),
-                Some(b'"') => break,
-                Some(b'\\') => match self.advance() {
-                    Some(b'"') => result.push('"'),
-                    Some(b'\\') => result.push('\\'),
-                    Some(b'/') => result.push('/'),
-                    Some(b'b') => result.push('\x08'),
-                    Some(b'f') => result.push('\x0C'),
-                    Some(b'n') => result.push('\n'),
-                    Some(b'r') => result.push('\r'),
-                    Some(b't') => result.push('\t'),
-                    Some(b'u') => {
-                        let cp = self.parse_hex4()?;
-                        // Handle surrogate pairs.
-                        if (0xD800..=0xDBFF).contains(&cp) {
-                            // High surrogate — expect \uXXXX low surrogate.
-                            if self.peek() == Some(b'\\') {
-                                self.advance();
-                                if self.peek() == Some(b'u') {
+                Some(b'"') => {
+                    flush_raw_bytes(&mut raw, &mut result);
+                    break;
+                }
+                Some(b'\\') => {
+                    flush_raw_bytes(&mut raw, &mut result);
+                    match self.advance() {
+                        Some(b'"') => result.push('"'),
+                        Some(b'\\') => result.push('\\'),
+                        Some(b'/') => result.push('/'),
+                        Some(b'b') => result.push('\x08'),
+                        Some(b'f') => result.push('\x0C'),
+                        Some(b'n') => result.push('\n'),
+                        Some(b'r') => result.push('\r'),
+                        Some(b't') => result.push('\t'),
+                        Some(b'u') => {
+                            let cp = self.parse_hex4()?;
+                            // Handle surrogate pairs.
+                            if (0xD800..=0xDBFF).contains(&cp) {
+                                // High surrogate — expect \uXXXX low surrogate.
+                                if self.peek() == Some(b'\\') {
                                     self.advance();
-                                    let low = self.parse_hex4()?;
-                                    if (0xDC00..=0xDFFF).contains(&low) {
-                                        let full = 0x10000
-                                            + ((cp as u32 - 0xD800) << 10)
-                                            + (low as u32 - 0xDC00);
-                                        if let Some(c) = char::from_u32(full) {
-                                            result.push(c);
-                                            continue;
+                                    if self.peek() == Some(b'u') {
+                                        self.advance();
+                                        let low = self.parse_hex4()?;
+                                        if (0xDC00..=0xDFFF).contains(&low) {
+                                            let full = 0x10000
+                                                + ((cp as u32 - 0xD800) << 10)
+                                                + (low as u32 - 0xDC00);
+                                            if let Some(c) = char::from_u32(full) {
+                                                result.push(c);
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
+                                result.push(char::REPLACEMENT_CHARACTER);
+                            } else if let Some(c) = char::from_u32(cp as u32) {
+                                result.push(c);
+                            } else {
+                                result.push(char::REPLACEMENT_CHARACTER);
                             }
-                            result.push(char::REPLACEMENT_CHARACTER);
-                        } else if let Some(c) = char::from_u32(cp as u32) {
-                            result.push(c);
-                        } else {
-                            result.push(char::REPLACEMENT_CHARACTER);
                         }
+                        Some(other) => result.push(other as char),
+                        None => return Err("EOF in string escape".to_string()),
                     }
-                    Some(other) => result.push(other as char),
-                    None => return Err("EOF in string escape".to_string()),
-                },
-                Some(b) => result.push(b as char),
+                }
+                Some(b) => raw.push(b),
             }
         }
         Ok(result)
@@ -1025,6 +1054,51 @@ mod tests {
             parse_json(b"\"\\u0041\"").unwrap(),
             JsonValue::Str("A".to_string())
         );
+    }
+
+    #[test]
+    fn json_parse_string_preserves_multibyte_utf8() {
+        // 2-byte (Latin-1 Supplement: é = U+00E9 = 0xC3 0xA9)
+        let bytes = "\"caf\u{00E9}\"".as_bytes().to_vec();
+        assert_eq!(
+            parse_json(&bytes).unwrap(),
+            JsonValue::Str("caf\u{00E9}".to_string())
+        );
+
+        // 3-byte (CJK: 日本語)
+        let bytes = "\"\u{65E5}\u{672C}\u{8A9E}\"".as_bytes().to_vec();
+        assert_eq!(
+            parse_json(&bytes).unwrap(),
+            JsonValue::Str("\u{65E5}\u{672C}\u{8A9E}".to_string())
+        );
+
+        // 4-byte (Emoji: 🚀 = U+1F680)
+        let bytes = "\"a\u{1F680}b\"".as_bytes().to_vec();
+        assert_eq!(
+            parse_json(&bytes).unwrap(),
+            JsonValue::Str("a\u{1F680}b".to_string())
+        );
+
+        // Mixed escapes and raw multi-byte: "x\néy"
+        let bytes = b"\"x\\nca\xc3\xa9y\"".to_vec();
+        assert_eq!(
+            parse_json(&bytes).unwrap(),
+            JsonValue::Str("x\nca\u{00E9}y".to_string())
+        );
+    }
+
+    #[test]
+    fn json_repr_truncates_safely_with_multibyte_utf8() {
+        // Build a string longer than 80 bytes consisting entirely of
+        // 4-byte emoji. Naive byte-slicing at 77 would split a codepoint
+        // and panic; the char-aware truncation must succeed.
+        let long_emoji: String = "\u{1F680}".repeat(40); // 40 × 4 bytes = 160
+        let value = JsonValue::Str(long_emoji);
+        let s = value.repr();
+        // Must not panic, must end with the ellipsis marker.
+        assert!(s.ends_with('\u{2026}'), "expected ellipsis, got: {s}");
+        // The result must be valid UTF-8 (trivially true: it's a String).
+        let _: &str = s.as_str();
     }
 
     #[test]
