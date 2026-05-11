@@ -142,6 +142,39 @@ impl Object {
     /// Object::reference(ObjectRef::new(7, 0)).write_pdf(&mut out);
     /// assert_eq!(out, b"7 0 R");
     /// ```
+    ///
+    /// Array whitespace follows the qpdf token-boundary convention: a space is
+    /// inserted between adjacent tokens unless both sides are PDF delimiters.
+    ///
+    /// ```
+    /// use flpdf::Object;
+    ///
+    /// // Numeric array: spaces between integers and at both ends.
+    /// let nums = Object::Array(vec![
+    ///     Object::Integer(0),
+    ///     Object::Integer(0),
+    ///     Object::Integer(612),
+    ///     Object::Integer(792),
+    /// ]);
+    /// let mut out = Vec::new();
+    /// nums.write_pdf(&mut out);
+    /// assert_eq!(out, b"[ 0 0 612 792 ]");
+    ///
+    /// // Hex-string array (/ID): both elements are delimiters, so no spaces.
+    /// let id_array = Object::Array(vec![
+    ///     Object::String(vec![0xabu8, 0xcdu8]),
+    ///     Object::String(vec![0xefu8, 0x01u8]),
+    /// ]);
+    /// let mut out = Vec::new();
+    /// id_array.write_pdf(&mut out);
+    /// assert_eq!(out, b"[<abcd><ef01>]");
+    ///
+    /// // Empty array.
+    /// let empty = Object::Array(vec![]);
+    /// let mut out = Vec::new();
+    /// empty.write_pdf(&mut out);
+    /// assert_eq!(out, b"[ ]");
+    /// ```
     pub fn write_pdf(&self, out: &mut Vec<u8>) {
         match self {
             Object::Null => out.extend_from_slice(b"null"),
@@ -162,12 +195,30 @@ impl Object {
                 }
             }
             Object::Array(values) => {
+                if values.is_empty() {
+                    out.extend_from_slice(b"[ ]");
+                    return;
+                }
                 out.push(b'[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
+                // qpdf token-boundary rule: insert a space between adjacent tokens
+                // unless both sides are PDF delimiters (`<`, `(`, `[`, `/`, `>`, `)`, `]`).
+                // `[` itself counts as a delimiter on the left.
+                // qpdf rule: omit the space only when BOTH sides are delimiters.
+                // `[` is treated as a delimiter on the left for the first element.
+                let mut prev_ends_with_delim = true; // treat `[` as delimiter
+                for value in values.iter() {
+                    // Insert a space unless both the previous token end AND the
+                    // current token start are PDF delimiters.
+                    if !(prev_ends_with_delim && starts_with_delim(value)) {
                         out.push(b' ');
                     }
                     value.write_pdf(out);
+                    prev_ends_with_delim = ends_with_delim(value);
+                }
+                // Add trailing space before `]` unless the last token ends with a delimiter.
+                // (`]` is also a delimiter, so we only omit if prev is also delimiter.)
+                if !prev_ends_with_delim {
+                    out.push(b' ');
                 }
                 out.push(b']');
             }
@@ -183,6 +234,32 @@ impl Object {
             }
         }
     }
+}
+
+/// Returns `true` when the serialized form of `o` starts with a PDF delimiter byte
+/// (`<`, `(`, `[`, `/`). Used by [`Object::write_pdf`] to decide whether to insert
+/// a space before this token inside an array.
+fn starts_with_delim(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::String(_)
+            | Object::Array(_)
+            | Object::Dictionary(_)
+            | Object::Stream(_)
+            | Object::Name(_)
+    )
+}
+
+/// Returns `true` when the serialized form of `o` ends with a PDF delimiter byte
+/// (`>`, `)`, `]`). Used by [`Object::write_pdf`] to decide whether to insert
+/// a space after this token inside an array.
+///
+/// Note: [`Object::Name`] ends with a regular letter, so it returns `false`.
+fn ends_with_delim(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::String(_) | Object::Array(_) | Object::Dictionary(_) | Object::Stream(_)
+    )
 }
 
 fn is_printable_string(value: &[u8]) -> bool {
