@@ -9,7 +9,7 @@
 //!
 //! | Field | Invariant checked |
 //! |-------|-------------------|
-//! | `/Linearized` | Object 1 has the key with a positive numeric value |
+//! | `/Linearized` | The first object in the file (physical position, not object number) has the key with a positive numeric value |
 //! | `/L`  | Value equals the actual file length (in bytes) |
 //! | `/N`  | Value equals the number of pages in the document |
 //! | `/O`  | Refers to an existing object whose dict contains `/Type /Page` |
@@ -504,47 +504,46 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 /// Returns `None` if no object header is found (e.g. truncated or
 /// non-PDF input).
 fn find_first_object_ref(file_bytes: &[u8]) -> Option<ObjectRef> {
-    // Scan for "<digits> <digits> obj" anchored at a real line start.
+    // Scan for "<num><ws+><gen><ws+>obj" anchored at a real line start.
     //
-    // Two false-positive hazards if we only look for the literal " obj":
-    //
-    // 1. A comment line such as `% the first object is 12 7 obj <- example`
-    //    in the header area would match.
-    // 2. The literal word `object` (e.g. inside a content stream) would
-    //    match because its prefix `obj` is the same.
-    //
-    // We defend against (1) by requiring the candidate to start at a line
-    // beginning that is NOT a `%` comment, and against (2) by tightening
-    // `parse_obj_header_at` so the `obj` keyword must be followed by a
-    // PDF whitespace byte (or EOF) — `obj` directly followed by `e` is
-    // rejected as the word "object".
+    // PDF spec (ISO 32000-1 §7.2.3) permits any non-empty whitespace
+    // sequence between the three tokens, including tabs and multiple
+    // spaces. We search for the `obj` keyword and validate token
+    // boundaries via `parse_obj_header_at`, then anchor the candidate at
+    // the start of its line so we ignore both header comments and
+    // accidental matches inside content streams (e.g. the word "object").
     let mut i = 0;
-    while i + 4 <= file_bytes.len() {
-        let pos_in_slice = file_bytes[i..].windows(4).position(|w| w == b" obj")?;
+    while i + 3 <= file_bytes.len() {
+        let pos_in_slice = file_bytes[i..].windows(3).position(|w| w == b"obj")?;
         let abs = i + pos_in_slice;
-        // Walk back over digits + space + digits.
-        let mut start = abs;
-        while start > 0 && (file_bytes[start - 1].is_ascii_digit() || file_bytes[start - 1] == b' ')
-        {
-            start -= 1;
-        }
-        // Skip any whitespace at start.
-        while start < abs && is_pdf_whitespace(file_bytes[start]) {
-            start += 1;
-        }
 
-        let at_line_start =
-            start == 0 || matches!(file_bytes.get(start - 1), Some(b'\n') | Some(b'\r'));
-        let not_in_comment = file_bytes.get(start) != Some(&b'%');
+        // The byte immediately before `obj` must be PDF whitespace —
+        // otherwise we've hit the suffix of an unrelated identifier.
+        let preceded_by_ws = abs
+            .checked_sub(1)
+            .and_then(|p| file_bytes.get(p))
+            .is_some_and(|&b| is_pdf_whitespace(b));
 
-        if at_line_start && not_in_comment {
-            if let Some((num, gen)) = parse_obj_header_at(&file_bytes[start..]) {
-                return Some(ObjectRef::new(num, gen));
+        if preceded_by_ws {
+            // Anchor at the start of this line, skipping leading whitespace.
+            let line_start = file_bytes[..abs]
+                .iter()
+                .rposition(|&b| matches!(b, b'\n' | b'\r'))
+                .map_or(0, |p| p + 1);
+            let mut start = line_start;
+            while start < abs && is_pdf_whitespace(file_bytes[start]) {
+                start += 1;
+            }
+
+            let not_in_comment = file_bytes.get(start) != Some(&b'%');
+            if not_in_comment {
+                if let Some((num, gen)) = parse_obj_header_at(&file_bytes[start..]) {
+                    return Some(ObjectRef::new(num, gen));
+                }
             }
         }
-        // Either not at a line start, in a comment, or failed strict parse.
-        // Advance past this " obj" position to keep searching.
-        i = abs + 4;
+        // Failed validation or strict parse; keep scanning past this `obj`.
+        i = abs + 3;
     }
     None
 }
@@ -569,12 +568,15 @@ fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
         .parse()
         .ok()?;
 
-    // Exactly one space (PDF allows any whitespace, but the canonical form is a
-    // single space and we don't need to be permissive here).
+    // One-or-more PDF whitespace bytes between the number and generation.
+    // ISO 32000-1 §7.2.3 admits any non-empty whitespace sequence (space,
+    // tab, CR, LF, FF, NUL).
     if i >= window.len() || !is_pdf_whitespace(window[i]) {
         return None;
     }
-    i += 1;
+    while i < window.len() && is_pdf_whitespace(window[i]) {
+        i += 1;
+    }
 
     // Generation digits.
     let gen_start = i;
@@ -589,11 +591,13 @@ fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
         .parse()
         .ok()?;
 
-    // Whitespace before `obj`.
+    // One-or-more PDF whitespace bytes before the `obj` keyword.
     if i >= window.len() || !is_pdf_whitespace(window[i]) {
         return None;
     }
-    i += 1;
+    while i < window.len() && is_pdf_whitespace(window[i]) {
+        i += 1;
+    }
 
     // The `obj` keyword.
     if window.get(i..i + 3) != Some(b"obj") {
@@ -884,5 +888,39 @@ mod tests {
         // buffer should still parse since there is no following byte to
         // disprove the delimiter.
         assert_eq!(parse_obj_header_at(b"12 7 obj"), Some((12, 7)));
+    }
+
+    // ISO 32000-1 §7.2.3 admits any non-empty whitespace sequence between
+    // the three tokens of an indirect-object header. Pin a few of the
+    // shapes that pdf writers in the wild actually emit.
+    #[test]
+    fn parse_obj_header_accepts_tab_between_number_and_generation() {
+        assert_eq!(parse_obj_header_at(b"12\t7 obj"), Some((12, 7)));
+    }
+
+    #[test]
+    fn parse_obj_header_accepts_tab_before_obj_keyword() {
+        assert_eq!(parse_obj_header_at(b"12 7\tobj"), Some((12, 7)));
+    }
+
+    #[test]
+    fn parse_obj_header_accepts_multiple_spaces_between_tokens() {
+        assert_eq!(parse_obj_header_at(b"12  7   obj"), Some((12, 7)));
+    }
+
+    #[test]
+    fn find_first_object_ref_accepts_tab_separated_header() {
+        let bytes: &[u8] = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n3\t0\tobj\n";
+        let r = find_first_object_ref(bytes).expect("expected an object ref");
+        assert_eq!(r.number, 3);
+        assert_eq!(r.generation, 0);
+    }
+
+    #[test]
+    fn find_first_object_ref_accepts_multispace_separated_header() {
+        let bytes: &[u8] = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n12  7  obj\n";
+        let r = find_first_object_ref(bytes).expect("expected an object ref");
+        assert_eq!(r.number, 12);
+        assert_eq!(r.generation, 7);
     }
 }
