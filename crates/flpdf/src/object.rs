@@ -236,17 +236,18 @@ impl Object {
     }
 }
 
-/// Returns `true` when the serialized form of `o` starts with a PDF delimiter byte
-/// (`<`, `(`, `[`, `/`). Used by [`Object::write_pdf`] to decide whether to insert
-/// a space before this token inside an array.
+/// Returns `true` when the serialized form of `o` starts with a self-separating
+/// PDF delimiter byte (`<`, `(`, `[`, `<<`). Used by [`Object::write_pdf`] to
+/// decide whether to insert a space before this token inside an array.
+///
+/// Note: [`Object::Name`] starts with `/` — technically a delimiter byte — but
+/// qpdf inserts a space before names anyway (`[ /PDF /Text ]` rather than
+/// `[/PDF /Text]`), so names are deliberately excluded from this set to match
+/// qpdf's array-writer convention.
 fn starts_with_delim(o: &Object) -> bool {
     matches!(
         o,
-        Object::String(_)
-            | Object::Array(_)
-            | Object::Dictionary(_)
-            | Object::Stream(_)
-            | Object::Name(_)
+        Object::String(_) | Object::Array(_) | Object::Dictionary(_) | Object::Stream(_)
     )
 }
 
