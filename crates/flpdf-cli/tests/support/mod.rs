@@ -179,16 +179,30 @@ impl Comparator for ByteComparator {
         };
 
         if qpdf_bytes == flpdf_bytes {
-            ComparatorResult::Match
-        } else {
-            ComparatorResult::Diverge {
-                reason: format!(
-                    "byte lengths differ: qpdf={} flpdf={}",
-                    qpdf_bytes.len(),
-                    flpdf_bytes.len()
-                ),
-            }
+            return ComparatorResult::Match;
         }
+
+        let reason = if qpdf_bytes.len() != flpdf_bytes.len() {
+            format!(
+                "byte lengths differ: qpdf={} flpdf={}",
+                qpdf_bytes.len(),
+                flpdf_bytes.len()
+            )
+        } else {
+            let first_diff = qpdf_bytes
+                .iter()
+                .zip(flpdf_bytes.iter())
+                .position(|(q, f)| q != f)
+                .expect("byte slices are unequal but no differing position found");
+            format!(
+                "bytes differ at offset {} (len={}): qpdf=0x{:02x} flpdf=0x{:02x}",
+                first_diff,
+                qpdf_bytes.len(),
+                qpdf_bytes[first_diff],
+                flpdf_bytes[first_diff]
+            )
+        };
+        ComparatorResult::Diverge { reason }
     }
 }
 
@@ -665,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_comparator_diverges_on_different_bytes() {
+    fn byte_comparator_diverges_on_different_lengths() {
         let outputs = RunOutputs {
             qpdf: ToolOutput {
                 success: true,
@@ -683,7 +697,45 @@ mod tests {
             },
         };
         let result = ByteComparator.compare(&outputs);
-        assert!(matches!(result, ComparatorResult::Diverge { .. }));
+        let ComparatorResult::Diverge { reason } = result else {
+            panic!("expected Diverge");
+        };
+        assert!(
+            reason.contains("byte lengths differ"),
+            "expected length-diff reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn byte_comparator_diverges_on_same_length_different_content() {
+        let outputs = RunOutputs {
+            qpdf: ToolOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: vec![],
+                stderr: vec![],
+                output_bytes: Some(vec![1, 2, 3, 4]),
+            },
+            flpdf: ToolOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: vec![],
+                stderr: vec![],
+                output_bytes: Some(vec![1, 2, 9, 4]),
+            },
+        };
+        let result = ByteComparator.compare(&outputs);
+        let ComparatorResult::Diverge { reason } = result else {
+            panic!("expected Diverge");
+        };
+        assert!(
+            reason.contains("offset 2"),
+            "expected first-diff offset 2, got: {reason}"
+        );
+        assert!(
+            reason.contains("len=4"),
+            "expected length tag, got: {reason}"
+        );
     }
 
     #[test]
