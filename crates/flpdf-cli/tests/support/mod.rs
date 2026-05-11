@@ -4,6 +4,9 @@
 //! `qpdf` and `flpdf`, route outputs through [`Comparator`]s, and collect
 //! structured [`MatrixReport`]s.
 
+pub mod comparators;
+pub use comparators::{QpdfJsonComparator, StructuralComparator};
+
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
@@ -571,30 +574,7 @@ pub fn run_matrix(
                 flpdf: flpdf_output,
             };
 
-            let findings: Vec<ComparatorFinding> = comparators
-                .iter()
-                .map(|c| ComparatorFinding {
-                    comparator: c.name().to_string(),
-                    result: c.compare(&run_outputs),
-                })
-                .collect();
-
-            let verdict = if findings.iter().all(|f| f.result == ComparatorResult::Match) {
-                Verdict::Pass
-            } else if findings
-                .iter()
-                .all(|f| matches!(f.result, ComparatorResult::Skipped { .. }))
-            {
-                Verdict::Skipped
-            } else if findings
-                .iter()
-                .any(|f| matches!(f.result, ComparatorResult::Diverge { .. }))
-            {
-                Verdict::Fail
-            } else {
-                // Mix of Match and Skipped: treat as Pass (skipped comparators are advisory).
-                Verdict::Pass
-            };
+            let (findings, verdict) = evaluate_tuple(comparators, &run_outputs);
 
             tuple_reports.push(TupleReport {
                 fixture: tuple_key.fixture.name.clone(),
@@ -606,6 +586,68 @@ pub fn run_matrix(
     }
 
     MatrixReport { tuple_reports }
+}
+
+/// Evaluate one tuple's `RunOutputs` against the supplied `comparators` and
+/// derive its [`Verdict`].
+///
+/// If either tool reported `success == false`, prepend a synthetic
+/// `tool-execution` finding so a tool crash or non-zero exit is surfaced as
+/// `Verdict::Fail` even when every comparator skipped (which is the natural
+/// behaviour when output bytes are missing). Without this, a `flpdf` crash
+/// would be silently absorbed into `Verdict::Skipped` and a real regression
+/// would slip past the matrix.
+fn evaluate_tuple(
+    comparators: &[&dyn Comparator],
+    run_outputs: &RunOutputs,
+) -> (Vec<ComparatorFinding>, Verdict) {
+    let mut findings: Vec<ComparatorFinding> = Vec::new();
+
+    if !run_outputs.qpdf.success || !run_outputs.flpdf.success {
+        let mut reason_parts = Vec::new();
+        if !run_outputs.qpdf.success {
+            reason_parts.push(format!(
+                "qpdf failed (exit_code={:?})",
+                run_outputs.qpdf.exit_code
+            ));
+        }
+        if !run_outputs.flpdf.success {
+            reason_parts.push(format!(
+                "flpdf failed (exit_code={:?})",
+                run_outputs.flpdf.exit_code
+            ));
+        }
+        findings.push(ComparatorFinding {
+            comparator: "tool-execution".to_string(),
+            result: ComparatorResult::Diverge {
+                reason: reason_parts.join("; "),
+            },
+        });
+    }
+
+    findings.extend(comparators.iter().map(|c| ComparatorFinding {
+        comparator: c.name().to_string(),
+        result: c.compare(run_outputs),
+    }));
+
+    let verdict = if findings
+        .iter()
+        .any(|f| matches!(f.result, ComparatorResult::Diverge { .. }))
+    {
+        Verdict::Fail
+    } else if findings.iter().all(|f| f.result == ComparatorResult::Match) {
+        Verdict::Pass
+    } else if findings
+        .iter()
+        .all(|f| matches!(f.result, ComparatorResult::Skipped { .. }))
+    {
+        Verdict::Skipped
+    } else {
+        // Mix of Match and Skipped: treat as Pass (skipped comparators are advisory).
+        Verdict::Pass
+    };
+
+    (findings, verdict)
 }
 
 // ---------------------------------------------------------------------------
@@ -775,5 +817,115 @@ mod tests {
         assert!(!md.is_empty());
         assert!(md.contains("PASS"));
         assert!(md.contains("one-page.pdf"));
+    }
+
+    fn output_ok(bytes: Vec<u8>) -> ToolOutput {
+        ToolOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: vec![],
+            stderr: vec![],
+            output_bytes: Some(bytes),
+        }
+    }
+
+    fn output_fail(exit_code: i32) -> ToolOutput {
+        ToolOutput {
+            success: false,
+            exit_code: Some(exit_code),
+            stdout: vec![],
+            stderr: b"boom".to_vec(),
+            output_bytes: None,
+        }
+    }
+
+    #[test]
+    fn evaluate_tuple_passes_when_all_match() {
+        let outputs = RunOutputs {
+            qpdf: output_ok(vec![1, 2, 3]),
+            flpdf: output_ok(vec![1, 2, 3]),
+        };
+        let comparators: Vec<&dyn Comparator> = vec![&ByteComparator];
+        let (findings, verdict) = evaluate_tuple(&comparators, &outputs);
+        assert_eq!(verdict, Verdict::Pass);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].comparator, "byte-equal");
+        assert_eq!(findings[0].result, ComparatorResult::Match);
+    }
+
+    #[test]
+    fn evaluate_tuple_fails_when_qpdf_execution_fails() {
+        let outputs = RunOutputs {
+            qpdf: output_fail(2),
+            flpdf: output_ok(vec![1, 2, 3]),
+        };
+        let comparators: Vec<&dyn Comparator> = vec![&ByteComparator];
+        let (findings, verdict) = evaluate_tuple(&comparators, &outputs);
+        assert_eq!(
+            verdict,
+            Verdict::Fail,
+            "tool failure must surface as Fail, not Skipped"
+        );
+        let exec_finding = findings
+            .iter()
+            .find(|f| f.comparator == "tool-execution")
+            .expect("synthetic tool-execution finding expected");
+        let ComparatorResult::Diverge { reason } = &exec_finding.result else {
+            panic!("tool-execution finding should be Diverge");
+        };
+        assert!(
+            reason.contains("qpdf failed"),
+            "expected qpdf failure marker, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn evaluate_tuple_fails_when_flpdf_execution_fails() {
+        let outputs = RunOutputs {
+            qpdf: output_ok(vec![1, 2, 3]),
+            flpdf: output_fail(101),
+        };
+        let comparators: Vec<&dyn Comparator> = vec![&ByteComparator];
+        let (findings, verdict) = evaluate_tuple(&comparators, &outputs);
+        assert_eq!(verdict, Verdict::Fail);
+        let exec_finding = findings
+            .iter()
+            .find(|f| f.comparator == "tool-execution")
+            .expect("synthetic tool-execution finding expected");
+        let ComparatorResult::Diverge { reason } = &exec_finding.result else {
+            panic!("tool-execution finding should be Diverge");
+        };
+        assert!(
+            reason.contains("flpdf failed"),
+            "expected flpdf failure marker, got: {reason}"
+        );
+        assert!(
+            reason.contains("101"),
+            "expected exit_code in reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn evaluate_tuple_skips_when_tools_ran_but_bytes_missing() {
+        // Both tools "succeeded" but neither produced output bytes (e.g. they
+        // were rejected mid-run by the comparator). This is treated as a
+        // benign skip — distinct from the tool-failure path above.
+        let no_bytes = ToolOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: vec![],
+            stderr: vec![],
+            output_bytes: None,
+        };
+        let outputs = RunOutputs {
+            qpdf: no_bytes.clone(),
+            flpdf: no_bytes,
+        };
+        let comparators: Vec<&dyn Comparator> = vec![&ByteComparator];
+        let (findings, verdict) = evaluate_tuple(&comparators, &outputs);
+        assert_eq!(verdict, Verdict::Skipped);
+        assert!(findings
+            .iter()
+            .all(|f| matches!(f.result, ComparatorResult::Skipped { .. })));
     }
 }
