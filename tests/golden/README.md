@@ -34,6 +34,13 @@ tests/golden/
       linearize.pdf          # qpdf --linearize --deterministic-id <fixture> <out>
 ```
 
+> **Note on `plain.pdf`:** The spec defines `plain` as `qpdf <fixture> <out>`,
+> but bare qpdf injects a random `/ID` on every run.  All `plain.pdf` references
+> therefore use `--deterministic-id` (content-hash-based ID) to make regeneration
+> byte-stable.  The `encrypted-r4-three-page/plain.pdf` reference uses
+> `--decrypt --static-id` instead, because `--deterministic-id` is incompatible
+> with encrypted input.
+
 ### Fixture × Flag Matrix
 
 | Fixture                      | plain | static-id | linearize |
