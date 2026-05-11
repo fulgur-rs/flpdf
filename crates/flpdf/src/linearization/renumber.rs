@@ -100,15 +100,21 @@ impl RenumberMap {
     ///
     /// # Panics
     ///
-    /// * In debug builds, panics if `plan.parts_are_disjoint()` is false.
-    /// * In any build, panics if the same original `ObjectRef` appears more
-    ///   than once across parts (defence-in-depth against a broken plan whose
-    ///   `parts_are_disjoint()` would lie). A duplicate would silently corrupt
-    ///   the bijective `original ↔ new` mapping if not caught.
+    /// * In any build, panics if `plan.parts_are_disjoint()` is false. The
+    ///   check runs in release too because the Part 4 head promotion (step 4
+    ///   above) skips refs that are already in `by_original`, and a duplicate
+    ///   inside `part4_objects` whose value also happens to be one of the
+    ///   promoted refs would be silently dropped instead of detected by the
+    ///   inner `push` assert.
+    /// * In any build, panics if the inner `push` helper encounters a
+    ///   duplicate while inserting into `by_original` — kept as
+    ///   defence-in-depth even though the disjointness check above already
+    ///   forbids that state.
     pub fn from_plan(plan: &LinearizationPlan) -> Self {
-        debug_assert!(
+        assert!(
             plan.parts_are_disjoint(),
-            "LinearizationPlan invariant violated: parts must be disjoint"
+            "LinearizationPlan invariant violated: parts must be disjoint \
+             (Part 2 ∪ Part 3 ∪ Part 4 must contain each ObjectRef at most once)"
         );
 
         // Total mapped objects = Part 2 + Part 3 + Part 4.
@@ -737,5 +743,29 @@ mod tests {
         assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 2);
         // The remaining Part 4 object lands right after Part 2.
         assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 4);
+    }
+
+    /// A duplicated ref inside `part4_objects` whose value also happens to
+    /// be a promotion target would be silently dropped by the promoted-set
+    /// skip if the disjointness check did not run in release. Pin both the
+    /// detection and the message.
+    #[test]
+    #[should_panic(expected = "parts must be disjoint")]
+    fn from_plan_panics_on_duplicate_in_part4_even_in_release() {
+        let dup = ObjectRef::new(5, 0);
+        let plan = LinearizationPlan {
+            part1_objects: vec![],
+            part2_objects: vec![ObjectRef::new(2, 0)],
+            part3_objects: vec![],
+            part4_objects: vec![dup, dup],
+            total_object_count: 3,
+            root_ref: Some(dup),
+            pages_tree_ref: Some(dup),
+            info_ref: None,
+            page_hints: vec![],
+            shared_hints: vec![],
+            per_page_private_objects: vec![],
+        };
+        let _ = RenumberMap::from_plan(&plan);
     }
 }
