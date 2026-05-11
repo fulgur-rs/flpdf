@@ -153,7 +153,7 @@ echo ""
 echo "=== All 13 references generated ==="
 
 # ---------------------------------------------------------------------------
-# Phase 3: Size check (warn if any reference exceeds 100 KB)
+# Phase 3: Size check (fail if any reference exceeds 100 KB)
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -162,7 +162,7 @@ LIMIT=$((100 * 1024))
 FAILED=0
 while IFS= read -r -d '' f; do
     size=$(stat -c%s "$f")
-    rel="${f#$ROOT/}"
+    rel="${f#"$ROOT"/}"
     if [[ "$size" -gt "$LIMIT" ]]; then
         echo "OVER LIMIT: $rel ($size bytes)"
         FAILED=1
