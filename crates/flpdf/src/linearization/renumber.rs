@@ -149,32 +149,6 @@ impl RenumberMap {
         // Slot 0: unused (PDF object numbers start at 1).
         by_new_number.push(SENTINEL);
 
-        // Backwards-compat fallback: a `LinearizationPlan` whose three new
-        // sub-partitions are all empty but whose legacy `part4_objects` is
-        // populated is treated as if every Part-4 object were part4_rest.
-        // Without this, callers constructing a plan in the old style (e.g.
-        // `LinearizationPlan { part4_objects: vec![..], ..Default::default() }`)
-        // would see Part-4 refs silently dropped from the renumber map.
-        let no_subpart_filled = plan.part4_other_pages_private.is_empty()
-            && plan.part4_other_pages_shared.is_empty()
-            && plan.part4_rest.is_empty();
-        let use_legacy_part4 = no_subpart_filled && !plan.part4_objects.is_empty();
-        let part4_other_pages_private: &[ObjectRef] = if use_legacy_part4 {
-            &[]
-        } else {
-            &plan.part4_other_pages_private
-        };
-        let part4_other_pages_shared: &[ObjectRef] = if use_legacy_part4 {
-            &[]
-        } else {
-            &plan.part4_other_pages_shared
-        };
-        let part4_rest: &[ObjectRef] = if use_legacy_part4 {
-            &plan.part4_objects
-        } else {
-            &plan.part4_rest
-        };
-
         let push_real = |original: ObjectRef,
                          by_new_number: &mut Vec<ObjectRef>,
                          by_original: &mut BTreeMap<ObjectRef, ObjectRef>| {
@@ -798,35 +772,5 @@ mod tests {
             ..Default::default()
         };
         let _ = RenumberMap::from_plan(&plan);
-    }
-
-    /// Legacy callers may construct a `LinearizationPlan` that populates only
-    /// the older `part4_objects` field without splitting into part7/part8/part9.
-    /// `from_plan` must treat that case as Part 4 rest so the objects are still
-    /// renumbered rather than silently dropped.
-    #[test]
-    fn from_plan_treats_legacy_part4_only_as_rest() {
-        let cat = ObjectRef::new(1, 0);
-        let page_obj = ObjectRef::new(3, 0);
-        let plan = LinearizationPlan {
-            part2_objects: vec![page_obj],
-            part4_objects: vec![cat],
-            // part4_other_pages_private / part4_other_pages_shared / part4_rest
-            // all empty — only the legacy field is set.
-            root_ref: Some(cat),
-            total_object_count: 3,
-            ..Default::default()
-        };
-        let rn = RenumberMap::from_plan(&plan);
-        // The legacy Part-4 object must still be renumbered.
-        assert!(
-            rn.new_for_original(cat).is_some(),
-            "legacy part4_objects entries must still be renumbered"
-        );
-        // Catalog promotion still fires because the legacy entry is treated
-        // as part4_rest, so root_ref's ref resolves through the promote step.
-        let cat_new = rn.new_for_original(cat).unwrap().number;
-        // It should land at the catalog slot (right after the param dict).
-        assert_eq!(cat_new, rn.param_dict_ref().number + 1);
     }
 }
