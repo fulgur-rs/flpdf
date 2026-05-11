@@ -15,7 +15,9 @@
 //! Part 2       | hint stream object (compressed, with /Filter /FlateDecode /S …)
 //! Part 3       | first-page body — Plan.part2_objects with renumbered refs
 //! Part 4       | shared/catalog/info — Plan.part3_objects with renumbered refs
-//! Part 5       | remaining body — Plan.part4_objects with renumbered refs
+//! Part 5       | remaining body — `Plan.part4_objects()` (derived view of
+//!              | `part4_other_pages_private` + `_shared` + `_rest`) with
+//!              | renumbered refs
 //! Part 6       | cross-reference table for all objects + trailer
 //! ```
 //!
@@ -25,7 +27,7 @@
 //!
 //! - `Plan.part2_objects` → Annex F Part 3 (first-page body)
 //! - `Plan.part3_objects` → Annex F Part 4 (shared/catalog/info)
-//! - `Plan.part4_objects` → Annex F Part 5 (remaining body)
+//! - `Plan.part4_objects()` → Annex F Part 5 (remaining body)
 //!
 //! The param-dict and hint-stream object numbers are **dynamic** — the
 //! renumber map decides which slots they occupy. Use
@@ -375,8 +377,9 @@ fn do_write_pass<R: Read + Seek>(
     // /E: end of first-page section, AFTER both Part-2 and Part-3.
     let end_of_first_page_offset = bytes.len();
 
-    // Part 5 (Annex F): remaining body — Plan.part4_objects
-    for original_ref in &plan.part4_objects {
+    // Part 5 (Annex F): remaining body — derived view of all Part-4
+    // sub-partitions in writer-emission order.
+    for original_ref in &plan.part4_objects() {
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
             return Err(crate::Error::Unsupported(format!(
                 "part4 object {} has no renumber entry",
@@ -486,7 +489,7 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 ///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
 /// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
 /// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
-/// 5. Emits the remaining body objects (`Plan.part4_objects` — Annex F Part 5).
+/// 5. Emits the remaining body objects (`Plan.part4_objects()` — Annex F Part 5).
 /// 6. Emits the main cross-reference table and trailer (Annex F Part 6).
 ///
 /// Uses a convergence loop (max 3 iterations) to ensure the hint stream's

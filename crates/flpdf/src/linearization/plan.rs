@@ -167,36 +167,50 @@ fn compute_closure<R: Read + Seek>(
                         continue;
                     }
                     if k == b"Parent" {
-                        // Walk the parent /Pages dict for inherited
-                        // /Resources, /MediaBox, /Rotate, etc., but DO
-                        // NOT add the parent object itself to the
-                        // closure.  Adding it would inflate this page's
-                        // object_count beyond what qpdf computes from the
-                        // linearized layout (qpdf never counts ancestor
-                        // /Pages dicts in any page's object_count).
+                        // Walk the /Parent chain up to the root Pages node so
+                        // inherited /Resources, /MediaBox, /Rotate, etc. from
+                        // any ancestor (not just the immediate parent) end up
+                        // in this page's closure. Without iterating to the
+                        // root, a `/Page → /Pages → /Pages` tree with the
+                        // inherited resource attached to the grandparent
+                        // would leave that resource unreachable from any
+                        // page's closure and land it in `part4_rest`,
+                        // misclassifying it relative to qpdf's part7/8/9
+                        // partition.
                         //
-                        // The walk follows non-/Kids, non-/Parent keys of
-                        // the parent and descends into ref values
-                        // recursively via the queue.  /Kids and /Parent
-                        // on the parent are suppressed here to avoid
-                        // pulling sibling pages or recursing into
-                        // grandparents — for pages that genuinely
-                        // inherit from multi-level page trees, multi-level
-                        // ancestor walking can be added later.
-                        let mut parent_refs = Vec::new();
-                        collect_direct_refs(v, &mut parent_refs);
-                        for parent_ref in parent_refs {
-                            if let Ok(Object::Dictionary(parent_dict)) = pdf.resolve(parent_ref) {
-                                for (pk, pv) in parent_dict.iter() {
-                                    if pk == b"Kids" || pk == b"Parent" {
-                                        continue;
-                                    }
-                                    let mut refs = Vec::new();
-                                    collect_direct_refs(pv, &mut refs);
-                                    for r in refs {
-                                        if !visited.contains(&r) {
-                                            queue.push_back(r);
-                                        }
+                        // The ancestor /Pages dicts themselves are NOT added
+                        // to this page's closure — adding them would inflate
+                        // the page's object_count beyond what qpdf computes
+                        // from the linearized layout. We follow each
+                        // ancestor's non-/Kids, non-/Parent entries and let
+                        // the queue traverse into ref targets normally.
+                        let mut to_visit: Vec<ObjectRef> = Vec::new();
+                        let mut seen_parents: BTreeSet<ObjectRef> = BTreeSet::new();
+                        collect_direct_refs(v, &mut to_visit);
+
+                        while let Some(parent_ref) = to_visit.pop() {
+                            if !seen_parents.insert(parent_ref) {
+                                continue;
+                            }
+                            let Ok(Object::Dictionary(parent_dict)) = pdf.resolve(parent_ref)
+                            else {
+                                continue;
+                            };
+                            for (pk, pv) in parent_dict.iter() {
+                                if pk == b"Kids" {
+                                    continue;
+                                }
+                                if pk == b"Parent" {
+                                    // Climb to the next ancestor instead of
+                                    // stopping at one level.
+                                    collect_direct_refs(pv, &mut to_visit);
+                                    continue;
+                                }
+                                let mut refs = Vec::new();
+                                collect_direct_refs(pv, &mut refs);
+                                for r in refs {
+                                    if !visited.contains(&r) {
+                                        queue.push_back(r);
                                     }
                                 }
                             }
@@ -260,8 +274,17 @@ pub struct LinearizationPlan {
     /// page 1 and at least one other page).
     /// Computed by `from_pdf`.
     pub part3_objects: Vec<ObjectRef>,
-    /// Part 4: remaining body objects not in Parts 1–3.
-    pub part4_objects: Vec<ObjectRef>,
+    /// qpdf part7: objects private to exactly one other page (pages 2..N).
+    ///
+    /// Ordered by page index, then by BFS closure order within each page.
+    pub part4_other_pages_private: Vec<ObjectRef>,
+    /// qpdf part8: objects shared by two or more other pages (pages 2..N),
+    /// but NOT reachable from page 1.
+    pub part4_other_pages_shared: Vec<ObjectRef>,
+    /// qpdf part9: all Part-4 objects that are not in part7 or part8.
+    /// Includes the Pages tree, Info dict, lc_other objects, and any objects
+    /// not reachable from any page closure (trailer-only refs, etc.).
+    pub part4_rest: Vec<ObjectRef>,
 
     // ------------------------------------------------------------------
     // Document summary (copied from the source at construction time)
@@ -503,37 +526,69 @@ impl LinearizationPlan {
         }
 
         // ----------------------------------------------------------------
-        // Step 6b: order Part 4 so each page's private objects are
-        // contiguous in plan / write order.
+        // Step 6b: partition Part 4 into qpdf part7 / part8 / part9.
         //
-        // qpdf's per-page length validator walks the file body forward
-        // from the page object and stops at the first object that doesn't
-        // belong to that page.  If page 1's content stream is interleaved
-        // with page 2's page object, qpdf reports "page length mismatch".
-        // The hint table records the COUNT of private objects, so the
-        // writer must place them physically together.
+        // qpdf numbers objects in the second half (Part 4) as:
+        //   part7 (other pages' private): objects reached by exactly ONE
+        //     other page (pages 2..N), iterated page by page in closure order.
+        //   part8 (other pages' shared): objects reached by TWO OR MORE
+        //     other pages (but NOT page 1), in plan order.
+        //   part9 (rest): everything else — Pages tree, Info, lc_other, and
+        //     objects not reached from any page closure (trailer-only refs).
         //
-        // Order: per_page_private[1] then per_page_private[2] … then any
-        // leftover Part-4 objects (globally shared between pages 1..N but
-        // not page 0).
-        let mut placed: BTreeSet<ObjectRef> = BTreeSet::new();
-        let mut part4_objects: Vec<ObjectRef> = Vec::with_capacity(part4_provisional.len());
+        // The renumber pass uses these three sub-partitions directly.
+        // `part4_objects` is then built as part7 ++ part8 ++ part9 so the
+        // writer (which iterates `part4_objects`) emits bytes in the same
+        // order as the renumber map.
+
+        // page_reach counts how many of (first_page_closure, other_page_closures...)
+        // contain the object.  For an object NOT in first_page_set:
+        //   - page_reach == 1 → exactly one other page → part7
+        //   - page_reach >= 2 → two or more other pages → part8
+        //   - page_reach == 0 → no page closure → part9
+        let provisional_set: BTreeSet<ObjectRef> = part4_provisional.iter().copied().collect();
+        let mut part4_other_pages_private: Vec<ObjectRef> = Vec::new();
+        let mut part4_other_pages_shared: Vec<ObjectRef> = Vec::new();
+        let mut part4_rest: Vec<ObjectRef> = Vec::new();
+        // Track which objects are already in part7 (private) to build in page order.
+        let mut placed_private: BTreeSet<ObjectRef> = BTreeSet::new();
+
+        // part7: iterate pages 2..N in order, closure order within each page.
+        // Use per_page_private_objects[1..] — these are already private (reach==1).
         for privates in per_page_private_objects.iter().skip(1) {
-            for r in privates {
-                if placed.insert(*r) {
-                    part4_objects.push(*r);
+            for &r in privates {
+                if provisional_set.contains(&r) && placed_private.insert(r) {
+                    part4_other_pages_private.push(r);
                 }
             }
         }
-        for r in &part4_provisional {
-            if placed.insert(*r) {
-                part4_objects.push(*r);
+
+        // part8 and part9: iterate provisional in original order.
+        for &r in &part4_provisional {
+            if placed_private.contains(&r) {
+                // Already in part7.
+                continue;
+            }
+            let reach = page_reach.get(&r).copied().unwrap_or(0);
+            let in_first_page = first_page_set.contains(&r);
+            if in_first_page {
+                // Should have been in Part 2 or Part 3 — skip (defensive).
+                continue;
+            }
+            if reach >= 2 {
+                part4_other_pages_shared.push(r);
+            } else {
+                // reach == 0 or reach == 1 but not private (shouldn't happen
+                // since per_page_private_objects captures all reach-1 non-first
+                // objects).  Everything else goes to part9.
+                part4_rest.push(r);
             }
         }
+
         debug_assert_eq!(
-            part4_objects.len(),
+            part4_other_pages_private.len() + part4_other_pages_shared.len() + part4_rest.len(),
             part4_provisional.len(),
-            "Part-4 reordering must preserve membership"
+            "Part-4 sub-partition must preserve membership"
         );
 
         // ----------------------------------------------------------------
@@ -579,7 +634,9 @@ impl LinearizationPlan {
             part1_objects: Vec::new(),
             part2_objects,
             part3_objects,
-            part4_objects,
+            part4_other_pages_private,
+            part4_other_pages_shared,
+            part4_rest,
             total_object_count,
             root_ref,
             pages_tree_ref,
@@ -592,18 +649,42 @@ impl LinearizationPlan {
 
     /// Return the set of all objects assigned to at least one part.
     ///
+    /// Part-4 body objects (Annex F Part 5), in the order the writer emits them.
+    ///
+    /// This is a derived view: the ordered concatenation of
+    /// [`part4_other_pages_private`](Self::part4_other_pages_private),
+    /// [`part4_other_pages_shared`](Self::part4_other_pages_shared), and
+    /// [`part4_rest`](Self::part4_rest). Callers that previously read a
+    /// `part4_objects` field should call this getter instead — it cannot
+    /// drift from the three sub-partitions because there is no separate
+    /// backing storage.
+    pub fn part4_objects(&self) -> Vec<ObjectRef> {
+        self.part4_other_pages_private
+            .iter()
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
+            .copied()
+            .collect()
+    }
+
     /// Useful for callers that want to verify the disjoint invariant.
+    /// Uses the three fine-grained Part-4 sub-partitions as the canonical
+    /// source of truth.
     pub fn all_assigned_refs(&self) -> BTreeSet<ObjectRef> {
         self.part1_objects
             .iter()
             .chain(&self.part2_objects)
             .chain(&self.part3_objects)
-            .chain(&self.part4_objects)
+            .chain(&self.part4_other_pages_private)
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
             .copied()
             .collect()
     }
 
     /// Return `true` if every object appears in **at most** one part.
+    /// Uses the three fine-grained Part-4 sub-partitions as the canonical
+    /// source of truth.
     pub fn parts_are_disjoint(&self) -> bool {
         let mut seen = BTreeSet::new();
         for r in self
@@ -611,13 +692,40 @@ impl LinearizationPlan {
             .iter()
             .chain(&self.part2_objects)
             .chain(&self.part3_objects)
-            .chain(&self.part4_objects)
+            .chain(&self.part4_other_pages_private)
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
         {
             if !seen.insert(*r) {
                 return false;
             }
         }
         true
+    }
+}
+
+impl Default for LinearizationPlan {
+    /// Construct a blank plan with no objects in any part.
+    ///
+    /// Useful in test fixtures via `LinearizationPlan { part2_objects: ...,
+    /// ..Default::default() }` to avoid repeating empty-vec boilerplate for
+    /// fields that are not under test.
+    fn default() -> Self {
+        Self {
+            part1_objects: Vec::new(),
+            part2_objects: Vec::new(),
+            part3_objects: Vec::new(),
+            part4_other_pages_private: Vec::new(),
+            part4_other_pages_shared: Vec::new(),
+            part4_rest: Vec::new(),
+            total_object_count: 0,
+            root_ref: None,
+            pages_tree_ref: None,
+            info_ref: None,
+            page_hints: Vec::new(),
+            shared_hints: Vec::new(),
+            per_page_private_objects: Vec::new(),
+        }
     }
 }
 
@@ -894,7 +1002,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
 
         // No object should appear in both Part 4 and Part 2/3.
-        let part4_set: BTreeSet<_> = plan.part4_objects.iter().copied().collect();
+        let part4_set: BTreeSet<_> = plan.part4_objects().into_iter().collect();
         for r in &plan.part2_objects {
             assert!(
                 !part4_set.contains(r),
@@ -953,7 +1061,7 @@ mod tests {
         // Page-2 content stream (7 0 R) is only reachable from page 2 → Part 4.
         let page2_content = ObjectRef::new(7, 0);
         assert!(
-            plan.part4_objects.contains(&page2_content),
+            plan.part4_objects().contains(&page2_content),
             "page-2-only content stream must be in Part 4"
         );
 
@@ -1062,5 +1170,116 @@ mod tests {
         for entry in &plan.shared_hints {
             assert_ne!(entry.object_ref.number, 0);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-level /Parent inheritance: a /Resources attached to the grandparent
+    // /Pages node must end up in the page's closure (so it is partitioned as a
+    // shared object or first-page private, not stranded in part4_rest).
+    // -----------------------------------------------------------------------
+
+    fn two_level_pages_inherited_resources_bytes() -> Vec<u8> {
+        // Object layout:
+        //   1 0 obj — Catalog
+        //   2 0 obj — Outer /Pages (Kids [3 0 R]) with inherited /Resources 6 0 R
+        //   3 0 obj — Inner /Pages (Parent 2 0 R, Kids [4 0 R, 5 0 R])
+        //   4 0 obj — Page 1 (Parent 3 0 R) — NO own /Resources, inherits 6 0 R
+        //   5 0 obj — Page 2 (Parent 3 0 R) — NO own /Resources, inherits 6 0 R
+        //   6 0 obj — Shared /Resources (inherited via the outer /Pages)
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 2 /Resources 6 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n");
+
+        // Font referenced by the inherited Resources, so the closure walker
+        // also has a deeper reachable object beyond the grandparent.
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref_section = format!(
+            "xref\n0 8\n\
+            0000000000 65535 f \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n",
+            off1, off2, off3, off4, off5, off6, off7,
+        );
+        pdf.extend_from_slice(xref_section.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref_start,
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Without ancestor-walking, the shared /Resources attached to the outer
+    /// /Pages (2 0 R) would never appear in any page's closure: the leaf page
+    /// (4 0 R) only walks one level up to 3 0 R, which has no /Resources of
+    /// its own. The resource (6 0 R) and its referenced font (7 0 R) would
+    /// then fall into part4_rest, causing qpdf-divergent renumbering.
+    ///
+    /// With the fix, both pages reach the inherited resource and font, so
+    /// the resource and font are classified as Part-3 (shared between both
+    /// pages) — not stranded in part4_rest.
+    #[test]
+    fn multilevel_pages_inherited_resources_join_page_closure() {
+        let bytes = two_level_pages_inherited_resources_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("multi-level Pages PDF should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let resources_ref = ObjectRef::new(6, 0);
+        let font_ref = ObjectRef::new(7, 0);
+        let all_refs = plan.all_assigned_refs();
+        assert!(
+            all_refs.contains(&resources_ref),
+            "inherited /Resources (6 0 R) must be reachable from page closures, \
+             not stranded outside every part"
+        );
+        assert!(
+            all_refs.contains(&font_ref),
+            "/Font (7 0 R) reached via inherited /Resources must be classified"
+        );
+        // The /Resources is referenced by both pages, so it is a Part-3 (shared)
+        // object — not in part4_rest where the pre-fix code would have placed it.
+        assert!(
+            plan.part3_objects.contains(&resources_ref),
+            "shared inherited /Resources must end up in Part 3"
+        );
+        assert!(
+            !plan.part4_rest.contains(&resources_ref),
+            "shared inherited /Resources must NOT end up in part4_rest"
+        );
     }
 }

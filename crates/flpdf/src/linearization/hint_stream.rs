@@ -586,40 +586,29 @@ mod tests {
     /// Single-page plan with no shared objects.
     fn single_page_plan() -> LinearizationPlan {
         LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![
                 ObjectRef::new(3, 0),
                 ObjectRef::new(2, 0),
                 ObjectRef::new(1, 0),
             ],
-            part3_objects: vec![],
-            part4_objects: vec![],
             total_object_count: 3,
-            root_ref: None,
-            pages_tree_ref: None,
-            info_ref: None,
             page_hints: vec![PageHintEntry {
                 page_ref: ObjectRef::new(3, 0),
                 first_object_index: 0,
                 object_count: 3,
                 byte_length: 0,
             }],
-            shared_hints: vec![],
-            per_page_private_objects: vec![],
+            ..Default::default()
         }
     }
 
     /// Two-page plan with two shared objects referenced by both pages.
     fn two_page_plan_with_shared() -> LinearizationPlan {
         LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
-            part4_objects: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+            part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             total_object_count: 8,
-            root_ref: None,
-            pages_tree_ref: None,
-            info_ref: None,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),
@@ -644,7 +633,7 @@ mod tests {
                     referencing_pages: vec![0, 1],
                 },
             ],
-            per_page_private_objects: vec![],
+            ..Default::default()
         }
     }
 
