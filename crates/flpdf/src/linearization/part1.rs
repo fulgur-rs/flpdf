@@ -156,7 +156,7 @@ impl Part1Bytes {
     ///
     /// ```text
     /// 1 0 obj
-    /// << /Linearized 1 /L XXXXXXXXXX /H [ XXXXXXXXXX XXXXXXXXXX ] /O XXXXXXXXXX /E XXXXXXXXXX /T XXXXXXXXXX /N XXXXXXXXXX >>
+    /// << /Linearized 1 /L XXXXXXXXXX /H [ XXXXXXXXXX XXXXXXXXXX ] /O XXXXXXXXXX /E XXXXXXXXXX /N XXXXXXXXXX /T XXXXXXXXXX >>
     /// endobj
     /// ```
     ///
@@ -228,19 +228,23 @@ impl Part1Bytes {
         bytes.extend_from_slice(PLACEHOLDER);
         let e_end = bytes.len();
 
-        bytes.extend_from_slice(b" /T ");
-
-        // /T placeholder — offset of last xref
-        let t_start = bytes.len();
-        bytes.extend_from_slice(PLACEHOLDER);
-        let t_end = bytes.len();
-
+        // qpdf emits the linearization param dict with /N preceding /T
+        // (the spec only requires /Linearized to come first; the remaining
+        // keys' order is implementation-defined). Match qpdf so writers
+        // doing byte comparisons across tools agree.
         bytes.extend_from_slice(b" /N ");
 
         // /N placeholder — page count
         let n_start = bytes.len();
         bytes.extend_from_slice(PLACEHOLDER);
         let n_end = bytes.len();
+
+        bytes.extend_from_slice(b" /T ");
+
+        // /T placeholder — offset of last xref
+        let t_start = bytes.len();
+        bytes.extend_from_slice(PLACEHOLDER);
+        let t_end = bytes.len();
 
         bytes.extend_from_slice(b" >>\n");
         bytes.extend_from_slice(b"endobj\n");
@@ -412,16 +416,17 @@ mod tests {
     fn placeholders_are_in_ascending_order() {
         let p1 = build_part1();
         let ph = &p1.placeholders;
+        // qpdf-aligned emission order: /L /H[0] /H[1] /O /E /N /T
         let starts = [
             ph.l.start,
             ph.h_offset.start,
             ph.h_length.start,
             ph.o.start,
             ph.e.start,
-            ph.t.start,
             ph.n.start,
+            ph.t.start,
         ];
-        let names = ["l", "h_offset", "h_length", "o", "e", "t", "n"];
+        let names = ["l", "h_offset", "h_length", "o", "e", "n", "t"];
         for i in 1..starts.len() {
             assert!(
                 starts[i] > starts[i - 1],
