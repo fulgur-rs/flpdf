@@ -850,33 +850,61 @@ pub fn write_linearized<R: Read + Seek>(
             so_table.header.least_length = least;
             so_table.header.bits_length_delta = bits_needed(max.saturating_sub(least));
 
-            // Location of first shared section object (= shared_hints[0] = part2[0] = page dict).
+            // Location (item 2): "virtual" byte offset of the first Part-8
+            // shared object, WITHOUT the hint stream object bytes.
             //
-            // The probe-pass xref_offsets already account for the hint stream
-            // object bytes (it is written inline in do_write_pass before Part 2/3
-            // objects).  Do NOT apply adjusted_offset here — that would add
-            // hint_stream_obj_total_len a second time and produce an offset
-            // that is too large by exactly the hint stream size.
-            let first_shared_orig = plan.shared_hints[0].object_ref;
-            let first_shared_new_num = renumber
-                .new_for_original(first_shared_orig)
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "first shared hint object {} has no renumber entry",
-                        first_shared_orig
-                    ))
-                })?
-                .number;
-            let first_shared_off = xref_offsets
-                .get(&first_shared_new_num)
-                .copied()
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "first shared hint object (new #{}) has no probed offset",
-                        first_shared_new_num
-                    ))
-                })?;
-            so_table.header.location = first_shared_off as u64;
+            // Per qpdf's checkHSharedObject (QPDF_linearization.cc lines 782-788),
+            // the stored value `so.first_shared_offset` is fed through
+            // `adjusted_offset(x)` which adds `H_length` (= /H[1] = full hint
+            // stream object byte length) to any offset that is >= H_offset.
+            // The resulting value is compared to the actual file offset.
+            //
+            // Since all offsets in our probe-pass xref_offsets ALREADY include
+            // the hint stream object (it is written inline in do_write_pass),
+            // we must subtract `hint_stream_obj_total_len` from the probe
+            // offset so that `adjusted_offset(location) == actual_offset`.
+            //
+            //   adjusted_offset(location)
+            //     = location + H_length             (since location >= H_offset)
+            //     = (actual - H_length) + H_length
+            //     = actual                           ✓
+            //
+            // This is only meaningful when nshared_total > nshared_first_page
+            // (i.e., there are Part-8 objects).  When part4_other_pages_shared
+            // is empty the location value is ignored (qpdf Implementation Note 131).
+            if !plan.part4_other_pages_shared.is_empty() {
+                let first_part8_orig = plan.part4_other_pages_shared[0];
+                let first_part8_new_num = renumber
+                    .new_for_original(first_part8_orig)
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "first Part-8 shared object {} has no renumber entry",
+                            first_part8_orig
+                        ))
+                    })?
+                    .number;
+                let first_part8_off =
+                    xref_offsets
+                        .get(&first_part8_new_num)
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "first Part-8 shared object (new #{}) has no probed offset",
+                                first_part8_new_num
+                            ))
+                        })?;
+                // Subtract hint stream total length so that qpdf's
+                // adjusted_offset() reconstructs the correct file offset.
+                so_table.header.location = first_part8_off
+                    .checked_sub(hint_stream_obj_total_len)
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "linearization layout mismatch: first Part-8 shared object offset \
+                             ({first_part8_off}) is less than hint stream length \
+                             ({hint_stream_obj_total_len}); cannot compute shared-hint location"
+                        ))
+                    })? as u64;
+            }
 
             // Per-object length_minus_least.  group_offset is no longer a
             // per-entry field (see hint_stream::encode_shared_object_entries:

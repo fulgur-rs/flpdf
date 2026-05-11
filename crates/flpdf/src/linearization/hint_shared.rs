@@ -226,53 +226,74 @@ impl SharedObjectHintTable {
         }
 
         // ------------------------------------------------------------------
-        // Step 1: first object number in the shared objects section.
+        // Step 1: first object number in the "Part 8" section.
         //
-        // Per qpdf's checkHSharedObject algorithm, the shared object hint table
-        // starts at the first object of the first-page section (= shared_hints[0],
-        // which is the page dict = part2[0]).  qpdf walks cur_object starting
-        // from pages[0].getObjectID() (= /O = the page dict new number), so
-        // first_object_number must point to part2[0], not to part3[0].
+        // Per ISO 32000-1 Annex F and qpdf's checkHSharedObject algorithm:
         //
-        // Fail fast on plan/renumber inconsistency: shared_count > 0 implies
-        // at least one shared object, which means shared_hints must be non-empty
-        // AND its first entry must be in the renumber map.  Silently writing
-        // first_object_number = 0 would emit a malformed Shared Object Hint
-        // Table header (object number 0 is reserved for the free-list head).
+        // - Item 1 (`first_object_number`) is the object number of the FIRST
+        //   shared object in the "end of file section" (Part 8 in qpdf's terms
+        //   = our part4_other_pages_shared).
+        //
+        // - This value is ONLY meaningful when `nshared_total > nshared_first_page`
+        //   (i.e., when there are Part-8 shared objects beyond the first-page
+        //   section).  Per qpdf's Implementation Note 131, the value is
+        //   meaningless when `nshared_total == nshared_first_page`.
+        //
+        // - qpdf's check walks the first `nshared_first_page` shared entries
+        //   starting from `pages[0].getObjectID()` (the first page object, not
+        //   from first_object_number).  Only at index `nshared_first_page` does
+        //   it jump to `first_object_number` and verify it matches the actual
+        //   first object of part8.
+        //
+        // When there are no Part-8 shared objects (`part4_other_pages_shared`
+        // is empty), we emit `0` (or any value; it is ignored by readers).
+        // When there ARE Part-8 shared objects, emit the renumbered object ID
+        // of the first entry in `part4_other_pages_shared`.
+        //
+        // Fail fast on plan/renumber inconsistency for the part8 case.
         // ------------------------------------------------------------------
-        let first_shared = plan.shared_hints.first().unwrap_or_else(|| {
-            panic!(
-                "non-empty shared_hints ({} entries) requires non-empty shared_hints vec \
-                 (plan invariant violated)",
-                shared_count
-            )
-        });
-        let first_object_number = renumber
-            .new_for_original(first_shared.object_ref)
-            .unwrap_or_else(|| {
-                panic!(
-                    "first shared object {:?} not found in RenumberMap \
-                     (plan/renumber inconsistency)",
-                    first_shared.object_ref
-                )
-            })
-            .number;
+        let first_object_number: u32 = if plan.part4_other_pages_shared.is_empty() {
+            // No Part-8 shared objects: value is meaningless per Note 131.
+            // Emit 0 (qpdf also emits 0 in this path per line 1400-1403 of
+            // QPDF_linearization.cc: first_shared_obj is only set when
+            // part8 is non-empty).
+            0
+        } else {
+            let first_part8 = plan.part4_other_pages_shared[0];
+            renumber
+                .new_for_original(first_part8)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "first Part-8 shared object {:?} not found in RenumberMap \
+                         (plan/renumber inconsistency)",
+                        first_part8
+                    )
+                })
+                .number
+        };
 
         // ------------------------------------------------------------------
         // Step 2: count shared objects that are physically in the first-page
         // section (before /E).
         //
-        // Per qpdf's Annex F layout, ALL Part-3 (shared) objects are written
-        // inside the first-page section.  The `first_page_entries` field in
-        // the Shared Object Hint Table header records how many shared objects
-        // reside in the first-page section (Annex F Part 3 / before /E).
-        // Since ALL shared objects are in the first-page section, this equals
-        // section_entries.  Setting it to fewer would tell readers that some
-        // shared objects are in Part 8 (after the remaining pages), which would
-        // produce the "part 8 is empty but nshared_total > nshared_first_page"
-        // qpdf warning.
+        // `shared_hints` is laid out as:
+        //   [part2 entries] + [part3 entries] + [part4_other_pages_shared entries]
+        //
+        // Only the part2 + part3 entries are physically in the first-page
+        // section (before /E).  The part4_other_pages_shared entries live
+        // after /E, so `first_page_entries` must NOT include them.
+        //
+        // Setting `first_page_entries = shared_count` (the old value) when
+        // there are part4 shared objects would tell qpdf that ALL shared
+        // objects are in the first-page section, contradicting the actual
+        // file layout and causing "in computed list but not hint table"
+        // warnings for those objects.
+        //
+        // `first_page_entries` = |part2| + |part3| (objects in [start, /E)).
+        // The remainder (section_entries - first_page_entries) are in
+        // the "end of file section" (Part 8 in qpdf's internal terminology).
         // ------------------------------------------------------------------
-        let first_page_entries = shared_count; // all shared objects are in the first-page section
+        let first_page_entries = (plan.part2_objects.len() + plan.part3_objects.len()) as u32;
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
@@ -559,21 +580,19 @@ mod tests {
     }
 
     #[test]
-    fn two_page_first_object_number_is_new_number_of_first_part3() {
+    fn two_page_first_object_number_is_zero_when_no_part8() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // shared_hints[0] = 3 0 R (part2[0] = page dict). The header points at
-        // its renumbered slot, which depends on how many promotion slots
-        // precede Part 2 — assert against the lookup rather than a constant.
+        // When part4_other_pages_shared is empty (no Part-8 shared objects),
+        // first_object_number must be 0 per ISO 32000-1 Implementation Note 131:
+        // the value is meaningless when nshared_total == nshared_first_page,
+        // so we emit 0 rather than pointing at an unrelated Part-2 object.
         assert_eq!(
-            table.header.first_object_number,
-            renumber
-                .new_for_original(ObjectRef::new(3, 0))
-                .unwrap()
-                .number,
-            "shared_hints[0] (3 0 R = part2[0]) must match the page dict's renumber"
+            table.header.first_object_number, 0,
+            "first_object_number must be 0 when there are no Part-8 shared objects \
+             (nshared_total == nshared_first_page, value is meaningless per Note 131)"
         );
     }
 
@@ -710,21 +729,18 @@ mod tests {
     }
 
     #[test]
-    fn partial_first_page_first_object_number() {
+    fn partial_first_page_first_object_number_is_zero_when_no_part8() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
-        // shared_hints[0] = 10 0 R (part2[0] = page dict). The plan has no
-        // promotable refs, so slots 1/2 are reserved for the param dict and
-        // hint stream; Part 2 starts at slot 3.
+        // Two-page plan with 3 part3 objects but no part4_other_pages_shared.
+        // first_object_number must be 0 — value is meaningless when
+        // nshared_total == nshared_first_page (Implementation Note 131).
         assert_eq!(
-            table.header.first_object_number,
-            renumber
-                .new_for_original(ObjectRef::new(10, 0))
-                .unwrap()
-                .number,
-            "shared_hints[0] (10 0 R = part2[0]) must match the page dict's renumber"
+            table.header.first_object_number, 0,
+            "first_object_number must be 0 when part4_other_pages_shared is empty \
+             (nshared_total == nshared_first_page, value is meaningless per Note 131)"
         );
     }
 
@@ -735,5 +751,128 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(&plan, &renumber);
 
         assert_eq!(table.objects.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan with Part-8 shared objects (part4_other_pages_shared non-empty).
+    //
+    // This models objects shared by two or more pages (pages 2..N) but NOT
+    // reachable from page 0 (i.e., not in Part 2 or Part 3).
+    //
+    // Part 2: [3 0 R]               → first-page private (page dict)
+    // Part 3: [5 0 R]               → first-page shared (font)
+    // part4_other_pages_shared: [9 0 R, 10 0 R]  → Part-8 shared (content streams)
+    // part4_other_pages_private: [4 0 R]          → page 2 private
+    // Pages:
+    //   page 0: page_ref = 3 0 R
+    //   page 1: page_ref = 4 0 R
+    // Shared hints: part2 + part3 + part4_shared entries.
+    //   3 0 R  → []           (part2, page 0 layout)
+    //   5 0 R  → [1]          (part3, page 0 layout, page 1 reference)
+    //   9 0 R  → [1, 2]       (part8, pages 1 and 2 reference it)
+    //   10 0 R → [1, 3]       (part8, pages 1 and 3 reference it)
+    // -----------------------------------------------------------------------
+
+    fn two_page_with_part8_shared() -> LinearizationPlan {
+        LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(3, 0)],
+            part3_objects: vec![ObjectRef::new(5, 0)],
+            part4_other_pages_shared: vec![ObjectRef::new(9, 0), ObjectRef::new(10, 0)],
+            part4_other_pages_private: vec![ObjectRef::new(4, 0)],
+            total_object_count: 5,
+            page_hints: vec![
+                PageHintEntry {
+                    page_ref: ObjectRef::new(3, 0),
+                    first_object_index: 0,
+                    object_count: 2,
+                    byte_length: 0,
+                },
+                PageHintEntry {
+                    page_ref: ObjectRef::new(4, 0),
+                    first_object_index: 0,
+                    object_count: 1,
+                    byte_length: 0,
+                },
+            ],
+            shared_hints: vec![
+                // part2 entry
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(3, 0),
+                    referencing_pages: vec![],
+                },
+                // part3 entry
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(5, 0),
+                    referencing_pages: vec![1],
+                },
+                // part4_other_pages_shared entries
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(9, 0),
+                    referencing_pages: vec![1, 2],
+                },
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(10, 0),
+                    referencing_pages: vec![1, 3],
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn part8_shared_first_page_entries_less_than_section_entries() {
+        let plan = two_page_with_part8_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+
+        // first_page_entries = |part2| + |part3| = 1 + 1 = 2
+        // section_entries = |shared_hints| = 4
+        assert_eq!(
+            table.header.first_page_entries, 2,
+            "first_page_entries must equal |part2| + |part3| = 2"
+        );
+        assert_eq!(
+            table.header.section_entries, 4,
+            "section_entries must equal total shared_hints count = 4"
+        );
+        assert!(
+            table.header.first_page_entries < table.header.section_entries,
+            "first_page_entries ({}) must be less than section_entries ({}) \
+             when there are Part-8 shared objects",
+            table.header.first_page_entries,
+            table.header.section_entries
+        );
+    }
+
+    #[test]
+    fn part8_shared_first_object_number_is_new_number_of_part8_first() {
+        let plan = two_page_with_part8_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+
+        // part4_other_pages_shared[0] = 9 0 R.
+        // first_object_number must point to its renumbered slot.
+        assert_eq!(
+            table.header.first_object_number,
+            renumber
+                .new_for_original(ObjectRef::new(9, 0))
+                .unwrap()
+                .number,
+            "first_object_number must equal the renumbered slot of \
+             part4_other_pages_shared[0] (9 0 R) when Part-8 shared objects exist"
+        );
+    }
+
+    #[test]
+    fn part8_shared_groups_count_equals_total_shared_hints() {
+        let plan = two_page_with_part8_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+
+        assert_eq!(
+            table.groups.len(),
+            plan.shared_hints.len(),
+            "groups count must equal total shared_hints (1-object-per-group model)"
+        );
     }
 }
