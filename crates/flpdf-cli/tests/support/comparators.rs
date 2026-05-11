@@ -321,7 +321,12 @@ fn parse_json(bytes: &[u8]) -> Result<JsonValue, String> {
     let mut parser = JsonParser::new(bytes);
     let val = parser.parse_value()?;
     parser.skip_whitespace();
-    // Allow trailing whitespace but nothing else.
+    if parser.pos != bytes.len() {
+        return Err(format!(
+            "unexpected trailing content at offset {} (after JSON value)",
+            parser.pos
+        ));
+    }
     Ok(val)
 }
 
@@ -957,5 +962,23 @@ mod tests {
         let b = parse_json(b"{\"x\": 2}").unwrap();
         let err = compare_json("", &a, &b).unwrap_err();
         assert!(err.contains("/x"), "expected /x in path, got: {err}");
+    }
+
+    #[test]
+    fn json_parse_rejects_trailing_garbage() {
+        let err = parse_json(b"{\"a\":1}garbage").unwrap_err();
+        assert!(
+            err.contains("trailing content"),
+            "expected trailing-content error, got: {err}"
+        );
+
+        let err = parse_json(b"42 99").unwrap_err();
+        assert!(
+            err.contains("trailing content"),
+            "expected trailing-content error, got: {err}"
+        );
+
+        // Trailing whitespace is still accepted.
+        assert!(parse_json(b"  42 \n\t").is_ok());
     }
 }
