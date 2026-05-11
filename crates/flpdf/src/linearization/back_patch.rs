@@ -29,7 +29,7 @@
 //! ```
 
 use crate::linearization::part1::PLACEHOLDER_WIDTH;
-use crate::linearization::writer::{LinearizedDocument, LinearizedOffsets};
+use crate::linearization::writer::{LinearizedDocument, LinearizedOffsets, PREV_PLACEHOLDER_WIDTH};
 use crate::Result;
 
 // ---------------------------------------------------------------------------
@@ -51,10 +51,16 @@ const MAX_PLACEHOLDER_VALUE: u64 = {
 /// Overwrite each placeholder range in `bytes` with the known value from
 /// `offsets`, encoded as a 10-digit zero-padded decimal ASCII string.
 ///
+/// Also back-patches the `/Prev` field in the Part 1 (first) trailer using
+/// `offsets.first_trailer_prev_range` and `offsets.last_xref_keyword_offset`.
+/// The `/Prev` value is written as a left-justified decimal integer padded on
+/// the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Unsupported`] if any value exceeds the maximum
-/// representable in [`PLACEHOLDER_WIDTH`] decimal digits (i.e. ≥ 10^10).
+/// representable in [`PLACEHOLDER_WIDTH`] decimal digits (i.e. ≥ 10^10), or
+/// if the `/Prev` value does not fit in [`PREV_PLACEHOLDER_WIDTH`] characters.
 ///
 /// # Panics
 ///
@@ -106,6 +112,27 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> R
         }
     }
 
+    // Preflight the /Prev range (if non-empty).
+    let prev_range = &offsets.first_trailer_prev_range;
+    if !prev_range.is_empty() {
+        if prev_range.end > bytes.len() {
+            return Err(crate::Error::Unsupported(format!(
+                "back_patch_param_dict: /Prev placeholder range {:?} out of bounds for buffer length {}",
+                prev_range,
+                bytes.len()
+            )));
+        }
+        if prev_range.len() != PREV_PLACEHOLDER_WIDTH {
+            return Err(crate::Error::Unsupported(format!(
+                "back_patch_param_dict: /Prev placeholder range has length {} (expected {})",
+                prev_range.len(),
+                PREV_PLACEHOLDER_WIDTH,
+            )));
+        }
+        // Value is last_xref_keyword_offset; no overflow check needed for a usize on
+        // any realistic PDF file (offset fits in a 22-char decimal string).
+    }
+
     // -----------------------------------------------------------------------
     // Pass 2: apply all writes.  After Pass 1 every range / value is known
     // good, so this loop cannot fail.
@@ -118,6 +145,18 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> R
             "formatted value '{formatted}' must be exactly {PLACEHOLDER_WIDTH} bytes",
         );
         bytes[(*range).clone()].copy_from_slice(formatted.as_bytes());
+    }
+
+    // Write the /Prev value (left-justified, space-padded on the right).
+    if !prev_range.is_empty() {
+        let prev_value = offsets.last_xref_keyword_offset;
+        let formatted = format!("{prev_value:<PREV_PLACEHOLDER_WIDTH$}");
+        debug_assert_eq!(
+            formatted.len(),
+            PREV_PLACEHOLDER_WIDTH,
+            "formatted /Prev value must be exactly {PREV_PLACEHOLDER_WIDTH} bytes",
+        );
+        bytes[prev_range.clone()].copy_from_slice(formatted.as_bytes());
     }
 
     Ok(())
@@ -232,6 +271,8 @@ mod tests {
             page_count: 1,
             part1_placeholders: part1.placeholders.clone(),
             xref_offsets: BTreeMap::new(),
+            // Empty range — tests that cover /Prev back-patching supply their own.
+            first_trailer_prev_range: 0..0,
         }
     }
 
