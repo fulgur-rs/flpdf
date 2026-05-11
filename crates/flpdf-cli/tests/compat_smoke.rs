@@ -59,10 +59,19 @@ fn smoke_matrix_runs_end_to_end() {
     }
 
     // The verdict must be one of the three valid values for each tuple.
+    // If a new Verdict variant is added later and a tuple ends up carrying
+    // it, this assertion catches the gap (matches! on its own would silently
+    // accept anything once a new variant slips through).
     for tuple_report in &report.tuple_reports {
-        let _valid = matches!(
+        assert!(
+            matches!(
+                tuple_report.verdict,
+                Verdict::Pass | Verdict::Fail | Verdict::Skipped
+            ),
+            "tuple ({}, {}) has unexpected verdict: {:?}",
+            tuple_report.fixture,
+            tuple_report.flag_set,
             tuple_report.verdict,
-            Verdict::Pass | Verdict::Fail | Verdict::Skipped
         );
     }
 
