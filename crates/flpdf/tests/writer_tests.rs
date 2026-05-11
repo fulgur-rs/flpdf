@@ -1378,6 +1378,65 @@ fn rewrites_repaired_pdf_in_best_effort_mode() {
 }
 
 #[test]
+fn write_qdf_header_has_binary_marker() {
+    // Build a minimal PDF with version 1.5 so we can verify both the version
+    // line and the binary marker line in the qdf output.
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // Line 1: version preserved from source
+    assert!(
+        output.starts_with(b"%PDF-1.5\n"),
+        "expected %PDF-1.5 version line; got {:?}",
+        std::str::from_utf8(&output[..output.len().min(20)]).unwrap_or("<invalid utf8>")
+    );
+
+    // Line 2: binary marker must be exactly qpdf's 6-byte sequence
+    // `%` + 4 high bytes (0xBF 0xF7 0xA2 0xFE) + newline
+    let expected_marker: &[u8] = b"%\xbf\xf7\xa2\xfe\n";
+    assert_eq!(
+        &output[b"%PDF-1.5\n".len()..b"%PDF-1.5\n".len() + expected_marker.len()],
+        expected_marker,
+        "binary marker bytes mismatch; got {:02x?}",
+        &output[b"%PDF-1.5\n".len()..b"%PDF-1.5\n".len() + expected_marker.len()]
+    );
+}
+
+#[test]
 fn writes_qdf_with_object_generations() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
