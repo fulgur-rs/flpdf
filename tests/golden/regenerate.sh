@@ -4,15 +4,26 @@ set -euo pipefail
 # Regenerate all golden reference outputs under tests/golden/references/.
 # Also regenerates derived fixtures under tests/fixtures/compat/ if they don't exist.
 #
-# Requirements: qpdf >= 11.0 installed on PATH
+# Requirements: qpdf 11.9.0 (exact version) installed on PATH — golden bytes
+# are tied to a specific upstream zlib/encoder flavour so a different qpdf
+# would silently drift the references.
 # Usage: bash tests/golden/regenerate.sh
 
 ROOT="$(git rev-parse --show-toplevel)"
 FIX="$ROOT/tests/fixtures/compat"
 REF="$ROOT/tests/golden/references"
 
+REQUIRED_QPDF_VERSION="11.9.0"
+
 echo "=== qpdf version ==="
-qpdf --version | head -1
+ACTUAL_QPDF_VERSION="$(qpdf --version | head -1 | awk '{print $3}')"
+echo "qpdf version $ACTUAL_QPDF_VERSION (required: $REQUIRED_QPDF_VERSION)"
+if [[ "$ACTUAL_QPDF_VERSION" != "$REQUIRED_QPDF_VERSION" ]]; then
+    echo "ERROR: qpdf $REQUIRED_QPDF_VERSION is required for byte-stable golden" >&2
+    echo "       outputs; got $ACTUAL_QPDF_VERSION. Install the required version" >&2
+    echo "       or bump tests/golden/README.md and re-bless the matrix." >&2
+    exit 1
+fi
 echo ""
 
 # ---------------------------------------------------------------------------

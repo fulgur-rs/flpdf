@@ -7,7 +7,7 @@ as ground-truth fixtures for flpdf compatibility tests.
 
 References were generated with:
 
-```
+```text
 qpdf version 11.9.0
 ```
 
@@ -25,7 +25,7 @@ output.  It also regenerates the derived fixtures under
 
 ## Directory Layout
 
-```
+```text
 tests/golden/
   references/
     <fixture-stem>/          # One directory per input fixture
