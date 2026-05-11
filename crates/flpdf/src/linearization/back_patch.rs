@@ -153,6 +153,7 @@ mod tests {
     use crate::linearization::plan::{LinearizationPlan, PageHintEntry};
     use crate::linearization::renumber::RenumberMap;
     use crate::linearization::writer::{write_linearized, LinearizedDocument, LinearizedOffsets};
+    use crate::writer::WriteOptions;
     use crate::{ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -201,7 +202,8 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = open_tiny_pdf();
-        write_linearized(&plan, &renumber, &mut pdf2).expect("write_linearized")
+        write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+            .expect("write_linearized")
     }
 
     /// Build a `LinearizationPlan` and minimal `Part1Bytes` for standalone tests.
@@ -240,7 +242,7 @@ mod tests {
     fn back_patch_writes_values_at_correct_ranges() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
         let file_len = bytes.len() + 99_999; // arbitrary > part1
         let offsets = minimal_offsets(&part1, file_len);
@@ -277,7 +279,7 @@ mod tests {
     fn back_patch_leaves_non_placeholder_bytes_unchanged() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let original = part1.bytes.clone();
         let mut bytes = original.clone();
         let offsets = minimal_offsets(&part1, bytes.len() + 1);
@@ -310,7 +312,7 @@ mod tests {
     fn after_back_patch_placeholders_are_all_digits() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
         let offsets = minimal_offsets(&part1, bytes.len() + 42);
 
@@ -334,7 +336,7 @@ mod tests {
     fn overflow_file_length_returns_err() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
 
         // file_length = 10^10 (one more than max)
@@ -352,7 +354,7 @@ mod tests {
     fn overflow_hint_stream_offset_returns_err() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
         let mut offsets = minimal_offsets(&part1, 100);
         offsets.hint_stream_offset = 10_000_000_000;
@@ -365,7 +367,7 @@ mod tests {
     fn overflow_last_xref_offset_returns_err() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
         let mut offsets = minimal_offsets(&part1, 100);
         offsets.last_xref_offset = 10_000_000_001;
@@ -380,7 +382,7 @@ mod tests {
     fn overflow_on_late_field_leaves_bytes_unchanged() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let part1 = Part1Bytes::build(&plan, &renumber);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let original = part1.bytes.clone();
         let mut bytes = original.clone();
 

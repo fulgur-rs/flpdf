@@ -161,7 +161,11 @@ impl Part1Bytes {
     /// ```
     ///
     /// where each `XXXXXXXXXX` is a 10-digit zero placeholder.
-    pub fn build(_plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
+    ///
+    /// `pdf_version` is the effective PDF version string to emit in the header
+    /// (e.g. `"1.3"`, `"1.7"`).  Callers should compute this via
+    /// [`crate::writer::effective_pdf_version`] before calling `build`.
+    pub fn build(_plan: &LinearizationPlan, renumber: &RenumberMap, pdf_version: &str) -> Self {
         // The param-dict slot must still hold its sentinel — overwriting it
         // would cause the writer to emit a duplicate object definition on the
         // same number, corrupting the xref. The slot number itself is now
@@ -181,8 +185,8 @@ impl Part1Bytes {
         // ------------------------------------------------------------------
         // File header
         // ------------------------------------------------------------------
-        // %PDF-1.7  (matches the convention in write_qdf)
-        bytes.extend_from_slice(b"%PDF-1.7\n");
+        // Emit the caller-supplied version (computed via effective_pdf_version).
+        bytes.extend_from_slice(format!("%PDF-{pdf_version}\n").as_bytes());
         // Binary marker: four bytes >= 128 signals a binary file.
         bytes.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
 
@@ -301,7 +305,7 @@ mod tests {
     fn build_part1() -> Part1Bytes {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        Part1Bytes::build(&plan, &renumber)
+        Part1Bytes::build(&plan, &renumber, "1.4")
     }
 
     // -----------------------------------------------------------------------
@@ -455,9 +459,10 @@ mod tests {
     #[test]
     fn binary_marker_present() {
         let p1 = build_part1();
-        // The binary marker bytes follow immediately after "%PDF-1.7\n".
+        // The binary marker bytes follow immediately after the header line.
+        // build_part1() uses version "1.4", so the header is "%PDF-1.4\n".
         let expected_marker: &[u8] = b"%\xE2\xE3\xCF\xD3\n";
-        let header_len = b"%PDF-1.7\n".len();
+        let header_len = b"%PDF-1.4\n".len();
         assert!(
             p1.bytes.len() > header_len + expected_marker.len(),
             "buffer too short to contain binary marker"

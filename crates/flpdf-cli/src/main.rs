@@ -116,6 +116,18 @@ struct RewriteCommand {
     /// --static-id equivalent). Testing only; not for production output.
     #[arg(long = "static-id")]
     static_id: bool,
+    /// Set a minimum PDF version for the output header.
+    ///
+    /// The effective version is `max(source_version, min_version)`.
+    /// Mirrors `qpdf --min-version`.
+    #[arg(long = "min-version")]
+    min_version: Option<String>,
+    /// Force the output PDF version header to exactly this value.
+    ///
+    /// Overrides source version and the linearize 1.2 floor.
+    /// Mirrors `qpdf --force-version`.
+    #[arg(long = "force-version")]
+    force_version: Option<String>,
 }
 
 fn main() {
@@ -142,7 +154,13 @@ fn main() {
     } else if args.check {
         run_check(args.input, args.repair)
     } else {
-        run_rewrite(args.input, args.output, args.repair, false, false)
+        run_rewrite(
+            args.input,
+            args.output,
+            args.repair,
+            false,
+            WriteOptions::default(),
+        )
     };
 
     if let Err(error) = result {
@@ -180,13 +198,19 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair),
-        Commands::Rewrite(cmd) => run_rewrite(
-            Some(cmd.input),
-            Some(cmd.output),
-            cmd.repair,
-            cmd.linearize,
-            cmd.static_id,
-        ),
+        Commands::Rewrite(cmd) => {
+            let mut options = WriteOptions::default();
+            options.static_id = cmd.static_id;
+            options.min_version = cmd.min_version;
+            options.force_version = cmd.force_version;
+            run_rewrite(
+                Some(cmd.input),
+                Some(cmd.output),
+                cmd.repair,
+                cmd.linearize,
+                options,
+            )
+        }
     }
 }
 
@@ -218,13 +242,13 @@ fn run_rewrite(
     output: Option<PathBuf>,
     repair: bool,
     linearize: bool,
-    static_id: bool,
+    options: WriteOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
 
     if linearize {
-        if static_id {
+        if options.static_id {
             return Err(
                 "--static-id with --linearize is not yet supported (tracked in epic 9hc.20)".into(),
             );
@@ -235,15 +259,13 @@ fn run_rewrite(
 
         // Re-open the PDF so `write_linearized` can seek/read objects independently.
         let mut pdf2 = open_pdf(&input, repair)?;
-        let mut doc = write_linearized(&plan, &renumber, &mut pdf2)?;
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
 
         std::fs::write(&output, &doc.bytes)?;
     } else {
         let mut pdf = open_pdf(&input, repair)?;
         let mut out = File::create(output)?;
-        let mut options = WriteOptions::default();
-        options.static_id = static_id;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
     }
     Ok(())

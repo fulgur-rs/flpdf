@@ -187,3 +187,184 @@ fn check_linearization_missing_file_exits_2() {
         .failure()
         .code(2);
 }
+
+// ---------------------------------------------------------------------------
+// 6. Version selection: --linearize inherits source version in the header
+//
+// Fixture: tests/fixtures/compat/one-page.pdf starts with %PDF-1.3
+// qpdf --linearize one-page.pdf → %PDF-1.3 (source version inherited)
+// flpdf rewrite --linearize should produce the same header.
+//
+// Note: qpdf may downgrade the version based on feature analysis (e.g.
+// two-page.pdf 1.4 → 1.3).  We do not replicate that subsystem; only
+// "source >= 1.2" docs where qpdf also preserves the version are tested.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_inherits_source_version() {
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("lin.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.3\n"),
+        "linearized header must be %PDF-1.3 (inherited from source); got: {}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(20)])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Version selection: --min-version raises the header version
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_min_version_raises_header() {
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("lin-min17.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--min-version=1.7",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.7\n"),
+        "with --min-version=1.7 the header must be %PDF-1.7; got: {}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(20)])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Version selection: --force-version overrides source and linearize floor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_force_version_overrides() {
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("lin-force14.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--force-version=1.4",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.4\n"),
+        "with --force-version=1.4 the header must be %PDF-1.4; got: {}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(20)])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Version selection: --force-version can go below the linearize 1.2 floor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_force_version_overrides_linearize_floor() {
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("lin-force10.pdf");
+
+    // %PDF-1.0 is unusual but the --force flag must honour the request.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--force-version=1.0",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.0\n"),
+        "with --force-version=1.0 the header must be %PDF-1.0; got: {}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(20)])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. parse_pdf_version / effective_pdf_version unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_pdf_version_valid() {
+    use flpdf::parse_pdf_version;
+    assert_eq!(parse_pdf_version("1.3"), Some((1, 3)));
+    assert_eq!(parse_pdf_version("1.7"), Some((1, 7)));
+    assert_eq!(parse_pdf_version("2.0"), Some((2, 0)));
+    assert_eq!(parse_pdf_version("1.10"), Some((1, 10)));
+    assert_eq!(parse_pdf_version("invalid"), None);
+    assert_eq!(parse_pdf_version(""), None);
+}
+
+#[test]
+fn effective_version_source_inherit() {
+    use flpdf::{effective_pdf_version, WriteOptions};
+    let opts = WriteOptions::default();
+    assert_eq!(effective_pdf_version("1.3", &opts, false), "1.3");
+    assert_eq!(effective_pdf_version("1.7", &opts, false), "1.7");
+}
+
+#[test]
+fn effective_version_linearize_floor() {
+    use flpdf::{effective_pdf_version, WriteOptions};
+    let opts = WriteOptions::default();
+    // Source 1.0 + linearize → should be bumped to 1.2.
+    assert_eq!(effective_pdf_version("1.0", &opts, true), "1.2");
+    // Source 1.3 + linearize → stays 1.3.
+    assert_eq!(effective_pdf_version("1.3", &opts, true), "1.3");
+}
+
+#[test]
+fn effective_version_min_version() {
+    use flpdf::{effective_pdf_version, WriteOptions};
+    let mut opts = WriteOptions::default();
+    opts.min_version = Some("1.7".to_string());
+    // Source 1.3, min 1.7 → 1.7
+    assert_eq!(effective_pdf_version("1.3", &opts, false), "1.7");
+    // Source 1.7, min 1.3 → stays 1.7
+    opts.min_version = Some("1.3".to_string());
+    assert_eq!(effective_pdf_version("1.7", &opts, false), "1.7");
+}
+
+#[test]
+fn effective_version_force_version() {
+    use flpdf::{effective_pdf_version, WriteOptions};
+    let mut opts = WriteOptions::default();
+    opts.force_version = Some("1.4".to_string());
+    // force overrides everything, even source 1.7
+    assert_eq!(effective_pdf_version("1.7", &opts, false), "1.4");
+    // force overrides linearize floor
+    opts.force_version = Some("1.0".to_string());
+    assert_eq!(effective_pdf_version("1.3", &opts, true), "1.0");
+}
