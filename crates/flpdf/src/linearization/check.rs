@@ -142,10 +142,10 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     //    dict at an obj number determined by its renumber pass, so we have
     //    to identify it from the file header's first object token.
     // -----------------------------------------------------------------------
-    let first_obj_number =
-        find_first_object_number(file_bytes).ok_or(LinearizationCheckError::NotLinearized)?;
+    let first_obj_ref =
+        find_first_object_ref(file_bytes).ok_or(LinearizationCheckError::NotLinearized)?;
     let first_obj = pdf
-        .resolve(ObjectRef::new(first_obj_number, 0))
+        .resolve(first_obj_ref)
         .map_err(LinearizationCheckError::from)?;
     let Object::Dictionary(param_dict) = first_obj else {
         return Err(LinearizationCheckError::NotLinearized);
@@ -485,15 +485,17 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 /// a window would silently accept misaligned offsets — this strict parser
 /// requires the `obj` keyword to follow exactly after `<digits> <digits>`.
 /// Locate the first indirect-object header in `file_bytes` and return its
-/// object number. PDF 1.7 Annex F.2.2.1 says the first object in a linearized
+/// [`ObjectRef`]. PDF 1.7 Annex F.2.2.1 says the first object in a linearized
 /// file is the linearization parameter dictionary, but does not constrain
 /// its object *number* — qpdf assigns it dynamically during renumbering. We
 /// therefore scan the bytes after the PDF header for the first `N G obj`
-/// token.
+/// token. The generation is preserved (rarely non-zero in practice, but a
+/// param dict written as `12 7 obj` is still valid PDF and must resolve to
+/// that exact ref, not to `12 0`).
 ///
 /// Returns `None` if no object header is found (e.g. truncated or
 /// non-PDF input).
-fn find_first_object_number(file_bytes: &[u8]) -> Option<u32> {
+fn find_first_object_ref(file_bytes: &[u8]) -> Option<ObjectRef> {
     // Scan for "<digits> <digits> obj". To be robust against the header
     // (`%PDF-1.x`) and the binary marker line, look for the literal " obj"
     // and back up to the start of the number pair. This is the same shape
@@ -520,8 +522,8 @@ fn find_first_object_number(file_bytes: &[u8]) -> Option<u32> {
             while start < abs && is_pdf_whitespace(file_bytes[start]) {
                 start += 1;
             }
-            if let Some((num, _gen)) = parse_obj_header_at(&file_bytes[start..]) {
-                return Some(num);
+            if let Some((num, gen)) = parse_obj_header_at(&file_bytes[start..]) {
+                return Some(ObjectRef::new(num, gen));
             }
             // Failed to parse; advance past this position to avoid infinite loop.
             i = abs + 4;
@@ -789,5 +791,33 @@ mod tests {
         assert_eq!(parse_xref_first_entry_pos(b"xref\n0\n", 0), None);
         // Truncated.
         assert_eq!(parse_xref_first_entry_pos(b"xref\n0 ", 0), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_first_object_ref preserves both the object number and generation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_first_object_ref_returns_object_number_and_generation() {
+        // A minimal PDF prefix with a non-zero generation on the first
+        // object — the helper must surface generation 7, not silently
+        // collapse it to 0 (which would cause the wrong object to resolve).
+        let bytes: &[u8] = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n12 7 obj\n<< /Linearized 1 >>\n";
+        let r = find_first_object_ref(bytes).expect("expected an object ref");
+        assert_eq!(r.number, 12);
+        assert_eq!(r.generation, 7);
+    }
+
+    #[test]
+    fn find_first_object_ref_handles_zero_generation() {
+        let bytes: &[u8] = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n3 0 obj\n";
+        let r = find_first_object_ref(bytes).expect("expected an object ref");
+        assert_eq!(r.number, 3);
+        assert_eq!(r.generation, 0);
+    }
+
+    #[test]
+    fn find_first_object_ref_returns_none_on_missing_obj() {
+        assert_eq!(find_first_object_ref(b"%PDF-1.7\nxref\n0 0\n"), None);
     }
 }

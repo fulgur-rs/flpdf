@@ -413,12 +413,17 @@ fn compute_byte_lengths(
     xref_offsets: &BTreeMap<u32, usize>,
     last_xref_offset: usize,
     hint_stream_new_num: u32,
+    param_dict_new_num: u32,
 ) -> BTreeMap<u32, usize> {
     // Build a sorted list of (offset, new_number) pairs, plus a sentinel for
     // the last_xref_offset (= start of main xref, which terminates the body).
     let mut sorted: Vec<(usize, u32)> = xref_offsets
         .iter()
-        .filter(|(&num, _)| num != 1) // exclude param dict (Part 1, before hint)
+        // Exclude the param dict (Part 1, written before the hint stream).
+        // The slot is dynamic because the renumber map may promote /Pages,
+        // /Info, /Catalog ahead of it — hard-coding `1` here would skip the
+        // wrong object whenever the param dict moves.
+        .filter(|(&num, _)| num != param_dict_new_num)
         .map(|(&num, &off)| (off, num))
         .collect();
     sorted.sort_unstable();
@@ -583,8 +588,12 @@ pub fn write_linearized<R: Read + Seek>(
         // Compute per-object byte lengths from this probe pass.
         // Use the xref keyword offset (not first_entry_offset) for length computation.
         // ------------------------------------------------------------------
-        let byte_lengths =
-            compute_byte_lengths(&xref_offsets, last_xref_offset, hint_stream_new_num);
+        let byte_lengths = compute_byte_lengths(
+            &xref_offsets,
+            last_xref_offset,
+            hint_stream_new_num,
+            renumber.param_dict_ref().number,
+        );
 
         // ------------------------------------------------------------------
         // Per-page byte lengths.
@@ -1209,5 +1218,35 @@ mod tests {
             expected_num,
             "first_page_object_new_num must equal renumber.new_for_original(page_hints[0].page_ref)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_byte_lengths excludes the param dict by its actual slot
+    // -----------------------------------------------------------------------
+    //
+    // The param dict sits before the hint stream and is not part of the
+    // body length budget. With the qpdf-aligned slot allocation the param
+    // dict number is dynamic, so the exclusion must be driven by the
+    // renumber map rather than the literal `1`.
+    #[test]
+    fn compute_byte_lengths_uses_dynamic_param_dict_slot() {
+        let mut offs: BTreeMap<u32, usize> = BTreeMap::new();
+        // Layout: obj 1 lives in the body at offset 100 (e.g. a promoted
+        // Pages tree), obj 3 is the param dict at offset 10, obj 5 is the
+        // hint stream at offset 50, obj 6 starts the first-page body at 200.
+        offs.insert(1, 100);
+        offs.insert(3, 10);
+        offs.insert(5, 50);
+        offs.insert(6, 200);
+
+        let lengths = compute_byte_lengths(&offs, 400, 5, 3);
+
+        // Obj 3 (the real param dict) is excluded.
+        assert!(!lengths.contains_key(&3));
+        // Obj 1 is NOT excluded any more — it is a regular body object.
+        // Its length runs to the next object's offset (obj 6 at 200).
+        assert_eq!(lengths.get(&1).copied(), Some(100));
+        // Obj 6 runs from offset 200 to last_xref_offset 400.
+        assert_eq!(lengths.get(&6).copied(), Some(200));
     }
 }
