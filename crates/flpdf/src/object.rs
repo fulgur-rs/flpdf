@@ -174,6 +174,22 @@ impl Object {
     /// let mut out = Vec::new();
     /// empty.write_pdf(&mut out);
     /// assert_eq!(out, b"[ ]");
+    ///
+    /// // Stream followed by a number: the stream's serialized form ends with
+    /// // the `endstream` keyword (a letter, not a delimiter), so a separating
+    /// // space must precede the next token.
+    /// use flpdf::object::{Dictionary, Stream};
+    /// let stream = Object::Stream(Stream::new(Dictionary::new(), vec![]));
+    /// let mixed = Object::Array(vec![stream, Object::Integer(7)]);
+    /// let mut out = Vec::new();
+    /// mixed.write_pdf(&mut out);
+    /// // The exact stream bytes vary; what matters is that a space appears
+    /// // between `endstream` and `7`.
+    /// assert!(
+    ///     out.windows(b"endstream 7".len()).any(|w| w == b"endstream 7"),
+    ///     "got: {:?}",
+    ///     std::str::from_utf8(&out).unwrap_or("<binary>"),
+    /// );
     /// ```
     pub fn write_pdf(&self, out: &mut Vec<u8>) {
         match self {
@@ -255,11 +271,14 @@ fn starts_with_delim(o: &Object) -> bool {
 /// (`>`, `)`, `]`). Used by [`Object::write_pdf`] to decide whether to insert
 /// a space after this token inside an array.
 ///
-/// Note: [`Object::Name`] ends with a regular letter, so it returns `false`.
+/// Excluded types end with a letter (`Name` → arbitrary letter from the name;
+/// `Stream` → the `endstream` keyword), so a following token in an array would
+/// run together without a separating space if these were treated as
+/// delimiter-terminated.
 fn ends_with_delim(o: &Object) -> bool {
     matches!(
         o,
-        Object::String(_) | Object::Array(_) | Object::Dictionary(_) | Object::Stream(_)
+        Object::String(_) | Object::Array(_) | Object::Dictionary(_)
     )
 }
 
