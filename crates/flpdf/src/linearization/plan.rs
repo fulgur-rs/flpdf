@@ -1436,7 +1436,10 @@ mod tests {
         );
 
         // It must appear in shared_hints.
-        let in_shared_hints = plan.shared_hints.iter().any(|h| h.object_ref == shared_content);
+        let in_shared_hints = plan
+            .shared_hints
+            .iter()
+            .any(|h| h.object_ref == shared_content);
         assert!(
             in_shared_hints,
             "content stream shared by pages 2 and 3 must appear in shared_hints"
