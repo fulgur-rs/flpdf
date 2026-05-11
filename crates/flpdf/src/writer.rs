@@ -19,6 +19,15 @@ pub struct WriteOptions {
     pub static_id: bool,
 }
 
+/// Binary header marker emitted by qpdf on the second line of every output
+/// PDF (immediately after the `%PDF-x.y` version line).  The four bytes are
+/// all > 127, which signals to file-transfer tools that the file is binary,
+/// as recommended by the PDF specification.  We fix these to qpdf's values so
+/// that flpdf output is byte-identical to qpdf output for the header section.
+///
+/// Hex: `25 BF F7 A2 FE 0A`  →  `%` + four high bytes + newline.
+const QPDF_BINARY_MARKER: &[u8] = b"%\xbf\xf7\xa2\xfe\n";
+
 /// qpdf's static-id constant: the first 32 hex digits of π, encoded as 16 raw
 /// bytes so the trailer emits `<31415926535897932384626433832795>`.
 const QPDF_STATIC_ID: [u8; 16] = [
@@ -815,7 +824,8 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
     object_refs.sort_by_key(|object_ref| (object_ref.number, object_ref.generation));
 
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"%PDF-1.7\n");
+    bytes.extend_from_slice(format!("%PDF-{}\n", pdf.version()).as_bytes());
+    bytes.extend_from_slice(QPDF_BINARY_MARKER);
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
     for object_ref in &object_refs {

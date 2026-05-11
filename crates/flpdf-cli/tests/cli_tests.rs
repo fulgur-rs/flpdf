@@ -120,8 +120,13 @@ fn qdf_subcommand_dumps_all_objects() {
     .assert()
     .success();
 
-    let rendered = std::fs::read_to_string(&output).unwrap();
-    assert!(rendered.contains("5 0 obj"));
+    // The qdf output contains a binary header marker (non-UTF-8 bytes), so we
+    // read raw bytes and search for the target substring as bytes.
+    let rendered = std::fs::read(&output).unwrap();
+    assert!(
+        rendered.windows(b"5 0 obj".len()).any(|w| w == b"5 0 obj"),
+        "expected '5 0 obj' in qdf output"
+    );
 }
 
 #[test]
