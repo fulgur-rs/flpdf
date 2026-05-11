@@ -7,9 +7,17 @@
 //! | New number | Meaning |
 //! |------------|---------|
 //! | 1          | Reserved for the linearization parameter dictionary (Part 1). |
-//! | 2 .. a     | Part 2 — first-page objects. |
-//! | a+1 .. b   | Part 3 — shared objects. |
-//! | b+1 .. N   | Part 4 — remaining objects. |
+//! | 2 .. a     | Part 2 — first-page objects (plan order). |
+//! | a+1 .. b   | Part 3 — shared objects (plan order). |
+//! | b+1 ..     | Part 4 head — promoted refs: pages tree, info, catalog. |
+//! | .. N       | Part 4 remaining — anything not promoted (plan order). |
+//!
+//! The Part 4 head promotion mirrors qpdf's `calculateLinearizationData`
+//! ordering of its `lc_root` / `lc_other` sets and is what brings flpdf's
+//! emitted object numbers closer to qpdf's. Each promoted slot is filled
+//! only when the corresponding [`LinearizationPlan`] field is `Some` **and**
+//! the ref is actually a member of `part4_objects`; otherwise it is silently
+//! skipped (no slot is reserved for an absent ref).
 //!
 //! All new object numbers carry `generation = 0` (the linearization spec does
 //! not require preserving generation numbers, and the writer starts fresh).
@@ -24,13 +32,18 @@
 //!
 //! * This module does **not** rewrite byte streams or fix up cross-references —
 //!   that is the writer's responsibility.
-//! * It does **not** move objects between parts (e.g. relocating the Catalog to
-//!   Part 3) — that is deferred to a later task.
+//! * It does **not** move objects between parts (e.g. relocating the Catalog
+//!   into Part 3 / first-page section) — that is a partition-level decision
+//!   for [`LinearizationPlan`].
+//! * The param-dict and hint-stream slots stay at the legacy positions
+//!   (slot 1 and `next_free()`); shifting them to qpdf's positions
+//!   (slot 3 and slot 5) is a separate change that touches `Part1Bytes`,
+//!   the linearization writer, back-patch, and check together.
 
 use crate::ObjectRef;
 
 use super::plan::LinearizationPlan;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // RenumberMap
@@ -78,7 +91,12 @@ impl RenumberMap {
     ///    recorded as a reserved slot and does not appear in `by_original`.
     /// 2. Numbers **2 ..** are assigned to Part-2 objects in plan order.
     /// 3. Continuing, Part-3 objects in plan order.
-    /// 4. Then Part-4 objects in plan order.
+    /// 4. **Part-4 head promotion**: if [`LinearizationPlan::pages_tree_ref`],
+    ///    [`info_ref`], or [`root_ref`] points at an object that is actually
+    ///    in `part4_objects`, those refs are appended next, in that exact
+    ///    order. Promoted refs are skipped during the natural Part 4 pass so
+    ///    each ref is mapped exactly once.
+    /// 5. Then the remaining Part-4 objects in plan order.
     ///
     /// # Panics
     ///
@@ -107,26 +125,62 @@ impl RenumberMap {
         // Slot 1: reserved for linearization parameter dictionary (Part 1).
         by_new_number.push(SENTINEL);
 
-        // Assign numbers starting at 2.
-        let parts: [&[ObjectRef]; 3] = [
-            &plan.part2_objects,
-            &plan.part3_objects,
-            &plan.part4_objects,
-        ];
+        let push = |original: ObjectRef,
+                    by_new_number: &mut Vec<ObjectRef>,
+                    by_original: &mut BTreeMap<ObjectRef, ObjectRef>| {
+            let new_number = by_new_number.len() as u32;
+            let new_ref = ObjectRef::new(new_number, 0);
+            by_new_number.push(original);
+            assert!(
+                by_original.insert(original, new_ref).is_none(),
+                "duplicate original ObjectRef in LinearizationPlan: {original:?}"
+            );
+        };
 
-        for part in parts {
-            for &original in part {
-                let new_number = by_new_number.len() as u32; // current length == next index == new number
-                let new_ref = ObjectRef::new(new_number, 0);
-                by_new_number.push(original);
-                // Reject duplicates in release too — silent overwrite would
-                // break the bijective invariant used by reverse lookups and
-                // by the writer's renumber-during-serialize path.
-                assert!(
-                    by_original.insert(original, new_ref).is_none(),
-                    "duplicate original ObjectRef in LinearizationPlan: {original:?}"
-                );
+        // Slots 2..a: Part 2 in plan order.
+        for &original in &plan.part2_objects {
+            push(original, &mut by_new_number, &mut by_original);
+        }
+
+        // Slots a+1..b: Part 3 in plan order.
+        for &original in &plan.part3_objects {
+            push(original, &mut by_new_number, &mut by_original);
+        }
+
+        // Slots b+1..N: Part 4.
+        //
+        // Promote the qpdf "part9 head" objects to the front of Part 4 so the
+        // emitted object numbers move closer to qpdf's. Order mirrors qpdf
+        // `calculateLinearizationData`: pages tree first (root key `/Pages`
+        // user set), then any catalog-level entries surfaced through
+        // `lc_other`. `root_ref` (Catalog) ends the promoted prefix because
+        // qpdf places `lc_root` in part4 (PDF 1.4 numbering = catalog
+        // section), which lands immediately after the linearization
+        // parameter dict in the final file even though the renumber pass
+        // visits the rest of part9 first.
+        //
+        // Bytes-identical numbering with qpdf also requires reserving the
+        // linearization parameter dict and hint stream slots at qpdf's
+        // positions; that change is deferred to a follow-up so this PR can
+        // land in isolation. The promotion below alone is enough to make
+        // [pages_tree, info, catalog] adjacent in the layout.
+        let promoted: Vec<ObjectRef> = [plan.pages_tree_ref, plan.info_ref, plan.root_ref]
+            .into_iter()
+            .flatten()
+            .collect();
+        let promoted_set: BTreeSet<ObjectRef> = promoted.iter().copied().collect();
+
+        for &original in &promoted {
+            if plan.part4_objects.contains(&original) && !by_original.contains_key(&original) {
+                push(original, &mut by_new_number, &mut by_original);
             }
+        }
+
+        for &original in &plan.part4_objects {
+            if promoted_set.contains(&original) {
+                continue;
+            }
+            push(original, &mut by_new_number, &mut by_original);
         }
 
         Self {
@@ -285,6 +339,8 @@ mod tests {
             part4_objects: vec![ObjectRef::new(1, 0)],
             total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
+            pages_tree_ref: None,
+            info_ref: None,
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
             shared_hints: vec![],
             per_page_private_objects: vec![],
@@ -315,6 +371,8 @@ mod tests {
             ],
             total_object_count: 8,
             root_ref: Some(ObjectRef::new(1, 0)),
+            pages_tree_ref: None,
+            info_ref: None,
             page_hints: vec![],
             shared_hints: vec![],
             per_page_private_objects: vec![],
@@ -600,5 +658,84 @@ mod tests {
         assert!(rn.original_for_new(ObjectRef::new(nf, 0)).is_none());
         // And it is one past `len()` (which itself is the highest allocated).
         assert_eq!(nf, (rn.len() as u32) + 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 4 head promotion (qpdf alignment, ステージ A)
+    // -----------------------------------------------------------------------
+
+    /// When `plan` exposes `pages_tree_ref`, `info_ref`, and `root_ref` and
+    /// all three are members of `part4_objects`, they must come out of
+    /// `from_plan` in that exact order (Pages → Info → Catalog) at the start
+    /// of the Part 4 slot range. The remaining Part 4 objects keep their plan
+    /// order behind them.
+    #[test]
+    fn part4_head_is_pages_info_catalog_when_refs_are_provided() {
+        let pages_ref = ObjectRef::new(8, 0);
+        let info_ref = ObjectRef::new(7, 0);
+        let catalog_ref = ObjectRef::new(6, 0);
+        let other_part4 = ObjectRef::new(9, 0);
+
+        let plan = LinearizationPlan {
+            part1_objects: vec![],
+            part2_objects: vec![ObjectRef::new(2, 0)],
+            part3_objects: vec![],
+            // Plan-order is deliberately scrambled so we can prove the
+            // promotion runs ahead of the natural iteration.
+            part4_objects: vec![catalog_ref, info_ref, pages_ref, other_part4],
+            total_object_count: 5,
+            root_ref: Some(catalog_ref),
+            pages_tree_ref: Some(pages_ref),
+            info_ref: Some(info_ref),
+            page_hints: vec![],
+            shared_hints: vec![],
+            per_page_private_objects: vec![],
+        };
+
+        let rn = RenumberMap::from_plan(&plan);
+
+        // Slot 1 stays reserved for the param dict; Part 2 fills slot 2;
+        // Part 4 head should then be Pages(3), Info(4), Catalog(5), other(6).
+        assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 3);
+        assert_eq!(rn.new_for_original(info_ref).unwrap().number, 4);
+        assert_eq!(rn.new_for_original(catalog_ref).unwrap().number, 5);
+        assert_eq!(rn.new_for_original(other_part4).unwrap().number, 6);
+    }
+
+    /// `None` refs fall through silently — the plan's natural Part 4 order
+    /// is preserved when there is nothing to promote.
+    #[test]
+    fn part4_promotion_is_inert_when_refs_are_none() {
+        let plan = single_page_plan(); // pages_tree_ref = None, info_ref = None
+        let rn = RenumberMap::from_plan(&plan);
+        // single_page_plan's Part 4 is [1 0 R]; it should be the next slot
+        // after Part 2 (which occupies slots 2, 3).
+        assert_eq!(rn.new_for_original(ObjectRef::new(1, 0)).unwrap().number, 4);
+    }
+
+    /// If the promoted ref is already in Part 2 or Part 3 (atypical input —
+    /// the catalog reaches into the first-page closure), the promotion
+    /// silently skips it so the slot bijection stays intact.
+    #[test]
+    fn part4_promotion_skips_refs_not_in_part4() {
+        let pages_ref = ObjectRef::new(10, 0);
+        let plan = LinearizationPlan {
+            part1_objects: vec![],
+            part2_objects: vec![pages_ref, ObjectRef::new(2, 0)],
+            part3_objects: vec![],
+            part4_objects: vec![ObjectRef::new(3, 0)],
+            total_object_count: 3,
+            root_ref: None,
+            pages_tree_ref: Some(pages_ref),
+            info_ref: None,
+            page_hints: vec![],
+            shared_hints: vec![],
+            per_page_private_objects: vec![],
+        };
+        let rn = RenumberMap::from_plan(&plan);
+        // pages_ref stays in its Part 2 slot (= 2).
+        assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 2);
+        // The remaining Part 4 object lands right after Part 2.
+        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 4);
     }
 }

@@ -368,6 +368,8 @@ mod tests {
             part4_objects: vec![],
             total_object_count: 3,
             root_ref: None,
+            pages_tree_ref: None,
+            info_ref: None,
             page_hints: vec![PageHintEntry {
                 page_ref,
                 first_object_index: 0,
@@ -400,6 +402,8 @@ mod tests {
             part4_objects: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
             total_object_count: 8,
             root_ref: None,
+            pages_tree_ref: None,
+            info_ref: None,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(3, 0),
@@ -463,6 +467,8 @@ mod tests {
             part4_objects: vec![ObjectRef::new(30, 0)],
             total_object_count: 5,
             root_ref: None,
+            pages_tree_ref: None,
+            info_ref: None,
             page_hints: vec![
                 PageHintEntry {
                     page_ref: ObjectRef::new(10, 0),

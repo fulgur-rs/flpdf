@@ -270,6 +270,19 @@ pub struct LinearizationPlan {
     pub total_object_count: u32,
     /// `/Root` reference from the trailer, if present.
     pub root_ref: Option<ObjectRef>,
+    /// `/Pages` tree root reference (catalog's `/Pages` entry).
+    ///
+    /// Promoted into the renumber map's reserved prefix so the resulting
+    /// object number matches qpdf's `part9` head (qpdf assigns the pages
+    /// tree to object 1). May be `None` for malformed inputs missing this
+    /// entry; in that case no promotion happens.
+    pub pages_tree_ref: Option<ObjectRef>,
+    /// `/Info` reference from the trailer, if present.
+    ///
+    /// Promoted into the renumber map's reserved prefix to mirror qpdf's
+    /// `lc_other` ordering (Info follows pages tree in the second-half
+    /// renumber pass).
+    pub info_ref: Option<ObjectRef>,
 
     // ------------------------------------------------------------------
     // Hint table inputs
@@ -332,6 +345,13 @@ impl LinearizationPlan {
 
         let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();
+        let info_ref = pdf.trailer().get_ref("Info");
+        let pages_tree_ref = root_ref
+            .and_then(|r| pdf.resolve(r).ok())
+            .and_then(|obj| match obj {
+                Object::Dictionary(d) => d.get_ref("Pages"),
+                _ => None,
+            });
 
         // ----------------------------------------------------------------
         // Step 2: collect page references.
@@ -562,6 +582,8 @@ impl LinearizationPlan {
             part4_objects,
             total_object_count,
             root_ref,
+            pages_tree_ref,
+            info_ref,
             page_hints,
             shared_hints,
             per_page_private_objects,
