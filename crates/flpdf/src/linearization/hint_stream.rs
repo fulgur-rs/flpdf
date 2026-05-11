@@ -543,13 +543,11 @@ pub fn encode_hint_stream(
     // -----------------------------------------------------------------------
     // Compress with FlateDecode (zlib, level 6 = Compression::default())
     //
-    // ## Encoding decision (2026-05-10)
-    // We use flate2 default settings (level 6).  qpdf uses zlib level 9.
-    // These produce structurally identical streams (qpdf --check-linearization
-    // validates the uncompressed content, not the compressed bytes), but the
-    // compressed byte sequences differ.  Byte-identical output requires either
-    // matching qpdf's zlib parameters or vendoring qpdf's zlib.  This is
-    // deferred; observable equivalence is the current acceptance criterion.
+    // qpdf also defaults to zlib level 6 (Z_DEFAULT_COMPRESSION). Verified by
+    // round-tripping a content stream through compress2() and flate2: with the
+    // `qpdf-zlib-compat` feature (flate2 linked against classic libz1g) the
+    // output is byte-identical to qpdf's. Under default features the size
+    // matches but internal bytes differ (miniz_oxide vs classic zlib internals).
     // -----------------------------------------------------------------------
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder

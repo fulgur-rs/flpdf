@@ -7,3 +7,10 @@ version.workspace = true
 [dependencies]
 thiserror.workspace = true
 flate2.workspace = true
+
+[features]
+default = []
+# Opt-in: link classic libz (zlib1g) via libz-sys so flate2's deflate output
+# matches qpdf's compress2() at level 6 byte-for-byte. Used by bytes-identical
+# tests only — production builds stay Pure Rust (miniz_oxide).
+qpdf-zlib-compat = ["flate2/zlib"]

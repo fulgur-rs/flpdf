@@ -95,3 +95,10 @@ jobs:
 
           echo "[ci] cargo test"
           cargo test
+
+      # Linux-only: the captured reference bytes match the Ubuntu base image's
+      # zlib1g version; libz-sys vendored zlib on Windows tracks a different
+      # upstream and would produce a spurious diff.
+      - name: bytes-identical zlib compat (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
