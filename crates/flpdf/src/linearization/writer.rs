@@ -317,9 +317,13 @@ fn write_part1_xref_and_trailer(
     }
 
     bytes.extend_from_slice(b" >>");
-    // startxref points to the xref keyword offset of this Part 1 xref section.
-    // PDF spec §7.5.5 requires startxref to be the byte offset of the xref keyword.
-    bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", xref_offset).as_bytes());
+    // Per linearized PDF convention (ISO 32000-1 Annex F and qpdf practice),
+    // the Part 1 first trailer's startxref value is always 0.  The main xref
+    // at the end of the file (Part 6) carries the real byte offset in its own
+    // trailing startxref, so readers that follow the tail-startxref path are
+    // unaffected.  qpdf uses 0 here to signal "this is the first trailer of a
+    // linearized file"; we adopt the same convention for byte-identical output.
+    bytes.extend_from_slice(b"\nstartxref\n0\n%%EOF\n");
 
     (xref_offset, prev_value_start..prev_value_end)
 }
@@ -1239,51 +1243,72 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 14. HIGH fix: Part 1 startxref value equals the offset of the first
-    //     `xref` keyword in the file (not obj1's offset).
+    // 14. Part 1 (first trailer) startxref value must be 0 (qpdf linearized
+    //     PDF convention, ISO 32000-1 Annex F).  The Part 6 (main) startxref
+    //     at the end of the file must be the real xref keyword offset.
     //
-    //     PDF §7.5.5: startxref shall give the byte offset of the xref keyword.
-    //     Before the fix, the value was obj1_offset (= 15), which pointed to
-    //     `1 0 obj`, causing parsers to fail finding the xref table.
+    //     qpdf always emits `startxref\n0\n%%EOF` in the first trailer to
+    //     signal "linearized first trailer".  The main xref at the file tail
+    //     carries the actual byte offset for readers that seek to the end.
     // -----------------------------------------------------------------------
     #[test]
-    fn part1_startxref_points_to_xref_keyword() {
+    fn part1_startxref_is_zero_and_main_startxref_is_real_offset() {
         let doc = build_linearized();
         let bytes = &doc.bytes;
 
-        // Find the byte offset of the first `xref` keyword in the file.
-        let first_xref_offset = bytes
-            .windows(4)
-            .position(|w| w == b"xref")
-            .expect("linearized output must contain at least one xref keyword");
+        // Helper: parse the decimal value immediately after "startxref\n".
+        let parse_startxref_value = |pos: usize| -> usize {
+            let needle = b"startxref\n";
+            let value_start = pos + needle.len();
+            let value_end = bytes[value_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|p| value_start + p)
+                .expect("startxref value must be terminated by newline");
+            let s = std::str::from_utf8(&bytes[value_start..value_end])
+                .expect("startxref value is UTF-8");
+            s.trim().parse().expect("startxref value must be decimal")
+        };
 
-        // Locate `startxref\n` in Part 1 (before any `xref` that is *not* the
-        // Part 1 xref, i.e. search only up to the Part 6 xref).
-        // We scan for b"startxref\n" and take the first occurrence.
-        let startxref_needle = b"startxref\n";
-        let startxref_pos = bytes
-            .windows(startxref_needle.len())
-            .position(|w| w == startxref_needle)
-            .expect("linearized output must contain startxref");
+        let needle = b"startxref\n";
 
-        // Read the decimal number immediately after "startxref\n".
-        let value_start = startxref_pos + startxref_needle.len();
-        let value_end = bytes[value_start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| value_start + p)
-            .expect("startxref value must be terminated by newline");
-        let value_str =
-            std::str::from_utf8(&bytes[value_start..value_end]).expect("startxref value is UTF-8");
-        let part1_startxref_value: usize = value_str
-            .trim()
-            .parse()
-            .expect("startxref value must be a decimal integer");
+        // Find first startxref (Part 1 first trailer).
+        let first_sxref_pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("linearized output must contain at least one startxref");
+        let part1_value: usize = parse_startxref_value(first_sxref_pos);
 
         assert_eq!(
-            part1_startxref_value, first_xref_offset,
-            "Part 1 startxref ({part1_startxref_value}) must equal the offset of the \
-             first xref keyword ({first_xref_offset}), not the offset of `1 0 obj`"
+            part1_value, 0,
+            "Part 1 first trailer startxref must be 0 (qpdf linearized convention), \
+             got {part1_value}"
+        );
+
+        // Find last startxref (Part 6 main trailer).
+        let last_sxref_pos = bytes
+            .windows(needle.len())
+            .rposition(|w| w == needle)
+            .expect("linearized output must contain at least two startxref");
+        let main_value: usize = parse_startxref_value(last_sxref_pos);
+
+        // The main startxref must point to the last standalone `xref` keyword
+        // token (not the `xref` that appears inside `startxref`).
+        // A standalone `xref` is preceded by whitespace or the start of the
+        // buffer, and followed by whitespace or the end of the buffer.
+        let last_xref_pos = (0..bytes.len().saturating_sub(3))
+            .rev()
+            .find(|&i| {
+                &bytes[i..i + 4] == b"xref"
+                    && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                    && (i + 4 >= bytes.len() || bytes[i + 4].is_ascii_whitespace())
+            })
+            .expect("linearized output must contain at least one standalone xref keyword");
+
+        assert_eq!(
+            main_value, last_xref_pos,
+            "Part 6 main startxref ({main_value}) must equal the last xref keyword \
+             offset ({last_xref_pos})"
         );
     }
 

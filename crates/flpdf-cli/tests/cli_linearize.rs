@@ -434,3 +434,77 @@ fn effective_version_force_version() {
     opts.force_version = Some("1.0".to_string());
     assert_eq!(effective_pdf_version("1.3", &opts, true), "1.0");
 }
+
+// ---------------------------------------------------------------------------
+// 13. Part 1 trailer startxref must be 0; Part 6 startxref must be the real
+//     main xref offset (qpdf linearized PDF convention, ISO 32000-1 Annex F).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_part1_startxref_is_zero_main_startxref_is_real() {
+    let input = write_temp(&minimal_pdf_bytes());
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("linearized.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--static-id",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+
+    let needle = b"startxref\n";
+
+    // Helper: parse the decimal value immediately after "startxref\n" at pos.
+    let parse_val = |pos: usize| -> usize {
+        let val_start = pos + needle.len();
+        let val_end = bytes[val_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| val_start + p)
+            .expect("startxref value must be newline-terminated");
+        std::str::from_utf8(&bytes[val_start..val_end])
+            .expect("UTF-8")
+            .trim()
+            .parse()
+            .expect("decimal")
+    };
+
+    // First startxref → Part 1 first trailer: must be 0.
+    let first_pos = bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("must have at least one startxref");
+    let part1_val: usize = parse_val(first_pos);
+    assert_eq!(
+        part1_val, 0,
+        "Part 1 first trailer startxref must be 0 (qpdf linearized convention)"
+    );
+
+    // Last startxref → Part 6 main trailer: must point at the last standalone
+    // `xref` keyword (not the `xref` that appears inside `startxref`).
+    let last_pos = bytes
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .expect("must have at least two startxref");
+    let main_val: usize = parse_val(last_pos);
+    let last_xref_pos = (0..bytes.len().saturating_sub(3))
+        .rev()
+        .find(|&i| {
+            &bytes[i..i + 4] == b"xref"
+                && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                && (i + 4 >= bytes.len() || bytes[i + 4].is_ascii_whitespace())
+        })
+        .expect("must have at least one standalone xref keyword");
+    assert_eq!(
+        main_val, last_xref_pos,
+        "Part 6 main startxref ({main_val}) must equal last xref keyword offset ({last_xref_pos})"
+    );
+}
