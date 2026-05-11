@@ -4,6 +4,9 @@
 //! `qpdf` and `flpdf`, route outputs through [`Comparator`]s, and collect
 //! structured [`MatrixReport`]s.
 
+pub mod comparators;
+pub use comparators::{QpdfJsonComparator, StructuralComparator};
+
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 

@@ -15,7 +15,8 @@
 mod support;
 
 use support::{
-    is_qpdf_available, run_matrix, ByteComparator, Comparator, Fixture, FlagSet, Verdict,
+    is_qpdf_available, run_matrix, ByteComparator, Comparator, Fixture, FlagSet,
+    QpdfJsonComparator, StructuralComparator, Verdict,
 };
 
 #[test]
@@ -32,7 +33,10 @@ fn smoke_matrix_runs_end_to_end() {
 
     let flag_sets = vec![FlagSet::Plain, FlagSet::StaticId];
 
-    let comparators: Vec<&dyn Comparator> = vec![&ByteComparator];
+    let byte_cmp = ByteComparator;
+    let json_cmp = QpdfJsonComparator;
+    let struct_cmp = StructuralComparator;
+    let comparators: Vec<&dyn Comparator> = vec![&byte_cmp, &json_cmp, &struct_cmp];
 
     let report = run_matrix(&fixtures, &flag_sets, &comparators);
 
@@ -46,12 +50,12 @@ fn smoke_matrix_runs_end_to_end() {
         report.tuple_reports.len()
     );
 
-    // Every tuple report must have exactly one finding (one comparator).
+    // Every tuple report must have exactly 3 findings (one per comparator).
     for tuple_report in &report.tuple_reports {
         assert_eq!(
             tuple_report.findings.len(),
-            1,
-            "tuple ({}, {}) should have 1 finding, got {}",
+            3,
+            "tuple ({}, {}) should have 3 findings, got {}",
             tuple_report.fixture,
             tuple_report.flag_set,
             tuple_report.findings.len()
@@ -75,6 +79,22 @@ fn smoke_matrix_runs_end_to_end() {
         );
     }
 
+    // Every tuple must carry all three comparator names.
+    let expected_names = ["byte-equal", "qpdf-json", "structural"];
+    for tuple_report in &report.tuple_reports {
+        for &cmp_name in &expected_names {
+            assert!(
+                tuple_report
+                    .findings
+                    .iter()
+                    .any(|f| f.comparator == cmp_name),
+                "tuple ({}, {}) missing comparator '{cmp_name}'",
+                tuple_report.fixture,
+                tuple_report.flag_set
+            );
+        }
+    }
+
     // --- Format assertions -------------------------------------------------------
 
     let json = report.to_json();
@@ -93,10 +113,18 @@ fn smoke_matrix_runs_end_to_end() {
         json.contains("two-page.pdf"),
         "JSON must mention two-page.pdf"
     );
-    // Must contain comparator name.
+    // Must contain all three comparator names.
     assert!(
         json.contains("byte-equal"),
         "JSON must mention the byte-equal comparator"
+    );
+    assert!(
+        json.contains("qpdf-json"),
+        "JSON must mention the qpdf-json comparator"
+    );
+    assert!(
+        json.contains("structural"),
+        "JSON must mention the structural comparator"
     );
 
     let md = report.to_markdown();
