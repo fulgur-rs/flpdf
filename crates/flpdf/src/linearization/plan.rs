@@ -261,7 +261,24 @@ pub struct LinearizationPlan {
     /// Computed by `from_pdf`.
     pub part3_objects: Vec<ObjectRef>,
     /// Part 4: remaining body objects not in Parts 1–3.
+    ///
+    /// This is the **ordered union** of `part4_other_pages_private`,
+    /// `part4_other_pages_shared`, and `part4_rest`, in that order.
+    /// It is kept for backward compatibility with the writer and checker,
+    /// which iterate this list to emit Part-5 body bytes.  Renumbering uses
+    /// the three sub-partition fields directly.
     pub part4_objects: Vec<ObjectRef>,
+    /// qpdf part7: objects private to exactly one other page (pages 2..N).
+    ///
+    /// Ordered by page index, then by BFS closure order within each page.
+    pub part4_other_pages_private: Vec<ObjectRef>,
+    /// qpdf part8: objects shared by two or more other pages (pages 2..N),
+    /// but NOT reachable from page 1.
+    pub part4_other_pages_shared: Vec<ObjectRef>,
+    /// qpdf part9: all Part-4 objects that are not in part7 or part8.
+    /// Includes the Pages tree, Info dict, lc_other objects, and any objects
+    /// not reachable from any page closure (trailer-only refs, etc.).
+    pub part4_rest: Vec<ObjectRef>,
 
     // ------------------------------------------------------------------
     // Document summary (copied from the source at construction time)
@@ -503,37 +520,76 @@ impl LinearizationPlan {
         }
 
         // ----------------------------------------------------------------
-        // Step 6b: order Part 4 so each page's private objects are
-        // contiguous in plan / write order.
+        // Step 6b: partition Part 4 into qpdf part7 / part8 / part9.
         //
-        // qpdf's per-page length validator walks the file body forward
-        // from the page object and stops at the first object that doesn't
-        // belong to that page.  If page 1's content stream is interleaved
-        // with page 2's page object, qpdf reports "page length mismatch".
-        // The hint table records the COUNT of private objects, so the
-        // writer must place them physically together.
+        // qpdf numbers objects in the second half (Part 4) as:
+        //   part7 (other pages' private): objects reached by exactly ONE
+        //     other page (pages 2..N), iterated page by page in closure order.
+        //   part8 (other pages' shared): objects reached by TWO OR MORE
+        //     other pages (but NOT page 1), in plan order.
+        //   part9 (rest): everything else — Pages tree, Info, lc_other, and
+        //     objects not reached from any page closure (trailer-only refs).
         //
-        // Order: per_page_private[1] then per_page_private[2] … then any
-        // leftover Part-4 objects (globally shared between pages 1..N but
-        // not page 0).
-        let mut placed: BTreeSet<ObjectRef> = BTreeSet::new();
-        let mut part4_objects: Vec<ObjectRef> = Vec::with_capacity(part4_provisional.len());
+        // The renumber pass uses these three sub-partitions directly.
+        // `part4_objects` is then built as part7 ++ part8 ++ part9 so the
+        // writer (which iterates `part4_objects`) emits bytes in the same
+        // order as the renumber map.
+
+        // page_reach counts how many of (first_page_closure, other_page_closures...)
+        // contain the object.  For an object NOT in first_page_set:
+        //   - page_reach == 1 → exactly one other page → part7
+        //   - page_reach >= 2 → two or more other pages → part8
+        //   - page_reach == 0 → no page closure → part9
+        let provisional_set: BTreeSet<ObjectRef> = part4_provisional.iter().copied().collect();
+        let mut part4_other_pages_private: Vec<ObjectRef> = Vec::new();
+        let mut part4_other_pages_shared: Vec<ObjectRef> = Vec::new();
+        let mut part4_rest: Vec<ObjectRef> = Vec::new();
+        // Track which objects are already in part7 (private) to build in page order.
+        let mut placed_private: BTreeSet<ObjectRef> = BTreeSet::new();
+
+        // part7: iterate pages 2..N in order, closure order within each page.
+        // Use per_page_private_objects[1..] — these are already private (reach==1).
         for privates in per_page_private_objects.iter().skip(1) {
-            for r in privates {
-                if placed.insert(*r) {
-                    part4_objects.push(*r);
+            for &r in privates {
+                if provisional_set.contains(&r) && placed_private.insert(r) {
+                    part4_other_pages_private.push(r);
                 }
             }
         }
-        for r in &part4_provisional {
-            if placed.insert(*r) {
-                part4_objects.push(*r);
+
+        // part8 and part9: iterate provisional in original order.
+        for &r in &part4_provisional {
+            if placed_private.contains(&r) {
+                // Already in part7.
+                continue;
+            }
+            let reach = page_reach.get(&r).copied().unwrap_or(0);
+            let in_first_page = first_page_set.contains(&r);
+            if in_first_page {
+                // Should have been in Part 2 or Part 3 — skip (defensive).
+                continue;
+            }
+            if reach >= 2 {
+                part4_other_pages_shared.push(r);
+            } else {
+                // reach == 0 or reach == 1 but not private (shouldn't happen
+                // since per_page_private_objects captures all reach-1 non-first
+                // objects).  Everything else goes to part9.
+                part4_rest.push(r);
             }
         }
+
+        // Build the legacy `part4_objects` as part7 ++ part8 ++ part9 so the
+        // body order matches the renumber order.
+        let mut part4_objects: Vec<ObjectRef> = Vec::with_capacity(part4_provisional.len());
+        part4_objects.extend_from_slice(&part4_other_pages_private);
+        part4_objects.extend_from_slice(&part4_other_pages_shared);
+        part4_objects.extend_from_slice(&part4_rest);
+
         debug_assert_eq!(
             part4_objects.len(),
             part4_provisional.len(),
-            "Part-4 reordering must preserve membership"
+            "Part-4 sub-partition must preserve membership"
         );
 
         // ----------------------------------------------------------------
@@ -580,6 +636,9 @@ impl LinearizationPlan {
             part2_objects,
             part3_objects,
             part4_objects,
+            part4_other_pages_private,
+            part4_other_pages_shared,
+            part4_rest,
             total_object_count,
             root_ref,
             pages_tree_ref,
@@ -593,17 +652,25 @@ impl LinearizationPlan {
     /// Return the set of all objects assigned to at least one part.
     ///
     /// Useful for callers that want to verify the disjoint invariant.
+    /// Uses the three fine-grained Part-4 sub-partitions as the canonical
+    /// source of truth; `part4_objects` is a derived view and is not
+    /// counted separately to avoid false duplicates.
     pub fn all_assigned_refs(&self) -> BTreeSet<ObjectRef> {
         self.part1_objects
             .iter()
             .chain(&self.part2_objects)
             .chain(&self.part3_objects)
-            .chain(&self.part4_objects)
+            .chain(&self.part4_other_pages_private)
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
             .copied()
             .collect()
     }
 
     /// Return `true` if every object appears in **at most** one part.
+    /// Uses the three fine-grained Part-4 sub-partitions as the canonical
+    /// source of truth; `part4_objects` is a derived view and is not
+    /// checked separately to avoid false duplicates.
     pub fn parts_are_disjoint(&self) -> bool {
         let mut seen = BTreeSet::new();
         for r in self
@@ -611,13 +678,41 @@ impl LinearizationPlan {
             .iter()
             .chain(&self.part2_objects)
             .chain(&self.part3_objects)
-            .chain(&self.part4_objects)
+            .chain(&self.part4_other_pages_private)
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
         {
             if !seen.insert(*r) {
                 return false;
             }
         }
         true
+    }
+}
+
+impl Default for LinearizationPlan {
+    /// Construct a blank plan with no objects in any part.
+    ///
+    /// Useful in test fixtures via `LinearizationPlan { part2_objects: ...,
+    /// ..Default::default() }` to avoid repeating empty-vec boilerplate for
+    /// fields that are not under test.
+    fn default() -> Self {
+        Self {
+            part1_objects: Vec::new(),
+            part2_objects: Vec::new(),
+            part3_objects: Vec::new(),
+            part4_objects: Vec::new(),
+            part4_other_pages_private: Vec::new(),
+            part4_other_pages_shared: Vec::new(),
+            part4_rest: Vec::new(),
+            total_object_count: 0,
+            root_ref: None,
+            pages_tree_ref: None,
+            info_ref: None,
+            page_hints: Vec::new(),
+            shared_hints: Vec::new(),
+            per_page_private_objects: Vec::new(),
+        }
     }
 }
 

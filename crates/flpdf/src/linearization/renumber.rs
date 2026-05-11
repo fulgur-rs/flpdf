@@ -3,28 +3,32 @@
 //! After the [`LinearizationPlan`] has partitioned all objects into Parts 2–4,
 //! this module assigns new object numbers that match qpdf's renumber order.
 //! qpdf's `calculateLinearizationData` + `writeLinearized` produce the layout
-//! `[part9_head, ParamDict, lc_root, HintStream, part6, part7, part8,
-//! part9_tail]`. We model that with the following slots:
+//! `[part7, part8, part9_head, ParamDict, lc_root, HintStream, part6/Part2,
+//! Part3, part9_tail]`. We model that with the following slots:
 //!
-//! | New number | Meaning |
-//! |------------|---------|
-//! | 1          | Pages tree (qpdf `obj_user_to_objects_["/Pages"]` head). Skipped if absent. |
-//! | 2          | Info dict (qpdf `lc_other` lead). Skipped if absent. |
-//! | param      | **Reserved** — linearization parameter dictionary (Part 1). |
-//! | catalog    | Catalog (qpdf `lc_root`). Skipped if absent. |
-//! | hint       | **Reserved** — primary hint stream. |
-//! | next..a    | Part 2 — first-page objects (plan order). |
-//! | a+1..b     | Part 3 — shared objects (plan order). |
-//! | b+1..N     | Part 4 remaining — everything not promoted (plan order). |
+//! | New number  | Meaning |
+//! |-------------|---------|
+//! | 1..M        | part7: other pages' private objects (qpdf part7). |
+//! | M+1..N      | part8: other pages' shared objects (qpdf part8). |
+//! | N+1         | Pages tree (qpdf part9 head). Skipped if absent. |
+//! | N+2         | Info dict (qpdf `lc_other`). Skipped if absent. |
+//! | param       | **Reserved** — linearization parameter dictionary (Part 1). |
+//! | catalog     | Catalog (qpdf `lc_root`). Skipped if absent. |
+//! | hint        | **Reserved** — primary hint stream. |
+//! | next..a     | Part 2 — first-page objects (plan order). |
+//! | a+1..b      | Part 3 — shared objects (plan order). |
+//! | b+1..end    | part4_rest remaining — everything not promoted (plan order). |
 //!
 //! The `param` and `hint` slots are *dynamic*: when an upstream object is
 //! absent from the plan its slot is simply not consumed, so emitted object
 //! numbers stay contiguous. Use [`RenumberMap::param_dict_ref`] and
 //! [`RenumberMap::hint_stream_slot`] to query their actual positions instead
-//! of assuming `1` / `next_free()`. With the fixture corpus (one/two/three-
-//! page PDFs that all carry `/Info`) the slots are 1=Pages, 2=Info,
-//! 3=ParamDict, 4=Catalog, 5=HintStream, 6+=Part 2, matching qpdf
-//! byte-for-byte.
+//! of assuming fixed values. With the fixture corpus (one/two/three-page PDFs
+//! that all carry `/Info`) the slots are:
+//! - one-page:   1=Pages, 2=Info, 3=ParamDict, 4=Catalog, 5=HintStream, 6+=Part2
+//! - two-page:   1=Page2dict, 2=Page2content, 3=Pages, 4=Info, 5=ParamDict, 6=Catalog, 7=Hint, 8+=Part2
+//! - three-page: 1-4=Page2+3 objs, 5=Pages, 6=Info, 7=ParamDict, 8=Catalog, 9=Hint, 10+=Part2
+//! These match qpdf byte-for-byte.
 //!
 //! All new object numbers carry `generation = 0` (the linearization spec does
 //! not require preserving generation numbers, and the writer starts fresh).
@@ -97,30 +101,28 @@ impl RenumberMap {
 
     /// Build a renumber map from a [`LinearizationPlan`].
     ///
-    /// Slot allocation mirrors qpdf's `writeLinearized` first-/second-half
+    /// Slot allocation mirrors qpdf's `writeLinearized` second-half + first-half
     /// renumber pass:
-    /// 1. **Slot 1**: pages tree (`plan.pages_tree_ref`) when promotable.
-    /// 2. **Slot 2**: info dict (`plan.info_ref`) when promotable.
-    /// 3. **Param dict** (reserved sentinel): linearization parameter dict.
-    /// 4. **Catalog**: `plan.root_ref` when promotable.
-    /// 5. **Hint stream** (reserved sentinel): primary hint stream.
-    /// 6. Part 2 objects in plan order.
-    /// 7. Part 3 objects in plan order.
-    /// 8. Remaining Part 4 objects in plan order (any ref already promoted
-    ///    above is skipped here so each ref maps exactly once).
+    /// 1. **part7**: `plan.part4_other_pages_private` in plan order.
+    /// 2. **part8**: `plan.part4_other_pages_shared` in plan order.
+    /// 3. **pages tree**: `plan.pages_tree_ref` when in `part4_rest`.
+    /// 4. **info dict**: `plan.info_ref` when in `part4_rest`.
+    /// 5. **Param dict** (reserved sentinel): linearization parameter dict.
+    /// 6. **Catalog**: `plan.root_ref` when in `part4_rest`.
+    /// 7. **Hint stream** (reserved sentinel): primary hint stream.
+    /// 8. Part 2 objects in plan order.
+    /// 9. Part 3 objects in plan order.
+    /// 10. Remaining `part4_rest` objects in plan order (any ref already
+    ///     promoted above is skipped so each ref maps exactly once).
     ///
-    /// A ref counts as *promotable* when [`Option`] is `Some(r)` and `r` is
-    /// a member of `plan.part4_objects`. Absent or non-Part-4 refs are
+    /// A ref counts as *promotable* when the [`Option`] is `Some(r)` and `r`
+    /// is a member of `plan.part4_rest`. Absent or non-`part4_rest` refs are
     /// silently skipped — the slot is not consumed, so subsequent slots
     /// shift down to keep object numbers contiguous.
     ///
     /// # Panics
     ///
-    /// * In any build, panics if `plan.parts_are_disjoint()` is false. A
-    ///   duplicate inside `part4_objects` whose value also happens to be
-    ///   one of the promoted refs would be silently dropped by the
-    ///   skip-already-promoted branch of the Part 4 loop, so the
-    ///   disjointness check is the only path that catches it.
+    /// * In any build, panics if `plan.parts_are_disjoint()` is false.
     /// * In any build, panics if the inner `push` helper encounters a
     ///   duplicate while inserting into `by_original` — kept as
     ///   defence-in-depth.
@@ -156,44 +158,71 @@ impl RenumberMap {
             );
         };
 
-        let part4_membership: BTreeSet<ObjectRef> = plan.part4_objects.iter().copied().collect();
+        // Promotion targets (pages tree, info, catalog) must come from
+        // part4_rest to avoid double-counting with part7/part8 objects.
+        let part4_rest_membership: BTreeSet<ObjectRef> = plan.part4_rest.iter().copied().collect();
         let promote = |slot_owner: Option<ObjectRef>,
                        by_new_number: &mut Vec<ObjectRef>,
                        by_original: &mut BTreeMap<ObjectRef, ObjectRef>| {
             if let Some(r) = slot_owner {
-                if part4_membership.contains(&r) && !by_original.contains_key(&r) {
+                if part4_rest_membership.contains(&r) && !by_original.contains_key(&r) {
                     push_real(r, by_new_number, by_original);
                 }
             }
         };
 
-        // 1. Pages tree, 2. Info — the two "part9 head" promotions.
+        // Second-half renumber order (qpdf slot assignment):
+        //
+        //  slot 1..    part7 (other pages' private) in plan order
+        //  slot N+1..  part8 (other pages' shared) in plan order
+        //  slot ..     pages_tree (if in part4_rest)
+        //  slot ..     info (if in part4_rest)
+        //  slot ..     <param dict reserved>
+        //  slot ..     root_ref / Catalog (if in part4_rest)
+        //  slot ..     <hint stream reserved>
+        //
+        // First-half follows:
+        //  slot ..     Part 2 in plan order
+        //  slot ..     Part 3 in plan order
+        //  slot ..     part4_rest remaining (pages_tree/info/root already promoted)
+
+        // 1. part7 (other pages' private) in plan order.
+        for &original in &plan.part4_other_pages_private {
+            push_real(original, &mut by_new_number, &mut by_original);
+        }
+
+        // 2. part8 (other pages' shared) in plan order.
+        for &original in &plan.part4_other_pages_shared {
+            push_real(original, &mut by_new_number, &mut by_original);
+        }
+
+        // 3. pages_tree, 4. info — the two "part9 head" promotions from part4_rest.
         promote(plan.pages_tree_ref, &mut by_new_number, &mut by_original);
         promote(plan.info_ref, &mut by_new_number, &mut by_original);
 
-        // 3. Param dict (reserved).
+        // 5. Param dict (reserved).
         let param_dict_slot = by_new_number.len() as u32;
         by_new_number.push(SENTINEL);
 
-        // 4. Catalog.
+        // 6. Catalog (promoted from part4_rest).
         promote(plan.root_ref, &mut by_new_number, &mut by_original);
 
-        // 5. Hint stream (reserved).
+        // 7. Hint stream (reserved).
         let hint_stream_slot = by_new_number.len() as u32;
         by_new_number.push(SENTINEL);
 
-        // 6. Part 2 in plan order.
+        // 8. Part 2 in plan order.
         for &original in &plan.part2_objects {
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
-        // 7. Part 3 in plan order.
+        // 9. Part 3 in plan order.
         for &original in &plan.part3_objects {
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
-        // 8. Part 4 remaining (skip refs already promoted above).
-        for &original in &plan.part4_objects {
+        // 10. part4_rest remaining (skip refs already promoted above).
+        for &original in &plan.part4_rest {
             if by_original.contains_key(&original) {
                 continue;
             }
@@ -329,31 +358,26 @@ mod tests {
     ///
     /// Part 2: [3 0 R, 2 0 R]
     /// Part 3: []
-    /// Part 4: [1 0 R]
+    /// part4_rest: [1 0 R]   (Catalog — no other pages so no part7/8)
     ///
-    /// Expected new numbering:
     /// Expected new numbering with qpdf-aligned slot allocation
     /// (pages_tree_ref / info_ref are None so those slots are not consumed;
-    /// root_ref = 1 is promotable from Part 4):
+    /// root_ref = 1 is in part4_rest and gets promoted):
     ///
     ///   slot 1 → reserved (param dict)
-    ///   slot 2 → 1 0 R   (Catalog, promoted from Part 4)
+    ///   slot 2 → 1 0 R   (Catalog, promoted from part4_rest)
     ///   slot 3 → reserved (hint stream)
     ///   slot 4 → 3 0 R   (Part 2 first)
     ///   slot 5 → 2 0 R   (Part 2 second)
     fn single_page_plan() -> LinearizationPlan {
         LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(2, 0)],
-            part3_objects: vec![],
             part4_objects: vec![ObjectRef::new(1, 0)],
+            part4_rest: vec![ObjectRef::new(1, 0)],
             total_object_count: 3,
             root_ref: Some(ObjectRef::new(1, 0)),
-            pages_tree_ref: None,
-            info_ref: None,
             page_hints: vec![PageHintEntry::placeholder(ObjectRef::new(3, 0))],
-            shared_hints: vec![],
-            per_page_private_objects: vec![],
+            ..Default::default()
         }
     }
 
@@ -361,35 +385,35 @@ mod tests {
     ///
     /// Part 2: [3 0 R, 6 0 R]          (page 1 dict + page-1-only content)
     /// Part 3: [5 0 R, 8 0 R]          (shared Resources + Font)
-    /// Part 4: [1 0 R, 2 0 R, 4 0 R, 7 0 R]  (Catalog, Pages node, page 2 dict, page-2 content)
+    /// part4_other_pages_private: [4 0 R, 7 0 R]  (page 2 dict + content, qpdf part7)
+    /// part4_rest: [1 0 R, 2 0 R]      (Catalog, Pages node, qpdf part9)
     ///
     /// Expected new numbering with qpdf-aligned slot allocation
-    /// (pages_tree_ref / info_ref are None; root_ref = 1 is promoted):
+    /// (pages_tree_ref / info_ref are None; root_ref = 1 0 R in part4_rest):
     ///
-    ///   slot 1 → reserved (param dict)
-    ///   slot 2 → 1 0 R   (Catalog, promoted from Part 4)
-    ///   slot 3 → reserved (hint stream)
-    ///   slot 4 → 3 0 R,  slot 5 → 6 0 R   (Part 2)
-    ///   slot 6 → 5 0 R,  slot 7 → 8 0 R   (Part 3)
-    ///   slot 8 → 2 0 R,  slot 9 → 4 0 R, slot 10 → 7 0 R   (Part 4 remainder)
+    ///   slot 1 → 4 0 R   (part7 — page 2 dict)
+    ///   slot 2 → 7 0 R   (part7 — page 2 content)
+    ///   slot 3 → reserved (param dict)   -- no pages_tree/info to promote
+    ///   slot 4 → 1 0 R   (Catalog, promoted from part4_rest)
+    ///   slot 5 → reserved (hint stream)
+    ///   slot 6 → 3 0 R,  slot 7 → 6 0 R   (Part 2)
+    ///   slot 8 → 5 0 R,  slot 9 → 8 0 R   (Part 3)
+    ///   slot 10 → 2 0 R   (part4_rest remainder)
     fn two_page_plan() -> LinearizationPlan {
         LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
             part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
             part4_objects: vec![
-                ObjectRef::new(1, 0),
-                ObjectRef::new(2, 0),
                 ObjectRef::new(4, 0),
                 ObjectRef::new(7, 0),
+                ObjectRef::new(1, 0),
+                ObjectRef::new(2, 0),
             ],
+            part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+            part4_rest: vec![ObjectRef::new(1, 0), ObjectRef::new(2, 0)],
             total_object_count: 8,
             root_ref: Some(ObjectRef::new(1, 0)),
-            pages_tree_ref: None,
-            info_ref: None,
-            page_hints: vec![],
-            shared_hints: vec![],
-            per_page_private_objects: vec![],
+            ..Default::default()
         }
     }
 
@@ -423,28 +447,32 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 3. Two-page: Part 2 → Part 3 → Part 4 remainder ordering is preserved
+    // 3. Two-page: part7 → part8 → part9_head → ParamDict → Catalog → Hint
+    //              → Part 2 → Part 3 → part9 remainder ordering
     // -----------------------------------------------------------------------
     #[test]
     fn two_page_part_ordering_correct() {
         let plan = two_page_plan();
         let rn = RenumberMap::from_plan(&plan);
 
-        // Catalog promoted to slot 2.
-        assert_eq!(rn.new_for_original(ObjectRef::new(1, 0)).unwrap().number, 2);
-        // Hint stream at slot 3.
-        assert_eq!(rn.hint_stream_slot(), 3);
-        // Part 2 starts at slot 4.
-        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 4);
-        assert_eq!(rn.new_for_original(ObjectRef::new(6, 0)).unwrap().number, 5);
+        // part7 (other pages' private): page-2 dict and content come first.
+        assert_eq!(rn.new_for_original(ObjectRef::new(4, 0)).unwrap().number, 1);
+        assert_eq!(rn.new_for_original(ObjectRef::new(7, 0)).unwrap().number, 2);
+        // No pages_tree / info to promote → param dict lands at slot 3.
+        assert_eq!(rn.param_dict_ref().number, 3);
+        // Catalog promoted from part4_rest to slot 4.
+        assert_eq!(rn.new_for_original(ObjectRef::new(1, 0)).unwrap().number, 4);
+        // Hint stream at slot 5.
+        assert_eq!(rn.hint_stream_slot(), 5);
+        // Part 2 starts at slot 6.
+        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 6);
+        assert_eq!(rn.new_for_original(ObjectRef::new(6, 0)).unwrap().number, 7);
         // Part 3 follows.
-        assert_eq!(rn.new_for_original(ObjectRef::new(5, 0)).unwrap().number, 6);
-        assert_eq!(rn.new_for_original(ObjectRef::new(8, 0)).unwrap().number, 7);
-        // Part 4 remainder (root_ref already promoted, so 2, 4, 7 only).
-        assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 8);
-        assert_eq!(rn.new_for_original(ObjectRef::new(4, 0)).unwrap().number, 9);
+        assert_eq!(rn.new_for_original(ObjectRef::new(5, 0)).unwrap().number, 8);
+        assert_eq!(rn.new_for_original(ObjectRef::new(8, 0)).unwrap().number, 9);
+        // part4_rest remainder (catalog already promoted, so only 2 0 R).
         assert_eq!(
-            rn.new_for_original(ObjectRef::new(7, 0)).unwrap().number,
+            rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number,
             10
         );
     }
@@ -643,8 +671,9 @@ mod tests {
         let h = rn.hint_stream_slot();
         // No plan original maps onto the hint stream slot.
         assert!(rn.original_for_new(ObjectRef::new(h, 0)).is_none());
-        // The hint stream sits immediately after the catalog (slot 2).
-        assert_eq!(h, 3);
+        // two_page_plan has 2 part7 objects before param dict, then catalog,
+        // then hint stream: slots 1, 2 = part7; 3 = param; 4 = catalog; 5 = hint.
+        assert_eq!(h, 5);
     }
 
     // -----------------------------------------------------------------------
@@ -654,6 +683,9 @@ mod tests {
     /// With qpdf-aligned slot allocation, `[pages, info, catalog]` consume
     /// slots 1, 2, 4 (slot 3 is the param-dict reservation; slot 5 is the
     /// hint stream). Pin that full layout.
+    ///
+    /// All three promotion targets (pages, info, catalog) live in `part4_rest`;
+    /// `part4_other_pages_private` and `part4_other_pages_shared` are empty.
     #[test]
     fn qpdf_layout_pages_info_paramdict_catalog_hint_part2() {
         let pages_ref = ObjectRef::new(8, 0);
@@ -661,20 +693,17 @@ mod tests {
         let catalog_ref = ObjectRef::new(6, 0);
         let other_part4 = ObjectRef::new(9, 0);
 
+        // Plan-order in part4_rest is deliberately scrambled so we can prove
+        // the promotion runs ahead of the natural iteration order.
         let plan = LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![ObjectRef::new(2, 0)],
-            part3_objects: vec![],
-            // Plan-order is deliberately scrambled so we can prove the
-            // promotion runs ahead of the natural iteration.
             part4_objects: vec![catalog_ref, info_ref, pages_ref, other_part4],
+            part4_rest: vec![catalog_ref, info_ref, pages_ref, other_part4],
             total_object_count: 5,
             root_ref: Some(catalog_ref),
             pages_tree_ref: Some(pages_ref),
             info_ref: Some(info_ref),
-            page_hints: vec![],
-            shared_hints: vec![],
-            per_page_private_objects: vec![],
+            ..Default::default()
         };
 
         let rn = RenumberMap::from_plan(&plan);
@@ -686,7 +715,7 @@ mod tests {
         assert_eq!(rn.hint_stream_slot(), 5);
         // Part 2 starts immediately after the hint stream slot.
         assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 6);
-        // Remaining Part 4 follows Part 2.
+        // Remaining part4_rest follows Part 2 (catalog, pages, info already promoted).
         assert_eq!(rn.new_for_original(other_part4).unwrap().number, 7);
     }
 
@@ -706,22 +735,17 @@ mod tests {
 
     /// If the promoted ref is already in Part 2 or Part 3 (atypical input —
     /// the catalog reaches into the first-page closure), the promotion
-    /// silently skips it so the slot bijection stays intact.
+    /// silently skips it because `pages_tree_ref` is not in `part4_rest`.
     #[test]
-    fn promotion_skips_refs_not_in_part4() {
+    fn promotion_skips_refs_not_in_part4_rest() {
         let pages_ref = ObjectRef::new(10, 0);
         let plan = LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![pages_ref, ObjectRef::new(2, 0)],
-            part3_objects: vec![],
             part4_objects: vec![ObjectRef::new(3, 0)],
+            part4_rest: vec![ObjectRef::new(3, 0)],
             total_object_count: 3,
-            root_ref: None,
-            pages_tree_ref: Some(pages_ref),
-            info_ref: None,
-            page_hints: vec![],
-            shared_hints: vec![],
-            per_page_private_objects: vec![],
+            pages_tree_ref: Some(pages_ref), // in Part 2, not in part4_rest → skipped
+            ..Default::default()
         };
         let rn = RenumberMap::from_plan(&plan);
         // Layout: param=1, hint=2 (nothing promoted, no catalog either),
@@ -730,30 +754,27 @@ mod tests {
         assert_eq!(rn.hint_stream_slot(), 2);
         assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 3);
         assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 4);
-        // Part 4 remainder lands last.
+        // part4_rest lands last.
         assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 5);
     }
 
-    /// A duplicated ref inside `part4_objects` whose value also happens to
-    /// be a promotion target would be silently dropped by the promoted-set
-    /// skip if the disjointness check did not run in release. Pin both the
-    /// detection and the message.
+    /// A duplicated ref inside `part4_rest` (and also in `part4_other_pages_private`)
+    /// would be silently dropped by the promoted-set skip if the disjointness check
+    /// did not run. Pin both the detection and the message.
     #[test]
     #[should_panic(expected = "parts must be disjoint")]
     fn from_plan_panics_on_duplicate_in_part4_even_in_release() {
         let dup = ObjectRef::new(5, 0);
+        // dup appears in both part4_other_pages_private and part4_rest — disjoint violation.
         let plan = LinearizationPlan {
-            part1_objects: vec![],
             part2_objects: vec![ObjectRef::new(2, 0)],
-            part3_objects: vec![],
             part4_objects: vec![dup, dup],
+            part4_other_pages_private: vec![dup],
+            part4_rest: vec![dup],
             total_object_count: 3,
             root_ref: Some(dup),
             pages_tree_ref: Some(dup),
-            info_ref: None,
-            page_hints: vec![],
-            shared_hints: vec![],
-            per_page_private_objects: vec![],
+            ..Default::default()
         };
         let _ = RenumberMap::from_plan(&plan);
     }
