@@ -895,8 +895,15 @@ pub fn write_linearized<R: Read + Seek>(
                         })?;
                 // Subtract hint stream total length so that qpdf's
                 // adjusted_offset() reconstructs the correct file offset.
-                so_table.header.location =
-                    first_part8_off.saturating_sub(hint_stream_obj_total_len) as u64;
+                so_table.header.location = first_part8_off
+                    .checked_sub(hint_stream_obj_total_len)
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "linearization layout mismatch: first Part-8 shared object offset \
+                             ({first_part8_off}) is less than hint stream length \
+                             ({hint_stream_obj_total_len}); cannot compute shared-hint location"
+                        ))
+                    })? as u64;
             }
 
             // Per-object length_minus_least.  group_offset is no longer a
