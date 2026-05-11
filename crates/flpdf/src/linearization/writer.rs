@@ -9,8 +9,9 @@
 //! ```text
 //! Annex F Part | Contents in this impl
 //! -------------|-------------------------------------------------------------------
-//! Part 1       | header + linearization param dict (object 1) with placeholders
-//!              | + Part 1 xref subsection (object 1 only) + trailer
+//! Part 1       | header + linearization param dict (`renumber.param_dict_ref()`)
+//!              | with placeholders + Part 1 xref subsection (param-dict obj only)
+//!              | + trailer
 //! Part 2       | hint stream object (compressed, with /Filter /FlateDecode /S …)
 //! Part 3       | first-page body — Plan.part2_objects with renumbered refs
 //! Part 4       | shared/catalog/info — Plan.part3_objects with renumbered refs
@@ -26,8 +27,13 @@
 //! - `Plan.part3_objects` → Annex F Part 4 (shared/catalog/info)
 //! - `Plan.part4_objects` → Annex F Part 5 (remaining body)
 //!
-//! The hint stream (Annex F Part 2) does **not** appear in the plan's object
-//! lists; its new object number is `renumber.len() + 1`.
+//! The param-dict and hint-stream object numbers are **dynamic** — the
+//! renumber map decides which slots they occupy. Use
+//! [`RenumberMap::param_dict_ref`] and [`RenumberMap::hint_stream_slot`]
+//! to query their actual positions; the writer reads both fields from
+//! the renumber map rather than assuming `1` and `renumber.len() + 1`.
+//! /Size in the trailer is `renumber.len() as u32 + 1` (the `total_count`
+//! local), which already accounts for both reserved slots.
 //!
 //! # 2-pass algorithm
 //!
@@ -472,10 +478,12 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// body parts) and a [`RenumberMap`] (which assigns the correct linearized
 /// object numbers), this function:
 ///
-/// 1. Emits Part 1: header + linearization param dict (object 1) with
-///    placeholder numeric values, followed by a one-object xref subsection
-///    and trailer.
-/// 2. Emits the hint stream object (Annex F Part 2).
+/// 1. Emits Part 1: header + linearization param dict (whose object number is
+///    `renumber.param_dict_ref().number` — typically 3 with the qpdf-aligned
+///    slot allocation, never assumed to be 1) with placeholder numeric values,
+///    followed by a one-object xref subsection and trailer.
+/// 2. Emits the hint stream object at `renumber.hint_stream_slot()` (Annex F
+///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
 /// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
 /// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
 /// 5. Emits the remaining body objects (`Plan.part4_objects` — Annex F Part 5).

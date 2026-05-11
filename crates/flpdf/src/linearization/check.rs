@@ -21,7 +21,8 @@
 //!
 //! The function returns a `LinearizationCheckResult`:
 //! - `Ok(())` — all checks passed
-//! - `Err(LinearizationCheckError::NotLinearized)` — object 1 has no `/Linearized` key
+//! - `Err(LinearizationCheckError::NotLinearized)` — the first object in the
+//!   file (physical position, not object number) has no `/Linearized` key
 //! - `Err(LinearizationCheckError::InvalidParam { … })` — a param-dict invariant failed
 //! - `Err(LinearizationCheckError::Io(…))` — I/O failure reading the file
 
@@ -38,7 +39,11 @@ use std::io::{BufReader, Read, Seek};
 /// Reason a linearization check failed.
 #[derive(Debug)]
 pub enum LinearizationCheckError {
-    /// The PDF is not linearized (object 1 lacks `/Linearized`).
+    /// The PDF is not linearized: the first object physically present in the
+    /// file (as located by [`find_first_object_ref`]) is missing or does not
+    /// expose a `/Linearized` key. PDF 1.7 Annex F.2.2.1 mandates that the
+    /// linearization parameter dictionary be the first object in a linearized
+    /// file, regardless of its object number.
     NotLinearized,
     /// A param-dict invariant failed.  `message` describes what went wrong in
     /// actionable terms suitable for printing to stderr.
@@ -51,7 +56,10 @@ impl fmt::Display for LinearizationCheckError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LinearizationCheckError::NotLinearized => {
-                write!(f, "not a linearized PDF: object 1 has no /Linearized key")
+                write!(
+                    f,
+                    "not a linearized PDF: the first object in the file has no /Linearized key"
+                )
             }
             LinearizationCheckError::InvalidParam { message } => {
                 write!(f, "linearization check failed: {message}")
@@ -496,40 +504,47 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 /// Returns `None` if no object header is found (e.g. truncated or
 /// non-PDF input).
 fn find_first_object_ref(file_bytes: &[u8]) -> Option<ObjectRef> {
-    // Scan for "<digits> <digits> obj". To be robust against the header
-    // (`%PDF-1.x`) and the binary marker line, look for the literal " obj"
-    // and back up to the start of the number pair. This is the same shape
-    // `parse_obj_header_at` consumes.
+    // Scan for "<digits> <digits> obj" anchored at a real line start.
+    //
+    // Two false-positive hazards if we only look for the literal " obj":
+    //
+    // 1. A comment line such as `% the first object is 12 7 obj <- example`
+    //    in the header area would match.
+    // 2. The literal word `object` (e.g. inside a content stream) would
+    //    match because its prefix `obj` is the same.
+    //
+    // We defend against (1) by requiring the candidate to start at a line
+    // beginning that is NOT a `%` comment, and against (2) by tightening
+    // `parse_obj_header_at` so the `obj` keyword must be followed by a
+    // PDF whitespace byte (or EOF) — `obj` directly followed by `e` is
+    // rejected as the word "object".
     let mut i = 0;
     while i + 4 <= file_bytes.len() {
-        if let Some(pos) = file_bytes[i..]
-            .windows(5)
-            .position(|w| w == b" obj\n")
-            .or_else(|| file_bytes[i..].windows(5).position(|w| w == b" obj\r"))
-            .or_else(|| file_bytes[i..].windows(4).position(|w| w == b" obj"))
+        let pos_in_slice = file_bytes[i..].windows(4).position(|w| w == b" obj")?;
+        let abs = i + pos_in_slice;
+        // Walk back over digits + space + digits.
+        let mut start = abs;
+        while start > 0 && (file_bytes[start - 1].is_ascii_digit() || file_bytes[start - 1] == b' ')
         {
-            // Look back from the " obj" position to find the start of the
-            // "<num> <gen>" pair.
-            let abs = i + pos;
-            // Walk back over digits + space + digits.
-            let mut start = abs;
-            while start > 0
-                && (file_bytes[start - 1].is_ascii_digit() || file_bytes[start - 1] == b' ')
-            {
-                start -= 1;
-            }
-            // Skip any whitespace at start.
-            while start < abs && is_pdf_whitespace(file_bytes[start]) {
-                start += 1;
-            }
+            start -= 1;
+        }
+        // Skip any whitespace at start.
+        while start < abs && is_pdf_whitespace(file_bytes[start]) {
+            start += 1;
+        }
+
+        let at_line_start =
+            start == 0 || matches!(file_bytes.get(start - 1), Some(b'\n') | Some(b'\r'));
+        let not_in_comment = file_bytes.get(start) != Some(&b'%');
+
+        if at_line_start && not_in_comment {
             if let Some((num, gen)) = parse_obj_header_at(&file_bytes[start..]) {
                 return Some(ObjectRef::new(num, gen));
             }
-            // Failed to parse; advance past this position to avoid infinite loop.
-            i = abs + 4;
-            continue;
         }
-        return None;
+        // Either not at a line start, in a comment, or failed strict parse.
+        // Advance past this " obj" position to keep searching.
+        i = abs + 4;
     }
     None
 }
@@ -583,6 +598,16 @@ fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
     // The `obj` keyword.
     if window.get(i..i + 3) != Some(b"obj") {
         return None;
+    }
+    i += 3;
+
+    // The keyword must end at a PDF whitespace byte (or EOF). Without this
+    // post-token check the parser would also accept `object` and surface a
+    // bogus `(num, gen)` pair to `find_first_object_ref`.
+    match window.get(i) {
+        None => {}
+        Some(&b) if is_pdf_whitespace(b) => {}
+        _ => return None,
     }
 
     Some((obj_num, obj_gen))
@@ -819,5 +844,45 @@ mod tests {
     #[test]
     fn find_first_object_ref_returns_none_on_missing_obj() {
         assert_eq!(find_first_object_ref(b"%PDF-1.7\nxref\n0 0\n"), None);
+    }
+
+    #[test]
+    fn find_first_object_ref_skips_comment_lines_that_look_like_obj_headers() {
+        // A comment in the header area may textually contain "<N> <G> obj"
+        // (qpdf, for instance, used to embed similar tokens in pdf comments).
+        // The scanner must skip the comment and resolve the actual obj that
+        // starts the body.
+        let bytes: &[u8] = b"%PDF-1.7\n% example: 12 7 obj inside comment\n3 0 obj\n<<>>\n";
+        let r = find_first_object_ref(bytes).expect("expected an object ref");
+        assert_eq!(r.number, 3);
+        assert_eq!(r.generation, 0);
+    }
+
+    #[test]
+    fn find_first_object_ref_rejects_word_object_in_content_stream() {
+        // The literal `obj` is also a prefix of the word `object`. Without
+        // a delimiter check after the keyword, the scanner would surface
+        // bogus `(num, gen)` pairs whenever a real content stream mentions
+        // an "object" coordinate.
+        let bytes: &[u8] = b"%PDF-1.7\nq 12 7 object\nQ\n5 0 obj\n";
+        let r = find_first_object_ref(bytes).expect("expected an object ref");
+        assert_eq!(r.number, 5);
+        assert_eq!(r.generation, 0);
+    }
+
+    #[test]
+    fn parse_obj_header_rejects_object_word() {
+        // Direct unit-level check: `12 7 object` must not parse as
+        // `(12, 7) obj …` because the `obj` keyword is followed by a
+        // letter, not a PDF whitespace byte.
+        assert_eq!(parse_obj_header_at(b"12 7 object"), None);
+    }
+
+    #[test]
+    fn parse_obj_header_accepts_obj_followed_by_eof() {
+        // Degenerate but tolerable: `12 7 obj` at the very end of the
+        // buffer should still parse since there is no following byte to
+        // disprove the delimiter.
+        assert_eq!(parse_obj_header_at(b"12 7 obj"), Some((12, 7)));
     }
 }

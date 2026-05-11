@@ -160,7 +160,9 @@ fn run_command(command: Commands) -> CliResult<()> {
                 Ok(())
             }
             Err(LinearizationCheckError::NotLinearized) => {
-                eprintln!("flpdf: not a linearized PDF: object 1 has no /Linearized key");
+                eprintln!(
+                    "flpdf: not a linearized PDF: the first object in the file has no /Linearized key"
+                );
                 std::process::exit(1);
             }
             Err(LinearizationCheckError::InvalidParam { message }) => {
