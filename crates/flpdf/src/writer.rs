@@ -3,6 +3,28 @@ use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefO
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 
+/// Options controlling [`write_pdf_with_options`].
+///
+/// Constructed via `Default::default()` or struct literal. The struct is
+/// `#[non_exhaustive]` so additional fields can be added without breaking
+/// existing callers.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone)]
+pub struct WriteOptions {
+    /// Override the trailer `/ID`'s second element (the changing identifier)
+    /// with qpdf's static-id constant — the first 32 hex digits of π. The
+    /// first element (the permanent identifier) is preserved from the input
+    /// trailer when present; if absent, both elements are set to the constant.
+    /// Mirrors `qpdf --static-id` and is intended for byte-identical testing.
+    pub static_id: bool,
+}
+
+/// qpdf's static-id constant: the first 32 hex digits of π, encoded as 16 raw
+/// bytes so the trailer emits `<31415926535897932384626433832795>`.
+const QPDF_STATIC_ID: [u8; 16] = [
+    0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27, 0x95,
+];
+
 /// Write `pdf` as an incrementally-updated revision (qpdf's default `--object-streams=preserve` mode).
 ///
 /// The original bytes are copied to `out` unchanged, then a single update section is
@@ -12,7 +34,16 @@ use std::io::{Read, Seek, Write};
 /// compact when the source used cross-reference streams.
 ///
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
-pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
+pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<()> {
+    write_pdf_with_options(pdf, out, &WriteOptions::default())
+}
+
+/// Like [`write_pdf`] but with caller-supplied [`WriteOptions`].
+pub fn write_pdf_with_options<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriteOptions,
+) -> Result<()> {
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
@@ -69,6 +100,7 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
         object_count,
         pdf.previous_xref_offset(),
         xref_offset,
+        options,
     )?;
 
     out.write_all(&bytes)?;
@@ -692,6 +724,7 @@ fn write_incremental_trailer<R: Read + Seek>(
     object_count: usize,
     previous_xref_offset: u64,
     xref_offset: usize,
+    options: &WriteOptions,
 ) -> Result<()> {
     let mut trailer = pdf.trailer().clone();
     strip_xref_stream_trailer_keys(&mut trailer);
@@ -703,11 +736,32 @@ fn write_incremental_trailer<R: Read + Seek>(
             crate::Error::Unsupported("startxref offset does not fit i64".to_string())
         })?),
     );
+    if options.static_id {
+        apply_static_id(&mut trailer);
+    }
 
     bytes.extend_from_slice(b"trailer\n");
     trailer.write_pdf(bytes);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
+}
+
+/// Replace `trailer`'s `/ID` so the changing identifier (element 2) is qpdf's
+/// static-id constant. The permanent identifier (element 1) is taken from the
+/// existing `/ID` when its shape matches a 2-element array of strings; in any
+/// other case (missing, wrong arity, wrong types) both elements fall back to
+/// the constant — matching qpdf's behaviour on inputs without a usable `/ID`.
+fn apply_static_id(trailer: &mut Dictionary) {
+    let pi_id = Object::String(QPDF_STATIC_ID.to_vec());
+    let first_id = match trailer.get("ID") {
+        Some(Object::Array(values))
+            if values.len() == 2 && matches!(values[0], Object::String(_)) =>
+        {
+            values[0].clone()
+        }
+        _ => pi_id.clone(),
+    };
+    trailer.insert("ID", Object::Array(vec![first_id, pi_id]));
 }
 
 fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {

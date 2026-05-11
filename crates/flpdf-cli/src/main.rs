@@ -5,7 +5,8 @@ use flpdf::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
     },
-    outline, pages, write_pdf, write_qdf, Object, ObjectRef, Pdf, Severity,
+    outline, pages, write_pdf_with_options, write_qdf, Object, ObjectRef, Pdf, Severity,
+    WriteOptions,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -111,6 +112,10 @@ struct RewriteCommand {
     /// Produce a linearized ("fast web view") output PDF.
     #[arg(long)]
     linearize: bool,
+    /// Use a fixed value for the trailer /ID's changing identifier (qpdf
+    /// --static-id equivalent). Testing only; not for production output.
+    #[arg(long = "static-id")]
+    static_id: bool,
 }
 
 fn main() {
@@ -137,7 +142,7 @@ fn main() {
     } else if args.check {
         run_check(args.input, args.repair)
     } else {
-        run_rewrite(args.input, args.output, args.repair, false)
+        run_rewrite(args.input, args.output, args.repair, false, false)
     };
 
     if let Err(error) = result {
@@ -173,9 +178,13 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair),
-        Commands::Rewrite(cmd) => {
-            run_rewrite(Some(cmd.input), Some(cmd.output), cmd.repair, cmd.linearize)
-        }
+        Commands::Rewrite(cmd) => run_rewrite(
+            Some(cmd.input),
+            Some(cmd.output),
+            cmd.repair,
+            cmd.linearize,
+            cmd.static_id,
+        ),
     }
 }
 
@@ -207,11 +216,17 @@ fn run_rewrite(
     output: Option<PathBuf>,
     repair: bool,
     linearize: bool,
+    static_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
 
     if linearize {
+        if static_id {
+            return Err(
+                "--static-id with --linearize is not yet supported (tracked in epic 9hc.20)".into(),
+            );
+        }
         let mut pdf = open_pdf(&input, repair)?;
         let plan = LinearizationPlan::from_pdf(&mut pdf)?;
         let renumber = RenumberMap::from_plan(&plan);
@@ -225,7 +240,9 @@ fn run_rewrite(
     } else {
         let mut pdf = open_pdf(&input, repair)?;
         let mut out = File::create(output)?;
-        write_pdf(&mut pdf, &mut out)?;
+        let mut options = WriteOptions::default();
+        options.static_id = static_id;
+        write_pdf_with_options(&mut pdf, &mut out, &options)?;
     }
     Ok(())
 }

@@ -60,7 +60,7 @@ pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use parser::parse_object;
 pub use reader::Pdf;
-pub use writer::{write_pdf, write_qdf};
+pub use writer::{write_pdf, write_pdf_with_options, write_qdf, WriteOptions};
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
     LoadedXref, XrefForm, XrefOffset,
