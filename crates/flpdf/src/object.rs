@@ -282,10 +282,15 @@ fn ends_with_delim(o: &Object) -> bool {
     )
 }
 
+/// Returns `true` when `value` can be emitted as a single-line literal string
+/// `(...)`. qpdf uses the literal form whenever every byte is printable ASCII
+/// (0x20–0x7e) even if the value contains `(`, `)`, or `\` — those simply
+/// need escaping. We mirror that: only CR / LF force the hex fallback because
+/// flpdf does not currently emit multi-line literals.
 fn is_printable_string(value: &[u8]) -> bool {
-    value.iter().all(|byte| {
-        (0x20..=0x7e).contains(byte) && !matches!(*byte, b'(' | b')' | b'\\' | b'\r' | b'\n')
-    })
+    value
+        .iter()
+        .all(|byte| (0x20..=0x7e).contains(byte) && !matches!(*byte, b'\r' | b'\n'))
 }
 
 fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
