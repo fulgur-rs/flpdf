@@ -169,7 +169,8 @@ fn static_id_trailer_id_matches_qpdf_oracle() {
 }
 
 #[test]
-fn static_id_with_linearize_is_rejected() {
+fn static_id_with_linearize_succeeds() {
+    // --static-id with --linearize is now supported (epic 9hc.20 sub-task .19).
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("out.pdf");
@@ -182,5 +183,10 @@ fn static_id_with_linearize_is_rejected() {
         .arg(&input)
         .arg(&output)
         .assert()
-        .failure();
+        .success();
+
+    assert!(
+        output.exists(),
+        "linearized --static-id output must be created"
+    );
 }

@@ -67,7 +67,7 @@ use crate::linearization::hint_stream::encode_hint_stream;
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::RenumberMap;
-use crate::writer::{effective_pdf_version, WriteOptions};
+use crate::writer::{effective_pdf_version, WriteOptions, QPDF_STATIC_ID};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
 // ---------------------------------------------------------------------------
@@ -123,6 +123,13 @@ pub struct LinearizedOffsets {
     /// `new_object_number → byte_offset` map covering every object in the
     /// linearized file.  Used by sub-task 2.11 for structural verification.
     pub xref_offsets: BTreeMap<u32, usize>,
+
+    /// Byte range of the `/Prev` value placeholder in the Part 1 (first)
+    /// trailer.  The value is written as a left-justified decimal integer
+    /// padded on the right with spaces to exactly [`PREV_PLACEHOLDER_WIDTH`]
+    /// bytes.  The back-patcher overwrites this range with the actual
+    /// `last_xref_keyword_offset` value.
+    pub first_trailer_prev_range: std::ops::Range<usize>,
 }
 
 /// The finished linearized PDF together with the offset metadata.
@@ -133,6 +140,17 @@ pub struct LinearizedDocument {
     /// Offset metadata for back-patching.
     pub offsets: LinearizedOffsets,
 }
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Width of the `/Prev` value field in the Part 1 (first) trailer.
+///
+/// The value is written as a left-justified decimal integer with space-padding
+/// on the right, matching qpdf's convention.  22 bytes is sufficient for any
+/// PDF file offset up to 10^22 - 1 (qpdf uses the same width).
+pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -193,36 +211,117 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
 }
 
 /// Write a Part 1 xref subsection (the linearization parameter dict only) plus
-/// a minimal trailer, then return the `startxref` offset of this xref block.
+/// a first-page trailer, then return `(xref_offset, prev_value_range)`.
 ///
 /// The Part 1 xref is required by the linearized PDF spec so that a viewer can
 /// quickly locate the linearization parameter dict without parsing the whole
 /// file.  It covers only the param-dict object (at whatever number the
 /// renumber map assigned it); all other objects are recorded in Part 6.
+///
+/// The first-page trailer includes `/Info` (when present), `/Root`, `/Size`,
+/// `/Prev`, and `/ID` — matching qpdf's key order and content for linearized
+/// PDFs.  The `/Prev` value is written as a left-justified decimal integer
+/// padded on the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes so it
+/// can be back-patched in-place once the Part 6 xref offset is known.
+///
+/// Returns `(xref_keyword_offset, prev_value_byte_range)` where
+/// `prev_value_byte_range` is the absolute byte range of the `/Prev` value
+/// field in `bytes` (for back-patching).
+#[allow(clippy::too_many_arguments)]
 fn write_part1_xref_and_trailer(
     bytes: &mut Vec<u8>,
     param_dict_offset: usize,
     param_dict_obj_number: u32,
     total_object_count: u32,
     catalog_new_ref: ObjectRef,
-) -> usize {
+    info_new_ref: Option<ObjectRef>,
+    options: &WriteOptions,
+    source_trailer: &Dictionary,
+) -> (usize, std::ops::Range<usize>) {
     let xref_offset = bytes.len();
 
     // Subsection: param dict object only.
     bytes.extend_from_slice(format!("xref\n{param_dict_obj_number} 1\n").as_bytes());
     bytes.extend_from_slice(format!("{:010} 00000 n \n", param_dict_offset).as_bytes());
 
-    // Minimal trailer for Part 1.
-    let mut trailer = Dictionary::new();
-    trailer.insert("Size", Object::Integer(i64::from(total_object_count)));
-    trailer.insert("Root", Object::Reference(catalog_new_ref));
-    bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(bytes);
+    // First-page trailer for Part 1.  qpdf emits keys in this order:
+    //   /Info /Root /Size /Prev /ID
+    // We write the dict as raw bytes (not via Dictionary::write_pdf) to:
+    //   (a) preserve qpdf's key order (BTreeMap would alphabetise),
+    //   (b) reserve a fixed-width space-padded field for /Prev back-patching.
+    bytes.extend_from_slice(b"trailer << ");
+
+    // /Info (omit when absent — qpdf also omits it when the source has none)
+    if let Some(info_ref) = info_new_ref {
+        bytes.extend_from_slice(
+            format!("/Info {} {} R ", info_ref.number, info_ref.generation).as_bytes(),
+        );
+    }
+
+    // /Root
+    bytes.extend_from_slice(
+        format!(
+            "/Root {} {} R ",
+            catalog_new_ref.number, catalog_new_ref.generation
+        )
+        .as_bytes(),
+    );
+
+    // /Size
+    bytes.extend_from_slice(format!("/Size {} ", total_object_count).as_bytes());
+
+    // /Prev — placeholder: left-justified 0, space-padded to PREV_PLACEHOLDER_WIDTH bytes.
+    bytes.extend_from_slice(b"/Prev ");
+    let prev_value_start = bytes.len();
+    // Write placeholder: "0" left-justified, padded to PREV_PLACEHOLDER_WIDTH with spaces.
+    let placeholder = format!("{:<PREV_PLACEHOLDER_WIDTH$}", 0);
+    bytes.extend_from_slice(placeholder.as_bytes());
+    let prev_value_end = bytes.len();
+
+    // /ID — emit only when meaningful.
+    //
+    // Three cases:
+    //   1. --static-id: emit the fixed [source_id0, π_const] array (or [π_const, π_const]
+    //      when the source has no /ID).
+    //   2. source trailer has /ID: inherit it verbatim.
+    //   3. Neither: omit the /ID key entirely.  The PDF spec (ISO 32000) marks
+    //      /ID as optional in the trailer; emitting an empty array `[]` is not a
+    //      valid two-element byte-string array and may cause conforming readers to
+    //      reject the file as malformed.
+    let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
+    if options.static_id {
+        // static-id: [π_const, π_const] — both elements set to qpdf constant.
+        // (first element preserved from source if available, like apply_static_id)
+        let first_id = match source_trailer.get("ID") {
+            Some(Object::Array(values))
+                if values.len() == 2 && matches!(values[0], Object::String(_)) =>
+            {
+                values[0].clone()
+            }
+            _ => pi_bytes.clone(),
+        };
+        let id_array = Object::Array(vec![first_id, pi_bytes]);
+        bytes.extend_from_slice(b" /ID ");
+        id_array.write_pdf(bytes);
+    } else {
+        // Dynamic ID: inherit from source trailer, or omit entirely.
+        match source_trailer.get("ID") {
+            Some(id_obj) => {
+                bytes.extend_from_slice(b" /ID ");
+                id_obj.write_pdf(bytes);
+            }
+            None => {
+                // Source has no /ID and --static-id is not set — omit the key.
+            }
+        }
+    }
+
+    bytes.extend_from_slice(b" >>");
     // startxref points to the xref keyword offset of this Part 1 xref section.
     // PDF spec §7.5.5 requires startxref to be the byte offset of the xref keyword.
     bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", xref_offset).as_bytes());
 
-    xref_offset
+    (xref_offset, prev_value_start..prev_value_end)
 }
 
 /// Write the Part 6 cross-reference table covering all objects (0 through N),
@@ -292,7 +391,8 @@ fn build_hint_stream_object(
 /// Perform a complete single-pass write of the linearized PDF body.
 ///
 /// Returns `(bytes, xref_offsets, hint_stream_offset, hint_stream_obj_total_len,
-///           end_of_first_page_offset, last_xref_offset, last_xref_first_entry_offset)`.
+///           end_of_first_page_offset, last_xref_offset, last_xref_first_entry_offset,
+///           first_trailer_prev_range)`.
 ///
 /// `hint_compressed` is the compressed payload to use for the hint stream object.
 /// `hint_shared_section_offset` is the `/S` value (offset within the uncompressed stream).
@@ -309,14 +409,17 @@ fn do_write_pass<R: Read + Seek>(
     _first_page_object_new_num: u32,
     hint_compressed: &[u8],
     hint_shared_section_offset: usize,
+    options: &WriteOptions,
+    source_trailer: &Dictionary,
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
-    usize, // hint_stream_offset
-    usize, // hint_stream_obj_total_len
-    usize, // end_of_first_page_offset
-    usize, // last_xref_offset (xref keyword position)
-    usize, // last_xref_first_entry_offset (= /T value per qpdf's convention)
+    usize,                  // hint_stream_offset
+    usize,                  // hint_stream_obj_total_len
+    usize,                  // end_of_first_page_offset
+    usize,                  // last_xref_offset (xref keyword position)
+    usize,                  // last_xref_first_entry_offset (= /T value per qpdf's convention)
+    std::ops::Range<usize>, // first_trailer_prev_range
 )> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
@@ -326,12 +429,15 @@ fn do_write_pass<R: Read + Seek>(
     let param_dict_absolute_offset = part1.obj1_offset;
     bytes.extend_from_slice(&part1.bytes);
     xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
-    write_part1_xref_and_trailer(
+    let (_p1_xref_offset, first_trailer_prev_range) = write_part1_xref_and_trailer(
         &mut bytes,
         param_dict_absolute_offset,
         param_dict_obj_number,
         total_count,
         catalog_new_ref,
+        info_new_ref,
+        options,
+        source_trailer,
     );
 
     // Hint stream object
@@ -410,6 +516,7 @@ fn do_write_pass<R: Read + Seek>(
         end_of_first_page_offset,
         last_xref_offset,
         last_xref_first_entry_offset,
+        first_trailer_prev_range,
     ))
 }
 
@@ -563,6 +670,9 @@ pub fn write_linearized<R: Read + Seek>(
     let mut current_hint_compressed = hint_bytes_initial.compressed;
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
 
+    // Capture the source trailer once; it does not change across iterations.
+    let source_trailer = pdf.trailer().clone();
+
     // ------------------------------------------------------------------
     // Convergence loop (max 3 iterations).
     // ------------------------------------------------------------------
@@ -574,6 +684,7 @@ pub fn write_linearized<R: Read + Seek>(
     let mut final_end_of_first_page_offset: usize = 0;
     let mut final_last_xref_keyword_offset: usize = 0;
     let mut final_last_xref_first_entry_offset: usize = 0;
+    let mut final_first_trailer_prev_range: std::ops::Range<usize> = 0..0;
 
     for iter in 0..max_iters {
         let (
@@ -584,6 +695,7 @@ pub fn write_linearized<R: Read + Seek>(
             end_of_first_page_offset,
             last_xref_offset,
             last_xref_first_entry_offset,
+            _probe_prev_range,
         ) = do_write_pass(
             plan,
             renumber,
@@ -596,6 +708,8 @@ pub fn write_linearized<R: Read + Seek>(
             first_page_object_new_num,
             &current_hint_compressed,
             current_hint_shared_s,
+            options,
+            &source_trailer,
         )?;
 
         // ------------------------------------------------------------------
@@ -810,6 +924,7 @@ pub fn write_linearized<R: Read + Seek>(
                 efp_final,
                 lxr_final,
                 lxr_first_final,
+                prev_range_final,
             ) = do_write_pass(
                 plan,
                 renumber,
@@ -822,6 +937,8 @@ pub fn write_linearized<R: Read + Seek>(
                 first_page_object_new_num,
                 &current_hint_compressed,
                 current_hint_shared_s,
+                options,
+                &source_trailer,
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;
@@ -830,6 +947,7 @@ pub fn write_linearized<R: Read + Seek>(
             final_end_of_first_page_offset = efp_final;
             final_last_xref_keyword_offset = lxr_final;
             final_last_xref_first_entry_offset = lxr_first_final;
+            final_first_trailer_prev_range = prev_range_final;
             break;
         }
     }
@@ -853,6 +971,7 @@ pub fn write_linearized<R: Read + Seek>(
         page_count,
         part1_placeholders,
         xref_offsets: final_xref_offsets,
+        first_trailer_prev_range: final_first_trailer_prev_range,
     };
 
     Ok(LinearizedDocument {

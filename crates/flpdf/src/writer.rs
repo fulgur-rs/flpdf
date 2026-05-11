@@ -120,7 +120,7 @@ const QPDF_BINARY_MARKER: &[u8] = b"%\xbf\xf7\xa2\xfe\n";
 
 /// qpdf's static-id constant: the first 32 hex digits of π, encoded as 16 raw
 /// bytes so the trailer emits `<31415926535897932384626433832795>`.
-const QPDF_STATIC_ID: [u8; 16] = [
+pub(crate) const QPDF_STATIC_ID: [u8; 16] = [
     0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27, 0x95,
 ];
 
@@ -850,7 +850,7 @@ fn write_incremental_trailer<R: Read + Seek>(
 /// existing `/ID` when its shape matches a 2-element array of strings; in any
 /// other case (missing, wrong arity, wrong types) both elements fall back to
 /// the constant — matching qpdf's behaviour on inputs without a usable `/ID`.
-fn apply_static_id(trailer: &mut Dictionary) {
+pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
     let pi_id = Object::String(QPDF_STATIC_ID.to_vec());
     let first_id = match trailer.get("ID") {
         Some(Object::Array(values))

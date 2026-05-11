@@ -313,7 +313,73 @@ fn linearize_force_version_overrides_linearize_floor() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. parse_pdf_version / effective_pdf_version unit tests
+// 10. /ID omission: when source has no /ID and --static-id is not set,
+//     the linearized output must not contain a /ID key.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_no_source_id_omits_id_key() {
+    // minimal_pdf_bytes() builds a trailer with no /ID entry.
+    let input = write_temp(&minimal_pdf_bytes());
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("linearized.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+
+    // The trailer must not contain the /ID key at all.
+    let id_needle = b"/ID";
+    assert!(
+        !bytes.windows(id_needle.len()).any(|w| w == id_needle),
+        "linearized output must not contain /ID when source has none and --static-id is off"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. /ID present: when --static-id is set, the linearized output must
+//     contain /ID (regression guard for the static-id path).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linearize_static_id_emits_id_key() {
+    let input = write_temp(&minimal_pdf_bytes());
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("linearized-static.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--static-id",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+
+    // The trailer must contain /ID when --static-id is set.
+    let id_needle = b"/ID";
+    assert!(
+        bytes.windows(id_needle.len()).any(|w| w == id_needle),
+        "linearized output with --static-id must contain /ID"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. parse_pdf_version / effective_pdf_version unit tests
 // ---------------------------------------------------------------------------
 
 #[test]

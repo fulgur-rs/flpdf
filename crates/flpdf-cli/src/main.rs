@@ -260,11 +260,6 @@ fn run_rewrite(
     let output = output.ok_or("missing output file")?;
 
     if linearize {
-        if options.static_id {
-            return Err(
-                "--static-id with --linearize is not yet supported (tracked in epic 9hc.20)".into(),
-            );
-        }
         let mut pdf = open_pdf(&input, repair)?;
         let plan = LinearizationPlan::from_pdf(&mut pdf)?;
         let renumber = RenumberMap::from_plan(&plan);
