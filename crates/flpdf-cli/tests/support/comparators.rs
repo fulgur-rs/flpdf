@@ -615,20 +615,22 @@ fn compare_objects(
             compare_dicts(path, a, b, pdf_q, pdf_f, visited)
         }
         (Object::Stream(a), Object::Stream(b)) => {
-            // Compare the dictionary part first.
-            compare_dicts(
-                &format!("{path}/dict"),
-                &a.dict,
-                &b.dict,
-                pdf_q,
-                pdf_f,
-                visited,
-            )?;
-            // Compare stream data: prefer decoded comparison.
+            // Try decoded comparison first; encoding-dependent dict keys are
+            // skipped only when both sides decode successfully (i.e. we're
+            // comparing semantic content, not the raw encoded form).
             let decoded_a = decode_stream_data(&a.dict, &a.data);
             let decoded_b = decode_stream_data(&b.dict, &b.data);
             match (decoded_a, decoded_b) {
                 (Ok(da), Ok(db)) => {
+                    compare_dicts_with_excluded(
+                        &format!("{path}/dict"),
+                        &a.dict,
+                        &b.dict,
+                        STREAM_ENCODING_KEYS,
+                        pdf_q,
+                        pdf_f,
+                        visited,
+                    )?;
                     if da != db {
                         return Err(format!(
                             "{path}/stream: decoded content differs ({} vs {} bytes)",
@@ -638,7 +640,16 @@ fn compare_objects(
                     }
                 }
                 _ => {
-                    // Fall back to raw comparison.
+                    // Raw fallback: the bytes' relationship to the dictionary
+                    // is significant, so compare the dict as-is.
+                    compare_dicts(
+                        &format!("{path}/dict"),
+                        &a.dict,
+                        &b.dict,
+                        pdf_q,
+                        pdf_f,
+                        visited,
+                    )?;
                     if a.data != b.data {
                         return Err(format!(
                             "{path}/stream: raw content differs (decode failed; {} vs {} bytes)",
@@ -690,6 +701,31 @@ fn compare_dicts(
     pdf_f: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
     visited: &mut BTreeSet<(ObjectRef, ObjectRef)>,
 ) -> Result<(), String> {
+    compare_dicts_with_excluded(path, dict_q, dict_f, &[], pdf_q, pdf_f, visited)
+}
+
+/// Dictionary keys that describe how a stream is encoded rather than what it
+/// semantically contains. When both sides decode successfully the structural
+/// comparator excludes these because qpdf and flpdf may legitimately pick
+/// different encoded lengths or filter chains for the same decoded payload.
+const STREAM_ENCODING_KEYS: &[&[u8]] = &[
+    b"Length",
+    b"Filter",
+    b"DecodeParms",
+    b"F",
+    b"FFilter",
+    b"FDecodeParms",
+];
+
+fn compare_dicts_with_excluded(
+    path: &str,
+    dict_q: &Dictionary,
+    dict_f: &Dictionary,
+    excluded_keys: &[&[u8]],
+    pdf_q: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
+    pdf_f: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
+    visited: &mut BTreeSet<(ObjectRef, ObjectRef)>,
+) -> Result<(), String> {
     let mut all_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
     for (k, _) in dict_q.iter() {
         all_keys.insert(k.to_vec());
@@ -698,6 +734,9 @@ fn compare_dicts(
         all_keys.insert(k.to_vec());
     }
     for key in &all_keys {
+        if excluded_keys.contains(&key.as_slice()) {
+            continue;
+        }
         let key_str = lossy_name(key);
         let child_path = format!("{path}/{key_str}");
         match (dict_q.get(key), dict_f.get(key)) {
@@ -884,6 +923,63 @@ mod tests {
             }
             other => panic!("expected Diverge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compare_dicts_with_excluded_skips_listed_keys() {
+        // Build two dictionaries that differ only in /Length and /Filter —
+        // exactly the keys a real encoder would vary even when the decoded
+        // stream content is identical.
+        let mut dict_q = Dictionary::new();
+        dict_q.insert("Type", Object::Name(b"XObject".to_vec()));
+        dict_q.insert("Length", Object::Integer(100));
+        dict_q.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+
+        let mut dict_f = Dictionary::new();
+        dict_f.insert("Type", Object::Name(b"XObject".to_vec()));
+        dict_f.insert("Length", Object::Integer(200));
+        dict_f.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+
+        // Open a fixture twice solely to obtain Pdf instances; the dict
+        // values we compare contain no indirect references, so no resolution
+        // actually happens.
+        let bytes = fixture_bytes("one-page.pdf");
+        let mut pdf_q = Pdf::open(BufReader::new(Cursor::new(bytes.clone()))).unwrap();
+        let mut pdf_f = Pdf::open(BufReader::new(Cursor::new(bytes))).unwrap();
+        let mut visited = BTreeSet::new();
+
+        // Without the exclusion list, an encoding-key divergence is
+        // reported (BTreeSet ordering picks /Filter first, then /Length —
+        // either is acceptable as long as the error points at one).
+        let err = compare_dicts_with_excluded(
+            "/x",
+            &dict_q,
+            &dict_f,
+            &[],
+            &mut pdf_q,
+            &mut pdf_f,
+            &mut visited,
+        )
+        .expect_err("expected an encoding-key divergence");
+        assert!(
+            err.contains("/Length") || err.contains("/Filter"),
+            "expected encoding-key in error, got: {err}"
+        );
+
+        // With STREAM_ENCODING_KEYS exclusion (the production setting for
+        // streams whose decoded content matched), the same dictionaries
+        // compare as equivalent.
+        let mut visited = BTreeSet::new();
+        compare_dicts_with_excluded(
+            "/x",
+            &dict_q,
+            &dict_f,
+            STREAM_ENCODING_KEYS,
+            &mut pdf_q,
+            &mut pdf_f,
+            &mut visited,
+        )
+        .expect("encoding-only divergences must be tolerated when decoded content matches");
     }
 
     // --- JSON parser unit tests ---
