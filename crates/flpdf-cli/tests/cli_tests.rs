@@ -147,6 +147,99 @@ fn rewrite_subcommand_rewrites_output() {
     assert!(std::fs::metadata(output).unwrap().len() > 0);
 }
 
+// ---------------------------------------------------------------------------
+// Version validation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rewrite_force_version_invalid_abc_exits_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--force-version=abc",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("invalid --force-version"));
+}
+
+#[test]
+fn rewrite_force_version_with_newline_exits_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .arg("--force-version=1.4\n")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("invalid --force-version"));
+}
+
+#[test]
+fn rewrite_min_version_invalid_abc_exits_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--min-version=abc",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("invalid --min-version"));
+}
+
+#[test]
+fn rewrite_valid_force_version_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--force-version=1.4",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
+fn rewrite_valid_min_version_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--min-version=1.3",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
 #[test]
 fn show_info_with_repair_flag_handles_corrupt_xref() {
     let temp = tempfile::tempdir().unwrap();

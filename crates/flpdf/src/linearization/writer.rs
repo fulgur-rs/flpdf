@@ -67,6 +67,7 @@ use crate::linearization::hint_stream::encode_hint_stream;
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::RenumberMap;
+use crate::writer::{effective_pdf_version, WriteOptions};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
 // ---------------------------------------------------------------------------
@@ -501,11 +502,13 @@ pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
+    options: &WriteOptions,
 ) -> Result<LinearizedDocument> {
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
-    let part1 = Part1Bytes::build(plan, renumber);
+    let eff_version = effective_pdf_version(pdf.version(), options, true);
+    let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
 
     let catalog_orig = plan.root_ref.ok_or_else(|| {
@@ -866,6 +869,7 @@ pub fn write_linearized<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
+    use crate::writer::WriteOptions;
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -915,7 +919,8 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = open_tiny_pdf();
-        write_linearized(&plan, &renumber, &mut pdf2).expect("write_linearized")
+        write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+            .expect("write_linearized")
     }
 
     // -----------------------------------------------------------------------
@@ -990,10 +995,11 @@ mod tests {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let part1_len = Part1Bytes::build(&plan, &renumber).byte_length();
+        let part1_len = Part1Bytes::build(&plan, &renumber, "1.4").byte_length();
 
         let mut pdf2 = open_tiny_pdf();
-        let doc = write_linearized(&plan, &renumber, &mut pdf2).expect("write");
+        let doc =
+            write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default()).expect("write");
 
         assert!(
             doc.offsets.hint_stream_offset >= part1_len,
@@ -1222,7 +1228,8 @@ mod tests {
             .number;
 
         let mut pdf2 = open_tiny_pdf();
-        let doc = write_linearized(&plan, &renumber, &mut pdf2).expect("write_linearized");
+        let doc = write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+            .expect("write_linearized");
 
         assert_eq!(
             doc.offsets.first_page_object_new_num,

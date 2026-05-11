@@ -658,6 +658,7 @@ mod tests {
     use crate::linearization::plan::LinearizationPlan;
     use crate::linearization::renumber::RenumberMap;
     use crate::linearization::writer::write_linearized;
+    use crate::writer::WriteOptions;
     use std::io::Cursor;
 
     fn tiny_pdf_bytes() -> Vec<u8> {
@@ -691,7 +692,8 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = Pdf::open(Cursor::new(raw)).unwrap();
-        let mut doc = write_linearized(&plan, &renumber, &mut pdf2).unwrap();
+        let mut doc =
+            write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default()).unwrap();
         doc.back_patch().unwrap();
         doc.bytes
     }

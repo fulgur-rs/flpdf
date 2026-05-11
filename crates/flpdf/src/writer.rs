@@ -17,6 +17,96 @@ pub struct WriteOptions {
     /// trailer when present; if absent, both elements are set to the constant.
     /// Mirrors `qpdf --static-id` and is intended for byte-identical testing.
     pub static_id: bool,
+
+    /// Enforce a minimum PDF version in the output header.
+    ///
+    /// The effective version is `max(source_version, min_version)`.  Only
+    /// applies to the new-generation write paths (`write_qdf`, linearize);
+    /// the incremental-update path (`write_pdf`) leaves the source header
+    /// untouched.  Format: `"1.3"`, `"1.7"`, etc.
+    ///
+    /// Mirrors `qpdf --min-version`.
+    pub min_version: Option<String>,
+
+    /// Force the output PDF version header to exactly this value, ignoring the
+    /// source version and the linearize floor.
+    ///
+    /// Mirrors `qpdf --force-version`.
+    pub force_version: Option<String>,
+}
+
+/// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
+///
+/// Returns `None` for any string that does not match `digit+ '.' digit+`.
+/// Only `1.x` documents are common in practice; `2.0` uses the same syntax.
+pub fn parse_pdf_version(v: &str) -> Option<(u8, u8)> {
+    let (major, minor) = v.split_once('.')?;
+    let major: u8 = major.parse().ok()?;
+    let minor: u8 = minor.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Compute the effective PDF version to write given the source version, the
+/// caller-supplied options, and whether the output is linearized.
+///
+/// Rule (mirrors qpdf):
+/// 1. If `options.force_version` is set, use it verbatim.
+/// 2. Otherwise start from `max(source, min_version_option)`.
+/// 3. If `linearize` is true, apply an additional `max(…, "1.2")` floor
+///    (linearized PDFs require at least PDF 1.2).
+///
+/// If the version strings cannot be parsed the function falls back to the
+/// `source` string unchanged (rather than panicking) so callers do not need to
+/// validate before calling.
+pub fn effective_pdf_version<'a>(
+    source: &'a str,
+    options: &'a WriteOptions,
+    linearize: bool,
+) -> &'a str {
+    // --force-version wins outright, but only when the value is a valid version string.
+    // Silently ignore invalid values (same treatment as invalid min_version) so that
+    // callers that cannot pre-validate do not produce a corrupted PDF header.
+    if let Some(ref forced) = options.force_version {
+        if parse_pdf_version(forced).is_some() {
+            return forced.as_str();
+        }
+    }
+
+    // Parse source; bail to source string on failure.
+    let Some(mut best) = parse_pdf_version(source) else {
+        return source;
+    };
+
+    // Apply --min-version floor.
+    if let Some(ref min_v) = options.min_version {
+        if let Some(min_parsed) = parse_pdf_version(min_v) {
+            if min_parsed > best {
+                best = min_parsed;
+            }
+        }
+    }
+
+    // Apply linearize floor (PDF spec requires >= 1.2).
+    if linearize {
+        let lin_floor = (1u8, 2u8);
+        if lin_floor > best {
+            best = lin_floor;
+        }
+    }
+
+    // If best == source parsed, return the original source slice to avoid an
+    // allocation.  Otherwise find which option string owns this version.
+    if parse_pdf_version(source) == Some(best) {
+        return source;
+    }
+    if let Some(ref min_v) = options.min_version {
+        if parse_pdf_version(min_v) == Some(best) {
+            return min_v.as_str();
+        }
+    }
+    // Linearize floor "1.2" — only reached when best == (1,2) and neither
+    // source nor min_version matched.
+    "1.2"
 }
 
 /// Binary header marker emitted by qpdf on the second line of every output
