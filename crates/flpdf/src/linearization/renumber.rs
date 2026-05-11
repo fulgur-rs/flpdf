@@ -24,11 +24,11 @@
 //! numbers stay contiguous. Use [`RenumberMap::param_dict_ref`] and
 //! [`RenumberMap::hint_stream_slot`] to query their actual positions instead
 //! of assuming fixed values. With the fixture corpus (one/two/three-page PDFs
-//! that all carry `/Info`) the slots are:
+//! that all carry `/Info`) the slots are (all matching qpdf byte-for-byte):
+//!
 //! - one-page:   1=Pages, 2=Info, 3=ParamDict, 4=Catalog, 5=HintStream, 6+=Part2
 //! - two-page:   1=Page2dict, 2=Page2content, 3=Pages, 4=Info, 5=ParamDict, 6=Catalog, 7=Hint, 8+=Part2
 //! - three-page: 1-4=Page2+3 objs, 5=Pages, 6=Info, 7=ParamDict, 8=Catalog, 9=Hint, 10+=Part2
-//! These match qpdf byte-for-byte.
 //!
 //! All new object numbers carry `generation = 0` (the linearization spec does
 //! not require preserving generation numbers, and the writer starts fresh).
