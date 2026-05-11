@@ -183,23 +183,25 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
     offset
 }
 
-/// Write a Part 1 xref subsection (object 1 only) plus a minimal trailer, then
-/// return the `startxref` offset of this xref block.
+/// Write a Part 1 xref subsection (the linearization parameter dict only) plus
+/// a minimal trailer, then return the `startxref` offset of this xref block.
 ///
 /// The Part 1 xref is required by the linearized PDF spec so that a viewer can
 /// quickly locate the linearization parameter dict without parsing the whole
-/// file.  It covers only object 1; all other objects are recorded in Part 6.
+/// file.  It covers only the param-dict object (at whatever number the
+/// renumber map assigned it); all other objects are recorded in Part 6.
 fn write_part1_xref_and_trailer(
     bytes: &mut Vec<u8>,
-    obj1_offset: usize,
+    param_dict_offset: usize,
+    param_dict_obj_number: u32,
     total_object_count: u32,
     catalog_new_ref: ObjectRef,
 ) -> usize {
     let xref_offset = bytes.len();
 
-    // Subsection: object 1 only.
-    bytes.extend_from_slice(b"xref\n1 1\n");
-    bytes.extend_from_slice(format!("{:010} 00000 n \n", obj1_offset).as_bytes());
+    // Subsection: param dict object only.
+    bytes.extend_from_slice(format!("xref\n{param_dict_obj_number} 1\n").as_bytes());
+    bytes.extend_from_slice(format!("{:010} 00000 n \n", param_dict_offset).as_bytes());
 
     // Minimal trailer for Part 1.
     let mut trailer = Dictionary::new();
@@ -311,12 +313,14 @@ fn do_write_pass<R: Read + Seek>(
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
 
     // Part 1
-    let obj1_absolute_offset = part1.obj1_offset;
+    let param_dict_obj_number = renumber.param_dict_ref().number;
+    let param_dict_absolute_offset = part1.obj1_offset;
     bytes.extend_from_slice(&part1.bytes);
-    xref_offsets.insert(1, obj1_absolute_offset);
+    xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
     write_part1_xref_and_trailer(
         &mut bytes,
-        obj1_absolute_offset,
+        param_dict_absolute_offset,
+        param_dict_obj_number,
         total_count,
         catalog_new_ref,
     );
@@ -502,8 +506,12 @@ pub fn write_linearized<R: Read + Seek>(
         ))
     })?;
 
-    let hint_stream_new_num: u32 = renumber.next_free();
-    let total_count: u32 = hint_stream_new_num + 1;
+    let hint_stream_new_num: u32 = renumber.hint_stream_slot();
+    // Highest object number actually used in the output: the largest slot in
+    // the renumber map (`len()` already returns that). Adding 1 yields the
+    // /Size value (count = highest_number + 1, because object numbering is
+    // 1-based and Size counts the unused free-list entry at 0).
+    let total_count: u32 = renumber.len() as u32 + 1;
 
     let info_new_ref: Option<ObjectRef> = pdf
         .trailer()
@@ -1015,20 +1023,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 10. xref_offsets[1] equals the obj1 absolute offset (15)
+    // 10. xref_offsets[param_dict_obj_number] equals byte 15 (after the two
+    //     header lines: %PDF-1.7 + binary marker).
     // -----------------------------------------------------------------------
     #[test]
-    fn xref_offsets_obj1_is_correct() {
+    fn xref_offsets_param_dict_is_at_byte_fifteen() {
         let doc = build_linearized();
-        let obj1_off = doc
+        // Whatever number the renumber map assigned the param dict, its
+        // xref offset is the position of the `N 0 obj` token immediately
+        // after the file header.
+        let param_dict_off = doc
             .offsets
             .xref_offsets
-            .get(&1)
+            .values()
             .copied()
+            .min()
             .unwrap_or(usize::MAX);
         assert_eq!(
-            obj1_off, 15,
-            "object 1 must start at byte 15 (after two header lines)"
+            param_dict_off, 15,
+            "the param dict (first object physically) must start at byte 15 \
+             (after %PDF-1.x and the binary marker)"
         );
     }
 

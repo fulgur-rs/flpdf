@@ -162,18 +162,19 @@ impl Part1Bytes {
     ///
     /// where each `XXXXXXXXXX` is a 10-digit zero placeholder.
     pub fn build(_plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
-        // Object 1 is reserved for the linearization parameter dictionary.
-        // The renumber map MUST keep slot 1 unmapped (its constructor reserves
-        // it via SENTINEL).  Asserting this here makes the contract explicit:
-        // a future change to RenumberMap that allocates a real plan object to
-        // new number 1 would silently produce a duplicate `1 0 obj` definition
-        // in the linearized output and corrupt the xref.
+        // The param-dict slot must still hold its sentinel — overwriting it
+        // would cause the writer to emit a duplicate object definition on the
+        // same number, corrupting the xref. The slot number itself is now
+        // dynamic (qpdf places the param dict after the Pages tree / Info
+        // promotion), so the writer reads it from the renumber map.
         debug_assert!(
-            renumber.slot_one_is_reserved(),
-            "Part1Bytes::build: RenumberMap allocated object number 1 to a \
-             plan object — slot 1 must remain reserved for the linearization \
-             parameter dictionary"
+            renumber.param_dict_slot_is_reserved(),
+            "Part1Bytes::build: RenumberMap allocated a plan object on top \
+             of the param-dict slot ({param_slot}) — slot must stay reserved",
+            param_slot = renumber.param_dict_ref().number
         );
+
+        let param_dict_obj_number = renumber.param_dict_ref().number;
 
         let mut bytes: Vec<u8> = Vec::new();
 
@@ -186,12 +187,12 @@ impl Part1Bytes {
         bytes.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
 
         // ------------------------------------------------------------------
-        // Object 1: linearization parameter dictionary
+        // Object {param_dict_obj_number}: linearization parameter dictionary
         // ------------------------------------------------------------------
-        // Capture the absolute offset of the `1 0 obj` token so callers do
-        // not need to compute the header length out of band.
-        let obj1_offset = bytes.len();
-        bytes.extend_from_slice(b"1 0 obj\n");
+        // Capture the absolute offset of the object header token so callers
+        // do not need to compute the file header length out of band.
+        let param_dict_offset = bytes.len();
+        bytes.extend_from_slice(format!("{param_dict_obj_number} 0 obj\n").as_bytes());
         bytes.extend_from_slice(b"<< /Linearized 1 /L ");
 
         // /L placeholder
@@ -257,7 +258,7 @@ impl Part1Bytes {
         Self {
             bytes,
             placeholders,
-            obj1_offset,
+            obj1_offset: param_dict_offset,
         }
     }
 

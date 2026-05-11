@@ -136,12 +136,18 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     let file_len = file_bytes.len() as u64;
 
     // -----------------------------------------------------------------------
-    // 1. Object 1 must have /Linearized with a positive value
+    // 1. The first object in the file must have /Linearized with a positive
+    //    value. PDF 1.7 Annex F.2.2.1 specifies "the first object" by
+    //    physical position, not by object number — qpdf places the param
+    //    dict at an obj number determined by its renumber pass, so we have
+    //    to identify it from the file header's first object token.
     // -----------------------------------------------------------------------
-    let obj1 = pdf
-        .resolve(ObjectRef::new(1, 0))
+    let first_obj_number =
+        find_first_object_number(file_bytes).ok_or(LinearizationCheckError::NotLinearized)?;
+    let first_obj = pdf
+        .resolve(ObjectRef::new(first_obj_number, 0))
         .map_err(LinearizationCheckError::from)?;
-    let Object::Dictionary(param_dict) = obj1 else {
+    let Object::Dictionary(param_dict) = first_obj else {
         return Err(LinearizationCheckError::NotLinearized);
     };
 
@@ -478,6 +484,54 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 /// indirect object header.  A loose scan that picks up the first digits in
 /// a window would silently accept misaligned offsets — this strict parser
 /// requires the `obj` keyword to follow exactly after `<digits> <digits>`.
+/// Locate the first indirect-object header in `file_bytes` and return its
+/// object number. PDF 1.7 Annex F.2.2.1 says the first object in a linearized
+/// file is the linearization parameter dictionary, but does not constrain
+/// its object *number* — qpdf assigns it dynamically during renumbering. We
+/// therefore scan the bytes after the PDF header for the first `N G obj`
+/// token.
+///
+/// Returns `None` if no object header is found (e.g. truncated or
+/// non-PDF input).
+fn find_first_object_number(file_bytes: &[u8]) -> Option<u32> {
+    // Scan for "<digits> <digits> obj". To be robust against the header
+    // (`%PDF-1.x`) and the binary marker line, look for the literal " obj"
+    // and back up to the start of the number pair. This is the same shape
+    // `parse_obj_header_at` consumes.
+    let mut i = 0;
+    while i + 4 <= file_bytes.len() {
+        if let Some(pos) = file_bytes[i..]
+            .windows(5)
+            .position(|w| w == b" obj\n")
+            .or_else(|| file_bytes[i..].windows(5).position(|w| w == b" obj\r"))
+            .or_else(|| file_bytes[i..].windows(4).position(|w| w == b" obj"))
+        {
+            // Look back from the " obj" position to find the start of the
+            // "<num> <gen>" pair.
+            let abs = i + pos;
+            // Walk back over digits + space + digits.
+            let mut start = abs;
+            while start > 0
+                && (file_bytes[start - 1].is_ascii_digit() || file_bytes[start - 1] == b' ')
+            {
+                start -= 1;
+            }
+            // Skip any whitespace at start.
+            while start < abs && is_pdf_whitespace(file_bytes[start]) {
+                start += 1;
+            }
+            if let Some((num, _gen)) = parse_obj_header_at(&file_bytes[start..]) {
+                return Some(num);
+            }
+            // Failed to parse; advance past this position to avoid infinite loop.
+            i = abs + 4;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
 fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
     // Skip leading whitespace.
     let mut i = 0;
