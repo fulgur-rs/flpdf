@@ -396,22 +396,42 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 4: compute closures for pages 2..N and find shared objects
         // ----------------------------------------------------------------
-        // For each object in the first-page closure, record which other
-        // pages (by 0-based index) also reference it.  Closures are retained
-        // so Step 7 can populate per-page object_count without re-walking.
+        // Build a full inverse map: (object_ref → set of page indices) across
+        // ALL pages (0..N).  This is used to determine which objects are shared
+        // between multiple pages regardless of whether they appear in the
+        // first-page closure.
+        //
+        // `shared_page_indices` retains the old semantics for Part 3 partitioning
+        // (only first-page-set objects that also appear in other pages).
+        // `all_referenced_pages` is the new full inverse map used for Step 8.
         let mut shared_page_indices: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
+        let mut all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
         let mut other_page_closures: Vec<Vec<ObjectRef>> =
             Vec::with_capacity(page_refs.len().saturating_sub(1));
+
+        // Record page 0 references in the full inverse map.
+        for obj_ref in &first_page_closure {
+            all_referenced_pages
+                .entry(*obj_ref)
+                .or_default()
+                .insert(0u32);
+        }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
             let closure = compute_closure(pdf, page_ref)?;
             for obj_ref in &closure {
+                // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
                     shared_page_indices
                         .entry(*obj_ref)
                         .or_default()
                         .insert(page_idx as u32);
                 }
+                // Track all page references in the full inverse map.
+                all_referenced_pages
+                    .entry(*obj_ref)
+                    .or_default()
+                    .insert(page_idx as u32);
             }
             other_page_closures.push(closure);
         }
@@ -594,21 +614,23 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 8: build shared_hints
         // ----------------------------------------------------------------
-        // `referencing_pages` lists the 0-based page indices of the pages
-        // that reference this shared object VIA THE HINT TABLE.  Per qpdf's
-        // Annex F implementation, page 0 does NOT appear here — shared objects
-        // are physically owned by the first-page section (written before /E),
-        // so page 0 "has" them by physical position without needing a hint
-        // table reference.  Only pages 1..N that also use these objects appear
-        // in `referencing_pages`.
-        // Per qpdf's checkHSharedObject algorithm, the shared object hint table
-        // must start at the first object of the first-page section (part2[0] =
-        // page dict) and cover ALL first-page section objects before the truly
-        // shared (part3) objects.  So when there are any part3 objects we
-        // prepend part2 entries (referencing_pages = [] since page 0 physically
-        // owns them) before the part3 entries.  When part3 is empty we keep
-        // shared_hints empty (no shared objects at all).
-        let shared_hints: Vec<SharedObjectHintEntry> = if part3_objects.is_empty() {
+        // The Shared Object Hint Table must cover ALL objects referenced by
+        // two or more pages, not just those in the first-page closure.
+        //
+        // Layout of shared_hints (in file order):
+        //   [part2 entries]  - first-page section private objects (page 0 owns
+        //                      them by physical position; referencing_pages = [])
+        //   [part3 entries]  - first-page section shared objects (also owned by
+        //                      page 0 physically; referencing_pages lists pages
+        //                      1..N that also use them, NOT page 0)
+        //   [part4_shared]   - Part-4 shared objects (after /E; owned by no
+        //                      page via physical position; referencing_pages lists
+        //                      ALL pages that reference them)
+        //
+        // When there are no shared objects at all (part3 empty AND
+        // part4_other_pages_shared empty), shared_hints stays empty.
+        let has_any_shared = !part3_objects.is_empty() || !part4_other_pages_shared.is_empty();
+        let shared_hints: Vec<SharedObjectHintEntry> = if !has_any_shared {
             Vec::new()
         } else {
             let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
@@ -620,14 +642,30 @@ impl LinearizationPlan {
                     .get(&obj_ref)
                     .map(|s| s.iter().copied().collect())
                     .unwrap_or_default();
-                // Do NOT add page 0: shared objects are in the first-page
+                // Do NOT add page 0: Part-3 shared objects are in the first-page
                 // section, so page 0 implicitly owns them by physical layout.
                 SharedObjectHintEntry {
                     object_ref: obj_ref,
                     referencing_pages: pages,
                 }
             });
-            part2_entries.chain(part3_entries).collect()
+            // Part-4 shared objects: referenced by ≥ 2 pages but NOT in the
+            // first-page closure.  These live after /E (not physically owned
+            // by any page via layout), so ALL referencing pages are listed.
+            let part4_shared_entries = part4_other_pages_shared.iter().map(|&obj_ref| {
+                let pages: Vec<u32> = all_referenced_pages
+                    .get(&obj_ref)
+                    .map(|s| s.iter().copied().collect())
+                    .unwrap_or_default();
+                SharedObjectHintEntry {
+                    object_ref: obj_ref,
+                    referencing_pages: pages,
+                }
+            });
+            part2_entries
+                .chain(part3_entries)
+                .chain(part4_shared_entries)
+                .collect()
         };
 
         Ok(Self {
@@ -1281,5 +1319,149 @@ mod tests {
             !plan.part4_rest.contains(&resources_ref),
             "shared inherited /Resources must NOT end up in part4_rest"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. Three-page PDF where pages 2 and 3 share a content stream.
+    //
+    // This tests that objects referenced by 2+ pages but NOT by page 1
+    // (i.e., part4_other_pages_shared) are included in shared_hints.
+    //
+    // Object layout:
+    //   1 0 obj – Catalog
+    //   2 0 obj – Pages node  (Kids: [3, 4, 5])
+    //   3 0 obj – Page 1 dict (unique content 6 0 R, resources 7 0 R)
+    //   4 0 obj – Page 2 dict (shared content 8 0 R, resources 7 0 R)
+    //   5 0 obj – Page 3 dict (shared content 8 0 R, resources 7 0 R)
+    //   6 0 obj – Content stream (page 1 only)
+    //   7 0 obj – Resources dict (shared by pages 1, 2, 3 → Part 3)
+    //   8 0 obj – Content stream shared by pages 2 and 3 (NOT page 1)
+    //            → part4_other_pages_shared
+    //
+    // Expected:
+    //   Part 2: [3 0 R, 6 0 R, ...] (page 1 exclusive)
+    //   Part 3: [7 0 R]             (first-page shared: resources)
+    //   part4_other_pages_shared: [8 0 R]  (non-first-page shared)
+    //   shared_hints contains 8 0 R with referencing_pages = [1, 2] or [2, 3]
+    //   depending on 0-based page indices.
+    // -----------------------------------------------------------------------
+
+    fn three_page_shared_content_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 7 0 R /Contents 6 0 R >>\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 7 0 R /Contents 8 0 R >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 7 0 R /Contents 8 0 R >>\nendobj\n");
+
+        // Page 1 content stream (unique)
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
+
+        // Shared resources (pages 1, 2, 3) → Part 3
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(b"7 0 obj\n<< /Font << /F1 9 0 R >> >>\nendobj\n");
+
+        // Content stream shared by pages 2 and 3 (NOT page 1) → part4_other_pages_shared
+        let off8 = pdf.len() as u64;
+        pdf.extend_from_slice(b"8 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
+
+        // Font shared via resources
+        let off9 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref_section = format!(
+            "xref\n0 10\n\
+            0000000000 65535 f \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n",
+            off1, off2, off3, off4, off5, off6, off7, off8, off9,
+        );
+        pdf.extend_from_slice(xref_section.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref_start,
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Non-first-page shared objects (pages 2..N share content stream 8 0 R)
+    /// must appear in shared_hints and part4_other_pages_shared.
+    ///
+    /// This validates the fix for the "in computed list but not hint table"
+    /// qpdf warning that occurred when shared objects were only tracked for
+    /// objects also reachable from page 1.
+    #[test]
+    fn non_first_page_shared_objects_in_shared_hints() {
+        let bytes = three_page_shared_content_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("three-page PDF should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        // The shared content stream (8 0 R) is referenced by pages 2 and 3
+        // (0-based: pages 1 and 2) but NOT page 1 (0-based: page 0).
+        let shared_content = ObjectRef::new(8, 0);
+
+        // It must land in part4_other_pages_shared (not part4_rest).
+        assert!(
+            plan.part4_other_pages_shared.contains(&shared_content),
+            "content stream shared by pages 2 and 3 must be in part4_other_pages_shared"
+        );
+        assert!(
+            !plan.part4_rest.contains(&shared_content),
+            "content stream shared by pages 2 and 3 must NOT be in part4_rest"
+        );
+
+        // It must appear in shared_hints.
+        let in_shared_hints = plan.shared_hints.iter().any(|h| h.object_ref == shared_content);
+        assert!(
+            in_shared_hints,
+            "content stream shared by pages 2 and 3 must appear in shared_hints"
+        );
+
+        // Its referencing_pages must include pages 1 and 2 (0-based).
+        let hint = plan
+            .shared_hints
+            .iter()
+            .find(|h| h.object_ref == shared_content)
+            .unwrap();
+        assert!(
+            hint.referencing_pages.contains(&1),
+            "shared content stream must reference page 1 (0-based)"
+        );
+        assert!(
+            hint.referencing_pages.contains(&2),
+            "shared content stream must reference page 2 (0-based)"
+        );
+        assert!(
+            !hint.referencing_pages.contains(&0),
+            "shared content stream must NOT reference page 0 (not reachable from page 1)"
+        );
+
+        // Disjoint invariant must hold.
+        assert!(plan.parts_are_disjoint());
     }
 }
