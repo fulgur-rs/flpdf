@@ -65,13 +65,15 @@
 //! | 6 | `least_length` | 32 |
 //! | 7 | `bits_length_delta` | 16 |
 //!
-//! ## Encoding decision (2026-05-10, sub-2.7)
+//! ## Encoding decision
 //!
-//! 現時点ではバイト互換よりも構造的妥当性 (observable equivalence) を優先する。
-//! flate2 デフォルト設定 (Compression::default = level 6) を採用。
-//! qpdf とのバイト一致が必要になった場合、qpdf の zlib (level 9, default strategy)
-//! を vendoring するか、qpdf 互換 deflate parameter を試すこと。
-//! テスト戦略: qpdf --check-linearization (sub-2.11 の round-trip テスト) で構造妥当性を確認する。
+//! Default builds use flate2's miniz_oxide backend at `Compression::default()`
+//! (level 6, matching qpdf's `Z_DEFAULT_COMPRESSION`). The two encoders produce
+//! same-size output with different internal bytes. With the `qpdf-zlib-compat`
+//! feature flate2 links against classic libz1g and the hint stream becomes
+//! byte-identical to qpdf's; the gated test in `tests/zlib_compat_tests.rs`
+//! pins that invariant. Structural validity is independently checked via
+//! `qpdf --check-linearization` on the round-tripped fixtures.
 
 use super::hint_page::PageOffsetHintTable;
 use super::hint_shared::SharedObjectHintTable;
@@ -543,13 +545,11 @@ pub fn encode_hint_stream(
     // -----------------------------------------------------------------------
     // Compress with FlateDecode (zlib, level 6 = Compression::default())
     //
-    // ## Encoding decision (2026-05-10)
-    // We use flate2 default settings (level 6).  qpdf uses zlib level 9.
-    // These produce structurally identical streams (qpdf --check-linearization
-    // validates the uncompressed content, not the compressed bytes), but the
-    // compressed byte sequences differ.  Byte-identical output requires either
-    // matching qpdf's zlib parameters or vendoring qpdf's zlib.  This is
-    // deferred; observable equivalence is the current acceptance criterion.
+    // qpdf also defaults to zlib level 6 (Z_DEFAULT_COMPRESSION). Verified by
+    // round-tripping a content stream through compress2() and flate2: with the
+    // `qpdf-zlib-compat` feature (flate2 linked against classic libz1g) the
+    // output is byte-identical to qpdf's. Under default features the size
+    // matches but internal bytes differ (miniz_oxide vs classic zlib internals).
     // -----------------------------------------------------------------------
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder
