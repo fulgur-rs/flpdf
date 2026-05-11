@@ -5,8 +5,8 @@ use flpdf::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
     },
-    outline, pages, write_pdf_with_options, write_qdf, Object, ObjectRef, Pdf, Severity,
-    WriteOptions,
+    outline, pages, parse_pdf_version, write_pdf_with_options, write_qdf, Object, ObjectRef, Pdf,
+    Severity, WriteOptions,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -199,6 +199,18 @@ fn run_command(command: Commands) -> CliResult<()> {
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair),
         Commands::Rewrite(cmd) => {
+            if let Some(ref v) = cmd.force_version {
+                if parse_pdf_version(v).is_none() {
+                    eprintln!("flpdf: invalid --force-version value: {:?}", v);
+                    std::process::exit(1);
+                }
+            }
+            if let Some(ref v) = cmd.min_version {
+                if parse_pdf_version(v).is_none() {
+                    eprintln!("flpdf: invalid --min-version value: {:?}", v);
+                    std::process::exit(1);
+                }
+            }
             let mut options = WriteOptions::default();
             options.static_id = cmd.static_id;
             options.min_version = cmd.min_version;

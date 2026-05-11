@@ -63,9 +63,13 @@ pub fn effective_pdf_version<'a>(
     options: &'a WriteOptions,
     linearize: bool,
 ) -> &'a str {
-    // --force-version wins outright.
+    // --force-version wins outright, but only when the value is a valid version string.
+    // Silently ignore invalid values (same treatment as invalid min_version) so that
+    // callers that cannot pre-validate do not produce a corrupted PDF header.
     if let Some(ref forced) = options.force_version {
-        return forced.as_str();
+        if parse_pdf_version(forced).is_some() {
+            return forced.as_str();
+        }
     }
 
     // Parse source; bail to source string on failure.
