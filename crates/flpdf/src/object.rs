@@ -142,6 +142,55 @@ impl Object {
     /// Object::reference(ObjectRef::new(7, 0)).write_pdf(&mut out);
     /// assert_eq!(out, b"7 0 R");
     /// ```
+    ///
+    /// Array whitespace follows the qpdf token-boundary convention: a space is
+    /// inserted between adjacent tokens unless both sides are PDF delimiters.
+    ///
+    /// ```
+    /// use flpdf::Object;
+    ///
+    /// // Numeric array: spaces between integers and at both ends.
+    /// let nums = Object::Array(vec![
+    ///     Object::Integer(0),
+    ///     Object::Integer(0),
+    ///     Object::Integer(612),
+    ///     Object::Integer(792),
+    /// ]);
+    /// let mut out = Vec::new();
+    /// nums.write_pdf(&mut out);
+    /// assert_eq!(out, b"[ 0 0 612 792 ]");
+    ///
+    /// // Hex-string array (/ID): both elements are delimiters, so no spaces.
+    /// let id_array = Object::Array(vec![
+    ///     Object::String(vec![0xabu8, 0xcdu8]),
+    ///     Object::String(vec![0xefu8, 0x01u8]),
+    /// ]);
+    /// let mut out = Vec::new();
+    /// id_array.write_pdf(&mut out);
+    /// assert_eq!(out, b"[<abcd><ef01>]");
+    ///
+    /// // Empty array.
+    /// let empty = Object::Array(vec![]);
+    /// let mut out = Vec::new();
+    /// empty.write_pdf(&mut out);
+    /// assert_eq!(out, b"[ ]");
+    ///
+    /// // Stream followed by a number: the stream's serialized form ends with
+    /// // the `endstream` keyword (a letter, not a delimiter), so a separating
+    /// // space must precede the next token.
+    /// use flpdf::object::{Dictionary, Stream};
+    /// let stream = Object::Stream(Stream::new(Dictionary::new(), vec![]));
+    /// let mixed = Object::Array(vec![stream, Object::Integer(7)]);
+    /// let mut out = Vec::new();
+    /// mixed.write_pdf(&mut out);
+    /// // The exact stream bytes vary; what matters is that a space appears
+    /// // between `endstream` and `7`.
+    /// assert!(
+    ///     out.windows(b"endstream 7".len()).any(|w| w == b"endstream 7"),
+    ///     "got: {:?}",
+    ///     std::str::from_utf8(&out).unwrap_or("<binary>"),
+    /// );
+    /// ```
     pub fn write_pdf(&self, out: &mut Vec<u8>) {
         match self {
             Object::Null => out.extend_from_slice(b"null"),
@@ -162,12 +211,30 @@ impl Object {
                 }
             }
             Object::Array(values) => {
+                if values.is_empty() {
+                    out.extend_from_slice(b"[ ]");
+                    return;
+                }
                 out.push(b'[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
+                // qpdf token-boundary rule: insert a space between adjacent tokens
+                // unless both sides are PDF delimiters (`<`, `(`, `[`, `/`, `>`, `)`, `]`).
+                // `[` itself counts as a delimiter on the left.
+                // qpdf rule: omit the space only when BOTH sides are delimiters.
+                // `[` is treated as a delimiter on the left for the first element.
+                let mut prev_ends_with_delim = true; // treat `[` as delimiter
+                for value in values.iter() {
+                    // Insert a space unless both the previous token end AND the
+                    // current token start are PDF delimiters.
+                    if !(prev_ends_with_delim && starts_with_delim(value)) {
                         out.push(b' ');
                     }
                     value.write_pdf(out);
+                    prev_ends_with_delim = ends_with_delim(value);
+                }
+                // Add trailing space before `]` unless the last token ends with a delimiter.
+                // (`]` is also a delimiter, so we only omit if prev is also delimiter.)
+                if !prev_ends_with_delim {
+                    out.push(b' ');
                 }
                 out.push(b']');
             }
@@ -183,6 +250,36 @@ impl Object {
             }
         }
     }
+}
+
+/// Returns `true` when the serialized form of `o` starts with a self-separating
+/// PDF delimiter byte (`<`, `(`, `[`, `<<`). Used by [`Object::write_pdf`] to
+/// decide whether to insert a space before this token inside an array.
+///
+/// Note: [`Object::Name`] starts with `/` — technically a delimiter byte — but
+/// qpdf inserts a space before names anyway (`[ /PDF /Text ]` rather than
+/// `[/PDF /Text]`), so names are deliberately excluded from this set to match
+/// qpdf's array-writer convention.
+fn starts_with_delim(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::String(_) | Object::Array(_) | Object::Dictionary(_) | Object::Stream(_)
+    )
+}
+
+/// Returns `true` when the serialized form of `o` ends with a PDF delimiter byte
+/// (`>`, `)`, `]`). Used by [`Object::write_pdf`] to decide whether to insert
+/// a space after this token inside an array.
+///
+/// Excluded types end with a letter (`Name` → arbitrary letter from the name;
+/// `Stream` → the `endstream` keyword), so a following token in an array would
+/// run together without a separating space if these were treated as
+/// delimiter-terminated.
+fn ends_with_delim(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::String(_) | Object::Array(_) | Object::Dictionary(_)
+    )
 }
 
 fn is_printable_string(value: &[u8]) -> bool {

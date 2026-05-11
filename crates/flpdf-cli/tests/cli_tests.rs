@@ -310,8 +310,8 @@ fn show_pages_lists_each_page() {
         .success()
         .stdout(predicate::str::contains("page 1: 3 0 R"))
         .stdout(predicate::str::contains("page 2: 6 0 R"))
-        .stdout(predicate::str::contains("media-box: [0 0 595.28 842]"))
-        .stdout(predicate::str::contains("media-box: [0 0 200 100]"));
+        .stdout(predicate::str::contains("media-box: [ 0 0 595.28 842 ]"))
+        .stdout(predicate::str::contains("media-box: [ 0 0 200 100 ]"));
 }
 
 fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
