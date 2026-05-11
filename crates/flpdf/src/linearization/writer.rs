@@ -67,7 +67,7 @@ use crate::linearization::hint_stream::encode_hint_stream;
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::RenumberMap;
-use crate::writer::{apply_static_id, effective_pdf_version, WriteOptions, QPDF_STATIC_ID};
+use crate::writer::{effective_pdf_version, WriteOptions, QPDF_STATIC_ID};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
 // ---------------------------------------------------------------------------
@@ -278,11 +278,16 @@ fn write_part1_xref_and_trailer(
     bytes.extend_from_slice(placeholder.as_bytes());
     let prev_value_end = bytes.len();
 
-    // /ID
-    bytes.extend_from_slice(b" /ID ");
-    // Build the ID array.  Use the same logic as apply_static_id:
-    // if static_id is enabled, use qpdf's π constant for both elements;
-    // otherwise take the source /ID array (or fall back to the constant).
+    // /ID — emit only when meaningful.
+    //
+    // Three cases:
+    //   1. --static-id: emit the fixed [source_id0, π_const] array (or [π_const, π_const]
+    //      when the source has no /ID).
+    //   2. source trailer has /ID: inherit it verbatim.
+    //   3. Neither: omit the /ID key entirely.  The PDF spec (ISO 32000) marks
+    //      /ID as optional in the trailer; emitting an empty array `[]` is not a
+    //      valid two-element byte-string array and may cause conforming readers to
+    //      reject the file as malformed.
     let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
     if options.static_id {
         // static-id: [π_const, π_const] — both elements set to qpdf constant.
@@ -296,17 +301,17 @@ fn write_part1_xref_and_trailer(
             _ => pi_bytes.clone(),
         };
         let id_array = Object::Array(vec![first_id, pi_bytes]);
+        bytes.extend_from_slice(b" /ID ");
         id_array.write_pdf(bytes);
     } else {
-        // Dynamic ID: inherit from source trailer or omit.
+        // Dynamic ID: inherit from source trailer, or omit entirely.
         match source_trailer.get("ID") {
             Some(id_obj) => {
+                bytes.extend_from_slice(b" /ID ");
                 id_obj.write_pdf(bytes);
             }
             None => {
-                // No /ID in source — emit empty array as fallback (matches
-                // qpdf behaviour when the source lacks an /ID).
-                Object::Array(vec![]).write_pdf(bytes);
+                // Source has no /ID and --static-id is not set — omit the key.
             }
         }
     }
