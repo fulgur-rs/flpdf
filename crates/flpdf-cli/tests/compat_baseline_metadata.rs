@@ -63,10 +63,11 @@ const FIXTURES: &[&str] = &[
 /// Uses `flpdf::Pdf::open` → `trailer().get_ref("Info")` → `resolve()` →
 /// `Object::write_pdf`. Returns `None` if the trailer has no `/Info` entry.
 fn extract_info_dict_bytes(path: &Path) -> Option<Vec<u8>> {
-    let file = File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
     let reader = BufReader::new(file);
-    let mut pdf = Pdf::open(reader)
-        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+    let mut pdf =
+        Pdf::open(reader).unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
 
     let info_ref = pdf.trailer().get_ref("Info")?;
     let info_obj = pdf
