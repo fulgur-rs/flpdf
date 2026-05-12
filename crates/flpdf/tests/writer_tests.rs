@@ -1,8 +1,8 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_qdf, Object,
-    ObjectRef, Pdf, XrefForm, XrefOffset,
+    check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_pdf_with_options,
+    write_qdf, Dictionary, Object, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -2128,4 +2128,276 @@ fn corrupt_xref_pdf() -> Vec<u8> {
         *byte = b'z';
     }
     corrupted
+}
+
+// ---------------------------------------------------------------------------
+// Full-rewrite mode tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal PDF in-memory whose stream uses a single FlateDecode filter.
+fn build_minimal_pdf_with_stream(stream_data: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder as Z;
+    use flate2::Compression as C;
+    let mut enc = Z::new(Vec::new(), C::default());
+    enc.write_all(stream_data).unwrap();
+    let compressed = enc.finish().unwrap();
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    // object 1: catalog
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    // object 2: pages
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    // object 3: content stream with FlateDecode
+    offsets.push(bytes.len());
+    let stream_header = format!(
+        "3 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+        compressed.len()
+    );
+    bytes.extend_from_slice(stream_header.as_bytes());
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Build a minimal PDF whose stream uses a multi-filter chain: [ASCII85Decode, FlateDecode].
+/// This is the kind of output produced by ReportLab.
+///
+/// The PDF decode pipeline for [ASCII85Decode, FlateDecode] is:
+///   stored → ASCII85 decode → FlateDecode decode → raw
+/// so stored = ASCII85(FlateDecode(raw)).
+fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
+    let raw_data = b"Hello from multi-filter stream!".repeat(20);
+    // Build stored = ASCII85(Flate(raw)):
+    //   Step 1: FlateDecode encode raw → flated
+    //   Step 2: ASCII85Decode encode flated → a85
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let flated = filters::encode_stream_data(&flate_dict, &raw_data).unwrap();
+
+    let mut a85_dict = Dictionary::new();
+    a85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+    let a85 = filters::encode_stream_data(&a85_dict, &flated).unwrap();
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    // object 1: catalog
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    // object 2: pages
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    // object 3: content stream with [ASCII85Decode FlateDecode]
+    offsets.push(bytes.len());
+    let stream_header = format!(
+        "3 0 obj\n<< /Filter [/ASCII85Decode /FlateDecode] /Length {} >>\nstream\n",
+        a85.len()
+    );
+    bytes.extend_from_slice(stream_header.as_bytes());
+    bytes.extend_from_slice(&a85);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn full_rewrite_minimal_pdf_is_valid() {
+    let source = build_minimal_pdf_with_stream(b"content data");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite output should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+#[test]
+fn full_rewrite_no_prev_in_trailer() {
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Trailer must not contain /Prev.
+    let reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    assert!(
+        reopened.trailer().get("Prev").is_none(),
+        "full-rewrite output must not have /Prev in trailer"
+    );
+}
+
+#[test]
+fn full_rewrite_single_flatedecode_filter() {
+    let source = build_minimal_pdf_with_stream(b"stream payload data for filter check");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Re-open and inspect stream 3's filter.
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let Object::Stream(stream) = stream_obj else {
+        panic!("object 3 should be a stream");
+    };
+    match stream.dict.get("Filter") {
+        Some(Object::Name(name)) => {
+            assert_eq!(name.as_slice(), b"FlateDecode", "stream Filter should be FlateDecode");
+        }
+        Some(Object::Array(_)) => {
+            // Also acceptable if the filter is a single-element array [/FlateDecode]
+            // but our implementation uses a Name directly.
+        }
+        other => panic!("unexpected Filter: {:?}", other),
+    }
+    // No DecodeParms from the old filter chain.
+    // Verify the stream decodes to the original data.
+    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+    assert_eq!(decoded, b"stream payload data for filter check");
+}
+
+#[test]
+fn full_rewrite_multi_filter_decodes_and_reencodes() {
+    // Input has [ASCII85Decode FlateDecode] — multi-filter chain from ReportLab.
+    let source = build_pdf_with_multi_filter_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite of multi-filter PDF should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // Stream 3 should now have a single FlateDecode filter (not ASCII85+Flate).
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let Object::Stream(stream) = stream_obj else {
+        panic!("object 3 should be a stream");
+    };
+    // Filter must NOT be an array containing ASCII85Decode.
+    match stream.dict.get("Filter") {
+        Some(Object::Array(filters_arr)) => {
+            for f in filters_arr {
+                if let Object::Name(name) = f {
+                    assert_ne!(
+                        name.as_slice(),
+                        b"ASCII85Decode",
+                        "ASCII85Decode must be removed by full-rewrite"
+                    );
+                }
+            }
+        }
+        Some(Object::Name(name)) => {
+            assert_ne!(
+                name.as_slice(),
+                b"ASCII85Decode",
+                "ASCII85Decode must be removed by full-rewrite"
+            );
+        }
+        None => {} // uncompressed is also fine
+        other => panic!("unexpected Filter: {:?}", other),
+    }
+
+    // Verify round-trip: decode the output stream and compare to original raw data.
+    let raw_data = b"Hello from multi-filter stream!".repeat(20);
+    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+    assert_eq!(
+        decoded, raw_data,
+        "full-rewrite stream round-trip should recover original data"
+    );
+}
+
+#[test]
+fn full_rewrite_default_options_still_incremental() {
+    // With default WriteOptions (full_rewrite=false), source bytes are preserved.
+    let source_bytes = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source_bytes.clone())).unwrap();
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &WriteOptions::default()).unwrap();
+
+    // Incremental: source bytes are a prefix of the output.
+    assert!(
+        output.starts_with(&source_bytes),
+        "incremental write should preserve source bytes as a prefix"
+    );
+}
+
+#[test]
+fn full_rewrite_from_fixture() {
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite of fixture should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // Verify that the output contains the PDF header.
+    let header = &output[..9];
+    assert!(
+        header.starts_with(b"%PDF-"),
+        "output should start with PDF header"
+    );
 }

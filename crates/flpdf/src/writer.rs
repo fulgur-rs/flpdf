@@ -33,6 +33,15 @@ pub struct WriteOptions {
     ///
     /// Mirrors `qpdf --force-version`.
     pub force_version: Option<String>,
+
+    /// When `true`, decode every stream through its filter pipeline and re-emit
+    /// the document end-to-end with a single `/FlateDecode` filter applied to
+    /// each stream.  The output contains no `/Prev` chain, no `ObjStm`, and no
+    /// xref-stream-only keys.
+    ///
+    /// When `false` (the default) the existing incremental-update write path is
+    /// used, preserving the source bytes verbatim.
+    pub full_rewrite: bool,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
@@ -139,6 +148,17 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 
 /// Like [`write_pdf`] but with caller-supplied [`WriteOptions`].
 pub fn write_pdf_with_options<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    out: W,
+    options: &WriteOptions,
+) -> Result<()> {
+    if options.full_rewrite {
+        return write_pdf_full_rewrite(pdf, out, options);
+    }
+    write_pdf_incremental(pdf, out, options)
+}
+
+fn write_pdf_incremental<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriteOptions,
@@ -964,4 +984,276 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 
     out.write_all(&bytes)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Full-rewrite path: decode+re-encode every stream, replaces incremental copy
+// ---------------------------------------------------------------------------
+
+/// Write `pdf` as a full non-incremental rewrite.
+///
+/// Every stream is decoded through its filter chain and re-encoded with a
+/// single `/FlateDecode` filter.  The output has no `/Prev` chain and no
+/// `ObjStm` container objects.  ObjStm member objects are emitted as ordinary
+/// indirect objects.  XRef stream container objects are replaced by a freshly
+/// rebuilt xref table (or xref stream, matching the input's form).
+///
+/// # Scope limitations (TODO)
+///
+/// - **ObjStm dissolve**: Object streams are dissolved — members are emitted as
+///   ordinary indirect objects.  There is currently no merging of existing
+///   ObjStm containers back into the regular sequence; they are simply skipped.
+///   A dedicated "renumber + pack into ObjStm" pass (flpdf-9hc.20.13) is a
+///   future concern.
+///
+/// - **Encrypted documents**: `/Encrypt` in the trailer is not supported.
+///   The function returns `Err(Unsupported)` when encryption is detected so
+///   that callers do not silently produce a corrupt output.
+///
+/// Returns [`crate::Error::Missing`] if the input has no `/Root`.
+fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriteOptions,
+) -> Result<()> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Err(crate::Error::Missing("/Root"));
+    };
+
+    // Reject encrypted documents — decoding encrypted streams without the
+    // encryption key would produce garbage.  (Scope limitation; NOTES.)
+    if pdf.trailer().get("Encrypt").is_some() {
+        return Err(crate::Error::Unsupported(
+            "full-rewrite mode does not support encrypted documents".to_string(),
+        ));
+    }
+
+    let version = effective_pdf_version(pdf.version(), options, false).to_owned();
+
+    let mut object_refs = pdf.object_refs();
+    object_refs.sort_by_key(|r| (r.number, r.generation));
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
+    bytes.extend_from_slice(QPDF_BINARY_MARKER);
+
+    let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
+
+    for object_ref in &object_refs {
+        // Resolve the object; if resolution fails, skip (soft error).
+        let object = match pdf.resolve(*object_ref) {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
+
+        // Skip xref-stream container objects — we'll rebuild the xref from
+        // scratch below.  Skip ObjStm container objects — their members have
+        // already been resolved into the cache as individual objects and are
+        // emitted in the main loop.
+        if let Object::Stream(ref s) = object {
+            let ty = s.dict.get("Type");
+            let is_xref = matches!(ty, Some(Object::Name(n)) if n.as_slice() == b"XRef");
+            let is_objstm = matches!(ty, Some(Object::Name(n)) if n.as_slice() == b"ObjStm");
+            if is_xref || is_objstm {
+                continue;
+            }
+        }
+
+        // Duplicate detection (same contract as write_qdf).
+        if offsets.contains_key(&object_ref.number) {
+            return Err(crate::Error::Unsupported(format!(
+                "duplicate object number {} in xref table",
+                object_ref.number
+            )));
+        }
+
+        let emit_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!("{} {} obj\n", object_ref.number, object_ref.generation).as_bytes(),
+        );
+
+        if let Object::Stream(stream) = object {
+            let reencoded = reencode_stream_flate(&stream);
+            reencoded.write_pdf(&mut bytes);
+        } else {
+            object.write_pdf(&mut bytes);
+        }
+
+        bytes.extend_from_slice(b"\nendobj\n");
+        offsets.insert(object_ref.number, (object_ref.generation, emit_offset));
+    }
+
+    // Build xref / trailer matching the input's xref form.
+    let xref_offset = bytes.len();
+    let object_count = offsets
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1) as usize;
+
+    match pdf.last_xref_form() {
+        XrefForm::Table => {
+            // Classic xref table.
+            bytes.extend_from_slice(format!("xref\n0 {}\n", object_count).as_bytes());
+            bytes.extend_from_slice(b"0000000000 65535 f \n");
+            for number in 1..object_count {
+                match offsets.get(&(number as u32)) {
+                    Some((generation, offset)) => bytes
+                        .extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes()),
+                    None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+                }
+            }
+
+            // Trailer — start from the document trailer, strip incremental keys.
+            let mut trailer = pdf.trailer().clone();
+            strip_incremental_trailer_keys(&mut trailer);
+            trailer.insert("Size", Object::Integer(object_count as i64));
+            trailer.insert("Root", Object::Reference(root_ref));
+            if options.static_id {
+                apply_static_id(&mut trailer);
+            }
+
+            bytes.extend_from_slice(b"trailer\n");
+            trailer.write_pdf(&mut bytes);
+            bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        }
+
+        XrefForm::Stream => {
+            // Cross-reference stream — pick a fresh object number beyond all
+            // emitted objects.
+            let xref_object_number = object_count as u32;
+
+            // Build the xref stream entries: object 0 is always free, then the
+            // emitted objects, then the xref stream object itself.
+            let mut xref_entries: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+            xref_entries.insert(0, (65535, XrefOffset::Free { next: 0 }));
+            for (&num, &(gen, off)) in &offsets {
+                xref_entries.insert(
+                    num,
+                    (
+                        gen,
+                        XrefOffset::Offset(u64::try_from(off).map_err(|_| {
+                            crate::Error::Unsupported(
+                                "xref offset does not fit u64".to_string(),
+                            )
+                        })?),
+                    ),
+                );
+            }
+            xref_entries.insert(
+                xref_object_number,
+                (
+                    0,
+                    XrefOffset::Offset(u64::try_from(xref_offset).map_err(|_| {
+                        crate::Error::Unsupported(
+                            "xref stream offset does not fit u64".to_string(),
+                        )
+                    })?),
+                ),
+            );
+
+            let mut object_numbers: Vec<u32> = xref_entries.keys().copied().collect();
+            object_numbers.sort_unstable();
+
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
+            let mut idx = 0;
+            while idx < object_numbers.len() {
+                let start = object_numbers[idx];
+                let mut end = start;
+                while idx + 1 < object_numbers.len() && object_numbers[idx + 1] == end + 1 {
+                    idx += 1;
+                    end = object_numbers[idx];
+                }
+                ranges.push((start, end.saturating_sub(start).saturating_add(1)));
+                idx += 1;
+            }
+
+            let stream_data = build_xref_stream_bytes(&xref_entries, &ranges)?;
+
+            let mut index_array = Vec::with_capacity(ranges.len() * 2);
+            for &(start, count) in &ranges {
+                index_array.push(Object::Integer(i64::from(start)));
+                index_array.push(Object::Integer(i64::from(count)));
+            }
+
+            let final_object_count = (xref_object_number as usize).saturating_add(1);
+            let mut xref_dict = pdf.trailer().clone();
+            strip_incremental_trailer_keys(&mut xref_dict);
+            xref_dict.insert("Type", Object::Name(b"XRef".to_vec()));
+            xref_dict.insert("Size", Object::Integer(final_object_count as i64));
+            xref_dict.insert(
+                "W",
+                Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Integer(8),
+                    Object::Integer(4),
+                ]),
+            );
+            xref_dict.insert("Index", Object::Array(index_array));
+            xref_dict.insert("Root", Object::Reference(root_ref));
+            xref_dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(stream_data.len()).map_err(|_| {
+                    crate::Error::Unsupported("xref stream /Length does not fit i64".to_string())
+                })?),
+            );
+            if options.static_id {
+                apply_static_id(&mut xref_dict);
+            }
+
+            let xref_stream = Object::Stream(crate::Stream::new(xref_dict, stream_data));
+            bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
+            xref_stream.write_pdf(&mut bytes);
+            bytes.extend_from_slice(b"\nendobj\n");
+            bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        }
+    }
+
+    out.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Decode a stream's filter chain and re-encode with a single `/FlateDecode`
+/// filter.  On any error (unsupported filter, corrupt data, etc.) the original
+/// stream object is returned unchanged so the caller can still emit a readable
+/// — if not fully normalized — PDF.
+fn reencode_stream_flate(stream: &crate::Stream) -> Object {
+    // Decode the stream through whatever filters are declared in its dict.
+    let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
+        Ok(d) => d,
+        Err(_) => {
+            // Decode failure: emit the stream with its original dict/data.
+            return Object::Stream(stream.clone());
+        }
+    };
+
+    // Re-encode with a minimal FlateDecode dict.
+    let mut encode_dict = Dictionary::new();
+    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
+        Ok(e) => e,
+        Err(_) => {
+            // Encode failure: fall back to uncompressed.
+            decoded.clone()
+        }
+    };
+
+    // Build a new stream dict: copy everything from the original except the
+    // filter-related keys (which we replace) and Length (which we update).
+    let mut new_dict = stream.dict.clone();
+    new_dict.remove("Filter");
+    new_dict.remove("DecodeParms");
+    new_dict.remove("FFilter");
+    new_dict.remove("FDecodeParms");
+
+    // Always apply FlateDecode — even if the encoded result is larger than the
+    // raw data (which can happen for small streams).  This guarantees that the
+    // output always has a single well-known filter regardless of stream size.
+    new_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    new_dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
+    );
+    Object::Stream(crate::Stream::new(new_dict, encoded))
 }

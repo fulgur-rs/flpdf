@@ -128,6 +128,11 @@ struct RewriteCommand {
     /// Mirrors `qpdf --force-version`.
     #[arg(long = "force-version")]
     force_version: Option<String>,
+    /// Decode every stream through its filter chain and re-emit the document
+    /// end-to-end with a single /FlateDecode filter per stream.  The output
+    /// contains no /Prev chain.  Cannot be combined with --linearize.
+    #[arg(long = "full-rewrite")]
+    full_rewrite: bool,
 }
 
 fn main() {
@@ -211,10 +216,15 @@ fn run_command(command: Commands) -> CliResult<()> {
                     std::process::exit(1);
                 }
             }
+            if cmd.full_rewrite && cmd.linearize {
+                eprintln!("flpdf: --full-rewrite and --linearize cannot be used together");
+                std::process::exit(1);
+            }
             let mut options = WriteOptions::default();
             options.static_id = cmd.static_id;
             options.min_version = cmd.min_version;
             options.force_version = cmd.force_version;
+            options.full_rewrite = cmd.full_rewrite;
             run_rewrite(
                 Some(cmd.input),
                 Some(cmd.output),
