@@ -365,6 +365,10 @@ impl Dictionary {
             .map(|(key, value)| (key.as_slice(), value))
     }
 
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Object> {
+        self.entries.values_mut()
+    }
+
     pub(crate) fn write_pdf(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(b"<<");
         for (key, value) in self.iter() {
