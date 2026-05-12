@@ -2401,3 +2401,94 @@ fn full_rewrite_from_fixture() {
         "output should start with PDF header"
     );
 }
+
+/// Build a minimal PDF that uses an xref stream (instead of an xref table).
+/// The xref stream has /W [1 3 1] entries and no /Filter (uncompressed).
+fn build_minimal_pdf_with_xref_stream() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    // object 1: catalog
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    // object 2: pages
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+
+    // Build raw xref stream bytes: W=[1,3,1]
+    // Entry for obj 0: type=0 (free), field1=0, field2=0
+    // Entry for obj 1: type=1 (in-use), field1=offset, field2=0 (generation)
+    // Entry for obj 2: type=1 (in-use), field1=offset, field2=0
+    // Entry for obj 3 (xref stream itself): type=1, field1=xref_offset, field2=0
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[1] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn full_rewrite_xref_stream_input_produces_valid_pdf() {
+    // Verify that full_rewrite handles a PDF whose source uses xref stream form
+    // (XrefForm::Stream) — the XrefForm::Stream branch of write_pdf_full_rewrite.
+    let source = build_minimal_pdf_with_xref_stream();
+    // Confirm the fixture itself uses xref stream form before testing full_rewrite.
+    {
+        let mut reader = Cursor::new(&source);
+        let loaded = load_xref_and_trailer(&mut reader).unwrap();
+        assert_eq!(
+            loaded.last_xref_form,
+            XrefForm::Stream,
+            "fixture must use xref stream form"
+        );
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite of xref-stream input should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+#[test]
+fn full_rewrite_xref_stream_input_no_prev() {
+    // /Prev must be absent in the full-rewrite output even when the source used
+    // xref stream form.
+    let source = build_minimal_pdf_with_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
+    assert!(
+        loaded.trailer.get("Prev").is_none(),
+        "full-rewrite output from xref-stream input must not have /Prev"
+    );
+}
