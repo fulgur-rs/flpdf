@@ -10,6 +10,8 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
     decode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
 
+// Wired into encrypted document reads by later flpdf-9hc.3 layers.
+#[allow(dead_code)]
 pub(crate) fn decode_stream_data_with_decryption(
     dict: &Dictionary,
     stream_data: &[u8],
