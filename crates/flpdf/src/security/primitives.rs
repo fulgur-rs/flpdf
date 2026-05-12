@@ -7,6 +7,15 @@
 //! `rc4` is a broken stream cipher. Its use in PDF is legacy (PDF 1.x–1.6
 //! encryption). Higher-level code MUST gate RC4 usage behind an
 //! `--allow-weak-crypto` flag before calling [`rc4`].
+//!
+//! # Dead-code notice
+//! Several primitives in this module are scaffolding for the encrypted-PDF
+//! support epic (flpdf-9hc.3) and are not yet wired up to any call site
+//! within this single subtask. They become live as subsequent stack layers
+//! (V=1/V=2 key derivation, AES decryption, V=5 R=6 hashing) land. The
+//! module-level `allow(dead_code)` keeps each layer's CI green without
+//! losing the unused-detector for everything else.
+#![allow(dead_code)]
 
 use aes::Aes128;
 use aes::Aes256;
@@ -83,7 +92,7 @@ pub(crate) fn aes128_cbc_decrypt(
     iv: &[u8; 16],
     ciphertext: &mut Vec<u8>,
 ) -> Result<(), PrimitiveError> {
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Err(PrimitiveError::InvalidLength);
     }
     let dec = <Decryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
@@ -106,7 +115,7 @@ pub(crate) fn aes256_cbc_decrypt(
     iv: &[u8; 16],
     ciphertext: &mut Vec<u8>,
 ) -> Result<(), PrimitiveError> {
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Err(PrimitiveError::InvalidLength);
     }
     let dec = <Decryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
@@ -131,12 +140,16 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Compute the SHA-384 digest of `data`.
+///
+/// Used by the V=5 R=6 password hashing path (flpdf-9hc.3.5).
 pub(crate) fn sha384(data: &[u8]) -> [u8; 48] {
     let result = Sha384::digest(data);
     result.into()
 }
 
 /// Compute the SHA-512 digest of `data`.
+///
+/// Used by the V=5 R=6 password hashing path (flpdf-9hc.3.5).
 pub(crate) fn sha512(data: &[u8]) -> [u8; 64] {
     let result = Sha512::digest(data);
     result.into()
@@ -154,7 +167,10 @@ mod tests {
 
     /// Convert a lowercase hex string to a `Vec<u8>`.
     fn from_hex(s: &str) -> Vec<u8> {
-        assert!(s.len() % 2 == 0, "hex string must have even length");
+        assert!(
+            s.len().is_multiple_of(2),
+            "hex string must have even length"
+        );
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("invalid hex digit"))
