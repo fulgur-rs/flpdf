@@ -7,6 +7,11 @@ version.workspace = true
 [dependencies]
 thiserror.workspace = true
 flate2.workspace = true
+rc4.workspace = true
+aes.workspace = true
+cbc.workspace = true
+md-5.workspace = true
+sha2.workspace = true
 
 [features]
 default = []
