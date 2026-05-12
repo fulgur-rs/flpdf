@@ -249,10 +249,14 @@ pub(crate) fn check_owner_password(
 
     // Step 2: Compute the RC4 key from the owner password.
     //   MD5(padded_owner), then 50× if R≥3, take first n bytes.
+    //
+    // Per PDF 1.7 §7.6.3.4 Algorithm 3 step 3, the R≥3 loop feeds the full
+    // 16-byte MD5 digest back as input (no n-truncation). Truncating to n
+    // would break n<16 cases like V=2/R=3/Length∈{40,56,64,...}.
     let mut digest = md5(&padded_owner);
     if inputs.r >= 3 {
         for _ in 0..50 {
-            digest = md5(&digest[..n]);
+            digest = md5(&digest);
         }
     }
     let rc4_key = &digest[..n];
@@ -847,6 +851,28 @@ mod tests {
                 )
             ),
             "expected UnsupportedHandler for V=1/Length=128, got: {err:?}"
+        );
+    }
+
+    /// Regression: the R≥3 owner-key 50× MD5 loop must feed back the FULL
+    /// 16-byte digest, not the n-truncated prefix. For n<16 (V=2/R=3 with
+    /// Length∈{40,…,120}) truncated iteration produces a different key, so
+    /// correct owner passwords would be rejected. This test exercises the
+    /// iteration mechanics directly to keep the fix from regressing.
+    #[test]
+    fn alg3_owner_key_iteration_uses_full_digest_for_short_keys() {
+        let seed = pad_password(b"");
+        let mut full = md5(&seed);
+        let mut truncated = full;
+        for _ in 0..50 {
+            full = md5(&full);
+            truncated = md5(&truncated[..5]);
+        }
+        assert_ne!(
+            &full[..5],
+            &truncated[..5],
+            "owner-key 50× loop must feed full digest back, not digest[..n]; \
+             if these match by accident, the regression guard is ineffective"
         );
     }
 
