@@ -94,22 +94,20 @@ fn filter_names(stream: &flpdf::Stream) -> Vec<Vec<u8>> {
 /// PDF).  `Object::Null` (freed / missing entries) and non-stream objects are
 /// ignored.
 fn collect_stream_filters(path: &Path) -> Vec<Vec<Vec<u8>>> {
-    let file = File::open(path)
-        .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
     let reader = BufReader::new(file);
-    let mut pdf = Pdf::open(reader)
-        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+    let mut pdf =
+        Pdf::open(reader).unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
 
     let mut refs = pdf.object_refs();
     refs.sort(); // stable order
 
     let mut filters: Vec<Vec<Vec<u8>>> = Vec::new();
     for obj_ref in refs {
-        let obj = pdf
-            .resolve(obj_ref)
-            .unwrap_or_else(|e| {
-                panic!("failed to resolve {:?} in {}: {e}", obj_ref, path.display())
-            });
+        let obj = pdf.resolve(obj_ref).unwrap_or_else(|e| {
+            panic!("failed to resolve {:?} in {}: {e}", obj_ref, path.display())
+        });
         if let Object::Stream(stream) = obj {
             filters.push(filter_names(&stream));
         }
