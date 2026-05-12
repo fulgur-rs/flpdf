@@ -80,8 +80,39 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
 }
 
 /// Validate `inputs` fields that are in scope for V=1/V=2.
+///
+/// Only the V/R/Length combinations that this module's Algorithms 2/6/7
+/// actually implement are accepted:
+///
+/// - V=1 ⇒ R=2 and Length=40 (RC4-40, fixed)
+/// - V=2 ⇒ R∈{2,3} and Length∈[40,128] in 8-bit steps (RC4-{40..128})
+///
+/// Other handlers (V=4 CF dispatch, V=5 R=5/R=6 AES-256) belong to other
+/// subtasks. Refusing them here prevents wrong-handler inputs from
+/// silently flowing into the R≥3/R≥4 branches in `compute_file_key()`
+/// and `check_user_password()`.
 fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
     if inputs.v != 1 && inputs.v != 2 {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: "Standard".into(),
+            v: inputs.v,
+            r: inputs.r,
+            cfm: None,
+        }
+        .into());
+    }
+    // R must be a revision this module handles.
+    if inputs.r != 2 && inputs.r != 3 {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: "Standard".into(),
+            v: inputs.v,
+            r: inputs.r,
+            cfm: None,
+        }
+        .into());
+    }
+    // V=1 is fixed at R=2 / Length=40 by spec.
+    if inputs.v == 1 && (inputs.r != 2 || inputs.length_bits != 40) {
         return Err(EncryptedError::UnsupportedHandler {
             filter: "Standard".into(),
             v: inputs.v,
@@ -750,6 +781,87 @@ mod tests {
                 crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
             ),
             "expected Malformed for length 256, got: {err:?}"
+        );
+    }
+
+    /// V=1 with R=3 is rejected — V=1 is fixed at R=2/Length=40 by spec.
+    #[test]
+    fn v1_with_wrong_r_returns_unsupported() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 1,
+            r: 3, // V=1 is R=2 only
+            length_bits: 40,
+            p: -1,
+            id0: &[],
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let err = compute_file_key(b"", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(
+                    crate::error::EncryptedError::UnsupportedHandler { .. }
+                )
+            ),
+            "expected UnsupportedHandler for V=1/R=3, got: {err:?}"
+        );
+    }
+
+    /// V=1 with Length=128 is rejected — V=1 is fixed at Length=40.
+    #[test]
+    fn v1_with_wrong_length_returns_unsupported() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 1,
+            r: 2,
+            length_bits: 128, // V=1 is 40-bit only
+            p: -1,
+            id0: &[],
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let err = compute_file_key(b"", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(
+                    crate::error::EncryptedError::UnsupportedHandler { .. }
+                )
+            ),
+            "expected UnsupportedHandler for V=1/Length=128, got: {err:?}"
+        );
+    }
+
+    /// V=2 with R=4 is out of this module's scope.
+    #[test]
+    fn r4_returns_unsupported() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 2,
+            r: 4, // V=4 handler territory
+            length_bits: 128,
+            p: -1,
+            id0: &[],
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let err = compute_file_key(b"", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(
+                    crate::error::EncryptedError::UnsupportedHandler { .. }
+                )
+            ),
+            "expected UnsupportedHandler for R=4, got: {err:?}"
         );
     }
 }
