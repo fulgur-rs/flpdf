@@ -998,6 +998,15 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 /// indirect objects.  XRef stream container objects are replaced by a freshly
 /// rebuilt xref table (or xref stream, matching the input's form).
 ///
+/// # Metadata preservation policy
+///
+/// The `/Info` dictionary (containing `/Producer`, `/CreationDate`, `/ModDate`,
+/// `/Author`, `/Title`, `/Creator`, `/Keywords`, `/Subject`, `/Trapped`, etc.)
+/// is preserved **verbatim** from the source document.  No fields are added,
+/// removed, or rewritten — in particular no "modified by flpdf" suffix is
+/// appended to `/Producer`.  This mirrors `qpdf`'s default behaviour
+/// (`qpdf in.pdf out.pdf`) and is required for byte-identical round-trip tests.
+///
 /// # Scope limitations (TODO)
 ///
 /// - **ObjStm dissolve**: Object streams are dissolved — members are emitted as
