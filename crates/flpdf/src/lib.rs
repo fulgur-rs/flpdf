@@ -37,6 +37,7 @@
 //! except for the small [`object::ParseObjectRefError`] returned by
 //! [`ObjectRef::parse`].
 
+pub mod ascii85;
 pub mod cache;
 pub mod check;
 pub mod diagnostics;
