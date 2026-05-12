@@ -1,4 +1,4 @@
-//! Standard Security Handler key derivation for PDF V=1 and V=2.
+//! Standard Security Handler key derivation for PDF V=1, V=2, and V=4.
 //!
 //! Implements the following algorithms from PDF 1.7 §7.6.3.3:
 //! - **Algorithm 2**: Compute the file encryption key from password + dictionary entries.
@@ -7,9 +7,18 @@
 //!
 //! Output is an RC4 file key of 40–128 bits (5–16 bytes).
 //!
+//! # V=4 Crypt Filter support
+//! This module also contains the V=4 key derivation shim (`compute_file_key_v4`) and the
+//! Crypt Filter (CF) dispatch types: `CryptFilterMethod`, `CryptFilter`, `CryptFilterRef`,
+//! and `select_crypt_filter`. The `/StmF`, `/StrF`, `/EFF` use-site selection and the
+//! `cfm_to_object_key_alg` helper are included for completeness.
+//!
+//! Actual PDF parsing of the `/Encrypt` dictionary and end-to-end round-trip decryption
+//! are deferred to issues flpdf-9hc.3.7, 3.8, 3.14, and 3.15.
+//!
 //! # Scope
-//! Only V=1 (R=2, 40-bit) and V=2 (R=2/R=3, 40–128-bit) are covered here.
-//! V=4 (AES/RC4 via crypt-filter) and V=5 (AES-256) are handled in separate subtasks.
+//! Only V=1 (R=2, 40-bit), V=2 (R=2/R=3, 40–128-bit), and V=4 (R=4, 128-bit) are
+//! covered here. V=5 (AES-256) is handled in a separate subtask.
 //!
 //! # Note on end-to-end compatibility
 //! Full qpdf-compatible fixture testing (real encrypted PDF files) is deferred to
@@ -154,6 +163,80 @@ fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
     Ok((inputs.length_bits / 8) as usize)
 }
 
+/// Validate `inputs` for V=4, R=4, Length=128 (the only combination this module
+/// supports for the CF-dispatch handler).
+///
+/// Accepts exactly V=4, R=4, Length=128.  Other combinations return
+/// [`EncryptedError::UnsupportedHandler`].
+fn validate_v4_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
+    if inputs.v != 4 || inputs.r != 4 || inputs.length_bits != 128 {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: "Standard".into(),
+            v: inputs.v,
+            r: inputs.r,
+            cfm: None,
+        }
+        .into());
+    }
+    Ok(16)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// V=4 Crypt Filter types
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Crypt-filter method (PDF 1.7 §7.6.5 /CFM).
+///
+/// Only the three methods used by V=4 are represented.  An unknown /CFM value
+/// encountered during parsing should be rejected with `UnsupportedHandler`
+/// before a `CryptFilter` is constructed — the type system then guarantees
+/// that any `CryptFilter` in scope uses a supported method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CryptFilterMethod {
+    /// `/CFM /V2` — RC4-128.
+    V2,
+    /// `/CFM /AESV2` — AES-128 CBC.
+    AesV2,
+    /// `/CFM /Identity` — no-op pass-through.
+    Identity,
+}
+
+/// A single entry in the `/CF` dictionary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CryptFilter {
+    /// The name of this filter as it appears in the `/CF` dictionary.
+    pub name: String,
+    /// The cipher method for this filter.
+    pub cfm: CryptFilterMethod,
+    /// Optional `/Length` override in **bits** (some PDFs include this per-entry).
+    pub length_bits: Option<i64>,
+}
+
+/// The result of resolving a use-site name against the `/CF` table.
+///
+/// Returned by [`select_crypt_filter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CryptFilterRef<'a> {
+    /// The use-site name was `None` or `"/Identity"` — no encryption is applied.
+    Identity,
+    /// The use-site name resolved to a specific entry in the `/CF` table.
+    Named(&'a CryptFilter),
+}
+
+/// Convenience holder for the three use-site selector fields from `/Encrypt`
+/// for a V=4 document.
+///
+/// `None` for any field means fall back to the `/Identity` no-op filter.
+#[derive(Debug, Clone)]
+pub(crate) struct V4UseSiteSelectors {
+    /// `/StmF` — default crypt filter for streams.
+    pub stm_f: Option<String>,
+    /// `/StrF` — default crypt filter for strings.
+    pub str_f: Option<String>,
+    /// `/EFF` — default crypt filter for embedded file streams.
+    pub eff: Option<String>,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Public API
 // ────────────────────────────────────────────────────────────────────────────
@@ -195,6 +278,89 @@ pub(crate) fn compute_file_key(
 
     // Step 5: Return the first n bytes as the file encryption key.
     Ok(digest[..n].to_vec())
+}
+
+/// PDF 1.7 §7.6.3.3 Algorithm 2 (R=4 path) — Compute the V=4 file encryption key.
+///
+/// This is a thin shim that validates the inputs as V=4/R=4/Length=128 and then
+/// delegates to the same MD5-based key derivation used by `compute_file_key`.
+/// The 0xFF×4 tail required by Algorithm 2 step 3 when `!encrypt_metadata && R≥4`
+/// is already handled inside `compute_file_key`'s inner loop; no new logic is needed.
+///
+/// Returns the 16-byte file encryption key.
+pub(crate) fn compute_file_key_v4(
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<Vec<u8>> {
+    // Validate that inputs are specifically V=4/R=4/Length=128.
+    let _n = validate_v4_inputs(inputs)?;
+    // compute_file_key contains the full Algorithm 2 R=4 path (including the
+    // conditional 0xFF×4 tail for !encrypt_metadata). We invoke it directly,
+    // bypassing validate_inputs (which rejects V=4) by constructing equivalent
+    // inputs that the inner function accepts — but that would couple the two
+    // validators. Instead, inline only the algorithmic core so we stay DRY
+    // without punching a hole in validate_inputs.
+    //
+    // Algorithmic core (mirrors compute_file_key):
+    let n = 16usize; // length_bits=128 → 16 bytes
+    let padded = pad_password(password);
+    let p_le = inputs.p.to_le_bytes();
+    let mut md5_input = Vec::with_capacity(32 + 32 + 4 + inputs.id0.len() + 4);
+    md5_input.extend_from_slice(&padded);
+    md5_input.extend_from_slice(inputs.o);
+    md5_input.extend_from_slice(&p_le);
+    md5_input.extend_from_slice(inputs.id0);
+    // R=4: append 0xFF×4 when encrypt_metadata is false (Algorithm 2, step 3).
+    if !inputs.encrypt_metadata {
+        md5_input.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+    let mut digest = md5(&md5_input);
+    // R=4 ≥ 3: 50 iterations of MD5 on the first n bytes.
+    for _ in 0..50 {
+        digest = md5(&digest[..n]);
+    }
+    Ok(digest[..n].to_vec())
+}
+
+/// Select the [`CryptFilter`] for a given use-site name from the `/CF` table.
+///
+/// The name is the value of `/StmF`, `/StrF`, or `/EFF` for the relevant
+/// use site.  Resolution rules:
+///
+/// - `name == None` or `name == Some("/Identity")` → [`CryptFilterRef::Identity`]
+/// - `name == Some(n)` and `cf_table` contains `n` → [`CryptFilterRef::Named`]
+/// - `name == Some(n)` and `cf_table` does **not** contain `n` →
+///   [`EncryptedError::Malformed`]
+///
+/// `/Identity` is a PDF-specified no-op pass-through and does not need to
+/// appear in the `/CF` dictionary.
+pub(crate) fn select_crypt_filter<'a>(
+    cf_table: &'a std::collections::HashMap<String, CryptFilter>,
+    name: Option<&str>,
+) -> Result<CryptFilterRef<'a>> {
+    match name {
+        None | Some("Identity") => Ok(CryptFilterRef::Identity),
+        Some(n) => match cf_table.get(n) {
+            Some(cf) => Ok(CryptFilterRef::Named(cf)),
+            None => Err(EncryptedError::Malformed {
+                reason: format!("/CF entry '{}' not found", n),
+            }
+            .into()),
+        },
+    }
+}
+
+/// Map a [`CryptFilterMethod`] to the [`ObjectKeyAlg`] required by
+/// [`per_object_key`].
+///
+/// Returns `None` for [`CryptFilterMethod::Identity`] because no key derivation
+/// is needed — the data is passed through unchanged.
+pub(crate) fn cfm_to_object_key_alg(cfm: CryptFilterMethod) -> Option<ObjectKeyAlg> {
+    match cfm {
+        CryptFilterMethod::V2 => Some(ObjectKeyAlg::Rc4),
+        CryptFilterMethod::AesV2 => Some(ObjectKeyAlg::Aes),
+        CryptFilterMethod::Identity => None,
+    }
 }
 
 /// PDF 1.7 §7.6.3.3 Algorithm 6 — Authenticate the user password.
@@ -1077,5 +1243,236 @@ mod tests {
             "TC-A1-6 mismatch"
         );
         assert_eq!(got.len(), 16, "output must be capped at 16");
+    }
+
+    // ── V=4 R=4 key derivation ───────────────────────────────────────────────
+    // KAT vectors generated by a Python reference implementation (hashlib.md5)
+    // that directly follows PDF 1.7 §7.6.3.3 Algorithm 2 for R=4.
+    // All tests use:  ID0 = [0x00..0x0f], P = -3904, O = [0u8; 32].
+
+    /// TC5: V=4 R=4 Length=128, empty password, encrypt_metadata=true.
+    /// Expected 16-byte file key (Python reference).
+    #[test]
+    fn compute_file_key_v4_empty_password_encrypt_metadata_true() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 4,
+            r: 4,
+            length_bits: 128,
+            p: P,
+            id0: &ID0,
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let key = compute_file_key_v4(b"", &inputs).unwrap();
+        assert_eq!(
+            key,
+            from_hex("b6bfe1cc3cede324f6d00115f6f22801"),
+            "TC5: wrong file key for V=4 R=4 empty pw encrypt_metadata=true"
+        );
+        assert_eq!(key.len(), 16);
+    }
+
+    /// TC6: V=4 R=4 Length=128, empty password, encrypt_metadata=false.
+    /// The 0xFF×4 tail must be appended, changing the key vs TC5.
+    #[test]
+    fn compute_file_key_v4_empty_password_encrypt_metadata_false() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 4,
+            r: 4,
+            length_bits: 128,
+            p: P,
+            id0: &ID0,
+            u: &u,
+            o: &o,
+            encrypt_metadata: false,
+        };
+        let key = compute_file_key_v4(b"", &inputs).unwrap();
+        assert_eq!(
+            key,
+            from_hex("08a258e623f388621234efcf1e86489d"),
+            "TC6: wrong file key for V=4 R=4 empty pw encrypt_metadata=false"
+        );
+        assert_eq!(key.len(), 16);
+        // The 0xFF×4 tail must change the key relative to TC5.
+        assert_ne!(
+            key,
+            from_hex("b6bfe1cc3cede324f6d00115f6f22801"),
+            "TC6: encrypt_metadata=false must produce a different key than encrypt_metadata=true"
+        );
+    }
+
+    /// TC7: V=4 R=4 Length=128, password="secret", encrypt_metadata=true.
+    #[test]
+    fn compute_file_key_v4_with_password() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 4,
+            r: 4,
+            length_bits: 128,
+            p: P,
+            id0: &ID0,
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let key = compute_file_key_v4(b"secret", &inputs).unwrap();
+        assert_eq!(
+            key,
+            from_hex("6e3b6cc29b8afaf34a03d43a08d67bbb"),
+            "TC7: wrong file key for V=4 R=4 pw='secret'"
+        );
+    }
+
+    /// validate: V=4 R=3 must be rejected (only R=4 is valid for V=4).
+    #[test]
+    fn compute_file_key_v4_rejects_r3() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 4,
+            r: 3, // wrong revision for V=4
+            length_bits: 128,
+            p: -1,
+            id0: &[],
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let err = compute_file_key_v4(b"", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(
+                    crate::error::EncryptedError::UnsupportedHandler { .. }
+                )
+            ),
+            "expected UnsupportedHandler for V=4/R=3, got: {err:?}"
+        );
+    }
+
+    /// validate: V=4 R=4 but Length != 128 must be rejected.
+    #[test]
+    fn compute_file_key_v4_rejects_wrong_length() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 4,
+            r: 4,
+            length_bits: 40, // V=4 requires exactly 128
+            p: -1,
+            id0: &[],
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let err = compute_file_key_v4(b"", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(
+                    crate::error::EncryptedError::UnsupportedHandler { .. }
+                )
+            ),
+            "expected UnsupportedHandler for V=4/R=4/Length=40, got: {err:?}"
+        );
+    }
+
+    // ── select_crypt_filter ──────────────────────────────────────────────────
+
+    fn make_cf_table() -> std::collections::HashMap<String, CryptFilter> {
+        let mut table = std::collections::HashMap::new();
+        table.insert(
+            "StdCF".to_string(),
+            CryptFilter {
+                name: "StdCF".to_string(),
+                cfm: CryptFilterMethod::AesV2,
+                length_bits: Some(128),
+            },
+        );
+        table.insert(
+            "RC4CF".to_string(),
+            CryptFilter {
+                name: "RC4CF".to_string(),
+                cfm: CryptFilterMethod::V2,
+                length_bits: None,
+            },
+        );
+        table
+    }
+
+    /// name=None → Identity.
+    #[test]
+    fn select_crypt_filter_none_is_identity() {
+        let table = make_cf_table();
+        let result = select_crypt_filter(&table, None).unwrap();
+        assert_eq!(result, CryptFilterRef::Identity);
+    }
+
+    /// name=Some("Identity") → Identity.
+    #[test]
+    fn select_crypt_filter_identity_name_is_identity() {
+        let table = make_cf_table();
+        let result = select_crypt_filter(&table, Some("Identity")).unwrap();
+        assert_eq!(result, CryptFilterRef::Identity);
+    }
+
+    /// name=Some("StdCF") with the entry present → Named.
+    #[test]
+    fn select_crypt_filter_known_name_returns_named() {
+        let table = make_cf_table();
+        let result = select_crypt_filter(&table, Some("StdCF")).unwrap();
+        match result {
+            CryptFilterRef::Named(cf) => {
+                assert_eq!(cf.name, "StdCF");
+                assert_eq!(cf.cfm, CryptFilterMethod::AesV2);
+            }
+            CryptFilterRef::Identity => panic!("expected Named, got Identity"),
+        }
+    }
+
+    /// name=Some("Missing") with no such entry → Malformed.
+    #[test]
+    fn select_crypt_filter_missing_name_returns_malformed() {
+        let table = make_cf_table();
+        let err = select_crypt_filter(&table, Some("Missing")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
+            ),
+            "expected Malformed for missing CF entry, got: {err:?}"
+        );
+    }
+
+    // ── cfm_to_object_key_alg ────────────────────────────────────────────────
+
+    /// CryptFilterMethod::V2 maps to ObjectKeyAlg::Rc4.
+    #[test]
+    fn cfm_v2_maps_to_rc4() {
+        assert_eq!(
+            cfm_to_object_key_alg(CryptFilterMethod::V2),
+            Some(ObjectKeyAlg::Rc4)
+        );
+    }
+
+    /// CryptFilterMethod::AesV2 maps to ObjectKeyAlg::Aes.
+    #[test]
+    fn cfm_aesv2_maps_to_aes() {
+        assert_eq!(
+            cfm_to_object_key_alg(CryptFilterMethod::AesV2),
+            Some(ObjectKeyAlg::Aes)
+        );
+    }
+
+    /// CryptFilterMethod::Identity maps to None (no cipher needed).
+    #[test]
+    fn cfm_identity_maps_to_none() {
+        assert_eq!(cfm_to_object_key_alg(CryptFilterMethod::Identity), None);
     }
 }
