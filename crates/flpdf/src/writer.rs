@@ -1040,11 +1040,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 
     for object_ref in &object_refs {
-        // Resolve the object; if resolution fails, skip (soft error).
-        let object = match pdf.resolve(*object_ref) {
-            Ok(obj) => obj,
-            Err(_) => continue,
-        };
+        // Resolve the object; propagate the error so callers see corrupt input
+        // rather than getting a silent success with missing /Root descendants.
+        let object = pdf.resolve(*object_ref)?;
 
         // Skip xref-stream container objects — we'll rebuild the xref from
         // scratch below.  Skip ObjStm container objects — their members have
@@ -1124,22 +1122,37 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // emitted objects.
             let xref_object_number = object_count as u32;
 
-            // Build the xref stream entries: object 0 is always free, then the
-            // emitted objects, then the xref stream object itself.
+            // Build the xref stream entries.  We include every object number
+            // in `[0, xref_object_number]` so that `/Size` and `/Index` stay
+            // consistent: object 0 and any gaps in the emitted-objects set are
+            // emitted as free entries, and the xref stream object itself sits
+            // at the end.  This produces a single contiguous /Index range and
+            // matches the structure a reader expects from a non-incremental
+            // xref stream.
+            let final_object_count = (xref_object_number as usize).saturating_add(1);
             let mut xref_entries: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
             xref_entries.insert(0, (65535, XrefOffset::Free { next: 0 }));
-            for (&num, &(gen, off)) in &offsets {
-                xref_entries.insert(
-                    num,
-                    (
-                        gen,
-                        XrefOffset::Offset(u64::try_from(off).map_err(|_| {
-                            crate::Error::Unsupported(
-                                "xref offset does not fit u64".to_string(),
-                            )
-                        })?),
-                    ),
-                );
+            for number in 1..xref_object_number {
+                match offsets.get(&number) {
+                    Some(&(gen, off)) => {
+                        xref_entries.insert(
+                            number,
+                            (
+                                gen,
+                                XrefOffset::Offset(u64::try_from(off).map_err(|_| {
+                                    crate::Error::Unsupported(
+                                        "xref offset does not fit u64".to_string(),
+                                    )
+                                })?),
+                            ),
+                        );
+                    }
+                    None => {
+                        // Gap in emitted objects — emit as a free entry so the
+                        // xref stream covers `[0, /Size)` contiguously.
+                        xref_entries.insert(number, (0, XrefOffset::Free { next: 0 }));
+                    }
+                }
             }
             xref_entries.insert(
                 xref_object_number,
@@ -1153,21 +1166,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 ),
             );
 
-            let mut object_numbers: Vec<u32> = xref_entries.keys().copied().collect();
-            object_numbers.sort_unstable();
-
-            let mut ranges: Vec<(u32, u32)> = Vec::new();
-            let mut idx = 0;
-            while idx < object_numbers.len() {
-                let start = object_numbers[idx];
-                let mut end = start;
-                while idx + 1 < object_numbers.len() && object_numbers[idx + 1] == end + 1 {
-                    idx += 1;
-                    end = object_numbers[idx];
-                }
-                ranges.push((start, end.saturating_sub(start).saturating_add(1)));
-                idx += 1;
-            }
+            // The entries are now contiguous `[0, final_object_count)`, so a
+            // single Index range suffices.
+            let ranges: Vec<(u32, u32)> = vec![(0, final_object_count as u32)];
 
             let stream_data = build_xref_stream_bytes(&xref_entries, &ranges)?;
 
@@ -1177,7 +1178,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 index_array.push(Object::Integer(i64::from(count)));
             }
 
-            let final_object_count = (xref_object_number as usize).saturating_add(1);
             let mut xref_dict = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut xref_dict);
             xref_dict.insert("Type", Object::Name(b"XRef".to_vec()));
@@ -1228,15 +1228,15 @@ fn reencode_stream_flate(stream: &crate::Stream) -> Object {
         }
     };
 
-    // Re-encode with a minimal FlateDecode dict.
+    // Re-encode with a minimal FlateDecode dict.  If encoding fails (which
+    // should be vanishingly rare for in-memory zlib), keep the original
+    // stream verbatim — declaring /FlateDecode on uncompressed bytes would
+    // produce an unreadable PDF.
     let mut encode_dict = Dictionary::new();
     encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
     let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
         Ok(e) => e,
-        Err(_) => {
-            // Encode failure: fall back to uncompressed.
-            decoded.clone()
-        }
+        Err(_) => return Object::Stream(stream.clone()),
     };
 
     // Build a new stream dict: copy everything from the original except the
