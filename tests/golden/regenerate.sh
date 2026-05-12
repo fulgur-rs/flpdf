@@ -160,8 +160,16 @@ echo ""
 echo "=== Size check (limit: 100 KB per file) ==="
 LIMIT=$((100 * 1024))
 FAILED=0
+# Portable file size: GNU stat uses -c%s, BSD/macOS stat uses -f%z.
+file_size() {
+    if size=$(stat -c%s "$1" 2>/dev/null); then
+        printf '%s' "$size"
+    else
+        stat -f%z "$1"
+    fi
+}
 while IFS= read -r -d '' f; do
-    size=$(stat -c%s "$f")
+    size=$(file_size "$f")
     rel="${f#"$ROOT"/}"
     if [[ "$size" -gt "$LIMIT" ]]; then
         echo "OVER LIMIT: $rel ($size bytes)"
