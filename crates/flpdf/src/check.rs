@@ -76,6 +76,12 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     };
 
     let mut diagnostics = pdf.repair_diagnostics().clone();
+    if pdf.uses_weak_crypto() {
+        diagnostics.push(Diagnostic::warning(
+            "encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied",
+            None,
+        ));
+    }
     if pdf.trailer().get_ref("Root").is_none() {
         diagnostics.push(Diagnostic::error("trailer is missing /Root", None));
     }

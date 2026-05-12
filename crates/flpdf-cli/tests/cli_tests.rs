@@ -39,6 +39,37 @@ fn check_encrypted_fixture_rejects_wrong_password() {
 }
 
 #[test]
+fn check_rejects_rc4_encrypted_input_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("rc4.pdf");
+    std::fs::write(&input, encrypted_v1_owner_password_fixture()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--password=owner"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("weak crypto"))
+        .stderr(predicate::str::contains("--allow-weak-crypto"));
+}
+
+#[test]
+fn check_allows_rc4_encrypted_input_with_warning_when_opted_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("rc4.pdf");
+    std::fs::write(&input, encrypted_v1_owner_password_fixture()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--allow-weak-crypto", "--password=owner"])
+        .arg(&input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stderr(predicate::str::contains("warning"))
+        .stderr(predicate::str::contains("weak crypto"));
+}
+
+#[test]
 fn check_repair_encrypted_fixture_rejects_wrong_password_actionably() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
@@ -846,6 +877,21 @@ fn corrupt_xref_pdf() -> Vec<u8> {
     }
 
     corrupted
+}
+
+fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+    let xref_offset = bytes.len();
+    let trailer = b"trailer\n<< /Size 3 /Root 1 0 R /Encrypt << /Filter /Standard /V 1 /R 2 /Length 40 /P -3904 /O <94e8094419662a774442fb072e3d9f19e9d130ec09a4d0061e78fe920f7ab62f> /U <13f520c882d052bf57b416b747c13979bded7ea31240fe41928852aca3894c49> >> /ID [<000102030405060708090a0b0c0d0e0f><000102030405060708090a0b0c0d0e0f>] >>\nstartxref\n";
+    bytes.extend_from_slice(format!("xref\n0 3\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(trailer);
+    bytes.extend_from_slice(xref_offset.to_string().as_bytes());
+    bytes.extend_from_slice(b"\n%%EOF\n");
+    bytes
 }
 
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
