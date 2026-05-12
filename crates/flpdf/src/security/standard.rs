@@ -1,4 +1,4 @@
-//! Standard Security Handler key derivation for PDF V=1, V=2, and V=4.
+//! Standard Security Handler key derivation for PDF V=1, V=2, V=4, and legacy V=5 R=5.
 //!
 //! Implements the following algorithms from PDF 1.7 §7.6.3.3:
 //! - **Algorithm 2**: Compute the file encryption key from password + dictionary entries.
@@ -16,9 +16,16 @@
 //! Actual PDF parsing of the `/Encrypt` dictionary and end-to-end round-trip decryption
 //! are deferred to issues flpdf-9hc.3.7, 3.8, 3.14, and 3.15.
 //!
+//! # Legacy V=5 R=5 AES-256 support
+//! R=5 is the deprecated pre-ISO 32000-2 AES-256 Standard handler. It uses a
+//! single SHA-256 pass over `password || salt` and AES-256-CBC with a zero IV to
+//! unwrap the 256-bit file key from `/UE` or `/OE`. New output using this legacy
+//! handler must remain behind weak-crypto opt-in if writer support is added.
+//!
 //! # Scope
-//! Only V=1 (R=2, 40-bit), V=2 (R=2/R=3, 40–128-bit), and V=4 (R=4, 128-bit) are
-//! covered here. V=5 (AES-256) is handled in a separate subtask.
+//! V=1 (R=2, 40-bit), V=2 (R=2/R=3, 40–128-bit), V=4 (R=4, 128-bit), and legacy
+//! V=5 R=5 AES-256 key derivation are covered here. V=5 R=6 hashing belongs to a
+//! separate subtask.
 //!
 //! # Note on end-to-end compatibility
 //! Full qpdf-compatible fixture testing (real encrypted PDF files) is deferred to
@@ -35,7 +42,10 @@
 #![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
-use crate::security::primitives::{md5, rc4};
+use crate::security::primitives::{md5, rc4, sha256};
+use aes::Aes256;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use cbc::Decryptor;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -73,6 +83,22 @@ pub(crate) struct StandardHandlerInputs<'a> {
     /// `/EncryptMetadata` flag.  For R ≤ 3, this is always treated as `true`
     /// per spec (the 0xFF×4 tail in Algorithm 2 is only appended for R ≥ 4).
     pub encrypt_metadata: bool,
+}
+
+/// Dictionary-derived inputs for legacy V=5 R=5 AES-256 key derivation.
+///
+/// `/U` and `/O` are 48 bytes each: 32-byte validation hash, 8-byte validation
+/// salt, and 8-byte file-key salt. `/UE` and `/OE` are the 32-byte AES-256-CBC
+/// encrypted file-key entries.
+pub(crate) struct StandardHandlerR5Inputs<'a> {
+    /// `/U` entry — validation hash, validation salt, key salt.
+    pub u: &'a [u8; 48],
+    /// `/O` entry — validation hash, validation salt, key salt.
+    pub o: &'a [u8; 48],
+    /// `/UE` entry — encrypted file key for the user password.
+    pub ue: &'a [u8; 32],
+    /// `/OE` entry — encrypted file key for the owner password.
+    pub oe: &'a [u8; 32],
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -179,6 +205,37 @@ fn validate_v4_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
         .into());
     }
     Ok(16)
+}
+
+fn r5_salted_hash(password: &[u8], salt: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(password.len() + salt.len());
+    input.extend_from_slice(password);
+    input.extend_from_slice(salt);
+    sha256(&input)
+}
+
+fn decrypt_r5_file_key(
+    password: &[u8],
+    entry: &[u8; 48],
+    encrypted_key: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let validation_salt = &entry[32..40];
+    let key_salt = &entry[40..48];
+
+    let validation_hash = r5_salted_hash(password, validation_salt);
+    if validation_hash[..] != entry[..32] {
+        return Err(EncryptedError::BadPassword.into());
+    }
+
+    let aes_key = r5_salted_hash(password, key_salt);
+    let iv = [0u8; 16];
+    let mut ciphertext = encrypted_key.to_vec();
+    let dec = <Decryptor<Aes256> as KeyIvInit>::new((&aes_key).into(), (&iv).into());
+    dec.decrypt_padded_mut::<NoPadding>(&mut ciphertext)
+        .map_err(|_| EncryptedError::Malformed {
+            reason: "invalid R=5 encrypted file-key entry".into(),
+        })?;
+    Ok(ciphertext)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -342,6 +399,29 @@ pub(crate) fn compute_file_key_v4(
         digest = md5(&digest[..n]);
     }
     Ok(digest[..n].to_vec())
+}
+
+/// Authenticate a user password for legacy V=5 R=5 and return the 32-byte file key.
+///
+/// This is the deprecated pre-ISO 32000-2 AES-256 path: authenticate with
+/// `SHA-256(password || /U validation_salt)`, then derive the AES key with
+/// `SHA-256(password || /U key_salt)` and decrypt `/UE` with AES-256-CBC using
+/// a zero IV.
+pub(crate) fn check_user_password_r5(
+    password: &[u8],
+    inputs: &StandardHandlerR5Inputs<'_>,
+) -> Result<Vec<u8>> {
+    decrypt_r5_file_key(password, inputs.u, inputs.ue)
+}
+
+/// Authenticate an owner password for legacy V=5 R=5 and return the 32-byte file key.
+///
+/// This mirrors [`check_user_password_r5`] using `/O` salts and `/OE`.
+pub(crate) fn check_owner_password_r5(
+    password: &[u8],
+    inputs: &StandardHandlerR5Inputs<'_>,
+) -> Result<Vec<u8>> {
+    decrypt_r5_file_key(password, inputs.o, inputs.oe)
 }
 
 /// Select the [`CryptFilter`] for a given use-site name from the `/CF` table.
@@ -555,6 +635,14 @@ mod tests {
         let v = from_hex(s);
         assert_eq!(v.len(), 32, "expected 32-byte hex string");
         let mut out = [0u8; 32];
+        out.copy_from_slice(&v);
+        out
+    }
+
+    fn hex48(s: &str) -> [u8; 48] {
+        let v = from_hex(s);
+        assert_eq!(v.len(), 48, "expected 48-byte hex string");
+        let mut out = [0u8; 48];
         out.copy_from_slice(&v);
         out
     }
@@ -1402,6 +1490,80 @@ mod tests {
                 )
             ),
             "expected UnsupportedHandler for V=4/R=4/Length=40, got: {err:?}"
+        );
+    }
+
+    // ── V=5 R=5 key derivation ───────────────────────────────────────────────
+    // R=5 is the deprecated pre-ISO 32000-2 AES-256 algorithm. Vectors generated
+    // by a Python hashlib SHA-256 reference plus OpenSSL AES-256-CBC -nopad.
+    // File key is bytes 0x00..0x1f; IV is all zeroes.
+
+    struct R5Fixture {
+        u: [u8; 48],
+        o: [u8; 48],
+        ue: [u8; 32],
+        oe: [u8; 32],
+    }
+
+    impl R5Fixture {
+        fn inputs(&self) -> StandardHandlerR5Inputs<'_> {
+            StandardHandlerR5Inputs {
+                u: &self.u,
+                o: &self.o,
+                ue: &self.ue,
+                oe: &self.oe,
+            }
+        }
+    }
+
+    fn r5_fixture() -> R5Fixture {
+        R5Fixture {
+            u: hex48(
+                "97e87734dfa9d2a69a7e7326ce3fabd944a3e718602d1bc4171df8a2736c6cbe\
+                 00112233445566778899aabbccddeeff",
+            ),
+            o: hex48(
+                "27268a7ad6a6c44c48c0aeea2ecd2907998deb36b652436c41f7096d1d6473b7\
+                 102132435465768798a9bacbdcedfe0f",
+            ),
+            ue: hex32("08030d6f64d3cf8bc22a9ec592a44da03b019659444bbb14111ea6f021b3bdac"),
+            oe: hex32("42ff75ffd7051f1140cadfb2edc04ba66d600779f571cd2c595ae87902fad106"),
+        }
+    }
+
+    #[test]
+    fn check_user_password_r5_returns_file_key() {
+        let fixture = r5_fixture();
+        let inputs = fixture.inputs();
+        let file_key = check_user_password_r5(b"userpass", &inputs).unwrap();
+        assert_eq!(
+            file_key,
+            from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        );
+    }
+
+    #[test]
+    fn check_owner_password_r5_returns_file_key() {
+        let fixture = r5_fixture();
+        let inputs = fixture.inputs();
+        let file_key = check_owner_password_r5(b"ownerpass", &inputs).unwrap();
+        assert_eq!(
+            file_key,
+            from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        );
+    }
+
+    #[test]
+    fn check_user_password_r5_rejects_wrong_password() {
+        let fixture = r5_fixture();
+        let inputs = fixture.inputs();
+        let err = check_user_password_r5(b"wrong", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(crate::error::EncryptedError::BadPassword)
+            ),
+            "expected BadPassword for wrong R=5 user password, got: {err:?}"
         );
     }
 
