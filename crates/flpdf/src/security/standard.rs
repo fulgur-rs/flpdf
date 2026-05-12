@@ -45,6 +45,7 @@
 
 use crate::error::{EncryptedError, Result};
 use crate::security::primitives::{md5, rc4, sha256, sha384, sha512};
+use crate::{Object, ObjectRef};
 use aes::{Aes128, Aes256};
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use cbc::{Decryptor, Encryptor};
@@ -673,6 +674,98 @@ pub(crate) enum ObjectKeyAlg {
     Aes,
 }
 
+/// Cipher material selected for decrypting string objects at a given use site.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StringCipher<'a> {
+    /// No-op crypt filter.
+    Identity,
+    /// RC4 with an already-derived object key (V<5) or selected CF key.
+    Rc4 { key: &'a [u8] },
+    /// AES-128-CBC with an already-derived object key. PDF string bytes include the IV.
+    Aes128 { key: &'a [u8; 16] },
+    /// AES-256-CBC for V=5. PDF string bytes include the IV.
+    Aes256 { key: &'a [u8; 32] },
+}
+
+/// Decrypt every string contained in a resolved object graph, in place.
+///
+/// The caller supplies the cipher material appropriate for `object_ref`: for V<5 this is
+/// the Algorithm 1 per-object key; for V=5 it is the file key or selected crypt-filter key.
+/// Stream payload bytes are intentionally left untouched, but stream dictionaries are
+/// traversed because they can contain ordinary string objects.
+pub(crate) fn decrypt_strings_in_object(
+    object_ref: ObjectRef,
+    object: &mut Object,
+    cipher: StringCipher<'_>,
+    encrypt_ref: Option<ObjectRef>,
+) -> Result<()> {
+    if Some(object_ref) == encrypt_ref {
+        return Ok(());
+    }
+    decrypt_strings_in_value(object, cipher)
+}
+
+fn decrypt_strings_in_value(object: &mut Object, cipher: StringCipher<'_>) -> Result<()> {
+    match object {
+        Object::String(bytes) => decrypt_string_bytes(bytes, cipher),
+        Object::Array(values) => {
+            for value in values {
+                decrypt_strings_in_value(value, cipher)?;
+            }
+            Ok(())
+        }
+        Object::Dictionary(dict) => {
+            for value in dict.values_mut() {
+                decrypt_strings_in_value(value, cipher)?;
+            }
+            Ok(())
+        }
+        Object::Stream(stream) => {
+            for value in stream.dict.values_mut() {
+                decrypt_strings_in_value(value, cipher)?;
+            }
+            Ok(())
+        }
+        Object::Null
+        | Object::Boolean(_)
+        | Object::Integer(_)
+        | Object::Real(_)
+        | Object::Name(_)
+        | Object::Reference(_) => Ok(()),
+    }
+}
+
+fn decrypt_string_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>) -> Result<()> {
+    match cipher {
+        StringCipher::Identity => Ok(()),
+        StringCipher::Rc4 { key } => rc4(key, bytes).map_err(Into::into),
+        StringCipher::Aes128 { key } => {
+            let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
+                return Err(EncryptedError::Malformed {
+                    reason: "AES string is missing its 16-byte IV".into(),
+                }
+                .into());
+            };
+            let mut decrypted = ciphertext.to_vec();
+            crate::security::primitives::aes128_cbc_decrypt(key, iv, &mut decrypted)?;
+            *bytes = decrypted;
+            Ok(())
+        }
+        StringCipher::Aes256 { key } => {
+            let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
+                return Err(EncryptedError::Malformed {
+                    reason: "AES string is missing its 16-byte IV".into(),
+                }
+                .into());
+            };
+            let mut decrypted = ciphertext.to_vec();
+            crate::security::primitives::aes256_cbc_decrypt(key, iv, &mut decrypted)?;
+            *bytes = decrypted;
+            Ok(())
+        }
+    }
+}
+
 /// PDF 1.7 §7.6.2 Algorithm 1 — derive a per-object key.
 ///
 /// Constructs the object-specific encryption key from the file encryption key,
@@ -720,6 +813,7 @@ pub(crate) fn per_object_key(file_key: &[u8], obj: u32, gen: u32, alg: ObjectKey
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Dictionary, Object, ObjectRef, Stream};
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -745,6 +839,146 @@ mod tests {
         let mut out = [0u8; 48];
         out.copy_from_slice(&v);
         out
+    }
+
+    fn aes128_string(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        let enc = <Encryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
+        let mut buf = plaintext.to_vec();
+        let msg_len = buf.len();
+        buf.resize(msg_len + 16, 0);
+        let ciphertext = enc
+            .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf, msg_len)
+            .unwrap();
+        let mut out = iv.to_vec();
+        out.extend_from_slice(ciphertext);
+        out
+    }
+
+    fn aes256_string(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        let enc = <Encryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
+        let mut buf = plaintext.to_vec();
+        let msg_len = buf.len();
+        buf.resize(msg_len + 16, 0);
+        let ciphertext = enc
+            .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf, msg_len)
+            .unwrap();
+        let mut out = iv.to_vec();
+        out.extend_from_slice(ciphertext);
+        out
+    }
+
+    #[test]
+    fn decrypt_strings_descends_into_nested_arrays_dicts_and_stream_dicts() {
+        let key = b"Key";
+        let mut nested = b"nested".to_vec();
+        rc4(key, &mut nested).unwrap();
+        let mut in_dict = b"in dict".to_vec();
+        rc4(key, &mut in_dict).unwrap();
+        let mut in_stream_dict = b"in stream dict".to_vec();
+        rc4(key, &mut in_stream_dict).unwrap();
+
+        let mut inner = Dictionary::new();
+        inner.insert("S", Object::String(in_dict));
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Title", Object::String(in_stream_dict));
+
+        let mut object = Object::Array(vec![
+            Object::String(nested),
+            Object::Dictionary(inner),
+            Object::Stream(Stream::new(
+                stream_dict,
+                b"encrypted stream bytes stay raw".to_vec(),
+            )),
+        ]);
+
+        decrypt_strings_in_object(
+            ObjectRef::new(7, 0),
+            &mut object,
+            StringCipher::Rc4 { key },
+            None,
+        )
+        .unwrap();
+
+        let Object::Array(values) = object else {
+            panic!("expected array");
+        };
+        assert_eq!(values[0], Object::String(b"nested".to_vec()));
+        let Object::Dictionary(dict) = &values[1] else {
+            panic!("expected dictionary");
+        };
+        assert_eq!(dict.get("S"), Some(&Object::String(b"in dict".to_vec())));
+        let Object::Stream(stream) = &values[2] else {
+            panic!("expected stream");
+        };
+        assert_eq!(
+            stream.dict.get("Title"),
+            Some(&Object::String(b"in stream dict".to_vec()))
+        );
+        assert_eq!(stream.data, b"encrypted stream bytes stay raw");
+    }
+
+    #[test]
+    fn decrypt_strings_skips_encrypt_object_subtree() {
+        let key = b"Key";
+        let mut secret = b"must stay encrypted".to_vec();
+        rc4(key, &mut secret).unwrap();
+        let encrypted = secret.clone();
+        let mut dict = Dictionary::new();
+        dict.insert("O", Object::String(secret));
+        let mut object = Object::Dictionary(dict);
+
+        decrypt_strings_in_object(
+            ObjectRef::new(5, 0),
+            &mut object,
+            StringCipher::Rc4 { key },
+            Some(ObjectRef::new(5, 0)),
+        )
+        .unwrap();
+
+        let Object::Dictionary(dict) = object else {
+            panic!("expected dictionary");
+        };
+        assert_eq!(dict.get("O"), Some(&Object::String(encrypted)));
+    }
+
+    #[test]
+    fn decrypt_strings_handles_rc4_aes128_and_v5_aes256_string_bytes() {
+        let rc4_key = b"Key";
+        let mut rc4_string = b"Plaintext".to_vec();
+        rc4(rc4_key, &mut rc4_string).unwrap();
+        let mut rc4_object = Object::String(rc4_string);
+        decrypt_strings_in_object(
+            ObjectRef::new(10, 0),
+            &mut rc4_object,
+            StringCipher::Rc4 { key: rc4_key },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rc4_object, Object::String(b"Plaintext".to_vec()));
+
+        let aes128_key = [0x11; 16];
+        let aes128_iv = [0x22; 16];
+        let mut aes128_object = Object::String(aes128_string(&aes128_key, &aes128_iv, b"AES V2"));
+        decrypt_strings_in_object(
+            ObjectRef::new(11, 0),
+            &mut aes128_object,
+            StringCipher::Aes128 { key: &aes128_key },
+            None,
+        )
+        .unwrap();
+        assert_eq!(aes128_object, Object::String(b"AES V2".to_vec()));
+
+        let aes256_key = [0x33; 32];
+        let aes256_iv = [0x44; 16];
+        let mut aes256_object = Object::String(aes256_string(&aes256_key, &aes256_iv, b"AES V5"));
+        decrypt_strings_in_object(
+            ObjectRef::new(12, 0),
+            &mut aes256_object,
+            StringCipher::Aes256 { key: &aes256_key },
+            None,
+        )
+        .unwrap();
+        assert_eq!(aes256_object, Object::String(b"AES V5".to_vec()));
     }
 
     // ── Password padding ─────────────────────────────────────────────────────
