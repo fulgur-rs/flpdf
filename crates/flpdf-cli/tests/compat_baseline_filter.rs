@@ -72,15 +72,12 @@ fn filter_names(stream: &flpdf::Stream) -> Vec<Vec<u8>> {
         Some(Object::Name(name)) => vec![name.clone()],
         Some(Object::Array(arr)) => arr
             .iter()
-            .filter_map(|item| {
-                if let Object::Name(n) = item {
-                    Some(n.clone())
-                } else {
-                    None
-                }
+            .map(|item| match item {
+                Object::Name(n) => n.clone(),
+                other => panic!("unexpected non-Name in /Filter array: {other:?}"),
             })
             .collect(),
-        _ => vec![],
+        Some(other) => panic!("unexpected /Filter shape: {other:?}"),
     }
 }
 
