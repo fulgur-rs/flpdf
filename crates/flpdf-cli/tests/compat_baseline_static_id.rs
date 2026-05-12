@@ -170,8 +170,14 @@ fn check_or_bless(actual: &str) {
         std::fs::write(&path, actual).expect("failed to write baseline");
         return;
     }
+    // Normalize CRLF → LF on read. Git on Windows defaults to autocrlf=true
+    // and converts LF line endings to CRLF on checkout, so the file on disk
+    // ends up with \r\n even though the committed bytes are LF. The
+    // rendered markdown uses bare \n, so without normalization the
+    // comparison fails on Windows runners.
     let expected = std::fs::read_to_string(&path)
-        .expect("baseline file must exist; run with BLESS=1 to create it");
+        .expect("baseline file must exist; run with BLESS=1 to create it")
+        .replace("\r\n", "\n");
     if actual != expected {
         panic!(
             "baseline drift detected\n\n--- expected ---\n{expected}\n\n--- actual ---\n{actual}\n\nRun with BLESS=1 to update."
