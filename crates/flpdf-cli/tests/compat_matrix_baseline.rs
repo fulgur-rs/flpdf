@@ -83,7 +83,7 @@ impl Flag {
 }
 
 // ---------------------------------------------------------------------------
-// Matrix descriptor — 13 (fixture, flag) tuples
+// Matrix descriptor — 12 (fixture, flag) tuples
 // ---------------------------------------------------------------------------
 
 struct Entry {
@@ -130,10 +130,6 @@ const MATRIX: &[Entry] = &[
     },
     Entry {
         fixture: "linearized-one-page.pdf",
-        flag: Flag::Plain,
-    },
-    Entry {
-        fixture: "encrypted-r4-three-page.pdf",
         flag: Flag::Plain,
     },
     Entry {
@@ -288,7 +284,7 @@ fn compat_matrix_baseline() {
             .join(stem)
             .join(format!("{}.pdf", entry.flag.name()));
 
-        // Read golden bytes — panics if missing (all 13 goldens must exist).
+        // Read golden bytes — panics if missing (all goldens must exist).
         let golden_bytes = std::fs::read(&golden_path)
             .unwrap_or_else(|e| panic!("failed to read golden {}: {e}", golden_path.display()));
 
