@@ -1,6 +1,6 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use flpdf::{parse_object, Object, ObjectRef, Pdf};
+use flpdf::{parse_object, EncryptedError, Error, Object, ObjectRef, Pdf, PdfOpenOptions};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
@@ -13,6 +13,29 @@ fn opens_pdf_without_resolving_all_objects() {
     assert_eq!(pdf.version(), "1.7");
     assert_eq!(pdf.resolved_count(), 0);
     assert_eq!(pdf.trailer().get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+#[test]
+fn open_with_options_uses_empty_password_by_default() {
+    let file = File::open("../../tests/fixtures/compat/encrypted-r4-three-page.pdf").unwrap();
+    let pdf = Pdf::open_with_options(BufReader::new(file), PdfOpenOptions::default()).unwrap();
+
+    assert_eq!(pdf.version(), "1.6");
+}
+
+#[test]
+fn open_with_options_rejects_wrong_password() {
+    let file = File::open("../../tests/fixtures/compat/encrypted-r4-three-page.pdf").unwrap();
+    let options = PdfOpenOptions {
+        password: b"wrong".to_vec(),
+        ..PdfOpenOptions::default()
+    };
+    let err = match Pdf::open_with_options(BufReader::new(file), options) {
+        Ok(_) => panic!("wrong password should be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, Error::Encrypted(EncryptedError::BadPassword)));
 }
 
 #[test]

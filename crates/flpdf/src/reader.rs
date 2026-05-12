@@ -1,5 +1,9 @@
 use crate::cache::{CacheEntry, ObjectCache};
+use crate::error::EncryptedError;
 use crate::parser::{parse_indirect_object, Parser};
+use crate::security::standard::{
+    check_user_password, check_user_password_v4, StandardHandlerInputs,
+};
 use crate::{
     load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
     Object, ObjectRef, Result, XrefForm, XrefOffset,
@@ -40,23 +44,43 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
 }
 
+/// Options for opening a PDF document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PdfOpenOptions {
+    /// Enable xref/trailer repair when strict parsing fails.
+    pub repair: bool,
+    /// Password bytes supplied to the Standard security handler.
+    pub password: Vec<u8>,
+}
+
 impl<R: Read + Seek> Pdf<R> {
     /// Open a document strictly: parse the cross-reference and trailer, but do not run
     /// the recovery heuristics. Returns an [`Error`] if the document is malformed.
     pub fn open(reader: R) -> Result<Self> {
-        Self::open_with_repair_mode(reader, false)
+        Self::open_with_options(reader, PdfOpenOptions::default())
     }
 
     /// Open a document, falling back to qpdf-style xref/trailer recovery when the
     /// strict parse fails. Diagnostics from the recovery pass are stored on the handle
     /// and exposed via [`Pdf::repair_diagnostics`].
     pub fn open_with_repair(reader: R) -> Result<Self> {
-        Self::open_with_repair_mode(reader, true)
+        Self::open_with_options(
+            reader,
+            PdfOpenOptions {
+                repair: true,
+                ..PdfOpenOptions::default()
+            },
+        )
     }
 
     /// Alias for [`Pdf::open_with_repair`].
     pub fn open_best_effort(reader: R) -> Result<Self> {
-        Self::open_with_repair_mode(reader, true)
+        Self::open_with_repair(reader)
+    }
+
+    /// Open a document with explicit repair and password options.
+    pub fn open_with_options(reader: R, options: PdfOpenOptions) -> Result<Self> {
+        Self::open_with_repair_mode(reader, options)
     }
 
     /// Diagnostics emitted while opening the document — typically warnings from the
@@ -65,9 +89,9 @@ impl<R: Read + Seek> Pdf<R> {
         &self.repair_diagnostics
     }
 
-    fn open_with_repair_mode(mut reader: R, allow_repair: bool) -> Result<Self> {
-        let loaded = if allow_repair {
-            load_xref_and_trailer_with_repair(&mut reader, allow_repair)?
+    fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
+        let loaded = if options.repair {
+            load_xref_and_trailer_with_repair(&mut reader, options.repair)?
         } else {
             load_xref_and_trailer(&mut reader)?
         };
@@ -82,7 +106,7 @@ impl<R: Read + Seek> Pdf<R> {
             })
             .collect();
         let cache = ObjectCache::from_offsets(&loaded.entries);
-        Ok(Self {
+        let mut pdf = Self {
             reader,
             version: loaded.version,
             trailer: loaded.trailer,
@@ -93,7 +117,41 @@ impl<R: Read + Seek> Pdf<R> {
             compressed_member_parents: BTreeMap::new(),
             source_xref_offsets,
             source_xref_entries,
-        })
+        };
+        pdf.authenticate_if_encrypted(&options.password)?;
+        Ok(pdf)
+    }
+
+    fn authenticate_if_encrypted(&mut self, password: &[u8]) -> Result<()> {
+        let Some(encrypt) = self.encrypt_dictionary()? else {
+            return Ok(());
+        };
+
+        let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
+        if inputs.v == 4 && inputs.r == 4 {
+            check_user_password_v4(password, &inputs)?;
+        } else {
+            check_user_password(password, &inputs)?;
+        }
+        Ok(())
+    }
+
+    fn encrypt_dictionary(&mut self) -> Result<Option<Dictionary>> {
+        match self.trailer().get("Encrypt").cloned() {
+            None => Ok(None),
+            Some(Object::Dictionary(dict)) => Ok(Some(dict)),
+            Some(Object::Reference(object_ref)) => match self.resolve(object_ref)? {
+                Object::Dictionary(dict) => Ok(Some(dict)),
+                _ => Err(EncryptedError::Malformed {
+                    reason: "/Encrypt object is not a dictionary".into(),
+                }
+                .into()),
+            },
+            Some(_) => Err(EncryptedError::Malformed {
+                reason: "/Encrypt entry is not a dictionary or reference".into(),
+            }
+            .into()),
+        }
     }
 
     /// PDF version header as written in the first line of the file (e.g. `"1.7"`).
@@ -428,6 +486,152 @@ fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -
 
     let mut object_parser = Parser::new(&stream_data[start..]);
     object_parser.object()
+}
+
+fn standard_handler_inputs<'a>(
+    encrypt: &'a Dictionary,
+    trailer: &'a Dictionary,
+) -> Result<StandardHandlerInputs<'a>> {
+    let filter = required_name(encrypt, "Filter")?;
+    let v = required_integer(encrypt, "V")?;
+    let r = required_integer(encrypt, "R")?;
+    if filter != "Standard" || !matches!((v, r), (1 | 2, 2 | 3) | (4, 4)) {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: filter.to_string(),
+            v,
+            r,
+            cfm: crypt_filter_method(encrypt),
+        }
+        .into());
+    }
+
+    let length_bits = match encrypt.get("Length") {
+        Some(Object::Integer(value)) => *value,
+        Some(_) => {
+            return Err(EncryptedError::Malformed {
+                reason: "/Length entry is not an integer".into(),
+            }
+            .into())
+        }
+        None => 40,
+    };
+    let p =
+        i32::try_from(required_integer(encrypt, "P")?).map_err(|_| EncryptedError::Malformed {
+            reason: "/P entry is out of i32 range".into(),
+        })?;
+    let u = required_32_byte_string(encrypt, "U")?;
+    let o = required_32_byte_string(encrypt, "O")?;
+    let id0 = first_file_id(trailer)?;
+    let encrypt_metadata = match encrypt.get("EncryptMetadata") {
+        Some(Object::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(EncryptedError::Malformed {
+                reason: "/EncryptMetadata entry is not a boolean".into(),
+            }
+            .into())
+        }
+        None => true,
+    };
+
+    Ok(StandardHandlerInputs {
+        v,
+        r,
+        length_bits,
+        p,
+        id0,
+        u,
+        o,
+        encrypt_metadata,
+    })
+}
+
+fn required_integer(dict: &Dictionary, key: &'static str) -> Result<i64> {
+    match dict.get(key) {
+        Some(Object::Integer(value)) => Ok(*value),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: format!("/{key} entry is not an integer"),
+        }
+        .into()),
+        None => Err(EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+fn required_name<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a str> {
+    match dict.get(key) {
+        Some(Object::Name(name)) => std::str::from_utf8(name).map_err(|_| {
+            EncryptedError::Malformed {
+                reason: format!("/{key} entry is not valid UTF-8"),
+            }
+            .into()
+        }),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a name"),
+        }
+        .into()),
+        None => Err(EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+fn required_32_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a [u8; 32]> {
+    match dict.get(key) {
+        Some(Object::String(bytes)) => bytes.as_slice().try_into().map_err(|_| {
+            EncryptedError::Malformed {
+                reason: format!("/{key} entry is not 32 bytes"),
+            }
+            .into()
+        }),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a string"),
+        }
+        .into()),
+        None => Err(EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+fn first_file_id(trailer: &Dictionary) -> Result<&[u8]> {
+    match trailer.get("ID") {
+        Some(Object::Array(ids)) => match ids.first() {
+            Some(Object::String(id0)) => Ok(id0),
+            Some(_) => Err(EncryptedError::Malformed {
+                reason: "/ID first entry is not a string".into(),
+            }
+            .into()),
+            None => Err(EncryptedError::Malformed {
+                reason: "/ID array is empty".into(),
+            }
+            .into()),
+        },
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: "/ID entry is not an array".into(),
+        }
+        .into()),
+        None => Err(EncryptedError::Malformed {
+            reason: "missing /ID entry".into(),
+        }
+        .into()),
+    }
+}
+
+fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
+    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+        return None;
+    };
+    let Object::Dictionary(std_cf) = cf.get("StdCF")? else {
+        return None;
+    };
+    let Object::Name(cfm) = std_cf.get("CFM")? else {
+        return None;
+    };
+    Some(String::from_utf8_lossy(cfm).to_string())
 }
 
 fn object_stream_count(stream_object: &crate::Stream) -> Result<usize> {

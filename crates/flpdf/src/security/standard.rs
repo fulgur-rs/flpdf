@@ -612,6 +612,32 @@ pub(crate) fn check_user_password(
     Ok(file_key)
 }
 
+/// PDF 1.7 §7.6.3.3 Algorithm 6 for V=4/R=4 Standard handler inputs.
+pub(crate) fn check_user_password_v4(
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<Vec<u8>> {
+    let file_key = compute_file_key_v4(password, inputs)?;
+
+    let mut md5_input = Vec::with_capacity(32 + inputs.id0.len());
+    md5_input.extend_from_slice(&PASSWORD_PADDING);
+    md5_input.extend_from_slice(inputs.id0);
+    let digest = md5(&md5_input);
+
+    let mut data = digest;
+    rc4(&file_key, &mut data)?;
+    for i in 1u8..=19 {
+        let xor_key: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
+        rc4(&xor_key, &mut data)?;
+    }
+
+    if data[..] != inputs.u[..16] {
+        return Err(EncryptedError::BadPassword.into());
+    }
+
+    Ok(file_key)
+}
+
 /// PDF 1.7 §7.6.3.3 Algorithm 7 — Authenticate the owner password.
 ///
 /// Returns the file encryption key on success, or
