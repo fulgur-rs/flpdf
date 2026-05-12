@@ -2590,3 +2590,74 @@ fn full_rewrite_strips_filter_from_rebuilt_xref_stream_dict() {
         );
     }
 }
+
+/// Build a minimal PDF whose content stream declares `/F` to point at an
+/// external file in addition to its embedded data.  Used to verify that
+/// `reencode_stream_flate` strips `/F` so readers don't load the stale
+/// external reference instead of the newly produced embedded Flate stream.
+fn build_pdf_with_external_file_stream() -> Vec<u8> {
+    use flate2::write::ZlibEncoder as Z;
+    use flate2::Compression as C;
+    let payload = b"embedded stream payload for external-file regression";
+    let mut enc = Z::new(Vec::new(), C::default());
+    enc.write_all(payload).unwrap();
+    let compressed = enc.finish().unwrap();
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    offsets.push(bytes.len());
+    let stream_header = format!(
+        "3 0 obj\n<< /Filter /FlateDecode /F (external.bin) /Length {} >>\nstream\n",
+        compressed.len()
+    );
+    bytes.extend_from_slice(stream_header.as_bytes());
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn full_rewrite_strips_external_file_ref_from_reencoded_stream() {
+    // Regression: previously /F survived through reencode_stream_flate, so a
+    // re-emitted Flate stream still pointed at the (now-stale) external file
+    // and readers honoring /F would ignore the embedded payload.
+    let source = build_pdf_with_external_file_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let Object::Stream(stream) = stream_obj else {
+        panic!("object 3 should be a stream");
+    };
+    for key in ["F", "FFilter", "FDecodeParms"] {
+        assert!(
+            stream.dict.get(key).is_none(),
+            "re-encoded stream must not carry /{key}"
+        );
+    }
+}
