@@ -102,3 +102,12 @@ jobs:
       - name: bytes-identical zlib compat (Linux)
         if: runner.os == 'Linux'
         run: cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
+
+      - name: Compat matrix baselines (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[ci] Running compat matrix baselines — drift surfaces here as an explicit step"
+          cargo test -p flpdf-cli --test compat_baseline_static_id -- --nocapture
+          cargo test -p flpdf-cli --test compat_matrix_baseline -- --nocapture
