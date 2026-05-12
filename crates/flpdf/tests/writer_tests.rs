@@ -1,8 +1,8 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_qdf, Object,
-    ObjectRef, Pdf, XrefForm, XrefOffset,
+    check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_pdf_with_options,
+    write_qdf, Dictionary, Object, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -2128,4 +2128,465 @@ fn corrupt_xref_pdf() -> Vec<u8> {
         *byte = b'z';
     }
     corrupted
+}
+
+// ---------------------------------------------------------------------------
+// Full-rewrite mode tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal PDF in-memory whose stream uses a single FlateDecode filter.
+fn build_minimal_pdf_with_stream(stream_data: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder as Z;
+    use flate2::Compression as C;
+    let mut enc = Z::new(Vec::new(), C::default());
+    enc.write_all(stream_data).unwrap();
+    let compressed = enc.finish().unwrap();
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    // object 1: catalog
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    // object 2: pages
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    // object 3: content stream with FlateDecode
+    offsets.push(bytes.len());
+    let stream_header = format!(
+        "3 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+        compressed.len()
+    );
+    bytes.extend_from_slice(stream_header.as_bytes());
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Build a minimal PDF whose stream uses a multi-filter chain: [ASCII85Decode, FlateDecode].
+/// This is the kind of output produced by ReportLab.
+///
+/// The PDF decode pipeline for [ASCII85Decode, FlateDecode] is:
+///   stored → ASCII85 decode → FlateDecode decode → raw
+/// so stored = ASCII85(FlateDecode(raw)).
+fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
+    let raw_data = b"Hello from multi-filter stream!".repeat(20);
+    // Build stored = ASCII85(Flate(raw)):
+    //   Step 1: FlateDecode encode raw → flated
+    //   Step 2: ASCII85Decode encode flated → a85
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let flated = filters::encode_stream_data(&flate_dict, &raw_data).unwrap();
+
+    let mut a85_dict = Dictionary::new();
+    a85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+    let a85 = filters::encode_stream_data(&a85_dict, &flated).unwrap();
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    // object 1: catalog
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    // object 2: pages
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    // object 3: content stream with [ASCII85Decode FlateDecode]
+    offsets.push(bytes.len());
+    let stream_header = format!(
+        "3 0 obj\n<< /Filter [/ASCII85Decode /FlateDecode] /Length {} >>\nstream\n",
+        a85.len()
+    );
+    bytes.extend_from_slice(stream_header.as_bytes());
+    bytes.extend_from_slice(&a85);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn full_rewrite_minimal_pdf_is_valid() {
+    let source = build_minimal_pdf_with_stream(b"content data");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite output should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+#[test]
+fn full_rewrite_no_prev_in_trailer() {
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Trailer must not contain /Prev.
+    let reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    assert!(
+        reopened.trailer().get("Prev").is_none(),
+        "full-rewrite output must not have /Prev in trailer"
+    );
+}
+
+#[test]
+fn full_rewrite_single_flatedecode_filter() {
+    let source = build_minimal_pdf_with_stream(b"stream payload data for filter check");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Re-open and inspect stream 3's filter.
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let Object::Stream(stream) = stream_obj else {
+        panic!("object 3 should be a stream");
+    };
+    match stream.dict.get("Filter") {
+        Some(Object::Name(name)) => {
+            assert_eq!(
+                name.as_slice(),
+                b"FlateDecode",
+                "stream Filter should be FlateDecode"
+            );
+        }
+        Some(Object::Array(_)) => {
+            // Also acceptable if the filter is a single-element array [/FlateDecode]
+            // but our implementation uses a Name directly.
+        }
+        other => panic!("unexpected Filter: {:?}", other),
+    }
+    // No DecodeParms from the old filter chain.
+    // Verify the stream decodes to the original data.
+    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+    assert_eq!(decoded, b"stream payload data for filter check");
+}
+
+#[test]
+fn full_rewrite_multi_filter_decodes_and_reencodes() {
+    // Input has [ASCII85Decode FlateDecode] — multi-filter chain from ReportLab.
+    let source = build_pdf_with_multi_filter_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite of multi-filter PDF should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // Stream 3 should now have a single FlateDecode filter (not ASCII85+Flate).
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let Object::Stream(stream) = stream_obj else {
+        panic!("object 3 should be a stream");
+    };
+    // Filter must NOT be an array containing ASCII85Decode.
+    match stream.dict.get("Filter") {
+        Some(Object::Array(filters_arr)) => {
+            for f in filters_arr {
+                if let Object::Name(name) = f {
+                    assert_ne!(
+                        name.as_slice(),
+                        b"ASCII85Decode",
+                        "ASCII85Decode must be removed by full-rewrite"
+                    );
+                }
+            }
+        }
+        Some(Object::Name(name)) => {
+            assert_ne!(
+                name.as_slice(),
+                b"ASCII85Decode",
+                "ASCII85Decode must be removed by full-rewrite"
+            );
+        }
+        None => {} // uncompressed is also fine
+        other => panic!("unexpected Filter: {:?}", other),
+    }
+
+    // Verify round-trip: decode the output stream and compare to original raw data.
+    let raw_data = b"Hello from multi-filter stream!".repeat(20);
+    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+    assert_eq!(
+        decoded, raw_data,
+        "full-rewrite stream round-trip should recover original data"
+    );
+}
+
+#[test]
+fn full_rewrite_default_options_still_incremental() {
+    // With default WriteOptions (full_rewrite=false), source bytes are preserved.
+    let source_bytes = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source_bytes.clone())).unwrap();
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &WriteOptions::default()).unwrap();
+
+    // Incremental: source bytes are a prefix of the output.
+    assert!(
+        output.starts_with(&source_bytes),
+        "incremental write should preserve source bytes as a prefix"
+    );
+}
+
+#[test]
+fn full_rewrite_from_fixture() {
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite of fixture should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // Verify that the output contains the PDF header.
+    let header = &output[..9];
+    assert!(
+        header.starts_with(b"%PDF-"),
+        "output should start with PDF header"
+    );
+}
+
+/// Build a minimal PDF that uses an xref stream (instead of an xref table).
+/// The xref stream has /W [1 3 1] entries and no /Filter (uncompressed).
+fn build_minimal_pdf_with_xref_stream() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    // object 1: catalog
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    // object 2: pages
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+
+    // Build raw xref stream bytes: W=[1,3,1]
+    // Entry for obj 0: type=0 (free), field1=0, field2=0
+    // Entry for obj 1: type=1 (in-use), field1=offset, field2=0 (generation)
+    // Entry for obj 2: type=1 (in-use), field1=offset, field2=0
+    // Entry for obj 3 (xref stream itself): type=1, field1=xref_offset, field2=0
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[1] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn full_rewrite_xref_stream_input_produces_valid_pdf() {
+    // Verify that full_rewrite handles a PDF whose source uses xref stream form
+    // (XrefForm::Stream) — the XrefForm::Stream branch of write_pdf_full_rewrite.
+    let source = build_minimal_pdf_with_xref_stream();
+    // Confirm the fixture itself uses xref stream form before testing full_rewrite.
+    {
+        let mut reader = Cursor::new(&source);
+        let loaded = load_xref_and_trailer(&mut reader).unwrap();
+        assert_eq!(
+            loaded.last_xref_form,
+            XrefForm::Stream,
+            "fixture must use xref stream form"
+        );
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite of xref-stream input should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+#[test]
+fn full_rewrite_xref_stream_input_no_prev() {
+    // /Prev must be absent in the full-rewrite output even when the source used
+    // xref stream form.
+    let source = build_minimal_pdf_with_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
+    assert!(
+        loaded.trailer.get("Prev").is_none(),
+        "full-rewrite output from xref-stream input must not have /Prev"
+    );
+}
+
+#[test]
+fn full_rewrite_xref_stream_input_bumps_header_to_1_5_under_force_version() {
+    // PDF 1.5 introduced xref streams. Forcing the header to 1.4 while
+    // preserving the xref-stream form would emit a spec-inconsistent PDF;
+    // full_rewrite must override --force-version up to 1.5 in that case.
+    let source = build_minimal_pdf_with_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.force_version = Some("1.4".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.5\n"),
+        "expected header '%PDF-1.5' for xref-stream output; got: {:?}",
+        std::str::from_utf8(&output[..16]).unwrap_or("<invalid utf-8>")
+    );
+}
+
+/// Build a tiny xref-stream PDF whose xref stream declares
+/// `/Filter /FlateDecode` and stores FlateDecode-encoded entries. Used to
+/// verify that `write_pdf_full_rewrite` does not propagate stale filter
+/// declarations from the source trailer into the rebuilt xref stream.
+fn build_minimal_pdf_with_flate_xref_stream() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+
+    let mut raw_entries = Vec::new();
+    append_xref_stream_entry(&mut raw_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut raw_entries, 1, offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut raw_entries, 1, offsets[1] as u32, 0);
+    append_xref_stream_entry(&mut raw_entries, 1, xref_offset as u32, 0);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw_entries).unwrap();
+    let encoded = encoder.finish().unwrap();
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Filter /FlateDecode /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            encoded.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn full_rewrite_strips_filter_from_rebuilt_xref_stream_dict() {
+    // Regression test: when the source PDF's xref stream declared
+    // `/Filter /FlateDecode`, the rebuilt xref stream output used to inherit
+    // that key from `pdf.trailer().clone()` while emitting raw entry bytes,
+    // producing an unreadable PDF.  Verify the filter keys are stripped.
+    let source = build_minimal_pdf_with_flate_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // The output must parse back cleanly.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite output from filtered xref-stream input should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // And the rebuilt xref stream must not carry any stream-filter keys.
+    let mut reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
+    for key in ["Filter", "DecodeParms", "F", "FFilter", "FDecodeParms"] {
+        assert!(
+            loaded.trailer.get(key).is_none(),
+            "rebuilt xref stream must not inherit /{key} from the source trailer"
+        );
+    }
 }
