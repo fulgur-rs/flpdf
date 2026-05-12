@@ -1,4 +1,6 @@
-use flpdf::{check_reader, check_reader_strict, Severity};
+use flpdf::{
+    check_reader, check_reader_strict, check_reader_with_options, PdfOpenOptions, Severity,
+};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 
@@ -33,6 +35,28 @@ fn check_reports_linearized_pdf_warning() {
         .entries()
         .iter()
         .any(|entry| entry.severity == Severity::Warning && entry.message.contains("linearized")));
+}
+
+#[test]
+fn check_weak_crypto_warning_is_library_scoped() {
+    let report = check_reader_with_options(
+        Cursor::new(encrypted_v1_owner_password_fixture()),
+        PdfOpenOptions {
+            password: b"owner".to_vec(),
+            allow_weak_crypto: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    let warning = report
+        .diagnostics
+        .entries()
+        .iter()
+        .find(|entry| entry.severity == Severity::Warning && entry.message.contains("weak crypto"))
+        .expect("weak crypto warning should be reported");
+
+    assert!(!warning.message.contains("--allow-weak-crypto"));
 }
 
 fn linearized_fixture_pdf() -> Vec<u8> {
@@ -154,4 +178,19 @@ fn corrupt_xref_pdf() -> Vec<u8> {
         *byte = b'z';
     }
     corrupted
+}
+
+fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+    let xref_offset = bytes.len();
+    let trailer = b"trailer\n<< /Size 3 /Root 1 0 R /Encrypt << /Filter /Standard /V 1 /R 2 /Length 40 /P -3904 /O <94e8094419662a774442fb072e3d9f19e9d130ec09a4d0061e78fe920f7ab62f> /U <13f520c882d052bf57b416b747c13979bded7ea31240fe41928852aca3894c49> >> /ID [<000102030405060708090a0b0c0d0e0f><000102030405060708090a0b0c0d0e0f>] >>\nstartxref\n";
+    bytes.extend_from_slice(format!("xref\n0 3\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(trailer);
+    bytes.extend_from_slice(xref_offset.to_string().as_bytes());
+    bytes.extend_from_slice(b"\n%%EOF\n");
+    bytes
 }
