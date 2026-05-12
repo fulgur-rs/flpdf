@@ -226,7 +226,16 @@ pub(crate) enum CryptFilterRef<'a> {
 /// Convenience holder for the three use-site selector fields from `/Encrypt`
 /// for a V=4 document.
 ///
-/// `None` for any field means fall back to the `/Identity` no-op filter.
+/// PDF 1.7 §7.6.5.1 default semantics, encoded here as the value-stored
+/// `Option<String>` plus the resolver method [`V4UseSiteSelectors::eff_or_stm`]:
+///
+/// - `/StmF` absent ⇒ `/Identity` (no encryption applied to streams)
+/// - `/StrF` absent ⇒ `/Identity` (no encryption applied to strings)
+/// - `/EFF`  absent ⇒ **falls back to `/StmF`** — embedded file streams use
+///   the same crypt filter as regular streams. Resolving `eff` raw via
+///   [`select_crypt_filter`] would treat absence as `/Identity` and miss
+///   encrypted embedded files; callers MUST go through `eff_or_stm()` for
+///   the EFF use-site.
 #[derive(Debug, Clone)]
 pub(crate) struct V4UseSiteSelectors {
     /// `/StmF` — default crypt filter for streams.
@@ -234,7 +243,20 @@ pub(crate) struct V4UseSiteSelectors {
     /// `/StrF` — default crypt filter for strings.
     pub str_f: Option<String>,
     /// `/EFF` — default crypt filter for embedded file streams.
+    ///
+    /// **Do not resolve this field directly with [`select_crypt_filter`].**
+    /// Use [`V4UseSiteSelectors::eff_or_stm`] to honor the
+    /// `/EFF absent ⇒ /StmF` fallback from the spec.
     pub eff: Option<String>,
+}
+
+impl V4UseSiteSelectors {
+    /// Effective embedded-file-stream selector name, per PDF 1.7 §7.6.5.1:
+    /// returns `self.eff` if present, otherwise `self.stm_f`. Pass the result
+    /// to [`select_crypt_filter`] as the use-site name.
+    pub(crate) fn eff_or_stm(&self) -> Option<&str> {
+        self.eff.as_deref().or_else(|| self.stm_f.as_deref())
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1521,5 +1543,65 @@ mod tests {
             ),
             "eff: missing name must yield Malformed, got: {eff_err:?}"
         );
+    }
+
+    /// Per PDF 1.7 §7.6.5.1, `/EFF` absent must fall back to `/StmF`, not
+    /// `/Identity`. Resolving eff via `eff_or_stm()` returns the stm_f name
+    /// so embedded file streams use the same filter as regular streams.
+    #[test]
+    fn v4_eff_absent_falls_back_to_stm_f() {
+        let table = make_cf_table();
+        let selectors = V4UseSiteSelectors {
+            stm_f: Some("StdCF".to_string()),
+            str_f: Some("StdCF".to_string()),
+            eff: None,
+        };
+
+        let eff_name = selectors.eff_or_stm();
+        assert_eq!(
+            eff_name,
+            Some("StdCF"),
+            "eff absent must fall back to stm_f"
+        );
+
+        let resolved = select_crypt_filter(&table, eff_name).unwrap();
+        match resolved {
+            CryptFilterRef::Named(cf) => {
+                assert_eq!(cf.name, "StdCF", "EFF fallback must resolve to StdCF entry");
+                assert_eq!(cf.cfm, CryptFilterMethod::AesV2);
+            }
+            CryptFilterRef::Identity => panic!(
+                "EFF=None with StmF=StdCF must NOT short-circuit to Identity; \
+                 that would leave encrypted embedded files as plaintext"
+            ),
+        }
+    }
+
+    /// When both `/EFF` and `/StmF` are absent, `eff_or_stm` returns None so
+    /// `select_crypt_filter` falls through to `/Identity` — the spec-correct
+    /// behavior when neither selector exists in the dictionary.
+    #[test]
+    fn v4_eff_and_stm_both_absent_resolve_to_identity() {
+        let table = make_cf_table();
+        let selectors = V4UseSiteSelectors {
+            stm_f: None,
+            str_f: None,
+            eff: None,
+        };
+
+        assert_eq!(selectors.eff_or_stm(), None);
+        let resolved = select_crypt_filter(&table, selectors.eff_or_stm()).unwrap();
+        assert_eq!(resolved, CryptFilterRef::Identity);
+    }
+
+    /// When `/EFF` IS present it wins over `/StmF` (no fallback needed).
+    #[test]
+    fn v4_eff_present_overrides_stm_f() {
+        let selectors = V4UseSiteSelectors {
+            stm_f: Some("StdCF".to_string()),
+            str_f: None,
+            eff: Some("OtherCF".to_string()),
+        };
+        assert_eq!(selectors.eff_or_stm(), Some("OtherCF"));
     }
 }
