@@ -1093,12 +1093,19 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     // Build xref / trailer matching the input's xref form.
     let xref_offset = bytes.len();
-    let object_count = offsets
-        .keys()
-        .next_back()
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1) as usize;
+    // `object_count` is the smallest object number strictly greater than every
+    // emitted one — i.e. the number we'll assign to a freshly created xref
+    // stream object.  Using `saturating_add` here would silently fail when the
+    // input's highest object number is `u32::MAX`: we'd reuse that exact
+    // number for the xref stream and collide with an existing object.  Use
+    // `checked_add` so the overflow surfaces as an explicit error instead.
+    let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
+    let object_count: usize = max_object_number
+        .checked_add(1)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            crate::Error::Unsupported("full-rewrite: object count does not fit in u32".to_string())
+        })?;
 
     match pdf.last_xref_form() {
         XrefForm::Table => {
