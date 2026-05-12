@@ -1159,9 +1159,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 (
                     0,
                     XrefOffset::Offset(u64::try_from(xref_offset).map_err(|_| {
-                        crate::Error::Unsupported(
-                            "xref stream offset does not fit u64".to_string(),
-                        )
+                        crate::Error::Unsupported("xref stream offset does not fit u64".to_string())
                     })?),
                 ),
             );

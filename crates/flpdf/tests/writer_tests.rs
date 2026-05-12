@@ -2288,7 +2288,11 @@ fn full_rewrite_single_flatedecode_filter() {
     };
     match stream.dict.get("Filter") {
         Some(Object::Name(name)) => {
-            assert_eq!(name.as_slice(), b"FlateDecode", "stream Filter should be FlateDecode");
+            assert_eq!(
+                name.as_slice(),
+                b"FlateDecode",
+                "stream Filter should be FlateDecode"
+            );
         }
         Some(Object::Array(_)) => {
             // Also acceptable if the filter is a single-element array [/FlateDecode]
