@@ -2492,3 +2492,75 @@ fn full_rewrite_xref_stream_input_no_prev() {
         "full-rewrite output from xref-stream input must not have /Prev"
     );
 }
+
+/// Build a tiny xref-stream PDF whose xref stream declares
+/// `/Filter /FlateDecode` and stores FlateDecode-encoded entries. Used to
+/// verify that `write_pdf_full_rewrite` does not propagate stale filter
+/// declarations from the source trailer into the rebuilt xref stream.
+fn build_minimal_pdf_with_flate_xref_stream() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+
+    let mut raw_entries = Vec::new();
+    append_xref_stream_entry(&mut raw_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut raw_entries, 1, offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut raw_entries, 1, offsets[1] as u32, 0);
+    append_xref_stream_entry(&mut raw_entries, 1, xref_offset as u32, 0);
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw_entries).unwrap();
+    let encoded = encoder.finish().unwrap();
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Filter /FlateDecode /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            encoded.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn full_rewrite_strips_filter_from_rebuilt_xref_stream_dict() {
+    // Regression test: when the source PDF's xref stream declared
+    // `/Filter /FlateDecode`, the rebuilt xref stream output used to inherit
+    // that key from `pdf.trailer().clone()` while emitting raw entry bytes,
+    // producing an unreadable PDF.  Verify the filter keys are stripped.
+    let source = build_minimal_pdf_with_flate_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // The output must parse back cleanly.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite output from filtered xref-stream input should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // And the rebuilt xref stream must not carry any stream-filter keys.
+    let mut reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
+    for key in ["Filter", "DecodeParms", "F", "FFilter", "FDecodeParms"] {
+        assert!(
+            loaded.trailer.get(key).is_none(),
+            "rebuilt xref stream must not inherit /{key} from the source trailer"
+        );
+    }
+}

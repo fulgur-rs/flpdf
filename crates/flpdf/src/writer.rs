@@ -1180,6 +1180,15 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
             let mut xref_dict = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut xref_dict);
+            // The trailer may carry filter keys from the input's xref stream
+            // (e.g. /Filter /FlateDecode). We're emitting freshly built raw
+            // entry bytes via `Stream::new`, so any stale filter declaration
+            // would make readers attempt to decode raw bytes as compressed.
+            xref_dict.remove("Filter");
+            xref_dict.remove("DecodeParms");
+            xref_dict.remove("F");
+            xref_dict.remove("FFilter");
+            xref_dict.remove("FDecodeParms");
             xref_dict.insert("Type", Object::Name(b"XRef".to_vec()));
             xref_dict.insert("Size", Object::Integer(final_object_count as i64));
             xref_dict.insert(
