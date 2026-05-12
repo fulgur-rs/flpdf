@@ -48,17 +48,17 @@ pub(crate) enum PrimitiveError {
 /// RC4 is cryptographically broken. Higher-level callers MUST require the
 /// user to opt-in with `--allow-weak-crypto` before invoking this function.
 ///
-/// The `rc4` workspace dependency provides the algorithmic implementation;
-/// this wrapper handles the variable-length key mapping required by PDF.
+/// # Implementation note
+/// `rc4::Rc4` is generic over a compile-time key-size const, which does not
+/// match PDF's runtime-variable 5–16-byte keys. This wrapper therefore
+/// implements KSA + PRGA inline (mirroring the `rc4` crate's `Rc4State`
+/// logic, MIT/Apache-2.0).
 ///
 /// # Errors
 /// Returns [`PrimitiveError::InvalidLength`] if `key` is empty. Empty `data`
 /// is permitted (no-op `Ok(())`) — encrypting/decrypting a zero-byte string
 /// is well-defined and used by PDF Algorithm 6 on edge cases.
 pub(crate) fn rc4(key: &[u8], data: &mut [u8]) -> Result<(), PrimitiveError> {
-    // rc4::Rc4 is generic over a compile-time key-size const, which prevents
-    // direct use with runtime-variable PDF keys. We implement the KSA+PRGA
-    // directly here, mirroring the rc4 crate's Rc4State logic (MIT/Apache-2.0).
     if key.is_empty() {
         return Err(PrimitiveError::InvalidLength);
     }
@@ -368,9 +368,13 @@ mod tests {
         assert!(matches!(err, PrimitiveError::InvalidLength));
     }
 
-    /// Tampering with the trailing ciphertext byte changes the decrypted
-    /// padding length value from 0x10 to 0x11, which exceeds the block size
-    /// and must surface as PaddingError.
+    /// Flipping the last byte of the *previous* CBC block changes exactly
+    /// one byte of the next plaintext block (last block's last byte:
+    /// 0x10 → 0x11), which is an invalid PKCS#7 length and must surface
+    /// as PaddingError. This pins the precise propagation property; a
+    /// tamper inside the final ciphertext block would scramble the whole
+    /// plaintext block via the AES round and the test would still pass
+    /// for the wrong reason.
     #[test]
     fn aes128_cbc_decrypt_padding_error() {
         let key: [u8; 16] = [
@@ -382,9 +386,10 @@ mod tests {
             0x0e, 0x0f,
         ];
         let mut ct = from_hex("7649abac8119b246cee98e9b12e9197d8964e0b149c10b7b682e6e39aaeb731c");
-        // Flip the low bit of the last byte. In CBC, this propagates to the
-        // last plaintext byte only — 0x10 → 0x11, an invalid PKCS#7 length.
-        *ct.last_mut().unwrap() ^= 0x01;
+        // Flip the last byte of block 0 (index 15). In CBC, block 1's plaintext
+        // = AES_dec(CT[1]) XOR CT[0], so flipping CT[0][15] changes exactly the
+        // last byte of plaintext block 1: 0x10 → 0x11, invalid PKCS#7 length.
+        ct[15] ^= 0x01;
         let err = aes128_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
         assert!(matches!(err, PrimitiveError::PaddingError));
     }
@@ -409,8 +414,8 @@ mod tests {
         assert!(matches!(err, PrimitiveError::InvalidLength));
     }
 
-    /// Same tamper strategy for AES-256: corrupt the final byte of the
-    /// padded ciphertext so unpadding sees length 0x11.
+    /// Same propagation argument as [`aes128_cbc_decrypt_padding_error`]:
+    /// flip CT[0][15] so the last plaintext byte of block 1 becomes 0x11.
     #[test]
     fn aes256_cbc_decrypt_padding_error() {
         let key: [u8; 32] = [
@@ -423,7 +428,7 @@ mod tests {
             0x0e, 0x0f,
         ];
         let mut ct = from_hex("f58c4c04d6e5f1ba779eabfb5f7bfbd6485a5c81519cf378fa36d42b8547edc0");
-        *ct.last_mut().unwrap() ^= 0x01;
+        ct[15] ^= 0x01;
         let err = aes256_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
         assert!(matches!(err, PrimitiveError::PaddingError));
     }
