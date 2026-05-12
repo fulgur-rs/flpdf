@@ -707,7 +707,7 @@ pub(crate) fn decrypt_strings_in_object(
 
 fn decrypt_strings_in_value(object: &mut Object, cipher: StringCipher<'_>) -> Result<()> {
     match object {
-        Object::String(bytes) => decrypt_string_bytes(bytes, cipher),
+        Object::String(bytes) => decrypt_cipher_bytes(bytes, cipher),
         Object::Array(values) => {
             for value in values {
                 decrypt_strings_in_value(value, cipher)?;
@@ -735,7 +735,7 @@ fn decrypt_strings_in_value(object: &mut Object, cipher: StringCipher<'_>) -> Re
     }
 }
 
-fn decrypt_string_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>) -> Result<()> {
+pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>) -> Result<()> {
     match cipher {
         StringCipher::Identity => Ok(()),
         StringCipher::Rc4 { key } => rc4(key, bytes).map_err(Into::into),
