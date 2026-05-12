@@ -211,7 +211,7 @@ pub(crate) fn check_user_password(
         // Algorithm 6, step (b) for R=2:
         // Encrypt the padding string with the file key using RC4.
         let mut encrypted = PASSWORD_PADDING;
-        rc4(&file_key, &mut encrypted);
+        rc4(&file_key, &mut encrypted)?;
         // Compare against /U (all 32 bytes).
         if encrypted[..] != inputs.u[..] {
             return Err(EncryptedError::BadPassword.into());
@@ -226,12 +226,12 @@ pub(crate) fn check_user_password(
 
         // 2. Encrypt that 16-byte digest with the file key.
         let mut data = digest;
-        rc4(&file_key, &mut data);
+        rc4(&file_key, &mut data)?;
 
         // 3. Apply 19 further RC4 passes with (file_key XOR i) for i = 1..=19.
         for i in 1u8..=19 {
             let xor_key: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
-            rc4(&xor_key, &mut data);
+            rc4(&xor_key, &mut data)?;
         }
 
         // 4. Compare the 16-byte result with the first 16 bytes of /U.
@@ -275,12 +275,12 @@ pub(crate) fn check_owner_password(
 
     if inputs.r == 2 {
         // Single RC4 pass.
-        rc4(rc4_key, &mut candidate);
+        rc4(rc4_key, &mut candidate)?;
     } else {
         // 20 passes in DESCENDING order (i = 19..=0).
         for i in (0u8..=19).rev() {
             let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
-            rc4(&xor_key, &mut candidate);
+            rc4(&xor_key, &mut candidate)?;
         }
     }
 
