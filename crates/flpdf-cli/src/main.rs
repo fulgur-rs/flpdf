@@ -351,17 +351,20 @@ fn run_rewrite(
 
     if linearize {
         let mut pdf = open_pdf(&input, repair, password)?;
+        reject_encrypted_write(&pdf)?;
         let plan = LinearizationPlan::from_pdf(&mut pdf)?;
         let renumber = RenumberMap::from_plan(&plan);
 
         // Re-open the PDF so `write_linearized` can seek/read objects independently.
         let mut pdf2 = open_pdf(&input, repair, password)?;
+        reject_encrypted_write(&pdf2)?;
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
 
         std::fs::write(&output, &doc.bytes)?;
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
+        reject_encrypted_write(&pdf)?;
         let mut out = File::create(output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
     }
@@ -377,9 +380,17 @@ fn run_qdf(
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
+    reject_encrypted_write(&pdf)?;
 
     let mut out = File::create(output)?;
     write_qdf(&mut pdf, &mut out)?;
+    Ok(())
+}
+
+fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> CliResult<()> {
+    if pdf.is_encrypted() {
+        return Err("encrypted PDF output is not supported yet; decrypt/re-encrypt support is tracked separately".into());
+    }
     Ok(())
 }
 

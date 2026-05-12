@@ -109,6 +109,11 @@ impl<R: Read + Seek> Pdf<R> {
         &self.repair_diagnostics
     }
 
+    /// Whether this document authenticated an `/Encrypt` dictionary while opening.
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
         let loaded = if options.repair {
             load_xref_and_trailer_with_repair(&mut reader, options.repair)?

@@ -4,7 +4,7 @@
 //! enabled), report parser warnings, and flag a few high-level invariants that would
 //! cause downstream tools to fail.
 
-use crate::{Diagnostic, Diagnostics, Pdf, PdfOpenOptions};
+use crate::{Diagnostic, Diagnostics, Error, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
 /// Result of [`check_reader`].
@@ -61,6 +61,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     let mut pdf = if allow_repair {
         match Pdf::open_with_options(reader, options) {
             Ok(pdf) => pdf,
+            Err(error @ Error::Encrypted(_)) => return Err(error),
             Err(error) => {
                 let mut diagnostics = Diagnostics::default();
                 diagnostics.push(Diagnostic::error(error.to_string(), None));
