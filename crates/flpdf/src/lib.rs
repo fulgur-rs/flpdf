@@ -53,6 +53,9 @@ pub mod reader;
 pub mod writer;
 pub mod xref;
 
+// Internal security primitives — not part of the public API.
+pub(crate) mod security;
+
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{check_reader, check_reader_strict, CheckReport};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
