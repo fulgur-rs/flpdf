@@ -121,6 +121,18 @@ fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
         }
         .into());
     }
+    // R=2 is a 40-bit revision regardless of V; reject longer keys to keep
+    // the R=2 branch in compute_file_key/check_user_password from emitting
+    // longer-than-spec keys.
+    if inputs.r == 2 && inputs.length_bits != 40 {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: "Standard".into(),
+            v: inputs.v,
+            r: inputs.r,
+            cfm: None,
+        }
+        .into());
+    }
     if inputs.length_bits < 40 || inputs.length_bits > 128 || inputs.length_bits % 8 != 0 {
         return Err(EncryptedError::Malformed {
             reason: format!(
@@ -835,6 +847,33 @@ mod tests {
                 )
             ),
             "expected UnsupportedHandler for V=1/Length=128, got: {err:?}"
+        );
+    }
+
+    /// V=2 with R=2 but Length>40 is rejected — R=2 is fixed at 40-bit by spec.
+    #[test]
+    fn v2_r2_with_long_length_returns_unsupported() {
+        let o = [0u8; 32];
+        let u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 2,
+            r: 2,
+            length_bits: 128, // R=2 is 40-bit only
+            p: -1,
+            id0: &[],
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let err = compute_file_key(b"", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(
+                    crate::error::EncryptedError::UnsupportedHandler { .. }
+                )
+            ),
+            "expected UnsupportedHandler for V=2/R=2/Length=128, got: {err:?}"
         );
     }
 
