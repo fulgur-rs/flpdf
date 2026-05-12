@@ -15,6 +15,15 @@
 //! Full qpdf-compatible fixture testing (real encrypted PDF files) is deferred to
 //! issues flpdf-9hc.3.14 and flpdf-9hc.3.15.  The tests here use Python-generated
 //! known-answer vectors (see inline comments) to verify algorithmic correctness.
+//!
+//! # Dead-code notice
+//! The items in this module are scaffolding for the encrypted-PDF support epic
+//! (flpdf-9hc.3) and are not yet wired up to any call site within the lower
+//! stack layers. They become live as subsequent layers (string decryption,
+//! stream decryption, CLI `--password`) land. The module-level
+//! `allow(dead_code)` keeps each layer's CI green without silencing the lint
+//! elsewhere.
+#![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
 use crate::security::primitives::{md5, rc4};
