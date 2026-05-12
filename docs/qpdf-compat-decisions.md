@@ -132,7 +132,7 @@ Grouped by area for navigation.
 
 To verify the registry covers every current `needs-review` subtask:
 
-```
+```shell
 bd list --label=needs-review
 ```
 
