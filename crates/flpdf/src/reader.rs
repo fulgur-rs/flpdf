@@ -51,7 +51,8 @@ pub struct Pdf<R: Read + Seek> {
 #[derive(Debug, Clone)]
 struct EncryptionState {
     file_key: Vec<u8>,
-    mode: EncryptionMode,
+    stream_mode: EncryptionMode,
+    string_mode: EncryptionMode,
     encrypt_ref: Option<ObjectRef>,
 }
 
@@ -148,21 +149,18 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(());
         };
 
-        let (file_key, mode) = if matches!(required_revision(&encrypt)?, 5 | 6) {
+        let (file_key, stream_mode, string_mode) = if matches!(required_revision(&encrypt)?, 5 | 6)
+        {
             let inputs = standard_handler_r5_inputs(&encrypt)?;
-            if required_revision(&encrypt)? == 5 {
-                (
-                    check_user_password_r5(password, &inputs)
-                        .or_else(|err| retry_owner_password_r5(err, password, &inputs))?,
-                    EncryptionMode::Aes256,
-                )
+            let file_key = if required_revision(&encrypt)? == 5 {
+                check_user_password_r5(password, &inputs)
+                    .or_else(|err| retry_owner_password_r5(err, password, &inputs))?
             } else {
-                (
-                    check_user_password_r6(password, &inputs)
-                        .or_else(|err| retry_owner_password_r6(err, password, &inputs))?,
-                    EncryptionMode::Aes256,
-                )
-            }
+                check_user_password_r6(password, &inputs)
+                    .or_else(|err| retry_owner_password_r6(err, password, &inputs))?
+            };
+            let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
+            (file_key, stream_mode, string_mode)
         } else {
             let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
             let file_key = if inputs.v == 4 && inputs.r == 4 {
@@ -172,11 +170,13 @@ impl<R: Read + Seek> Pdf<R> {
                 check_user_password(password, &inputs)
                     .or_else(|err| retry_owner_password(err, password, &inputs))?
             };
-            (file_key, standard_v4_or_legacy_mode(&encrypt))
+            let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
+            (file_key, stream_mode, string_mode)
         };
         self.encryption = Some(EncryptionState {
             file_key,
-            mode,
+            stream_mode,
+            string_mode,
             encrypt_ref,
         });
         Ok(())
@@ -407,55 +407,20 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(object);
         }
 
-        match encryption.mode {
-            EncryptionMode::Rc4 => {
-                let key = per_object_key(
-                    &encryption.file_key,
-                    object_ref.number,
-                    u32::from(object_ref.generation),
-                    ObjectKeyAlg::Rc4,
-                );
-                decrypt_strings_in_object(
-                    object_ref,
-                    &mut object,
-                    StringCipher::Rc4 { key: &key },
-                    encryption.encrypt_ref,
-                )?;
-                if let Object::Stream(stream) = &mut object {
-                    decrypt_cipher_bytes(&mut stream.data, StringCipher::Rc4 { key: &key })?;
-                }
-            }
-            EncryptionMode::Aes128 => {
-                let key = per_object_key(
-                    &encryption.file_key,
-                    object_ref.number,
-                    u32::from(object_ref.generation),
-                    ObjectKeyAlg::Aes,
-                );
-                let key = aes128_object_key(&key)?;
-                decrypt_strings_in_object(
-                    object_ref,
-                    &mut object,
-                    StringCipher::Aes128 { key: &key },
-                    encryption.encrypt_ref,
-                )?;
-                if let Object::Stream(stream) = &mut object {
-                    decrypt_cipher_bytes(&mut stream.data, StringCipher::Aes128 { key: &key })?;
-                }
-            }
-            EncryptionMode::Identity => {}
-            EncryptionMode::Aes256 => {
-                let key = aes256_file_key(&encryption.file_key)?;
-                decrypt_strings_in_object(
-                    object_ref,
-                    &mut object,
-                    StringCipher::Aes256 { key: &key },
-                    encryption.encrypt_ref,
-                )?;
-                if let Object::Stream(stream) = &mut object {
-                    decrypt_cipher_bytes(&mut stream.data, StringCipher::Aes256 { key: &key })?;
-                }
-            }
+        decrypt_object_strings(
+            object_ref,
+            &mut object,
+            encryption.string_mode,
+            &encryption.file_key,
+            encryption.encrypt_ref,
+        )?;
+        if let Object::Stream(stream) = &mut object {
+            decrypt_stream_bytes(
+                object_ref,
+                &mut stream.data,
+                encryption.stream_mode,
+                &encryption.file_key,
+            )?;
         }
         Ok(object)
     }
@@ -540,6 +505,90 @@ impl<R: Read + Seek> Pdf<R> {
 
         streams.push((stream_ref, stream_object.clone()));
         Ok(())
+    }
+}
+
+fn decrypt_object_strings(
+    object_ref: ObjectRef,
+    object: &mut Object,
+    mode: EncryptionMode,
+    file_key: &[u8],
+    encrypt_ref: Option<ObjectRef>,
+) -> Result<()> {
+    match mode {
+        EncryptionMode::Rc4 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Rc4,
+            );
+            decrypt_strings_in_object(
+                object_ref,
+                object,
+                StringCipher::Rc4 { key: &key },
+                encrypt_ref,
+            )
+        }
+        EncryptionMode::Aes128 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Aes,
+            );
+            let key = aes128_object_key(&key)?;
+            decrypt_strings_in_object(
+                object_ref,
+                object,
+                StringCipher::Aes128 { key: &key },
+                encrypt_ref,
+            )
+        }
+        EncryptionMode::Identity => Ok(()),
+        EncryptionMode::Aes256 => {
+            let key = aes256_file_key(file_key)?;
+            decrypt_strings_in_object(
+                object_ref,
+                object,
+                StringCipher::Aes256 { key: &key },
+                encrypt_ref,
+            )
+        }
+    }
+}
+
+fn decrypt_stream_bytes(
+    object_ref: ObjectRef,
+    bytes: &mut Vec<u8>,
+    mode: EncryptionMode,
+    file_key: &[u8],
+) -> Result<()> {
+    match mode {
+        EncryptionMode::Rc4 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Rc4,
+            );
+            decrypt_cipher_bytes(bytes, StringCipher::Rc4 { key: &key })
+        }
+        EncryptionMode::Aes128 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Aes,
+            );
+            let key = aes128_object_key(&key)?;
+            decrypt_cipher_bytes(bytes, StringCipher::Aes128 { key: &key })
+        }
+        EncryptionMode::Identity => Ok(()),
+        EncryptionMode::Aes256 => {
+            let key = aes256_file_key(file_key)?;
+            decrypt_cipher_bytes(bytes, StringCipher::Aes256 { key: &key })
+        }
     }
 }
 
@@ -698,15 +747,99 @@ fn required_revision(encrypt: &Dictionary) -> Result<i64> {
     required_integer(encrypt, "R")
 }
 
-fn standard_v4_or_legacy_mode(encrypt: &Dictionary) -> EncryptionMode {
+fn standard_v4_or_legacy_modes(encrypt: &Dictionary) -> Result<(EncryptionMode, EncryptionMode)> {
     if required_integer(encrypt, "V").ok() != Some(4) {
-        return EncryptionMode::Rc4;
+        return Ok((EncryptionMode::Rc4, EncryptionMode::Rc4));
     }
-    match crypt_filter_method(encrypt).as_deref() {
-        Some("AESV2") => EncryptionMode::Aes128,
-        Some("Identity") => EncryptionMode::Identity,
-        _ => EncryptionMode::Rc4,
+    Ok((
+        v4_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StmF")?)?,
+        v4_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StrF")?)?,
+    ))
+}
+
+fn standard_r5_or_r6_modes(encrypt: &Dictionary) -> Result<(EncryptionMode, EncryptionMode)> {
+    Ok((
+        r5_or_r6_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StmF")?)?,
+        r5_or_r6_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StrF")?)?,
+    ))
+}
+
+fn v4_mode_for_selector(encrypt: &Dictionary, selector: Option<String>) -> Result<EncryptionMode> {
+    let Some(selector) = selector else {
+        return Ok(EncryptionMode::Identity);
+    };
+    if selector == "Identity" {
+        return Ok(EncryptionMode::Identity);
     }
+    let cfm = crypt_filter_method_for_name(encrypt, &selector)?.unwrap_or_else(|| "V2".into());
+    match cfm.as_str() {
+        "V2" => Ok(EncryptionMode::Rc4),
+        "AESV2" => Ok(EncryptionMode::Aes128),
+        "Identity" => Ok(EncryptionMode::Identity),
+        _ => unsupported_crypt_filter(encrypt, Some(cfm)),
+    }
+}
+
+fn r5_or_r6_mode_for_selector(
+    encrypt: &Dictionary,
+    selector: Option<String>,
+) -> Result<EncryptionMode> {
+    let Some(selector) = selector else {
+        return Ok(EncryptionMode::Aes256);
+    };
+    if selector == "Identity" {
+        return Ok(EncryptionMode::Identity);
+    }
+    let cfm = crypt_filter_method_for_name(encrypt, &selector)?.unwrap_or_else(|| "AESV3".into());
+    match cfm.as_str() {
+        "AESV3" => Ok(EncryptionMode::Aes256),
+        "Identity" => Ok(EncryptionMode::Identity),
+        _ => unsupported_crypt_filter(encrypt, Some(cfm)),
+    }
+}
+
+fn crypt_filter_selector(encrypt: &Dictionary, key: &str) -> Result<Option<String>> {
+    match encrypt.get(key) {
+        None => Ok(None),
+        Some(Object::Name(name)) => Ok(Some(String::from_utf8_lossy(name).to_string())),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a name"),
+        }
+        .into()),
+    }
+}
+
+fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Option<String>> {
+    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+        return Err(EncryptedError::Malformed {
+            reason: format!("/CF entry '{name}' not found"),
+        }
+        .into());
+    };
+    let Some(Object::Dictionary(filter)) = cf.get(name) else {
+        return Err(EncryptedError::Malformed {
+            reason: format!("/CF entry '{name}' not found"),
+        }
+        .into());
+    };
+    match filter.get("CFM") {
+        None => Ok(None),
+        Some(Object::Name(cfm)) => Ok(Some(String::from_utf8_lossy(cfm).to_string())),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: format!("/CF/{name}/CFM entry is not a name"),
+        }
+        .into()),
+    }
+}
+
+fn unsupported_crypt_filter<T>(encrypt: &Dictionary, cfm: Option<String>) -> Result<T> {
+    Err(EncryptedError::UnsupportedHandler {
+        filter: required_name(encrypt, "Filter")?.to_string(),
+        v: required_integer(encrypt, "V")?,
+        r: required_integer(encrypt, "R")?,
+        cfm,
+    }
+    .into())
 }
 
 fn retry_owner_password(
