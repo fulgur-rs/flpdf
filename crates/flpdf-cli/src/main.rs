@@ -181,6 +181,9 @@ struct PasswordArgs {
     /// File containing password bytes. One trailing LF or CRLF is stripped.
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<PathBuf>,
+    /// Permit deprecated RC4-backed handlers and revision 5 encryption.
+    #[arg(long = "allow-weak-crypto")]
+    allow_weak_crypto: bool,
 }
 
 fn main() {
@@ -630,11 +633,17 @@ fn open_pdf(
     for diagnostic in pdf.repair_diagnostics().entries() {
         eprintln!("warning: {}", diagnostic.message);
     }
+    if pdf.uses_weak_crypto() {
+        eprintln!(
+            "warning: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied"
+        );
+    }
 
     Ok(pdf)
 }
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
+    let allow_weak_crypto = password.allow_weak_crypto;
     let password = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
     } else if let Some(path) = &password.password_file {
@@ -649,7 +658,11 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         Vec::new()
     };
 
-    Ok(PdfOpenOptions { repair, password })
+    Ok(PdfOpenOptions {
+        repair,
+        password,
+        allow_weak_crypto,
+    })
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
