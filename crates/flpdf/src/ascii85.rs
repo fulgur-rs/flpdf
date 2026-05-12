@@ -318,22 +318,22 @@ mod tests {
 
     #[test]
     fn encode_short_remainder_1_byte() {
-        let enc = encode(&[0x4D]); // 'M' = 0x4D
-        // 1 byte → 2 chars + "~>"
+        // 1 byte 'M' (0x4D) → 2 chars + "~>"
+        let enc = encode(&[0x4D]);
         assert_eq!(enc.len(), 2 + 2);
     }
 
     #[test]
     fn encode_short_remainder_2_bytes() {
-        let enc = encode(&[0x4D, 0x61]); // "Ma"
-        // 2 bytes → 3 chars + "~>"
+        // 2 bytes "Ma" → 3 chars + "~>"
+        let enc = encode(&[0x4D, 0x61]);
         assert_eq!(enc.len(), 3 + 2);
     }
 
     #[test]
     fn encode_short_remainder_3_bytes() {
-        let enc = encode(&[0x4D, 0x61, 0x6E]); // "Man"
-        // 3 bytes → 4 chars + "~>"
+        // 3 bytes "Man" → 4 chars + "~>"
+        let enc = encode(&[0x4D, 0x61, 0x6E]);
         assert_eq!(enc.len(), 4 + 2);
     }
 
