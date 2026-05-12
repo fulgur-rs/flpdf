@@ -1475,4 +1475,51 @@ mod tests {
     fn cfm_identity_maps_to_none() {
         assert_eq!(cfm_to_object_key_alg(CryptFilterMethod::Identity), None);
     }
+
+    // ── V4UseSiteSelectors: /StmF /StrF /EFF dispatch ───────────────────────
+
+    /// Demonstrate that /StmF, /StrF, and /EFF resolve correctly via
+    /// select_crypt_filter using a V4UseSiteSelectors struct.
+    ///
+    /// This test confirms the AC requirement that "use site selects the CF":
+    /// - stm_f = Some("StdCF") → Named (AesV2)
+    /// - str_f = None          → Identity
+    /// - eff   = Some("Missing") → Malformed
+    #[test]
+    fn v4_use_site_selectors_dispatch() {
+        let table = make_cf_table();
+        let selectors = V4UseSiteSelectors {
+            stm_f: Some("StdCF".to_string()),
+            str_f: None,
+            eff: Some("Missing".to_string()),
+        };
+
+        // stm_f resolves to Named(StdCF / AesV2).
+        let stm = select_crypt_filter(&table, selectors.stm_f.as_deref()).unwrap();
+        match stm {
+            CryptFilterRef::Named(cf) => {
+                assert_eq!(cf.name, "StdCF");
+                assert_eq!(cf.cfm, CryptFilterMethod::AesV2);
+            }
+            CryptFilterRef::Identity => panic!("stm_f: expected Named, got Identity"),
+        }
+
+        // str_f (None) resolves to Identity.
+        let str = select_crypt_filter(&table, selectors.str_f.as_deref()).unwrap();
+        assert_eq!(
+            str,
+            CryptFilterRef::Identity,
+            "str_f: None must yield Identity"
+        );
+
+        // eff with an unknown name resolves to Malformed.
+        let eff_err = select_crypt_filter(&table, selectors.eff.as_deref()).unwrap_err();
+        assert!(
+            matches!(
+                eff_err,
+                crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
+            ),
+            "eff: missing name must yield Malformed, got: {eff_err:?}"
+        );
+    }
 }
