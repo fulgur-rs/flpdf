@@ -255,7 +255,7 @@ impl V4UseSiteSelectors {
     /// returns `self.eff` if present, otherwise `self.stm_f`. Pass the result
     /// to [`select_crypt_filter`] as the use-site name.
     pub(crate) fn eff_or_stm(&self) -> Option<&str> {
-        self.eff.as_deref().or_else(|| self.stm_f.as_deref())
+        self.eff.as_deref().or(self.stm_f.as_deref())
     }
 }
 
