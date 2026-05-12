@@ -50,12 +50,20 @@ pub(crate) enum PrimitiveError {
 ///
 /// The `rc4` workspace dependency provides the algorithmic implementation;
 /// this wrapper handles the variable-length key mapping required by PDF.
-pub(crate) fn rc4(key: &[u8], data: &mut [u8]) {
+///
+/// # Errors
+/// Returns [`PrimitiveError::InvalidLength`] if `key` is empty. Empty `data`
+/// is permitted (no-op `Ok(())`) — encrypting/decrypting a zero-byte string
+/// is well-defined and used by PDF Algorithm 6 on edge cases.
+pub(crate) fn rc4(key: &[u8], data: &mut [u8]) -> Result<(), PrimitiveError> {
     // rc4::Rc4 is generic over a compile-time key-size const, which prevents
     // direct use with runtime-variable PDF keys. We implement the KSA+PRGA
     // directly here, mirroring the rc4 crate's Rc4State logic (MIT/Apache-2.0).
-    if key.is_empty() || data.is_empty() {
-        return;
+    if key.is_empty() {
+        return Err(PrimitiveError::InvalidLength);
+    }
+    if data.is_empty() {
+        return Ok(());
     }
 
     // Key Scheduling Algorithm (KSA)
@@ -79,6 +87,7 @@ pub(crate) fn rc4(key: &[u8], data: &mut [u8]) {
         let idx = state[i as usize].wrapping_add(state[j as usize]) as usize;
         *byte ^= state[idx];
     }
+    Ok(())
 }
 
 /// Decrypt `ciphertext` in-place with AES-128-CBC and remove PKCS#7 padding.
@@ -185,7 +194,7 @@ mod tests {
     #[test]
     fn rc4_rfc6229_key_plaintext() {
         let mut data = b"Plaintext".to_vec();
-        rc4(b"Key", &mut data);
+        rc4(b"Key", &mut data).unwrap();
         assert_eq!(data, [0xBB, 0xF3, 0x16, 0xE8, 0xD9, 0x40, 0xAF, 0x0A, 0xD3]);
     }
 
@@ -193,8 +202,28 @@ mod tests {
     #[test]
     fn rc4_wiki_pedia() {
         let mut data = b"pedia".to_vec();
-        rc4(b"Wiki", &mut data);
+        rc4(b"Wiki", &mut data).unwrap();
         assert_eq!(data, [0x10, 0x21, 0xBF, 0x04, 0x20]);
+    }
+
+    /// An empty key is a programmer error, not a silent no-op: KSA would
+    /// be undefined. The function returns `InvalidLength` so callers cannot
+    /// accidentally pass an unauthenticated buffer through unchanged.
+    #[test]
+    fn rc4_empty_key_returns_invalid_length() {
+        let mut data = b"abc".to_vec();
+        let err = rc4(b"", &mut data).unwrap_err();
+        assert!(matches!(err, PrimitiveError::InvalidLength));
+        assert_eq!(data, b"abc", "data must be untouched on error");
+    }
+
+    /// Empty data is a well-defined no-op (used by Algorithm 6 edge cases),
+    /// not an error.
+    #[test]
+    fn rc4_empty_data_is_ok_noop() {
+        let mut data: Vec<u8> = Vec::new();
+        rc4(b"Key", &mut data).unwrap();
+        assert!(data.is_empty());
     }
 
     // ── MD5 ──────────────────────────────────────────────────────────────────
@@ -260,6 +289,9 @@ mod tests {
     /// CT   : 7649abac8119b246cee98e9b12e9197d
     ///
     /// We add one block of PKCS#7 padding (0x10 * 16) and verify round-trip.
+    /// First CT block matches NIST F.2.1 exactly: 7649abac8119b246cee98e9b12e9197d.
+    /// Second CT block is the PKCS#7 trailer (computed and verified offline against
+    /// the `cryptography` reference library so the test is not self-validating).
     #[test]
     fn aes128_cbc_decrypt_nist() {
         let key: [u8; 16] = [
@@ -270,29 +302,10 @@ mod tests {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
         ];
-        // Plaintext "6bc1bee22e409f96e93d7e117393172a" padded with one full
-        // block of 0x10 bytes → 32-byte ciphertext from NIST + padding block.
-        // First CT block (NIST F.2.1): 7649abac8119b246cee98e9b12e9197d
-        // Second CT block encrypts [0x10 * 16]:
-        //   IV for block 2 = 7649abac8119b246cee98e9b12e9197d
-        //   XOR with [0x10*16] → cipher block
-        // We build the ciphertext by encrypting with AES-128-CBC directly.
-        use aes::Aes128;
-        use cbc::cipher::block_padding::Pkcs7;
-        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
-        use cbc::Encryptor;
-
         let plaintext = from_hex("6bc1bee22e409f96e93d7e117393172a");
-        // Allocate buf: plaintext + one full padding block (16 bytes for PKCS#7).
-        let mut buf = vec![0u8; plaintext.len() + 16];
-        buf[..plaintext.len()].copy_from_slice(&plaintext);
-        let enc = <Encryptor<Aes128> as KeyIvInit>::new(&key.into(), &iv.into());
-        let ct_slice = enc
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
-            .unwrap();
-        let ciphertext = ct_slice.to_vec();
+        // NIST F.2.1 block 1 + independently-computed PKCS#7 padding block 2.
+        let mut ct = from_hex("7649abac8119b246cee98e9b12e9197d8964e0b149c10b7b682e6e39aaeb731c");
 
-        let mut ct = ciphertext.clone();
         aes128_cbc_decrypt(&key, &iv, &mut ct).unwrap();
         assert_eq!(ct, plaintext);
     }
@@ -303,6 +316,9 @@ mod tests {
     /// Key  : 603deb1015ca71be2b73aef0857d7781 1f352c073b6108d72d9810a30914dff4
     /// IV   : 000102030405060708090a0b0c0d0e0f
     /// PT   : 6bc1bee22e409f96e93d7e117393172a
+    /// First CT block matches NIST F.2.5 exactly: f58c4c04d6e5f1ba779eabfb5f7bfbd6.
+    /// Second CT block is the PKCS#7 trailer (computed and verified offline against
+    /// the `cryptography` reference library).
     #[test]
     fn aes256_cbc_decrypt_nist() {
         let key: [u8; 32] = [
@@ -314,22 +330,10 @@ mod tests {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
         ];
-        use aes::Aes256;
-        use cbc::cipher::block_padding::Pkcs7;
-        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
-        use cbc::Encryptor;
-
         let plaintext = from_hex("6bc1bee22e409f96e93d7e117393172a");
-        // Allocate buf: plaintext + one full padding block (16 bytes for PKCS#7).
-        let mut buf = vec![0u8; plaintext.len() + 16];
-        buf[..plaintext.len()].copy_from_slice(&plaintext);
-        let enc = <Encryptor<Aes256> as KeyIvInit>::new(&key.into(), &iv.into());
-        let ct_slice = enc
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
-            .unwrap();
-        let ciphertext = ct_slice.to_vec();
+        // NIST F.2.5 block 1 + independently-computed PKCS#7 padding block 2.
+        let mut ct = from_hex("f58c4c04d6e5f1ba779eabfb5f7bfbd6485a5c81519cf378fa36d42b8547edc0");
 
-        let mut ct = ciphertext.clone();
         aes256_cbc_decrypt(&key, &iv, &mut ct).unwrap();
         assert_eq!(ct, plaintext);
     }
