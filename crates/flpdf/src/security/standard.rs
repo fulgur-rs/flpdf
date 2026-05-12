@@ -1,4 +1,4 @@
-//! Standard Security Handler key derivation for PDF V=1, V=2, V=4, and legacy V=5 R=5.
+//! Standard Security Handler key derivation for PDF V=1, V=2, V=4, and V=5.
 //!
 //! Implements the following algorithms from PDF 1.7 §7.6.3.3:
 //! - **Algorithm 2**: Compute the file encryption key from password + dictionary entries.
@@ -16,16 +16,18 @@
 //! Actual PDF parsing of the `/Encrypt` dictionary and end-to-end round-trip decryption
 //! are deferred to issues flpdf-9hc.3.7, 3.8, 3.14, and 3.15.
 //!
-//! # Legacy V=5 R=5 AES-256 support
+//! # V=5 AES-256 support
 //! R=5 is the deprecated pre-ISO 32000-2 AES-256 Standard handler. It uses a
 //! single SHA-256 pass over `password || salt` and AES-256-CBC with a zero IV to
 //! unwrap the 256-bit file key from `/UE` or `/OE`. New output using this legacy
 //! handler must remain behind weak-crypto opt-in if writer support is added.
+//! R=6 is the ISO 32000-2 AES-256 Standard handler. It keeps the same dictionary
+//! entry shape and replaces the salted hash with Algorithm 2.B's iterative
+//! SHA-256/384/512 construction.
 //!
 //! # Scope
-//! V=1 (R=2, 40-bit), V=2 (R=2/R=3, 40–128-bit), V=4 (R=4, 128-bit), and legacy
-//! V=5 R=5 AES-256 key derivation are covered here. V=5 R=6 hashing belongs to a
-//! separate subtask.
+//! V=1 (R=2, 40-bit), V=2 (R=2/R=3, 40–128-bit), V=4 (R=4, 128-bit), and
+//! V=5 R=5/R=6 AES-256 key derivation are covered here.
 //!
 //! # Note on end-to-end compatibility
 //! Full qpdf-compatible fixture testing (real encrypted PDF files) is deferred to
@@ -42,10 +44,10 @@
 #![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
-use crate::security::primitives::{md5, rc4, sha256};
-use aes::Aes256;
-use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
-use cbc::Decryptor;
+use crate::security::primitives::{md5, rc4, sha256, sha384, sha512};
+use aes::{Aes128, Aes256};
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::{Decryptor, Encryptor};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -216,6 +218,17 @@ fn r5_salted_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
     sha256(&input)
 }
 
+fn aes256_cbc_zero_iv_unwrap(encrypted_key: &[u8; 32], aes_key: &[u8; 32]) -> Result<Vec<u8>> {
+    let iv = [0u8; 16];
+    let mut ciphertext = encrypted_key.to_vec();
+    let dec = <Decryptor<Aes256> as KeyIvInit>::new(aes_key.into(), (&iv).into());
+    dec.decrypt_padded_mut::<NoPadding>(&mut ciphertext)
+        .map_err(|_| EncryptedError::Malformed {
+            reason: "invalid V=5 encrypted file-key entry".into(),
+        })?;
+    Ok(ciphertext)
+}
+
 fn decrypt_r5_file_key(
     password: &[u8],
     entry: &[u8; 48],
@@ -231,14 +244,75 @@ fn decrypt_r5_file_key(
     }
 
     let aes_key = r5_salted_hash(password, key_salt, extra);
-    let iv = [0u8; 16];
-    let mut ciphertext = encrypted_key.to_vec();
-    let dec = <Decryptor<Aes256> as KeyIvInit>::new((&aes_key).into(), (&iv).into());
-    dec.decrypt_padded_mut::<NoPadding>(&mut ciphertext)
-        .map_err(|_| EncryptedError::Malformed {
-            reason: "invalid R=5 encrypted file-key entry".into(),
-        })?;
-    Ok(ciphertext)
+    aes256_cbc_zero_iv_unwrap(encrypted_key, &aes_key)
+}
+
+fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
+    let password = &password[..password.len().min(127)];
+    let mut input = Vec::with_capacity(password.len() + salt.len() + extra.len());
+    input.extend_from_slice(password);
+    input.extend_from_slice(salt);
+    input.extend_from_slice(extra);
+    let mut key = sha256(&input).to_vec();
+
+    let mut round_number = 0usize;
+    loop {
+        round_number += 1;
+
+        let mut k1 = Vec::with_capacity(password.len() + key.len() + extra.len());
+        k1.extend_from_slice(password);
+        k1.extend_from_slice(&key);
+        k1.extend_from_slice(extra);
+
+        let mut e = Vec::with_capacity(k1.len() * 64);
+        for _ in 0..64 {
+            e.extend_from_slice(&k1);
+        }
+
+        let mut aes_key = [0u8; 16];
+        aes_key.copy_from_slice(&key[..16]);
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&key[16..32]);
+        let enc = <Encryptor<Aes128> as KeyIvInit>::new((&aes_key).into(), (&iv).into());
+        enc.encrypt_padded_mut::<NoPadding>(&mut e, k1.len() * 64)
+            .expect("R=6 hash input repeated 64 times is block-aligned");
+
+        let e_mod_3 = e[..16]
+            .iter()
+            .fold(0u16, |acc, byte| acc + u16::from(*byte))
+            % 3;
+        key = match e_mod_3 {
+            0 => sha256(&e).to_vec(),
+            1 => sha384(&e).to_vec(),
+            _ => sha512(&e).to_vec(),
+        };
+
+        if round_number >= 64
+            && usize::from(*e.last().expect("R=6 E is non-empty")) <= round_number - 32
+        {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&key[..32]);
+            return out;
+        }
+    }
+}
+
+fn decrypt_r6_file_key(
+    password: &[u8],
+    entry: &[u8; 48],
+    encrypted_key: &[u8; 32],
+    extra: &[u8],
+) -> Result<Vec<u8>> {
+    let validation_salt = &entry[32..40];
+    let key_salt = &entry[40..48];
+
+    let validation_hash = r6_password_hash(password, validation_salt, extra);
+    if validation_hash[..] != entry[..32] {
+        return Err(EncryptedError::BadPassword.into());
+    }
+
+    let aes_key = r6_password_hash(password, key_salt, extra);
+    aes256_cbc_zero_iv_unwrap(encrypted_key, &aes_key)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -426,6 +500,28 @@ pub(crate) fn check_owner_password_r5(
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
     decrypt_r5_file_key(password, inputs.o, inputs.oe, inputs.u)
+}
+
+/// Authenticate a user password for V=5 R=6 and return the 32-byte file key.
+///
+/// Uses ISO 32000-2 Algorithm 2.B for the validation and file-key hashes, then
+/// decrypts `/UE` with AES-256-CBC using a zero IV.
+pub(crate) fn check_user_password_r6(
+    password: &[u8],
+    inputs: &StandardHandlerR5Inputs<'_>,
+) -> Result<Vec<u8>> {
+    decrypt_r6_file_key(password, inputs.u, inputs.ue, &[])
+}
+
+/// Authenticate an owner password for V=5 R=6 and return the 32-byte file key.
+///
+/// Owner-password hashes include the full 48-byte `/U` entry as the extra input,
+/// and the resulting key unwraps `/OE` with AES-256-CBC using a zero IV.
+pub(crate) fn check_owner_password_r6(
+    password: &[u8],
+    inputs: &StandardHandlerR5Inputs<'_>,
+) -> Result<Vec<u8>> {
+    decrypt_r6_file_key(password, inputs.o, inputs.oe, inputs.u)
 }
 
 /// Select the [`CryptFilter`] for a given use-site name from the `/CF` table.
@@ -1594,6 +1690,111 @@ mod tests {
         assert_eq!(
             file_key,
             from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        );
+    }
+
+    // ── V=5 R=6 key derivation ───────────────────────────────────────────────
+    // R=6 vectors generated by a Python hashlib + OpenSSL AES reference that
+    // mirrors qpdf's ISO 32000-2 Algorithm 2.B interpretation. File key is
+    // bytes 0x00..0x1f; IV is all zeroes for /UE and /OE wrapping.
+
+    struct R6Fixture {
+        u: [u8; 48],
+        o: [u8; 48],
+        ue: [u8; 32],
+        oe: [u8; 32],
+    }
+
+    impl R6Fixture {
+        fn inputs(&self) -> StandardHandlerR5Inputs<'_> {
+            StandardHandlerR5Inputs {
+                u: &self.u,
+                o: &self.o,
+                ue: &self.ue,
+                oe: &self.oe,
+            }
+        }
+    }
+
+    fn r6_fixture() -> R6Fixture {
+        R6Fixture {
+            u: hex48(
+                "6ce813242d7505a42af6eb24292ac1fe9c8de1a21f598c5205b39d9e9a5ba7bf\
+                 00112233445566778899aabbccddeeff",
+            ),
+            o: hex48(
+                "b03bdf6b914364dcdecf182d4cc04bacff9e9a38ea5fd1af31acd59c654495e1\
+                 102132435465768798a9bacbdcedfe0f",
+            ),
+            ue: hex32("4ca56fc060201d966373508e0d5970b65f7581d8f6ff46ee6a3755b623b8379b"),
+            oe: hex32("b2ee22084804dbe76635580e7caeb3ba9069d40184ae4ec16eee7aca91d05936"),
+        }
+    }
+
+    #[test]
+    fn r6_password_hash_matches_algorithm_2b_kat() {
+        let salt = from_hex("0102030405060708");
+        assert_eq!(
+            r6_password_hash(b"password", &salt, &[]),
+            hex32("22d08d1860cb92edcadda1451a4aebb49c1873722bbfca2aef1a7e5f51e69935")
+        );
+    }
+
+    #[test]
+    fn r6_password_hash_uses_owner_extra_data() {
+        let fixture = r6_fixture();
+        let salt = from_hex("1021324354657687");
+        assert_eq!(
+            r6_password_hash(b"ownerpass", &salt, &fixture.u),
+            hex32("b03bdf6b914364dcdecf182d4cc04bacff9e9a38ea5fd1af31acd59c654495e1")
+        );
+    }
+
+    #[test]
+    fn r6_password_hash_truncates_password_to_127_bytes() {
+        let salt = from_hex("0102030405060708");
+        let mut password = vec![b'a'; 127];
+        password.extend_from_slice(b"zzz");
+
+        assert_eq!(
+            r6_password_hash(&password, &salt, b"extra"),
+            hex32("87d58b9b16c2aacf4cb477fa9b5cb57b4b7f6b34d6cfb051b5b35c92a772e723")
+        );
+    }
+
+    #[test]
+    fn check_user_password_r6_returns_file_key() {
+        let fixture = r6_fixture();
+        let inputs = fixture.inputs();
+        let file_key = check_user_password_r6(b"userpass", &inputs).unwrap();
+        assert_eq!(
+            file_key,
+            from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        );
+    }
+
+    #[test]
+    fn check_owner_password_r6_returns_file_key() {
+        let fixture = r6_fixture();
+        let inputs = fixture.inputs();
+        let file_key = check_owner_password_r6(b"ownerpass", &inputs).unwrap();
+        assert_eq!(
+            file_key,
+            from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+        );
+    }
+
+    #[test]
+    fn check_user_password_r6_rejects_wrong_password() {
+        let fixture = r6_fixture();
+        let inputs = fixture.inputs();
+        let err = check_user_password_r6(b"wrong", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(crate::error::EncryptedError::BadPassword)
+            ),
+            "expected BadPassword for wrong R=6 user password, got: {err:?}"
         );
     }
 
