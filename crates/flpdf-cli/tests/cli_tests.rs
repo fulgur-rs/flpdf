@@ -148,6 +148,87 @@ fn rewrite_subcommand_rewrites_output() {
 }
 
 // ---------------------------------------------------------------------------
+// qpdf-style top-level flat flags
+//
+// These exist so the qpdf qtest acceptance harness (which PATH-shims
+// `qpdf` → `flpdf` with no arg translation) can drive flpdf with the
+// commands its `.test` files already use. The behaviour mirrors the
+// equivalent `flpdf rewrite ...` subcommand invocation.
+// ---------------------------------------------------------------------------
+
+/// Build a single-page PDF in memory.  Same shape as the helper in
+/// cli_linearize.rs; duplicated here to keep this test self-contained
+/// without re-exporting test helpers between integration test crates.
+fn one_page_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn top_level_linearize_rewrites_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--linearize", "--static-id"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
+fn top_level_linearize_accepts_compress_streams_and_pass1() {
+    // Mirrors the COMMAND from upstream qpdf's linearize-pass1.test:
+    //   qpdf --linearize --static-id --compress-streams=n \
+    //        --linearize-pass1=b.pdf in.pdf a.pdf
+    // We do not assert byte-equality with qpdf's golden output here —
+    // that is a separate, much larger gate. We assert only that the CLI
+    // parses, runs to completion, writes both files, and emits no
+    // stdout/stderr (qpdf qtest's subtest 1 condition).
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("a.pdf");
+    let pass1 = temp.path().join("b.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--linearize", "--static-id", "--compress-streams=n"])
+        .arg(format!("--linearize-pass1={}", pass1.display()))
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+
+    assert!(output.exists());
+    assert!(pass1.exists());
+}
+
+// ---------------------------------------------------------------------------
 // Version validation tests
 // ---------------------------------------------------------------------------
 
