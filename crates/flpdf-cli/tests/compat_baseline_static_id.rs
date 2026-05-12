@@ -301,11 +301,19 @@ fn static_id_baseline() {
 // ---------------------------------------------------------------------------
 
 fn extract_first_diff_display(golden: &[u8], flpdf: &[u8]) -> String {
-    let offset = golden
-        .iter()
-        .zip(flpdf.iter())
-        .position(|(g, f)| g != f)
-        .unwrap_or(0);
+    // Callers guard against length mismatch (the length-mismatch branch
+    // runs first), so this is only invoked with equal-length slices.
+    // Defensive: an unexpected empty pair must not panic.
+    if golden.is_empty() || flpdf.is_empty() {
+        return format!(
+            "empty slice (golden len={} flpdf len={})",
+            golden.len(),
+            flpdf.len()
+        );
+    }
+    let Some(offset) = golden.iter().zip(flpdf.iter()).position(|(g, f)| g != f) else {
+        return "no differing byte (slices are equal)".to_string();
+    };
     format!(
         "offset {} (golden=0x{:02x} flpdf=0x{:02x})",
         offset, golden[offset], flpdf[offset]
