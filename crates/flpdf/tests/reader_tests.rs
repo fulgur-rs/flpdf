@@ -114,7 +114,7 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
 
     assert_eq!(
         pdf.resolve(ObjectRef::new(5, 0)).unwrap(),
-        Object::Integer(42)
+        Object::String(b"plain text".to_vec())
     );
 }
 
@@ -332,7 +332,7 @@ fn encrypted_r2_reader_fixture() -> Vec<u8> {
         .as_bytes(),
     );
 
-    let obj_stream_plaintext = b"5 0 42";
+    let obj_stream_plaintext = b"5 0 (plain text)";
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(obj_stream_plaintext).unwrap();
     let compressed = encoder.finish().unwrap();
