@@ -53,6 +53,7 @@ struct EncryptionState {
     file_key: Vec<u8>,
     stream_mode: EncryptionMode,
     string_mode: EncryptionMode,
+    encrypt_metadata: bool,
     encrypt_ref: Option<ObjectRef>,
     weak_crypto: bool,
 }
@@ -165,42 +166,58 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let revision = required_revision(&encrypt)?;
-        let (file_key, stream_mode, string_mode, weak_crypto) = if matches!(revision, 5 | 6) {
-            let inputs = standard_handler_r5_inputs(&encrypt)?;
-            let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
-            let weak_crypto = revision == 5;
-            if weak_crypto && !options.allow_weak_crypto {
-                return Err(EncryptedError::WeakCryptoNotAllowed.into());
-            }
-            let file_key = if revision == 5 {
-                check_user_password_r5(&options.password, &inputs)
-                    .or_else(|err| retry_owner_password_r5(err, &options.password, &inputs))?
+        let (file_key, stream_mode, string_mode, encrypt_metadata, weak_crypto) =
+            if matches!(revision, 5 | 6) {
+                let inputs = standard_handler_r5_inputs(&encrypt)?;
+                let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
+                let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
+                let weak_crypto = revision == 5;
+                if weak_crypto && !options.allow_weak_crypto {
+                    return Err(EncryptedError::WeakCryptoNotAllowed.into());
+                }
+                let file_key = if revision == 5 {
+                    check_user_password_r5(&options.password, &inputs)
+                        .or_else(|err| retry_owner_password_r5(err, &options.password, &inputs))?
+                } else {
+                    check_user_password_r6(&options.password, &inputs)
+                        .or_else(|err| retry_owner_password_r6(err, &options.password, &inputs))?
+                };
+                (
+                    file_key,
+                    stream_mode,
+                    string_mode,
+                    encrypt_metadata,
+                    weak_crypto,
+                )
             } else {
-                check_user_password_r6(&options.password, &inputs)
-                    .or_else(|err| retry_owner_password_r6(err, &options.password, &inputs))?
+                let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
+                let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
+                let encrypt_metadata = inputs.encrypt_metadata;
+                let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
+                    || matches!(string_mode, EncryptionMode::Rc4);
+                if weak_crypto && !options.allow_weak_crypto {
+                    return Err(EncryptedError::WeakCryptoNotAllowed.into());
+                }
+                let file_key = if inputs.v == 4 && inputs.r == 4 {
+                    check_user_password_v4(&options.password, &inputs)
+                        .or_else(|err| retry_owner_password_v4(err, &options.password, &inputs))?
+                } else {
+                    check_user_password(&options.password, &inputs)
+                        .or_else(|err| retry_owner_password(err, &options.password, &inputs))?
+                };
+                (
+                    file_key,
+                    stream_mode,
+                    string_mode,
+                    encrypt_metadata,
+                    weak_crypto,
+                )
             };
-            (file_key, stream_mode, string_mode, weak_crypto)
-        } else {
-            let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
-            let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
-            let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
-                || matches!(string_mode, EncryptionMode::Rc4);
-            if weak_crypto && !options.allow_weak_crypto {
-                return Err(EncryptedError::WeakCryptoNotAllowed.into());
-            }
-            let file_key = if inputs.v == 4 && inputs.r == 4 {
-                check_user_password_v4(&options.password, &inputs)
-                    .or_else(|err| retry_owner_password_v4(err, &options.password, &inputs))?
-            } else {
-                check_user_password(&options.password, &inputs)
-                    .or_else(|err| retry_owner_password(err, &options.password, &inputs))?
-            };
-            (file_key, stream_mode, string_mode, weak_crypto)
-        };
         self.encryption = Some(EncryptionState {
             file_key,
             stream_mode,
             string_mode,
+            encrypt_metadata,
             encrypt_ref,
             weak_crypto,
         });
@@ -441,6 +458,9 @@ impl<R: Read + Seek> Pdf<R> {
             encryption.encrypt_ref,
         )?;
         if let Object::Stream(stream) = &mut object {
+            if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
+                return Ok(object);
+            }
             decrypt_stream_bytes(
                 object_ref,
                 &mut stream.data,
@@ -618,6 +638,10 @@ fn decrypt_stream_bytes(
     }
 }
 
+fn is_metadata_stream(dict: &Dictionary) -> bool {
+    matches!(dict.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"Metadata")
+}
+
 fn aes256_file_key(file_key: &[u8]) -> Result<[u8; 32]> {
     file_key.try_into().map_err(|_| {
         EncryptedError::Malformed {
@@ -724,16 +748,7 @@ fn standard_handler_inputs<'a>(
     let u = required_32_byte_string(encrypt, "U")?;
     let o = required_32_byte_string(encrypt, "O")?;
     let id0 = first_file_id(trailer)?;
-    let encrypt_metadata = match encrypt.get("EncryptMetadata") {
-        Some(Object::Boolean(value)) => *value,
-        Some(_) => {
-            return Err(EncryptedError::Malformed {
-                reason: "/EncryptMetadata entry is not a boolean".into(),
-            }
-            .into())
-        }
-        None => true,
-    };
+    let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
 
     Ok(StandardHandlerInputs {
         v,
@@ -767,6 +782,17 @@ fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5I
         ue: required_32_byte_string(encrypt, "UE")?,
         oe: required_32_byte_string(encrypt, "OE")?,
     })
+}
+
+fn encrypt_metadata_flag(encrypt: &Dictionary) -> Result<bool> {
+    match encrypt.get("EncryptMetadata") {
+        Some(Object::Boolean(value)) => Ok(*value),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: "/EncryptMetadata entry is not a boolean".into(),
+        }
+        .into()),
+        None => Ok(true),
+    }
 }
 
 fn required_revision(encrypt: &Dictionary) -> Result<i64> {

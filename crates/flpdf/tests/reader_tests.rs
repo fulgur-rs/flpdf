@@ -277,6 +277,46 @@ fn r5_and_r6_reject_unsupported_crypt_filter_methods() {
     }
 }
 
+#[test]
+fn v4_encrypt_metadata_false_leaves_metadata_stream_plaintext() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_plaintext_metadata_stream_fixture(),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("expected metadata stream");
+    };
+
+    assert_eq!(stream.data, b"<xmpmeta>plain</xmpmeta>".to_vec());
+}
+
+#[test]
+fn r5_and_r6_reject_malformed_encrypt_metadata() {
+    for revision in [5, 6] {
+        let err = match Pdf::open_with_options(
+            std::io::Cursor::new(encrypted_r5_or_r6_pdf(
+                revision,
+                " /EncryptMetadata /false",
+                &[],
+            )),
+            PdfOpenOptions {
+                allow_weak_crypto: revision == 5,
+                password: b"userpass".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("malformed /EncryptMetadata should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Encrypted(EncryptedError::Malformed { .. })),
+            "expected Malformed for R={revision}, got {err:?}"
+        );
+    }
+}
+
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let obj1_offset = bytes.len();
@@ -426,6 +466,45 @@ fn encrypted_v4_rc4_cf_fixture() -> Vec<u8> {
     bytes
 }
 
+fn encrypted_v4_plaintext_metadata_stream_fixture() -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key_with_encrypt_metadata(b"", &o, p, &id0, false);
+    let u = r4_user_key(&file_key, &id0);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+    let metadata = b"<xmpmeta>plain</xmpmeta>";
+    let obj3_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
+            metadata.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(metadata);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n{obj3_offset:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /EncryptMetadata false /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /StdCF /StrF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 fn encrypted_r2_reader_fixture() -> Vec<u8> {
     let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
     let o = [0x42u8; 32];
@@ -507,6 +586,16 @@ fn r2_file_key(password: &[u8], o: &[u8], p: i32, id0: &[u8]) -> Vec<u8> {
 }
 
 fn r4_file_key(password: &[u8], o: &[u8], p: i32, id0: &[u8]) -> Vec<u8> {
+    r4_file_key_with_encrypt_metadata(password, o, p, id0, true)
+}
+
+fn r4_file_key_with_encrypt_metadata(
+    password: &[u8],
+    o: &[u8],
+    p: i32,
+    id0: &[u8],
+    encrypt_metadata: bool,
+) -> Vec<u8> {
     let mut padded = [0u8; 32];
     let password_len = password.len().min(32);
     padded[..password_len].copy_from_slice(&password[..password_len]);
@@ -517,6 +606,9 @@ fn r4_file_key(password: &[u8], o: &[u8], p: i32, id0: &[u8]) -> Vec<u8> {
     hasher.update(o);
     hasher.update(p.to_le_bytes());
     hasher.update(id0);
+    if !encrypt_metadata {
+        hasher.update([0xff; 4]);
+    }
     let mut digest = hasher.finalize().to_vec();
     for _ in 0..50 {
         let mut hasher = Md5::new();
