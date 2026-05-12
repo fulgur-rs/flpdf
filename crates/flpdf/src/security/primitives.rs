@@ -337,4 +337,94 @@ mod tests {
         aes256_cbc_decrypt(&key, &iv, &mut ct).unwrap();
         assert_eq!(ct, plaintext);
     }
+
+    // ── AES error paths ─────────────────────────────────────────────────────
+    //
+    // The decrypt functions have two failure modes that downstream callers
+    // (string/stream decryption, V=4 AES-128 CF, V=5 AES-256) need to be able
+    // to reason about:
+    //   - InvalidLength: ciphertext not a non-zero multiple of 16
+    //   - PaddingError:  PKCS#7 trailer is malformed after decryption
+    // These tests pin those contracts so a future cipher refactor cannot
+    // collapse one into the other silently.
+
+    /// 31 bytes is not a multiple of 16, so AES-128 must refuse it.
+    #[test]
+    fn aes128_cbc_decrypt_invalid_length() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut ct = vec![0u8; 31];
+        let err = aes128_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
+        assert!(matches!(err, PrimitiveError::InvalidLength));
+    }
+
+    /// Empty input is also InvalidLength (vs. a silent zero-byte plaintext).
+    #[test]
+    fn aes128_cbc_decrypt_empty_is_invalid_length() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut ct: Vec<u8> = Vec::new();
+        let err = aes128_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
+        assert!(matches!(err, PrimitiveError::InvalidLength));
+    }
+
+    /// Tampering with the trailing ciphertext byte changes the decrypted
+    /// padding length value from 0x10 to 0x11, which exceeds the block size
+    /// and must surface as PaddingError.
+    #[test]
+    fn aes128_cbc_decrypt_padding_error() {
+        let key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let iv: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let mut ct = from_hex("7649abac8119b246cee98e9b12e9197d8964e0b149c10b7b682e6e39aaeb731c");
+        // Flip the low bit of the last byte. In CBC, this propagates to the
+        // last plaintext byte only — 0x10 → 0x11, an invalid PKCS#7 length.
+        *ct.last_mut().unwrap() ^= 0x01;
+        let err = aes128_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
+        assert!(matches!(err, PrimitiveError::PaddingError));
+    }
+
+    /// 31 bytes is not a multiple of 16, so AES-256 must refuse it.
+    #[test]
+    fn aes256_cbc_decrypt_invalid_length() {
+        let key = [0u8; 32];
+        let iv = [0u8; 16];
+        let mut ct = vec![0u8; 31];
+        let err = aes256_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
+        assert!(matches!(err, PrimitiveError::InvalidLength));
+    }
+
+    /// Empty input is also InvalidLength for AES-256.
+    #[test]
+    fn aes256_cbc_decrypt_empty_is_invalid_length() {
+        let key = [0u8; 32];
+        let iv = [0u8; 16];
+        let mut ct: Vec<u8> = Vec::new();
+        let err = aes256_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
+        assert!(matches!(err, PrimitiveError::InvalidLength));
+    }
+
+    /// Same tamper strategy for AES-256: corrupt the final byte of the
+    /// padded ciphertext so unpadding sees length 0x11.
+    #[test]
+    fn aes256_cbc_decrypt_padding_error() {
+        let key: [u8; 32] = [
+            0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d,
+            0x77, 0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3,
+            0x09, 0x14, 0xdf, 0xf4,
+        ];
+        let iv: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let mut ct = from_hex("f58c4c04d6e5f1ba779eabfb5f7bfbd6485a5c81519cf378fa36d42b8547edc0");
+        *ct.last_mut().unwrap() ^= 0x01;
+        let err = aes256_cbc_decrypt(&key, &iv, &mut ct).unwrap_err();
+        assert!(matches!(err, PrimitiveError::PaddingError));
+    }
 }
