@@ -59,7 +59,7 @@ pub(crate) mod security;
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{check_reader, check_reader_strict, CheckReport};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
-pub use error::{Error, Result};
+pub use error::{EncryptedError, Error, Result};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use parser::parse_object;
