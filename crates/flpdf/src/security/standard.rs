@@ -683,6 +683,26 @@ pub(crate) fn check_owner_password(
     check_user_password(&candidate, inputs)
 }
 
+/// PDF 1.7 §7.6.3.3 Algorithm 7 for V=4/R=4 Standard handler inputs.
+pub(crate) fn check_owner_password_v4(
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<Vec<u8>> {
+    let n = validate_v4_inputs(inputs)?;
+    let padded_owner = pad_password(password);
+    let mut digest = md5(&padded_owner);
+    for _ in 0..50 {
+        digest = md5(&digest);
+    }
+    let rc4_key = &digest[..n];
+    let mut candidate = *inputs.o;
+    for i in (0u8..=19).rev() {
+        let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
+        rc4(&xor_key, &mut candidate)?;
+    }
+    check_user_password_v4(&candidate, inputs)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Algorithm 1 — Per-object key derivation (V=1/V=2/V=4)
 // ────────────────────────────────────────────────────────────────────────────

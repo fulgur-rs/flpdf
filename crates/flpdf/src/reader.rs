@@ -2,7 +2,8 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::parser::{parse_indirect_object, Parser};
 use crate::security::standard::{
-    check_user_password, check_user_password_v4, StandardHandlerInputs,
+    check_owner_password, check_owner_password_v4, check_user_password, check_user_password_v4,
+    StandardHandlerInputs,
 };
 use crate::{
     load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
@@ -128,11 +129,14 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
-        if inputs.v == 4 && inputs.r == 4 {
-            check_user_password_v4(password, &inputs)?;
+        let result = if inputs.v == 4 && inputs.r == 4 {
+            check_user_password_v4(password, &inputs)
+                .or_else(|err| retry_owner_password_v4(err, password, &inputs))
         } else {
-            check_user_password(password, &inputs)?;
-        }
+            check_user_password(password, &inputs)
+                .or_else(|err| retry_owner_password(err, password, &inputs))
+        };
+        result?;
         Ok(())
     }
 
@@ -543,6 +547,28 @@ fn standard_handler_inputs<'a>(
         o,
         encrypt_metadata,
     })
+}
+
+fn retry_owner_password(
+    err: Error,
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<Vec<u8>> {
+    match err {
+        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password(password, inputs),
+        err => Err(err),
+    }
+}
+
+fn retry_owner_password_v4(
+    err: Error,
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<Vec<u8>> {
+    match err {
+        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_v4(password, inputs),
+        err => Err(err),
+    }
 }
 
 fn required_integer(dict: &Dictionary, key: &'static str) -> Result<i64> {
