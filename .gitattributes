@@ -1,1 +1,7 @@
 *.pdf -text
+
+# Committed snapshot baselines must stay LF-terminated even when checked
+# out on Windows. Without this Git's autocrlf=true converts LF→CRLF and
+# the snapshot tests (`compat_baseline_static_id`, `compat_matrix_baseline`)
+# read CRLF but compare against LF-rendered markdown.
+tests/golden/*.md text eol=lf
