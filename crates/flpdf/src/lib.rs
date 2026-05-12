@@ -57,13 +57,13 @@ pub mod xref;
 pub(crate) mod security;
 
 pub use cache::{CacheEntry, ObjectCache};
-pub use check::{check_reader, check_reader_strict, CheckReport};
+pub use check::{check_reader, check_reader_strict, check_reader_with_options, CheckReport};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use error::{EncryptedError, Error, Result};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use parser::parse_object;
-pub use reader::Pdf;
+pub use reader::{Pdf, PdfOpenOptions};
 pub use writer::{
     effective_pdf_version, parse_pdf_version, write_pdf, write_pdf_with_options, write_qdf,
     WriteOptions,

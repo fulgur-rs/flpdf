@@ -1,12 +1,12 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use flpdf::{
-    check_reader, check_reader_strict, fonts,
+    check_reader_with_options, fonts,
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
     },
     outline, pages, parse_pdf_version, write_pdf_with_options, write_qdf, Object, ObjectRef, Pdf,
-    Severity, WriteOptions,
+    PdfOpenOptions, Severity, WriteOptions,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -26,6 +26,8 @@ struct Cli {
     check: bool,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
     #[arg(long)]
     dump_object: Option<String>,
     #[arg(long)]
@@ -96,6 +98,8 @@ struct CheckCommand {
     input: PathBuf,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -110,6 +114,8 @@ struct DumpObjectCommand {
     input: PathBuf,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -119,6 +125,8 @@ struct PagesCommand {
     count: bool,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -127,6 +135,8 @@ struct QdfCommand {
     output: PathBuf,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -135,6 +145,8 @@ struct RewriteCommand {
     output: PathBuf,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
     /// Produce a linearized ("fast web view") output PDF.
     #[arg(long)]
     linearize: bool,
@@ -161,33 +173,50 @@ struct RewriteCommand {
     full_rewrite: bool,
 }
 
+#[derive(Debug, Clone, Default, ClapArgs)]
+struct PasswordArgs {
+    /// Password bytes for encrypted PDFs.
+    #[arg(long, conflicts_with = "password_file")]
+    password: Option<String>,
+    /// File containing password bytes. One trailing LF or CRLF is stripped.
+    #[arg(long = "password-file", value_name = "PATH")]
+    password_file: Option<PathBuf>,
+}
+
 fn main() {
     let args = Cli::parse();
 
     let result = if let Some(command) = args.command {
         run_command(command)
     } else if let Some(object_ref) = args.dump_object.as_deref() {
-        run_dump_object(args.input, args.repair, object_ref)
+        run_dump_object(args.input, args.repair, &args.password, object_ref)
     } else if args.show_info {
-        run_show_info(args.input, args.repair)
+        run_show_info(args.input, args.repair, &args.password)
     } else if args.show_catalog {
-        run_show_catalog(args.input, args.repair)
+        run_show_catalog(args.input, args.repair, &args.password)
     } else if args.show_metadata {
-        run_show_metadata(args.input, args.repair)
+        run_show_metadata(args.input, args.repair, &args.password)
     } else if args.show_outline {
-        run_show_outline(args.input, args.repair)
+        run_show_outline(args.input, args.repair, &args.password)
     } else if args.show_fonts {
-        run_show_fonts(args.input, args.repair)
+        run_show_fonts(args.input, args.repair, &args.password)
     } else if args.show_npages {
-        run_show_npages(args.input, args.repair)
+        run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
-        run_show_pages(args.input, args.repair)
+        run_show_pages(args.input, args.repair, &args.password)
     } else if args.check {
-        run_check(args.input, args.repair)
+        run_check(args.input, args.repair, &args.password)
     } else if args.linearize {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
-        let result = run_rewrite(args.input, args.output.clone(), args.repair, true, options);
+        let result = run_rewrite(
+            args.input,
+            args.output.clone(),
+            args.repair,
+            &args.password,
+            true,
+            options,
+        );
         if result.is_ok() {
             if let (Some(pass1), Some(output)) =
                 (args.linearize_pass1.as_ref(), args.output.as_ref())
@@ -207,7 +236,14 @@ fn main() {
     } else {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
-        run_rewrite(args.input, args.output, args.repair, false, options)
+        run_rewrite(
+            args.input,
+            args.output,
+            args.repair,
+            &args.password,
+            false,
+            options,
+        )
     };
 
     if let Err(error) = result {
@@ -218,7 +254,7 @@ fn main() {
 
 fn run_command(command: Commands) -> CliResult<()> {
     match command {
-        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair),
+        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password),
         Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
             Ok(()) => {
                 println!("linearization OK");
@@ -236,15 +272,17 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
             Err(LinearizationCheckError::Io(e)) => Err(e.to_string().into()),
         },
-        Commands::DumpObject(cmd) => run_dump_object(Some(cmd.input), cmd.repair, &cmd.object_ref),
+        Commands::DumpObject(cmd) => {
+            run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
+        }
         Commands::Pages(cmd) => {
             if cmd.count {
-                run_show_npages(Some(cmd.input), cmd.repair)
+                run_show_npages(Some(cmd.input), cmd.repair, &cmd.password)
             } else {
-                run_show_pages(Some(cmd.input), cmd.repair)
+                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password)
             }
         }
-        Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair),
+        Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair, &cmd.password),
         Commands::Rewrite(cmd) => {
             if let Some(ref v) = cmd.force_version {
                 if parse_pdf_version(v).is_none() {
@@ -271,6 +309,7 @@ fn run_command(command: Commands) -> CliResult<()> {
                 Some(cmd.input),
                 Some(cmd.output),
                 cmd.repair,
+                &cmd.password,
                 cmd.linearize,
                 options,
             )
@@ -278,14 +317,12 @@ fn run_command(command: Commands) -> CliResult<()> {
     }
 }
 
-fn run_check(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(input)?;
-    let report = if repair {
-        check_reader(BufReader::new(file))?
-    } else {
-        check_reader_strict(BufReader::new(file))?
-    };
+    let options = pdf_open_options(repair, password)?;
+    let report = check_reader_with_options(BufReader::new(file), options)
+        .map_err(actionable_password_error)?;
     for diagnostic in report.diagnostics.entries() {
         let label = match diagnostic.severity {
             Severity::Warning => "warning",
@@ -305,6 +342,7 @@ fn run_rewrite(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     repair: bool,
+    password: &PasswordArgs,
     linearize: bool,
     options: WriteOptions,
 ) -> CliResult<()> {
@@ -312,39 +350,60 @@ fn run_rewrite(
     let output = output.ok_or("missing output file")?;
 
     if linearize {
-        let mut pdf = open_pdf(&input, repair)?;
+        let mut pdf = open_pdf(&input, repair, password)?;
+        reject_encrypted_write(&pdf)?;
         let plan = LinearizationPlan::from_pdf(&mut pdf)?;
         let renumber = RenumberMap::from_plan(&plan);
 
         // Re-open the PDF so `write_linearized` can seek/read objects independently.
-        let mut pdf2 = open_pdf(&input, repair)?;
+        let mut pdf2 = open_pdf(&input, repair, password)?;
+        reject_encrypted_write(&pdf2)?;
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
 
         std::fs::write(&output, &doc.bytes)?;
     } else {
-        let mut pdf = open_pdf(&input, repair)?;
+        let mut pdf = open_pdf(&input, repair, password)?;
+        reject_encrypted_write(&pdf)?;
         let mut out = File::create(output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
     }
     Ok(())
 }
 
-fn run_qdf(input: Option<PathBuf>, output: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_qdf(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    reject_encrypted_write(&pdf)?;
 
     let mut out = File::create(output)?;
     write_qdf(&mut pdf, &mut out)?;
     Ok(())
 }
 
-fn run_dump_object(input: Option<PathBuf>, repair: bool, object_ref: &str) -> CliResult<()> {
+fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> CliResult<()> {
+    if pdf.is_encrypted() {
+        return Err("encrypted PDF output is not supported yet; decrypt/re-encrypt support is tracked separately".into());
+    }
+    Ok(())
+}
+
+fn run_dump_object(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    object_ref: &str,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let object_ref = ObjectRef::parse(object_ref)?;
 
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
     let object = pdf.resolve(object_ref)?;
 
     if matches!(object, Object::Null) {
@@ -361,9 +420,9 @@ fn run_dump_object(input: Option<PathBuf>, repair: bool, object_ref: &str) -> Cl
     Ok(())
 }
 
-fn run_show_info(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_info(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
     let info_ref = pdf
         .trailer()
         .get_ref("Info")
@@ -382,18 +441,26 @@ fn run_show_info(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     Ok(())
 }
 
-fn run_show_catalog(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_catalog(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
     println!("Catalog: {}", object_to_pdf(&catalog));
     Ok(())
 }
 
-fn run_show_metadata(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_metadata(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve(catalog_ref)?;
 
@@ -445,9 +512,13 @@ fn run_show_metadata(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     Ok(())
 }
 
-fn run_show_outline(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_outline(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
 
     let items = match outline::outline_items(&mut pdf) {
         Ok(items) => items,
@@ -469,9 +540,9 @@ fn run_show_outline(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     Ok(())
 }
 
-fn run_show_fonts(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_fonts(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
 
     let font_refs = match fonts::font_entries(&mut pdf) {
         Ok(font_refs) => font_refs,
@@ -511,17 +582,17 @@ fn run_show_fonts(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     Ok(())
 }
 
-fn run_show_npages(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
     let pages = pages::page_refs(&mut pdf)?;
     println!("{}", pages.len());
     Ok(())
 }
 
-fn run_show_pages(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
+fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair)?;
+    let mut pdf = open_pdf(&input, repair, password)?;
     let page_refs = pages::page_refs(&mut pdf)?;
     for (index, page_ref) in page_refs.iter().enumerate() {
         let page = pdf.resolve(*page_ref)?;
@@ -547,19 +618,49 @@ fn run_show_pages(input: Option<PathBuf>, repair: bool) -> CliResult<()> {
     Ok(())
 }
 
-fn open_pdf(input: &PathBuf, repair: bool) -> CliResult<Pdf<BufReader<File>>> {
+fn open_pdf(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input)?;
-    let pdf = if repair {
-        Pdf::open_with_repair(BufReader::new(file))?
-    } else {
-        Pdf::open(BufReader::new(file))?
-    };
+    let pdf = Pdf::open_with_options(BufReader::new(file), pdf_open_options(repair, password)?)
+        .map_err(actionable_password_error)?;
 
     for diagnostic in pdf.repair_diagnostics().entries() {
         eprintln!("warning: {}", diagnostic.message);
     }
 
     Ok(pdf)
+}
+
+fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
+    let password = if let Some(password) = &password.password {
+        password.as_bytes().to_vec()
+    } else if let Some(path) = &password.password_file {
+        let mut bytes = std::fs::read(path)?;
+        if bytes.ends_with(b"\r\n") {
+            bytes.truncate(bytes.len() - 2);
+        } else if bytes.ends_with(b"\n") {
+            bytes.truncate(bytes.len() - 1);
+        }
+        bytes
+    } else {
+        Vec::new()
+    };
+
+    Ok(PdfOpenOptions { repair, password })
+}
+
+fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
+    if matches!(
+        error,
+        flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
+    ) {
+        return "encrypted PDF: incorrect password; retry with --password or --password-file"
+            .into();
+    }
+    error.into()
 }
 
 fn object_to_pdf(object: &Object) -> String {

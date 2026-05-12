@@ -4,7 +4,7 @@
 //! enabled), report parser warnings, and flag a few high-level invariants that would
 //! cause downstream tools to fail.
 
-use crate::{Diagnostic, Diagnostics, Pdf};
+use crate::{Diagnostic, Diagnostics, Error, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
 /// Result of [`check_reader`].
@@ -26,6 +26,14 @@ pub fn check_reader<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, true)
 }
 
+/// Validate the document with explicit open options.
+pub fn check_reader_with_options<R: Read + Seek>(
+    reader: R,
+    options: PdfOpenOptions,
+) -> crate::Result<CheckReport> {
+    check_reader_inner_with_options(reader, options)
+}
+
 /// Validate the document behind `reader` without running the recovery heuristics.
 ///
 /// A failed strict parse is propagated as a hard [`crate::Error`] rather than turned
@@ -36,9 +44,24 @@ pub fn check_reader_strict<R: Read + Seek>(reader: R) -> crate::Result<CheckRepo
 }
 
 fn check_reader_inner<R: Read + Seek>(reader: R, allow_repair: bool) -> crate::Result<CheckReport> {
+    check_reader_inner_with_options(
+        reader,
+        PdfOpenOptions {
+            repair: allow_repair,
+            ..PdfOpenOptions::default()
+        },
+    )
+}
+
+fn check_reader_inner_with_options<R: Read + Seek>(
+    reader: R,
+    options: PdfOpenOptions,
+) -> crate::Result<CheckReport> {
+    let allow_repair = options.repair;
     let mut pdf = if allow_repair {
-        match Pdf::open_with_repair(reader) {
+        match Pdf::open_with_options(reader, options) {
             Ok(pdf) => pdf,
+            Err(error @ Error::Encrypted(_)) => return Err(error),
             Err(error) => {
                 let mut diagnostics = Diagnostics::default();
                 diagnostics.push(Diagnostic::error(error.to_string(), None));
@@ -49,7 +72,7 @@ fn check_reader_inner<R: Read + Seek>(reader: R, allow_repair: bool) -> crate::R
             }
         }
     } else {
-        Pdf::open(reader)?
+        Pdf::open_with_options(reader, options)?
     };
 
     let mut diagnostics = pdf.repair_diagnostics().clone();

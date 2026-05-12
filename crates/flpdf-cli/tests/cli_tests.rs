@@ -12,6 +12,108 @@ fn check_valid_fixture_exits_successfully() {
 }
 
 #[test]
+fn check_encrypted_fixture_accepts_correct_empty_password_flag() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--check",
+        "--password=",
+        "../../tests/fixtures/compat/encrypted-r4-three-page.pdf",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("PDF check succeeded"));
+}
+
+#[test]
+fn check_encrypted_fixture_rejects_wrong_password() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--check",
+        "--password=wrong",
+        "../../tests/fixtures/compat/encrypted-r4-three-page.pdf",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("incorrect password"))
+    .stderr(predicate::str::contains("--password"));
+}
+
+#[test]
+fn check_repair_encrypted_fixture_rejects_wrong_password_actionably() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--check",
+        "--repair",
+        "--password=wrong",
+        "../../tests/fixtures/compat/encrypted-r4-three-page.pdf",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("incorrect password"))
+    .stderr(predicate::str::contains("--password"));
+}
+
+#[test]
+fn rewrite_encrypted_fixture_is_rejected_until_decrypt_output_is_supported() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.arg("--password=")
+        .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "encrypted PDF output is not supported yet",
+        ));
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn check_encrypted_fixture_uses_empty_default_password() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--check",
+        "../../tests/fixtures/compat/encrypted-r4-three-page.pdf",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("PDF check succeeded"));
+}
+
+#[test]
+fn check_encrypted_fixture_reads_password_file_and_strips_newline() {
+    let temp = tempfile::tempdir().unwrap();
+    let password_file = temp.path().join("password.txt");
+    std::fs::write(&password_file, b"\r\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check"])
+        .arg(format!("--password-file={}", password_file.display()))
+        .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PDF check succeeded"));
+}
+
+#[test]
+fn password_and_password_file_are_mutually_exclusive() {
+    let temp = tempfile::tempdir().unwrap();
+    let password_file = temp.path().join("password.txt");
+    std::fs::write(&password_file, b"").unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--password="])
+        .arg(format!("--password-file={}", password_file.display()))
+        .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
 fn rewrite_fixture_creates_output() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");

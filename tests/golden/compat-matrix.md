@@ -39,6 +39,5 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 | three-page.pdf | static-id | 5e6e94efa6d229b8 | diverge | diverge | diverge |
 | three-page.pdf | linearize | da6b7cdf60ce4cfe | diverge | diverge | diverge |
 | linearized-one-page.pdf | plain | b61b931c99624f9f | diverge | diverge | diverge |
-| encrypted-r4-three-page.pdf | plain | 7efccdf95bd0ea9f | diverge | diverge | diverge |
 | attachment-two-page.pdf | plain | 8e9f438c4417c29e | diverge | diverge | diverge |
 | attachment-two-page.pdf | static-id | 8e9f438c4417c29e | diverge | diverge | diverge |
