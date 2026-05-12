@@ -254,14 +254,19 @@ fn check_or_bless(actual: &str) {
 #[test]
 fn compat_matrix_baseline() {
     // Without qpdf the qpdf-json comparator skips and the matrix becomes
-    // meaningless. Locally we accept that and skip the whole test; in CI
-    // a missing qpdf would silently bypass this gate, so fail loudly
-    // instead. CI=true is set by GitHub Actions and most other CI
-    // runners.
+    // meaningless. Locally we accept that and skip the whole test; on
+    // the Linux CI runner (where the workflow installs qpdf) a missing
+    // qpdf would silently bypass this gate, so fail loudly. The Windows
+    // CI runner intentionally does not install qpdf — `.github/workflows/
+    // ci.yml` documents this — so the loud-fail guard must not fire
+    // there. CI=true is set by GitHub Actions and most other CI runners;
+    // cfg!(target_os = "linux") is what gates the strict assertion.
     if !is_qpdf_available() {
-        if std::env::var("CI").is_ok() {
+        let in_ci = std::env::var("CI").is_ok();
+        let is_linux = cfg!(target_os = "linux");
+        if in_ci && is_linux {
             panic!(
-                "compat_matrix_baseline is running in CI but qpdf is not on PATH. \
+                "compat_matrix_baseline is running in Linux CI but qpdf is not on PATH. \
                  Install qpdf in the workflow before this test so the matrix \
                  actually exercises the qpdf-json comparator."
             );
