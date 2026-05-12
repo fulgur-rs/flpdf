@@ -1,3 +1,4 @@
+use crate::ascii85;
 use crate::{Dictionary, Error, Object, Result};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -256,6 +257,10 @@ fn apply_single_filter_decode(
         return Ok(decoded);
     }
 
+    if filter_name == b"ASCII85Decode" {
+        return ascii85::decode(stream_data);
+    }
+
     Err(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
@@ -273,6 +278,10 @@ fn apply_single_filter_encode(
             .map_err(|error| error.to_string())?;
         let encoded = encoder.finish().map_err(|error| error.to_string())?;
         return Ok(encoded);
+    }
+
+    if filter_name == b"ASCII85Decode" {
+        return Ok(ascii85::encode(stream_data));
     }
 
     Err(format!(
