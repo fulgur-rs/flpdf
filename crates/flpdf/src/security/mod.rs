@@ -5,3 +5,4 @@
 //! `rc4::Rc4`) never appear in the `flpdf` public interface.
 
 pub(crate) mod primitives;
+pub(crate) mod standard;
