@@ -207,10 +207,12 @@ fn validate_v4_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
     Ok(16)
 }
 
-fn r5_salted_hash(password: &[u8], salt: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(password.len() + salt.len());
+fn r5_salted_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
+    let password = &password[..password.len().min(127)];
+    let mut input = Vec::with_capacity(password.len() + salt.len() + extra.len());
     input.extend_from_slice(password);
     input.extend_from_slice(salt);
+    input.extend_from_slice(extra);
     sha256(&input)
 }
 
@@ -218,16 +220,17 @@ fn decrypt_r5_file_key(
     password: &[u8],
     entry: &[u8; 48],
     encrypted_key: &[u8; 32],
+    extra: &[u8],
 ) -> Result<Vec<u8>> {
     let validation_salt = &entry[32..40];
     let key_salt = &entry[40..48];
 
-    let validation_hash = r5_salted_hash(password, validation_salt);
+    let validation_hash = r5_salted_hash(password, validation_salt, extra);
     if validation_hash[..] != entry[..32] {
         return Err(EncryptedError::BadPassword.into());
     }
 
-    let aes_key = r5_salted_hash(password, key_salt);
+    let aes_key = r5_salted_hash(password, key_salt, extra);
     let iv = [0u8; 16];
     let mut ciphertext = encrypted_key.to_vec();
     let dec = <Decryptor<Aes256> as KeyIvInit>::new((&aes_key).into(), (&iv).into());
@@ -411,17 +414,18 @@ pub(crate) fn check_user_password_r5(
     password: &[u8],
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_r5_file_key(password, inputs.u, inputs.ue)
+    decrypt_r5_file_key(password, inputs.u, inputs.ue, &[])
 }
 
 /// Authenticate an owner password for legacy V=5 R=5 and return the 32-byte file key.
 ///
-/// This mirrors [`check_user_password_r5`] using `/O` salts and `/OE`.
+/// This mirrors [`check_user_password_r5`] using `/O` salts, `/OE`, and the
+/// required `/U` entry suffix in the owner-password hash input.
 pub(crate) fn check_owner_password_r5(
     password: &[u8],
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_r5_file_key(password, inputs.o, inputs.oe)
+    decrypt_r5_file_key(password, inputs.o, inputs.oe, inputs.u)
 }
 
 /// Select the [`CryptFilter`] for a given use-site name from the `/CF` table.
@@ -1523,11 +1527,23 @@ mod tests {
                  00112233445566778899aabbccddeeff",
             ),
             o: hex48(
-                "27268a7ad6a6c44c48c0aeea2ecd2907998deb36b652436c41f7096d1d6473b7\
+                "d95e9aa87833363eccce3e1ba1161b87fcc36c3a2e144b199ddd543db3ad480a\
                  102132435465768798a9bacbdcedfe0f",
             ),
             ue: hex32("08030d6f64d3cf8bc22a9ec592a44da03b019659444bbb14111ea6f021b3bdac"),
-            oe: hex32("42ff75ffd7051f1140cadfb2edc04ba66d600779f571cd2c595ae87902fad106"),
+            oe: hex32("f8e5af968015e82307b0f2c725cb2641a22dd792ec33c4b104fd5d685f2bba41"),
+        }
+    }
+
+    fn r5_long_password_fixture() -> R5Fixture {
+        R5Fixture {
+            u: hex48(
+                "d39d90631a68ed50a791f40f2d19d45959b7caa339c4c16b43e01863732d43ee\
+                 01020304050607081112131415161718",
+            ),
+            o: [0u8; 48],
+            ue: hex32("74c028775d1a6223f4c4f12f6bd57c325de66fd8eac481d80f7eb5313354db40"),
+            oe: [0u8; 32],
         }
     }
 
@@ -1564,6 +1580,20 @@ mod tests {
                 crate::error::Error::Encrypted(crate::error::EncryptedError::BadPassword)
             ),
             "expected BadPassword for wrong R=5 user password, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_user_password_r5_truncates_password_to_127_bytes() {
+        let fixture = r5_long_password_fixture();
+        let inputs = fixture.inputs();
+        let mut password = vec![b'a'; 127];
+        password.extend_from_slice(b"zzz");
+
+        let file_key = check_user_password_r5(&password, &inputs).unwrap();
+        assert_eq!(
+            file_key,
+            from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
         );
     }
 
