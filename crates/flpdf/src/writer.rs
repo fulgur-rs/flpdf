@@ -1254,11 +1254,19 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 ///
 /// # Filter policy
 ///
-/// Regardless of what filter chain the input stream declares (e.g.
-/// `[/ASCII85Decode /FlateDecode]`, raw uncompressed, or a custom filter),
-/// the output always carries exactly one filter: `/FlateDecode`.  This is
-/// intentionally equivalent to qpdf's default passthrough mode, which
-/// normalises every stream to `/FlateDecode` when no special flags are given.
+/// Streams that decode and re-encode successfully are normalised to a single
+/// `/FlateDecode` filter, regardless of what chain the input declared (e.g.
+/// `[/ASCII85Decode /FlateDecode]` or raw uncompressed bytes).  This matches
+/// qpdf's default passthrough mode, which emits every stream as `/FlateDecode`
+/// when no special flags are given.
+///
+/// **Fallback for unsupported / corrupt inputs.**  When `decode_stream_data` or
+/// `encode_stream_data` returns an error (e.g. the source declares a filter the
+/// pipeline does not implement, or the stream data is corrupt), the original
+/// stream — including its `/Filter` chain — is preserved verbatim.  Callers
+/// must not assume every emitted stream carries `/FlateDecode`; the guarantee
+/// only holds for inputs the filter pipeline can round-trip.
+///
 /// Opt-out flags such as `--qdf` or `--ascii85` are not implemented here;
 /// if those behaviours are needed they should be addressed in a separate issue.
 fn reencode_stream_flate(stream: &crate::Stream) -> Object {
