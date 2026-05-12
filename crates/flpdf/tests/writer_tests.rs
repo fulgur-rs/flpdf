@@ -2497,6 +2497,28 @@ fn full_rewrite_xref_stream_input_no_prev() {
     );
 }
 
+#[test]
+fn full_rewrite_xref_stream_input_bumps_header_to_1_5_under_force_version() {
+    // PDF 1.5 introduced xref streams. Forcing the header to 1.4 while
+    // preserving the xref-stream form would emit a spec-inconsistent PDF;
+    // full_rewrite must override --force-version up to 1.5 in that case.
+    let source = build_minimal_pdf_with_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.force_version = Some("1.4".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.5\n"),
+        "expected header '%PDF-1.5' for xref-stream output; got: {:?}",
+        std::str::from_utf8(&output[..16]).unwrap_or("<invalid utf-8>")
+    );
+}
+
 /// Build a tiny xref-stream PDF whose xref stream declares
 /// `/Filter /FlateDecode` and stores FlateDecode-encoded entries. Used to
 /// verify that `write_pdf_full_rewrite` does not propagate stale filter

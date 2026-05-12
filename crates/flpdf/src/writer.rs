@@ -1028,7 +1028,17 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         ));
     }
 
-    let version = effective_pdf_version(pdf.version(), options, false).to_owned();
+    let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
+    // PDF 1.5 introduced xref streams.  If we preserve the source's xref-stream
+    // form but write a `%PDF-1.4` (or earlier) header, the result is
+    // spec-inconsistent and some readers reject it.  Bump the header floor to
+    // 1.5 whenever the chosen xref form is `Stream`, overriding even an
+    // explicit `--force-version` lower than 1.5.
+    if matches!(pdf.last_xref_form(), XrefForm::Stream)
+        && parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
+    {
+        version = "1.5".to_string();
+    }
 
     let mut object_refs = pdf.object_refs();
     object_refs.sort_by_key(|r| (r.number, r.generation));
@@ -1248,9 +1258,13 @@ fn reencode_stream_flate(stream: &crate::Stream) -> Object {
 
     // Build a new stream dict: copy everything from the original except the
     // filter-related keys (which we replace) and Length (which we update).
+    // `/F` carries an external-file reference for the stream data, so we
+    // strip it as well — otherwise readers may try to load the old external
+    // file instead of the new embedded Flate stream we just produced.
     let mut new_dict = stream.dict.clone();
     new_dict.remove("Filter");
     new_dict.remove("DecodeParms");
+    new_dict.remove("F");
     new_dict.remove("FFilter");
     new_dict.remove("FDecodeParms");
 
