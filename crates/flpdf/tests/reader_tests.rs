@@ -332,9 +332,10 @@ fn encrypted_r2_reader_fixture() -> Vec<u8> {
         .as_bytes(),
     );
 
-    let obj_stream_plaintext = b"5 0 (plain text)";
+    let compressed_string = rc4_crypt(&per_object_key(&file_key, 5, 0), b"plain text");
+    let obj_stream_plaintext = format!("5 0 <{}>", hex_string(&compressed_string));
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(obj_stream_plaintext).unwrap();
+    encoder.write_all(obj_stream_plaintext.as_bytes()).unwrap();
     let compressed = encoder.finish().unwrap();
     let encrypted_stream = rc4_crypt(&per_object_key(&file_key, 4, 0), &compressed);
     let obj4_offset = bytes.len();

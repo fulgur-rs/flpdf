@@ -398,6 +398,7 @@ impl<R: Read + Seek> Pdf<R> {
 
         let (parent_ref, parent_index, object) =
             self.parse_object_stream_chain_entry(stream_ref, &stream_object, index)?;
+        let object = self.decrypt_resolved_object(object_ref, object)?;
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object.clone());
