@@ -1251,6 +1251,16 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// filter.  On any error (unsupported filter, corrupt data, etc.) the original
 /// stream object is returned unchanged so the caller can still emit a readable
 /// — if not fully normalized — PDF.
+///
+/// # Filter policy
+///
+/// Regardless of what filter chain the input stream declares (e.g.
+/// `[/ASCII85Decode /FlateDecode]`, raw uncompressed, or a custom filter),
+/// the output always carries exactly one filter: `/FlateDecode`.  This is
+/// intentionally equivalent to qpdf's default passthrough mode, which
+/// normalises every stream to `/FlateDecode` when no special flags are given.
+/// Opt-out flags such as `--qdf` or `--ascii85` are not implemented here;
+/// if those behaviours are needed they should be addressed in a separate issue.
 fn reencode_stream_flate(stream: &crate::Stream) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
