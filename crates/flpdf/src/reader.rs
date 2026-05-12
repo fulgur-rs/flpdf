@@ -2,8 +2,10 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::parser::{parse_indirect_object, Parser};
 use crate::security::standard::{
-    check_owner_password, check_owner_password_v4, check_user_password, check_user_password_v4,
-    StandardHandlerInputs,
+    check_owner_password, check_owner_password_r5, check_owner_password_r6,
+    check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
+    check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, per_object_key,
+    ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
 use crate::{
     load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
@@ -43,6 +45,22 @@ pub struct Pdf<R: Read + Seek> {
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
+    encryption: Option<EncryptionState>,
+}
+
+#[derive(Debug, Clone)]
+struct EncryptionState {
+    file_key: Vec<u8>,
+    mode: EncryptionMode,
+    encrypt_ref: Option<ObjectRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionMode {
+    Rc4,
+    Aes128,
+    Identity,
+    Aes256,
 }
 
 /// Options for opening a PDF document.
@@ -118,25 +136,49 @@ impl<R: Read + Seek> Pdf<R> {
             compressed_member_parents: BTreeMap::new(),
             source_xref_offsets,
             source_xref_entries,
+            encryption: None,
         };
         pdf.authenticate_if_encrypted(&options.password)?;
         Ok(pdf)
     }
 
     fn authenticate_if_encrypted(&mut self, password: &[u8]) -> Result<()> {
+        let encrypt_ref = self.trailer().get_ref("Encrypt");
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(());
         };
 
-        let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
-        let result = if inputs.v == 4 && inputs.r == 4 {
-            check_user_password_v4(password, &inputs)
-                .or_else(|err| retry_owner_password_v4(err, password, &inputs))
+        let (file_key, mode) = if matches!(required_revision(&encrypt)?, 5 | 6) {
+            let inputs = standard_handler_r5_inputs(&encrypt)?;
+            if required_revision(&encrypt)? == 5 {
+                (
+                    check_user_password_r5(password, &inputs)
+                        .or_else(|err| retry_owner_password_r5(err, password, &inputs))?,
+                    EncryptionMode::Aes256,
+                )
+            } else {
+                (
+                    check_user_password_r6(password, &inputs)
+                        .or_else(|err| retry_owner_password_r6(err, password, &inputs))?,
+                    EncryptionMode::Aes256,
+                )
+            }
         } else {
-            check_user_password(password, &inputs)
-                .or_else(|err| retry_owner_password(err, password, &inputs))
+            let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
+            let file_key = if inputs.v == 4 && inputs.r == 4 {
+                check_user_password_v4(password, &inputs)
+                    .or_else(|err| retry_owner_password_v4(err, password, &inputs))?
+            } else {
+                check_user_password(password, &inputs)
+                    .or_else(|err| retry_owner_password(err, password, &inputs))?
+            };
+            (file_key, standard_v4_or_legacy_mode(&encrypt))
         };
-        result?;
+        self.encryption = Some(EncryptionState {
+            file_key,
+            mode,
+            encrypt_ref,
+        });
         Ok(())
     }
 
@@ -306,6 +348,7 @@ impl<R: Read + Seek> Pdf<R> {
                 if parsed_ref != object_ref {
                     return Ok(Object::Null);
                 }
+                let object = self.decrypt_resolved_object(object_ref, object)?;
                 self.cache.set_resolved(object_ref, object.clone());
                 Ok(object)
             }
@@ -335,6 +378,7 @@ impl<R: Read + Seek> Pdf<R> {
                     return Ok(Object::Null);
                 }
 
+                let object = self.decrypt_resolved_object(stream_ref, object)?;
                 self.cache.set_resolved(stream_ref, object.clone());
                 object
             }
@@ -352,6 +396,67 @@ impl<R: Read + Seek> Pdf<R> {
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object.clone());
+        Ok(object)
+    }
+
+    fn decrypt_resolved_object(&self, object_ref: ObjectRef, mut object: Object) -> Result<Object> {
+        let Some(encryption) = &self.encryption else {
+            return Ok(object);
+        };
+        if Some(object_ref) == encryption.encrypt_ref {
+            return Ok(object);
+        }
+
+        match encryption.mode {
+            EncryptionMode::Rc4 => {
+                let key = per_object_key(
+                    &encryption.file_key,
+                    object_ref.number,
+                    u32::from(object_ref.generation),
+                    ObjectKeyAlg::Rc4,
+                );
+                decrypt_strings_in_object(
+                    object_ref,
+                    &mut object,
+                    StringCipher::Rc4 { key: &key },
+                    encryption.encrypt_ref,
+                )?;
+                if let Object::Stream(stream) = &mut object {
+                    decrypt_cipher_bytes(&mut stream.data, StringCipher::Rc4 { key: &key })?;
+                }
+            }
+            EncryptionMode::Aes128 => {
+                let key = per_object_key(
+                    &encryption.file_key,
+                    object_ref.number,
+                    u32::from(object_ref.generation),
+                    ObjectKeyAlg::Aes,
+                );
+                let key = aes128_object_key(&key)?;
+                decrypt_strings_in_object(
+                    object_ref,
+                    &mut object,
+                    StringCipher::Aes128 { key: &key },
+                    encryption.encrypt_ref,
+                )?;
+                if let Object::Stream(stream) = &mut object {
+                    decrypt_cipher_bytes(&mut stream.data, StringCipher::Aes128 { key: &key })?;
+                }
+            }
+            EncryptionMode::Identity => {}
+            EncryptionMode::Aes256 => {
+                let key = aes256_file_key(&encryption.file_key)?;
+                decrypt_strings_in_object(
+                    object_ref,
+                    &mut object,
+                    StringCipher::Aes256 { key: &key },
+                    encryption.encrypt_ref,
+                )?;
+                if let Object::Stream(stream) = &mut object {
+                    decrypt_cipher_bytes(&mut stream.data, StringCipher::Aes256 { key: &key })?;
+                }
+            }
+        }
         Ok(object)
     }
 
@@ -436,6 +541,24 @@ impl<R: Read + Seek> Pdf<R> {
         streams.push((stream_ref, stream_object.clone()));
         Ok(())
     }
+}
+
+fn aes256_file_key(file_key: &[u8]) -> Result<[u8; 32]> {
+    file_key.try_into().map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "AES-256 file key is not 32 bytes".into(),
+        }
+        .into()
+    })
+}
+
+fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
+    key.try_into().map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "AES-128 object key is not 16 bytes".into(),
+        }
+        .into()
+    })
 }
 
 fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -> Result<Object> {
@@ -549,6 +672,43 @@ fn standard_handler_inputs<'a>(
     })
 }
 
+fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5Inputs<'_>> {
+    let filter = required_name(encrypt, "Filter")?;
+    let v = required_integer(encrypt, "V")?;
+    let r = required_integer(encrypt, "R")?;
+    if filter != "Standard" || v != 5 || !matches!(r, 5 | 6) {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: filter.to_string(),
+            v,
+            r,
+            cfm: crypt_filter_method(encrypt),
+        }
+        .into());
+    }
+
+    Ok(StandardHandlerR5Inputs {
+        u: required_48_byte_string(encrypt, "U")?,
+        o: required_48_byte_string(encrypt, "O")?,
+        ue: required_32_byte_string(encrypt, "UE")?,
+        oe: required_32_byte_string(encrypt, "OE")?,
+    })
+}
+
+fn required_revision(encrypt: &Dictionary) -> Result<i64> {
+    required_integer(encrypt, "R")
+}
+
+fn standard_v4_or_legacy_mode(encrypt: &Dictionary) -> EncryptionMode {
+    if required_integer(encrypt, "V").ok() != Some(4) {
+        return EncryptionMode::Rc4;
+    }
+    match crypt_filter_method(encrypt).as_deref() {
+        Some("AESV2") => EncryptionMode::Aes128,
+        Some("Identity") => EncryptionMode::Identity,
+        _ => EncryptionMode::Rc4,
+    }
+}
+
 fn retry_owner_password(
     err: Error,
     password: &[u8],
@@ -567,6 +727,28 @@ fn retry_owner_password_v4(
 ) -> Result<Vec<u8>> {
     match err {
         Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_v4(password, inputs),
+        err => Err(err),
+    }
+}
+
+fn retry_owner_password_r5(
+    err: Error,
+    password: &[u8],
+    inputs: &StandardHandlerR5Inputs<'_>,
+) -> Result<Vec<u8>> {
+    match err {
+        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_r5(password, inputs),
+        err => Err(err),
+    }
+}
+
+fn retry_owner_password_r6(
+    err: Error,
+    password: &[u8],
+    inputs: &StandardHandlerR5Inputs<'_>,
+) -> Result<Vec<u8>> {
+    match err {
+        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_r6(password, inputs),
         err => Err(err),
     }
 }
@@ -609,6 +791,25 @@ fn required_32_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Resul
         Some(Object::String(bytes)) => bytes.as_slice().try_into().map_err(|_| {
             EncryptedError::Malformed {
                 reason: format!("/{key} entry is not 32 bytes"),
+            }
+            .into()
+        }),
+        Some(_) => Err(EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a string"),
+        }
+        .into()),
+        None => Err(EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+fn required_48_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a [u8; 48]> {
+    match dict.get(key) {
+        Some(Object::String(bytes)) => bytes.as_slice().try_into().map_err(|_| {
+            EncryptedError::Malformed {
+                reason: format!("/{key} entry is not 48 bytes"),
             }
             .into()
         }),

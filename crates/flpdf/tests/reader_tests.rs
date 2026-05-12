@@ -1,6 +1,7 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{parse_object, EncryptedError, Error, Object, ObjectRef, Pdf, PdfOpenOptions};
+use md5::{Digest, Md5};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
@@ -65,6 +66,55 @@ fn resolves_indirect_object_on_access() {
     assert_eq!(pdf.resolved_count(), 1);
 }
 
+#[test]
+fn open_with_options_accepts_r5_and_r6_user_and_owner_passwords() {
+    for (revision, password) in [
+        (5, b"userpass".as_slice()),
+        (5, b"ownerpass"),
+        (6, b"userpass"),
+        (6, b"ownerpass"),
+    ] {
+        let options = PdfOpenOptions {
+            password: password.to_vec(),
+            ..PdfOpenOptions::default()
+        };
+
+        let pdf = Pdf::open_with_options(
+            std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(revision)),
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(pdf.version(), "2.0");
+    }
+}
+
+#[test]
+fn resolve_decrypts_encrypted_strings_after_authentication() {
+    let bytes = encrypted_r2_reader_fixture();
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    let Object::Dictionary(dict) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("expected dictionary");
+    };
+
+    assert_eq!(
+        dict.get("Secret"),
+        Some(&Object::String(b"plain text".to_vec()))
+    );
+}
+
+#[test]
+fn resolve_decrypts_object_stream_before_filter_decode() {
+    let bytes = encrypted_r2_reader_fixture();
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(5, 0)).unwrap(),
+        Object::Integer(42)
+    );
+}
+
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let obj1_offset = bytes.len();
@@ -78,6 +128,164 @@ fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
     bytes.extend_from_slice(xref_offset.to_string().as_bytes());
     bytes.extend_from_slice(b"\n%%EOF\n");
     bytes
+}
+
+fn encrypted_r5_or_r6_minimal_pdf(revision: i64) -> Vec<u8> {
+    let (u, o, ue, oe) = match revision {
+        5 => (
+            "97e87734dfa9d2a69a7e7326ce3fabd944a3e718602d1bc4171df8a2736c6cbe00112233445566778899aabbccddeeff",
+            "d95e9aa87833363eccce3e1ba1161b87fcc36c3a2e144b199ddd543db3ad480a102132435465768798a9bacbdcedfe0f",
+            "08030d6f64d3cf8bc22a9ec592a44da03b019659444bbb14111ea6f021b3bdac",
+            "f8e5af968015e82307b0f2c725cb2641a22dd792ec33c4b104fd5d685f2bba41",
+        ),
+        6 => (
+            "6ce813242d7505a42af6eb24292ac1fe9c8de1a21f598c5205b39d9e9a5ba7bf00112233445566778899aabbccddeeff",
+            "b03bdf6b914364dcdecf182d4cc04bacff9e9a38ea5fd1af31acd59c654495e1102132435465768798a9bacbdcedfe0f",
+            "4ca56fc060201d966373508e0d5970b65f7581d8f6ff46ee6a3755b623b8379b",
+            "b2ee22084804dbe76635580e7caeb3ba9069d40184ae4ec16eee7aca91d05936",
+        ),
+        _ => panic!("unsupported revision"),
+    };
+
+    let mut bytes = b"%PDF-2.0\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R /Encrypt << /Filter /Standard /V 5 /R {revision} /Length 256 /P -3904 /O <{o}> /U <{u}> /OE <{oe}> /UE <{ue}> >> /ID [<000102030405060708090a0b0c0d0e0f><000102030405060708090a0b0c0d0e0f>] >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn encrypted_r2_reader_fixture() -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r2_file_key(b"", &o, p, &id0);
+    let u = rc4_crypt(&file_key, &PASSWORD_PADDING);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+
+    let encrypted_secret = rc4_crypt(&per_object_key(&file_key, 3, 0), b"plain text");
+    let obj3_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Secret <{}> >>\nendobj\n",
+            hex_string(&encrypted_secret)
+        )
+        .as_bytes(),
+    );
+
+    let obj_stream_plaintext = b"5 0 42";
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(obj_stream_plaintext).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let encrypted_stream = rc4_crypt(&per_object_key(&file_key, 4, 0), &compressed);
+    let obj4_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} /Filter /FlateDecode >>\nstream\n",
+            encrypted_stream.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&encrypted_stream);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj2_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj3_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj4_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 0);
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 3 1] /Index [0 6] /Length {} /Encrypt << /Filter /Standard /V 1 /R 2 /Length 40 /P {p} /O <{}> /U <{}> >> /ID [<{}><{}>] >>\nstream\n",
+            xref_entries.len(),
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn r2_file_key(password: &[u8], o: &[u8], p: i32, id0: &[u8]) -> Vec<u8> {
+    let mut padded = [0u8; 32];
+    let password_len = password.len().min(32);
+    padded[..password_len].copy_from_slice(&password[..password_len]);
+    padded[password_len..].copy_from_slice(&PASSWORD_PADDING[..32 - password_len]);
+
+    let mut hasher = Md5::new();
+    hasher.update(padded);
+    hasher.update(o);
+    hasher.update(p.to_le_bytes());
+    hasher.update(id0);
+    hasher.finalize()[..5].to_vec()
+}
+
+const PASSWORD_PADDING: [u8; 32] = [
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+    0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+];
+
+fn per_object_key(file_key: &[u8], object_number: u32, generation: u32) -> Vec<u8> {
+    let mut hasher = Md5::new();
+    hasher.update(file_key);
+    hasher.update(&object_number.to_le_bytes()[..3]);
+    hasher.update(&generation.to_le_bytes()[..2]);
+    let digest = hasher.finalize();
+    digest[..(file_key.len() + 5).min(16)].to_vec()
+}
+
+fn rc4_crypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut state = [0u8; 256];
+    for (i, value) in state.iter_mut().enumerate() {
+        *value = i as u8;
+    }
+    let mut j = 0u8;
+    for i in 0..256usize {
+        j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+        state.swap(i, j as usize);
+    }
+    let mut out = data.to_vec();
+    let mut i = 0u8;
+    j = 0;
+    for byte in &mut out {
+        i = i.wrapping_add(1);
+        j = j.wrapping_add(state[i as usize]);
+        state.swap(i as usize, j as usize);
+        let idx = state[i as usize].wrapping_add(state[j as usize]) as usize;
+        *byte ^= state[idx];
+    }
+    out
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[test]
