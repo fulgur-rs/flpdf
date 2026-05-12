@@ -42,6 +42,32 @@ struct Cli {
     show_npages: bool,
     #[arg(long)]
     show_pages: bool,
+
+    // qpdf-style top-level write flags. When `--linearize` is set together
+    // with INPUT and OUTPUT, behave as if `flpdf rewrite --linearize ...`
+    // had been invoked. This exists so the qpdf qtest acceptance harness
+    // (PATH-shimmed `qpdf` → `flpdf`) can issue qpdf-shaped commands
+    // without an arg-translating wrapper.
+    /// Produce a linearized ("fast web view") output PDF (top-level alias
+    /// of `flpdf rewrite --linearize`).
+    #[arg(long)]
+    linearize: bool,
+    /// Use a fixed value for the trailer /ID's changing identifier
+    /// (top-level alias of `flpdf rewrite --static-id`). Testing only.
+    #[arg(long = "static-id")]
+    static_id: bool,
+    /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
+    /// currently a no-op: flpdf does not re-encode stream contents on
+    /// rewrite.  Provided so qtest commands parse cleanly.
+    #[arg(long = "compress-streams")]
+    compress_streams: Option<String>,
+    /// `qpdf --linearize-pass1=PATH` compatibility flag.  Accepted; flpdf
+    /// writes the pass-1 intermediate file as a copy of the final
+    /// linearized output (qpdf writes a distinct intermediate; matching
+    /// those bytes is out of scope here — see flpdf-vrn).
+    #[arg(long = "linearize-pass1")]
+    linearize_pass1: Option<PathBuf>,
+
     input: Option<PathBuf>,
     output: Option<PathBuf>,
 }
@@ -158,14 +184,30 @@ fn main() {
         run_show_pages(args.input, args.repair)
     } else if args.check {
         run_check(args.input, args.repair)
+    } else if args.linearize {
+        let mut options = WriteOptions::default();
+        options.static_id = args.static_id;
+        let result = run_rewrite(args.input, args.output.clone(), args.repair, true, options);
+        if result.is_ok() {
+            if let (Some(pass1), Some(output)) =
+                (args.linearize_pass1.as_ref(), args.output.as_ref())
+            {
+                // qpdf --linearize-pass1=PATH dumps the pre-back-patched pass1
+                // intermediate. flpdf does not currently expose that internal
+                // state; copy the final output instead so the path exists and
+                // downstream byte-equality checks fail meaningfully rather
+                // than the file being absent.
+                if let Err(error) = std::fs::copy(output, pass1) {
+                    eprintln!("flpdf: failed to write --linearize-pass1 file: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        result
     } else {
-        run_rewrite(
-            args.input,
-            args.output,
-            args.repair,
-            false,
-            WriteOptions::default(),
-        )
+        let mut options = WriteOptions::default();
+        options.static_id = args.static_id;
+        run_rewrite(args.input, args.output, args.repair, false, options)
     };
 
     if let Err(error) = result {
