@@ -129,6 +129,9 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
 
+      - name: Clean stale package artifacts
+        run: rm -rf target/package
+
       - name: cargo publish --dry-run -p flpdf
         run: cargo publish --dry-run -p flpdf
 
