@@ -67,8 +67,16 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           # workspace.package.version (inherited by both flpdf and flpdf-cli via
-          # `version.workspace = true`).
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          # `version.workspace = true`). Scope the replacement to the
+          # [workspace.package] section so a future top-level `version = ...`
+          # under, e.g., [workspace.metadata.*] cannot be accidentally rewritten.
+          awk -v v="$VERSION" '
+            /^\[workspace\.package\]/ { in_ws_pkg = 1; print; next }
+            /^\[/ { in_ws_pkg = 0 }
+            in_ws_pkg && /^version = "/ { $0 = "version = \"" v "\"" }
+            { print }
+          ' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
 
           # flpdf-cli's path dep on flpdf carries an explicit version constraint
           # so it resolves against the registry on publish. Keep it in lockstep
