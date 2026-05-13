@@ -64,6 +64,7 @@ pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use parser::parse_object;
 pub use reader::{Pdf, PdfOpenOptions, Permissions};
+pub use security::password::PasswordMode;
 pub use writer::{
     effective_pdf_version, parse_pdf_version, write_pdf, write_pdf_with_options, write_qdf,
     WriteOptions,

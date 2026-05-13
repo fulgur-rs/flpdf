@@ -1,6 +1,7 @@
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::parser::{parse_indirect_object, Parser};
+use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
     check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
@@ -139,6 +140,9 @@ pub struct PdfOpenOptions {
     pub repair: bool,
     /// Password bytes supplied to the Standard security handler.
     pub password: Vec<u8>,
+    /// How `password` should be interpreted before key derivation. See
+    /// [`PasswordMode`] for the qpdf-compatible semantics.
+    pub password_mode: PasswordMode,
     /// Permit deprecated RC4-backed handlers and revision 5 AES-256.
     pub allow_weak_crypto: bool,
 }
@@ -247,6 +251,7 @@ impl<R: Read + Seek> Pdf<R> {
         let revision = required_revision(&encrypt)?;
         let permissions = Permissions::new(required_permissions(&encrypt)?);
         let crypt_filters = crypt_filter_modes(&encrypt, revision)?;
+        let password = normalize_password(&options.password, options.password_mode, revision)?;
         let (file_key, stream_mode, string_mode, encrypt_metadata, weak_crypto) =
             if matches!(revision, 5 | 6) {
                 let inputs = standard_handler_r5_inputs(&encrypt)?;
@@ -257,11 +262,11 @@ impl<R: Read + Seek> Pdf<R> {
                     return Err(EncryptedError::WeakCryptoNotAllowed.into());
                 }
                 let file_key = if revision == 5 {
-                    check_user_password_r5(&options.password, &inputs)
-                        .or_else(|err| retry_owner_password_r5(err, &options.password, &inputs))?
+                    check_user_password_r5(&password, &inputs)
+                        .or_else(|err| retry_owner_password_r5(err, &password, &inputs))?
                 } else {
-                    check_user_password_r6(&options.password, &inputs)
-                        .or_else(|err| retry_owner_password_r6(err, &options.password, &inputs))?
+                    check_user_password_r6(&password, &inputs)
+                        .or_else(|err| retry_owner_password_r6(err, &password, &inputs))?
                 };
                 (
                     file_key,
@@ -283,11 +288,11 @@ impl<R: Read + Seek> Pdf<R> {
                     return Err(EncryptedError::WeakCryptoNotAllowed.into());
                 }
                 let file_key = if inputs.v == 4 && inputs.r == 4 {
-                    check_user_password_v4(&options.password, &inputs)
-                        .or_else(|err| retry_owner_password_v4(err, &options.password, &inputs))?
+                    check_user_password_v4(&password, &inputs)
+                        .or_else(|err| retry_owner_password_v4(err, &password, &inputs))?
                 } else {
-                    check_user_password(&options.password, &inputs)
-                        .or_else(|err| retry_owner_password(err, &options.password, &inputs))?
+                    check_user_password(&password, &inputs)
+                        .or_else(|err| retry_owner_password(err, &password, &inputs))?
                 };
                 (
                     file_key,
