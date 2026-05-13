@@ -13,7 +13,9 @@ const ENCRYPTED_FIXTURES: &[(&str, &str, bool)] = &[
 
 #[test]
 fn encrypted_fixtures_rewrite_to_plaintext_matching_qpdf_decrypt_objects() {
-    skip_if_qpdf_missing();
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
 
     let tmp = tempfile::tempdir().unwrap();
     for (file_name, password, allow_weak_crypto) in ENCRYPTED_FIXTURES {
@@ -106,14 +108,14 @@ fn qpdf_objects_json(path: &Path) -> Vec<u8> {
     result.stdout
 }
 
-fn skip_if_qpdf_missing() {
+fn ensure_qpdf_or_skip() -> bool {
     let available = ShellCommand::new("qpdf")
         .arg("--version")
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
     if available {
-        return;
+        return true;
     }
 
     let on_ci = std::env::var_os("CI").is_some();
@@ -128,4 +130,5 @@ fn skip_if_qpdf_missing() {
         std::env::consts::OS,
         on_ci
     );
+    false
 }
