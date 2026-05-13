@@ -511,4 +511,84 @@ mod tests {
 
         assert_eq!(decoded, plaintext.as_slice());
     }
+
+    // ----- ASCII85Decode filter integration tests -----
+
+    fn ascii85_dict() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        dict
+    }
+
+    #[test]
+    fn decode_stream_data_ascii85_round_trip() {
+        let dict = ascii85_dict();
+        let plaintext = b"Hello from ASCII85Decode filter!";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_ascii85_empty() {
+        let dict = ascii85_dict();
+        let plaintext = b"";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_ascii85_zero_block() {
+        let dict = ascii85_dict();
+        // A 4-byte all-zero block triggers the 'z' shorthand in the encoder
+        let plaintext = [0u8; 8]; // two complete zero blocks → encoder emits "zz~>"
+
+        let encoded = encode_stream_data(&dict, &plaintext).unwrap();
+        // Verify the encoder actually used the 'z' shorthand
+        assert!(
+            encoded.contains(&b'z'),
+            "encoder should emit 'z' for 4-byte zero block"
+        );
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_ascii85_short_final_group() {
+        let dict = ascii85_dict();
+        // Test all three short-final-group lengths: 1, 2, 3 bytes remainder
+        for plaintext in [b"M".as_slice(), b"Ma", b"Man"] {
+            let encoded = encode_stream_data(&dict, plaintext).unwrap();
+            let decoded = decode_stream_data(&dict, &encoded).unwrap();
+            assert_eq!(
+                decoded,
+                plaintext,
+                "short final group round-trip failed for {} bytes",
+                plaintext.len()
+            );
+        }
+    }
+
+    #[test]
+    fn decode_stream_data_ascii85_rejects_invalid_byte() {
+        let dict = ascii85_dict();
+        // 'v' (0x76) is above the valid range '!'..'u' (0x21..=0x75)
+        // Feed a hand-crafted stream: "9jqov~>" where 'v' is out-of-range
+        let invalid_stream = b"9jqov~>";
+
+        let result = decode_stream_data(&dict, invalid_stream);
+
+        assert!(result.is_err(), "expected error for out-of-range byte");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("ASCII85Decode"),
+            "error message should contain 'ASCII85Decode', got: {msg}"
+        );
+    }
 }
