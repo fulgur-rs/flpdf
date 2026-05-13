@@ -53,7 +53,7 @@ struct EncryptionState {
     file_key: Vec<u8>,
     stream_mode: EncryptionMode,
     string_mode: EncryptionMode,
-    crypt_filters: BTreeMap<String, EncryptionMode>,
+    crypt_filters: BTreeMap<Vec<u8>, EncryptionMode>,
     encrypt_metadata: bool,
     encrypt_ref: Option<ObjectRef>,
     weak_crypto: bool,
@@ -765,13 +765,9 @@ fn explicit_crypt_mode(
     let Some(Object::Dictionary(params)) = decode_params else {
         return Ok(EncryptionMode::Identity);
     };
-    let name = match params.get("Name") {
+    let name: &[u8] = match params.get("Name") {
         None => return Ok(EncryptionMode::Identity),
-        Some(Object::Name(name)) => {
-            std::str::from_utf8(name).map_err(|_| EncryptedError::Malformed {
-                reason: "/Crypt /DecodeParms /Name is not valid UTF-8".into(),
-            })?
-        }
+        Some(Object::Name(name)) => name.as_slice(),
         Some(_) => {
             return Err(EncryptedError::Malformed {
                 reason: "/Crypt /DecodeParms /Name is not a name".into(),
@@ -779,12 +775,12 @@ fn explicit_crypt_mode(
             .into())
         }
     };
-    if name == "Identity" {
+    if name == b"Identity" {
         return Ok(EncryptionMode::Identity);
     }
     encryption.crypt_filters.get(name).copied().ok_or_else(|| {
         EncryptedError::Malformed {
-            reason: format!("/CF entry '{name}' not found"),
+            reason: format!("/CF entry '{}' not found", String::from_utf8_lossy(name)),
         }
         .into()
     })
@@ -1108,20 +1104,18 @@ fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Opti
 fn crypt_filter_modes(
     encrypt: &Dictionary,
     revision: i64,
-) -> Result<BTreeMap<String, EncryptionMode>> {
+) -> Result<BTreeMap<Vec<u8>, EncryptionMode>> {
     let mut modes = BTreeMap::new();
     let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
         return Ok(modes);
     };
     for (name, value) in cf.iter() {
-        let name = std::str::from_utf8(name)
-            .map_err(|_| EncryptedError::Malformed {
-                reason: "/CF entry name is not valid UTF-8".into(),
-            })?
-            .to_string();
         let Object::Dictionary(filter) = value else {
             return Err(EncryptedError::Malformed {
-                reason: format!("/CF entry '{name}' is not a dictionary"),
+                reason: format!(
+                    "/CF entry '{}' is not a dictionary",
+                    String::from_utf8_lossy(name)
+                ),
             }
             .into());
         };
@@ -1131,7 +1125,10 @@ fn crypt_filter_modes(
             Some(Object::Name(cfm)) => String::from_utf8_lossy(cfm).to_string(),
             Some(_) => {
                 return Err(EncryptedError::Malformed {
-                    reason: format!("/CF/{name}/CFM entry is not a name"),
+                    reason: format!(
+                        "/CF/{}/CFM entry is not a name",
+                        String::from_utf8_lossy(name)
+                    ),
                 }
                 .into())
             }
@@ -1144,7 +1141,7 @@ fn crypt_filter_modes(
             (_, "AESV2") => EncryptionMode::Aes128,
             (_, _) => unsupported_crypt_filter(encrypt, Some(cfm))?,
         };
-        modes.insert(name, mode);
+        modes.insert(name.to_vec(), mode);
     }
     Ok(modes)
 }
