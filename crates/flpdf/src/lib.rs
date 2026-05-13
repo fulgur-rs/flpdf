@@ -51,6 +51,7 @@ pub mod outline;
 pub mod pages;
 pub mod parser;
 pub mod reader;
+pub mod run_length;
 pub mod writer;
 pub mod xref;
 

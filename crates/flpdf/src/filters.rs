@@ -1,5 +1,6 @@
 use crate::ascii85;
 use crate::ascii_hex;
+use crate::run_length;
 use crate::security::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::{Dictionary, Error, Object, Result};
 use flate2::read::ZlibDecoder;
@@ -319,6 +320,10 @@ fn apply_single_filter_decode(
         return ascii_hex::decode(stream_data);
     }
 
+    if filter_name == b"RunLengthDecode" {
+        return run_length::decode(stream_data);
+    }
+
     Err(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
@@ -346,6 +351,10 @@ fn apply_single_filter_encode(
         return Ok(ascii_hex::encode(stream_data));
     }
 
+    if filter_name == b"RunLengthDecode" {
+        return Ok(run_length::encode(stream_data));
+    }
+
     Err(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>"),
@@ -358,6 +367,7 @@ fn object_debug_repr(object: &Object) -> &'static str {
         Object::Name(name) if name == b"ASCII85Decode" => "ASCII85Decode",
         Object::Name(name) if name == b"ASCIIHexDecode" => "ASCIIHexDecode",
         Object::Name(name) if name == b"LZWDecode" => "LZWDecode",
+        Object::Name(name) if name == b"RunLengthDecode" => "RunLengthDecode",
         _ => "unsupported",
     }
 }
@@ -589,6 +599,66 @@ mod tests {
         assert!(
             msg.contains("ASCII85Decode"),
             "error message should contain 'ASCII85Decode', got: {msg}"
+        );
+    }
+
+    // ----- RunLengthDecode filter integration tests -----
+
+    fn run_length_dict() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
+        dict
+    }
+
+    #[test]
+    fn decode_stream_data_run_length_round_trip() {
+        let dict = run_length_dict();
+        let plaintext = b"Hello from RunLengthDecode filter!";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_run_length_empty() {
+        let dict = run_length_dict();
+        let plaintext = b"";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_run_length_with_repeats() {
+        let dict = run_length_dict();
+        // Data with prominent repeat runs (triggers repeat-run encoding).
+        let mut plaintext = vec![0x42u8; 100]; // 100 'B' bytes
+        plaintext.extend(b"literal");
+        plaintext.extend(vec![0xCCu8; 50]); // 50 0xCC bytes
+
+        let encoded = encode_stream_data(&dict, &plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_run_length_rejects_truncated_literal() {
+        let dict = run_length_dict();
+        // Hand-crafted truncated stream: header says 6 literals (l=5) but only 3 follow.
+        let truncated_stream = vec![0x05u8, b'A', b'B', b'C']; // 3 bytes instead of 6
+
+        let result = decode_stream_data(&dict, &truncated_stream);
+
+        assert!(result.is_err(), "expected error for truncated literal stream");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("RunLengthDecode"),
+            "error message should contain 'RunLengthDecode', got: {msg}"
         );
     }
 }
