@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    # tag push / crates.io publish are irreversible, so gate via required_reviewers
+    # on the `release` environment (see docs/RELEASE_SETUP.md).
+    environment: release
+    # id-token: write is required for rust-lang/crates-io-auth-action to fetch
+    # an OIDC token (crates.io Trusted Publisher flow). contents: write is
+    # repeated here because top-level permissions are reset when a job sets its
+    # own permissions block.
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: Extract version from branch name
+        id: version
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          VERSION="${BRANCH#release/v}"
+          # Validate semver format
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid version from branch name: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: $VERSION"
+
+      # GITHUB_TOKEN cannot push a tag whose commit modifies .github/workflows/*.yml
+      # (workflows permission missing). Use a GitHub App token instead; the App
+      # is configured with `Workflows: Read and write` (see docs/RELEASE_SETUP.md).
+      - name: Generate App token for tag push
+        id: app-token-tag
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Tag release
+        env:
+          GH_TOKEN: ${{ steps.app-token-tag.outputs.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git tag "v$VERSION" || true
+          git push origin "v$VERSION" --force
+
+      # crates.io Trusted Publishing: rust-lang/crates-io-auth-action presents
+      # the OIDC claim (repo + workflow + environment) to crates.io and gets a
+      # short-lived token back. No long-lived PAT in secrets.
+      - name: Authenticate to crates.io
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish flpdf (lib)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: cargo publish -p flpdf
+
+      - name: Publish flpdf-cli (with retry for crates.io index lag)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "Attempt $i: publishing flpdf-cli..."
+            if cargo publish -p flpdf-cli 2>&1; then
+              echo "Published successfully."
+              exit 0
+            fi
+            WAIT=$((15 * i))
+            echo "Failed. Waiting ${WAIT}s for crates.io index..."
+            sleep "$WAIT"
+          done
+          echo "::error::Failed to publish flpdf-cli after 8 attempts"
+          exit 1
+
+  release:
+    name: Publish GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      # App token (not GITHUB_TOKEN) because `release:published` events fired
+      # by GITHUB_TOKEN do not trigger other workflows (loop-prevention rule).
+      # Future binding workflows would chain off the release event.
+      - name: Generate App token for release publish
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Publish draft GitHub Release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ needs.publish.outputs.version }}"
+          REPO="${{ github.repository }}"
+          # Fallback: if release-prepare.yml's draft is missing, create one now.
+          if ! gh release view "v$VERSION" --repo "$REPO" &>/dev/null; then
+            gh release create "v$VERSION" \
+              --title "v$VERSION" \
+              --notes "Release v$VERSION" \
+              --draft \
+              --repo "$REPO"
+          fi
+          gh release edit "v$VERSION" --draft=false --repo "$REPO"
