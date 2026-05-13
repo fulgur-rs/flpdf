@@ -91,7 +91,10 @@ enum Commands {
     Qdf(QdfCommand),
     #[command(about = "Rewrite the input PDF to a normalized output")]
     Rewrite(RewriteCommand),
-    #[command(name = "show-stream", about = "Show a stream object's decoded (or raw) data")]
+    #[command(
+        name = "show-stream",
+        about = "Show a stream object's decoded (or raw) data"
+    )]
     ShowStream(ShowStreamCommand),
 }
 
