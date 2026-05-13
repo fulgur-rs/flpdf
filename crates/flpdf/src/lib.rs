@@ -37,8 +37,8 @@
 //! except for the small [`object::ParseObjectRefError`] returned by
 //! [`ObjectRef::parse`].
 
-pub mod ascii85;
-pub mod ascii_hex;
+pub(crate) mod ascii85;
+pub(crate) mod ascii_hex;
 pub mod cache;
 pub mod check;
 pub mod diagnostics;
@@ -51,7 +51,7 @@ pub mod outline;
 pub mod pages;
 pub mod parser;
 pub mod reader;
-pub mod run_length;
+pub(crate) mod run_length;
 pub mod writer;
 pub mod xref;
 

@@ -1,7 +1,8 @@
 //! Back-patcher for Part 1 linearization parameter dictionary (sub-task 2.9).
 //!
 //! After layout is complete and all byte offsets are known, this module fills
-//! in the 10-digit zero-padded decimal placeholders that [`Part1Bytes::build`]
+//! in the 10-digit zero-padded decimal placeholders that
+//! [`Part1Bytes::build`](crate::linearization::part1::Part1Bytes::build)
 //! left in the linearization parameter dictionary:
 //!
 //! | Param dict key | Source field in [`LinearizedOffsets`]       |
@@ -54,13 +55,13 @@ const MAX_PLACEHOLDER_VALUE: u64 = {
 /// Also back-patches the `/Prev` field in the Part 1 (first) trailer using
 /// `offsets.first_trailer_prev_range` and `offsets.last_xref_keyword_offset`.
 /// The `/Prev` value is written as a left-justified decimal integer padded on
-/// the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes.
+/// the right with spaces to `PREV_PLACEHOLDER_WIDTH` bytes.
 ///
 /// # Errors
 ///
 /// Returns [`crate::Error::Unsupported`] if any value exceeds the maximum
 /// representable in [`PLACEHOLDER_WIDTH`] decimal digits (i.e. ≥ 10^10), or
-/// if the `/Prev` value does not fit in [`PREV_PLACEHOLDER_WIDTH`] characters.
+/// if the `/Prev` value does not fit in `PREV_PLACEHOLDER_WIDTH` characters.
 ///
 /// # Panics
 ///

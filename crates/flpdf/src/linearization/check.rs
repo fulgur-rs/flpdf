@@ -40,7 +40,7 @@ use std::io::{BufReader, Read, Seek};
 #[derive(Debug)]
 pub enum LinearizationCheckError {
     /// The PDF is not linearized: the first object physically present in the
-    /// file (as located by [`find_first_object_ref`]) is missing or does not
+    /// file (as located by `find_first_object_ref`) is missing or does not
     /// expose a `/Linearized` key. PDF 1.7 Annex F.2.2.1 mandates that the
     /// linearization parameter dictionary be the first object in a linearized
     /// file, regardless of its object number.
