@@ -53,6 +53,7 @@ struct EncryptionState {
     file_key: Vec<u8>,
     stream_mode: EncryptionMode,
     string_mode: EncryptionMode,
+    crypt_filters: BTreeMap<String, EncryptionMode>,
     encrypt_metadata: bool,
     encrypt_ref: Option<ObjectRef>,
     weak_crypto: bool,
@@ -166,6 +167,7 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let revision = required_revision(&encrypt)?;
+        let crypt_filters = crypt_filter_modes(&encrypt, revision)?;
         let (file_key, stream_mode, string_mode, encrypt_metadata, weak_crypto) =
             if matches!(revision, 5 | 6) {
                 let inputs = standard_handler_r5_inputs(&encrypt)?;
@@ -194,7 +196,10 @@ impl<R: Read + Seek> Pdf<R> {
                 let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
                 let encrypt_metadata = inputs.encrypt_metadata;
                 let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
-                    || matches!(string_mode, EncryptionMode::Rc4);
+                    || matches!(string_mode, EncryptionMode::Rc4)
+                    || crypt_filters
+                        .values()
+                        .any(|mode| matches!(mode, EncryptionMode::Rc4));
                 if weak_crypto && !options.allow_weak_crypto {
                     return Err(EncryptedError::WeakCryptoNotAllowed.into());
                 }
@@ -217,6 +222,7 @@ impl<R: Read + Seek> Pdf<R> {
             file_key,
             stream_mode,
             string_mode,
+            crypt_filters,
             encrypt_metadata,
             encrypt_ref,
             weak_crypto,
@@ -461,12 +467,16 @@ impl<R: Read + Seek> Pdf<R> {
             if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
                 return Ok(object);
             }
-            decrypt_stream_bytes(
-                object_ref,
-                &mut stream.data,
-                encryption.stream_mode,
-                &encryption.file_key,
-            )?;
+            if stream_has_explicit_crypt_filter(&stream.dict) {
+                apply_explicit_crypt_filters(object_ref, stream, encryption)?;
+            } else {
+                decrypt_stream_bytes(
+                    object_ref,
+                    &mut stream.data,
+                    encryption.stream_mode,
+                    &encryption.file_key,
+                )?;
+            }
         }
         Ok(object)
     }
@@ -635,6 +645,69 @@ fn decrypt_stream_bytes(
             let key = aes256_file_key(file_key)?;
             decrypt_cipher_bytes(bytes, StringCipher::Aes256 { key: &key })
         }
+    }
+}
+
+fn apply_explicit_crypt_filters(
+    object_ref: ObjectRef,
+    stream: &mut crate::Stream,
+    encryption: &EncryptionState,
+) -> Result<()> {
+    let decoded = crate::filters::decode_stream_data_with_crypt_filter(
+        &stream.dict,
+        &stream.data,
+        |decode_params, bytes| {
+            let mode = explicit_crypt_mode(encryption, decode_params)?;
+            let mut decrypted = bytes.to_vec();
+            decrypt_stream_bytes(object_ref, &mut decrypted, mode, &encryption.file_key)?;
+            Ok(decrypted)
+        },
+    )?;
+    stream.data = decoded;
+    stream.dict.remove("Filter");
+    stream.dict.remove("DecodeParms");
+    Ok(())
+}
+
+fn explicit_crypt_mode(
+    encryption: &EncryptionState,
+    decode_params: Option<&Object>,
+) -> Result<EncryptionMode> {
+    let Some(Object::Dictionary(params)) = decode_params else {
+        return Ok(EncryptionMode::Identity);
+    };
+    let name = match params.get("Name") {
+        None => return Ok(EncryptionMode::Identity),
+        Some(Object::Name(name)) => {
+            std::str::from_utf8(name).map_err(|_| EncryptedError::Malformed {
+                reason: "/Crypt /DecodeParms /Name is not valid UTF-8".into(),
+            })?
+        }
+        Some(_) => {
+            return Err(EncryptedError::Malformed {
+                reason: "/Crypt /DecodeParms /Name is not a name".into(),
+            }
+            .into())
+        }
+    };
+    if name == "Identity" {
+        return Ok(EncryptionMode::Identity);
+    }
+    encryption.crypt_filters.get(name).copied().ok_or_else(|| {
+        EncryptedError::Malformed {
+            reason: format!("/CF entry '{name}' not found"),
+        }
+        .into()
+    })
+}
+
+fn stream_has_explicit_crypt_filter(dict: &Dictionary) -> bool {
+    match dict.get("Filter") {
+        Some(Object::Name(name)) => name == b"Crypt",
+        Some(Object::Array(filters)) => filters
+            .iter()
+            .any(|filter| matches!(filter, Object::Name(name) if name == b"Crypt")),
+        _ => false,
     }
 }
 
@@ -882,6 +955,50 @@ fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Opti
         }
         .into()),
     }
+}
+
+fn crypt_filter_modes(
+    encrypt: &Dictionary,
+    revision: i64,
+) -> Result<BTreeMap<String, EncryptionMode>> {
+    let mut modes = BTreeMap::new();
+    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+        return Ok(modes);
+    };
+    for (name, value) in cf.iter() {
+        let name = std::str::from_utf8(name)
+            .map_err(|_| EncryptedError::Malformed {
+                reason: "/CF entry name is not valid UTF-8".into(),
+            })?
+            .to_string();
+        let Object::Dictionary(filter) = value else {
+            return Err(EncryptedError::Malformed {
+                reason: format!("/CF entry '{name}' is not a dictionary"),
+            }
+            .into());
+        };
+        let cfm = match filter.get("CFM") {
+            None if revision >= 5 => "AESV3".to_string(),
+            None => "V2".to_string(),
+            Some(Object::Name(cfm)) => String::from_utf8_lossy(cfm).to_string(),
+            Some(_) => {
+                return Err(EncryptedError::Malformed {
+                    reason: format!("/CF/{name}/CFM entry is not a name"),
+                }
+                .into())
+            }
+        };
+        let mode = match (revision, cfm.as_str()) {
+            (_, "Identity") => EncryptionMode::Identity,
+            (5 | 6, "AESV3") => EncryptionMode::Aes256,
+            (5 | 6, _) => unsupported_crypt_filter(encrypt, Some(cfm))?,
+            (_, "V2") => EncryptionMode::Rc4,
+            (_, "AESV2") => EncryptionMode::Aes128,
+            (_, _) => unsupported_crypt_filter(encrypt, Some(cfm))?,
+        };
+        modes.insert(name, mode);
+    }
+    Ok(modes)
 }
 
 fn unsupported_crypt_filter<T>(encrypt: &Dictionary, cfm: Option<String>) -> Result<T> {

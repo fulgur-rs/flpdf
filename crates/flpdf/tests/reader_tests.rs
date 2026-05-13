@@ -226,6 +226,50 @@ fn v4_uses_separate_stream_and_string_crypt_filters() {
 }
 
 #[test]
+fn v4_explicit_crypt_filter_decrypts_at_filter_slot_before_flate() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_explicit_crypt_filter_fixture(false, false),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+
+    assert_eq!(stream.data, b"explicit crypt stream".to_vec());
+    assert_eq!(stream.dict.get("Filter"), None);
+    assert_eq!(stream.dict.get("DecodeParms"), None);
+}
+
+#[test]
+fn v4_explicit_crypt_filter_decrypts_at_filter_slot_after_flate() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_explicit_crypt_filter_fixture(false, true),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+
+    assert_eq!(stream.data, b"explicit crypt stream".to_vec());
+}
+
+#[test]
+fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_explicit_crypt_filter_fixture(true, false),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+
+    assert_eq!(stream.data, b"explicit crypt stream".to_vec());
+}
+
+#[test]
 fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
     for revision in [5, 6] {
         let mut pdf = Pdf::open_with_options(
@@ -456,6 +500,72 @@ fn encrypted_v4_rc4_cf_fixture() -> Vec<u8> {
     bytes.extend_from_slice(
         format!(
             "xref\n0 3\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /V2 /Length 128 >> >> /StmF /StdCF /StrF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate: bool) -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = r4_user_key(&file_key, &id0);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
+    let stream_data = if crypt_after_flate {
+        let encrypted =
+            aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], b"explicit crypt stream");
+        encoder.write_all(&encrypted).unwrap();
+        encoder.finish().unwrap()
+    } else {
+        encoder.write_all(b"explicit crypt stream").unwrap();
+        let compressed = encoder.finish().unwrap();
+        if identity {
+            compressed
+        } else {
+            aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &compressed)
+        }
+    };
+    let decode_parms = if identity { "Identity" } else { "StdCF" };
+    let (filters, decode_parms_array) = if crypt_after_flate {
+        (
+            "[/FlateDecode /Crypt]",
+            format!("[null << /Name /{decode_parms} >>]"),
+        )
+    } else {
+        (
+            "[/Crypt /FlateDecode]",
+            format!("[<< /Name /{decode_parms} >> null]"),
+        )
+    };
+    let obj4_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} /Filter {filters} /DecodeParms {decode_parms_array} >>\nstream\n",
+            stream_data.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n0000000000 65535 f \n{obj4_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /Identity /StrF /Identity >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
             hex_string(&o),
             hex_string(&u),
             hex_string(&id0),

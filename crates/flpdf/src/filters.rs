@@ -22,6 +22,22 @@ pub(crate) fn decode_stream_data_with_decryption(
     decode_stream_data(dict, &decrypted)
 }
 
+pub(crate) fn decode_stream_data_with_crypt_filter<F>(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    mut decrypt_crypt: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
+{
+    decode_stream_data_with_filters_and_crypt(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        stream_data,
+        &mut decrypt_crypt,
+    )
+}
+
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), stream_data)
 }
@@ -31,9 +47,28 @@ fn decode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
+    decode_stream_data_with_filters_and_crypt(filter, decode_params, stream_data, &mut |_, _| {
+        Err(Error::Unsupported(
+            "unsupported stream filter: Crypt".to_string(),
+        ))
+    })
+}
+
+fn decode_stream_data_with_filters_and_crypt<F>(
+    filter: Option<&Object>,
+    decode_params: Option<&Object>,
+    stream_data: &[u8],
+    decrypt_crypt: &mut F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
+{
     match filter {
         None => Ok(stream_data.to_vec()),
         Some(Object::Name(filter_name)) => {
+            if filter_name == b"Crypt" {
+                return decrypt_crypt(get_decode_params(decode_params, 0), stream_data);
+            }
             let decoded =
                 apply_single_filter_decode(filter_name, stream_data).map_err(Error::Unsupported)?;
             apply_decode_params(get_decode_params(decode_params, 0), &decoded)
@@ -46,9 +81,14 @@ fn decode_stream_data_with_filters(
                         "unsupported stream filter type: expected name".to_string(),
                     ));
                 };
-                decoded = apply_single_filter_decode(filter_name, &decoded)
-                    .map_err(Error::Unsupported)?;
-                decoded = apply_decode_params(get_decode_params(decode_params, index), &decoded)?;
+                if filter_name == b"Crypt" {
+                    decoded = decrypt_crypt(get_decode_params(decode_params, index), &decoded)?;
+                } else {
+                    decoded = apply_single_filter_decode(filter_name, &decoded)
+                        .map_err(Error::Unsupported)?;
+                    decoded =
+                        apply_decode_params(get_decode_params(decode_params, index), &decoded)?;
+                }
             }
             Ok(decoded)
         }
