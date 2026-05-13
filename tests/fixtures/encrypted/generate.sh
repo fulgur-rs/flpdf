@@ -30,6 +30,7 @@ v4-rc4-128-r4.pdf|user-v4-rc4|owner-v4-rc4|128|--use-aes=n --force-V4|a3668e477a
 v4-aes-128-r4.pdf|user-v4-aes|owner-v4-aes|128|--use-aes=y|a3668e477aa1c1e138f9ffa965db3d81cb6abaceeb8b7269d8e8622d29df753d|R = 4|file encryption method: AESv2
 v5-aes-256-r5.pdf|user-v5-r5|owner-v5-r5|256|--force-R5|ee894a875f95c6e53451fa3bb84683af3adbb329dba4b58cef502054a3a5d518|R = 5|file encryption method: AESv3
 v5-aes-256-r6.pdf|user-v5-r6|owner-v5-r6|256||f54d7aa9e6150ce3dc675c615ca571f2c8a924e0853e5ad215674951655ed42a|R = 6|file encryption method: AESv3
+v5-aes-256-r6-utf8.pdf|café|résumé|256||f54d7aa9e6150ce3dc675c615ca571f2c8a924e0853e5ad215674951655ed42a|R = 6|file encryption method: AESv3
 ROWS
 }
 

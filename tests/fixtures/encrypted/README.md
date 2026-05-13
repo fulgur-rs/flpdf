@@ -28,6 +28,7 @@ decryption, not the encrypted fixture bytes.
 | `v4-aes-128-r4.pdf` | V=4, R=4, AES-128 | `user-v4-aes` | `owner-v4-aes` | `a3668e477aa1c1e138f9ffa965db3d81cb6abaceeb8b7269d8e8622d29df753d` |
 | `v5-aes-256-r5.pdf` | V=5, R=5, AES-256 | `user-v5-r5` | `owner-v5-r5` | `ee894a875f95c6e53451fa3bb84683af3adbb329dba4b58cef502054a3a5d518` |
 | `v5-aes-256-r6.pdf` | V=5, R=6, AES-256 | `user-v5-r6` | `owner-v5-r6` | `f54d7aa9e6150ce3dc675c615ca571f2c8a924e0853e5ad215674951655ed42a` |
+| `v5-aes-256-r6-utf8.pdf` | V=5, R=6, AES-256 with non-ASCII (NFC composed) passwords for `--password-mode` coverage | `café` (U+0063 U+0061 U+0066 U+00E9) | `résumé` (U+0072 U+00E9 U+0073 U+0075 U+006D U+00E9) | `f54d7aa9e6150ce3dc675c615ca571f2c8a924e0853e5ad215674951655ed42a` |
 
 The generator uses these qpdf commands, all with `--static-id`:
 
@@ -38,6 +39,7 @@ qpdf --static-id --allow-weak-crypto --encrypt user-v4-rc4 owner-v4-rc4 128 --us
 qpdf --static-id --allow-weak-crypto --encrypt user-v4-aes owner-v4-aes 128 --use-aes=y -- tests/fixtures/minimal.pdf v4-aes-128-r4.pdf
 qpdf --static-id --encrypt user-v5-r5 owner-v5-r5 256 --force-R5 -- tests/fixtures/minimal.pdf v5-aes-256-r5.pdf
 qpdf --static-id --encrypt user-v5-r6 owner-v5-r6 256 -- tests/fixtures/minimal.pdf v5-aes-256-r6.pdf
+qpdf --static-id --encrypt café résumé 256 -- tests/fixtures/minimal.pdf v5-aes-256-r6-utf8.pdf
 ```
 
 `qpdf --deterministic-id` cannot be combined with encryption in qpdf 11.9.0, so

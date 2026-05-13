@@ -1,12 +1,12 @@
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::{
     check_reader_with_options, fonts,
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
     },
-    outline, pages, parse_pdf_version, write_pdf_with_options, write_qdf, Object, ObjectRef, Pdf,
-    PdfOpenOptions, Severity, WriteOptions,
+    outline, pages, parse_pdf_version, write_pdf_with_options, write_qdf, Object, ObjectRef,
+    PasswordMode, Pdf, PdfOpenOptions, Severity, WriteOptions,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -181,9 +181,35 @@ struct PasswordArgs {
     /// File containing password bytes. One trailing LF or CRLF is stripped.
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<PathBuf>,
+    /// How to interpret --password bytes before key derivation. Defaults to
+    /// `auto` which picks `bytes` for V<5 documents and `unicode` (SASLprep)
+    /// for V=5 R=5/R=6. Mirrors qpdf's --password-mode flag.
+    #[arg(long = "password-mode", value_enum, default_value_t = CliPasswordMode::Auto)]
+    password_mode: CliPasswordMode,
     /// Permit deprecated RC4-backed handlers and revision 5 encryption.
     #[arg(long = "allow-weak-crypto")]
     allow_weak_crypto: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum CliPasswordMode {
+    #[default]
+    Auto,
+    Bytes,
+    #[clap(name = "hex-bytes")]
+    HexBytes,
+    Unicode,
+}
+
+impl From<CliPasswordMode> for PasswordMode {
+    fn from(value: CliPasswordMode) -> Self {
+        match value {
+            CliPasswordMode::Auto => PasswordMode::Auto,
+            CliPasswordMode::Bytes => PasswordMode::Bytes,
+            CliPasswordMode::HexBytes => PasswordMode::HexBytes,
+            CliPasswordMode::Unicode => PasswordMode::Unicode,
+        }
+    }
 }
 
 fn main() {
@@ -647,6 +673,7 @@ fn open_pdf(
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
     let allow_weak_crypto = password.allow_weak_crypto;
+    let password_mode = password.password_mode.into();
     let password = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
     } else if let Some(path) = &password.password_file {
@@ -664,6 +691,7 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
     Ok(PdfOpenOptions {
         repair,
         password,
+        password_mode,
         allow_weak_crypto,
     })
 }

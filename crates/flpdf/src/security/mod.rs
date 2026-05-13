@@ -4,5 +4,6 @@
 //! `pub(crate)` at most. External crate types (e.g. `aes::Aes128`,
 //! `rc4::Rc4`) never appear in the `flpdf` public interface.
 
+pub(crate) mod password;
 pub(crate) mod primitives;
 pub(crate) mod standard;

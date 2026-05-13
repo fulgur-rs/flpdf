@@ -22,3 +22,5 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["block-padding"] }
 md-5 = "0.10"
 sha2 = "0.10"
+stringprep = "0.1"
+hex = "0.4"
