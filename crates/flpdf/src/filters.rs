@@ -1,4 +1,5 @@
 use crate::ascii85;
+use crate::ascii_hex;
 use crate::security::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::{Dictionary, Error, Object, Result};
 use flate2::read::ZlibDecoder;
@@ -314,6 +315,10 @@ fn apply_single_filter_decode(
         return ascii85::decode(stream_data);
     }
 
+    if filter_name == b"ASCIIHexDecode" {
+        return ascii_hex::decode(stream_data);
+    }
+
     Err(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
@@ -335,6 +340,10 @@ fn apply_single_filter_encode(
 
     if filter_name == b"ASCII85Decode" {
         return Ok(ascii85::encode(stream_data));
+    }
+
+    if filter_name == b"ASCIIHexDecode" {
+        return Ok(ascii_hex::encode(stream_data));
     }
 
     Err(format!(
@@ -458,5 +467,48 @@ mod tests {
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext);
+    }
+
+    // ----- ASCIIHexDecode filter integration tests -----
+
+    fn ascii_hex_dict() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+        dict
+    }
+
+    #[test]
+    fn decode_stream_data_ascii_hex_round_trip() {
+        let dict = ascii_hex_dict();
+        let plaintext = b"Hello from ASCIIHexDecode filter!";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_ascii_hex_empty() {
+        let dict = ascii_hex_dict();
+        let plaintext = b"";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn decode_stream_data_ascii_hex_odd_length_data() {
+        let dict = ascii_hex_dict();
+        // 3 bytes → odd nibble count in inner encoding only if we provide raw odd data;
+        // encode always emits two hex chars per byte so no padding needed on decode
+        let plaintext = b"ABC";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
     }
 }
