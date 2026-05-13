@@ -35,9 +35,7 @@ pub(crate) fn decode(input: &[u8]) -> Result<Vec<u8>, String> {
 
         // Parse hex digit
         let nibble = hex_nibble(b).ok_or_else(|| {
-            format!(
-                "ASCIIHexDecode: invalid character 0x{b:02X} at position {pos}"
-            )
+            format!("ASCIIHexDecode: invalid character 0x{b:02X} at position {pos}")
         })?;
 
         match pending {
