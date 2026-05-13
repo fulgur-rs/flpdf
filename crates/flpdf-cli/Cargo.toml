@@ -3,6 +3,15 @@ name = "flpdf-cli"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Command-line tools for flpdf, mirroring qpdf inspection and rewrite subcommands."
+documentation = "https://docs.rs/flpdf-cli"
+keywords = ["pdf", "qpdf", "cli", "linearization"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "flpdf"

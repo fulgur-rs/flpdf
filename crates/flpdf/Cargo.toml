@@ -3,6 +3,15 @@ name = "flpdf"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "A pure-Rust PDF toolkit modeled on qpdf — read, rewrite, linearize, and inspect PDFs."
+documentation = "https://docs.rs/flpdf"
+keywords = ["pdf", "qpdf", "parser", "linearization"]
+categories = ["parser-implementations", "encoding"]
 
 [dependencies]
 thiserror.workspace = true
