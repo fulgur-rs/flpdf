@@ -85,7 +85,7 @@ fn check_repair_encrypted_fixture_rejects_wrong_password_actionably() {
 }
 
 #[test]
-fn rewrite_encrypted_fixture_is_rejected_until_decrypt_output_is_supported() {
+fn rewrite_encrypted_fixture_writes_plaintext_output() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -94,12 +94,15 @@ fn rewrite_encrypted_fixture_is_rejected_until_decrypt_output_is_supported() {
         .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "encrypted PDF output is not supported yet",
-        ));
+        .success();
 
-    assert!(!output.exists());
+    assert!(output.exists());
+    let mut check = Command::cargo_bin("flpdf").unwrap();
+    check
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PDF check succeeded"));
 }
 
 #[test]

@@ -19,7 +19,7 @@
 //!
 //! Fixtures excluded:
 //! - `linearized-one-page.pdf`    — linearize path is independent of full_rewrite (separate issue).
-//! - `encrypted-r4-three-page.pdf` — full_rewrite rejects encrypted documents.
+//! - `encrypted-r4-three-page.pdf` — this baseline does not pass fixture passwords.
 //!
 //! If `qpdf` is not on PATH the entire test is skipped (non-failing).
 
