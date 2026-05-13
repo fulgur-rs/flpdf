@@ -16,6 +16,7 @@ categories = ["command-line-utilities"]
 [[bin]]
 name = "flpdf"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 clap.workspace = true

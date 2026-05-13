@@ -126,7 +126,7 @@ pub struct LinearizedOffsets {
 
     /// Byte range of the `/Prev` value placeholder in the Part 1 (first)
     /// trailer.  The value is written as a left-justified decimal integer
-    /// padded on the right with spaces to exactly [`PREV_PLACEHOLDER_WIDTH`]
+    /// padded on the right with spaces to exactly `PREV_PLACEHOLDER_WIDTH`
     /// bytes.  The back-patcher overwrites this range with the actual
     /// `last_xref_keyword_offset` value.
     pub first_trailer_prev_range: std::ops::Range<usize>,

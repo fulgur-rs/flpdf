@@ -188,7 +188,7 @@ impl HintStreamBuilder {
 
     /// Consume the builder and return the fully byte-aligned output.
     ///
-    /// Calls [`align_to_byte`] before returning.
+    /// Calls [`Self::align_to_byte`] before returning.
     pub fn finish(mut self) -> Vec<u8> {
         self.align_to_byte();
         self.buf

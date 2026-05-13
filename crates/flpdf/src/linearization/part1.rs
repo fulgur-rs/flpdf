@@ -81,7 +81,7 @@ pub struct Part1Placeholders {
 }
 
 impl Part1Placeholders {
-    /// Return all seven ranges as a slice in dict-key order: L, H[0], H[1],
+    /// Return all seven ranges as a slice in dict-key order: L, `H[0]`, `H[1]`,
     /// O, E, T, N.
     ///
     /// Useful for checking disjoint and ordering invariants.
