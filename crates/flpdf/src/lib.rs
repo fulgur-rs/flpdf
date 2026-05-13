@@ -38,6 +38,7 @@
 //! [`ObjectRef::parse`].
 
 pub mod ascii85;
+pub mod ascii_hex;
 pub mod cache;
 pub mod check;
 pub mod diagnostics;
