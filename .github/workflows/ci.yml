@@ -111,3 +111,46 @@ jobs:
           echo "[ci] Running compat matrix baselines — drift surfaces here as an explicit step"
           cargo test -p flpdf-cli --test compat_baseline_static_id -- --nocapture
           cargo test -p flpdf-cli --test compat_matrix_baseline -- --nocapture
+
+  publish-dry-run:
+    name: Publish dry-run (flpdf)
+    needs: quality
+    runs-on: ubuntu-latest
+    # flpdf-cli は flpdf がまだ crates.io に未 publish のため
+    # cargo publish --dry-run できない（version not found）。
+    # crates.io 上で flpdf が利用可能になった後に別途 cargo publish --dry-run -p flpdf-cli を CI に追加する。
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: cargo publish --dry-run -p flpdf
+        run: cargo publish --dry-run -p flpdf
+
+      - name: Verify packaged .crate contains README and LICENSE files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo publish --dry-run writes the .crate under target/package/tmp-crate/
+          # (not directly under target/package/). Match both locations to stay
+          # robust against future cargo changes.
+          CRATE_FILE=$(find target/package -name 'flpdf-*.crate' -print -quit)
+          if [ -z "$CRATE_FILE" ]; then
+            echo "ERROR: no .crate file found under target/package"
+            find target/package -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          contents=$(tar tzf "$CRATE_FILE")
+          for required in README.md LICENSE-APACHE LICENSE-MIT; do
+            if ! printf '%s\n' "$contents" | grep -Eq "^flpdf-[0-9.]+/${required}\$"; then
+              echo "ERROR: missing $required in $CRATE_FILE"
+              echo "$contents"
+              exit 1
+            fi
+          done
+          echo "OK: README.md / LICENSE-APACHE / LICENSE-MIT present in $CRATE_FILE"
