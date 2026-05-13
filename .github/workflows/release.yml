@@ -69,8 +69,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git tag "v$VERSION" || true
-          git push origin "v$VERSION" --force
+
+          # Refuse to move an existing remote tag that does not already match HEAD.
+          # `git push --force` would silently rewrite the tag, which would desync
+          # the source on GitHub from the version already on crates.io. Re-runs of
+          # the same merged PR produce the same HEAD SHA, so a same-SHA tag is a
+          # safe no-op and the push below succeeds. Different SHA = abort.
+          HEAD_SHA=$(git rev-parse HEAD)
+          REMOTE_SHA=$(git ls-remote --tags origin "refs/tags/v$VERSION" | awk '{print $1}')
+          if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$HEAD_SHA" ]; then
+            echo "::error::Tag v$VERSION already exists on origin at $REMOTE_SHA but HEAD is $HEAD_SHA. Refusing to move the tag because the published crate could already point at $REMOTE_SHA."
+            exit 1
+          fi
+
+          # Drop any stale local tag so the new tag points at the current HEAD.
+          git tag -d "v$VERSION" 2>/dev/null || true
+          git tag "v$VERSION"
+          # No --force: relies on the SHA check above to make re-runs safe.
+          git push origin "v$VERSION"
 
       # crates.io Trusted Publishing: rust-lang/crates-io-auth-action presents
       # the OIDC claim (repo + workflow + environment) to crates.io and gets a
