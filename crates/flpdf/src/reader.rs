@@ -8,8 +8,8 @@ use crate::security::standard::{
     ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
 use crate::{
-    load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostics, Dictionary, Error,
-    Object, ObjectRef, Result, XrefForm, XrefOffset,
+    load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostic, Diagnostics, Dictionary,
+    Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -57,6 +57,71 @@ struct EncryptionState {
     encrypt_metadata: bool,
     encrypt_ref: Option<ObjectRef>,
     weak_crypto: bool,
+    permissions: Permissions,
+}
+
+/// Standard security handler permission bits from an encrypted document's `/P` entry.
+///
+/// These flags are advisory. They report the producer's requested restrictions but do
+/// not enforce them while reading or rewriting the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permissions {
+    raw: i32,
+}
+
+impl Permissions {
+    fn new(raw: i32) -> Self {
+        Self { raw }
+    }
+
+    /// Raw signed `/P` value.
+    pub fn raw(self) -> i32 {
+        self.raw
+    }
+
+    /// Print the document, possibly at degraded quality if high-quality printing is denied.
+    pub fn can_print(self) -> bool {
+        self.has_bit(0x0004)
+    }
+
+    /// Modify document contents by operations other than controlled form/annotation edits.
+    pub fn can_modify(self) -> bool {
+        self.has_bit(0x0008)
+    }
+
+    /// Copy or otherwise extract text and graphics.
+    pub fn can_copy(self) -> bool {
+        self.has_bit(0x0010)
+    }
+
+    /// Add or modify annotations and interactive form fields.
+    pub fn can_annotate(self) -> bool {
+        self.has_bit(0x0020)
+    }
+
+    /// Fill in existing interactive form fields.
+    pub fn can_fill_forms(self) -> bool {
+        self.has_bit(0x0100)
+    }
+
+    /// Extract text and graphics for accessibility purposes.
+    pub fn can_extract_for_accessibility(self) -> bool {
+        self.has_bit(0x0200)
+    }
+
+    /// Assemble the document by inserting, rotating, or deleting pages/bookmarks.
+    pub fn can_assemble(self) -> bool {
+        self.has_bit(0x0400)
+    }
+
+    /// Print the document at high quality.
+    pub fn can_print_high_quality(self) -> bool {
+        self.has_bit(0x0800)
+    }
+
+    fn has_bit(self, bit: u32) -> bool {
+        (self.raw as u32) & bit != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +191,13 @@ impl<R: Read + Seek> Pdf<R> {
             .is_some_and(|encryption| encryption.weak_crypto)
     }
 
+    /// Advisory standard security handler permissions from `/P`, if the document is encrypted.
+    pub fn permissions(&self) -> Option<Permissions> {
+        self.encryption
+            .as_ref()
+            .map(|encryption| encryption.permissions)
+    }
+
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
         let loaded = if options.repair {
             load_xref_and_trailer_with_repair(&mut reader, options.repair)?
@@ -167,6 +239,7 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let revision = required_revision(&encrypt)?;
+        let permissions = Permissions::new(required_permissions(&encrypt)?);
         let crypt_filters = crypt_filter_modes(&encrypt, revision)?;
         let (file_key, stream_mode, string_mode, encrypt_metadata, weak_crypto) =
             if matches!(revision, 5 | 6) {
@@ -218,6 +291,11 @@ impl<R: Read + Seek> Pdf<R> {
                     weak_crypto,
                 )
             };
+        let r6_perms_warning = if revision == 6 {
+            r6_perms_warning(&encrypt, &file_key, permissions, encrypt_metadata)?
+        } else {
+            None
+        };
         self.encryption = Some(EncryptionState {
             file_key,
             stream_mode,
@@ -226,7 +304,12 @@ impl<R: Read + Seek> Pdf<R> {
             encrypt_metadata,
             encrypt_ref,
             weak_crypto,
+            permissions,
         });
+        if let Some(warning) = r6_perms_warning {
+            self.repair_diagnostics
+                .push(Diagnostic::warning(warning, None));
+        }
         Ok(())
     }
 
@@ -814,10 +897,7 @@ fn standard_handler_inputs<'a>(
         }
         None => 40,
     };
-    let p =
-        i32::try_from(required_integer(encrypt, "P")?).map_err(|_| EncryptedError::Malformed {
-            reason: "/P entry is out of i32 range".into(),
-        })?;
+    let p = required_permissions(encrypt)?;
     let u = required_32_byte_string(encrypt, "U")?;
     let o = required_32_byte_string(encrypt, "O")?;
     let id0 = first_file_id(trailer)?;
@@ -866,6 +946,68 @@ fn encrypt_metadata_flag(encrypt: &Dictionary) -> Result<bool> {
         .into()),
         None => Ok(true),
     }
+}
+
+fn required_permissions(encrypt: &Dictionary) -> Result<i32> {
+    i32::try_from(required_integer(encrypt, "P")?).map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "/P entry is out of i32 range".into(),
+        }
+        .into()
+    })
+}
+
+fn r6_perms_warning(
+    encrypt: &Dictionary,
+    file_key: &[u8],
+    permissions: Permissions,
+    encrypt_metadata: bool,
+) -> Result<Option<String>> {
+    let Some(perms) = encrypt.get("Perms") else {
+        return Ok(None);
+    };
+    let Object::String(bytes) = perms else {
+        return Ok(Some("R=6 /Perms entry is not a string".into()));
+    };
+    let Ok(mut block) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        return Ok(Some("R=6 /Perms entry is not 16 bytes".into()));
+    };
+    let Ok(file_key) = <&[u8; 32]>::try_from(file_key) else {
+        return Ok(Some(
+            "R=6 /Perms cannot be verified with non-256-bit file key".into(),
+        ));
+    };
+
+    crate::security::primitives::aes256_ecb_decrypt_block(file_key, &mut block);
+    let perms_p = i32::from_le_bytes(block[..4].try_into().expect("slice length checked"));
+    let perms_metadata = match block[8] {
+        b'T' => true,
+        b'F' => false,
+        _ => {
+            return Ok(Some(
+                "R=6 /Perms encrypted-metadata flag is not T or F".into(),
+            ))
+        }
+    };
+
+    if perms_p != permissions.raw() {
+        return Ok(Some(format!(
+            "R=6 /Perms permissions value {perms_p} does not match /P {}",
+            permissions.raw()
+        )));
+    }
+    if block[4..8] != [0xff; 4] {
+        return Ok(Some("R=6 /Perms reserved bytes are invalid".into()));
+    }
+    if perms_metadata != encrypt_metadata {
+        return Ok(Some(
+            "R=6 /Perms encrypted-metadata flag does not match /EncryptMetadata".into(),
+        ));
+    }
+    if &block[9..12] != b"adb" {
+        return Ok(Some("R=6 /Perms magic bytes are not 'adb'".into()));
+    }
+    Ok(None)
 }
 
 fn required_revision(encrypt: &Dictionary) -> Result<i64> {
