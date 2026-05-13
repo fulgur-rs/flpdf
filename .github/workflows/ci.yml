@@ -147,7 +147,7 @@ jobs:
           fi
           contents=$(tar tzf "$CRATE_FILE")
           for required in README.md LICENSE-APACHE LICENSE-MIT; do
-            if ! printf '%s\n' "$contents" | grep -Eq "^flpdf-[0-9.]+/${required}\$"; then
+            if ! printf '%s\n' "$contents" | grep -Eq "^flpdf-[^/]+/${required}\$"; then
               echo "ERROR: missing $required in $CRATE_FILE"
               echo "$contents"
               exit 1
