@@ -98,18 +98,39 @@ jobs:
       - name: Publish flpdf (lib)
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
-        run: cargo publish -p flpdf
+        # Idempotent on re-run: cargo publish refuses to upload the same version
+        # twice, but if a previous attempt of this same merged PR already pushed
+        # flpdf successfully (e.g. flpdf-cli then failed and we are retrying),
+        # treat the "already uploaded" error as success rather than blocking.
+        run: |
+          if OUT=$(cargo publish -p flpdf 2>&1); then
+            echo "$OUT"
+          else
+            echo "$OUT"
+            echo "$OUT" | grep -qi "already uploaded" || exit 1
+            echo "flpdf already uploaded for this version -- treating as success."
+          fi
 
       - name: Publish flpdf-cli (with retry for crates.io index lag)
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        # Two failure modes are handled distinctly:
+        # - "already uploaded": a previous attempt succeeded, treat as success.
+        # - any other failure: wait for crates.io index propagation and retry,
+        #   since the most common cause is flpdf's index entry not yet visible.
         run: |
           for i in 1 2 3 4 5 6 7 8; do
             echo "Attempt $i: publishing flpdf-cli..."
-            if cargo publish -p flpdf-cli 2>&1; then
+            if OUT=$(cargo publish -p flpdf-cli 2>&1); then
+              echo "$OUT"
               echo "Published successfully."
               exit 0
+            elif echo "$OUT" | grep -qi "already uploaded"; then
+              echo "$OUT"
+              echo "flpdf-cli already uploaded for this version -- treating as success."
+              exit 0
             fi
+            echo "$OUT"
             WAIT=$((15 * i))
             echo "Failed. Waiting ${WAIT}s for crates.io index..."
             sleep "$WAIT"
