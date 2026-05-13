@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.2.0). Leave empty to auto-bump minor (ZeroVer policy).'
+        description: 'Release version (e.g. 0.1.1). Leave empty to auto-bump patch. Pass explicitly for minor / major bumps.'
         required: false
         type: string
 
@@ -39,11 +39,15 @@ jobs:
           echo "current=$CURRENT"
 
           if [ -z "$INPUT_VERSION" ]; then
-            # ZeroVer auto-bump: minor++ (0.1.0 -> 0.2.0). Patches are reserved
-            # for hotfixes -- pass `version` input explicitly when cutting a patch.
+            # SemVer auto-bump: patch++ (0.1.0 -> 0.1.1) as the safe minimum.
+            # For minor / major bumps (new features, breaking changes, 0.x -> 1.0),
+            # pass the `version` input explicitly.
             IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-            MINOR=$((MINOR + 1))
-            VERSION="$MAJOR.$MINOR.0"
+            # Strip any pre-release suffix from PATCH (e.g. "1-alpha.2" -> "1")
+            # before incrementing.
+            PATCH="${PATCH%%-*}"
+            PATCH=$((PATCH + 1))
+            VERSION="$MAJOR.$MINOR.$PATCH"
           else
             VERSION="$INPUT_VERSION"
             # Strip leading 'v' if present
