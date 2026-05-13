@@ -184,6 +184,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.encryption.is_some()
     }
 
+    pub(crate) fn encryption_ref(&self) -> Option<ObjectRef> {
+        self.encryption
+            .as_ref()
+            .and_then(|encryption| encryption.encrypt_ref)
+    }
+
     /// Whether opening this document required the weak-crypto opt-in.
     pub fn uses_weak_crypto(&self) -> bool {
         self.encryption

@@ -16,7 +16,7 @@
 //! the orchestrator already confirmed on-disk equality empirically.
 //!
 //! Fixtures excluded:
-//! - `encrypted-r4-three-page.pdf` — full_rewrite rejects encrypted documents.
+//! - `encrypted-r4-three-page.pdf` — this baseline does not pass fixture passwords.
 //!
 //! If `qpdf` is not on PATH the entire test is skipped (non-failing).
 

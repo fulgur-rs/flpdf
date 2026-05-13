@@ -1015,9 +1015,8 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Resu
 ///   A dedicated "renumber + pack into ObjStm" pass (flpdf-9hc.20.13) is a
 ///   future concern.
 ///
-/// - **Encrypted documents**: `/Encrypt` in the trailer is not supported.
-///   The function returns `Err(Unsupported)` when encryption is detected so
-///   that callers do not silently produce a corrupt output.
+/// - **Encrypted documents**: authenticated inputs are rewritten as plaintext;
+///   no encryption dictionary is emitted and no re-encryption is attempted.
 ///
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
@@ -1028,14 +1027,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
-
-    // Reject encrypted documents — decoding encrypted streams without the
-    // encryption key would produce garbage.  (Scope limitation; NOTES.)
-    if pdf.trailer().get("Encrypt").is_some() {
-        return Err(crate::Error::Unsupported(
-            "full-rewrite mode does not support encrypted documents".to_string(),
-        ));
-    }
 
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
     // PDF 1.5 introduced xref streams.  If we preserve the source's xref-stream
@@ -1059,6 +1050,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 
     for object_ref in &object_refs {
+        if Some(*object_ref) == pdf.encryption_ref() {
+            continue;
+        }
+
         // Resolve the object; propagate the error so callers see corrupt input
         // rather than getting a silent success with missing /Root descendants.
         let object = pdf.resolve(*object_ref)?;
@@ -1132,6 +1127,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // Trailer — start from the document trailer, strip incremental keys.
             let mut trailer = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut trailer);
+            if pdf.is_encrypted() {
+                trailer.remove("Encrypt");
+            }
             trailer.insert("Size", Object::Integer(object_count as i64));
             trailer.insert("Root", Object::Reference(root_ref));
             if options.static_id {
@@ -1204,6 +1202,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
             let mut xref_dict = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut xref_dict);
+            if pdf.is_encrypted() {
+                xref_dict.remove("Encrypt");
+            }
             // The trailer may carry filter keys from the input's xref stream
             // (e.g. /Filter /FlateDecode). We're emitting freshly built raw
             // entry bytes via `Stream::new`, so any stale filter declaration

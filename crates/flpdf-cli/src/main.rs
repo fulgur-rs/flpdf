@@ -367,7 +367,10 @@ fn run_rewrite(
         std::fs::write(&output, &doc.bytes)?;
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
-        reject_encrypted_write(&pdf)?;
+        let mut options = options;
+        if pdf.is_encrypted() {
+            options.full_rewrite = true;
+        }
         let mut out = File::create(output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
     }
@@ -392,7 +395,7 @@ fn run_qdf(
 
 fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> CliResult<()> {
     if pdf.is_encrypted() {
-        return Err("encrypted PDF output is not supported yet; decrypt/re-encrypt support is tracked separately".into());
+        return Err("encrypted PDF output is not supported for this mode; use plain rewrite to produce decrypted plaintext".into());
     }
     Ok(())
 }
