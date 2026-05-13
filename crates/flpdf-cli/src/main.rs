@@ -1,6 +1,6 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::{
-    check_reader_with_options, fonts,
+    check_reader_with_options, filters, fonts,
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
@@ -9,7 +9,7 @@ use flpdf::{
     PasswordMode, Pdf, PdfOpenOptions, Severity, WriteOptions,
 };
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -91,6 +91,8 @@ enum Commands {
     Qdf(QdfCommand),
     #[command(about = "Rewrite the input PDF to a normalized output")]
     Rewrite(RewriteCommand),
+    #[command(name = "show-stream", about = "Show a stream object's decoded (or raw) data")]
+    ShowStream(ShowStreamCommand),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -112,6 +114,23 @@ struct CheckLinearizationCommand {
 struct DumpObjectCommand {
     object_ref: String,
     input: PathBuf,
+    #[arg(long)]
+    repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+struct ShowStreamCommand {
+    /// Object reference, e.g. "7 0" or "7 0 R".
+    object_ref: String,
+    input: PathBuf,
+    /// Emit unfiltered stored bytes instead of decoding.
+    #[arg(long)]
+    raw: bool,
+    /// Write output to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
     #[arg(long)]
     repair: bool,
     #[command(flatten)]
@@ -312,6 +331,7 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair, &cmd.password),
+        Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::Rewrite(cmd) => {
             if let Some(ref v) = cmd.force_version {
                 if parse_pdf_version(v).is_none() {
@@ -449,6 +469,42 @@ fn run_dump_object(
     let mut out = Vec::new();
     object.write_pdf(&mut out);
     println!("{}", String::from_utf8_lossy(&out));
+    Ok(())
+}
+
+fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
+    let object_ref = ObjectRef::parse(&cmd.object_ref)?;
+    let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
+    let object = pdf.resolve(object_ref)?;
+
+    if matches!(object, Object::Null) {
+        return Err(format!(
+            "object {} {} R not found",
+            object_ref.number, object_ref.generation
+        )
+        .into());
+    }
+
+    let Object::Stream(stream) = object else {
+        return Err(format!(
+            "object {} {} R is not a stream",
+            object_ref.number, object_ref.generation
+        )
+        .into());
+    };
+
+    let bytes = if cmd.raw {
+        stream.data
+    } else {
+        filters::decode_stream_data(&stream.dict, &stream.data)?
+    };
+
+    if let Some(path) = cmd.out {
+        std::fs::write(path, bytes)?;
+    } else {
+        std::io::stdout().write_all(&bytes)?;
+        std::io::stdout().flush()?;
+    }
     Ok(())
 }
 
