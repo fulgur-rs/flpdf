@@ -1,0 +1,163 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.2.0). Leave empty to auto-bump minor (ZeroVer policy).'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "current=$CURRENT"
+
+          if [ -z "$INPUT_VERSION" ]; then
+            # ZeroVer auto-bump: minor++ (0.1.0 -> 0.2.0). Patches are reserved
+            # for hotfixes -- pass `version` input explicitly when cutting a patch.
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            MINOR=$((MINOR + 1))
+            VERSION="$MAJOR.$MINOR.0"
+          else
+            VERSION="$INPUT_VERSION"
+            # Strip leading 'v' if present
+            VERSION="${VERSION#v}"
+            # Validate semver format
+            echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || {
+              echo "::error::Version must be semver format, e.g. 0.2.0 (not v0.2.0)"
+              exit 1
+            }
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing: $VERSION (was $CURRENT)"
+
+      - name: Update version in Cargo.toml
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # workspace.package.version (inherited by both flpdf and flpdf-cli via
+          # `version.workspace = true`).
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+
+          # flpdf-cli's path dep on flpdf carries an explicit version constraint
+          # so it resolves against the registry on publish. Keep it in lockstep
+          # with workspace version.
+          sed -i \
+            "s|flpdf = { path = \"../flpdf\", version = \"[^\"]*\" }|flpdf = { path = \"../flpdf\", version = \"$VERSION\" }|g" \
+            crates/flpdf-cli/Cargo.toml
+
+          cargo check --workspace
+
+      # PR-based changelog: ask GitHub to render notes from merged PRs since the
+      # last release, classified by labels per .github/release.yml.
+      # `previous_tag_name` is auto-detected when omitted.
+      - name: Generate release notes from PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="v$VERSION" \
+            --jq .body > RELEASE_NOTES.md
+
+      - name: Prepend new section to CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          # Drop the API's "## What's Changed" preamble so categories nest
+          # cleanly under "## [VERSION] - DATE" as H3.
+          sed -i "/^## What's Changed$/d" RELEASE_NOTES.md
+          {
+            echo "# Changelog"
+            echo
+            echo "All notable changes to this project will be documented in this file."
+            echo
+            echo "The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),"
+            echo "and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)."
+            echo
+            echo "## [$VERSION] - $DATE"
+            echo
+            cat RELEASE_NOTES.md
+            echo
+            # Skip the existing top-of-file header and keep history from the first
+            # versioned section onward.
+            awk '/^## \[/{found=1} found' CHANGELOG.md
+          } > CHANGELOG.tmp
+          mv CHANGELOG.tmp CHANGELOG.md
+
+      - name: Create release branch and PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BRANCH="release/v$VERSION"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Clean up existing branch/PR if re-running.
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+          git checkout -b "$BRANCH"
+          # RELEASE_NOTES.md is a transient artifact handed to the draft release
+          # step below; keep it on disk but out of the commit.
+          git add -A
+          git reset HEAD -- RELEASE_NOTES.md
+          git commit -m "release: v$VERSION"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "release: v$VERSION" \
+            --body "$(cat <<PRBODY
+          ## Release v$VERSION
+
+          - Version bumped in Cargo.toml (workspace + flpdf-cli path dep)
+          - CHANGELOG.md updated (PR-based notes)
+          - Draft GitHub Release created
+
+          **Merging this PR will automatically:**
+          1. Tag \`v$VERSION\`
+          2. Publish \`flpdf\` then \`flpdf-cli\` to crates.io (Trusted Publishing)
+          3. Publish the draft GitHub Release
+          PRBODY
+          )" \
+            --base main \
+            --head "$BRANCH"
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Delete existing draft release if re-running
+          gh release delete "v$VERSION" --yes 2>/dev/null || true
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            --draft
