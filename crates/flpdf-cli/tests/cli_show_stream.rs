@@ -25,7 +25,9 @@ fn show_stream_raw_emits_stored_bytes() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::starts_with("GapQh0E"));
+    .stdout(predicate::function(|out: &[u8]| {
+        out.starts_with(b"GapQh0E")
+    }));
 }
 
 #[test]
@@ -68,7 +70,8 @@ fn show_stream_writes_to_out_file() {
     ])
     .arg(&out_path)
     .assert()
-    .success();
+    .success()
+    .stdout(predicate::function(|out: &[u8]| out.is_empty()));
 
     let contents = std::fs::read_to_string(&out_path).unwrap();
     assert!(
