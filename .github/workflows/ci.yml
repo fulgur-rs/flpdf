@@ -149,8 +149,12 @@ jobs:
             exit 1
           fi
           contents=$(tar tzf "$CRATE_FILE")
+          # Derive the exact in-archive directory (e.g. flpdf-0.1.0) so we can
+          # use grep -F for literal-string matching. Avoids the "." in
+          # "README.md" being interpreted as any-char by regex.
+          PKG_DIR=$(basename "$CRATE_FILE" .crate)
           for required in README.md LICENSE-APACHE LICENSE-MIT; do
-            if ! printf '%s\n' "$contents" | grep -Eq "^flpdf-[^/]+/${required}\$"; then
+            if ! printf '%s\n' "$contents" | grep -Fxq "${PKG_DIR}/${required}"; then
               echo "ERROR: missing $required in $CRATE_FILE"
               echo "$contents"
               exit 1
