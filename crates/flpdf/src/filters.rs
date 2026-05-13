@@ -654,7 +654,10 @@ mod tests {
 
         let result = decode_stream_data(&dict, &truncated_stream);
 
-        assert!(result.is_err(), "expected error for truncated literal stream");
+        assert!(
+            result.is_err(),
+            "expected error for truncated literal stream"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("RunLengthDecode"),
