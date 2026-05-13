@@ -167,8 +167,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Delete existing draft release if re-running
-          gh release delete "v$VERSION" --yes 2>/dev/null || true
+          # Re-running release-prepare for the same version should reset the
+          # draft release so the new notes take effect. But never delete a
+          # published release: that would silently wipe production metadata
+          # users may already depend on.
+          DRAFT_STATE=$(gh release view "v$VERSION" --json draft -q .draft 2>/dev/null || echo none)
+          case "$DRAFT_STATE" in
+            none)
+              : # release does not exist yet, nothing to delete
+              ;;
+            true)
+              gh release delete "v$VERSION" --yes
+              ;;
+            false)
+              echo "::error::Release v$VERSION is already published. Refusing to delete a published release. Bump the version, or delete the release manually via the GitHub UI first if you really mean to overwrite."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected draft state for release v$VERSION: \"$DRAFT_STATE\""
+              exit 1
+              ;;
+          esac
           gh release create "v$VERSION" \
             --title "v$VERSION" \
             --notes-file RELEASE_NOTES.md \
