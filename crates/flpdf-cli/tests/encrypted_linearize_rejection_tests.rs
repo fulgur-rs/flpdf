@@ -63,6 +63,9 @@ fn rewrite_linearize_rejects_all_encrypted_fixture_variants() {
             .failure()
             .stderr(predicates::str::contains(
                 "encrypted PDF output is not supported",
+            ))
+            .stderr(predicates::str::contains(
+                "use plain rewrite to produce decrypted plaintext",
             ));
         assert!(
             !out.exists(),
@@ -82,8 +85,13 @@ fn top_level_linearize_shorthand_also_rejects_encrypted_input() {
         .arg("--password=user-v5-r6")
         .arg(fixture("v5-aes-256-r6.pdf"))
         .arg(&out);
-    cmd.assert().failure().stderr(predicates::str::contains(
-        "encrypted PDF output is not supported",
-    ));
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "encrypted PDF output is not supported",
+        ))
+        .stderr(predicates::str::contains(
+            "use plain rewrite to produce decrypted plaintext",
+        ));
     assert!(!out.exists());
 }
