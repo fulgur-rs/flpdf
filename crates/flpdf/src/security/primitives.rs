@@ -17,6 +17,7 @@
 //! losing the unused-detector for everything else.
 #![allow(dead_code)]
 
+use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use aes::Aes256;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
@@ -134,6 +135,12 @@ pub(crate) fn aes256_cbc_decrypt(
     let pt_len = pt.len();
     ciphertext.truncate(pt_len);
     Ok(())
+}
+
+/// Decrypt one AES-256-ECB block in place.
+pub(crate) fn aes256_ecb_decrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
+    let dec = <Aes256 as KeyInit>::new(key.into());
+    dec.decrypt_block(block.into());
 }
 
 /// Compute the MD5 digest of `data`.

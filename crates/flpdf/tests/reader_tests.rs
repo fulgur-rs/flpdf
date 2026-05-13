@@ -1,4 +1,5 @@
-use aes::Aes128;
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::{Aes128, Aes256};
 use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use cbc::Encryptor;
 use flate2::write::ZlibEncoder;
@@ -165,6 +166,46 @@ fn open_with_options_accepts_r5_with_weak_crypto_opt_in_and_r6_by_default() {
 
         assert_eq!(pdf.version(), "2.0");
     }
+}
+
+#[test]
+fn permissions_exposes_standard_flags() {
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(6)),
+        PdfOpenOptions {
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    let permissions = pdf.permissions().expect("encrypted fixture has /P");
+
+    assert_eq!(permissions.raw(), -3904);
+    assert!(!permissions.can_print());
+    assert!(!permissions.can_modify());
+    assert!(!permissions.can_copy());
+    assert!(!permissions.can_annotate());
+    assert!(!permissions.can_fill_forms());
+    assert!(!permissions.can_extract_for_accessibility());
+    assert!(!permissions.can_assemble());
+    assert!(!permissions.can_print_high_quality());
+}
+
+#[test]
+fn r6_perms_mismatch_warns_without_failing_open() {
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r6_pdf_with_perms(-4, true)),
+        PdfOpenOptions {
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+        entry.severity == flpdf::Severity::Warning && entry.message.contains("/Perms")
+    }));
 }
 
 #[test]
@@ -397,6 +438,26 @@ fn encrypted_r5_or_r6_unsupported_cf_minimal_pdf(revision: i64) -> Vec<u8> {
         " /CF << /StdCF << /CFM /V2 /Length 128 >> >> /StmF /StdCF /StrF /Identity",
         &[],
     )
+}
+
+fn encrypted_r6_pdf_with_perms(perms_p: i32, perms_encrypt_metadata: bool) -> Vec<u8> {
+    let perms = r6_perms_entry(perms_p, perms_encrypt_metadata);
+    encrypted_r5_or_r6_pdf(6, &format!(" /Perms <{}>", hex_string(&perms)), &[])
+}
+
+fn r6_perms_entry(p: i32, encrypt_metadata: bool) -> [u8; 16] {
+    let mut block = [0u8; 16];
+    block[..4].copy_from_slice(&p.to_le_bytes());
+    block[4..8].copy_from_slice(&[0xff; 4]);
+    block[8] = if encrypt_metadata { b'T' } else { b'F' };
+    block[9..12].copy_from_slice(b"adb");
+    block[12..16].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+
+    let file_key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let cipher = Aes256::new((&file_key).into());
+    let mut encrypted = block.into();
+    cipher.encrypt_block(&mut encrypted);
+    encrypted.into()
 }
 
 fn encrypted_r5_or_r6_pdf(revision: i64, encrypt_suffix: &str, extra_objects: &[&[u8]]) -> Vec<u8> {
