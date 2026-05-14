@@ -606,6 +606,188 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue
     Ok(JsonValue::Array(entries))
 }
 
+// ── build_pagelabels_section ──────────────────────────────────────────────────
+
+/// Convert a page-label dictionary (`/Type /PageLabel`) to a JSON object with
+/// keys in alphabetical order: `first`, `prefix`, `style`.
+///
+/// - `first`  = `/St` (integer, default 1)
+/// - `prefix` = `/P` (PDF text string, decoded without `u:`/`b:` prefix; default `""`)
+/// - `style`  = `/S` (name string `"D"/"R"/"r"/"A"/"a"`, or `null` when absent)
+fn label_dict_to_json(dict: &Dictionary) -> JsonValue {
+    // first: /St integer, default 1
+    let first = match dict.get("St") {
+        Some(Object::Integer(n)) => *n,
+        _ => 1,
+    };
+
+    // prefix: /P text string, decoded as PDF text string without u:/b: decoration.
+    // Absent → "".  Undecodable bytes → lossy UTF-8 replacement.
+    let prefix = match dict.get("P") {
+        Some(Object::String(bytes)) => decode_pdf_text_string(bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+        _ => String::new(),
+    };
+
+    // style: /S name, or null if absent / not a recognised name.
+    let style = match dict.get("S") {
+        Some(Object::Name(bytes)) => {
+            let s = match bytes.as_slice() {
+                b"D" => "D",
+                b"R" => "R",
+                b"r" => "r",
+                b"A" => "A",
+                b"a" => "a",
+                _ => "",
+            };
+            if s.is_empty() {
+                JsonValue::Null
+            } else {
+                JsonValue::String(s.to_string())
+            }
+        }
+        _ => JsonValue::Null,
+    };
+
+    // Key order: alphabetical → first, prefix, style
+    JsonValue::Object(vec![
+        ("first".to_string(), JsonValue::Integer(first)),
+        ("prefix".to_string(), JsonValue::String(prefix)),
+        ("style".to_string(), style),
+    ])
+}
+
+/// Walk a number-tree node for `/PageLabels`, collecting `(page_index, label_dict)` pairs.
+///
+/// Handles both leaf nodes (`/Nums`) and intermediate nodes (`/Kids`).  When both are
+/// present (spec violation), `/Nums` takes priority.  The `seen` set prevents infinite
+/// loops on cyclic indirect references.
+fn walk_pagelabels<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node: Object,
+    entries: &mut Vec<(i64, Dictionary)>,
+    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), ConvertError> {
+    if depth > max_depth {
+        return Ok(()); // silently truncate to avoid unbounded recursion
+    }
+
+    let dict = match node {
+        Object::Dictionary(d) => d,
+        _ => return Ok(()), // unexpected node type — skip
+    };
+
+    // /Nums takes priority over /Kids (spec §7.9.7 leaf vs. intermediate).
+    if let Some(Object::Array(nums)) = dict.get("Nums") {
+        let nums = nums.clone();
+        let mut iter = nums.into_iter();
+        while let (Some(idx_obj), Some(label_obj)) = (iter.next(), iter.next()) {
+            let idx = match idx_obj {
+                Object::Integer(n) => n,
+                _ => continue, // malformed — skip pair
+            };
+            // Label value may be a direct Dictionary or an indirect Reference.
+            let label_dict = match label_obj {
+                Object::Dictionary(d) => d,
+                Object::Reference(r) => match pdf.resolve(r).map_err(ConvertError::from)? {
+                    Object::Dictionary(d) => d,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            entries.push((idx, label_dict));
+        }
+        return Ok(());
+    }
+
+    // No /Nums — try /Kids (intermediate node).
+    if let Some(Object::Array(kids)) = dict.get("Kids") {
+        let kids = kids.clone();
+        for kid in kids {
+            let kid_ref = match kid {
+                Object::Reference(r) => r,
+                _ => continue,
+            };
+            if !seen.insert(kid_ref) {
+                continue; // cycle — skip
+            }
+            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
+            walk_pagelabels(pdf, child, entries, seen, depth + 1, max_depth)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the qpdf JSON v2 `"pagelabels"` section.
+///
+/// Returns a [`JsonValue::Array`] where each element is a JSON object with
+/// keys in alphabetical order: `index`, `label`.
+///
+/// Returns `JsonValue::Array(vec![])` when the document has no `/PageLabels` entry.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any indirect object resolution fails during tree walk.
+pub fn build_pagelabels_section<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<JsonValue, ConvertError> {
+    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+
+    // Resolve the Catalog.
+    let catalog_ref = match pdf.root_ref() {
+        Some(r) => r,
+        None => return Ok(JsonValue::Array(vec![])),
+    };
+    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog_dict = match catalog {
+        Object::Dictionary(d) => d,
+        _ => return Ok(JsonValue::Array(vec![])),
+    };
+
+    // Look up /PageLabels.  May be absent, a direct Dictionary, or a Reference.
+    let pagelabels_val = match catalog_dict.get("PageLabels") {
+        Some(v) => v.clone(),
+        None => return Ok(JsonValue::Array(vec![])),
+    };
+
+    // Resolve indirect reference if needed.
+    let root_node = match pagelabels_val {
+        Object::Reference(r) => pdf.resolve(r).map_err(ConvertError::from)?,
+        other => other,
+    };
+
+    let mut entries: Vec<(i64, Dictionary)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    walk_pagelabels(
+        pdf,
+        root_node,
+        &mut entries,
+        &mut seen,
+        0,
+        DEFAULT_MAX_PAGE_TREE_DEPTH,
+    )?;
+
+    // Sort by page index (ascending) — spec guarantees ascending order in a
+    // well-formed number tree, but we sort defensively.
+    entries.sort_by_key(|(idx, _)| *idx);
+
+    let result: Vec<JsonValue> = entries
+        .into_iter()
+        .map(|(idx, label_dict)| {
+            let label_json = label_dict_to_json(&label_dict);
+            JsonValue::Object(vec![
+                ("index".to_string(), JsonValue::Integer(idx)),
+                ("label".to_string(), label_json),
+            ])
+        })
+        .collect();
+
+    Ok(JsonValue::Array(result))
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1512,5 +1694,259 @@ mod tests {
             vec!["4 0 R".to_string(), "5 0 R".to_string()],
             "indirect Array of refs must be unwrapped, not emitted as the array's ref number"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // build_pagelabels_section tests (flpdf-9hc.11.5)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // Helper: build a synthetic catalog with a /PageLabels entry.
+    fn patch_pagelabels(pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>, pagelabels: Object) {
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d,
+            _ => panic!("catalog is not a Dictionary"),
+        };
+        catalog.insert("PageLabels", pagelabels);
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    }
+
+    // ── 36. No /PageLabels → empty array ─────────────────────────────────────
+
+    #[test]
+    fn pagelabels_missing_returns_empty_array() {
+        // one-page.pdf has no /PageLabels — must return [].
+        let mut pdf = load_one_page_pdf();
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![]),
+            "missing /PageLabels must yield empty array"
+        );
+    }
+
+    // ── 37. Single range: /Nums [0 << /S /D /St 1 >>] ───────────────────────
+
+    #[test]
+    fn pagelabels_single_range_decimal() {
+        let mut pdf = load_one_page_pdf();
+
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name(b"D".to_vec()));
+        label.insert("St", Object::Integer(1));
+
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let JsonValue::Array(arr) = &result else {
+            panic!("expected Array, got {result:?}");
+        };
+        assert_eq!(arr.len(), 1, "expected 1 entry");
+
+        let JsonValue::Object(entry) = &arr[0] else {
+            panic!("entry is not an Object");
+        };
+        // Key order: index, label
+        assert_eq!(entry[0].0, "index");
+        assert_eq!(entry[0].1, JsonValue::Integer(0));
+        assert_eq!(entry[1].0, "label");
+
+        let JsonValue::Object(label_pairs) = &entry[1].1 else {
+            panic!("label is not an Object");
+        };
+        // Key order: first, prefix, style
+        assert_eq!(label_pairs[0], ("first".to_string(), JsonValue::Integer(1)));
+        assert_eq!(
+            label_pairs[1],
+            ("prefix".to_string(), JsonValue::String(String::new()))
+        );
+        assert_eq!(
+            label_pairs[2],
+            ("style".to_string(), JsonValue::String("D".to_string()))
+        );
+    }
+
+    // ── 38. Multiple ranges ────────────────────────────────────────────────
+
+    #[test]
+    fn pagelabels_multiple_ranges() {
+        // /Nums [0 << /S /D >> 5 << /S /R /P "Appx" /St 1 >> 10 << /S /a >>]
+        let mut pdf = load_one_page_pdf();
+
+        let mut label0 = Dictionary::new();
+        label0.insert("S", Object::Name(b"D".to_vec()));
+
+        let mut label5 = Dictionary::new();
+        label5.insert("S", Object::Name(b"R".to_vec()));
+        label5.insert("P", Object::String(b"Appx".to_vec()));
+        label5.insert("St", Object::Integer(1));
+
+        let mut label10 = Dictionary::new();
+        label10.insert("S", Object::Name(b"a".to_vec()));
+
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Dictionary(label0),
+                    Object::Integer(5),
+                    Object::Dictionary(label5),
+                    Object::Integer(10),
+                    Object::Dictionary(label10),
+                ]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let JsonValue::Array(arr) = &result else {
+            panic!("expected Array");
+        };
+        assert_eq!(arr.len(), 3, "expected 3 entries");
+
+        // Check indices
+        let get_index = |i: usize| {
+            let JsonValue::Object(e) = &arr[i] else {
+                panic!()
+            };
+            match &e[0].1 {
+                JsonValue::Integer(n) => *n,
+                _ => panic!(),
+            }
+        };
+        assert_eq!(get_index(0), 0);
+        assert_eq!(get_index(1), 5);
+        assert_eq!(get_index(2), 10);
+
+        // Check styles
+        let get_style = |i: usize| {
+            let JsonValue::Object(e) = &arr[i] else {
+                panic!()
+            };
+            let JsonValue::Object(lp) = &e[1].1 else {
+                panic!()
+            };
+            lp[2].1.clone()
+        };
+        assert_eq!(get_style(0), JsonValue::String("D".to_string()));
+        assert_eq!(get_style(1), JsonValue::String("R".to_string()));
+        assert_eq!(get_style(2), JsonValue::String("a".to_string()));
+
+        // Check prefix on entry 1
+        let JsonValue::Object(e1) = &arr[1] else {
+            panic!()
+        };
+        let JsonValue::Object(lp1) = &e1[1].1 else {
+            panic!()
+        };
+        assert_eq!(lp1[1].1, JsonValue::String("Appx".to_string()));
+    }
+
+    // ── 39. /S absent → style: null ──────────────────────────────────────────
+
+    #[test]
+    fn pagelabels_no_style_gives_null() {
+        // Label dict with only /P — no /S → style must be null
+        let mut pdf = load_one_page_pdf();
+
+        let mut label = Dictionary::new();
+        label.insert("P", Object::String(b"App".to_vec()));
+
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let JsonValue::Array(arr) = &result else {
+            panic!("expected Array");
+        };
+        assert_eq!(arr.len(), 1);
+        let JsonValue::Object(entry) = &arr[0] else {
+            panic!()
+        };
+        let JsonValue::Object(label_pairs) = &entry[1].1 else {
+            panic!()
+        };
+        assert_eq!(label_pairs[2].0, "style");
+        assert_eq!(
+            label_pairs[2].1,
+            JsonValue::Null,
+            "style must be null when /S is absent"
+        );
+    }
+
+    // ── 40. /Kids subtree walk ────────────────────────────────────────────────
+
+    #[test]
+    fn pagelabels_kids_subtree_walk() {
+        // /PageLabels << /Kids [99 0 R] >>  where 99 0 obj << /Nums [0 << /S /r >>] >>
+        let mut pdf = load_one_page_pdf();
+
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name(b"r".to_vec()));
+
+        let mut subtree = Dictionary::new();
+        subtree.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
+        );
+
+        let subtree_ref = crate::ObjectRef::new(99, 0);
+        pdf.set_object(subtree_ref, Object::Dictionary(subtree));
+
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert("Kids", Object::Array(vec![Object::Reference(subtree_ref)]));
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let JsonValue::Array(arr) = &result else {
+            panic!("expected Array");
+        };
+        assert_eq!(arr.len(), 1, "expected 1 entry from /Kids walk");
+        let JsonValue::Object(entry) = &arr[0] else {
+            panic!()
+        };
+        assert_eq!(entry[0].1, JsonValue::Integer(0));
+        let JsonValue::Object(lp) = &entry[1].1 else {
+            panic!()
+        };
+        assert_eq!(lp[2].1, JsonValue::String("r".to_string()));
+    }
+
+    // ── 41. All compat fixtures without /PageLabels yield empty array ─────────
+
+    #[test]
+    fn pagelabels_compat_fixtures_all_empty() {
+        let fixtures = ["one-page.pdf", "three-page.pdf", "attachment-two-page.pdf"];
+        for name in fixtures {
+            let mut pdf = load_fixture_pdf(name);
+            let result = build_pagelabels_section(&mut pdf)
+                .unwrap_or_else(|e| panic!("{name}: build_pagelabels_section failed: {e:?}"));
+            assert_eq!(
+                result,
+                JsonValue::Array(vec![]),
+                "{name}: expected empty pagelabels array"
+            );
+        }
     }
 }
