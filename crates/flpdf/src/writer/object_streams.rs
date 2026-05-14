@@ -1,12 +1,14 @@
 //! ObjStm eligibility predicate — decides whether an indirect object may be
 //! stored inside an object stream (PDF 1.5+, ISO 32000-1 §7.5.7).
 //! Also provides the packing planner that groups eligible objects into batches.
+//! Provides the body emitter that serialises a list of objects into an ObjStm
+//! payload (§7.5.7 body format; compression/dict wrapping is done in 5.4).
 
 // These items are consumed by the upcoming ObjStm writer; suppress dead_code
 // until that code lands.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::object::{Dictionary, Object, ObjectRef};
@@ -277,6 +279,94 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     }
 
     Ok(PackingPlan { batches })
+}
+
+// ── ObjStm body emitter ───────────────────────────────────────────────────────
+
+/// The serialised body of an ObjStm (ISO 32000-1 §7.5.7).
+///
+/// Contains the raw pair table concatenated with the objects section.
+/// Compression (FlateDecode) and the stream dictionary wrapping are handled
+/// by a subsequent step (5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjStmBody {
+    /// Raw concatenation: pair table || objects section.  To be deflate-wrapped by 5.4.
+    pub bytes: Vec<u8>,
+    /// Offset within `bytes` where the first object body starts.  Matches /First.
+    pub first_offset: usize,
+    /// Number of members.  Matches /N.
+    pub n_members: usize,
+}
+
+/// Serialise a list of pre-resolved `(ObjectRef, Object)` pairs into an ObjStm
+/// body following ISO 32000-1 §7.5.7.
+///
+/// This inner function does the real work without touching a `Pdf` reader; it
+/// exists primarily to make unit-testing Pdf-free.
+pub(crate) fn emit_objstm_body_from_resolved(
+    members: &[(ObjectRef, Object)],
+) -> crate::Result<ObjStmBody> {
+    if members.is_empty() {
+        return Ok(ObjStmBody {
+            bytes: vec![],
+            first_offset: 0,
+            n_members: 0,
+        });
+    }
+
+    // Duplicate detection — fail fast before producing any output.
+    let mut seen: HashSet<u32> = HashSet::with_capacity(members.len());
+    for (obj_ref, _) in members {
+        if !seen.insert(obj_ref.number) {
+            return Err(crate::Error::Unsupported(format!(
+                "duplicate member in ObjStm batch {}",
+                obj_ref.number
+            )));
+        }
+    }
+
+    // Build the objects section and record per-member offsets.
+    let mut objects_section: Vec<u8> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(members.len());
+
+    for (_, obj) in members {
+        offsets.push(objects_section.len());
+        obj.write_pdf(&mut objects_section);
+        // Append exactly one newline after each object body (write_pdf has no trailing LF).
+        objects_section.push(b'\n');
+    }
+
+    // Build the pair table: "<number> <offset>\n" for each member.
+    let mut pair_table: Vec<u8> = Vec::new();
+    for ((obj_ref, _), offset) in members.iter().zip(offsets.iter()) {
+        let entry = format!("{} {}\n", obj_ref.number, offset);
+        pair_table.extend_from_slice(entry.as_bytes());
+    }
+
+    let first_offset = pair_table.len();
+
+    // Concatenate: pair table || objects section.
+    let mut bytes = pair_table;
+    bytes.extend_from_slice(&objects_section);
+
+    Ok(ObjStmBody {
+        bytes,
+        first_offset,
+        n_members: members.len(),
+    })
+}
+
+/// Resolve each member reference from `pdf` then call
+/// [`emit_objstm_body_from_resolved`].
+pub(crate) fn emit_objstm_body<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+    members: &[ObjectRef],
+) -> crate::Result<ObjStmBody> {
+    let resolved: crate::Result<Vec<(ObjectRef, Object)>> = members
+        .iter()
+        .map(|&r| pdf.resolve(r).map(|obj| (r, obj)))
+        .collect();
+    emit_objstm_body_from_resolved(&resolved?)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -631,5 +721,145 @@ mod tests {
         );
         assert_eq!(batch[0], ObjectRef::new(2, 0));
         assert_eq!(batch[1], ObjectRef::new(4, 0));
+    }
+
+    // ── ObjStm body emitter tests ────────────────────────────────────────────
+
+    #[test]
+    fn emit_objstm_body_empty_batch_returns_empty() {
+        let body = emit_objstm_body_from_resolved(&[]).unwrap();
+        assert_eq!(body.bytes, Vec::<u8>::new());
+        assert_eq!(body.first_offset, 0);
+        assert_eq!(body.n_members, 0);
+    }
+
+    #[test]
+    fn emit_objstm_body_single_member_layout() {
+        let obj_ref = ObjectRef::new(12, 0);
+        let obj = Object::Integer(42);
+
+        // Serialize expected object bytes manually.
+        let mut expected_obj_bytes = Vec::new();
+        obj.write_pdf(&mut expected_obj_bytes);
+        // write_pdf has no trailing LF; emitter appends one.
+        expected_obj_bytes.push(b'\n');
+
+        let body = emit_objstm_body_from_resolved(&[(obj_ref, obj)]).unwrap();
+
+        // Pair table: "12 0\n"
+        let expected_pair_table = b"12 0\n";
+        assert_eq!(
+            &body.bytes[..expected_pair_table.len()],
+            expected_pair_table,
+            "pair table mismatch"
+        );
+
+        // first_offset matches pair table length.
+        assert_eq!(body.first_offset, expected_pair_table.len());
+
+        // Objects section starts at first_offset.
+        let objects_section = &body.bytes[body.first_offset..];
+        assert_eq!(
+            objects_section, expected_obj_bytes,
+            "objects section mismatch"
+        );
+
+        assert_eq!(body.n_members, 1);
+    }
+
+    #[test]
+    fn emit_objstm_body_multiple_members_offsets_are_correct() {
+        let members: Vec<(ObjectRef, Object)> = vec![
+            (ObjectRef::new(5, 0), Object::Integer(100)),
+            (ObjectRef::new(7, 0), Object::Boolean(true)),
+            (ObjectRef::new(9, 0), Object::Null),
+        ];
+
+        let body = emit_objstm_body_from_resolved(&members).unwrap();
+
+        assert_eq!(body.n_members, 3);
+
+        // Parse the pair table to get reported offsets.
+        let pair_table_bytes = &body.bytes[..body.first_offset];
+        let pair_table_str = std::str::from_utf8(pair_table_bytes).unwrap();
+        let mut reported_offsets: Vec<usize> = Vec::new();
+        for line in pair_table_str.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(
+                parts.len(),
+                2,
+                "pair table line must have 2 tokens: {line:?}"
+            );
+            let offset: usize = parts[1].parse().unwrap();
+            reported_offsets.push(offset);
+        }
+        assert_eq!(reported_offsets.len(), 3);
+
+        // Verify that each reported offset matches the actual start position
+        // of each serialized object in the objects section.
+        let objects_section = &body.bytes[body.first_offset..];
+        for (i, (_, obj)) in members.iter().enumerate() {
+            let mut expected_obj = Vec::new();
+            obj.write_pdf(&mut expected_obj);
+            let start = reported_offsets[i];
+            let end = start + expected_obj.len();
+            assert!(
+                end <= objects_section.len(),
+                "object {i} offset {start} + len {} out of range",
+                expected_obj.len()
+            );
+            assert_eq!(
+                &objects_section[start..end],
+                expected_obj.as_slice(),
+                "object {i} body mismatch at offset {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_objstm_body_rejects_duplicate_member_numbers() {
+        let members: Vec<(ObjectRef, Object)> = vec![
+            (ObjectRef::new(5, 0), Object::Integer(1)),
+            (ObjectRef::new(5, 0), Object::Integer(2)),
+        ];
+        let result = emit_objstm_body_from_resolved(&members);
+        assert!(result.is_err(), "expected Err for duplicate member");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate member") || err_msg.contains("5"),
+            "error message should mention duplicate/number: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn emit_objstm_body_round_trip_with_reader() {
+        // Build a body with three integer objects and parse each back via
+        // parse_object_stream_entry (no Pdf construction needed — no /Filter).
+        let members: Vec<(ObjectRef, Object)> = vec![
+            (ObjectRef::new(10, 0), Object::Integer(111)),
+            (ObjectRef::new(20, 0), Object::Integer(222)),
+            (ObjectRef::new(30, 0), Object::Integer(333)),
+        ];
+
+        let body = emit_objstm_body_from_resolved(&members).unwrap();
+
+        // Construct a synthetic Stream with no /Filter (data is already plain).
+        let mut dict = crate::object::Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        dict.insert("N", Object::Integer(body.n_members as i64));
+        dict.insert("First", Object::Integer(body.first_offset as i64));
+        dict.insert("Length", Object::Integer(body.bytes.len() as i64));
+        let stream = crate::Stream {
+            dict,
+            data: body.bytes.clone(),
+        };
+
+        for (index, (_, expected_obj)) in members.iter().enumerate() {
+            let parsed = crate::reader::parse_object_stream_entry(&stream, index as u32).unwrap();
+            assert_eq!(
+                &parsed, expected_obj,
+                "round-trip mismatch at index {index}"
+            );
+        }
     }
 }
