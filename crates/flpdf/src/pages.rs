@@ -301,8 +301,7 @@ mod tests {
 
         let off3 = pdf.len() as u64;
         let page_obj = if contents_entry.is_empty() {
-            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
-                .to_string()
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_string()
         } else {
             format!(
                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {contents_entry} >>\nendobj\n"
@@ -378,15 +377,33 @@ mod tests {
         out
     }
 
-    /// Build raw stream object bytes with a FlateDecode filter.
-    fn flate_stream_object_bytes(num: u32, body: &[u8]) -> Vec<u8> {
-        let mut dict = Dictionary::new();
-        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        let encoded = encode_stream_data(&dict, body).unwrap();
+    /// Build raw stream object bytes with a chained [/FlateDecode /ASCII85Decode] filter array.
+    ///
+    /// PDF semantics: Filter = [/FlateDecode /ASCII85Decode] means the *decode* pipeline
+    /// applies filters left-to-right, so during decode the reader first FlateDecode-decompresses,
+    /// then ASCII85Decode-decodes.  To produce bytes that round-trip correctly we therefore
+    /// *encode* in the reverse order: first ASCII85Decode-encode, then FlateDecode-compress.
+    /// We encode each step manually (single-name dicts) rather than using encode_stream_data
+    /// with an Array dict, because encode_stream_data applies Array filters in the same
+    /// left-to-right order as decode (which is the inverse of what we need here).
+    ///
+    /// This exercises the Array branch in decode_stream_data_with_filters_and_crypt
+    /// (filters.rs L78-96).
+    fn chained_filter_stream_object_bytes(num: u32, body: &[u8]) -> Vec<u8> {
+        // Step 1: ASCII85Decode-encode (encode is the inverse of ASCII85Decode decode)
+        let mut a85_dict = Dictionary::new();
+        a85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        let after_a85 = encode_stream_data(&a85_dict, body).unwrap();
+
+        // Step 2: FlateDecode-compress
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = encode_stream_data(&flate_dict, &after_a85).unwrap();
+
         let mut out = Vec::new();
         out.extend_from_slice(
             format!(
-                "{num} 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+                "{num} 0 obj\n<< /Filter [ /FlateDecode /ASCII85Decode ] /Length {} >>\nstream\n",
                 encoded.len()
             )
             .as_bytes(),
@@ -415,8 +432,7 @@ mod tests {
 
         let off3 = pdf.len() as u64;
         let page_obj = if contents_entry.is_empty() {
-            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
-                .to_string()
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_string()
         } else {
             format!(
                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {contents_entry} >>\nendobj\n"
@@ -507,13 +523,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: /Contents stream with chained FlateDecode filter
+    // Test: /Contents stream with chained [/FlateDecode /ASCII85Decode] filter array
     // -----------------------------------------------------------------------
 
     #[test]
     fn page_content_bytes_applies_chained_filters() {
+        // This stream uses Filter = [/FlateDecode /ASCII85Decode], exercising the Array branch
+        // in decode_stream_data (not the single-Name branch).
         let body = b"q 0.5 g 100 100 300 300 re f Q";
-        let stream_bytes = flate_stream_object_bytes(4, body);
+        let stream_bytes = chained_filter_stream_object_bytes(4, body);
         let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, stream_bytes)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let page_ref = ObjectRef::new(3, 0);
