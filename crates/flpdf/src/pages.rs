@@ -6,7 +6,7 @@
 //! depth limit, since malformed PDFs occasionally embed self-referential page trees.
 
 use crate::filters::decode_stream_data;
-use crate::{Error, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -217,6 +217,95 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Dictionary(_) => "dictionary",
         Object::Stream(_) => "stream",
         Object::Reference(_) => "reference",
+    }
+}
+
+/// Return the `/Resources` dictionary for a page, walking up the `/Parent` chain
+/// until one is found. Uses [`DEFAULT_MAX_PAGE_TREE_DEPTH`] as the depth limit.
+///
+/// Inheritable attributes in PDF are defined in ISO 32000-1 §7.7.3.4. `/Resources`
+/// is one of them: if a `Page` node does not carry its own `/Resources`, the nearest
+/// ancestor `Pages` node that has one should be used.
+///
+/// Returns `Ok(None)` when no node in the chain carries a `/Resources` entry.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if the depth limit is exceeded (indicates a malformed or
+///   extremely deeply nested document).
+/// - Any [`Error`] propagated from [`Pdf::resolve`].
+pub fn resolve_inherited_resources<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Option<Dictionary>> {
+    resolve_inherited_resources_with_max_depth(pdf, page_ref, DEFAULT_MAX_PAGE_TREE_DEPTH)
+}
+
+/// Like [`resolve_inherited_resources`] but with a caller-supplied recursion limit.
+pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    max_depth: usize,
+) -> Result<Option<Dictionary>> {
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = page_ref;
+    let mut depth: usize = 0;
+
+    loop {
+        if depth >= max_depth {
+            return Err(Error::Unsupported(format!(
+                "page tree depth exceeds maximum of {max_depth} at {current}"
+            )));
+        }
+
+        // Cycle guard: if we have already visited this node, stop.
+        if !seen.insert(current) {
+            return Ok(None);
+        }
+
+        let node_obj = pdf.resolve(current)?;
+        let Object::Dictionary(dict) = node_obj else {
+            // Not a dictionary — cannot walk further.
+            return Ok(None);
+        };
+
+        // Check for /Resources on this node.
+        if let Some(resources_val) = dict.get("Resources").cloned() {
+            match resources_val {
+                Object::Dictionary(d) => return Ok(Some(d)),
+                Object::Reference(r) => {
+                    let resolved = pdf.resolve(r)?;
+                    match resolved {
+                        Object::Dictionary(d) => return Ok(Some(d)),
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "/Resources reference {r} on node {current} does not resolve to a dictionary"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "/Resources entry on node {current} has unexpected type"
+                    )));
+                }
+            }
+        }
+
+        // No /Resources here — try the /Parent.
+        let parent_val = match dict.get("Parent").cloned() {
+            Some(v) => v,
+            None => return Ok(None), // reached the root without finding /Resources
+        };
+
+        match parent_val {
+            Object::Reference(r) => {
+                current = r;
+                depth += 1;
+            }
+            // Direct dictionary as /Parent is non-standard; treat as absent.
+            _ => return Ok(None),
+        }
     }
 }
 
@@ -576,5 +665,202 @@ mod tests {
 
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert_eq!(content, content_body);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for resolve_inherited_resources tests
+    // -----------------------------------------------------------------------
+
+    /// Build a PDF where the Page (3 0 R) has /Resources directly as a Dictionary.
+    ///
+    /// Object layout:
+    ///   1 0 R  Catalog
+    ///   2 0 R  Pages  (no /Resources)
+    ///   3 0 R  Page   (/Resources << /Font << >> >>)
+    fn build_pdf_page_has_direct_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << >> >> >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Build a PDF where:
+    ///   1 0 R  Catalog
+    ///   2 0 R  Pages  (/Resources 4 0 R — indirect reference)
+    ///   3 0 R  Page   (no /Resources, /Parent 2 0 R)
+    ///   4 0 R  Resources dictionary (indirect object)
+    fn build_pdf_resources_inherited_via_indirect_ref() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        // The actual Resources dictionary as an indirect object
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 << /Type /Font >> >> >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Build a PDF where no node has /Resources at all.
+    ///
+    /// Object layout:
+    ///   1 0 R  Catalog
+    ///   2 0 R  Pages  (no /Resources)
+    ///   3 0 R  Page   (no /Resources, /Parent 2 0 R)
+    fn build_pdf_no_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (a): Page itself has /Resources as a direct Dictionary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_inherited_resources_page_has_direct_dict() {
+        let bytes = build_pdf_page_has_direct_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let page_ref = ObjectRef::new(3, 0);
+        let result = resolve_inherited_resources(&mut pdf, page_ref).expect("should succeed");
+        let dict = result.expect("should find /Resources");
+        // The page's /Resources has a /Font key
+        assert!(
+            dict.get("Font").is_some(),
+            "expected /Font key in resolved Resources dict"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (b): Page inherits /Resources from parent via an indirect Reference
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_inherited_resources_from_parent_via_indirect_ref() {
+        let bytes = build_pdf_resources_inherited_via_indirect_ref();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        // Page (3 0 R) has no /Resources — it must be inherited from Pages (2 0 R)
+        // which references Resources dict (4 0 R) via an indirect reference.
+        let page_ref = ObjectRef::new(3, 0);
+        let result = resolve_inherited_resources(&mut pdf, page_ref).expect("should succeed");
+        let dict = result.expect("should find inherited /Resources via indirect ref");
+        // The inherited Resources (4 0 R) has a /Font key
+        assert!(
+            dict.get("Font").is_some(),
+            "expected /Font key in inherited Resources dict"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (c): No /Resources anywhere → Ok(None)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_inherited_resources_none_when_absent() {
+        let bytes = build_pdf_no_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let page_ref = ObjectRef::new(3, 0);
+        let result =
+            resolve_inherited_resources(&mut pdf, page_ref).expect("should succeed with Ok(None)");
+        assert!(
+            result.is_none(),
+            "expected Ok(None) when no /Resources anywhere in the parent chain"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test (d): Circular /Parent reference → does not crash; returns Err or Ok(None)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_inherited_resources_cycle_does_not_crash() {
+        // We build a PDF via set_object to introduce a cycle: Page 3 → Pages 2 → Page 3.
+        // Use the no-resources PDF as a base, then patch /Parent of Pages (2 0 R) to point
+        // back to Page (3 0 R), creating a cycle.
+        let bytes = build_pdf_no_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        // Patch Pages node (2 0 R) to have /Parent pointing back to Page (3 0 R)
+        let mut pages_dict = Dictionary::new();
+        pages_dict.insert("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
+        );
+        pages_dict.insert("Count", Object::Integer(1));
+        pages_dict.insert("Parent", Object::Reference(ObjectRef::new(3, 0))); // cycle!
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages_dict));
+
+        let page_ref = ObjectRef::new(3, 0);
+        // Must not panic or loop forever; either Ok(None) or Err(Unsupported) is acceptable.
+        let result = resolve_inherited_resources(&mut pdf, page_ref);
+        match result {
+            Ok(None) => {} // cycle detected via BTreeSet — acceptable
+            Ok(Some(_)) => panic!("should not find resources in a cycle-only graph"),
+            Err(Error::Unsupported(_)) => {} // depth exceeded or explicit cycle error — acceptable
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
     }
 }
