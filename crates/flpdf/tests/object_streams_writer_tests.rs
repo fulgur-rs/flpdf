@@ -1,9 +1,10 @@
 //! Integration tests for write_pdf_full_rewrite + ObjStm packing planner.
 //!
-//! Covers the four cases from flpdf-9hc.5.6 design:
+//! Covers cases from flpdf-9hc.5.6 design:
 //!   a. Disable mode emits no ObjStm
 //!   c. Generate mode packs eligible objects
-//!   d. Error when ObjStm requested on xref-table-form input
+//!   d. Generate mode on xref-table-form input upgrades the output to an
+//!      xref stream (flpdf-9hc.5.7)
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -289,10 +290,10 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     }
 }
 
-// ── d. Error when ObjStm requested on xref-table-form input ──────────────────
+// ── d. Generate mode on xref-table input upgrades to xref stream (5.7) ───────
 
 #[test]
-fn error_when_objstm_requested_on_xref_table_form() {
+fn generate_mode_on_xref_table_form_upgrades_to_xref_stream() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -301,15 +302,60 @@ fn error_when_objstm_requested_on_xref_table_form() {
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    let result = write_pdf_with_options(&mut pdf, &mut output, &options);
+    write_pdf_with_options(&mut pdf, &mut output, &options)
+        .expect("Generate mode on xref-table input must upgrade silently to xref stream");
 
+    // The output must be re-readable.
+    check_reader(Cursor::new(output.clone())).expect("rewritten output must validate");
+    let mut roundtrip = Pdf::open(Cursor::new(output.clone())).unwrap();
+
+    let mut found_objstm = false;
+    for r in roundtrip.object_refs() {
+        if let Object::Stream(s) = roundtrip.resolve(r).unwrap() {
+            if let Some(Object::Name(n)) = s.dict.get("Type") {
+                if n.as_slice() == b"ObjStm" {
+                    found_objstm = true;
+                    break;
+                }
+            }
+        }
+    }
     assert!(
-        result.is_err(),
-        "Generate mode on xref-table input must return Err, got Ok"
+        found_objstm,
+        "Generate mode must emit at least one ObjStm container"
     );
-    let err_msg = result.unwrap_err().to_string();
+
+    // The output header must be PDF 1.5 or later (xref streams require it).
+    let header = &output[..16];
+    let header_str = std::str::from_utf8(&header[..8]).unwrap();
     assert!(
-        err_msg.contains("5.7") || err_msg.contains("xref stream"),
-        "Error message should mention 5.7 or xref stream; got: {err_msg}"
+        header_str.starts_with("%PDF-1.")
+            && header_str
+                .chars()
+                .nth(7)
+                .and_then(|c| c.to_digit(10))
+                .is_some_and(|d| d >= 5),
+        "header must be bumped to >=1.5 for xref stream; got: {header_str:?}"
+    );
+}
+
+#[test]
+fn disable_mode_on_xref_table_form_preserves_classic_table() {
+    let source = build_xref_table_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Disable;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // The output must contain a classic "xref" keyword (table form), not just
+    // a stream-form xref.  The keyword sits on its own line preceded by LF.
+    let needle = b"\nxref\n";
+    assert!(
+        output.windows(needle.len()).any(|w| w == needle),
+        "Disable mode on xref-table input must keep classic xref table form"
     );
 }

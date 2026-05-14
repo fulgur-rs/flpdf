@@ -1053,20 +1053,32 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     };
 
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
-    // PDF 1.5 introduced xref streams.  If we preserve the source's xref-stream
-    // form but write a `%PDF-1.4` (or earlier) header, the result is
-    // spec-inconsistent and some readers reject it.  Bump the header floor to
-    // 1.5 whenever the chosen xref form is `Stream`, overriding even an
-    // explicit `--force-version` lower than 1.5.
-    if matches!(pdf.last_xref_form(), XrefForm::Stream)
-        && parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
-    {
-        version = "1.5".to_string();
-    }
 
     // ── Step 1: run the ObjStm planner ───────────────────────────────────────
     let planner_config = object_streams::planner_config_from_options(options);
     let plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+
+    // Xref form selection: ObjStm-resident objects need type-2 xref entries,
+    // which can only live in xref streams.  When the planner emits any batch
+    // we therefore force-upgrade to `Stream` even if the source used a
+    // classic xref table.  An empty plan respects the source form, so a
+    // Disable-mode rewrite of a Table-form input still produces a classic
+    // xref table.
+    let effective_xref_form = if plan.batches.is_empty() {
+        pdf.last_xref_form()
+    } else {
+        XrefForm::Stream
+    };
+
+    // PDF 1.5 introduced xref streams.  Bump the header floor to 1.5 whenever
+    // the chosen xref form is `Stream`, overriding even an explicit
+    // `--force-version` lower than 1.5.  This applies both when the source
+    // was already a stream and when we just upgraded for ObjStm output.
+    if matches!(effective_xref_form, XrefForm::Stream)
+        && parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
+    {
+        version = "1.5".to_string();
+    }
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     let mut object_refs = pdf.object_refs();
@@ -1096,13 +1108,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         for (idx_in_batch, &member_ref) in batch.iter().enumerate() {
             member_to_batch.insert(member_ref, (container_num, idx_in_batch as u32));
         }
-    }
-
-    // Early guard: Table form + non-empty batches is not yet supported (5.7).
-    if matches!(pdf.last_xref_form(), XrefForm::Table) && !plan.batches.is_empty() {
-        return Err(crate::Error::Unsupported(
-            "ObjStm output requires xref stream — wait for flpdf-9hc.5.7".to_string(),
-        ));
     }
 
     let mut bytes = Vec::new();
@@ -1191,7 +1196,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             crate::Error::Unsupported("full-rewrite: object count does not fit in u32".to_string())
         })?;
 
-    match pdf.last_xref_form() {
+    match effective_xref_form {
         XrefForm::Table => {
             // Classic xref table.
             bytes.extend_from_slice(format!("xref\n0 {}\n", object_count).as_bytes());
