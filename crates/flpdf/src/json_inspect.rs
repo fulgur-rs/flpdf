@@ -788,6 +788,58 @@ pub fn build_pagelabels_section<R: Read + Seek>(
     Ok(JsonValue::Array(result))
 }
 
+// ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
+
+/// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
+/// (`version`, `parameters`) with every section that flpdf currently
+/// implements.
+///
+/// As of flpdf-9hc.11.5 this is: `version`, `parameters`, `pages`,
+/// `pagelabels`, `qpdf`. The remaining qpdf v2 sections (`acroform`,
+/// `attachments`, `encrypt`, `outlines`) will be inserted here as the
+/// respective subtasks (flpdf-9hc.11.6 / .7 / .8 / .9) land.
+///
+/// Key order matches qpdf v2 output: top-level keys are emitted in the
+/// fixed order shown in qpdf's `--json=2` output, not alphabetical.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any section builder fails.
+pub fn build_qpdf_json_v2<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+) -> Result<JsonValue, ConvertError> {
+    let mut pairs = match build_envelope(decode_level) {
+        JsonValue::Object(p) => p,
+        _ => unreachable!("build_envelope always returns an Object"),
+    };
+
+    let pages = build_pages_section(pdf)?;
+    pairs.push(("pages".to_string(), pages));
+
+    let pagelabels = build_pagelabels_section(pdf)?;
+    pairs.push(("pagelabels".to_string(), pagelabels));
+
+    // qpdf metadata: maxobjectid comes from the highest live object number;
+    // pushedinheritedpageresources / calledgetallpages mirror qpdf's defaults.
+    let max_object_id = pdf
+        .live_object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0);
+    let qpdf_metadata = QpdfMetadata {
+        pdf_version: pdf.version().to_string(),
+        max_object_id,
+        pushed_inherited_page_resources: false,
+        called_get_all_pages: true,
+    };
+    let qpdf = build_qpdf_key(pdf, qpdf_metadata)?;
+    pairs.push(("qpdf".to_string(), qpdf));
+
+    Ok(JsonValue::Object(pairs))
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1136,6 +1188,14 @@ mod tests {
         let bytes = std::fs::read(&fixture)
             .unwrap_or_else(|e| panic!("one-page.pdf not found at {}: {e}", fixture.display()));
         crate::Pdf::open_mem_owned(bytes).expect("failed to open one-page.pdf")
+    }
+
+    fn load_three_page_pdf() -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../../tests/fixtures/compat/three-page.pdf");
+        let bytes = std::fs::read(&fixture)
+            .unwrap_or_else(|e| panic!("three-page.pdf not found at {}: {e}", fixture.display()));
+        crate::Pdf::open_mem_owned(bytes).expect("failed to open three-page.pdf")
     }
 
     // ── 17. build_qpdf_key returns a 2-element array ──────────────────────────
@@ -1948,5 +2008,93 @@ mod tests {
                 "{name}: expected empty pagelabels array"
             );
         }
+    }
+
+    // ── build_qpdf_json_v2 (top-level composite output) ───────────────────────
+
+    #[test]
+    fn build_qpdf_json_v2_has_expected_top_level_keys_in_order() {
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object at top level");
+        };
+        // qpdf-style fixed order: version, parameters, pages, pagelabels, qpdf
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["version", "parameters", "pages", "pagelabels", "qpdf"]
+        );
+    }
+
+    #[test]
+    fn build_qpdf_json_v2_includes_pagelabels_section() {
+        // Regression for CodeRabbit's flpdf-9hc.11.5 finding: the
+        // pagelabels builder was added but never wired into the top-level
+        // JSON, so users would never see the section. This test fails if
+        // the wiring is dropped again.
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object at top level");
+        };
+        let pagelabels = pairs
+            .iter()
+            .find(|(k, _)| k == "pagelabels")
+            .map(|(_, v)| v)
+            .expect("pagelabels key must be present in the composite output");
+        assert!(
+            matches!(pagelabels, JsonValue::Array(_)),
+            "pagelabels must be an Array"
+        );
+    }
+
+    #[test]
+    fn build_qpdf_json_v2_pages_count_matches_fixture() {
+        let mut pdf = load_three_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object at top level");
+        };
+        let pages = pairs
+            .iter()
+            .find(|(k, _)| k == "pages")
+            .map(|(_, v)| v)
+            .expect("pages key missing");
+        let JsonValue::Array(page_entries) = pages else {
+            panic!("pages must be Array");
+        };
+        assert_eq!(
+            page_entries.len(),
+            3,
+            "three-page.pdf must produce 3 page entries"
+        );
+    }
+
+    #[test]
+    fn build_qpdf_json_v2_qpdf_metadata_uses_actual_pdf_version() {
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object");
+        };
+        let qpdf = pairs.iter().find(|(k, _)| k == "qpdf").unwrap().1.clone();
+        let JsonValue::Array(qpdf_arr) = qpdf else {
+            panic!("qpdf must be Array");
+        };
+        let JsonValue::Object(meta_pairs) = &qpdf_arr[0] else {
+            panic!("qpdf[0] must be Object");
+        };
+        let pdf_version = meta_pairs
+            .iter()
+            .find(|(k, _)| k == "pdfversion")
+            .map(|(_, v)| v)
+            .expect("pdfversion missing");
+        // one-page.pdf header is "%PDF-1.3".
+        assert_eq!(*pdf_version, JsonValue::String("1.3".to_string()));
     }
 }
