@@ -108,8 +108,10 @@ fn encode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) 
             apply_single_filter_encode(filter_name, stream_data).map_err(Error::Unsupported)
         }
         Some(Object::Array(filters)) => {
+            // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
+            // order, so encoding must apply them in reverse for round-tripping.
             let mut encoded = stream_data.to_vec();
-            for filter in filters {
+            for filter in filters.iter().rev() {
                 let Object::Name(filter_name) = filter else {
                     return Err(Error::Unsupported(
                         "unsupported stream filter type: expected name".to_string(),
@@ -662,6 +664,60 @@ mod tests {
         assert!(
             msg.contains("RunLengthDecode"),
             "error message should contain 'RunLengthDecode', got: {msg}"
+        );
+    }
+
+    // ----- Array filter chain round-trip tests (regression for flpdf-fh8) -----
+    //
+    // Per ISO 32000-1 §7.4.2, the /Filter array names the filters in the order
+    // they must be applied to *decode* the stream. The encoder therefore has
+    // to apply them in reverse so that `decode(encode(x))` round-trips for any
+    // multi-element filter chain.
+
+    fn array_filter_dict(filters: &[&[u8]]) -> Dictionary {
+        let mut dict = Dictionary::new();
+        let names: Vec<Object> = filters.iter().map(|f| Object::Name(f.to_vec())).collect();
+        dict.insert("Filter", Object::Array(names));
+        dict
+    }
+
+    #[test]
+    fn encode_stream_data_array_chain_round_trips_ascii85_then_flate() {
+        // Decoder order: ASCII85Decode, then FlateDecode.
+        // Encoder must therefore apply FlateDecode first, then ASCII85Decode.
+        let dict = array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]);
+        let plaintext = b"Round-trip me through ASCII85 over Flate, please!";
+
+        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn encode_stream_data_array_chain_round_trips_ascii_hex_then_flate() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"FlateDecode"]);
+        let plaintext: Vec<u8> = (0u8..=200u8).collect();
+
+        let encoded = encode_stream_data(&dict, &plaintext).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, plaintext);
+    }
+
+    #[test]
+    fn encode_stream_data_array_chain_single_filter_matches_name_form() {
+        // /Filter [/FlateDecode] should behave identically to /Filter /FlateDecode.
+        let array_dict = array_filter_dict(&[b"FlateDecode"]);
+        let name_dict = flate_dict();
+        let plaintext = b"single-filter array form";
+
+        let encoded_array = encode_stream_data(&array_dict, plaintext).unwrap();
+        let encoded_name = encode_stream_data(&name_dict, plaintext).unwrap();
+
+        assert_eq!(
+            encoded_array, encoded_name,
+            "Array form with one filter should produce the same bytes as the Name form"
         );
     }
 }
