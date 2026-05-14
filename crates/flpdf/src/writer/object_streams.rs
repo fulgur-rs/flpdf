@@ -731,22 +731,29 @@ mod tests {
         assert_eq!(plan.batches.len(), 3);
     }
 
-    /// Build a minimal PDF-1.5 in which one ObjStm has its /Length as an indirect
-    /// reference to a separate integer object (object 5 0 R).
+    /// Verify that an ObjStm whose `/Length` is an indirect reference causes
+    /// `plan_object_streams` to return `Err`.
     ///
-    /// Structure:
+    /// ## Fixture layout
     ///   0          free
     ///   1 0 obj    Catalog  (plain indirect)
-    ///   2 0 obj    Pages    (compressed in ObjStm 3, index 0)
-    ///   3 0 obj    ObjStm   with /Length 5 0 R  (plain indirect)
+    ///   2 0 obj    Pages    (compressed in ObjStm 3, index 1)
+    ///   3 0 obj    ObjStm   with /Length 5 0 R  (plain indirect; parser cannot decode it)
     ///   4 0 obj    XRef stream
-    ///   5 0 obj    Integer (the actual length of the ObjStm data) (plain indirect)
+    ///   5 0 obj    Integer  (the actual length value; serves as /Length target)
     ///
-    /// Note: The parser cannot resolve ObjStm 3 0 because /Length is not a direct
-    /// integer.  `collect_indirect_objstm_length_refs` will therefore return an
-    /// error for this fixture.  The test accepts either outcome:
-    ///   (a) `plan_object_streams` returns `Err` — parser rejects indirect /Length.
-    ///   (b) `plan_object_streams` succeeds and (5,0) is absent from every batch.
+    /// ## What this test verifies
+    ///
+    /// The flpdf stream parser (`stream_from_dict`) requires `/Length` to be a
+    /// direct integer.  When `collect_indirect_objstm_length_refs` iterates
+    /// over all objects and hits ObjStm 3, `pdf.resolve(3 0 R)` calls
+    /// `stream_from_dict`, which errors on the indirect `/Length 5 0 R`.
+    /// That error propagates through `plan_object_streams` via `?`, so the
+    /// function must return `Err`.
+    ///
+    /// The `Ok` branch is kept for forward-compatibility: if the parser gains
+    /// indirect-/Length support in the future, the exclusion rule (object 5 0 R
+    /// must not appear in any batch) should still hold.
     #[test]
     fn planner_excludes_indirect_objstm_length_target() {
         // Build ObjStm payload containing Catalog(1,0) and Pages(2,0).
@@ -811,14 +818,18 @@ mod tests {
         };
         let result = plan_object_streams(&mut pdf, &config);
 
+        // As of 2026-05, stream_from_dict requires /Length to be a direct integer,
+        // so plan_object_streams returns Err for this fixture.  The Err branch is
+        // the expected path.  The Ok branch is kept for forward-compatibility only.
         match result {
             Err(_) => {
-                // Parser cannot resolve the ObjStm with indirect /Length — this is
-                // acceptable: the fixture exposes a known limitation.
+                // Expected: parser rejects indirect /Length, plan_object_streams
+                // returns Err.  This documents the known limitation.
             }
             Ok(plan) => {
-                // If planning succeeded, object (5,0) — the /Length holder — must NOT
-                // appear in any batch.
+                // Forward-compat path: if indirect /Length support lands, the
+                // exclusion rule must still hold — object (5,0) must not appear
+                // in any batch because it is the /Length target of an ObjStm.
                 let holder = ObjectRef::new(5, 0);
                 for (i, batch) in plan.batches.iter().enumerate() {
                     assert!(

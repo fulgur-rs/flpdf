@@ -13,9 +13,9 @@
 //!    (no source ObjStm) gets at least 2 compressed entries, and the Catalog / Pages
 //!    objects resolve correctly from the output.
 //!
-//! 4. **generate eligibility matches qpdf semantically** — both qpdf and flpdf produce
-//!    the same *count* of compressed entries when applying `--object-streams=generate`
-//!    to `one-page.pdf`, confirming parity in the eligibility predicate and planner.
+//! 4. **generate eligibility is complete for both tools** — both qpdf and flpdf compress
+//!    *all* eligible non-stream objects when applying `--object-streams=generate` to
+//!    `one-page.pdf` (no eligible object is left uncompressed in either output).
 //!
 //! When qpdf is not installed:
 //! - **Linux CI** (`CI` env var set, non-Windows): the test panics — qpdf is a hard
@@ -23,7 +23,7 @@
 //! - **Local / Windows CI**: prints a diagnostic and returns early (tests skip).
 
 use assert_cmd::Command as CargoCommand;
-use flpdf::{Object, Pdf};
+use flpdf::{Object, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -366,11 +366,79 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: generate eligibility matches qpdf semantically (count parity)
+// Test 4: generate eligibility is complete for both tools (SET parity)
 // ---------------------------------------------------------------------------
 
+/// Returns the set of object numbers that are uncompressed but would be
+/// eligible for ObjStm placement.
+///
+/// An object is considered eligible iff (on `one-page.pdf`, which has no
+/// Encryption dict or Linearization parameter dict):
+///   - generation == 0 (enforced by the xref — all objects here are gen-0)
+///   - it is NOT a stream
+///   - it is NOT a /Type /ObjStm or /Type /XRef dictionary
+///
+/// This mirrors the `is_eligible_for_objstm` predicate implemented in flpdf,
+/// applied here to a PDF opened with the flpdf public API.
+fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
+
+    // Build set of compressed object numbers from xref.
+    let compressed: BTreeSet<u32> = compressed_object_set(xref);
+
+    let mut uncovered = BTreeSet::new();
+    for record in xref {
+        let num = match record {
+            XrefRecord::Uncompressed { num, .. } => *num,
+            // Already compressed — not our target.
+            _ => continue,
+        };
+        // Resolve the object.
+        let obj_ref = ObjectRef::new(num, 0);
+        let obj = match pdf.resolve(obj_ref) {
+            Ok(o) => o,
+            // If we cannot resolve it, skip (e.g. object 0 free).
+            Err(_) => continue,
+        };
+        // Streams are always ineligible.
+        if matches!(obj, Object::Stream(_)) {
+            continue;
+        }
+        // Check dict /Type for ObjStm / XRef.
+        if let Object::Dictionary(ref d) = obj {
+            let type_bytes = match d.get("Type") {
+                Some(Object::Name(n)) => Some(n.as_slice()),
+                _ => None,
+            };
+            if let Some(t) = type_bytes {
+                if t == b"ObjStm" || t == b"XRef" {
+                    continue;
+                }
+            }
+        }
+        // This object is eligible but uncompressed.
+        if !compressed.contains(&num) {
+            uncovered.insert(num);
+        }
+    }
+    uncovered
+}
+
+/// Test 4: both qpdf and flpdf achieve **complete** coverage — no eligible
+/// object is left uncompressed.
+///
+/// `one-page.pdf` has no Encryption dict or Linearization parameter dict,
+/// so the only ineligible objects are stream objects (page content, ObjStm,
+/// XRef stream) — which are also uncompressed.  Every non-stream
+/// gen-0 object must end up in an ObjStm.
+///
+/// Object numbers differ because qpdf renumbers on generate (ObjStm gets
+/// number 1, members start at 2) while flpdf retains original numbering.
+/// Asserting that both sets of uncovered-eligible objects are empty is
+/// therefore equivalent to the full SET parity requirement in the spec.
 #[test]
-fn generate_eligibility_count_matches_qpdf() {
+fn generate_eligibility_complete_for_both_tools() {
     if skip_if_qpdf_missing() {
         return;
     }
@@ -390,25 +458,44 @@ fn generate_eligibility_count_matches_qpdf() {
     let qpdf_xref = parse_qpdf_show_xref(&run_qpdf_show_xref(&qpdf_out));
     let flpdf_xref = parse_qpdf_show_xref(&run_qpdf_show_xref(&flpdf_out));
 
+    // Both outputs must have at least some compressed entries (basic sanity).
     let qpdf_compressed = compressed_object_set(&qpdf_xref);
     let flpdf_compressed = compressed_object_set(&flpdf_xref);
+    assert!(
+        !qpdf_compressed.is_empty(),
+        "qpdf generate must compress at least one object"
+    );
+    assert!(
+        !flpdf_compressed.is_empty(),
+        "flpdf generate must compress at least one object"
+    );
 
-    // Both tools must compress the same number of objects.
-    // Object numbers differ because qpdf renumbers (ObjStm gets number 1, members start at 2)
-    // while flpdf retains original numbering.  Count equality is the semantic assertion.
+    // Neither tool may leave an eligible non-stream object uncompressed.
+    let qpdf_uncovered = uncovered_eligible_objects(&qpdf_out, &qpdf_xref);
+    let flpdf_uncovered = uncovered_eligible_objects(&flpdf_out, &flpdf_xref);
+
+    assert!(
+        qpdf_uncovered.is_empty(),
+        "qpdf --object-streams=generate left eligible objects uncompressed: {:?}",
+        qpdf_uncovered
+    );
+    assert!(
+        flpdf_uncovered.is_empty(),
+        "flpdf --object-streams=generate left eligible objects uncompressed: {:?}",
+        flpdf_uncovered
+    );
+
+    // Also verify counts are equal (belt-and-suspenders — the completeness
+    // assertions above already imply this for this fixture).
     assert_eq!(
         qpdf_compressed.len(),
         flpdf_compressed.len(),
-        "generate mode: qpdf and flpdf must compress the same NUMBER of objects;\n\
-         qpdf compressed set (count {}): {:?}\n\
-         flpdf compressed set (count {}): {:?}",
+        "generate mode: compressed-object count must agree;\n\
+         qpdf ({} objects): {:?}\n\
+         flpdf ({} objects): {:?}",
         qpdf_compressed.len(),
         qpdf_compressed,
         flpdf_compressed.len(),
         flpdf_compressed
-    );
-    assert!(
-        !qpdf_compressed.is_empty(),
-        "generate mode must compress at least one object"
     );
 }
