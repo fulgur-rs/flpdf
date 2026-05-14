@@ -13,7 +13,7 @@ use crate::{
     Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 /// Lazily parsed PDF document handle.
 ///
@@ -655,6 +655,97 @@ impl<R: Read + Seek> Pdf<R> {
 
         streams.push((stream_ref, stream_object.clone()));
         Ok(())
+    }
+}
+
+impl<'a> Pdf<Cursor<&'a [u8]>> {
+    /// Open a PDF document from a borrowed byte slice without wrapping it in a `Cursor` manually.
+    ///
+    /// This is a zero-copy convenience wrapper around [`Pdf::open`]. The resulting handle
+    /// borrows `bytes` for its lifetime, so it is not `'static` and cannot be moved out of
+    /// the scope that owns the original slice.
+    ///
+    /// For an owned, movable version see [`Pdf::open_mem_owned`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let mut pdf = Pdf::open_mem(&bytes)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem(bytes: &'a [u8]) -> crate::Result<Self> {
+        Self::open(Cursor::new(bytes))
+    }
+
+    /// Open a PDF document from a borrowed byte slice with explicit open options.
+    ///
+    /// Like [`Pdf::open_mem`] but accepts a [`PdfOpenOptions`] struct for repair and
+    /// password configuration, mirroring [`Pdf::open_with_options`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flpdf::{Pdf, PdfOpenOptions};
+    ///
+    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let opts = PdfOpenOptions { repair: true, ..PdfOpenOptions::default() };
+    /// let mut pdf = Pdf::open_mem_with_options(&bytes, opts)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem_with_options(bytes: &'a [u8], options: PdfOpenOptions) -> crate::Result<Self> {
+        Self::open_with_options(Cursor::new(bytes), options)
+    }
+}
+
+impl Pdf<Cursor<Vec<u8>>> {
+    /// Open a PDF document from an owned byte vector without wrapping it in a `Cursor` manually.
+    ///
+    /// This is the owned counterpart to [`Pdf::open_mem`]. The handle takes ownership of
+    /// `bytes` and is therefore `'static`—it can be freely moved and stored in data structures.
+    ///
+    /// This is the preferred form for in-memory PDF handling in most contexts (e.g. WASM,
+    /// test helpers, fulgur's document pipeline).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let mut pdf = Pdf::open_mem_owned(bytes)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem_owned(bytes: Vec<u8>) -> crate::Result<Self> {
+        Self::open(Cursor::new(bytes))
+    }
+
+    /// Open a PDF document from an owned byte vector with explicit open options.
+    ///
+    /// Like [`Pdf::open_mem_owned`] but accepts a [`PdfOpenOptions`] struct for repair
+    /// and password configuration, mirroring [`Pdf::open_with_options`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flpdf::{Pdf, PdfOpenOptions};
+    ///
+    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let opts = PdfOpenOptions { repair: true, ..PdfOpenOptions::default() };
+    /// let mut pdf = Pdf::open_mem_owned_with_options(bytes, opts)?;
+    /// println!("version {}", pdf.version());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open_mem_owned_with_options(
+        bytes: Vec<u8>,
+        options: PdfOpenOptions,
+    ) -> crate::Result<Self> {
+        Self::open_with_options(Cursor::new(bytes), options)
     }
 }
 
@@ -1342,4 +1433,156 @@ fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
         return Err(Error::parse(0, format!("{context} is negative")));
     }
     Ok(value as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pages::page_refs;
+
+    /// Minimal valid single-page PDF used across `open_mem` tests.
+    ///
+    /// Structure:
+    ///   1 0 obj  Catalog  /Root
+    ///   2 0 obj  Pages    /Kids [3 0 R]  /Count 1
+    ///   3 0 obj  Page
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    // ------------------------------------------------------------------
+    // Acceptance (1): open_mem_owned(Vec<u8>) opens an in-memory PDF
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn open_mem_owned_opens_minimal_pdf() {
+        let bytes = minimal_pdf_bytes();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open_mem_owned should succeed");
+        let refs = page_refs(&mut pdf).expect("page_refs should succeed");
+        assert_eq!(refs.len(), 1, "expected 1 page");
+        assert_eq!(
+            pdf.root_ref(),
+            Some(ObjectRef::new(1, 0)),
+            "expected root at 1 0 R"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Acceptance (2): open_mem(&[u8]) opens an in-memory PDF
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn open_mem_opens_minimal_pdf() {
+        let bytes = minimal_pdf_bytes();
+        let mut pdf = Pdf::open_mem(&bytes).expect("open_mem should succeed");
+        let refs = page_refs(&mut pdf).expect("page_refs should succeed");
+        assert_eq!(refs.len(), 1, "expected 1 page");
+        assert_eq!(
+            pdf.root_ref(),
+            Some(ObjectRef::new(1, 0)),
+            "expected root at 1 0 R"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Acceptance (3): sugar wrappers match Cursor::new(bytes) directly
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn open_mem_owned_matches_cursor_open() {
+        let bytes = minimal_pdf_bytes();
+
+        let mut pdf_cursor =
+            Pdf::open(Cursor::new(bytes.clone())).expect("Cursor::new open should succeed");
+        let refs_cursor = page_refs(&mut pdf_cursor).expect("page_refs from cursor");
+        let root_cursor = pdf_cursor.root_ref();
+
+        let mut pdf_owned = Pdf::open_mem_owned(bytes).expect("open_mem_owned should succeed");
+        let refs_owned = page_refs(&mut pdf_owned).expect("page_refs from open_mem_owned");
+        let root_owned = pdf_owned.root_ref();
+
+        assert_eq!(
+            refs_cursor, refs_owned,
+            "page refs from Cursor::new vs open_mem_owned must match"
+        );
+        assert_eq!(
+            root_cursor, root_owned,
+            "root ref from Cursor::new vs open_mem_owned must match"
+        );
+    }
+
+    #[test]
+    fn open_mem_matches_cursor_open() {
+        let bytes = minimal_pdf_bytes();
+
+        let mut pdf_cursor =
+            Pdf::open(Cursor::new(bytes.clone())).expect("Cursor::new open should succeed");
+        let refs_cursor = page_refs(&mut pdf_cursor).expect("page_refs from cursor");
+        let root_cursor = pdf_cursor.root_ref();
+
+        let mut pdf_mem = Pdf::open_mem(&bytes).expect("open_mem should succeed");
+        let refs_mem = page_refs(&mut pdf_mem).expect("page_refs from open_mem");
+        let root_mem = pdf_mem.root_ref();
+
+        assert_eq!(
+            refs_cursor, refs_mem,
+            "page refs from Cursor::new vs open_mem must match"
+        );
+        assert_eq!(
+            root_cursor, root_mem,
+            "root ref from Cursor::new vs open_mem must match"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // _with_options variants pass options through correctly (repair path)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn open_mem_owned_with_options_accepts_repair_flag() {
+        let bytes = minimal_pdf_bytes();
+        let opts = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, opts).expect("open_mem_owned_with_options");
+        let refs = page_refs(&mut pdf).expect("page_refs");
+        assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn open_mem_with_options_accepts_repair_flag() {
+        let bytes = minimal_pdf_bytes();
+        let opts = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf = Pdf::open_mem_with_options(&bytes, opts).expect("open_mem_with_options");
+        let refs = page_refs(&mut pdf).expect("page_refs");
+        assert_eq!(refs.len(), 1);
+    }
 }
