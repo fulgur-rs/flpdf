@@ -598,40 +598,33 @@ mod tests {
 
     #[test]
     fn planner_preserve_mode_skips_ineligible_members() {
-        // Simulate: the xref incorrectly records a high-generation object as compressed.
-        // We can't inject that via Pdf::open (the parser enforces gen==0 for compressed),
-        // so instead verify that even if the source xref has only eligible objects,
-        // an object that is_eligible_for_objstm rejects (gen≠0) is filtered.
-        // This is tested via the eligibility predicate unit tests above.
-        // Here, verify that Preserve mode does not crash on a PDF with no ObjStm entries.
-        let pdf_bytes = {
-            // Plain table-based PDF with no ObjStm at all.
-            let mut bytes = b"%PDF-1.4\n".to_vec();
-            let off1 = bytes.len();
-            bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-            let off2 = bytes.len();
-            bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-            let xref_off = bytes.len();
-            bytes.extend_from_slice(b"xref\n0 3\n");
-            bytes.extend_from_slice(b"0000000000 65535 f \n");
-            bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
-            bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
-            bytes.extend_from_slice(
-                format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
-                    .as_bytes(),
-            );
-            bytes
-        };
+        // ObjStm has 3 compressed members:
+        //   obj 2: Pages dict          → eligible
+        //   obj 3: /Type /XRef dict    → ineligible (is_eligible_for_objstm rejects XRef-typed dicts)
+        //   obj 4: plain string        → eligible
+        //
+        // Preserve mode must include only obj 2 and obj 4 in the output batch,
+        // skipping obj 3 even though it is recorded as compressed in the source xref.
+        let pdf_bytes = one_objstm_pdf_n(&[
+            b"<< /Type /XRef /Size 1 >>", // obj 3: XRef-typed dict — ineligible
+            b"(eligible-string)",         // obj 4: plain string — eligible
+        ]);
         let mut pdf = open_pdf(pdf_bytes);
         let config = PlannerConfig {
             mode: ObjectStreamMode::Preserve,
             batch_size_cap: 100,
         };
         let plan = plan_object_streams(&mut pdf, &config).unwrap();
-        // No ObjStm in source → no batches
-        assert!(
-            plan.batches.is_empty(),
-            "Preserve mode with no source ObjStm must yield no batches"
+        assert_eq!(plan.batches.len(), 1, "expected 1 batch");
+        let batch = &plan.batches[0];
+        // Only obj 2 (Pages) and obj 4 (string) are eligible; obj 3 (/Type /XRef) is filtered.
+        assert_eq!(
+            batch.len(),
+            2,
+            "expected 2 eligible members; got {:?}",
+            batch
         );
+        assert_eq!(batch[0], ObjectRef::new(2, 0));
+        assert_eq!(batch[1], ObjectRef::new(4, 0));
     }
 }
