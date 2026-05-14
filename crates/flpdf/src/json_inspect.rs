@@ -41,16 +41,128 @@ impl From<crate::Error> for ConvertError {
 
 // ── pdf_object_to_json ────────────────────────────────────────────────────────
 
-/// Classify a PDF string as either a "u:" text string or "b:" binary string.
+/// PDFDocEncoding lookup table per ISO 32000-1 Annex D.3.
 ///
-/// A string is considered text (printable ASCII, no NUL) when every byte is
-/// in 0x20..=0x7e and contains no NUL byte.  Otherwise it's binary.
+/// `None` means the code point is unassigned and the string cannot be safely
+/// decoded as PDFDocEncoding text.  Most byte values map to the corresponding
+/// ISO 8859-1 character; the 0x18..=0x1F and 0x80..=0x9F ranges are
+/// PDF-specific additions.
+const PDFDOC_ENCODING: [Option<char>; 256] = build_pdfdoc_table();
+
+const fn build_pdfdoc_table() -> [Option<char>; 256] {
+    let mut table: [Option<char>; 256] = [None; 256];
+    // 0x08..=0x0D: standard control codes
+    table[0x08] = Some('\u{0008}');
+    table[0x09] = Some('\t');
+    table[0x0A] = Some('\n');
+    table[0x0B] = Some('\u{000B}');
+    table[0x0C] = Some('\u{000C}');
+    table[0x0D] = Some('\r');
+    // 0x18..=0x1F: PDF-specific accents
+    table[0x18] = Some('\u{02D8}'); // ˘ BREVE
+    table[0x19] = Some('\u{02C7}'); // ˇ CARON
+    table[0x1A] = Some('\u{02C6}'); // ˆ MODIFIER LETTER CIRCUMFLEX ACCENT
+    table[0x1B] = Some('\u{02D9}'); // ˙ DOT ABOVE
+    table[0x1C] = Some('\u{02DD}'); // ˝ DOUBLE ACUTE ACCENT
+    table[0x1D] = Some('\u{02DB}'); // ˛ OGONEK
+    table[0x1E] = Some('\u{02DA}'); // ˚ RING ABOVE
+    table[0x1F] = Some('\u{02DC}'); // ˜ SMALL TILDE
+                                    // 0x20..=0x7E: same as ASCII printable
+    let mut b = 0x20u8;
+    while b <= 0x7E {
+        table[b as usize] = Some(b as char);
+        b += 1;
+    }
+    // 0x80..=0x9F: PDF-specific symbols
+    table[0x80] = Some('\u{2022}'); // BULLET
+    table[0x81] = Some('\u{2020}'); // DAGGER
+    table[0x82] = Some('\u{2021}'); // DOUBLE DAGGER
+    table[0x83] = Some('\u{2026}'); // HORIZONTAL ELLIPSIS
+    table[0x84] = Some('\u{2014}'); // EM DASH
+    table[0x85] = Some('\u{2013}'); // EN DASH
+    table[0x86] = Some('\u{0192}'); // LATIN SMALL LETTER F WITH HOOK
+    table[0x87] = Some('\u{2044}'); // FRACTION SLASH
+    table[0x88] = Some('\u{2039}'); // SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+    table[0x89] = Some('\u{203A}'); // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+    table[0x8A] = Some('\u{2212}'); // MINUS SIGN
+    table[0x8B] = Some('\u{2030}'); // PER MILLE SIGN
+    table[0x8C] = Some('\u{201E}'); // DOUBLE LOW-9 QUOTATION MARK
+    table[0x8D] = Some('\u{201C}'); // LEFT DOUBLE QUOTATION MARK
+    table[0x8E] = Some('\u{201D}'); // RIGHT DOUBLE QUOTATION MARK
+    table[0x8F] = Some('\u{2018}'); // LEFT SINGLE QUOTATION MARK
+    table[0x90] = Some('\u{2019}'); // RIGHT SINGLE QUOTATION MARK
+    table[0x91] = Some('\u{201A}'); // SINGLE LOW-9 QUOTATION MARK
+    table[0x92] = Some('\u{2122}'); // TRADE MARK SIGN
+    table[0x93] = Some('\u{FB01}'); // LATIN SMALL LIGATURE FI
+    table[0x94] = Some('\u{FB02}'); // LATIN SMALL LIGATURE FL
+    table[0x95] = Some('\u{0141}'); // LATIN CAPITAL LETTER L WITH STROKE
+    table[0x96] = Some('\u{0152}'); // LATIN CAPITAL LIGATURE OE
+    table[0x97] = Some('\u{0160}'); // LATIN CAPITAL LETTER S WITH CARON
+    table[0x98] = Some('\u{0178}'); // LATIN CAPITAL LETTER Y WITH DIAERESIS
+    table[0x99] = Some('\u{017D}'); // LATIN CAPITAL LETTER Z WITH CARON
+    table[0x9A] = Some('\u{0131}'); // LATIN SMALL LETTER DOTLESS I
+    table[0x9B] = Some('\u{0142}'); // LATIN SMALL LETTER L WITH STROKE
+    table[0x9C] = Some('\u{0153}'); // LATIN SMALL LIGATURE OE
+    table[0x9D] = Some('\u{0161}'); // LATIN SMALL LETTER S WITH CARON
+    table[0x9E] = Some('\u{017E}'); // LATIN SMALL LETTER Z WITH CARON
+                                    // 0x9F: unassigned
+    table[0xA0] = Some('\u{20AC}'); // EURO SIGN
+                                    // 0xA1..=0xFF: same as ISO 8859-1 (Latin-1 Supplement)
+    let mut b = 0xA1u8;
+    loop {
+        table[b as usize] = Some(b as char);
+        if b == 0xFF {
+            break;
+        }
+        b += 1;
+    }
+    table
+}
+
+/// Decode a PDF text string (ISO 32000-1 §7.9.2) into a Rust `String`.
 ///
-/// This is a simplified rule — it does not decode PDFDocEncoding or UTF-16BE.
+/// Returns `Some(text)` when the byte sequence is valid as a PDF text string
+/// (UTF-16BE/UTF-16LE BOM-prefixed UTF-16, or PDFDocEncoding-mapped bytes).
+/// Returns `None` when the byte sequence cannot be safely interpreted as
+/// text — at which point the caller falls back to the `b:` hex representation.
+fn decode_pdf_text_string(bytes: &[u8]) -> Option<String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        if rest.len() % 2 != 0 {
+            return None;
+        }
+        let units = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]));
+        return char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .ok();
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        if rest.len() % 2 != 0 {
+            return None;
+        }
+        let units = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]));
+        return char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .ok();
+    }
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        out.push(PDFDOC_ENCODING[b as usize]?);
+    }
+    Some(out)
+}
+
+/// Classify a PDF string as either a `u:` text string or `b:` binary string.
+///
+/// Text bytes are decoded through [`decode_pdf_text_string`]; only when the
+/// byte sequence cannot be decoded as PDF text do we fall back to the
+/// hex-encoded `b:` form.  This matches qpdf JSON v2 behavior for
+/// UTF-16-marked text strings, PDFDocEncoded metadata, and binary IDs.
 fn pdf_string_to_json_string(bytes: &[u8]) -> String {
-    let is_text = bytes.iter().all(|&b| (0x20..=0x7e).contains(&b));
-    if is_text {
-        let text = std::str::from_utf8(bytes).unwrap_or("");
+    if let Some(text) = decode_pdf_text_string(bytes) {
         format!("u:{text}")
     } else {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -527,9 +639,60 @@ mod tests {
 
     #[test]
     fn object_string_binary_has_b_prefix() {
-        // Binary bytes with high-bit set.
-        let result = pdf_object_to_json(&Object::String(vec![0x2d, 0xc7, 0x80])).unwrap();
-        assert_eq!(result, JsonValue::String("b:2dc780".to_string()));
+        // 0x01 is unassigned in PDFDocEncoding (no UTF-16 BOM either), so the
+        // string is not decodable as PDF text and must fall back to "b:" hex.
+        let result = pdf_object_to_json(&Object::String(vec![0x2d, 0x01, 0x80])).unwrap();
+        assert_eq!(result, JsonValue::String("b:2d0180".to_string()));
+    }
+
+    #[test]
+    fn object_string_pdfdoc_high_byte_decodes_as_text() {
+        // 0xC7 is "Ç" (LATIN CAPITAL LETTER C WITH CEDILLA) in PDFDocEncoding
+        // == ISO 8859-1. qpdf treats this as a text string.
+        let result = pdf_object_to_json(&Object::String(vec![b'A', 0xC7, b'B'])).unwrap();
+        assert_eq!(result, JsonValue::String("u:A\u{00C7}B".to_string()));
+    }
+
+    #[test]
+    fn object_string_utf16be_bom_decodes_to_unicode() {
+        // FEFF + 0041 + 0042 → "u:AB"
+        let bytes = vec![0xFE, 0xFF, 0x00, 0x41, 0x00, 0x42];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("u:AB".to_string()));
+    }
+
+    #[test]
+    fn object_string_utf16le_bom_decodes_to_unicode() {
+        // FFFE + 41 00 + 42 00 → "u:AB"
+        let bytes = vec![0xFF, 0xFE, 0x41, 0x00, 0x42, 0x00];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("u:AB".to_string()));
+    }
+
+    #[test]
+    fn object_string_utf16be_japanese_decodes_to_unicode() {
+        // FEFF + 3042 (あ) + 3044 (い) → "u:あい"
+        let bytes = vec![0xFE, 0xFF, 0x30, 0x42, 0x30, 0x44];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("u:あい".to_string()));
+    }
+
+    #[test]
+    fn object_string_utf16be_with_odd_length_falls_back_to_binary() {
+        // FEFF + 0041 + 00 (truncated last unit) → binary fallback.
+        let bytes = vec![0xFE, 0xFF, 0x00, 0x41, 0x00];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("b:feff004100".to_string()));
+    }
+
+    #[test]
+    fn object_string_undefined_pdfdoc_byte_falls_back_to_binary() {
+        // 0x00 (NUL) is unassigned in PDFDocEncoding; the whole string falls
+        // through to the binary path. This is the qpdf-equivalent treatment
+        // for an /ID array element that contains a NUL.
+        let bytes = vec![0xab, 0xcd, 0x00, 0xef];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("b:abcd00ef".to_string()));
     }
 
     #[test]
