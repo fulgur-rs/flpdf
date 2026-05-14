@@ -269,13 +269,17 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
             return Ok(None);
         };
 
-        // Check for /Resources on this node.
+        // Check for /Resources on this node. Per PDF §7.3.9, a null value is
+        // equivalent to the key being absent — so Object::Null (and references
+        // that resolve to null) fall through to the /Parent chain.
         if let Some(resources_val) = dict.get("Resources").cloned() {
             match resources_val {
+                Object::Null => {}
                 Object::Dictionary(d) => return Ok(Some(d)),
                 Object::Reference(r) => {
                     let resolved = pdf.resolve(r)?;
                     match resolved {
+                        Object::Null => {}
                         Object::Dictionary(d) => return Ok(Some(d)),
                         _ => {
                             return Err(Error::Unsupported(format!(
@@ -292,10 +296,11 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
             }
         }
 
-        // No /Resources here — try the /Parent.
+        // No /Resources here — try the /Parent. A null /Parent is equivalent
+        // to no /Parent at all (PDF §7.3.9), so stop walking in either case.
         let parent_val = match dict.get("Parent").cloned() {
+            Some(Object::Null) | None => return Ok(None),
             Some(v) => v,
-            None => return Ok(None), // reached the root without finding /Resources
         };
 
         match parent_val {
@@ -862,5 +867,71 @@ mod tests {
             Err(Error::Unsupported(_)) => {} // depth exceeded or explicit cycle error — acceptable
             Err(e) => panic!("unexpected error variant: {e:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: /Resources null and /Parent null are treated as absent (PDF §7.3.9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_inherited_resources_null_falls_through_to_parent() {
+        // Page has /Resources null → must continue inheritance to the Pages
+        // node, which has a real /Resources dict.
+        let bytes = build_pdf_resources_inherited_via_indirect_ref();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Type", Object::Name(b"Page".to_vec()));
+        page_dict.insert("Parent", Object::Reference(ObjectRef::new(2, 0)));
+        page_dict.insert(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        page_dict.insert("Resources", Object::Null);
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page_dict));
+
+        let page_ref = ObjectRef::new(3, 0);
+        let result =
+            resolve_inherited_resources(&mut pdf, page_ref).expect("null should be like absent");
+        let dict = result.expect("should inherit /Resources from parent despite null on page");
+        assert!(
+            dict.get("Font").is_some(),
+            "expected inherited /Font key when page's /Resources is null"
+        );
+    }
+
+    #[test]
+    fn resolve_inherited_resources_null_parent_terminates_chain() {
+        // Page has no /Resources and /Parent null → must terminate at this
+        // node and return Ok(None), rather than dereferencing null as a ref.
+        let bytes = build_pdf_no_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Type", Object::Name(b"Page".to_vec()));
+        page_dict.insert("Parent", Object::Null);
+        page_dict.insert(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page_dict));
+
+        let page_ref = ObjectRef::new(3, 0);
+        let result = resolve_inherited_resources(&mut pdf, page_ref)
+            .expect("null /Parent should be like absent");
+        assert!(
+            result.is_none(),
+            "expected Ok(None) when /Parent is null and no /Resources"
+        );
     }
 }
