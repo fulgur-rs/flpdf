@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use crate::object::{Dictionary, Object, ObjectRef};
 use crate::XrefOffset;
@@ -97,19 +98,25 @@ pub(crate) enum ObjectStreamMode {
     Generate,
 }
 
+/// qpdf's default ObjStm batch size cap.
+pub(crate) const DEFAULT_BATCH_SIZE_CAP: NonZeroUsize = match NonZeroUsize::new(100) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
 /// Configuration for the ObjStm packing planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannerConfig {
     pub mode: ObjectStreamMode,
     /// Maximum number of members per ObjStm batch. qpdf default is 100.
-    pub batch_size_cap: usize,
+    pub batch_size_cap: NonZeroUsize,
 }
 
 impl Default for PlannerConfig {
     fn default() -> Self {
         Self {
             mode: ObjectStreamMode::Preserve,
-            batch_size_cap: 100,
+            batch_size_cap: DEFAULT_BATCH_SIZE_CAP,
         }
     }
 }
@@ -135,8 +142,6 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
     config: &PlannerConfig,
 ) -> crate::Result<PackingPlan> {
-    debug_assert!(config.batch_size_cap > 0, "batch_size_cap must be >= 1");
-
     if config.mode == ObjectStreamMode::Disable {
         return Ok(PackingPlan::default());
     }
@@ -191,7 +196,7 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    let cap = config.batch_size_cap;
+    let cap = config.batch_size_cap.get();
     let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
 
     // Iterate containers in ascending container-number order.
@@ -250,7 +255,7 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         .collect();
     refs.sort_by_key(|r| (r.number, r.generation));
 
-    let cap = config.batch_size_cap;
+    let cap = config.batch_size_cap.get();
     let mut current_batch: Vec<ObjectRef> = Vec::new();
     let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
 
@@ -498,7 +503,7 @@ mod tests {
         let mut pdf = open_pdf(pdf_bytes);
         let config = PlannerConfig {
             mode: ObjectStreamMode::Disable,
-            batch_size_cap: 100,
+            batch_size_cap: NonZeroUsize::new(100).unwrap(),
         };
         let plan = plan_object_streams(&mut pdf, &config).unwrap();
         assert!(
@@ -515,7 +520,7 @@ mod tests {
 
         let config = PlannerConfig {
             mode: ObjectStreamMode::Preserve,
-            batch_size_cap: 100,
+            batch_size_cap: NonZeroUsize::new(100).unwrap(),
         };
         let plan = plan_object_streams(&mut pdf, &config).unwrap();
 
@@ -540,7 +545,7 @@ mod tests {
 
         let config = PlannerConfig {
             mode: ObjectStreamMode::Generate,
-            batch_size_cap: 100,
+            batch_size_cap: NonZeroUsize::new(100).unwrap(),
         };
         let plan = plan_object_streams(&mut pdf, &config).unwrap();
 
@@ -570,7 +575,7 @@ mod tests {
 
         let config = PlannerConfig {
             mode: ObjectStreamMode::Generate,
-            batch_size_cap: 3,
+            batch_size_cap: NonZeroUsize::new(3).unwrap(),
         };
         let plan = plan_object_streams(&mut pdf, &config).unwrap();
 
@@ -612,7 +617,7 @@ mod tests {
         let mut pdf = open_pdf(pdf_bytes);
         let config = PlannerConfig {
             mode: ObjectStreamMode::Preserve,
-            batch_size_cap: 100,
+            batch_size_cap: NonZeroUsize::new(100).unwrap(),
         };
         let plan = plan_object_streams(&mut pdf, &config).unwrap();
         assert_eq!(plan.batches.len(), 1, "expected 1 batch");
