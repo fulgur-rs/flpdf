@@ -1038,6 +1038,16 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
 ) -> Result<()> {
+    // ── ObjStm-routing overview ───────────────────────────────────────────────
+    // 1. Run the planner to decide which objects belong in ObjStm batches.
+    // 2. Build a member→(container_num, index_in_batch) lookup.
+    // 3. Allocate container object numbers above the highest input number.
+    // 4. Emission loop: skip members (they'll be emitted via containers).
+    // 5. After the loop: emit each container as a stream object.
+    // 6. xref: for Stream form, insert Compressed entries for members.
+    //    For Table form with non-empty batches: return Err (5.7 guard).
+    // ─────────────────────────────────────────────────────────────────────────
+
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
@@ -1054,8 +1064,46 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         version = "1.5".to_string();
     }
 
+    // ── Step 1: run the ObjStm planner ───────────────────────────────────────
+    let planner_config = object_streams::planner_config_from_options(options);
+    let plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+
+    // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     let mut object_refs = pdf.object_refs();
     object_refs.sort_by_key(|r| (r.number, r.generation));
+
+    let existing_max: u32 = object_refs.iter().map(|r| r.number).max().unwrap_or(0);
+
+    // Allocate a fresh object number for each container above existing_max.
+    let container_refs: Vec<ObjectRef> = (1..=plan.batches.len())
+        .map(|i| {
+            existing_max
+                .checked_add(i as u32)
+                .map(|n| ObjectRef::new(n, 0))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            crate::Error::Unsupported(
+                "full-rewrite: ObjStm container number overflows u32".to_string(),
+            )
+        })?;
+
+    // member_to_batch: ObjectRef → (container_obj_num, index_in_batch)
+    use std::collections::HashMap;
+    let mut member_to_batch: HashMap<ObjectRef, (u32, u32)> = HashMap::new();
+    for (batch_idx, batch) in plan.batches.iter().enumerate() {
+        let container_num = container_refs[batch_idx].number;
+        for (idx_in_batch, &member_ref) in batch.iter().enumerate() {
+            member_to_batch.insert(member_ref, (container_num, idx_in_batch as u32));
+        }
+    }
+
+    // Early guard: Table form + non-empty batches is not yet supported (5.7).
+    if matches!(pdf.last_xref_form(), XrefForm::Table) && !plan.batches.is_empty() {
+        return Err(crate::Error::Unsupported(
+            "ObjStm output requires xref stream — wait for flpdf-9hc.5.7".to_string(),
+        ));
+    }
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
@@ -1065,6 +1113,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     for object_ref in &object_refs {
         if Some(*object_ref) == pdf.encryption_ref() {
+            continue;
+        }
+
+        // ── Step 4: skip members that will be routed into an ObjStm batch ───
+        if member_to_batch.contains_key(object_ref) {
             continue;
         }
 
@@ -1107,6 +1160,19 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
         bytes.extend_from_slice(b"\nendobj\n");
         offsets.insert(object_ref.number, (object_ref.generation, emit_offset));
+    }
+
+    // ── Step 5: emit each ObjStm container ───────────────────────────────────
+    for (batch_idx, batch) in plan.batches.iter().enumerate() {
+        let container_ref = container_refs[batch_idx];
+        let body = object_streams::emit_objstm_body(pdf, batch)?;
+        let stream = object_streams::wrap_objstm_body(&body)?;
+
+        let emit_offset = bytes.len();
+        bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
+        Object::Stream(stream).write_pdf(&mut bytes);
+        bytes.extend_from_slice(b"\nendobj\n");
+        offsets.insert(container_ref.number, (0, emit_offset));
     }
 
     // Build xref / trailer matching the input's xref form.
@@ -1171,25 +1237,40 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             let mut xref_entries: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
             xref_entries.insert(0, (65535, XrefOffset::Free { next: 0 }));
             for number in 1..xref_object_number {
-                match offsets.get(&number) {
-                    Some(&(gen, off)) => {
-                        xref_entries.insert(
-                            number,
-                            (
-                                gen,
-                                XrefOffset::Offset(u64::try_from(off).map_err(|_| {
-                                    crate::Error::Unsupported(
-                                        "xref offset does not fit u64".to_string(),
-                                    )
-                                })?),
-                            ),
-                        );
-                    }
-                    None => {
-                        // Gap in emitted objects — emit as a free entry so the
-                        // xref stream covers `[0, /Size)` contiguously.
-                        xref_entries.insert(number, (0, XrefOffset::Free { next: 0 }));
-                    }
+                if let Some(&(gen, off)) = offsets.get(&number) {
+                    // Regular indirect object (plain or ObjStm container).
+                    xref_entries.insert(
+                        number,
+                        (
+                            gen,
+                            XrefOffset::Offset(u64::try_from(off).map_err(|_| {
+                                crate::Error::Unsupported(
+                                    "xref offset does not fit u64".to_string(),
+                                )
+                            })?),
+                        ),
+                    );
+                } else if let Some(&(container_num, index_in_batch)) =
+                    member_to_batch.get(&ObjectRef::new(number, 0))
+                {
+                    // Member object that lives inside an ObjStm container.
+                    // Compressed members have implicit generation 0; the
+                    // type-2 xref record carries the container's object number
+                    // and the member's index within that container.
+                    xref_entries.insert(
+                        number,
+                        (
+                            0,
+                            XrefOffset::Compressed {
+                                stream: container_num,
+                                index: index_in_batch,
+                            },
+                        ),
+                    );
+                } else {
+                    // Gap in emitted objects — emit as a free entry so the
+                    // xref stream covers `[0, /Size)` contiguously.
+                    xref_entries.insert(number, (0, XrefOffset::Free { next: 0 }));
                 }
             }
             xref_entries.insert(
