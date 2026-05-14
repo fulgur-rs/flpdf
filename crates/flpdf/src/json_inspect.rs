@@ -178,10 +178,12 @@ pub fn build_qpdf_key<R: Read + Seek>(
     ]);
 
     // ── 2. Build objects_map ───────────────────────────────────────────────
-    // Collect all object refs from the xref table (skip object 0).
-    // Free/deleted entries will resolve() to Object::Null and be skipped below.
+    // Use live_object_refs() so that free / deleted xref entries are excluded
+    // at the xref-status level. A live indirect object that *is* null (e.g.
+    // `1 0 obj null endobj`) is then emitted as `{ "value": null }` like any
+    // other non-stream live object — qpdf does the same.
     let all_refs: Vec<crate::ObjectRef> = pdf
-        .object_refs()
+        .live_object_refs()
         .into_iter()
         .filter(|r| r.number != 0)
         .collect();
@@ -200,12 +202,8 @@ pub fn build_qpdf_key<R: Read + Seek>(
                     JsonValue::Object(vec![("dict".to_string(), dict_json)]),
                 )])
             }
-            Object::Null => {
-                // Free/missing objects resolve to Null — skip them.
-                continue;
-            }
             other => {
-                // Non-stream: emit { "value": <json> }
+                // Non-stream (including live Object::Null): emit { "value": <json> }.
                 let val = pdf_object_to_json(other)?;
                 JsonValue::Object(vec![("value".to_string(), val)])
             }
@@ -757,5 +755,81 @@ mod tests {
             .map(|(_, v)| v)
             .expect("/Size not found in trailer");
         assert_eq!(*size, JsonValue::Integer(8), "/Size should be 8");
+    }
+
+    // ── 22. Live null indirect object is emitted, not silently dropped ────────
+    //
+    // Regression test for the earlier `Object::Null => continue` bug: a live
+    // indirect object that *is* null (e.g. `1 0 obj null endobj`) must appear
+    // in objects_map as `{ "value": null }`, just like a non-null live object.
+    // qpdf does the same.
+
+    #[test]
+    fn build_qpdf_key_live_null_indirect_object_is_emitted_with_value_null() {
+        let mut pdf = load_one_page_pdf();
+
+        // Patch obj 2 (the Font dictionary in one-page.pdf) to a live null
+        // indirect object. The xref entry remains live; only the resolved
+        // value becomes Null. build_qpdf_key must still emit obj:2 0 R.
+        pdf.set_object(crate::ObjectRef::new(2, 0), Object::Null);
+
+        let meta = QpdfMetadata {
+            pdf_version: "1.3".to_string(),
+            max_object_id: 7,
+            pushed_inherited_page_resources: false,
+            called_get_all_pages: true,
+        };
+        let JsonValue::Array(elems) =
+            build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed")
+        else {
+            panic!("expected Array");
+        };
+        let JsonValue::Object(map_pairs) = &elems[1] else {
+            panic!("objects_map is not an Object");
+        };
+
+        let obj2 = map_pairs
+            .iter()
+            .find(|(k, _)| k == "obj:2 0 R")
+            .map(|(_, v)| v)
+            .expect("obj:2 0 R must remain in objects_map when it is live and null");
+        let JsonValue::Object(obj2_pairs) = obj2 else {
+            panic!("obj:2 0 R is not an Object");
+        };
+        assert_eq!(
+            obj2_pairs.len(),
+            1,
+            "live null indirect must have a single 'value' key"
+        );
+        assert_eq!(obj2_pairs[0].0, "value");
+        assert_eq!(obj2_pairs[0].1, JsonValue::Null);
+    }
+
+    // ── 23. Pdf::live_object_refs() unit check ────────────────────────────────
+    //
+    // Direct check that live_object_refs() returns the same set of live refs
+    // as object_refs() on a fixture with no free entries, and that an
+    // explicitly deleted object is excluded.
+
+    #[test]
+    fn live_object_refs_excludes_explicitly_deleted_entries() {
+        let mut pdf = load_one_page_pdf();
+        let before: std::collections::BTreeSet<_> = pdf.live_object_refs().into_iter().collect();
+        assert!(
+            before.contains(&crate::ObjectRef::new(2, 0)),
+            "obj 2 should start out as live"
+        );
+
+        pdf.delete_object(crate::ObjectRef::new(2, 0));
+        let after: std::collections::BTreeSet<_> = pdf.live_object_refs().into_iter().collect();
+        assert!(
+            !after.contains(&crate::ObjectRef::new(2, 0)),
+            "obj 2 must drop out of live_object_refs after delete_object"
+        );
+        assert_eq!(
+            before.len() - 1,
+            after.len(),
+            "exactly one ref should be removed"
+        );
     }
 }

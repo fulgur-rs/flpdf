@@ -446,6 +446,21 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.object_refs()
     }
 
+    /// Object refs that the cross-reference table marks as live — i.e. excluding
+    /// free entries (`XrefOffset::Free`) and any explicit deletions. A live
+    /// reference may still resolve to `Object::Null`; that is a real null
+    /// indirect object, not an absent one.
+    pub fn live_object_refs(&self) -> Vec<ObjectRef> {
+        self.cache
+            .entries()
+            .iter()
+            .filter_map(|(object_ref, entry)| match entry {
+                crate::cache::CacheEntry::Deleted | crate::cache::CacheEntry::Missing => None,
+                _ => Some(*object_ref),
+            })
+            .collect()
+    }
+
     /// `/Root` as listed in the trailer, when present.
     pub fn root_ref(&self) -> Option<ObjectRef> {
         self.trailer.get_ref("Root")
