@@ -443,21 +443,54 @@ pub fn build_envelope(decode_level: DecodeLevel) -> JsonValue {
 ///
 /// Direct inline Streams outside an array have no object number and are
 /// therefore skipped (spec-compliant PDFs use indirect refs for /Contents).
-fn collect_content_refs(content_obj: &Object) -> Vec<String> {
+/// Collect the page's `/Contents` references as `"N M R"` strings.
+///
+/// PDF allows `/Contents` in several shapes:
+///
+/// 1. A direct Stream (rare; no ref to emit, returns `[]`).
+/// 2. A `Reference` to a Stream → one entry.
+/// 3. A `Reference` to an Array (`/Contents 12 0 R` where `12 0 obj [4 0 R 5 0 R]`)
+///    → resolve the indirect array and recurse over its elements.
+/// 4. A direct `Array` of References → one entry per Reference element.
+///
+/// In every variant the function emits the *original* reference strings, not
+/// the wrapper array's ref number — that matches qpdf's `contents` output.
+fn collect_content_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    content_obj: &Object,
+) -> Result<Vec<String>, ConvertError> {
+    fn ref_string(r: &crate::ObjectRef) -> String {
+        format!("{} {} R", r.number, r.generation)
+    }
+
     match content_obj {
-        Object::Reference(r) => vec![format!("{} {} R", r.number, r.generation)],
-        Object::Array(elems) => elems
-            .iter()
-            .filter_map(|e| {
-                if let Object::Reference(r) = e {
-                    Some(format!("{} {} R", r.number, r.generation))
-                } else {
-                    None
+        Object::Reference(r) => {
+            // Resolve to see whether the indirect object is a Stream (in
+            // which case this ref itself is the content) or an Array of
+            // Stream refs (in which case we recurse to flatten).
+            let resolved = pdf.resolve(*r).map_err(ConvertError::from)?;
+            match resolved {
+                Object::Stream(_) => Ok(vec![ref_string(r)]),
+                Object::Array(_) => {
+                    // Recurse so a nested indirect array is also unwrapped.
+                    collect_content_refs(pdf, &resolved)
                 }
-            })
-            .collect(),
+                // /Contents pointing at anything else (Null, missing) → empty.
+                _ => Ok(vec![]),
+            }
+        }
+        Object::Array(elems) => {
+            let mut refs = Vec::with_capacity(elems.len());
+            for e in elems {
+                if let Object::Reference(r) = e {
+                    refs.push(ref_string(r));
+                }
+                // Direct inline streams have no ref string — skip them.
+            }
+            Ok(refs)
+        }
         // Null, missing, or direct Stream — emit empty list.
-        _ => vec![],
+        _ => Ok(vec![]),
     }
 }
 
@@ -542,7 +575,7 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue
             _ => None,
         };
         let contents: Vec<JsonValue> = match &contents_obj {
-            Some(c) => collect_content_refs(c)
+            Some(c) => collect_content_refs(pdf, c)?
                 .into_iter()
                 .map(JsonValue::String)
                 .collect(),
@@ -1404,12 +1437,15 @@ mod tests {
         }
     }
 
-    // ── 31. collect_content_refs: single Reference ────────────────────────────
+    // ── 31. collect_content_refs: single Reference to a Stream ────────────────
 
     #[test]
-    fn collect_content_refs_single_ref() {
+    fn collect_content_refs_single_ref_to_stream() {
+        // one-page.pdf's /Contents is a single reference to a Stream
+        // (object 7). The function must return that ref as-is.
+        let mut pdf = load_one_page_pdf();
         let obj = Object::Reference(crate::ObjectRef::new(7, 0));
-        let refs = collect_content_refs(&obj);
+        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["7 0 R".to_string()]);
     }
 
@@ -1417,11 +1453,12 @@ mod tests {
 
     #[test]
     fn collect_content_refs_array_of_refs() {
+        let mut pdf = load_one_page_pdf();
         let obj = Object::Array(vec![
             Object::Reference(crate::ObjectRef::new(4, 0)),
             Object::Reference(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs = collect_content_refs(&obj);
+        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["4 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -1429,8 +1466,9 @@ mod tests {
 
     #[test]
     fn collect_content_refs_null_returns_empty() {
+        let mut pdf = load_one_page_pdf();
         let obj = Object::Null;
-        let refs = collect_content_refs(&obj);
+        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
         assert!(refs.is_empty());
     }
 
@@ -1438,12 +1476,41 @@ mod tests {
 
     #[test]
     fn collect_content_refs_array_skips_non_refs() {
+        let mut pdf = load_one_page_pdf();
         let obj = Object::Array(vec![
             Object::Reference(crate::ObjectRef::new(3, 0)),
             Object::Integer(99), // not a ref — must be skipped
             Object::Reference(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs = collect_content_refs(&obj);
+        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["3 0 R".to_string(), "5 0 R".to_string()]);
+    }
+
+    // ── 35. collect_content_refs: indirect Array unwraps to inner refs ────────
+    //
+    // `/Contents 2 0 R` where `2 0 obj [4 0 R 5 0 R] endobj` is legal in PDF.
+    // qpdf-compatible output must flatten this to ["4 0 R", "5 0 R"], not
+    // ["2 0 R"]. Regression test for CodeRabbit's finding.
+
+    #[test]
+    fn collect_content_refs_indirect_array_is_flattened() {
+        let mut pdf = load_one_page_pdf();
+        // Patch object 2 (currently the Font dict in one-page.pdf) into an
+        // Array of References. /Contents -> 2 0 R must then unwrap to those.
+        pdf.set_object(
+            crate::ObjectRef::new(2, 0),
+            Object::Array(vec![
+                Object::Reference(crate::ObjectRef::new(4, 0)),
+                Object::Reference(crate::ObjectRef::new(5, 0)),
+            ]),
+        );
+
+        let obj = Object::Reference(crate::ObjectRef::new(2, 0));
+        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        assert_eq!(
+            refs,
+            vec!["4 0 R".to_string(), "5 0 R".to_string()],
+            "indirect Array of refs must be unwrapped, not emitted as the array's ref number"
+        );
     }
 }
