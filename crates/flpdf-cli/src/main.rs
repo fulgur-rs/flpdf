@@ -6,7 +6,7 @@ use flpdf::{
         RenumberMap,
     },
     outline, pages, parse_pdf_version, write_pdf_with_options, write_qdf, Object, ObjectRef,
-    PasswordMode, Pdf, PdfOpenOptions, Severity, WriteOptions,
+    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, Severity, WriteOptions,
 };
 use std::fs::File;
 use std::io::{BufReader, Write};
@@ -193,6 +193,37 @@ struct RewriteCommand {
     /// contains no /Prev chain.  Cannot be combined with --linearize.
     #[arg(long = "full-rewrite")]
     full_rewrite: bool,
+    /// Object stream behaviour for the output. Mirrors qpdf
+    /// `--object-streams=preserve|disable|generate`. Default: `preserve`.
+    ///
+    /// - `preserve` (default): reuse the source document's existing ObjStm
+    ///   grouping.
+    /// - `disable`: emit every eligible object as a plain indirect object.
+    /// - `generate`: pack eligible objects into freshly generated ObjStm
+    ///   containers.
+    ///
+    /// Only applies to the full-rewrite path; the incremental write path
+    /// ignores this flag (tracked in flpdf-9hc.5.9).
+    #[arg(long = "object-streams", value_enum, default_value_t = CliObjectStreamMode::Preserve)]
+    object_streams: CliObjectStreamMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum CliObjectStreamMode {
+    #[default]
+    Preserve,
+    Disable,
+    Generate,
+}
+
+impl From<CliObjectStreamMode> for ObjectStreamMode {
+    fn from(value: CliObjectStreamMode) -> Self {
+        match value {
+            CliObjectStreamMode::Preserve => ObjectStreamMode::Preserve,
+            CliObjectStreamMode::Disable => ObjectStreamMode::Disable,
+            CliObjectStreamMode::Generate => ObjectStreamMode::Generate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, ClapArgs)]
@@ -357,6 +388,7 @@ fn run_command(command: Commands) -> CliResult<()> {
             options.min_version = cmd.min_version;
             options.force_version = cmd.force_version;
             options.full_rewrite = cmd.full_rewrite;
+            options.object_streams = cmd.object_streams.into();
             run_rewrite(
                 Some(cmd.input),
                 Some(cmd.output),
