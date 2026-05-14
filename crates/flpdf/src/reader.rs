@@ -823,7 +823,10 @@ fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
     })
 }
 
-fn parse_object_stream_entry(stream_object: &crate::Stream, target_index: u32) -> Result<Object> {
+pub(crate) fn parse_object_stream_entry(
+    stream_object: &crate::Stream,
+    target_index: u32,
+) -> Result<Object> {
     let stream_data = crate::filters::decode_stream_data(&stream_object.dict, &stream_object.data)?;
 
     let stream_object_count = object_stream_count(stream_object)?;
@@ -1313,7 +1316,7 @@ fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
     Some(String::from_utf8_lossy(cfm).to_string())
 }
 
-fn object_stream_count(stream_object: &crate::Stream) -> Result<usize> {
+pub(crate) fn object_stream_count(stream_object: &crate::Stream) -> Result<usize> {
     usize::try_from(parse_non_negative_i64(
         stream_object
             .dict
