@@ -45,6 +45,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod filters;
 pub mod fonts;
+pub mod json;
 pub mod linearization;
 pub mod object;
 pub mod outline;
