@@ -99,6 +99,42 @@ jobs:
 
           cargo check --workspace
 
+      # Validate packaging against the just-bumped version. crates.io publish is
+      # irreversible, so catching missing files / bad metadata here (before the
+      # release PR is opened) is much cheaper than discovering it during the
+      # actual publish step in release.yml.
+      - name: cargo publish --dry-run -p flpdf
+        run: |
+          rm -rf target/package
+          cargo publish --dry-run -p flpdf
+
+      - name: Verify packaged .crate contains README and LICENSE files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo publish --dry-run writes the .crate under target/package/tmp-crate/
+          # (not directly under target/package/). Match both locations to stay
+          # robust against future cargo changes.
+          CRATE_FILE=$(find target/package -name 'flpdf-*.crate' -print -quit)
+          if [ -z "$CRATE_FILE" ]; then
+            echo "ERROR: no .crate file found under target/package"
+            find target/package -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          contents=$(tar tzf "$CRATE_FILE")
+          # Derive the exact in-archive directory (e.g. flpdf-0.1.0) so we can
+          # use grep -F for literal-string matching. Avoids the "." in
+          # "README.md" being interpreted as any-char by regex.
+          PKG_DIR=$(basename "$CRATE_FILE" .crate)
+          for required in README.md LICENSE-APACHE LICENSE-MIT; do
+            if ! printf '%s\n' "$contents" | grep -Fxq "${PKG_DIR}/${required}"; then
+              echo "ERROR: missing $required in $CRATE_FILE"
+              echo "$contents"
+              exit 1
+            fi
+          done
+          echo "OK: README.md / LICENSE-APACHE / LICENSE-MIT present in $CRATE_FILE"
+
       # PR-based changelog: ask GitHub to render notes from merged PRs since the
       # last release, classified by labels per .github/release.yml.
       # `previous_tag_name` is auto-detected when omitted.
