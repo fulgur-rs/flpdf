@@ -369,6 +369,35 @@ pub(crate) fn emit_objstm_body<R: std::io::Read + std::io::Seek>(
     emit_objstm_body_from_resolved(&resolved?)
 }
 
+// ── ObjStm stream wrapper ────────────────────────────────────────────────────
+
+/// Wrap an [`ObjStmBody`] with FlateDecode compression and build the complete
+/// `/Type /ObjStm` stream dictionary (ISO 32000-1 §7.5.7).
+///
+/// The returned [`crate::Stream`] is ready to be written as an indirect object.
+/// Key order follows qpdf parity: `Type → N → First → Length → Filter`.
+pub(crate) fn wrap_objstm_body(body: &ObjStmBody) -> crate::Result<crate::Stream> {
+    // Build a temporary encode dict with /Filter /FlateDecode.
+    let mut encode_dict = Dictionary::new();
+    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+
+    // Compress the body bytes via the existing helper.
+    let encoded = crate::filters::encode_stream_data(&encode_dict, &body.bytes)?;
+
+    // Build the final stream dictionary in qpdf-compatible key order.
+    let mut dict = Dictionary::new();
+    dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+    dict.insert("N", Object::Integer(body.n_members as i64));
+    dict.insert("First", Object::Integer(body.first_offset as i64));
+    dict.insert("Length", Object::Integer(encoded.len() as i64));
+    dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+
+    Ok(crate::Stream {
+        dict,
+        data: encoded,
+    })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Returns `true` when `dict` contains `/Type /<expected>`.
@@ -861,5 +890,110 @@ mod tests {
                 "round-trip mismatch at index {index}"
             );
         }
+    }
+
+    // ── wrap_objstm_body tests ────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_objstm_body_dict_layout() {
+        let body = ObjStmBody {
+            bytes: b"1 0\n42\n".to_vec(),
+            first_offset: 4,
+            n_members: 1,
+        };
+        let stream = wrap_objstm_body(&body).unwrap();
+
+        assert_eq!(
+            stream.dict.get("Type"),
+            Some(&Object::Name(b"ObjStm".to_vec())),
+            "/Type must be /ObjStm"
+        );
+        assert_eq!(
+            stream.dict.get("N"),
+            Some(&Object::Integer(1)),
+            "/N must be 1"
+        );
+        assert_eq!(
+            stream.dict.get("First"),
+            Some(&Object::Integer(4)),
+            "/First must be 4"
+        );
+        assert_eq!(
+            stream.dict.get("Length"),
+            Some(&Object::Integer(stream.data.len() as i64)),
+            "/Length must equal compressed data length"
+        );
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            "/Filter must be /FlateDecode"
+        );
+    }
+
+    #[test]
+    fn wrap_objstm_body_round_trip_via_decode() {
+        let members: Vec<(ObjectRef, Object)> = vec![
+            (ObjectRef::new(5, 0), Object::Integer(10)),
+            (ObjectRef::new(6, 0), Object::Integer(20)),
+        ];
+        let body = emit_objstm_body_from_resolved(&members).unwrap();
+        let original_bytes = body.bytes.clone();
+
+        let stream = wrap_objstm_body(&body).unwrap();
+
+        let decoded = crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+        assert_eq!(
+            decoded, original_bytes,
+            "decoded bytes must equal original body bytes"
+        );
+    }
+
+    #[test]
+    fn wrap_objstm_body_round_trip_via_parse_object_stream_entry() {
+        let ref1 = ObjectRef::new(11, 0);
+        let obj1 = Object::Integer(42);
+        let ref2 = ObjectRef::new(22, 0);
+        let obj2 = Object::Integer(99);
+
+        let body =
+            emit_objstm_body_from_resolved(&[(ref1, obj1.clone()), (ref2, obj2.clone())]).unwrap();
+        let stream = wrap_objstm_body(&body).unwrap();
+
+        let parsed0 = crate::reader::parse_object_stream_entry(&stream, 0).unwrap();
+        let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
+
+        assert_eq!(parsed0, obj1, "index 0 must parse to Integer(42)");
+        assert_eq!(parsed1, obj2, "index 1 must parse to Integer(99)");
+    }
+
+    #[test]
+    fn wrap_objstm_body_empty_members_still_valid() {
+        let body = ObjStmBody {
+            bytes: vec![],
+            first_offset: 0,
+            n_members: 0,
+        };
+        let stream = wrap_objstm_body(&body).unwrap();
+
+        assert_eq!(
+            stream.dict.get("N"),
+            Some(&Object::Integer(0)),
+            "/N must be 0"
+        );
+        assert_eq!(
+            stream.dict.get("First"),
+            Some(&Object::Integer(0)),
+            "/First must be 0"
+        );
+        assert_eq!(
+            stream.dict.get("Length"),
+            Some(&Object::Integer(stream.data.len() as i64)),
+            "/Length must equal compressed data length"
+        );
+        // Even empty input produces some deflate bytes (header + checksum).
+        assert!(
+            !stream.data.is_empty(),
+            "compressed empty input must produce non-empty deflate bytes"
+        );
     }
 }
