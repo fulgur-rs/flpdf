@@ -305,8 +305,16 @@ fn generate_mode_on_xref_table_form_upgrades_to_xref_stream() {
     write_pdf_with_options(&mut pdf, &mut output, &options)
         .expect("Generate mode on xref-table input must upgrade silently to xref stream");
 
-    // The output must be re-readable.
-    check_reader(Cursor::new(output.clone())).expect("rewritten output must validate");
+    // The output must be re-readable AND structurally valid — a Report with
+    // valid == false would slip past a bare expect() on the Result, so check
+    // the flag explicitly.
+    let report = check_reader(Cursor::new(output.clone()))
+        .expect("check_reader must not return Err on rewritten output");
+    assert!(
+        report.valid,
+        "rewritten output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
     let mut roundtrip = Pdf::open(Cursor::new(output.clone())).unwrap();
 
     let mut found_objstm = false;
@@ -350,6 +358,17 @@ fn disable_mode_on_xref_table_form_preserves_classic_table() {
 
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Validate the output before asserting on its byte structure — otherwise a
+    // malformed file that happens to contain "\nxref\n" somewhere in a stream
+    // body would pass the byte-search assertion while being unreadable.
+    let report = check_reader(Cursor::new(output.clone()))
+        .expect("check_reader must not return Err on rewritten output");
+    assert!(
+        report.valid,
+        "rewritten output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
 
     // The output must contain a classic "xref" keyword (table form), not just
     // a stream-form xref.  The keyword sits on its own line preceded by LF.
