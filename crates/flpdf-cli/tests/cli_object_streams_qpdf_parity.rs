@@ -147,13 +147,22 @@ fn parse_qpdf_show_xref(output: &str) -> Vec<XrefRecord> {
         if rest.starts_with("free") {
             records.push(XrefRecord::Free);
         } else if let Some(offset_part) = rest.strip_prefix("uncompressed; offset = ") {
-            let offset: u64 = offset_part.trim().parse().unwrap_or(0);
+            // Skip lines we cannot parse rather than silently substituting 0,
+            // which would make a future qpdf format change show up as bogus
+            // "object 0 lives at offset 0" entries instead of a test diagnostic.
+            let Ok(offset) = offset_part.trim().parse::<u64>() else {
+                continue;
+            };
             records.push(XrefRecord::Uncompressed { num, offset });
         } else if let Some(compressed_part) = rest.strip_prefix("compressed; stream = ") {
             // "S, index = I"
             if let Some((stream_str, index_part)) = compressed_part.split_once(", index = ") {
-                let stream: u32 = stream_str.trim().parse().unwrap_or(0);
-                let index: u32 = index_part.trim().parse().unwrap_or(0);
+                let Ok(stream) = stream_str.trim().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(index) = index_part.trim().parse::<u32>() else {
+                    continue;
+                };
                 records.push(XrefRecord::Compressed { num, stream, index });
             }
         }
@@ -384,8 +393,33 @@ fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32>
     let bytes = std::fs::read(path).unwrap();
     let mut pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
 
+    // Defensive guard for the assumption baked into the eligibility check below:
+    // we treat every uncompressed gen-0 non-stream non-ObjStm/XRef object as
+    // eligible.  That is only correct when the fixture has no Encryption dict
+    // and no Linearization parameter dict.  If the fixture grows either, the
+    // caller must broaden this function (or pick a different fixture).
+    assert!(
+        !pdf.is_encrypted(),
+        "uncovered_eligible_objects assumes the fixture is not encrypted; \
+         broaden the eligibility check before reusing it on encrypted inputs"
+    );
+    assert!(
+        pdf.linearized_hint_ref().ok().flatten().is_none(),
+        "uncovered_eligible_objects assumes the fixture is not linearized; \
+         broaden the eligibility check before reusing it on linearized inputs"
+    );
+
     // Build set of compressed object numbers from xref.
     let compressed: BTreeSet<u32> = compressed_object_set(xref);
+
+    // Resolve every (number, generation) the document actually advertises so we
+    // can look up the real generation per number rather than hard-coding 0.
+    // Conforming xref-stream PDFs assign generation 0 to all in-use entries,
+    // but reading it from the source keeps this honest if that ever changes.
+    let mut gen_by_number: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+    for r in pdf.object_refs() {
+        gen_by_number.insert(r.number, r.generation);
+    }
 
     let mut uncovered = BTreeSet::new();
     for record in xref {
@@ -394,8 +428,16 @@ fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32>
             // Already compressed — not our target.
             _ => continue,
         };
-        // Resolve the object.
-        let obj_ref = ObjectRef::new(num, 0);
+        // Resolve the object at its real generation (0 for conforming fixtures).
+        // Non-zero generation is ineligible per ObjStm rules — skip.
+        let generation = match gen_by_number.get(&num) {
+            Some(g) => *g,
+            None => continue,
+        };
+        if generation != 0 {
+            continue;
+        }
+        let obj_ref = ObjectRef::new(num, generation);
         let obj = match pdf.resolve(obj_ref) {
             Ok(o) => o,
             // If we cannot resolve it, skip (e.g. object 0 free).
