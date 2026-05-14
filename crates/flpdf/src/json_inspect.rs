@@ -431,6 +431,148 @@ pub fn build_envelope(decode_level: DecodeLevel) -> JsonValue {
     ])
 }
 
+// ── build_pages_section ───────────────────────────────────────────────────────
+
+/// Flatten a `/Contents` entry into a list of indirect-reference strings.
+///
+/// Handles three forms:
+/// - `Object::Reference(r)` → `["N M R"]`
+/// - `Object::Array([Reference, ...])` → each element as `"N M R"` (direct
+///   streams in the array are silently skipped — they carry no ref string)
+/// - `Object::Null` or absent → `[]`
+///
+/// Direct inline Streams outside an array have no object number and are
+/// therefore skipped (spec-compliant PDFs use indirect refs for /Contents).
+fn collect_content_refs(content_obj: &Object) -> Vec<String> {
+    match content_obj {
+        Object::Reference(r) => vec![format!("{} {} R", r.number, r.generation)],
+        Object::Array(elems) => elems
+            .iter()
+            .filter_map(|e| {
+                if let Object::Reference(r) = e {
+                    Some(format!("{} {} R", r.number, r.generation))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        // Null, missing, or direct Stream — emit empty list.
+        _ => vec![],
+    }
+}
+
+/// Collect image XObject reference strings for a single page.
+///
+/// Walks the inherited `/Resources /XObject` dictionary and, for each entry
+/// whose resolved value is a Stream with `/Subtype /Image`, appends
+/// `"N M R"` (the *original* reference string) to the result. Entries that
+/// are direct inline Streams (no ref number) are skipped. The output is
+/// sorted by XObject name (alphabetical byte-lex order).
+fn collect_image_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: crate::ObjectRef,
+) -> Result<Vec<String>, ConvertError> {
+    let resources = match crate::pages::resolve_inherited_resources(pdf, page_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return Ok(vec![]),
+        Err(e) => return Err(ConvertError::PdfError(e.to_string())),
+    };
+
+    // Resolve the /XObject sub-dictionary (may itself be indirect).
+    let xobject_dict = match resources.get("XObject") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => {
+            let resolved = pdf.resolve(*r).map_err(ConvertError::from)?;
+            match resolved {
+                Object::Dictionary(d) => d,
+                _ => return Ok(vec![]),
+            }
+        }
+        _ => return Ok(vec![]),
+    };
+
+    // Iterate in name (key) order — BTreeMap gives byte-lex order automatically.
+    let mut image_refs: Vec<String> = Vec::new();
+    for (_name, value) in xobject_dict.iter() {
+        // Each XObject entry should be an indirect Reference.
+        let xobj_ref = match value {
+            Object::Reference(r) => *r,
+            // Direct inline stream — no ref string available, skip.
+            _ => continue,
+        };
+        let resolved = pdf.resolve(xobj_ref).map_err(ConvertError::from)?;
+        if let Object::Stream(stream) = &resolved {
+            if let Some(Object::Name(subtype)) = stream.dict.get("Subtype") {
+                if subtype.as_slice() == b"Image" {
+                    image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
+                }
+            }
+        }
+    }
+    Ok(image_refs)
+}
+
+/// Build the qpdf JSON v2 `"pages"` section.
+///
+/// Returns a [`JsonValue::Array`] where each element is a JSON object with
+/// keys in alphabetical order:
+/// `contents`, `images`, `label`, `object`, `outlines`, `pageposfrom1`.
+///
+/// - `label` is always `null` (placeholder until flpdf-9hc.11.5).
+/// - `outlines` is always `[]` (placeholder until flpdf-9hc.11.6).
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if the page tree cannot be traversed or any
+/// object resolution fails.
+pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+    let page_refs =
+        crate::pages::page_refs(pdf).map_err(|e| ConvertError::PdfError(e.to_string()))?;
+
+    let mut entries: Vec<JsonValue> = Vec::with_capacity(page_refs.len());
+
+    for (idx, page_ref) in page_refs.into_iter().enumerate() {
+        let pageposfrom1 = (idx as i64) + 1;
+        let object_str = format!("{} {} R", page_ref.number, page_ref.generation);
+
+        // Resolve the page dict to extract /Contents.
+        let page_obj = pdf.resolve(page_ref).map_err(ConvertError::from)?;
+        let contents_obj = match &page_obj {
+            Object::Dictionary(d) => d.get("Contents").cloned(),
+            _ => None,
+        };
+        let contents: Vec<JsonValue> = match &contents_obj {
+            Some(c) => collect_content_refs(c)
+                .into_iter()
+                .map(JsonValue::String)
+                .collect(),
+            None => vec![],
+        };
+
+        // Collect image XObject refs from (inherited) Resources.
+        let images: Vec<JsonValue> = collect_image_refs(pdf, page_ref)?
+            .into_iter()
+            .map(JsonValue::String)
+            .collect();
+
+        // Build page entry with keys in strict alphabetical order:
+        // contents < images < label < object < outlines < pageposfrom1
+        let entry = JsonValue::Object(vec![
+            ("contents".to_string(), JsonValue::Array(contents)),
+            ("images".to_string(), JsonValue::Array(images)),
+            // placeholder until flpdf-9hc.11.5 (page labels)
+            ("label".to_string(), JsonValue::Null),
+            ("object".to_string(), JsonValue::String(object_str)),
+            // placeholder until flpdf-9hc.11.6 (outline back-references)
+            ("outlines".to_string(), JsonValue::Array(vec![])),
+            ("pageposfrom1".to_string(), JsonValue::Integer(pageposfrom1)),
+        ]);
+        entries.push(entry);
+    }
+
+    Ok(JsonValue::Array(entries))
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1080,5 +1222,228 @@ mod tests {
             after.len(),
             "exactly one ref should be removed"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // build_pages_section tests (flpdf-9hc.11.4)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fn load_fixture_pdf(name: &str) -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../../tests/fixtures/compat").join(name);
+        let bytes = std::fs::read(&fixture)
+            .unwrap_or_else(|e| panic!("{name} not found at {}: {e}", fixture.display()));
+        crate::Pdf::open_mem_owned(bytes).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
+    }
+
+    // Helper: get page entry at index from build_pages_section result.
+    fn get_page_entry(pages: &JsonValue, idx: usize) -> &[(String, JsonValue)] {
+        let JsonValue::Array(arr) = pages else {
+            panic!("pages section is not an Array");
+        };
+        let JsonValue::Object(pairs) = &arr[idx] else {
+            panic!("page entry {idx} is not an Object");
+        };
+        pairs.as_slice()
+    }
+
+    // ── 26. one-page.pdf: pages array length ─────────────────────────────────
+
+    #[test]
+    fn build_pages_section_one_page_length() {
+        let mut pdf = load_fixture_pdf("one-page.pdf");
+        let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
+        let JsonValue::Array(arr) = &pages else {
+            panic!("expected Array");
+        };
+        assert_eq!(arr.len(), 1, "one-page.pdf must have exactly 1 page entry");
+    }
+
+    // ── 27. one-page.pdf: key order is alphabetical ───────────────────────────
+
+    #[test]
+    fn build_pages_section_one_page_key_order() {
+        let mut pdf = load_fixture_pdf("one-page.pdf");
+        let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
+        let pairs = get_page_entry(&pages, 0);
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "contents",
+                "images",
+                "label",
+                "object",
+                "outlines",
+                "pageposfrom1"
+            ],
+            "key order must be strictly alphabetical"
+        );
+    }
+
+    // ── 28. one-page.pdf: entry values match qpdf --json=2 --json-key=pages ──
+
+    #[test]
+    fn build_pages_section_one_page_values() {
+        // Expected from: qpdf --json=2 --json-key=pages one-page.pdf
+        // contents: ["7 0 R"], images: [], label: null, object: "3 0 R",
+        // outlines: [], pageposfrom1: 1
+        let mut pdf = load_fixture_pdf("one-page.pdf");
+        let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
+        let pairs = get_page_entry(&pages, 0);
+
+        // contents = ["7 0 R"]
+        assert_eq!(
+            pairs[0].1,
+            JsonValue::Array(vec![JsonValue::String("7 0 R".to_string())]),
+            "contents mismatch"
+        );
+        // images = []
+        assert_eq!(pairs[1].1, JsonValue::Array(vec![]), "images must be empty");
+        // label = null
+        assert_eq!(pairs[2].1, JsonValue::Null, "label must be null");
+        // object = "3 0 R"
+        assert_eq!(
+            pairs[3].1,
+            JsonValue::String("3 0 R".to_string()),
+            "object mismatch"
+        );
+        // outlines = []
+        assert_eq!(
+            pairs[4].1,
+            JsonValue::Array(vec![]),
+            "outlines must be empty"
+        );
+        // pageposfrom1 = 1
+        assert_eq!(pairs[5].1, JsonValue::Integer(1), "pageposfrom1 must be 1");
+    }
+
+    // ── 29. three-page.pdf: length and pageposfrom1 sequence ─────────────────
+
+    #[test]
+    fn build_pages_section_three_page_length_and_positions() {
+        // Expected from: qpdf --json=2 --json-key=pages three-page.pdf
+        // pages[0]: object="3 0 R", contents=["9 0 R"],  pageposfrom1=1
+        // pages[1]: object="4 0 R", contents=["10 0 R"], pageposfrom1=2
+        // pages[2]: object="5 0 R", contents=["11 0 R"], pageposfrom1=3
+        let mut pdf = load_fixture_pdf("three-page.pdf");
+        let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
+        let JsonValue::Array(arr) = &pages else {
+            panic!("expected Array");
+        };
+        assert_eq!(arr.len(), 3, "three-page.pdf must have 3 page entries");
+
+        let expected = [
+            ("3 0 R", "9 0 R", 1i64),
+            ("4 0 R", "10 0 R", 2),
+            ("5 0 R", "11 0 R", 3),
+        ];
+        for (i, (exp_obj, exp_contents, exp_pos)) in expected.iter().enumerate() {
+            let pairs = get_page_entry(&pages, i);
+            assert_eq!(
+                pairs[0].1,
+                JsonValue::Array(vec![JsonValue::String(exp_contents.to_string())]),
+                "page {i} contents mismatch"
+            );
+            assert_eq!(
+                pairs[3].1,
+                JsonValue::String(exp_obj.to_string()),
+                "page {i} object mismatch"
+            );
+            assert_eq!(
+                pairs[5].1,
+                JsonValue::Integer(*exp_pos),
+                "page {i} pageposfrom1 mismatch"
+            );
+            // label and outlines are placeholders
+            assert_eq!(pairs[2].1, JsonValue::Null, "page {i} label must be null");
+            assert_eq!(
+                pairs[4].1,
+                JsonValue::Array(vec![]),
+                "page {i} outlines must be empty"
+            );
+        }
+    }
+
+    // ── 30. attachment-two-page.pdf: length and object/contents refs ──────────
+
+    #[test]
+    fn build_pages_section_attachment_two_page_values() {
+        // Expected from: qpdf --json=2 --json-key=pages attachment-two-page.pdf
+        // pages[0]: object="6 0 R", contents=["9 0 R"],  pageposfrom1=1
+        // pages[1]: object="7 0 R", contents=["11 0 R"], pageposfrom1=2
+        let mut pdf = load_fixture_pdf("attachment-two-page.pdf");
+        let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
+        let JsonValue::Array(arr) = &pages else {
+            panic!("expected Array");
+        };
+        assert_eq!(
+            arr.len(),
+            2,
+            "attachment-two-page.pdf must have 2 page entries"
+        );
+
+        let expected = [("6 0 R", "9 0 R", 1i64), ("7 0 R", "11 0 R", 2)];
+        for (i, (exp_obj, exp_contents, exp_pos)) in expected.iter().enumerate() {
+            let pairs = get_page_entry(&pages, i);
+            assert_eq!(
+                pairs[0].1,
+                JsonValue::Array(vec![JsonValue::String(exp_contents.to_string())]),
+                "page {i} contents mismatch"
+            );
+            assert_eq!(
+                pairs[3].1,
+                JsonValue::String(exp_obj.to_string()),
+                "page {i} object mismatch"
+            );
+            assert_eq!(
+                pairs[5].1,
+                JsonValue::Integer(*exp_pos),
+                "page {i} pageposfrom1 mismatch"
+            );
+        }
+    }
+
+    // ── 31. collect_content_refs: single Reference ────────────────────────────
+
+    #[test]
+    fn collect_content_refs_single_ref() {
+        let obj = Object::Reference(crate::ObjectRef::new(7, 0));
+        let refs = collect_content_refs(&obj);
+        assert_eq!(refs, vec!["7 0 R".to_string()]);
+    }
+
+    // ── 32. collect_content_refs: Array of References ─────────────────────────
+
+    #[test]
+    fn collect_content_refs_array_of_refs() {
+        let obj = Object::Array(vec![
+            Object::Reference(crate::ObjectRef::new(4, 0)),
+            Object::Reference(crate::ObjectRef::new(5, 0)),
+        ]);
+        let refs = collect_content_refs(&obj);
+        assert_eq!(refs, vec!["4 0 R".to_string(), "5 0 R".to_string()]);
+    }
+
+    // ── 33. collect_content_refs: Null → empty ────────────────────────────────
+
+    #[test]
+    fn collect_content_refs_null_returns_empty() {
+        let obj = Object::Null;
+        let refs = collect_content_refs(&obj);
+        assert!(refs.is_empty());
+    }
+
+    // ── 34. collect_content_refs: Array with mixed types skips non-refs ───────
+
+    #[test]
+    fn collect_content_refs_array_skips_non_refs() {
+        let obj = Object::Array(vec![
+            Object::Reference(crate::ObjectRef::new(3, 0)),
+            Object::Integer(99), // not a ref — must be skipped
+            Object::Reference(crate::ObjectRef::new(5, 0)),
+        ]);
+        let refs = collect_content_refs(&obj);
+        assert_eq!(refs, vec!["3 0 R".to_string(), "5 0 R".to_string()]);
     }
 }
