@@ -69,7 +69,7 @@ pub use reader::{Pdf, PdfOpenOptions, Permissions};
 pub use security::password::PasswordMode;
 pub use writer::{
     effective_pdf_version, parse_pdf_version, write_pdf, write_pdf_with_options, write_qdf,
-    WriteOptions,
+    ObjectStreamMode, WriteOptions,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,

@@ -90,9 +90,15 @@ pub(crate) fn eligibility_context<R: std::io::Read + std::io::Seek>(
 // ── Packing planner types ────────────────────────────────────────────────────
 
 /// Controls how the ObjStm packing planner groups objects into batches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ObjectStreamMode {
+///
+/// Mirrors `qpdf --object-streams=preserve|disable|generate`. The default,
+/// `Preserve`, matches qpdf's behaviour for a plain `qpdf in.pdf out.pdf`
+/// invocation: ObjStms present in the input are reused; their membership is
+/// not repartitioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectStreamMode {
     /// Keep the original ObjStm membership from the source document.
+    #[default]
     Preserve,
     /// Emit no ObjStms; all eligible objects become plain indirects.
     Disable,
@@ -129,6 +135,18 @@ impl Default for PlannerConfig {
 pub(crate) struct PackingPlan {
     /// Each inner `Vec` is one ObjStm batch, members in deterministic order.
     pub batches: Vec<Vec<ObjectRef>>,
+}
+
+/// Convert public [`WriteOptions`](crate::WriteOptions) into an internal
+/// [`PlannerConfig`].  The conversion is direct: `WriteOptions.object_streams`
+/// names the policy, and the planner's batch cap defaults to qpdf's value of
+/// 100.  Future writer-side knobs (e.g. an explicit cap override) would be
+/// threaded through this conversion.
+pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> PlannerConfig {
+    PlannerConfig {
+        mode: options.object_streams,
+        batch_size_cap: DEFAULT_BATCH_SIZE_CAP,
+    }
 }
 
 // ── Packing planner ──────────────────────────────────────────────────────────
@@ -995,5 +1013,49 @@ mod tests {
             !stream.data.is_empty(),
             "compressed empty input must produce non-empty deflate bytes"
         );
+    }
+
+    // ── Mode dispatch (flpdf-9hc.5.5) ────────────────────────────────────────
+
+    #[test]
+    fn write_options_default_is_preserve_mode() {
+        let options = crate::WriteOptions::default();
+        assert_eq!(options.object_streams, ObjectStreamMode::Preserve);
+    }
+
+    #[test]
+    fn object_stream_mode_default_is_preserve() {
+        assert_eq!(ObjectStreamMode::default(), ObjectStreamMode::Preserve);
+    }
+
+    #[test]
+    fn planner_config_from_options_maps_preserve() {
+        let options = crate::WriteOptions {
+            object_streams: ObjectStreamMode::Preserve,
+            ..Default::default()
+        };
+        let config = planner_config_from_options(&options);
+        assert_eq!(config.mode, ObjectStreamMode::Preserve);
+        assert_eq!(config.batch_size_cap, DEFAULT_BATCH_SIZE_CAP);
+    }
+
+    #[test]
+    fn planner_config_from_options_maps_disable() {
+        let options = crate::WriteOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..Default::default()
+        };
+        let config = planner_config_from_options(&options);
+        assert_eq!(config.mode, ObjectStreamMode::Disable);
+    }
+
+    #[test]
+    fn planner_config_from_options_maps_generate() {
+        let options = crate::WriteOptions {
+            object_streams: ObjectStreamMode::Generate,
+            ..Default::default()
+        };
+        let config = planner_config_from_options(&options);
+        assert_eq!(config.mode, ObjectStreamMode::Generate);
     }
 }

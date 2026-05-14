@@ -1,5 +1,6 @@
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
+pub use object_streams::ObjectStreamMode;
 
 use crate::parser::Parser;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
@@ -45,6 +46,16 @@ pub struct WriteOptions {
     /// When `false` (the default) the existing incremental-update write path is
     /// used, preserving the source bytes verbatim.
     pub full_rewrite: bool,
+
+    /// Object stream emission policy for the output.
+    ///
+    /// Mirrors `qpdf --object-streams=preserve|disable|generate`. Defaults to
+    /// [`ObjectStreamMode::Preserve`], matching qpdf's behaviour for a plain
+    /// `qpdf in.pdf out.pdf` invocation.
+    ///
+    /// Only consulted by writer paths that emit ObjStms; the incremental copy
+    /// path that simply appends to the source bytes ignores it.
+    pub object_streams: ObjectStreamMode,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
