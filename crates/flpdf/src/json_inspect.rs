@@ -671,6 +671,13 @@ mod tests {
         // one-page.pdf has objects 1..7 (some may be free) plus trailer.
         // At minimum, trailer must be present.
         assert!(keys.contains(&"trailer"), "trailer key missing: {keys:?}");
+        // Exactly 7 object entries + 1 trailer = 8 keys total (one-page.pdf has
+        // objects 1..7, all of which are live).
+        assert_eq!(
+            map_pairs.len(),
+            8,
+            "expected 7 objs + trailer, got {keys:?}"
+        );
         // Keys must be alphabetically sorted.
         let mut sorted = keys.clone();
         sorted.sort();
