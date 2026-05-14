@@ -238,27 +238,32 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
         report.diagnostics.entries()
     );
 
-    // Re-open and assert at least one /Type /ObjStm exists.
+    // Re-open: assert at least one /Type /ObjStm exists and check /N.
+    // The fixture has 2 eligible objects (Catalog obj 1 + Pages obj 2), so
+    // a correctly-working Generate mode must pack both into the container.
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
-    let mut found_objstm = false;
+    let mut objstm_n: Option<i64> = None;
     for obj_ref in reopened.object_refs() {
         if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
             if matches!(
                 s.dict.get("Type"),
                 Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
             ) {
-                found_objstm = true;
+                objstm_n = match s.dict.get("N") {
+                    Some(Object::Integer(n)) => Some(*n),
+                    _ => None,
+                };
                 break;
             }
         }
     }
-    assert!(
-        found_objstm,
-        "Generate mode must emit at least one /Type /ObjStm"
+    let n = objstm_n.expect("Generate mode must emit at least one /Type /ObjStm");
+    assert_eq!(
+        n, 2,
+        "Generate mode must pack both eligible objects (Catalog + Pages) into ObjStm; /N = {n}"
     );
 
-    // Verify objects still resolve — the fact that an ObjStm exists and objects
-    // resolve correctly implies they are stored as Compressed xref entries.
+    // Verify objects still resolve correctly from the ObjStm container.
     let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
     let catalog = reopened2.resolve(ObjectRef::new(1, 0)).unwrap();
     match &catalog {
@@ -270,6 +275,17 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
             );
         }
         other => panic!("Object 1 should be a Dictionary, got {:?}", other),
+    }
+    let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
+    match &pages {
+        Object::Dictionary(d) => {
+            assert_eq!(
+                d.get("Type"),
+                Some(&Object::Name(b"Pages".to_vec())),
+                "Object 2 must be the Pages dict"
+            );
+        }
+        other => panic!("Object 2 should be a Dictionary, got {:?}", other),
     }
 }
 
