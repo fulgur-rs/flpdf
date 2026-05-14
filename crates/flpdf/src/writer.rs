@@ -1,3 +1,6 @@
+#[path = "writer/object_streams.rs"]
+pub(crate) mod object_streams;
+
 use crate::parser::Parser;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
