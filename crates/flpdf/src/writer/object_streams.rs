@@ -737,7 +737,7 @@ mod tests {
     /// ## Fixture layout
     ///   0          free
     ///   1 0 obj    Catalog  (plain indirect)
-    ///   2 0 obj    Pages    (compressed in ObjStm 3, index 1)
+    ///   2 0 obj    Pages    (compressed in ObjStm 3, index 0)
     ///   3 0 obj    ObjStm   with /Length 5 0 R  (plain indirect; parser cannot decode it)
     ///   4 0 obj    XRef stream
     ///   5 0 obj    Integer  (the actual length value; serves as /Length target)
@@ -756,11 +756,11 @@ mod tests {
     /// must not appear in any batch) should still hold.
     #[test]
     fn planner_excludes_indirect_objstm_length_target() {
-        // Build ObjStm payload containing Catalog(1,0) and Pages(2,0).
-        // We use build_objstm_payload helper with object numbers 1 and 2.
-        let catalog_bytes: &[u8] = b"<< /Type /Catalog /Pages 2 0 R >>";
+        // Build ObjStm payload containing only Pages(2,0).  Catalog (1,0) is
+        // emitted as a plain indirect object below — putting it in both places
+        // would create a ghost member that no xref entry points to.
         let pages_bytes: &[u8] = b"<< /Type /Pages /Count 0 /Kids [] >>";
-        let (stream_data, first) = build_objstm_payload(&[(1, catalog_bytes), (2, pages_bytes)]);
+        let (stream_data, first) = build_objstm_payload(&[(2, pages_bytes)]);
         let stream_len = stream_data.len();
 
         // We will write the length holder (5 0 obj) as a plain integer.
@@ -774,7 +774,7 @@ mod tests {
         // 3 0 obj — ObjStm with /Length 5 0 R (indirect)
         let objstm_offset = bytes.len();
         let objstm_header = format!(
-            "3 0 obj\n<< /Type /ObjStm /N 2 /First {first} /Length 5 0 R /Filter /FlateDecode >>\nstream\n"
+            "3 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length 5 0 R /Filter /FlateDecode >>\nstream\n"
         );
         bytes.extend_from_slice(objstm_header.as_bytes());
         bytes.extend_from_slice(&stream_data);
@@ -792,8 +792,8 @@ mod tests {
         append_xref_entry(&mut xref_entries, 0, 0, 0);
         // 1: Catalog at catalog_offset
         append_xref_entry(&mut xref_entries, 1, catalog_offset as u32, 0);
-        // 2: Pages compressed in ObjStm 3, index 1
-        append_xref_entry(&mut xref_entries, 2, 3, 1);
+        // 2: Pages compressed in ObjStm 3, index 0
+        append_xref_entry(&mut xref_entries, 2, 3, 0);
         // 3: ObjStm at objstm_offset
         append_xref_entry(&mut xref_entries, 1, objstm_offset as u32, 0);
         // 4: XRef at xref_offset (self-referential)
