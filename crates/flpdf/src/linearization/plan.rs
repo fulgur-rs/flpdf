@@ -2108,7 +2108,10 @@ mod tests {
                 3,
                 b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>",
             ),
-            (5, b"<< /Font << /F1 99 0 R >> >>"),
+            (
+                5,
+                b"<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>",
+            ),
         ];
         let (stream1_data, first1) = build_objstm_payload_plan(objstm1_members);
         let n1 = objstm1_members.len() as u32;
