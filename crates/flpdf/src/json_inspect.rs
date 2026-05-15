@@ -820,10 +820,13 @@ pub fn build_qpdf_json_v2<R: Read + Seek>(
     let pagelabels = build_pagelabels_section(pdf)?;
     pairs.push(("pagelabels".to_string(), pagelabels));
 
-    // qpdf metadata: maxobjectid comes from the highest live object number;
-    // pushedinheritedpageresources / calledgetallpages mirror qpdf's defaults.
+    // qpdf metadata: maxobjectid is the highest object id present in the
+    // xref table, *including* deleted/free entries — qpdf's JSON v2 spec
+    // wants the highest ID ever assigned in the file, not the highest live
+    // ID. pushedinheritedpageresources / calledgetallpages mirror qpdf's
+    // defaults.
     let max_object_id = pdf
-        .live_object_refs()
+        .object_refs()
         .iter()
         .map(|r| r.number)
         .max()
