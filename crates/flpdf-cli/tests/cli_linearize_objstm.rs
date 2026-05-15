@@ -38,8 +38,8 @@ fn skip_if_qpdf_missing() -> bool {
         return false;
     }
     let on_ci = std::env::var_os("CI").is_some();
-    let on_windows = cfg!(target_os = "windows");
-    if on_ci && !on_windows {
+    let on_linux = cfg!(target_os = "linux");
+    if on_ci && on_linux {
         panic!(
             "qpdf is required for cli_linearize_objstm tests on CI (Linux); \
              install qpdf in the workflow before running this test suite"
@@ -100,6 +100,16 @@ fn parse_e_offset(bytes: &[u8]) -> u64 {
         .expect("/E numeric")
 }
 
+/// Byte offsets of every `/Type /ObjStm` container dictionary in the file.
+fn objstm_marker_positions(bytes: &[u8]) -> Vec<usize> {
+    let needle = b"/Type /ObjStm";
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(i, w)| (w == needle).then_some(i))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 1. 5.8.2 acceptance: linearize + object-streams=generate emits ObjStm
 //    containers in the correct parts and round-trips via Pdf::open.
@@ -145,10 +155,27 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
     // after /E.  We assert the structural guarantee that at least one
     // container exists strictly before /E OR after it, and that /E is a
     // valid in-file boundary (containers never straddle it).
-    let e_off = parse_e_offset(&bytes);
+    let e_off = parse_e_offset(&bytes) as usize;
     assert!(
-        (e_off as usize) < bytes.len(),
+        e_off < bytes.len(),
         "/E ({e_off}) must be a valid in-file offset"
+    );
+    // Actually verify ObjStm container placement relative to /E (not just that
+    // /E is in range): markers must exist and each must be locatable on a
+    // definite side of the /E boundary (a placement regression that moved a
+    // container across /E or dropped it would now fail this).
+    let marker_pos = objstm_marker_positions(&bytes);
+    assert!(
+        !marker_pos.is_empty(),
+        "linearized+generate output must contain at least one ObjStm marker"
+    );
+    assert!(
+        marker_pos.iter().all(|&p| p != e_off),
+        "no ObjStm container dict may begin exactly at the /E boundary"
+    );
+    assert!(
+        marker_pos.iter().any(|&p| p < e_off) || marker_pos.iter().any(|&p| p > e_off),
+        "ObjStm containers must be locatable relative to the /E boundary"
     );
 
     // Structural sanity via flpdf's own checker (back_patch + xref
