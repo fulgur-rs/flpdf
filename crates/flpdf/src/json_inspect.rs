@@ -1421,6 +1421,21 @@ fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
     let minute = take(10, 12, zero_default)?;
     let second = take(12, 14, zero_default)?;
 
+    // Numeric range validation so we don't emit ISO 8601 strings that
+    // downstream parsers will reject (e.g. month=13, hour=24). All fields
+    // are guaranteed to be 2-digit ASCII at this point.
+    let in_range = |s: &str, lo: u8, hi: u8| -> bool {
+        s.parse::<u8>().map(|n| n >= lo && n <= hi).unwrap_or(false)
+    };
+    if !in_range(month, 1, 12)
+        || !in_range(day, 1, 31)
+        || !in_range(hour, 0, 23)
+        || !in_range(minute, 0, 59)
+        || !in_range(second, 0, 59)
+    {
+        return None;
+    }
+
     // Parse timezone. Trailing garbage (anything not empty / Z / z / +... /
     // -...) must yield None rather than silently defaulting to "Z", to keep
     // the function's "unparseable input -> None" contract honest.
@@ -1456,12 +1471,17 @@ fn parse_tz_offset(sign: char, rest: &str) -> Option<String> {
     } else {
         return None;
     };
-    // Validate digits
+    // Validate digits and numeric ranges for the tz offset.
     if !hh.chars().all(|c| c.is_ascii_digit()) || !mm.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
+    let hh_n = hh.parse::<u8>().ok()?;
+    let mm_n = mm.parse::<u8>().ok()?;
+    if hh_n > 23 || mm_n > 59 {
+        return None;
+    }
     // If +00:00, emit Z
-    if sign == '+' && hh == "00" && mm == "00" {
+    if sign == '+' && hh_n == 0 && mm_n == 0 {
         Some("Z".to_string())
     } else {
         Some(format!("{sign}{hh}:{mm}"))
@@ -5043,6 +5063,30 @@ mod tests {
         assert!(parse_pdf_date(b"D:2026").is_some());
         assert!(parse_pdf_date(b"D:202601").is_some());
         assert!(parse_pdf_date(b"D:20260101000000").is_some());
+    }
+
+    #[test]
+    fn parse_pdf_date_out_of_range_components_return_none() {
+        // Regression for CodeRabbit's range-validation finding. ISO 8601
+        // parsers reject month > 12, day > 31, hour > 23, minute > 59,
+        // second > 59. The PDF date parser must do the same so the function
+        // never emits a malformed ISO timestamp.
+        assert_eq!(parse_pdf_date(b"D:20261301000000Z"), None, "month 13");
+        assert_eq!(parse_pdf_date(b"D:20260132000000Z"), None, "day 32");
+        assert_eq!(parse_pdf_date(b"D:20260101240000Z"), None, "hour 24");
+        assert_eq!(parse_pdf_date(b"D:20260101006000Z"), None, "minute 60");
+        assert_eq!(parse_pdf_date(b"D:20260101000060Z"), None, "second 60");
+        // Month 00 / day 00 are also rejected.
+        assert_eq!(parse_pdf_date(b"D:20260001000000Z"), None, "month 00");
+        assert_eq!(parse_pdf_date(b"D:20260100000000Z"), None, "day 00");
+    }
+
+    #[test]
+    fn parse_pdf_date_out_of_range_tz_offset_returns_none() {
+        // tz offsets above 23 hours or 59 minutes are not valid ISO 8601.
+        assert_eq!(parse_pdf_date(b"D:20260101000000+99'00'"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101000000+09'99'"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101000000-2400"), None);
     }
 
     #[test]
