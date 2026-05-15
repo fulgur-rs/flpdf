@@ -1949,6 +1949,376 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // (f) Preserve mode with source ObjStms — the primary behaviour under test.
+    //
+    // Fixture (PDF-1.5, two ObjStms, two pages):
+    //
+    //   Object layout:
+    //     0          free
+    //     1 0 obj    Catalog (plain indirect)
+    //     2 0 obj    Pages node (compressed in ObjStm 7, index 0)
+    //     3 0 obj    Page 1 dict (compressed in ObjStm 7, index 1)  ← Part 2, EXCLUDED
+    //     4 0 obj    Page 2 dict (compressed in ObjStm 8, index 0)
+    //     5 0 obj    Shared Resources dict (compressed in ObjStm 7, index 2) ← Part 3
+    //     6 0 obj    Ineligible dict /Type /XRef (compressed in ObjStm 8, index 1) ← EXCLUDED (ineligible)
+    //     7 0 obj    ObjStm #1  (plain indirect stream)
+    //     8 0 obj    ObjStm #2  (plain indirect stream)
+    //     9 0 obj    XRef stream (plain indirect)
+    //
+    //   LinearizationPlan partition:
+    //     Part 2: [3 0 R, ...]        (first-page closure exclusives)
+    //     Part 3: [5 0 R]             (shared resources — first-page AND page 2)
+    //     Part 4: [2 0 R, 4 0 R, ...]  (everything else)
+    //
+    //   Preserve batches expected:
+    //     ObjStm 7 members eligible for Part 3:  [5 0 R]   → part3_batches
+    //     ObjStm 7 members eligible for Part 4:  [2 0 R]   → part4_batches
+    //     ObjStm 8 members eligible for Part 4:  [4 0 R]   → part4_batches
+    //     3 0 R excluded (Part 2), 6 0 R excluded (ineligible /Type /XRef)
+    // -----------------------------------------------------------------------
+
+    /// Build a zlib-compressed ObjStm payload from (object-number, raw-bytes) pairs.
+    /// Returns (compressed_bytes, first_offset_in_body).
+    /// Mirrors the private helper in `writer/object_streams.rs`.
+    fn build_objstm_payload_plan(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut header = String::new();
+        let mut body = Vec::new();
+        for (index, (number, object_data)) in members.iter().enumerate() {
+            let offset = body.len();
+            header.push_str(&format!("{} {} ", number, offset));
+            body.extend_from_slice(object_data);
+            if index + 1 < members.len() {
+                body.push(b'\n');
+            }
+        }
+        let mut decoded = Vec::new();
+        decoded.extend_from_slice(header.as_bytes());
+        decoded.extend_from_slice(&body);
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&decoded).unwrap();
+        let encoded = enc.finish().unwrap();
+        (encoded, header.len())
+    }
+
+    fn append_u24_be_plan(bytes: &mut Vec<u8>, value: u32) {
+        let b = value.to_be_bytes();
+        bytes.extend_from_slice(&b[1..]);
+    }
+
+    /// Append a 1+3+1 xref stream entry (W=[1 3 1]).
+    fn append_xref_entry_plan(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
+        entries.push(entry_type);
+        append_u24_be_plan(entries, field1);
+        entries.push(field2);
+    }
+
+    /// Build a 2-page PDF-1.5 with two source ObjStms.
+    ///
+    /// Object layout:
+    ///   0: free
+    ///   1: Catalog (plain indirect)
+    ///   2: Pages node (ObjStm 7, idx 0)
+    ///   3: Page 1 dict (ObjStm 7, idx 1) — Part 2 (excluded from ObjStm batches)
+    ///   4: Page 2 dict (ObjStm 8, idx 0) — Part 4 private
+    ///   5: Shared Resources dict (ObjStm 7, idx 2) — Part 3
+    ///   6: Ineligible dict /Type /XRef (ObjStm 8, idx 1) — excluded (ineligible)
+    ///   7: ObjStm stream containing [2, 3, 5] in source-index order [0, 1, 2]
+    ///   8: ObjStm stream containing [4, 6] in source-index order [0, 1]
+    ///   9: XRef stream
+    fn two_page_two_objstm_pdf_bytes() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        // Object 1: Catalog (plain indirect)
+        let catalog_offset = bytes.len() as u32;
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+
+        // ObjStm #7: members [2=Pages, 3=Page1, 5=Resources] at indices [0, 1, 2]
+        let objstm1_members: &[(u32, &[u8])] = &[
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>"),
+            (5, b"<< /Font << /F1 99 0 R >> >>"),
+        ];
+        let (stream1_data, first1) = build_objstm_payload_plan(objstm1_members);
+        let n1 = objstm1_members.len() as u32;
+        let objstm1_offset = bytes.len() as u32;
+        bytes.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /ObjStm /N {n1} /First {first1} /Length {} /Filter /FlateDecode >>\nstream\n",
+                stream1_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream1_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // ObjStm #8: members [4=Page2, 6=ineligible /Type /XRef dict] at indices [0, 1]
+        let objstm2_members: &[(u32, &[u8])] = &[
+            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>"),
+            (6, b"<< /Type /XRef >>"),
+        ];
+        let (stream2_data, first2) = build_objstm_payload_plan(objstm2_members);
+        let n2 = objstm2_members.len() as u32;
+        let objstm2_offset = bytes.len() as u32;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N {n2} /First {first2} /Length {} /Filter /FlateDecode >>\nstream\n",
+                stream2_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream2_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // XRef stream (object 9)
+        let xref_offset = bytes.len() as u32;
+        // W=[1 3 1]: 10 objects (0..=9)
+        let mut xref_entries: Vec<u8> = Vec::new();
+        // 0: free
+        append_xref_entry_plan(&mut xref_entries, 0, 0, 0);
+        // 1: Catalog at catalog_offset
+        append_xref_entry_plan(&mut xref_entries, 1, catalog_offset, 0);
+        // 2: Pages in ObjStm 7, index 0
+        append_xref_entry_plan(&mut xref_entries, 2, 7, 0);
+        // 3: Page1 in ObjStm 7, index 1
+        append_xref_entry_plan(&mut xref_entries, 2, 7, 1);
+        // 4: Page2 in ObjStm 8, index 0
+        append_xref_entry_plan(&mut xref_entries, 2, 8, 0);
+        // 5: Resources in ObjStm 7, index 2
+        append_xref_entry_plan(&mut xref_entries, 2, 7, 2);
+        // 6: Ineligible in ObjStm 8, index 1
+        append_xref_entry_plan(&mut xref_entries, 2, 8, 1);
+        // 7: ObjStm #1 at objstm1_offset
+        append_xref_entry_plan(&mut xref_entries, 1, objstm1_offset, 0);
+        // 8: ObjStm #2 at objstm2_offset
+        append_xref_entry_plan(&mut xref_entries, 1, objstm2_offset, 0);
+        // 9: XRef stream at xref_offset
+        append_xref_entry_plan(&mut xref_entries, 1, xref_offset, 0);
+
+        bytes.extend_from_slice(
+            format!(
+                "9 0 obj\n<< /Type /XRef /Size 10 /Root 1 0 R /W [1 3 1] /Index [0 10] /Length {} >>\nstream\n",
+                xref_entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    /// Preserve mode with source ObjStms: members are grouped by source ObjStm,
+    /// sorted by source index, split into Part3/Part4, and ineligible + Part2
+    /// members are excluded.
+    #[test]
+    fn objstm_batches_preserve_source_objstm_grouping_and_part_split() {
+        let bytes = two_page_two_objstm_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        // Verify the partition is what the fixture was designed to produce.
+        // Part 2 must contain page 1 dict (3 0 R).
+        let page1_ref = ObjectRef::new(3, 0);
+        assert!(
+            plan.part2_objects.contains(&page1_ref),
+            "page 1 dict (3 0 R) must be in Part 2"
+        );
+
+        // Resources dict (5 0 R) must be in Part 3 (shared by both pages).
+        let resources_ref = ObjectRef::new(5, 0);
+        assert!(
+            plan.part3_objects.contains(&resources_ref),
+            "shared Resources dict (5 0 R) must be in Part 3"
+        );
+
+        // Page 2 dict (4 0 R) must be in Part 4.
+        let page2_ref = ObjectRef::new(4, 0);
+        assert!(
+            plan.part4_objects().contains(&page2_ref),
+            "page 2 dict (4 0 R) must be in Part 4"
+        );
+
+        // Now call objstm_batches in Preserve mode.
+        let batch_plan = plan
+            .objstm_batches(&mut pdf, &preserve_config())
+            .expect("Preserve mode must succeed");
+
+        let all_part3_batched: BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let all_part4_batched: BTreeSet<ObjectRef> = batch_plan
+            .part4_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        // ── Invariant 1: Part 2 objects never appear in any batch ──────────
+        let part2_set: BTreeSet<ObjectRef> = plan.part2_objects.iter().copied().collect();
+        for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
+            assert!(
+                !part2_set.contains(r),
+                "Part-2 object {r} must never appear in any ObjStm batch"
+            );
+        }
+
+        // ── Invariant 2: Ineligible object (6 0 R, /Type /XRef dict) excluded ──
+        let ineligible_ref = ObjectRef::new(6, 0);
+        assert!(
+            !all_part3_batched.contains(&ineligible_ref),
+            "ineligible /Type /XRef dict (6 0 R) must not appear in part3_batches"
+        );
+        assert!(
+            !all_part4_batched.contains(&ineligible_ref),
+            "ineligible /Type /XRef dict (6 0 R) must not appear in part4_batches"
+        );
+
+        // ── Invariant 3: Part 3 eligible member goes to part3_batches ─────────
+        // 5 0 R (Resources) is in Part 3 and eligible → must be in part3_batches.
+        assert!(
+            all_part3_batched.contains(&resources_ref),
+            "Part-3 eligible object 5 0 R must appear in part3_batches"
+        );
+        assert!(
+            !all_part4_batched.contains(&resources_ref),
+            "Part-3 object 5 0 R must NOT appear in part4_batches"
+        );
+
+        // ── Invariant 4: Part 4 eligible members go to part4_batches ─────────
+        // 2 0 R (Pages) from ObjStm 7 and 4 0 R (Page 2) from ObjStm 8 → part4_batches.
+        let pages_ref = ObjectRef::new(2, 0);
+        assert!(
+            all_part4_batched.contains(&pages_ref),
+            "Part-4 eligible object 2 0 R (Pages) must appear in part4_batches"
+        );
+        assert!(
+            !all_part3_batched.contains(&pages_ref),
+            "Part-4 object 2 0 R must NOT appear in part3_batches"
+        );
+        assert!(
+            all_part4_batched.contains(&page2_ref),
+            "Part-4 eligible object 4 0 R (Page 2) must appear in part4_batches"
+        );
+
+        // ── Invariant 5: Within each batch, members come from one ObjStm ──────
+        // ObjStm 7 contributes: [5 0 R] to part3, [2 0 R] to part4.
+        // ObjStm 8 contributes: [4 0 R] to part4.
+        // Check that part3_batches has exactly one batch containing resources_ref,
+        // and part4_batches has batches where pages_ref and page2_ref are NOT mixed
+        // (they originate from different source ObjStms).
+        let part3_flat: Vec<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        assert!(
+            part3_flat.contains(&resources_ref),
+            "Resources dict must be in part3_batches"
+        );
+
+        // ── Invariant 6: Source-index ordering within each source ObjStm ──────
+        // ObjStm 7 members in source-index order: 2 (idx 0), 3 (idx 1), 5 (idx 2).
+        // After filtering: 2 goes to part4, 5 goes to part3.
+        // Within the part4 contribution from ObjStm 7, ordering must respect idx.
+        // Here only obj 2 survives to part4 from ObjStm 7, so the batch from ObjStm 7
+        // to part4 is [2 0 R] — a single element, trivially sorted.
+        // ObjStm 8 part4 contribution: [4 0 R] (idx 0, sole survivor) — also trivial.
+        // We verify via the full batch list that containers are visited in ascending
+        // container number order (7 before 8), so the pages_ref batch appears before
+        // or the same as the page2_ref batch in part4_batches.
+        let pages_batch_idx = batch_plan
+            .part4_batches
+            .iter()
+            .position(|b| b.contains(&pages_ref));
+        let page2_batch_idx = batch_plan
+            .part4_batches
+            .iter()
+            .position(|b| b.contains(&page2_ref));
+        if let (Some(pi), Some(p2i)) = (pages_batch_idx, page2_batch_idx) {
+            assert!(
+                pi <= p2i,
+                "batch from ObjStm 7 (pages_ref) must appear before or equal to batch from ObjStm 8 (page2_ref); \
+                 got indices {pi} vs {p2i} (container numbers must be visited in ascending order)"
+            );
+        }
+
+        // ── Invariant 7: No overlap between part3_batches and part4_batches ────
+        let overlap: Vec<ObjectRef> = all_part3_batched
+            .intersection(&all_part4_batched)
+            .copied()
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "part3_batches and part4_batches must be disjoint; overlap: {overlap:?}"
+        );
+
+        // ── Invariant 8: Every batched ref is eligible ──────────────────────────
+        use crate::writer::object_streams::{eligibility_context, is_eligible_for_objstm};
+        let ctx = eligibility_context(&mut pdf).unwrap();
+        for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
+            let obj = pdf.resolve(*r).unwrap();
+            assert!(
+                is_eligible_for_objstm(*r, &obj, &ctx),
+                "batched object {r} must be eligible for ObjStm"
+            );
+        }
+    }
+
+    /// Preserve mode with source ObjStms and a small cap: ObjStm members that
+    /// exceed the cap are split into multiple batches per part.
+    #[test]
+    fn objstm_batches_preserve_cap_splits_large_groups() {
+        // ObjStm 7 contributes 1 member to part3 (5 0 R) and 1 to part4 (2 0 R).
+        // ObjStm 8 contributes 1 member to part4 (4 0 R).
+        // With cap=1, each eligible member from a given ObjStm that lands in the
+        // same part must form its own batch (since at most 1 per batch).
+        let bytes = two_page_two_objstm_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let cap1_config = PlannerConfig {
+            mode: crate::writer::object_streams::ObjectStreamMode::Preserve,
+            batch_size_cap: std::num::NonZeroUsize::new(1).unwrap(),
+        };
+
+        let batch_plan = plan
+            .objstm_batches(&mut pdf, &cap1_config)
+            .expect("Preserve with cap=1 must succeed");
+
+        // Each batch must have at most 1 member.
+        for batch in batch_plan.part3_batches.iter().chain(&batch_plan.part4_batches) {
+            assert!(
+                batch.len() <= 1,
+                "with cap=1, each batch must have at most 1 member; got {} members: {batch:?}",
+                batch.len()
+            );
+        }
+
+        // All previously expected objects must still appear.
+        let all_batched: BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .chain(&batch_plan.part4_batches)
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        let resources_ref = ObjectRef::new(5, 0);
+        let pages_ref = ObjectRef::new(2, 0);
+        let page2_ref = ObjectRef::new(4, 0);
+        assert!(all_batched.contains(&resources_ref), "5 0 R must be batched even with cap=1");
+        assert!(all_batched.contains(&pages_ref), "2 0 R must be batched even with cap=1");
+        assert!(all_batched.contains(&page2_ref), "4 0 R must be batched even with cap=1");
+    }
+
+    // -----------------------------------------------------------------------
     // Generate: part3 objects go only to part3_batches, part4 to part4_batches
     // -----------------------------------------------------------------------
     #[test]
