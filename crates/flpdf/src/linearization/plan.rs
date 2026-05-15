@@ -812,7 +812,7 @@ impl LinearizationPlan {
     /// |------|--------|
     /// | `Disable` | Both batch lists are empty (no ObjStms emitted). |
     /// | `Generate` | Eligible Part-3 objects are packed into `part3_batches`; eligible Part-4 objects into `part4_batches`. |
-    /// | `Preserve` | Existing source ObjStm membership is re-used, but any member in `part2_objects` or ineligible per [`is_eligible_for_objstm`] is silently dropped. Members that span the Part-3/Part-4 boundary are split into separate batches per part. If the source document contained no ObjStms, both batch lists are empty (no fall-through to Generate). |
+    /// | `Preserve` | Existing source ObjStm membership is re-used, but any member in `part2_objects` or ineligible per [`is_eligible_for_objstm`] is silently dropped. Members that span the Part-3/Part-4 boundary are split into separate batches per part. If the source document contained no ObjStms, both batch lists are **empty** — Preserve does **not** fall through to Generate; it mirrors the behaviour of the non-linearized `writer::object_streams::plan_preserve` and qpdf's `--object-streams=preserve` semantics (preserve means "keep what was there", not "invent new ObjStms"). |
     ///
     /// # Invariants
     ///
