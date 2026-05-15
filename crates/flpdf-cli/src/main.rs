@@ -428,14 +428,12 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     }
 
     // 3. Resolve stream-data mode.
-    let has_json_output = cli.json_output.is_some();
-    let stream_data_raw = cli.json_stream_data.as_deref().unwrap_or({
-        if has_json_output {
-            "inline"
-        } else {
-            "none"
-        }
-    });
+    //
+    // The help text documents the default as "none". Stream payloads are
+    // never embedded or written to disk unless the caller explicitly opts
+    // in via --json-stream-data, even when --json-output is used: leaking
+    // stream contents based on an unrelated flag would be surprising.
+    let stream_data_raw = cli.json_stream_data.as_deref().unwrap_or("none");
 
     let prefix_default = || -> String {
         cli.json_stream_prefix
@@ -489,21 +487,79 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         locked.flush()?;
     }
 
-    // 9. Write side files for stream-data=file mode.
+    // 9. Write side files for stream-data=file mode — only for streams
+    // that actually survived --json-key / --json-object filtering. Walk
+    // the final JSON and collect every "datafile" value emitted in the
+    // qpdf objects map, then write exactly those streams to disk. Without
+    // this scoping, --json-key=pages --json-stream-data=file would dump
+    // every stream to the filesystem even though the qpdf section was
+    // filtered out of the output.
     if let StreamDataMode::File { ref prefix } = stream_mode {
-        // Re-open PDF to iterate streams and write side files.
-        let mut pdf2 = open_pdf(input, cli.repair, &cli.password)?;
-        let all_refs = pdf2.live_object_refs();
-        for oref in all_refs {
-            let obj = pdf2.resolve(oref)?;
-            if let Object::Stream(stream) = obj {
-                let side_path = format!("{prefix}-{:03}", oref.number);
-                std::fs::write(&side_path, &stream.data)?;
+        let wanted_refs = collect_datafile_object_refs(&v2);
+        if !wanted_refs.is_empty() {
+            let mut pdf2 = open_pdf(input, cli.repair, &cli.password)?;
+            for oref in wanted_refs {
+                let obj = pdf2.resolve(oref)?;
+                if let Object::Stream(stream) = obj {
+                    let side_path = format!("{prefix}-{:03}", oref.number);
+                    std::fs::write(&side_path, &stream.data)?;
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Walk the qpdf JSON v2 output and collect every `(obj_num, generation)`
+/// whose stream entry carries a `datafile` field. Used to scope side-file
+/// writes to exactly the streams that survived --json-key/--json-object
+/// filtering, so the CLI never writes streams the JSON output doesn't
+/// reference.
+fn collect_datafile_object_refs(v2: &flpdf::json::JsonValue) -> Vec<ObjectRef> {
+    use flpdf::json::JsonValue;
+    let mut out = Vec::new();
+    let JsonValue::Object(top) = v2 else {
+        return out;
+    };
+    let Some((_, qpdf_value)) = top.iter().find(|(k, _)| k == "qpdf") else {
+        return out;
+    };
+    let JsonValue::Array(qpdf_arr) = qpdf_value else {
+        return out;
+    };
+    // Expected shape: [metadata, objects_map].
+    let Some(JsonValue::Object(objects_map)) = qpdf_arr.get(1) else {
+        return out;
+    };
+    for (key, entry) in objects_map {
+        // Skip the "trailer" entry — it has no object number.
+        let Some(rest) = key.strip_prefix("obj:") else {
+            continue;
+        };
+        let rest = rest.trim_end_matches(" R");
+        let mut parts = rest.split_whitespace();
+        let Some(num) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(gen) = parts.next().and_then(|s| s.parse::<u16>().ok()) else {
+            continue;
+        };
+        // Only collect if the stream entry has a datafile field.
+        let JsonValue::Object(entry_pairs) = entry else {
+            continue;
+        };
+        let Some((_, stream_val)) = entry_pairs.iter().find(|(k, _)| k == "stream") else {
+            continue;
+        };
+        let JsonValue::Object(stream_pairs) = stream_val else {
+            continue;
+        };
+        if stream_pairs.iter().any(|(k, _)| k == "datafile") {
+            out.push(ObjectRef::new(num, gen));
+        }
+    }
+    out
 }
 
 fn run_command(command: Commands) -> CliResult<()> {
