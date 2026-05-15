@@ -1127,12 +1127,12 @@ fn walk_acroform_fields<R: Read + Seek>(
             d.get("Subtype"),
             Some(Object::Name(n)) if n.as_slice() == b"Widget"
         );
-        // Field-like markers: presence of any of these means the kid acts as
-        // a field (named or unnamed) and must be recursed into.
-        let has_field_entries = d.get("T").is_some()
-            || d.get("FT").is_some()
-            || d.get("Kids").is_some()
-            || d.get("Parent").is_some();
+        // Field-like markers that mean the kid acts as a (possibly unnamed)
+        // field even when /Subtype is /Widget. /Parent is intentionally NOT
+        // here: widget annotations are normally attached to a parent field
+        // via /Parent, so its presence alone doesn't make a kid a field.
+        let has_field_entries =
+            d.get("T").is_some() || d.get("FT").is_some() || d.get("Kids").is_some();
 
         if is_widget_subtype && !has_field_entries {
             // Pure widget annotation — collect ref string, do not recurse.
@@ -3614,6 +3614,71 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert_eq!(leaf_ft, JsonValue::String("Tx".to_string()));
+    }
+
+    // ── acroform: widget kid with /Parent is still classified as annotation ─
+    //
+    // Regression for CodeRabbit's 2nd-pass review on kid classification:
+    // tightening kid-recursion to "field-like entries" must not regress the
+    // common case of a /Subtype /Widget kid that carries /Parent (the normal
+    // way a widget annotation refers back to its owning field). Such kids
+    // must end up under the parent field's annotations[], not get recursed
+    // into as bogus field entries.
+
+    #[test]
+    fn acroform_widget_kid_with_parent_classified_as_annotation() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+        let widget_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        // Field with /T and a single widget kid.
+        let mut field = Dictionary::new();
+        field.insert("T", Object::String(b"signature".to_vec()));
+        field.insert("FT", Object::Name(b"Sig".to_vec()));
+        field.insert("Kids", Object::Array(vec![Object::Reference(widget_ref)]));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+
+        // Standalone widget annotation: /Subtype /Widget + /Parent. No /T,
+        // /FT, or /Kids. Must end up under annotations[], not recursed into.
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("Parent", Object::Reference(field_ref));
+        pdf.set_object(widget_ref, Object::Dictionary(widget));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        // Only the parent field should be in the flat list — widget must
+        // NOT be recursed into.
+        assert_eq!(
+            fields.len(),
+            1,
+            "widget kid with /Parent must NOT create a second field entry"
+        );
+
+        let JsonValue::Object(field_entry) = &fields[0] else {
+            panic!("field entry must be Object");
+        };
+        let annotations = field_entry
+            .iter()
+            .find(|(k, _)| k == "annotations")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(
+            annotations,
+            JsonValue::Array(vec![JsonValue::String("202 0 R".to_string())]),
+            "the widget kid must be listed in annotations, not promoted to a field"
+        );
     }
 
     #[test]
