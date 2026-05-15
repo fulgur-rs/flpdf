@@ -66,6 +66,7 @@ struct Cli {
     #[arg(
         long = "json-output",
         value_name = "PATH",
+        requires = "json",
         help = "Write JSON to PATH instead of stdout"
     )]
     json_output: Option<PathBuf>,
@@ -76,7 +77,10 @@ struct Cli {
     #[arg(
         long = "json-key",
         value_name = "KEY",
-        help = "Restrict JSON output to this top-level key (repeatable)"
+        requires = "json",
+        help = "This option is repeatable. If given, only the specified \
+                top-level keys will be included in the JSON output. \
+                Otherwise, all keys will be included."
     )]
     json_key: Vec<String>,
 
@@ -85,7 +89,11 @@ struct Cli {
     #[arg(
         long = "json-object",
         value_name = "SELECTOR",
-        help = "Restrict JSON qpdf section to a single object: trailer, N, or N,G (repeatable)"
+        requires = "json",
+        help = "This option is repeatable. If given, only specified objects \
+                will be shown in the \"qpdf\" key of the JSON output. \
+                Otherwise, all objects will be shown. Format: trailer, N, \
+                or N,G."
     )]
     json_object: Vec<String>,
 
@@ -95,7 +103,13 @@ struct Cli {
     #[arg(
         long = "json-stream-data",
         value_name = "MODE",
-        help = "Stream data inclusion: none (default), inline, file"
+        requires = "json",
+        help = "When used with --json, this option controls whether streams \
+                in json output should be omitted, written inline \
+                (base64-encoded), or written to a file. If \"file\" is \
+                chosen, the file name is the --json-stream-prefix value \
+                appended with -nnn where nnn is the object number. The \
+                default is \"none\"."
     )]
     json_stream_data: Option<String>,
 
@@ -104,6 +118,7 @@ struct Cli {
     #[arg(
         long = "json-stream-prefix",
         value_name = "PREFIX",
+        requires = "json",
         help = "Prefix for side files with --json-stream-data=file"
     )]
     json_stream_prefix: Option<String>,
