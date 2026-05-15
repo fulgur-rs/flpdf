@@ -1461,10 +1461,20 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
 ///
 /// Both leaf nodes (`/Names`) and intermediate nodes (`/Kids`) are handled.
 /// The `seen` set prevents infinite loops on cyclic references.
+/// Source of a filespec value found in the EmbeddedFiles name tree.
+///
+/// PDF name tree leaf values can be either an indirect Reference (the common
+/// case) or a direct Dictionary embedded inline. Both shapes must produce an
+/// `attachments` entry.
+enum FilespecSource {
+    Indirect(crate::ObjectRef),
+    Direct(Dictionary),
+}
+
 fn walk_embedded_files_name_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node: Object,
-    entries: &mut Vec<(String, crate::ObjectRef)>,
+    entries: &mut Vec<(String, FilespecSource)>,
     seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
     depth: usize,
     max_depth: usize,
@@ -1478,23 +1488,25 @@ fn walk_embedded_files_name_tree<R: Read + Seek>(
         _ => return Ok(()),
     };
 
-    // /Names: leaf node with [name1 ref1 name2 ref2 ...] pairs
+    // /Names: leaf node with [name1 value1 name2 value2 ...] pairs
     if let Some(Object::Array(names)) = dict.get("Names") {
         let names = names.clone();
         let mut iter = names.into_iter();
-        while let (Some(name_obj), Some(ref_obj)) = (iter.next(), iter.next()) {
+        while let (Some(name_obj), Some(value_obj)) = (iter.next(), iter.next()) {
             // name is a PDF string (text or byte string)
             let name_str = match name_obj {
                 Object::String(bytes) => decode_pdf_text_string(&bytes)
                     .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
                 _ => continue,
             };
-            // value should be an indirect reference to a filespec dict
-            let filespec_ref = match ref_obj {
-                Object::Reference(r) => r,
+            // value can be either an indirect reference or a direct filespec
+            // dictionary inlined in the name tree.
+            let source = match value_obj {
+                Object::Reference(r) => FilespecSource::Indirect(r),
+                Object::Dictionary(d) => FilespecSource::Direct(d),
                 _ => continue,
             };
-            entries.push((name_str, filespec_ref));
+            entries.push((name_str, source));
         }
         return Ok(());
     }
@@ -1542,6 +1554,25 @@ fn filespec_to_json<R: Read + Seek>(
                 ("streams".to_string(), JsonValue::Object(vec![])),
             ]));
         }
+    };
+
+    filespec_dict_to_json(pdf, &filespec_dict, Some(filespec_str))
+}
+
+/// Same as [`filespec_to_json`] but takes the filespec dictionary directly,
+/// for the case where the name tree leaf value is a direct dictionary rather
+/// than an indirect reference. When `filespec_str` is `Some`, it is used for
+/// the `filespec` key; when `None`, that key emits `JsonValue::Null` because
+/// no reference number exists.
+fn filespec_dict_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filespec_dict: &Dictionary,
+    filespec_str: Option<String>,
+) -> Result<JsonValue, ConvertError> {
+    let filespec_dict = filespec_dict.clone();
+    let filespec_value = match filespec_str {
+        Some(s) => JsonValue::String(s),
+        None => JsonValue::Null,
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
@@ -1697,7 +1728,7 @@ fn filespec_to_json<R: Read + Seek>(
 
     Ok(JsonValue::Object(vec![
         ("description".to_string(), description),
-        ("filespec".to_string(), JsonValue::String(filespec_str)),
+        ("filespec".to_string(), filespec_value),
         ("names".to_string(), JsonValue::Object(names_pairs)),
         ("preferredcontents".to_string(), preferredcontents),
         ("preferredname".to_string(), preferredname),
@@ -1750,7 +1781,7 @@ pub fn build_attachments_section<R: Read + Seek>(
     };
 
     // Walk the name tree to collect (name, filespec_ref) pairs
-    let mut raw_entries: Vec<(String, crate::ObjectRef)> = Vec::new();
+    let mut raw_entries: Vec<(String, FilespecSource)> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     walk_embedded_files_name_tree(
         pdf,
@@ -1764,10 +1795,14 @@ pub fn build_attachments_section<R: Read + Seek>(
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Build the output object
+    // Build the output object. Both indirect (Reference) and direct
+    // (inlined Dictionary) filespec values yield an attachments entry.
     let mut pairs: Vec<(String, JsonValue)> = Vec::new();
-    for (name, filespec_ref) in raw_entries {
-        let entry = filespec_to_json(pdf, filespec_ref)?;
+    for (name, source) in raw_entries {
+        let entry = match source {
+            FilespecSource::Indirect(filespec_ref) => filespec_to_json(pdf, filespec_ref)?,
+            FilespecSource::Direct(dict) => filespec_dict_to_json(pdf, &dict, None)?,
+        };
         pairs.push((name, entry));
     }
 
@@ -4815,6 +4850,86 @@ mod tests {
             JsonValue::Null,
             "/UF modificationdate must be null"
         );
+    }
+
+    // ── attachments: direct (non-Reference) filespec value in the name tree ──
+    //
+    // Regression for CodeRabbit's flpdf-9hc.11.8 review: previously the name
+    // tree walker only accepted Object::Reference as the leaf value, silently
+    // dropping inline (direct) filespec dictionaries. They must produce an
+    // entry too — the only difference is `filespec` becomes null because
+    // there is no object reference to point at.
+
+    #[test]
+    fn attachments_direct_inline_filespec_dictionary_is_serialized() {
+        let mut pdf = load_one_page_pdf();
+
+        // Build an inline (direct) filespec dictionary and place it directly
+        // into the /Names array — no indirect reference layer.
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"inline.txt".to_vec()));
+        filespec.insert("UF", Object::String(b"inline.txt".to_vec()));
+
+        let mut ef_root = Dictionary::new();
+        ef_root.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"inline.txt".to_vec()),
+                Object::Dictionary(filespec), // <-- direct, not Reference
+            ]),
+        );
+        let ef_root_ref = crate::ObjectRef::new(300, 0);
+        pdf.set_object(ef_root_ref, Object::Dictionary(ef_root));
+
+        let mut names_dict = Dictionary::new();
+        names_dict.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
+        let names_ref = crate::ObjectRef::new(301, 0);
+        pdf.set_object(names_ref, Object::Dictionary(names_dict));
+
+        let catalog_ref = pdf.root_ref().unwrap();
+        let mut catalog = match pdf.resolve(catalog_ref).unwrap() {
+            Object::Dictionary(d) => d,
+            _ => panic!(),
+        };
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object");
+        };
+
+        // The inline filespec must produce an entry, not be silently dropped.
+        assert_eq!(
+            pairs.len(),
+            1,
+            "direct inline filespec must yield an attachments entry"
+        );
+        assert_eq!(pairs[0].0, "inline.txt");
+
+        let JsonValue::Object(entry) = &pairs[0].1 else {
+            panic!("entry must be Object");
+        };
+        let get = |k: &str| -> &JsonValue {
+            entry
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("key '{k}' missing"))
+        };
+        // No indirect reference → filespec must be null.
+        assert_eq!(
+            *get("filespec"),
+            JsonValue::Null,
+            "filespec must be null when the leaf value was a direct dictionary"
+        );
+        // The names sub-object still surfaces the inlined /F and /UF.
+        let JsonValue::Object(names) = get("names") else {
+            panic!("names must be Object");
+        };
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0, "/F");
+        assert_eq!(names[1].0, "/UF");
     }
 
     // ── parse_pdf_date unit tests ─────────────────────────────────────────────
