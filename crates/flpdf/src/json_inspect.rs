@@ -984,6 +984,332 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
     Ok(JsonValue::Array(entries))
 }
 
+// ── build_acroform_section ────────────────────────────────────────────────────
+
+/// Walk a single AcroForm field (and its sub-fields), appending flat field
+/// entries to `output`.
+///
+/// - `field_ref`: the ObjectRef of this field
+/// - `parent_fullname`: dot-joined name path of the parent (empty string at root)
+/// - `parent_ref`: the parent field's ObjectRef (None at root)
+/// - `output`: flat list of JSON field entries to append to
+/// - `seen`: cycle guard (ObjectRef set)
+/// - `depth` / `max_depth`: recursion limit
+#[allow(clippy::too_many_arguments)]
+fn walk_acroform_fields<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: crate::ObjectRef,
+    parent_fullname: &str,
+    parent_ref: Option<crate::ObjectRef>,
+    output: &mut Vec<JsonValue>,
+    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), ConvertError> {
+    if depth > max_depth {
+        return Ok(());
+    }
+    if !seen.insert(field_ref) {
+        return Ok(()); // cycle guard
+    }
+
+    let field_obj = pdf.resolve(field_ref).map_err(ConvertError::from)?;
+    let field_dict = match field_obj {
+        Object::Dictionary(d) => d,
+        _ => return Ok(()), // non-dictionary field — skip
+    };
+
+    // Compute fullname: parent.T or just T at root.
+    let t_string = match field_dict.get("T") {
+        Some(Object::String(bytes)) => decode_pdf_text_string(bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+        _ => String::new(),
+    };
+    let fullname = if parent_fullname.is_empty() {
+        t_string.clone()
+    } else if t_string.is_empty() {
+        parent_fullname.to_string()
+    } else {
+        format!("{parent_fullname}.{t_string}")
+    };
+
+    // object ref string
+    let object_str = format!("{} {} R", field_ref.number, field_ref.generation);
+
+    // parent ref string (null at root)
+    let parent_json = match parent_ref {
+        Some(r) => JsonValue::String(format!("{} {} R", r.number, r.generation)),
+        None => JsonValue::Null,
+    };
+
+    // /FT — bare name string (no "/" prefix), inherited from parent if absent.
+    let fieldtype = {
+        let ft = field_dict.get("FT").cloned();
+        let ft_obj = if ft.is_some() {
+            ft
+        } else {
+            // Simple inheritance: walk /Parent chain.
+            let mut inherited = None;
+            let mut iparent = field_dict.get("Parent").cloned();
+            let mut inherit_seen = std::collections::BTreeSet::new();
+            while let Some(Object::Reference(pr)) = iparent {
+                if !inherit_seen.insert(pr) {
+                    break;
+                }
+                match pdf.resolve(pr).map_err(ConvertError::from)? {
+                    Object::Dictionary(pd) => {
+                        if let Some(v) = pd.get("FT").cloned() {
+                            inherited = Some(v);
+                            break;
+                        }
+                        iparent = pd.get("Parent").cloned();
+                    }
+                    _ => break,
+                }
+            }
+            inherited
+        };
+        match ft_obj {
+            Some(Object::Name(bytes)) => {
+                JsonValue::String(String::from_utf8_lossy(&bytes).into_owned())
+            }
+            _ => JsonValue::Null,
+        }
+    };
+
+    // /V — value, run through pdf_object_to_json.
+    let value = match field_dict.get("V") {
+        Some(v) => pdf_object_to_json(v)?,
+        None => JsonValue::Null,
+    };
+
+    // /DV — default value, run through pdf_object_to_json.
+    let defaultvalue = match field_dict.get("DV") {
+        Some(v) => pdf_object_to_json(v)?,
+        None => JsonValue::Null,
+    };
+
+    // /Ff — field flags integer.
+    let fieldflags = match field_dict.get("Ff") {
+        Some(Object::Integer(n)) => JsonValue::Integer(*n),
+        _ => JsonValue::Null,
+    };
+
+    // /TU — alternate name.
+    let alternatename = match field_dict.get("TU") {
+        Some(Object::String(bytes)) => {
+            let s = decode_pdf_text_string(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+            JsonValue::String(s)
+        }
+        _ => JsonValue::Null,
+    };
+
+    // /TM — mapping name.
+    let mappingname = match field_dict.get("TM") {
+        Some(Object::String(bytes)) => {
+            let s = decode_pdf_text_string(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+            JsonValue::String(s)
+        }
+        _ => JsonValue::Null,
+    };
+
+    // Determine if this field is itself a widget annotation.
+    let is_widget = field_dict
+        .get("Subtype")
+        .map(|v| matches!(v, Object::Name(n) if n.as_slice() == b"Widget"))
+        .unwrap_or(false);
+
+    // /Kids — may contain sub-fields (with /T) or widget annotations (without /T).
+    let kids = match field_dict.get("Kids") {
+        Some(Object::Array(arr)) => arr.clone(),
+        _ => vec![],
+    };
+
+    let mut annotations: Vec<JsonValue> = Vec::new();
+    let mut has_subfield_kids = false;
+
+    // Classify each kid: if it has /T → sub-field; otherwise → widget annotation.
+    // We need to resolve each kid to check.
+    let mut subfield_refs: Vec<crate::ObjectRef> = Vec::new();
+    for kid in &kids {
+        let kid_ref = match kid {
+            Object::Reference(r) => *r,
+            _ => continue,
+        };
+        // Resolve kid to classify it (sub-field vs widget).
+        // We avoid consuming the `seen` set here since sub-fields are walked below.
+        let kid_obj = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
+        let has_t = match &kid_obj {
+            Object::Dictionary(d) => d.get("T").is_some(),
+            _ => false,
+        };
+        if has_t {
+            subfield_refs.push(kid_ref);
+            has_subfield_kids = true;
+        } else {
+            // Widget annotation — collect ref string.
+            annotations.push(JsonValue::String(format!(
+                "{} {} R",
+                kid_ref.number, kid_ref.generation
+            )));
+        }
+    }
+
+    // If this field itself is a widget (and no sub-fields), add self to annotations.
+    if is_widget && !has_subfield_kids {
+        annotations.insert(0, JsonValue::String(object_str.clone()));
+    }
+
+    // Build and push this field's JSON entry (alphabetical key order).
+    let entry = JsonValue::Object(vec![
+        ("alternatename".to_string(), alternatename),
+        ("annotations".to_string(), JsonValue::Array(annotations)),
+        ("defaultvalue".to_string(), defaultvalue),
+        ("fieldflags".to_string(), fieldflags),
+        ("fieldtype".to_string(), fieldtype),
+        ("fullname".to_string(), JsonValue::String(fullname.clone())),
+        ("mappingname".to_string(), mappingname),
+        ("object".to_string(), JsonValue::String(object_str)),
+        ("parent".to_string(), parent_json),
+        ("value".to_string(), value),
+    ]);
+    output.push(entry);
+
+    // Recurse into sub-field kids.
+    if depth < max_depth {
+        for kid_ref in subfield_refs {
+            walk_acroform_fields(
+                pdf,
+                kid_ref,
+                &fullname,
+                Some(field_ref),
+                output,
+                seen,
+                depth + 1,
+                max_depth,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the qpdf JSON v2 `"acroform"` section.
+///
+/// Returns a [`JsonValue::Object`] with three keys in alphabetical order:
+/// `fields`, `hasacroform`, `needappearances`.
+///
+/// - `hasacroform`: true iff `/Catalog/AcroForm` exists.
+/// - `needappearances`: value of `/AcroForm/NeedAppearances` (default false).
+/// - `fields`: flat list of all field entries, recursively expanded.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any indirect object resolution fails.
+pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+
+    // Resolve the Catalog.
+    let catalog_ref = match pdf.root_ref() {
+        Some(r) => r,
+        None => {
+            return Ok(JsonValue::Object(vec![
+                ("fields".to_string(), JsonValue::Array(vec![])),
+                ("hasacroform".to_string(), JsonValue::Bool(false)),
+                ("needappearances".to_string(), JsonValue::Bool(false)),
+            ]))
+        }
+    };
+    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog_dict = match catalog {
+        Object::Dictionary(d) => d,
+        _ => {
+            return Ok(JsonValue::Object(vec![
+                ("fields".to_string(), JsonValue::Array(vec![])),
+                ("hasacroform".to_string(), JsonValue::Bool(false)),
+                ("needappearances".to_string(), JsonValue::Bool(false)),
+            ]))
+        }
+    };
+
+    // Check for /AcroForm.
+    let acroform_val = match catalog_dict.get("AcroForm") {
+        Some(v) => v.clone(),
+        None => {
+            return Ok(JsonValue::Object(vec![
+                ("fields".to_string(), JsonValue::Array(vec![])),
+                ("hasacroform".to_string(), JsonValue::Bool(false)),
+                ("needappearances".to_string(), JsonValue::Bool(false)),
+            ]))
+        }
+    };
+
+    // Resolve indirect reference if needed.
+    let acroform_dict = match acroform_val {
+        Object::Reference(r) => match pdf.resolve(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => d,
+            _ => {
+                return Ok(JsonValue::Object(vec![
+                    ("fields".to_string(), JsonValue::Array(vec![])),
+                    ("hasacroform".to_string(), JsonValue::Bool(true)),
+                    ("needappearances".to_string(), JsonValue::Bool(false)),
+                ]))
+            }
+        },
+        Object::Dictionary(d) => d,
+        _ => {
+            return Ok(JsonValue::Object(vec![
+                ("fields".to_string(), JsonValue::Array(vec![])),
+                ("hasacroform".to_string(), JsonValue::Bool(true)),
+                ("needappearances".to_string(), JsonValue::Bool(false)),
+            ]))
+        }
+    };
+
+    // /NeedAppearances (default false).
+    let need_appearances = match acroform_dict.get("NeedAppearances") {
+        Some(Object::Boolean(b)) => *b,
+        _ => false,
+    };
+
+    // /Fields array (top-level field refs).
+    let fields_array = match acroform_dict.get("Fields") {
+        Some(Object::Array(arr)) => arr.clone(),
+        _ => vec![],
+    };
+
+    let mut output: Vec<JsonValue> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for field_obj in &fields_array {
+        let field_ref = match field_obj {
+            Object::Reference(r) => *r,
+            _ => continue,
+        };
+        walk_acroform_fields(
+            pdf,
+            field_ref,
+            "",
+            None,
+            &mut output,
+            &mut seen,
+            0,
+            DEFAULT_MAX_PAGE_TREE_DEPTH,
+        )?;
+    }
+
+    Ok(JsonValue::Object(vec![
+        ("fields".to_string(), JsonValue::Array(output)),
+        ("hasacroform".to_string(), JsonValue::Bool(true)),
+        (
+            "needappearances".to_string(),
+            JsonValue::Bool(need_appearances),
+        ),
+    ]))
+}
+
 // ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
 
 /// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
@@ -1015,6 +1341,9 @@ pub fn build_qpdf_json_v2<R: Read + Seek>(
 
     let pagelabels = build_pagelabels_section(pdf)?;
     pairs.push(("pagelabels".to_string(), pagelabels));
+
+    let acroform = build_acroform_section(pdf)?;
+    pairs.push(("acroform".to_string(), acroform));
 
     let outlines = build_outlines_section(pdf)?;
     pairs.push(("outlines".to_string(), outlines));
@@ -2222,7 +2551,7 @@ mod tests {
         let JsonValue::Object(pairs) = v2 else {
             panic!("expected Object at top level");
         };
-        // qpdf-style fixed order: version, parameters, pages, pagelabels, outlines, qpdf
+        // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, outlines, qpdf
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -2231,6 +2560,7 @@ mod tests {
                 "parameters",
                 "pages",
                 "pagelabels",
+                "acroform",
                 "outlines",
                 "qpdf"
             ]
@@ -2748,5 +3078,360 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert_eq!(action_value, JsonValue::String("102 0 R".to_string()));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // build_acroform_section tests (flpdf-9hc.11.7)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Helper: inject a synthetic /AcroForm into the catalog.
+    fn patch_acroform(
+        pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>,
+        acroform_ref: crate::ObjectRef,
+        acroform: Dictionary,
+    ) {
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d,
+            _ => panic!("catalog is not a Dictionary"),
+        };
+        catalog.insert("AcroForm", Object::Reference(acroform_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        pdf.set_object(acroform_ref, Object::Dictionary(acroform));
+    }
+
+    // ── acroform Test 1: No /AcroForm → hasacroform: false, empty fields ──────
+
+    #[test]
+    fn acroform_missing_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object, got {result:?}");
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["fields", "hasacroform", "needappearances"]);
+        assert_eq!(pairs[0].1, JsonValue::Array(vec![]), "fields must be empty");
+        assert_eq!(
+            pairs[1].1,
+            JsonValue::Bool(false),
+            "hasacroform must be false"
+        );
+        assert_eq!(
+            pairs[2].1,
+            JsonValue::Bool(false),
+            "needappearances must be false"
+        );
+    }
+
+    // ── acroform Test 2: AcroForm present, empty /Fields → hasacroform: true ──
+
+    #[test]
+    fn acroform_present_empty_fields() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object");
+        };
+        assert_eq!(pairs[0].1, JsonValue::Array(vec![]), "fields must be empty");
+        assert_eq!(
+            pairs[1].1,
+            JsonValue::Bool(true),
+            "hasacroform must be true"
+        );
+        assert_eq!(
+            pairs[2].1,
+            JsonValue::Bool(false),
+            "needappearances must be false"
+        );
+    }
+
+    // ── acroform Test 3: Single leaf field (synthetic) ────────────────────────
+
+    #[test]
+    fn acroform_single_leaf_field() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        acroform.insert("NeedAppearances", Object::Boolean(true));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("T", Object::String(b"firstname".to_vec()));
+        field.insert("FT", Object::Name(b"Tx".to_vec()));
+        field.insert("V", Object::String(b"John".to_vec()));
+        field.insert("Ff", Object::Integer(0));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        assert_eq!(top[1].1, JsonValue::Bool(true), "hasacroform must be true");
+        assert_eq!(
+            top[2].1,
+            JsonValue::Bool(true),
+            "needappearances must be true"
+        );
+
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        assert_eq!(fields.len(), 1, "expected 1 field entry");
+
+        let JsonValue::Object(entry) = &fields[0] else {
+            panic!("field entry must be Object");
+        };
+        let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "alternatename",
+                "annotations",
+                "defaultvalue",
+                "fieldflags",
+                "fieldtype",
+                "fullname",
+                "mappingname",
+                "object",
+                "parent",
+                "value"
+            ],
+            "key order must be alphabetical"
+        );
+
+        // Check values
+        assert_eq!(entry[0].1, JsonValue::Null, "alternatename must be null");
+        assert_eq!(
+            entry[1].1,
+            JsonValue::Array(vec![]),
+            "annotations must be empty (no widget)"
+        );
+        assert_eq!(entry[2].1, JsonValue::Null, "defaultvalue must be null");
+        assert_eq!(entry[3].1, JsonValue::Integer(0), "fieldflags must be 0");
+        assert_eq!(
+            entry[4].1,
+            JsonValue::String("Tx".to_string()),
+            "fieldtype must be Tx (bare, no /)"
+        );
+        assert_eq!(
+            entry[5].1,
+            JsonValue::String("firstname".to_string()),
+            "fullname must match /T"
+        );
+        assert_eq!(entry[6].1, JsonValue::Null, "mappingname must be null");
+        assert_eq!(
+            entry[7].1,
+            JsonValue::String("201 0 R".to_string()),
+            "object must be ref string"
+        );
+        assert_eq!(entry[8].1, JsonValue::Null, "parent must be null at root");
+        assert_eq!(
+            entry[9].1,
+            JsonValue::String("u:John".to_string()),
+            "value must be u:John"
+        );
+    }
+
+    // ── acroform Test 4: parent + child, fullname = "parent.child" ───────────
+
+    #[test]
+    fn acroform_parent_child_fullname() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let parent_field_ref = crate::ObjectRef::new(201, 0);
+        let child_field_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(vec![Object::Reference(parent_field_ref)]),
+        );
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        // Parent field (has /Kids → sub-field child, so parent itself is NOT a leaf)
+        let mut parent_field = Dictionary::new();
+        parent_field.insert("T", Object::String(b"person".to_vec()));
+        parent_field.insert("FT", Object::Name(b"Tx".to_vec()));
+        parent_field.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(child_field_ref)]),
+        );
+        pdf.set_object(parent_field_ref, Object::Dictionary(parent_field));
+
+        // Child field (leaf, has /T)
+        let mut child_field = Dictionary::new();
+        child_field.insert("T", Object::String(b"name".to_vec()));
+        child_field.insert("FT", Object::Name(b"Tx".to_vec()));
+        child_field.insert("Parent", Object::Reference(parent_field_ref));
+        pdf.set_object(child_field_ref, Object::Dictionary(child_field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        // flat list: parent + child = 2 entries
+        assert_eq!(fields.len(), 2, "expected 2 entries (parent + child)");
+
+        // First entry is the parent
+        let JsonValue::Object(parent_entry) = &fields[0] else {
+            panic!("first entry must be Object");
+        };
+        let parent_fullname = parent_entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .map(|(_, v)| v)
+            .expect("fullname missing");
+        assert_eq!(
+            *parent_fullname,
+            JsonValue::String("person".to_string()),
+            "parent fullname must be 'person'"
+        );
+        let parent_obj = parent_entry
+            .iter()
+            .find(|(k, _)| k == "object")
+            .map(|(_, v)| v)
+            .expect("object missing");
+        assert_eq!(*parent_obj, JsonValue::String("201 0 R".to_string()));
+
+        // Second entry is the child
+        let JsonValue::Object(child_entry) = &fields[1] else {
+            panic!("second entry must be Object");
+        };
+        let child_fullname = child_entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .map(|(_, v)| v)
+            .expect("fullname missing");
+        assert_eq!(
+            *child_fullname,
+            JsonValue::String("person.name".to_string()),
+            "child fullname must be 'person.name'"
+        );
+        let child_parent = child_entry
+            .iter()
+            .find(|(k, _)| k == "parent")
+            .map(|(_, v)| v)
+            .expect("parent missing");
+        assert_eq!(
+            *child_parent,
+            JsonValue::String("201 0 R".to_string()),
+            "child parent must point to 201 0 R"
+        );
+    }
+
+    // ── acroform Test 5: NeedAppearances = true ───────────────────────────────
+
+    #[test]
+    fn acroform_needappearances_true() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![]));
+        acroform.insert("NeedAppearances", Object::Boolean(true));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object");
+        };
+        assert_eq!(
+            pairs[2].1,
+            JsonValue::Bool(true),
+            "needappearances must be true"
+        );
+    }
+
+    // ── acroform Test 6: AcroForm.Fields absent → fields: [] ─────────────────
+
+    #[test]
+    fn acroform_no_fields_key_yields_empty() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        // AcroForm without /Fields key
+        let acroform = Dictionary::new();
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object");
+        };
+        assert_eq!(
+            pairs[0].1,
+            JsonValue::Array(vec![]),
+            "fields must be empty when /Fields absent"
+        );
+        assert_eq!(
+            pairs[1].1,
+            JsonValue::Bool(true),
+            "hasacroform must be true even with no /Fields"
+        );
+    }
+
+    // ── acroform: all compat fixtures produce hasacroform: false ─────────────
+
+    #[test]
+    fn acroform_compat_fixtures_all_no_acroform() {
+        let fixtures = ["one-page.pdf", "three-page.pdf", "attachment-two-page.pdf"];
+        for name in fixtures {
+            let mut pdf = load_fixture_pdf(name);
+            let result = build_acroform_section(&mut pdf)
+                .unwrap_or_else(|e| panic!("{name}: build_acroform_section failed: {e:?}"));
+            let JsonValue::Object(pairs) = &result else {
+                panic!("{name}: expected Object");
+            };
+            assert_eq!(
+                pairs[1].1,
+                JsonValue::Bool(false),
+                "{name}: hasacroform must be false"
+            );
+            assert_eq!(
+                pairs[0].1,
+                JsonValue::Array(vec![]),
+                "{name}: fields must be empty"
+            );
+        }
+    }
+
+    // ── acroform: build_qpdf_json_v2 has acroform key before outlines ─────────
+
+    #[test]
+    fn build_qpdf_json_v2_has_expected_top_level_keys_with_acroform() {
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object at top level");
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "version",
+                "parameters",
+                "pages",
+                "pagelabels",
+                "acroform",
+                "outlines",
+                "qpdf"
+            ],
+            "key order must match qpdf v2: acroform before outlines"
+        );
     }
 }
