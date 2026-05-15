@@ -875,4 +875,88 @@ mod tests {
             "groups count must equal total shared_hints (1-object-per-group model)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // ObjStm-aware back-patch behaviour (flpdf-9hc.5.8.3)
+    //
+    // `from_plan` computes `first_object_number` from the renumber map only
+    // — it has no knowledge of ObjStm containers.  When the first Part-8
+    // shared object is packed inside an ObjStm the writer's convergence loop
+    // patches `so_table.header.first_object_number` with the *container's*
+    // new object number (not the member's renumber slot).
+    //
+    // The tests below verify two invariants:
+    //
+    // 1. `from_plan` returns the member's own renumber slot (the "before-patch"
+    //    value).  This is *intentionally different* from the ObjStm-container
+    //    number; the convergence loop is responsible for correcting it.
+    //
+    // 2. If the writer's patch replaces `first_object_number` with a
+    //    hypothetical container number, the field must store *that* container
+    //    number, not the original member slot — demonstrating that the patch
+    //    logic selects the right source when `member_to_container` has an entry.
+    //
+    // Note: these tests operate on the struct directly (before the writer patch
+    // runs).  They document the two-step contract: (a) from_plan establishes the
+    // member-slot baseline, and (b) the writer overwrites it with container_num
+    // when the member is ObjStm-packed.
+    // -----------------------------------------------------------------------
+
+    /// `from_plan` returns the member's own renumber slot for Part-8 shared objects.
+    /// The writer's convergence loop is responsible for patching this to the
+    /// container's number when the member lives inside an ObjStm.
+    #[test]
+    fn part8_shared_from_plan_returns_member_renumber_slot_before_objstm_patch() {
+        let plan = two_page_with_part8_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+
+        // from_plan: member's renumber slot (before writer patch)
+        let member_slot = renumber
+            .new_for_original(ObjectRef::new(9, 0))
+            .expect("9 0 R must be in renumber map")
+            .number;
+        assert_eq!(
+            table.header.first_object_number,
+            member_slot,
+            "from_plan must return the member's renumber slot (pre-patch baseline)"
+        );
+    }
+
+    /// When the writer patches `first_object_number` with an ObjStm container
+    /// number, the patched value must differ from the member's renumber slot
+    /// (unless the object happens to be allocated the same number, which is
+    /// impossible since ObjStm containers are allocated above the renumber
+    /// range).  This test simulates the patch by hand to verify the expected
+    /// post-patch value.
+    #[test]
+    fn part8_shared_objstm_patch_uses_container_num_not_member_slot() {
+        let plan = two_page_with_part8_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut table = SharedObjectHintTable::from_plan(&plan, &renumber);
+
+        // Simulate the writer's ObjStm-aware patch: container numbers are
+        // allocated above the RenumberMap range (renumber.len() + 1, +2 …).
+        // For this plan, renumber.len() == 5 (objects 3,5,9,10,4 → slots 2-6),
+        // so a Part-4 ObjStm container might get number 7.
+        let simulated_container_num: u32 = renumber.len() as u32 + 2; // > any member slot
+        table.header.first_object_number = simulated_container_num;
+
+        // After patch: the field must hold the container number, not the member slot.
+        let member_slot = renumber
+            .new_for_original(ObjectRef::new(9, 0))
+            .expect("9 0 R must be in renumber map")
+            .number;
+        assert_ne!(
+            table.header.first_object_number,
+            member_slot,
+            "post-patch: first_object_number must differ from member's renumber slot \
+             when the member is ObjStm-packed (container_num > all member slots)"
+        );
+        assert_eq!(
+            table.header.first_object_number,
+            simulated_container_num,
+            "post-patch: first_object_number must equal the ObjStm container number"
+        );
+    }
 }

@@ -1351,6 +1351,19 @@ pub fn write_linearized<R: Read + Seek>(
                              ({hint_stream_obj_total_len}); cannot compute shared-hint location"
                         ))
                     })? as u64;
+
+                // first_object_number (item 1): object number of the first Part-8
+                // shared object.  When that object is packed into an ObjStm we use
+                // the *container's* new object number (already resolved above as
+                // `first_part8_lookup_num`), because the xref points readers to the
+                // container — not to a standalone object.
+                //
+                // `from_plan` computes this from `renumber.new_for_original`, which
+                // returns the member's own renumber slot — incorrect when the member
+                // lives inside an ObjStm container.  We patch it here alongside the
+                // `location` field so both fields agree on which object number to
+                // announce as the first Part-8 entry.
+                so_table.header.first_object_number = first_part8_lookup_num;
             }
 
             // Per-object length_minus_least.  group_offset is no longer a
