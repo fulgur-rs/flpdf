@@ -25,13 +25,21 @@
 //! therefore exercise Part-4 (rest-of-document) ObjStm packing, which IS
 //! qpdf-clean.
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
-use flpdf::Pdf;
+use flpdf::{pages, Pdf};
 
 const FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
+
+fn fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(name)
+}
 
 fn qpdf_available() -> bool {
     StdCommand::new("qpdf")
@@ -307,4 +315,442 @@ fn linearize_generate_qpdf_check_clean() {
         .assert()
         .success()
         .stdout(predicates::str::contains("linearization OK"));
+}
+
+// ============================================================================
+// Epic acceptance gate (flpdf-9hc.5.8.5) — systematic 3-mode × multi-page
+// coverage with Part-boundary, per-page-1, round-trip, and qpdf cross-check.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Helpers (acceptance gate)
+// ---------------------------------------------------------------------------
+
+/// Run `qpdf --show-xref <path>` and return stdout.
+fn qpdf_show_xref(path: &Path) -> String {
+    let out = StdCommand::new("qpdf")
+        .args(["--show-xref", path.to_str().unwrap()])
+        .output()
+        .expect("spawn qpdf --show-xref");
+    assert!(
+        out.status.success(),
+        "qpdf --show-xref failed on {}",
+        path.display()
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Parsed xref entry produced by `qpdf --show-xref`.
+#[derive(Debug, Clone)]
+enum XrefEntry {
+    Uncompressed { num: u32, offset: u64 },
+    Compressed { num: u32, stream: u32 },
+}
+
+/// Parse the stdout of `qpdf --show-xref` into a vector of [`XrefEntry`].
+fn parse_xref_entries(xref_output: &str) -> Vec<XrefEntry> {
+    let mut entries = Vec::new();
+    for line in xref_output.lines() {
+        let line = line.trim();
+        let Some((obj_part, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some((num_str, _)) = obj_part.split_once('/') else {
+            continue;
+        };
+        let Ok(num) = num_str.trim().parse::<u32>() else {
+            continue;
+        };
+        if let Some(offset_str) = rest.strip_prefix("uncompressed; offset = ") {
+            if let Ok(offset) = offset_str.trim().parse::<u64>() {
+                entries.push(XrefEntry::Uncompressed { num, offset });
+            }
+        } else if let Some(compressed_part) = rest.strip_prefix("compressed; stream = ") {
+            if let Some((stream_str, _)) = compressed_part.split_once(", index = ") {
+                if let Ok(stream) = stream_str.trim().parse::<u32>() {
+                    entries.push(XrefEntry::Compressed { num, stream });
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Return the set of object numbers that are compressed (inside an ObjStm).
+fn compressed_obj_numbers(entries: &[XrefEntry]) -> BTreeSet<u32> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            if let XrefEntry::Compressed { num, .. } = e {
+                Some(*num)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Return the uncompressed offset for `num`, or `None`.
+fn uncompressed_offset(entries: &[XrefEntry], num: u32) -> Option<u64> {
+    entries.iter().find_map(|e| {
+        if let XrefEntry::Uncompressed { num: n, offset } = e {
+            if *n == num {
+                return Some(*offset);
+            }
+        }
+        None
+    })
+}
+
+/// Return the set of ObjStm container object numbers in the xref.
+fn objstm_container_numbers(entries: &[XrefEntry]) -> BTreeSet<u32> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            if let XrefEntry::Compressed { stream, .. } = e {
+                Some(*stream)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Run `flpdf rewrite --linearize --object-streams=<mode> <input> <output>`.
+fn linearize_with_mode(mode: &str, input: &Path, output: &Path) {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            &format!("--object-streams={mode}"),
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+// ---------------------------------------------------------------------------
+// 4. Epic acceptance gate: 3 modes × multi-page fixture
+//    (a) qpdf --check-linearization clean
+//    (c) per-page-1 plain indirect (not compressed)
+//    (d) round-trip (all objects resolve, page count matches)
+//    (b) Part boundary: ObjStm containers in Part-4 (offset > /E)
+// ---------------------------------------------------------------------------
+
+/// Verify invariants for one (mode, fixture) combination.
+///
+/// Used by `acceptance_gate_three_modes_multi_page` and
+/// `acceptance_gate_multi_objstm_input`.
+fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize) {
+    let bytes = std::fs::read(out).unwrap();
+
+    // --- (a) qpdf --check-linearization ---
+    let (ok, msg) = qpdf_check_linearization(out);
+    assert!(
+        ok && msg.contains("no linearization errors"),
+        "mode={mode}: qpdf --check-linearization failed: {msg}"
+    );
+
+    // --- (d) round-trip: all objects resolve, page count preserved ---
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "mode={mode}: round-tripped doc exposes objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("mode={mode}: object {r} did not resolve: {e}"));
+    }
+    let mut pdf2 = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open for page count");
+    let out_pages = pages::page_refs(&mut pdf2).expect("page_refs");
+    assert_eq!(
+        out_pages.len(),
+        input_page_count,
+        "mode={mode}: page count must be preserved after linearize; expected {input_page_count} got {}",
+        out_pages.len()
+    );
+
+    // --- (c) per-page-1 plain indirect: first page must NOT be compressed ---
+    let first_page_ref = out_pages[0];
+    let xref_text = qpdf_show_xref(out);
+    let xref_entries = parse_xref_entries(&xref_text);
+    let compressed_nums = compressed_obj_numbers(&xref_entries);
+    assert!(
+        !compressed_nums.contains(&first_page_ref.number),
+        "mode={mode}: first-page object {} must be plain indirect (not inside ObjStm); \
+         xref shows it as compressed — Part-3 first-page packing invariant violated",
+        first_page_ref
+    );
+    // First page must have an uncompressed xref entry with a valid offset.
+    let fp_offset = uncompressed_offset(&xref_entries, first_page_ref.number);
+    assert!(
+        fp_offset.is_some(),
+        "mode={mode}: first-page object {} has no uncompressed xref entry",
+        first_page_ref
+    );
+
+    // --- (b) Part-4-only packing: ObjStm container offsets must be >= /E ---
+    let e_off = parse_e_offset(&bytes);
+    assert!(
+        (e_off as usize) < bytes.len(),
+        "mode={mode}: /E ({e_off}) must be a valid in-file offset (file len {})",
+        bytes.len()
+    );
+    let container_nums = objstm_container_numbers(&xref_entries);
+    for cnum in &container_nums {
+        let coff = uncompressed_offset(&xref_entries, *cnum)
+            .unwrap_or_else(|| panic!("mode={mode}: ObjStm container {cnum} has no offset in xref"));
+        assert!(
+            coff >= e_off,
+            "mode={mode}: ObjStm container obj {cnum} at offset {coff} is BEFORE /E={e_off}; \
+             ObjStm packing must be in Part-4 (rest-of-document) only — \
+             Part-3 first-page shared objects must NOT be packed into ObjStm"
+        );
+    }
+
+    // --- (b) Param dict placement: the /Linearized dict must be before /E ---
+    // The param dict is the first object in the file (at the very beginning, offset ~ 15).
+    let param_needle = b"/Linearized ";
+    let param_pos = bytes
+        .windows(param_needle.len())
+        .position(|w| w == param_needle)
+        .expect("param dict /Linearized key present");
+    assert!(
+        (param_pos as u64) < e_off,
+        "mode={mode}: /Linearized param dict (at byte {param_pos}) must be before /E={e_off}"
+    );
+}
+
+#[test]
+fn acceptance_gate_three_modes_multi_page() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures: &[(&str, usize)] = &[
+        ("two-page.pdf", 2),
+        ("three-page.pdf", 3),
+    ];
+    let modes = ["preserve", "disable", "generate"];
+
+    for (fixture_name, page_count) in fixtures {
+        let input = fixture_path(fixture_name);
+        for mode in &modes {
+            let out = dir
+                .path()
+                .join(format!("acceptance-{fixture_name}-{mode}.pdf"));
+            linearize_with_mode(mode, &input, &out);
+            assert_acceptance_invariants(mode, &out, *page_count);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Generate mode: ObjStm containers must exist (non-vacuous check)
+//    Regression: ensure at least one Part-4 ObjStm is present for generate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn acceptance_gate_generate_has_objstm_in_part4() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures: &[&str] = &["two-page.pdf", "three-page.pdf"];
+
+    for fixture_name in fixtures {
+        let input = fixture_path(fixture_name);
+        let out = dir.path().join(format!("part4-generate-{fixture_name}.pdf"));
+        linearize_with_mode("generate", &input, &out);
+
+        let bytes = std::fs::read(&out).unwrap();
+        let n = count_objstm_containers(&bytes);
+        assert!(
+            n >= 1,
+            "generate mode on {fixture_name}: expected >=1 ObjStm container, found {n}"
+        );
+
+        // All ObjStm containers must be in Part-4 (verified in
+        // `acceptance_gate_three_modes_multi_page`; this test adds the
+        // non-vacuous check so generate is distinguishable from disable).
+        let e_off = parse_e_offset(&bytes);
+        let xref_text = qpdf_show_xref(&out);
+        let xref_entries = parse_xref_entries(&xref_text);
+        let containers = objstm_container_numbers(&xref_entries);
+        assert!(
+            !containers.is_empty(),
+            "generate mode on {fixture_name}: xref must reference ObjStm containers"
+        );
+        for cnum in containers {
+            let coff = uncompressed_offset(&xref_entries, cnum).unwrap();
+            assert!(
+                coff >= e_off,
+                "generate {fixture_name}: ObjStm container {cnum} at {coff} must be in Part-4 (>= /E={e_off})"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Multi-ObjStm input: preserve + generate must handle ObjStm-bearing input
+//    Validates (d) round-trip and (c) per-page-1 invariants on ObjStm input.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn acceptance_gate_objstm_bearing_input() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixture_path("three-page.pdf");
+
+    // Produce an ObjStm-bearing input via qpdf --object-streams=generate.
+    let multi_objstm_input = dir.path().join("multi-objstm-source.pdf");
+    let status = StdCommand::new("qpdf")
+        .args([
+            "--object-streams=generate",
+            source.to_str().unwrap(),
+            multi_objstm_input.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn qpdf --object-streams=generate");
+    assert!(status.success(), "qpdf --object-streams=generate failed");
+
+    // Confirm the input actually has ObjStm containers.
+    let input_bytes = std::fs::read(&multi_objstm_input).unwrap();
+    let input_containers = count_objstm_containers(&input_bytes);
+    assert!(
+        input_containers >= 1,
+        "pre-condition: qpdf generate input must contain >=1 ObjStm; found {input_containers}"
+    );
+
+    // Run preserve and generate modes against the ObjStm-bearing input.
+    for mode in &["preserve", "generate"] {
+        let out = dir
+            .path()
+            .join(format!("objstm-input-linearize-{mode}.pdf"));
+        linearize_with_mode(mode, &multi_objstm_input, &out);
+        // Three-page fixture has 3 pages.
+        assert_acceptance_invariants(mode, &out, 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. qpdf cross-check: qpdf's own --linearize --object-streams=generate output
+//    and flpdf's output both keep first-page object as plain indirect.
+//
+//    Note: qpdf itself DOES place an ObjStm container in Part-3 (before /E),
+//    packing shared catalog/font/info objects.  flpdf currently defers Part-3
+//    ObjStm packing entirely (safety valve clears part3_batches, tracked as
+//    flpdf-ihb).  The observable behavioral agreement between the two tools is
+//    therefore NOT "same ObjStm placement" but rather "first-page object stays
+//    uncompressed" — which both tools satisfy.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qpdf_crosscheck_per_page1_plain_both_tools() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixture_path("three-page.pdf");
+    let qpdf_out = dir.path().join("qpdf-lin-gen.pdf");
+
+    // Produce qpdf's own linearized+generate output as the reference.
+    let status = StdCommand::new("qpdf")
+        .args([
+            "--linearize",
+            "--object-streams=generate",
+            source.to_str().unwrap(),
+            qpdf_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn qpdf --linearize --object-streams=generate");
+    assert!(status.success(), "qpdf --linearize --object-streams=generate failed");
+
+    let qpdf_bytes = std::fs::read(&qpdf_out).unwrap();
+    let qpdf_xref_text = qpdf_show_xref(&qpdf_out);
+    let qpdf_xref_entries = parse_xref_entries(&qpdf_xref_text);
+
+    // qpdf must pass --check-linearization on its own output.
+    let (ok, msg) = qpdf_check_linearization(&qpdf_out);
+    assert!(
+        ok && msg.contains("no linearization errors"),
+        "qpdf's own lin+gen output must be qpdf-clean: {msg}"
+    );
+
+    // (e-cross) qpdf must produce at least one ObjStm container.
+    let qpdf_containers = objstm_container_numbers(&qpdf_xref_entries);
+    assert!(
+        !qpdf_containers.is_empty(),
+        "qpdf lin+gen must produce at least one ObjStm container"
+    );
+
+    // (e-cross) SHARED INVARIANT: qpdf keeps first-page object as plain indirect.
+    // Note: qpdf may place ObjStm containers in Part-3 (before /E) for shared
+    // catalog/font/info objects — that is qpdf's own behavior and NOT what we
+    // assert here.  What we assert is that the FIRST PAGE OBJECT is always plain,
+    // which both tools must satisfy.
+    let mut pdf_qpdf = Pdf::open(Cursor::new(qpdf_bytes)).expect("Pdf::open qpdf output");
+    let qpdf_page_refs = pages::page_refs(&mut pdf_qpdf).expect("page_refs on qpdf output");
+    assert!(
+        !qpdf_page_refs.is_empty(),
+        "qpdf lin+gen output must expose at least one page"
+    );
+    let qpdf_first_page_num = qpdf_page_refs[0].number;
+    let qpdf_compressed = compressed_obj_numbers(&qpdf_xref_entries);
+    assert!(
+        !qpdf_compressed.contains(&qpdf_first_page_num),
+        "qpdf reference: first-page object {} must be plain indirect (not inside ObjStm)",
+        qpdf_page_refs[0]
+    );
+
+    // Now produce flpdf's generate output on the same fixture and verify the
+    // same per-page-1-plain invariant holds — confirming behavioral parity.
+    let flpdf_out = dir.path().join("flpdf-lin-gen.pdf");
+    linearize_with_mode("generate", &source, &flpdf_out);
+    let flpdf_bytes = std::fs::read(&flpdf_out).unwrap();
+    let flpdf_xref_text = qpdf_show_xref(&flpdf_out);
+    let flpdf_xref_entries = parse_xref_entries(&flpdf_xref_text);
+
+    // flpdf must also produce at least one ObjStm (non-vacuous check).
+    let flpdf_containers = objstm_container_numbers(&flpdf_xref_entries);
+    assert!(
+        !flpdf_containers.is_empty(),
+        "flpdf lin+gen must produce at least one ObjStm container (same as qpdf)"
+    );
+
+    // flpdf also places all ObjStm containers in Part-4 only (safety valve).
+    // This is a STRICTER constraint than qpdf (qpdf may put some in Part-3),
+    // but equally correct per the PDF spec — Part-3 ObjStm packing is optional.
+    let flpdf_e_off = parse_e_offset(&flpdf_bytes);
+    for cnum in &flpdf_containers {
+        let coff = uncompressed_offset(&flpdf_xref_entries, *cnum)
+            .unwrap_or_else(|| panic!("flpdf ObjStm container {cnum} has no uncompressed offset"));
+        assert!(
+            coff >= flpdf_e_off,
+            "flpdf: ObjStm container {cnum} at {coff} is before /E={flpdf_e_off}; \
+             flpdf's safety valve must keep all ObjStm containers in Part-4"
+        );
+    }
+
+    let mut pdf_flpdf = Pdf::open(Cursor::new(flpdf_bytes)).expect("Pdf::open flpdf output");
+    let flpdf_page_refs = pages::page_refs(&mut pdf_flpdf).expect("page_refs on flpdf output");
+    assert_eq!(
+        flpdf_page_refs.len(),
+        qpdf_page_refs.len(),
+        "flpdf and qpdf outputs must have the same page count"
+    );
+    let flpdf_first_page_num = flpdf_page_refs[0].number;
+    let flpdf_compressed = compressed_obj_numbers(&flpdf_xref_entries);
+    assert!(
+        !flpdf_compressed.contains(&flpdf_first_page_num),
+        "flpdf: first-page object {} must be plain indirect — \
+         both flpdf and qpdf agree: first-page object is not packed into ObjStm",
+        flpdf_page_refs[0]
+    );
 }
