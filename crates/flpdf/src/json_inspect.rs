@@ -1411,44 +1411,49 @@ fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
     let minute = take(10, 12, zero_default)?;
     let second = take(12, 14, zero_default)?;
 
-    // Parse timezone
+    // Parse timezone. Trailing garbage (anything not empty / Z / z / +... /
+    // -...) must yield None rather than silently defaulting to "Z", to keep
+    // the function's "unparseable input -> None" contract honest.
     let tz_str = if s.len() > 14 { &s[14..] } else { "" };
     let tz = if tz_str.is_empty() || tz_str == "Z" || tz_str == "z" {
         "Z".to_string()
     } else if let Some(rest) = tz_str.strip_prefix('+') {
-        // +HH'mm' or +HH
-        parse_tz_offset('+', rest)
+        parse_tz_offset('+', rest)?
     } else if let Some(rest) = tz_str.strip_prefix('-') {
-        parse_tz_offset('-', rest)
+        parse_tz_offset('-', rest)?
     } else {
-        "Z".to_string()
+        return None;
     };
 
     Some(format!("{year}-{month}-{day}T{hour}:{minute}:{second}{tz}"))
 }
 
-/// Parse a timezone offset in the form `HH'mm'` or `HH` and return a string like `+HH:MM`.
-fn parse_tz_offset(sign: char, rest: &str) -> String {
-    // Format: HH'mm' (with literal apostrophes) or just HH
+/// Parse a timezone offset in the form `HH'mm'` or `HH` and return a string
+/// like `+HH:MM`. Returns `None` for malformed offsets so callers can
+/// propagate the failure up.
+fn parse_tz_offset(sign: char, rest: &str) -> Option<String> {
+    // Accept exactly one of `HH'mm'`, `HH'mm`, `HHmm`, or `HH` after the
+    // sign. Anything longer is treated as trailing garbage and rejected so
+    // callers don't get a silent partial parse.
     let rest = rest.trim_end_matches('\'');
-    let (hh, mm) = if rest.len() >= 5 && rest.as_bytes().get(2) == Some(&b'\'') {
+    let (hh, mm) = if rest.len() == 5 && rest.as_bytes().get(2) == Some(&b'\'') {
         (&rest[0..2], &rest[3..5])
-    } else if rest.len() >= 4 {
+    } else if rest.len() == 4 {
         (&rest[0..2], &rest[2..4])
     } else if rest.len() == 2 {
         (rest, "00")
     } else {
-        return "Z".to_string();
+        return None;
     };
     // Validate digits
     if !hh.chars().all(|c| c.is_ascii_digit()) || !mm.chars().all(|c| c.is_ascii_digit()) {
-        return "Z".to_string();
+        return None;
     }
     // If +00:00, emit Z
     if sign == '+' && hh == "00" && mm == "00" {
-        "Z".to_string()
+        Some("Z".to_string())
     } else {
-        format!("{sign}{hh}:{mm}")
+        Some(format!("{sign}{hh}:{mm}"))
     }
 }
 
@@ -4994,6 +4999,24 @@ mod tests {
         // pass through. Previously only the year was validated.
         assert_eq!(parse_pdf_date(b"D:2026XX0101000000Z"), None);
         assert_eq!(parse_pdf_date(b"D:20260101NN0000Z"), None);
+    }
+
+    #[test]
+    fn parse_pdf_date_trailing_garbage_returns_none() {
+        // Regression: garbage suffix after the seconds field used to default
+        // to "Z" instead of failing. The function contract says unparseable
+        // input -> None, so the silent default is wrong.
+        assert_eq!(parse_pdf_date(b"D:20260101000000garbage"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101000000*"), None);
+    }
+
+    #[test]
+    fn parse_pdf_date_malformed_tz_offset_returns_none() {
+        // Half-formed offsets after + / - must also fail instead of falling
+        // back to "Z".
+        assert_eq!(parse_pdf_date(b"D:20260101000000+X"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101000000+0X"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101000000+0900XX"), None);
     }
 
     #[test]
