@@ -1105,30 +1105,46 @@ fn walk_acroform_fields<R: Read + Seek>(
     let mut annotations: Vec<JsonValue> = Vec::new();
     let mut has_subfield_kids = false;
 
-    // Classify each kid: if it has /T → sub-field; otherwise → widget annotation.
-    // We need to resolve each kid to check.
+    // Classify each kid as a widget annotation vs a (sub-)field dictionary.
+    //
+    // A kid is a widget *only* when its dictionary has `/Subtype /Widget` AND
+    // carries no field-like entries that would make it a real field. Field
+    // dictionaries can legitimately have no `/T` (unnamed intermediate
+    // grouping nodes — `/T` is optional per ISO 32000-1 §12.7.3.1, only
+    // `fullname` derivation cares); checking only for `/T` previously dropped
+    // those branches and their descendants from the flat list.
     let mut subfield_refs: Vec<crate::ObjectRef> = Vec::new();
     for kid in &kids {
         let kid_ref = match kid {
             Object::Reference(r) => *r,
             _ => continue,
         };
-        // Resolve kid to classify it (sub-field vs widget).
-        // We avoid consuming the `seen` set here since sub-fields are walked below.
         let kid_obj = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
-        let has_t = match &kid_obj {
-            Object::Dictionary(d) => d.get("T").is_some(),
-            _ => false,
+        let Object::Dictionary(d) = &kid_obj else {
+            continue;
         };
-        if has_t {
-            subfield_refs.push(kid_ref);
-            has_subfield_kids = true;
-        } else {
-            // Widget annotation — collect ref string.
+        let is_widget_subtype = matches!(
+            d.get("Subtype"),
+            Some(Object::Name(n)) if n.as_slice() == b"Widget"
+        );
+        // Field-like markers: presence of any of these means the kid acts as
+        // a field (named or unnamed) and must be recursed into.
+        let has_field_entries = d.get("T").is_some()
+            || d.get("FT").is_some()
+            || d.get("Kids").is_some()
+            || d.get("Parent").is_some();
+
+        if is_widget_subtype && !has_field_entries {
+            // Pure widget annotation — collect ref string, do not recurse.
             annotations.push(JsonValue::String(format!(
                 "{} {} R",
                 kid_ref.number, kid_ref.generation
             )));
+        } else {
+            // Field dict (named or unnamed) — recurse so descendants are
+            // emitted in the flat list.
+            subfield_refs.push(kid_ref);
+            has_subfield_kids = true;
         }
     }
 
@@ -3523,6 +3539,81 @@ mod tests {
             JsonValue::Integer(8192),
             "child must inherit /Ff from parent"
         );
+    }
+
+    // ── acroform: unnamed intermediate field still recursed into ─────────────
+    //
+    // Regression for the CodeRabbit finding on kid classification: a /Kids
+    // member that is a field dictionary (has /Kids or /FT or /Parent) but
+    // lacks /T is a valid unnamed intermediate grouping node per ISO
+    // 32000-1 §12.7.3.1. The previous "has /T -> sub-field, else widget"
+    // rule dropped such nodes and silently lost every descendant.
+
+    #[test]
+    fn acroform_unnamed_intermediate_field_with_kids_recurses() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let unnamed_ref = crate::ObjectRef::new(201, 0); // no /T, but has /Kids
+        let leaf_ref = crate::ObjectRef::new(202, 0); // has /T, real leaf
+
+        let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(vec![Object::Reference(unnamed_ref)]),
+        );
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        // Unnamed intermediate field: no /T, no /Subtype, but has /Kids.
+        // Must be classified as a field (so we recurse into its Kids).
+        let mut unnamed = Dictionary::new();
+        unnamed.insert("FT", Object::Name(b"Tx".to_vec()));
+        unnamed.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        pdf.set_object(unnamed_ref, Object::Dictionary(unnamed));
+
+        // Real leaf field with /T — must reach the flat list.
+        let mut leaf = Dictionary::new();
+        leaf.insert("T", Object::String(b"name".to_vec()));
+        leaf.insert("Parent", Object::Reference(unnamed_ref));
+        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        // Both the unnamed intermediate and the leaf must appear (2 entries).
+        assert_eq!(
+            fields.len(),
+            2,
+            "expected 2 entries: unnamed intermediate + leaf"
+        );
+
+        // The leaf entry must be present with fullname == "name" (intermediate
+        // contributed no name segment because /T was absent).
+        let JsonValue::Object(leaf_entry) = &fields[1] else {
+            panic!("leaf entry must be Object");
+        };
+        let leaf_fullname = leaf_entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(
+            leaf_fullname,
+            JsonValue::String("name".to_string()),
+            "leaf fullname must be 'name' (unnamed intermediate contributes no segment)"
+        );
+
+        // Leaf must inherit /FT from the unnamed intermediate.
+        let leaf_ft = leaf_entry
+            .iter()
+            .find(|(k, _)| k == "fieldtype")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(leaf_ft, JsonValue::String("Tx".to_string()));
     }
 
     #[test]
