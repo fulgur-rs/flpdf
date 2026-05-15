@@ -534,18 +534,18 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // filtered out of the output.
     if let StreamDataMode::File { ref prefix } = stream_mode {
         let wanted_refs = collect_datafile_object_refs(&v2);
-        if !wanted_refs.is_empty() {
-            let mut pdf2 = open_pdf(input, cli.repair, &cli.password)?;
-            for oref in wanted_refs {
-                let obj = pdf2.resolve(oref)?;
-                if let Object::Stream(stream) = obj {
-                    // qpdf names side files `<prefix>-nnn` where nnn is the
-                    // object number zero-padded to at least 3 digits
-                    // (qpdf manual, --json-stream-prefix). Match that so
-                    // tooling written against qpdf's layout finds the files.
-                    let side_path = format!("{prefix}-{:03}", oref.number);
-                    std::fs::write(&side_path, &stream.data)?;
-                }
+        // Reuse the same `pdf` handle the JSON was built from. Re-opening
+        // the input here would risk the file being swapped mid-run, so the
+        // JSON body and the side files could capture different snapshots.
+        for oref in wanted_refs {
+            let obj = pdf.resolve(oref)?;
+            if let Object::Stream(stream) = obj {
+                // qpdf names side files `<prefix>-nnn` where nnn is the
+                // object number zero-padded to at least 3 digits
+                // (qpdf manual, --json-stream-prefix). Match that so
+                // tooling written against qpdf's layout finds the files.
+                let side_path = format!("{prefix}-{:03}", oref.number);
+                std::fs::write(&side_path, &stream.data)?;
             }
         }
     }
