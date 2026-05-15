@@ -953,6 +953,17 @@ impl LinearizationPlan {
 
         let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
         let part3_set: BTreeSet<ObjectRef> = self.part3_objects.iter().copied().collect();
+        // Only objects actually in the linearization plan's Part-4 set have a
+        // RenumberMap entry. A source ObjStm may carry eligible-but-unplanned
+        // objects (unreachable / trailer-only); batching those would make
+        // ObjStmLayout::build fail with "has no renumber entry". Skip them.
+        let part4_set: BTreeSet<ObjectRef> = self
+            .part4_other_pages_private
+            .iter()
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
+            .copied()
+            .collect();
 
         // Part-4 ownership classification (same rationale as the Generate path):
         // a batch must not co-locate objects with different page ownership, so
@@ -1014,11 +1025,19 @@ impl LinearizationPlan {
                 }
                 if part3_set.contains(&obj_ref) {
                     p3_eligible.push(obj_ref);
-                } else if let Some(owner) = owner_of(&obj_ref) {
-                    p4_by_owner.entry(owner).or_default().push(obj_ref);
+                } else if part4_set.contains(&obj_ref) {
+                    // part4_set gates owner bucketing: only objects with a
+                    // linearization-plan slot (RenumberMap entry) may be
+                    // batched. owner_of's page-private set is the raw
+                    // per_page_private list (unfiltered), so an unplanned
+                    // member could otherwise be bucketed and crash
+                    // ObjStmLayout::build with "has no renumber entry".
+                    if let Some(owner) = owner_of(&obj_ref) {
+                        p4_by_owner.entry(owner).or_default().push(obj_ref);
+                    }
                 }
-                // else: eligible but in no linearization Part — leave it as a
-                // plain indirect object (no batch).
+                // else: eligible but not in any linearization part (no
+                // RenumberMap entry) — leave it as a plain indirect object.
             }
 
             // Split into cap-sized batches per part / per owner.
@@ -2339,6 +2358,27 @@ mod tests {
             assert!(
                 is_eligible_for_objstm(*r, &obj, &ctx),
                 "batched object {r} must be eligible for ObjStm"
+            );
+        }
+
+        // ── Invariant 9: Every batched ref has a linearization-plan slot ──────
+        // A batched object must live in the plan's Part-3 or Part-4 set; an
+        // eligible source-ObjStm member that is not in any part has no
+        // RenumberMap entry and would crash ObjStmLayout::build with "has no
+        // renumber entry". Guards the preserve-mode part4_set filter.
+        let part3_set: BTreeSet<ObjectRef> = plan.part3_objects.iter().copied().collect();
+        let part4_set: BTreeSet<ObjectRef> = plan
+            .part4_other_pages_private
+            .iter()
+            .chain(&plan.part4_other_pages_shared)
+            .chain(&plan.part4_rest)
+            .copied()
+            .collect();
+        for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
+            assert!(
+                part3_set.contains(r) || part4_set.contains(r),
+                "batched object {r} has no linearization-plan slot \
+                 (not in Part-3 or Part-4) — would break ObjStmLayout::build"
             );
         }
     }
