@@ -2447,8 +2447,14 @@ mod tests {
             !all_batched.contains(&resources_ref),
             "interim: Part-3 object 5 0 R must NOT be batched"
         );
-        assert!(all_batched.contains(&pages_ref), "2 0 R must be batched even with cap=1");
-        assert!(all_batched.contains(&page2_ref), "4 0 R must be batched even with cap=1");
+        assert!(
+            all_batched.contains(&pages_ref),
+            "2 0 R must be batched even with cap=1"
+        );
+        assert!(
+            all_batched.contains(&page2_ref),
+            "4 0 R must be batched even with cap=1"
+        );
     }
 
     /// One source ObjStm whose **two** members both land in Part 4 (they are

@@ -917,8 +917,7 @@ mod tests {
             .expect("9 0 R must be in renumber map")
             .number;
         assert_eq!(
-            table.header.first_object_number,
-            member_slot,
+            table.header.first_object_number, member_slot,
             "from_plan must return the member's renumber slot (pre-patch baseline)"
         );
     }
@@ -948,14 +947,12 @@ mod tests {
             .expect("9 0 R must be in renumber map")
             .number;
         assert_ne!(
-            table.header.first_object_number,
-            member_slot,
+            table.header.first_object_number, member_slot,
             "post-patch: first_object_number must differ from member's renumber slot \
              when the member is ObjStm-packed (container_num > all member slots)"
         );
         assert_eq!(
-            table.header.first_object_number,
-            simulated_container_num,
+            table.header.first_object_number, simulated_container_num,
             "post-patch: first_object_number must equal the ObjStm container number"
         );
     }
