@@ -406,3 +406,44 @@ fn json_flag_conflicts_with_subcommand() {
     .assert()
     .code(2);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: --json is exclusive with other top-level modes / OUTPUT.
+//
+// CodeRabbit flagged that `flpdf --json --check in` or `flpdf --json in out`
+// silently ignored the second mode because run_json wins main's dispatch
+// chain. clap conflicts_with_all now turns these into usage errors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_flag_conflicts_with_check_mode() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--json", "--check", input.path().to_str().unwrap()])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn json_flag_conflicts_with_output_positional() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let out = temp.path().join("out.pdf");
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        input.path().to_str().unwrap(),
+        out.to_str().unwrap(),
+    ])
+    .assert()
+    .code(2);
+}
+
+#[test]
+fn json_flag_conflicts_with_show_info() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--json", "--show-info", input.path().to_str().unwrap()])
+        .assert()
+        .code(2);
+}
