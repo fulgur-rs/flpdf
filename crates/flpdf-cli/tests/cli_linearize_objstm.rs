@@ -456,7 +456,10 @@ fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize)
     // --- (d) round-trip: all objects resolve, page count preserved ---
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
-    assert!(!refs.is_empty(), "mode={mode}: round-tripped doc exposes objects");
+    assert!(
+        !refs.is_empty(),
+        "mode={mode}: round-tripped doc exposes objects"
+    );
     for r in refs {
         pdf.resolve(r)
             .unwrap_or_else(|e| panic!("mode={mode}: object {r} did not resolve: {e}"));
@@ -498,8 +501,9 @@ fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize)
     );
     let container_nums = objstm_container_numbers(&xref_entries);
     for cnum in &container_nums {
-        let coff = uncompressed_offset(&xref_entries, *cnum)
-            .unwrap_or_else(|| panic!("mode={mode}: ObjStm container {cnum} has no offset in xref"));
+        let coff = uncompressed_offset(&xref_entries, *cnum).unwrap_or_else(|| {
+            panic!("mode={mode}: ObjStm container {cnum} has no offset in xref")
+        });
         assert!(
             coff >= e_off,
             "mode={mode}: ObjStm container obj {cnum} at offset {coff} is BEFORE /E={e_off}; \
@@ -528,10 +532,7 @@ fn acceptance_gate_three_modes_multi_page() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let fixtures: &[(&str, usize)] = &[
-        ("two-page.pdf", 2),
-        ("three-page.pdf", 3),
-    ];
+    let fixtures: &[(&str, usize)] = &[("two-page.pdf", 2), ("three-page.pdf", 3)];
     let modes = ["preserve", "disable", "generate"];
 
     for (fixture_name, page_count) in fixtures {
@@ -562,7 +563,9 @@ fn acceptance_gate_generate_has_objstm_in_part4() {
 
     for fixture_name in fixtures {
         let input = fixture_path(fixture_name);
-        let out = dir.path().join(format!("part4-generate-{fixture_name}.pdf"));
+        let out = dir
+            .path()
+            .join(format!("part4-generate-{fixture_name}.pdf"));
         linearize_with_mode("generate", &input, &out);
 
         let bytes = std::fs::read(&out).unwrap();
@@ -670,7 +673,10 @@ fn qpdf_crosscheck_per_page1_plain_both_tools() {
         ])
         .status()
         .expect("spawn qpdf --linearize --object-streams=generate");
-    assert!(status.success(), "qpdf --linearize --object-streams=generate failed");
+    assert!(
+        status.success(),
+        "qpdf --linearize --object-streams=generate failed"
+    );
 
     let qpdf_bytes = std::fs::read(&qpdf_out).unwrap();
     let qpdf_xref_text = qpdf_show_xref(&qpdf_out);
