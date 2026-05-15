@@ -1042,56 +1042,31 @@ fn walk_acroform_fields<R: Read + Seek>(
         None => JsonValue::Null,
     };
 
-    // /FT — bare name string (no "/" prefix), inherited from parent if absent.
-    let fieldtype = {
-        let ft = field_dict.get("FT").cloned();
-        let ft_obj = if ft.is_some() {
-            ft
-        } else {
-            // Simple inheritance: walk /Parent chain.
-            let mut inherited = None;
-            let mut iparent = field_dict.get("Parent").cloned();
-            let mut inherit_seen = std::collections::BTreeSet::new();
-            while let Some(Object::Reference(pr)) = iparent {
-                if !inherit_seen.insert(pr) {
-                    break;
-                }
-                match pdf.resolve(pr).map_err(ConvertError::from)? {
-                    Object::Dictionary(pd) => {
-                        if let Some(v) = pd.get("FT").cloned() {
-                            inherited = Some(v);
-                            break;
-                        }
-                        iparent = pd.get("Parent").cloned();
-                    }
-                    _ => break,
-                }
-            }
-            inherited
-        };
-        match ft_obj {
-            Some(Object::Name(bytes)) => {
-                JsonValue::String(String::from_utf8_lossy(&bytes).into_owned())
-            }
-            _ => JsonValue::Null,
+    // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
+    // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
+    let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
+    let fieldtype = match ft_obj {
+        Some(Object::Name(bytes)) => {
+            JsonValue::String(String::from_utf8_lossy(&bytes).into_owned())
         }
+        _ => JsonValue::Null,
     };
 
-    // /V — value, run through pdf_object_to_json.
-    let value = match field_dict.get("V") {
-        Some(v) => pdf_object_to_json(v)?,
+    // /V — value, run through pdf_object_to_json. Inherited from /Parent.
+    let value = match inherited_field_value(pdf, &field_dict, "V")? {
+        Some(v) => pdf_object_to_json(&v)?,
         None => JsonValue::Null,
     };
 
-    // /DV — default value, run through pdf_object_to_json.
-    let defaultvalue = match field_dict.get("DV") {
-        Some(v) => pdf_object_to_json(v)?,
+    // /DV — default value. Inherited from /Parent.
+    let defaultvalue = match inherited_field_value(pdf, &field_dict, "DV")? {
+        Some(v) => pdf_object_to_json(&v)?,
         None => JsonValue::Null,
     };
 
-    // /Ff — field flags integer.
-    let fieldflags = match field_dict.get("Ff") {
-        Some(Object::Integer(n)) => JsonValue::Integer(*n),
+    // /Ff — field flags integer. Inherited from /Parent.
+    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")? {
+        Some(Object::Integer(n)) => JsonValue::Integer(n),
         _ => JsonValue::Null,
     };
 
@@ -1194,6 +1169,39 @@ fn walk_acroform_fields<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+// Look up an inheritable AcroForm field entry on `field_dict`, walking the
+// `/Parent` chain if the key is absent locally (ISO 32000-1 §12.7.3.1).
+//
+// Returns `Some(value)` for the first non-absent value found at this dict or
+// any ancestor; `None` if neither this field nor any ancestor carries `key`.
+// Cycle-safe: never visits the same `/Parent` twice.
+fn inherited_field_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_dict: &Dictionary,
+    key: &str,
+) -> Result<Option<Object>, ConvertError> {
+    if let Some(local) = field_dict.get(key).cloned() {
+        return Ok(Some(local));
+    }
+    let mut parent = field_dict.get("Parent").cloned();
+    let mut seen: std::collections::BTreeSet<crate::ObjectRef> = std::collections::BTreeSet::new();
+    while let Some(Object::Reference(pr)) = parent {
+        if !seen.insert(pr) {
+            break;
+        }
+        match pdf.resolve(pr).map_err(ConvertError::from)? {
+            Object::Dictionary(pd) => {
+                if let Some(v) = pd.get(key).cloned() {
+                    return Ok(Some(v));
+                }
+                parent = pd.get("Parent").cloned();
+            }
+            _ => break,
+        }
+    }
+    Ok(None)
 }
 
 /// Build the qpdf JSON v2 `"acroform"` section.
@@ -3432,6 +3440,141 @@ mod tests {
                 "qpdf"
             ],
             "key order must match qpdf v2: acroform before outlines"
+        );
+    }
+
+    // ── acroform: inheritable fields /V, /DV, /Ff propagate from parent ──────
+    //
+    // Regression for CodeRabbit's flpdf-9hc.11.7 review: /V, /DV, /Ff are
+    // inheritable per ISO 32000-1 §12.7.3.1, just like /FT. A child field
+    // that omits them must still see the ancestor value in the JSON output.
+
+    #[test]
+    fn acroform_inheritable_fields_descend_from_parent() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let parent_field_ref = crate::ObjectRef::new(201, 0);
+        let child_field_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(vec![Object::Reference(parent_field_ref)]),
+        );
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        // Parent carries /FT, /V, /DV, /Ff. Child has only /T and /Parent
+        // so it must inherit all four through the /Parent chain.
+        let mut parent_field = Dictionary::new();
+        parent_field.insert("T", Object::String(b"person".to_vec()));
+        parent_field.insert("FT", Object::Name(b"Tx".to_vec()));
+        parent_field.insert("V", Object::String(b"alice".to_vec()));
+        parent_field.insert("DV", Object::String(b"default-alice".to_vec()));
+        parent_field.insert("Ff", Object::Integer(8192));
+        parent_field.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(child_field_ref)]),
+        );
+        pdf.set_object(parent_field_ref, Object::Dictionary(parent_field));
+
+        let mut child_field = Dictionary::new();
+        child_field.insert("T", Object::String(b"name".to_vec()));
+        child_field.insert("Parent", Object::Reference(parent_field_ref));
+        pdf.set_object(child_field_ref, Object::Dictionary(child_field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        // The child is the second entry (parent listed first).
+        let JsonValue::Object(child_entry) = &fields[1] else {
+            panic!("child entry must be Object");
+        };
+
+        let get = |k: &str| -> JsonValue {
+            child_entry
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(JsonValue::Null)
+        };
+
+        assert_eq!(
+            get("fieldtype"),
+            JsonValue::String("Tx".to_string()),
+            "child must inherit /FT from parent"
+        );
+        assert_eq!(
+            get("value"),
+            JsonValue::String("u:alice".to_string()),
+            "child must inherit /V from parent"
+        );
+        assert_eq!(
+            get("defaultvalue"),
+            JsonValue::String("u:default-alice".to_string()),
+            "child must inherit /DV from parent"
+        );
+        assert_eq!(
+            get("fieldflags"),
+            JsonValue::Integer(8192),
+            "child must inherit /Ff from parent"
+        );
+    }
+
+    #[test]
+    fn acroform_local_field_value_overrides_parent_inheritance() {
+        // Verify that a locally-present /V still wins over the parent's /V.
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let parent_field_ref = crate::ObjectRef::new(201, 0);
+        let child_field_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(vec![Object::Reference(parent_field_ref)]),
+        );
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut parent_field = Dictionary::new();
+        parent_field.insert("T", Object::String(b"person".to_vec()));
+        parent_field.insert("V", Object::String(b"alice".to_vec()));
+        parent_field.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(child_field_ref)]),
+        );
+        pdf.set_object(parent_field_ref, Object::Dictionary(parent_field));
+
+        let mut child_field = Dictionary::new();
+        child_field.insert("T", Object::String(b"name".to_vec()));
+        child_field.insert("V", Object::String(b"bob".to_vec()));
+        child_field.insert("Parent", Object::Reference(parent_field_ref));
+        pdf.set_object(child_field_ref, Object::Dictionary(child_field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        let JsonValue::Object(child_entry) = &fields[1] else {
+            panic!("child entry must be Object");
+        };
+        let value = child_entry
+            .iter()
+            .find(|(k, _)| k == "value")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(
+            value,
+            JsonValue::String("u:bob".to_string()),
+            "local /V must win over parent's /V"
         );
     }
 }
