@@ -94,6 +94,29 @@ const SENTINEL: ObjectRef = ObjectRef {
     generation: 0,
 };
 
+/// Slot numbers reserved by [`RenumberMap::relocate_objstm_members`] for the
+/// split linearized xref-stream layout.
+///
+/// All zero (the [`Default`]) when there were no ObjStm batches — the writer
+/// then keeps its classic Part-1 mini-xref + single Part-6 path verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjStmRelocation {
+    /// Object number of the first-page (Part-1) cross-reference stream.
+    pub first_xref_slot: u32,
+    /// Object number of the main (Part-6) cross-reference stream.
+    pub main_xref_slot: u32,
+    /// Per-batch ObjStm container object numbers, in flat (Part-3 then
+    /// Part-4) batch order.
+    pub container_numbers: Vec<u32>,
+}
+
+impl ObjStmRelocation {
+    /// `true` when no relocation happened (no ObjStm batches).
+    pub fn is_empty(&self) -> bool {
+        self.first_xref_slot == 0 && self.main_xref_slot == 0
+    }
+}
+
 impl RenumberMap {
     // -----------------------------------------------------------------------
     // Construction
@@ -317,6 +340,148 @@ impl RenumberMap {
             self.by_new_number.get(self.param_dict_slot as usize),
             Some(r) if r.number == 0 && r.generation == 0
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // ObjStm container-slot allocation (flpdf-56u)
+    // -----------------------------------------------------------------------
+
+    /// Relocate every ObjStm member to a contiguous block of the **highest**
+    /// object numbers, with the per-batch container objects numbered directly
+    /// **below** their members, mirroring qpdf's linearized+ObjStm renumber
+    /// order ("container < members, members trailing").
+    ///
+    /// `batches` is the writer's resolved batch order: an ordered list of
+    /// batches, each a list of member original refs in pair-table order.  The
+    /// first slice of `batches` is the Part-3 (first-page section) batches,
+    /// the remainder Part-4 — but this method does not need that split; it
+    /// only needs a stable global order.
+    ///
+    /// After relocation:
+    ///
+    /// * every non-member object keeps its relative order and is compacted so
+    ///   the low slots stay contiguous (param dict / hint stream / catalog /
+    ///   Part-2 / Part-3-plain / Part-4 — all **type-1** in the xref stream);
+    /// * for each batch, one fresh container slot is appended (type-1),
+    ///   immediately followed by that batch's member slots (type-2).
+    ///
+    /// In addition, two fresh slots are reserved **between** the non-member
+    /// block and the container block — one for the linearized first-page
+    /// (Part-1) cross-reference *stream* object and one for the main (Part-6)
+    /// cross-reference *stream* object.  Both are type-1 entries numbered
+    /// below every container/member, so each of the two split xref streams
+    /// can carry a single contiguous `/Index` range with no type-1-after-
+    /// type-2 interleave (qpdf's linearization rule).
+    ///
+    /// Returns an [`ObjStmRelocation`] carrying the two reserved xref-stream
+    /// object numbers and the per-batch container object numbers (in
+    /// `batches` order), so the writer can build its `ObjStmLayout` and emit
+    /// the split xref streams against the *relocated* map without re-deriving
+    /// numbers independently.
+    ///
+    /// The param-dict and hint-stream sentinel reservations are preserved
+    /// (their slot numbers are recomputed to track the compaction).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member ref is not present in the map (a planner / renumber
+    /// inconsistency the caller must not paper over).
+    pub fn relocate_objstm_members(&mut self, batches: &[Vec<ObjectRef>]) -> ObjStmRelocation {
+        // Fast path: nothing to relocate — leave the map byte-identical.
+        if batches.iter().all(|b| b.is_empty()) {
+            return ObjStmRelocation::default();
+        }
+
+        let member_set: BTreeSet<ObjectRef> = batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        // Walk the existing layout (ascending new number, slot 0 skipped) and
+        // rebuild it: keep slot 0, then re-emit every non-member slot
+        // (sentinels included) in order, recording the new positions of the
+        // two reservations.  Member slots are dropped here and re-appended in
+        // batch order below.
+        let old_param_slot = self.param_dict_slot;
+        let old_hint_slot = self.hint_stream_slot;
+
+        let mut new_by_new_number: Vec<ObjectRef> = Vec::with_capacity(self.by_new_number.len());
+        new_by_new_number.push(SENTINEL); // slot 0
+        let mut new_param_slot = 0u32;
+        let mut new_hint_slot = 0u32;
+
+        for (old_idx, &original) in self.by_new_number.iter().enumerate().skip(1) {
+            let old_idx = old_idx as u32;
+            if old_idx == old_param_slot {
+                new_param_slot = new_by_new_number.len() as u32;
+                new_by_new_number.push(SENTINEL);
+                continue;
+            }
+            if old_idx == old_hint_slot {
+                new_hint_slot = new_by_new_number.len() as u32;
+                new_by_new_number.push(SENTINEL);
+                continue;
+            }
+            if original.number == 0 {
+                // An unexpected sentinel (defence-in-depth) — keep it.
+                new_by_new_number.push(SENTINEL);
+                continue;
+            }
+            if member_set.contains(&original) {
+                continue; // relocated to the tail below
+            }
+            new_by_new_number.push(original);
+        }
+
+        // Reserve the two split xref-stream object numbers, BELOW every
+        // container and member, so both `/Index` ranges stay non-interleaved.
+        let first_xref_slot = new_by_new_number.len() as u32;
+        new_by_new_number.push(SENTINEL);
+        let main_xref_slot = new_by_new_number.len() as u32;
+        new_by_new_number.push(SENTINEL);
+
+        // Append container + member blocks, batch by batch.
+        let mut container_numbers: Vec<u32> = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if batch.is_empty() {
+                continue;
+            }
+            let container_num = new_by_new_number.len() as u32;
+            new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
+            container_numbers.push(container_num);
+            for &member in batch {
+                assert!(
+                    self.by_original.contains_key(&member),
+                    "relocate_objstm_members: member {member:?} not present in RenumberMap \
+                     (planner / renumber inconsistency)"
+                );
+                new_by_new_number.push(member);
+            }
+        }
+
+        // Rebuild the forward index from the relocated table.
+        let mut new_by_original: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        for (idx, &original) in new_by_new_number.iter().enumerate().skip(1) {
+            if original.number == 0 {
+                continue;
+            }
+            let prev = new_by_original.insert(original, ObjectRef::new(idx as u32, 0));
+            assert!(
+                prev.is_none(),
+                "relocate_objstm_members: duplicate original {original:?} after relocation"
+            );
+        }
+
+        self.by_new_number = new_by_new_number;
+        self.by_original = new_by_original;
+        self.param_dict_slot = new_param_slot;
+        self.hint_stream_slot = new_hint_slot;
+
+        ObjStmRelocation {
+            first_xref_slot,
+            main_xref_slot,
+            container_numbers,
+        }
     }
 
     // -----------------------------------------------------------------------

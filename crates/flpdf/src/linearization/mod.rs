@@ -26,5 +26,5 @@ pub use hint_shared::{
 pub use hint_stream::{encode_hint_stream, HintStreamBuilder, HintStreamBytes};
 pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
-pub use renumber::RenumberMap;
+pub use renumber::{ObjStmRelocation, RenumberMap};
 pub use writer::{write_linearized, LinearizedDocument, LinearizedOffsets};
