@@ -1388,6 +1388,16 @@ fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
         return None;
     }
 
+    // The fixed-width date prefix must end at one of the valid component
+    // boundaries: YYYY, YYYYMM, YYYYMMDD, YYYYMMDDhh, YYYYMMDDhhmm, or
+    // YYYYMMDDhhmmss. A trailing partial component (e.g. an odd 5th char in
+    // "D:20261") is malformed; we refuse it rather than discarding the
+    // dangling digits.
+    let prefix_len = s.len().min(14);
+    if !matches!(prefix_len, 4 | 6 | 8 | 10 | 12 | 14) {
+        return None;
+    }
+
     let month_default = "01";
     let day_default = "01";
     let zero_default = "00";
@@ -1432,10 +1442,11 @@ fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
 /// like `+HH:MM`. Returns `None` for malformed offsets so callers can
 /// propagate the failure up.
 fn parse_tz_offset(sign: char, rest: &str) -> Option<String> {
-    // Accept exactly one of `HH'mm'`, `HH'mm`, `HHmm`, or `HH` after the
-    // sign. Anything longer is treated as trailing garbage and rejected so
-    // callers don't get a silent partial parse.
-    let rest = rest.trim_end_matches('\'');
+    // Accept exactly one of: `HH'mm'`, `HH'mm`, `HHmm`, or `HH`.
+    // Strip the single optional closing apostrophe so the remaining shapes
+    // collapse to four; anything else (multiple trailing apostrophes,
+    // garbage suffix, partial component) is rejected.
+    let rest = rest.strip_suffix('\'').unwrap_or(rest);
     let (hh, mm) = if rest.len() == 5 && rest.as_bytes().get(2) == Some(&b'\'') {
         (&rest[0..2], &rest[3..5])
     } else if rest.len() == 4 {
@@ -5017,6 +5028,36 @@ mod tests {
         assert_eq!(parse_pdf_date(b"D:20260101000000+X"), None);
         assert_eq!(parse_pdf_date(b"D:20260101000000+0X"), None);
         assert_eq!(parse_pdf_date(b"D:20260101000000+0900XX"), None);
+    }
+
+    #[test]
+    fn parse_pdf_date_partial_date_component_returns_none() {
+        // Regression: previously `take` silently fell back to the default
+        // whenever the input was shorter than the requested boundary, so
+        // dangling partial digits ("D:20261" / "D:2026010" / "D:202601010")
+        // produced a valid-looking timestamp. They must now return None.
+        assert_eq!(parse_pdf_date(b"D:20261"), None);
+        assert_eq!(parse_pdf_date(b"D:2026010"), None);
+        assert_eq!(parse_pdf_date(b"D:202601010"), None);
+        // The boundaries 4 / 6 / 8 / 10 / 12 / 14 themselves must still work.
+        assert!(parse_pdf_date(b"D:2026").is_some());
+        assert!(parse_pdf_date(b"D:202601").is_some());
+        assert!(parse_pdf_date(b"D:20260101000000").is_some());
+    }
+
+    #[test]
+    fn parse_pdf_date_multiple_trailing_apostrophes_in_offset_returns_none() {
+        // Regression: trim_end_matches('\'') used to swallow any number of
+        // trailing apostrophes, accepting "+09''", "+09'00'''" as if valid.
+        // The parser now accepts only a single closing apostrophe (the
+        // standard PDF date form `+HH'mm'`); anything else is rejected.
+        assert_eq!(parse_pdf_date(b"D:20260101000000+09''"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101000000+09'00'''"), None);
+        // The well-formed `+HH'mm'` still parses.
+        assert_eq!(
+            parse_pdf_date(b"D:20260101000000+09'00'"),
+            Some("2026-01-01T00:00:00+09:00".to_string())
+        );
     }
 
     #[test]
