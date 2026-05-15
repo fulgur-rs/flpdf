@@ -833,15 +833,28 @@ impl LinearizationPlan {
         let ctx = eligibility_context(pdf)?;
         let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
 
-        match config.mode {
+        let mut plan = match config.mode {
             ObjectStreamMode::Disable => unreachable!(),
             ObjectStreamMode::Generate => {
-                self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions)
+                self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions)?
             }
             ObjectStreamMode::Preserve => {
-                self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)
+                self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)?
             }
-        }
+        };
+
+        // Interim scope reduction (flpdf-9hc.5.8.3): Part-3 page-1 shared
+        // objects stay plain indirect. Packing them into an ObjStm makes
+        // qpdf's first-page-section accounting reject the output and leaves
+        // their Shared Object Hint Table member length encoded as 0, because
+        // ObjStm-aware Part-3 hint encoding depends on the split
+        // first-half/second-half xref restructure tracked in flpdf-56u
+        // (which blocks flpdf-9hc.5.8.4). Part-4 (rest-of-document) packing is
+        // unaffected. Re-enable Part-3 packing by removing this clear once
+        // flpdf-56u + the Part-3 shared hint encoding land in 5.8.4.
+        plan.part3_batches.clear();
+
+        Ok(plan)
     }
 
     /// Generate mode: pack eligible Part-3 and Part-4 objects into fresh ObjStm batches.
@@ -1881,18 +1894,18 @@ mod tests {
             .flat_map(|b| b.iter().copied())
             .collect();
 
-        // Resources dict (7 0 R) is in part3_objects and is eligible → part3_batches.
+        // Interim scope reduction (flpdf-9hc.5.8.3, re-enabled by flpdf-56u):
+        // Part-3 page-1 shared objects are NOT packed — part3_batches is empty
+        // and the Resources dict (7 0 R) stays a plain indirect object.
         let resources_ref = ObjectRef::new(7, 0);
-        if plan.part3_objects.contains(&resources_ref) {
-            assert!(
-                all_part3_batched.contains(&resources_ref),
-                "eligible part3 object 7 0 R must be in part3_batches"
-            );
-            assert!(
-                !all_part4_batched.contains(&resources_ref),
-                "part3 object 7 0 R must NOT be in part4_batches"
-            );
-        }
+        assert!(
+            all_part3_batched.is_empty(),
+            "interim: part3_batches must be empty (Part-3 packing deferred to flpdf-56u)"
+        );
+        assert!(
+            !all_part4_batched.contains(&resources_ref),
+            "Part-3 object 7 0 R must never be misrouted into part4_batches"
+        );
 
         // Part4 objects that are plain dicts (page 2: 4 0 R, page 3: 5 0 R) → part4_batches.
         // 8 0 R is a stream → ineligible, must NOT be in any batch.
@@ -2271,15 +2284,18 @@ mod tests {
             "ineligible /Type /XRef dict (6 0 R) must not appear in part4_batches"
         );
 
-        // ── Invariant 3: Part 3 eligible member goes to part3_batches ─────────
-        // 5 0 R (Resources) is in Part 3 and eligible → must be in part3_batches.
+        // ── Invariant 3: interim Part-3 packing is disabled ───────────────────
+        // flpdf-9hc.5.8.3 interim (re-enabled by flpdf-56u): Part-3 page-1
+        // shared objects stay plain indirect. 5 0 R (Resources, Part-3) must
+        // appear in NO batch — neither part3_batches (cleared) nor misrouted
+        // into part4_batches.
         assert!(
-            all_part3_batched.contains(&resources_ref),
-            "Part-3 eligible object 5 0 R must appear in part3_batches"
+            all_part3_batched.is_empty(),
+            "interim: part3_batches must be empty (Part-3 packing deferred to flpdf-56u)"
         );
         assert!(
             !all_part4_batched.contains(&resources_ref),
-            "Part-3 object 5 0 R must NOT appear in part4_batches"
+            "Part-3 object 5 0 R must NOT be misrouted into part4_batches"
         );
 
         // ── Invariant 4: Part 4 eligible members go to part4_batches ─────────
@@ -2298,26 +2314,20 @@ mod tests {
             "Part-4 eligible object 4 0 R (Page 2) must appear in part4_batches"
         );
 
-        // ── Invariant 5: Within each batch, members come from one ObjStm ──────
-        // ObjStm 7 contributes: [5 0 R] to part3, [2 0 R] to part4.
-        // ObjStm 8 contributes: [4 0 R] to part4.
-        // Check that part3_batches has exactly one batch containing resources_ref,
-        // and part4_batches has batches where pages_ref and page2_ref are NOT mixed
-        // (they originate from different source ObjStms).
-        let part3_flat: Vec<ObjectRef> = batch_plan
-            .part3_batches
-            .iter()
-            .flat_map(|b| b.iter().copied())
-            .collect();
+        // ── Invariant 5: Part-4 batches draw from one source ObjStm ───────────
+        // With interim Part-3 packing disabled, ObjStm 7 contributes only
+        // [2 0 R] to part4 (5 0 R is Part-3 → not packed); ObjStm 8 contributes
+        // [4 0 R] to part4. part3_batches is empty.
         assert!(
-            part3_flat.contains(&resources_ref),
-            "Resources dict must be in part3_batches"
+            batch_plan.part3_batches.is_empty(),
+            "interim: part3_batches must be empty"
         );
 
         // ── Invariant 6: Source-index ordering within each source ObjStm ──────
         // ObjStm 7 members in source-index order: 2 (idx 0), 3 (idx 1), 5 (idx 2).
-        // After filtering: 2 goes to part4, 5 goes to part3.
-        // Within the part4 contribution from ObjStm 7, ordering must respect idx.
+        // After filtering: 2 goes to part4; 3 is Part-2; 5 is Part-3 (not packed
+        // in the interim). Within the part4 contribution from ObjStm 7, ordering
+        // must respect idx.
         // Here only obj 2 survives to part4 from ObjStm 7, so the batch from ObjStm 7
         // to part4 is [2 0 R] — a single element, trivially sorted.
         // ObjStm 8 part4 contribution: [4 0 R] (idx 0, sole survivor) — also trivial.
@@ -2387,10 +2397,11 @@ mod tests {
     /// exceed the cap are split into multiple batches per part.
     #[test]
     fn objstm_batches_preserve_cap_splits_large_groups() {
-        // ObjStm 7 contributes 1 member to part3 (5 0 R) and 1 to part4 (2 0 R).
-        // ObjStm 8 contributes 1 member to part4 (4 0 R).
-        // With cap=1, each eligible member from a given ObjStm that lands in the
-        // same part must form its own batch (since at most 1 per batch).
+        // Interim (flpdf-9hc.5.8.3, re-enabled by flpdf-56u): Part-3 packing is
+        // disabled, so ObjStm 7 contributes only 2 0 R to part4 (5 0 R is
+        // Part-3 → not packed); ObjStm 8 contributes 4 0 R to part4.
+        // With cap=1, each eligible member that lands in part4 forms its own
+        // batch (at most 1 per batch).
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
@@ -2429,17 +2440,15 @@ mod tests {
         let pages_ref = ObjectRef::new(2, 0);
         let page2_ref = ObjectRef::new(4, 0);
         assert!(
-            all_batched.contains(&resources_ref),
-            "5 0 R must be batched even with cap=1"
+            batch_plan.part3_batches.is_empty(),
+            "interim: Part-3 (5 0 R) is not packed; part3_batches must be empty"
         );
         assert!(
-            all_batched.contains(&pages_ref),
-            "2 0 R must be batched even with cap=1"
+            !all_batched.contains(&resources_ref),
+            "interim: Part-3 object 5 0 R must NOT be batched"
         );
-        assert!(
-            all_batched.contains(&page2_ref),
-            "4 0 R must be batched even with cap=1"
-        );
+        assert!(all_batched.contains(&pages_ref), "2 0 R must be batched even with cap=1");
+        assert!(all_batched.contains(&page2_ref), "4 0 R must be batched even with cap=1");
     }
 
     /// One source ObjStm whose **two** members both land in Part 4 (they are
