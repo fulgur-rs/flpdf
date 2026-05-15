@@ -168,6 +168,205 @@ fn open_with_options_accepts_r5_with_weak_crypto_opt_in_and_r6_by_default() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// flpdf-9hc.3.21: authentication error parity for V=5 (and the V<5/V=4 path).
+//
+// Error-variant firing order in reader.rs `authenticate_if_encrypted`:
+//   - Password authentication runs FIRST. Both user+owner failing => BadPassword.
+//   - The weak-crypto gate (WeakCryptoNotAllowed) is applied only AFTER a
+//     password authenticates.
+//   - On the V=5 R=5/R=6 auth path, a wrong-length /U or /O entry maps to
+//     BadPassword (not Malformed), matching qpdf's "invalid password".
+//
+// `encryption.test` parity: subtest 7 (RC4 + wrong password without
+// --allow-weak-crypto => BadPassword) and subtest 8 (V=5 with a /U shorter
+// than 48 bytes => BadPassword) are reproduced fixture-by-fixture below,
+// together with the four regression fences (a)-(d).
+// ---------------------------------------------------------------------------
+
+/// scenario 7: an RC4 (V=1/R=2, weak) file opened with the WRONG password and
+/// WITHOUT --allow-weak-crypto must report BadPassword, not
+/// WeakCryptoNotAllowed. qpdf reports "invalid password" here.
+#[test]
+fn scenario7_rc4_wrong_password_without_weak_opt_in_is_bad_password() {
+    let err = match Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r2_reader_fixture()),
+        PdfOpenOptions {
+            password: b"wrong".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("wrong password should be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        "expected BadPassword (password checked before weak-crypto gate), got {err:?}"
+    );
+}
+
+/// scenario 8: a V=5 file whose /U entry is shorter than 48 bytes, opened on
+/// the authentication path, must report BadPassword, not Malformed. qpdf
+/// reports "invalid password" here.
+#[test]
+fn scenario8_v5_short_u_entry_is_bad_password() {
+    let bytes = v5_pdf_with_truncated_u_entry();
+    let err = match Pdf::open_with_options(
+        std::io::Cursor::new(bytes),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("a V=5 file with a short /U entry must not open"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        "expected BadPassword for a wrong-length /U on the auth path, got {err:?}"
+    );
+}
+
+/// Fence: a wrong-length /UE entry (not /U or /O) stays Malformed. The
+/// reclassification is intentionally scoped to /U and /O only.
+#[test]
+fn fence_v5_short_ue_entry_stays_malformed() {
+    let bytes = v5_pdf_with_truncated_ue_entry();
+    let err = match Pdf::open_with_options(
+        std::io::Cursor::new(bytes),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("a V=5 file with a short /UE entry must not open"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::Encrypted(EncryptedError::Malformed { .. })),
+        "/UE length errors must remain Malformed (not reclassified), got {err:?}"
+    );
+}
+
+/// Regression fence (a): a CORRECT password against a weak (RC4) file WITHOUT
+/// --allow-weak-crypto must still return WeakCryptoNotAllowed. Only the
+/// ordering relative to BadPassword changed, not this behaviour.
+#[test]
+fn fence_a_correct_password_weak_not_allowed_still_weak_crypto() {
+    // encrypted_r2_reader_fixture is built with the empty user password, so
+    // the default (empty) password authenticates successfully.
+    let err = match Pdf::open(std::io::Cursor::new(encrypted_r2_reader_fixture())) {
+        Ok(_) => panic!("RC4 must be rejected without --allow-weak-crypto"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::Encrypted(EncryptedError::WeakCryptoNotAllowed)),
+        "correct password + weak + not allowed must stay WeakCryptoNotAllowed, got {err:?}"
+    );
+}
+
+/// Regression fence (b): a CORRECT password against a weak (RC4) file WITH
+/// --allow-weak-crypto must still open.
+#[test]
+fn fence_b_correct_password_weak_allowed_still_opens() {
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r2_reader_fixture()),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("correct password + weak + --allow-weak-crypto must open");
+
+    assert!(pdf.uses_weak_crypto());
+}
+
+/// Regression fence (c): a well-formed V=5 file with a WRONG password still
+/// returns BadPassword (unchanged).
+#[test]
+fn fence_c_v5_wellformed_wrong_password_is_bad_password() {
+    let err = match Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"definitely-wrong".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("wrong password against a well-formed V=5 file must fail"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        "well-formed V=5 + wrong password must stay BadPassword, got {err:?}"
+    );
+}
+
+/// Regression fence (d): a non-weak (AES, R=6) file with a WRONG password
+/// still returns BadPassword (unchanged).
+#[test]
+fn fence_d_non_weak_aes_wrong_password_is_bad_password() {
+    let err = match Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(6)),
+        PdfOpenOptions {
+            password: b"definitely-wrong".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("wrong password against an AES R=6 file must fail"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
+        "non-weak AES + wrong password must stay BadPassword, got {err:?}"
+    );
+}
+
+/// Build a well-formed V=5 R=5 fixture, then binary-edit the `/U <...>` hex
+/// literal so the decoded string is 47 bytes (one byte short of the required
+/// 48). The crafted file still parses; the short /U is detected on the
+/// authentication path.
+fn v5_pdf_with_truncated_u_entry() -> Vec<u8> {
+    truncate_hex_entry(encrypted_r5_or_r6_minimal_pdf(5), b"/U <")
+}
+
+/// As [`v5_pdf_with_truncated_u_entry`] but truncates the `/UE` entry instead,
+/// to exercise the fence that /UE length errors stay Malformed.
+fn v5_pdf_with_truncated_ue_entry() -> Vec<u8> {
+    truncate_hex_entry(encrypted_r5_or_r6_minimal_pdf(5), b"/UE <")
+}
+
+/// Drop the last hex byte (two hex chars) of the `<...>` string that follows
+/// `marker` in `bytes`, shortening the decoded value by one byte.
+fn truncate_hex_entry(bytes: Vec<u8>, marker: &[u8]) -> Vec<u8> {
+    let start = find_subslice(&bytes, marker).expect("marker present in fixture") + marker.len();
+    let end = start
+        + bytes[start..]
+            .iter()
+            .position(|&b| b == b'>')
+            .expect("closing > present");
+    assert!(
+        (end - start) >= 2 && (end - start).is_multiple_of(2),
+        "hex literal must be a non-empty even number of nibbles"
+    );
+    let mut out = Vec::with_capacity(bytes.len() - 2);
+    out.extend_from_slice(&bytes[..end - 2]);
+    out.extend_from_slice(&bytes[end..]);
+    out
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 #[test]
 fn permissions_exposes_standard_flags() {
     let pdf = Pdf::open_with_options(
