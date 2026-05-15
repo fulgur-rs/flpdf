@@ -62,9 +62,20 @@ struct Cli {
     /// compatible).  The value, when given, must be supplied as `--json=2`
     /// (with the equals sign) to avoid ambiguity with the positional input
     /// argument.
+    // JSON mode is exclusive with the other top-level inspection / write
+    // modes and with the OUTPUT positional. Without these conflicts, e.g.
+    // `flpdf --json --check in` or `flpdf --json in out` would silently
+    // ignore the second mode (run_json wins in main's dispatch chain).
+    // Listing them as clap conflicts surfaces the mistake as a usage error
+    // instead of doing one thing while the user asked for two.
     #[arg(long, num_args = 0..=1, default_missing_value = "2",
           require_equals = true,
           value_name = "VERSION", value_parser = ["2"],
+          conflicts_with_all = [
+              "check", "linearize", "static_id", "dump_object",
+              "show_info", "show_catalog", "show_metadata", "show_outline",
+              "show_fonts", "show_npages", "show_pages", "output",
+          ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
 
