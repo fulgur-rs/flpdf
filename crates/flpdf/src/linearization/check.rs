@@ -336,7 +336,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         // The first-page xref stream is emitted before /E and the main xref's
         // `/Prev` chains back to it, so /T = that object's `<num> <gen> obj`
         // header offset.
-        let (xref_obj_num, _gen) =
+        let (xref_obj_num, xref_obj_gen) =
             parse_obj_header_at(&file_bytes[t_usize..]).ok_or_else(|| {
                 LinearizationCheckError::InvalidParam {
                     message: format!(
@@ -346,8 +346,12 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
                     ),
                 }
             })?;
+        // Resolve with the *parsed* generation, not a hardcoded 0: this
+        // checker validates arbitrary linearized PDFs (including third-party
+        // producers), and a cross-reference stream with gen != 0 is
+        // spec-legal — hardcoding 0 would mis-resolve and spuriously reject it.
         let xref_obj = pdf
-            .resolve(ObjectRef::new(xref_obj_num, 0))
+            .resolve(ObjectRef::new(xref_obj_num, xref_obj_gen))
             .map_err(LinearizationCheckError::from)?;
         let is_xref_stream = matches!(
             &xref_obj,
