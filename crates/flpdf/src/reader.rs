@@ -59,6 +59,12 @@ struct EncryptionState {
     encrypt_ref: Option<ObjectRef>,
     weak_crypto: bool,
     permissions: Permissions,
+    /// Whether the supplied password authenticated as the user password.
+    user_password_matched: bool,
+    /// Whether the supplied password authenticated as the owner password.
+    /// Many real PDFs share an empty password for both, so both flags can
+    /// be true simultaneously.
+    owner_password_matched: bool,
 }
 
 /// Standard security handler permission bits from an encrypted document's `/P` entry.
@@ -208,6 +214,24 @@ impl<R: Read + Seek> Pdf<R> {
             .map(|encryption| encryption.permissions)
     }
 
+    /// Whether the password supplied at open time authenticated against the
+    /// document's user password (`/U`). Always `false` for plaintext PDFs.
+    pub fn user_password_matched(&self) -> bool {
+        self.encryption
+            .as_ref()
+            .is_some_and(|encryption| encryption.user_password_matched)
+    }
+
+    /// Whether the password supplied at open time authenticated against the
+    /// document's owner password (`/O`). Always `false` for plaintext PDFs.
+    /// Many PDFs use an empty password for both, so this can be true at the
+    /// same time as [`Pdf::user_password_matched`].
+    pub fn owner_password_matched(&self) -> bool {
+        self.encryption
+            .as_ref()
+            .is_some_and(|encryption| encryption.owner_password_matched)
+    }
+
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
         let loaded = if options.repair {
             load_xref_and_trailer_with_repair(&mut reader, options.repair)?
@@ -252,56 +276,88 @@ impl<R: Read + Seek> Pdf<R> {
         let permissions = Permissions::new(required_permissions(&encrypt)?);
         let crypt_filters = crypt_filter_modes(&encrypt, revision)?;
         let password = normalize_password(&options.password, options.password_mode, revision)?;
-        let (file_key, stream_mode, string_mode, encrypt_metadata, weak_crypto) =
-            if matches!(revision, 5 | 6) {
-                let inputs = standard_handler_r5_inputs(&encrypt)?;
-                let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
-                let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
-                let weak_crypto = revision == 5;
-                if weak_crypto && !options.allow_weak_crypto {
-                    return Err(EncryptedError::WeakCryptoNotAllowed.into());
-                }
-                let file_key = if revision == 5 {
-                    check_user_password_r5(&password, &inputs)
-                        .or_else(|err| retry_owner_password_r5(err, &password, &inputs))?
-                } else {
-                    check_user_password_r6(&password, &inputs)
-                        .or_else(|err| retry_owner_password_r6(err, &password, &inputs))?
-                };
-                (
-                    file_key,
-                    stream_mode,
-                    string_mode,
-                    encrypt_metadata,
-                    weak_crypto,
-                )
+        let (
+            file_key,
+            stream_mode,
+            string_mode,
+            encrypt_metadata,
+            weak_crypto,
+            user_password_matched,
+            owner_password_matched,
+        ) = if matches!(revision, 5 | 6) {
+            let inputs = standard_handler_r5_inputs(&encrypt)?;
+            let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
+            let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
+            let weak_crypto = revision == 5;
+            if weak_crypto && !options.allow_weak_crypto {
+                return Err(EncryptedError::WeakCryptoNotAllowed.into());
+            }
+            let user_attempt = if revision == 5 {
+                check_user_password_r5(&password, &inputs)
             } else {
-                let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
-                let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
-                let encrypt_metadata = inputs.encrypt_metadata;
-                let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
-                    || matches!(string_mode, EncryptionMode::Rc4)
-                    || crypt_filters
-                        .values()
-                        .any(|mode| matches!(mode, EncryptionMode::Rc4));
-                if weak_crypto && !options.allow_weak_crypto {
-                    return Err(EncryptedError::WeakCryptoNotAllowed.into());
-                }
-                let file_key = if inputs.v == 4 && inputs.r == 4 {
-                    check_user_password_v4(&password, &inputs)
-                        .or_else(|err| retry_owner_password_v4(err, &password, &inputs))?
-                } else {
-                    check_user_password(&password, &inputs)
-                        .or_else(|err| retry_owner_password(err, &password, &inputs))?
-                };
-                (
-                    file_key,
-                    stream_mode,
-                    string_mode,
-                    encrypt_metadata,
-                    weak_crypto,
-                )
+                check_user_password_r6(&password, &inputs)
             };
+            let owner_attempt = if revision == 5 {
+                check_owner_password_r5(&password, &inputs)
+            } else {
+                check_owner_password_r6(&password, &inputs)
+            };
+            let user_password_matched = user_attempt.is_ok();
+            let owner_password_matched = owner_attempt.is_ok();
+            let file_key = match (user_attempt, owner_attempt) {
+                (Ok(key), _) => key,
+                (Err(_), Ok(key)) => key,
+                (Err(user_err), Err(_owner_err)) => return Err(user_err),
+            };
+            (
+                file_key,
+                stream_mode,
+                string_mode,
+                encrypt_metadata,
+                weak_crypto,
+                user_password_matched,
+                owner_password_matched,
+            )
+        } else {
+            let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
+            let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
+            let encrypt_metadata = inputs.encrypt_metadata;
+            let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
+                || matches!(string_mode, EncryptionMode::Rc4)
+                || crypt_filters
+                    .values()
+                    .any(|mode| matches!(mode, EncryptionMode::Rc4));
+            if weak_crypto && !options.allow_weak_crypto {
+                return Err(EncryptedError::WeakCryptoNotAllowed.into());
+            }
+            let v4_path = inputs.v == 4 && inputs.r == 4;
+            let user_attempt = if v4_path {
+                check_user_password_v4(&password, &inputs)
+            } else {
+                check_user_password(&password, &inputs)
+            };
+            let owner_attempt = if v4_path {
+                check_owner_password_v4(&password, &inputs)
+            } else {
+                check_owner_password(&password, &inputs)
+            };
+            let user_password_matched = user_attempt.is_ok();
+            let owner_password_matched = owner_attempt.is_ok();
+            let file_key = match (user_attempt, owner_attempt) {
+                (Ok(key), _) => key,
+                (Err(_), Ok(key)) => key,
+                (Err(user_err), Err(_owner_err)) => return Err(user_err),
+            };
+            (
+                file_key,
+                stream_mode,
+                string_mode,
+                encrypt_metadata,
+                weak_crypto,
+                user_password_matched,
+                owner_password_matched,
+            )
+        };
         let r6_perms_warning = if revision == 6 {
             r6_perms_warning(&encrypt, &file_key, permissions, encrypt_metadata)?
         } else {
@@ -316,6 +372,8 @@ impl<R: Read + Seek> Pdf<R> {
             encrypt_ref,
             weak_crypto,
             permissions,
+            user_password_matched,
+            owner_password_matched,
         });
         if let Some(warning) = r6_perms_warning {
             self.repair_diagnostics
@@ -1279,50 +1337,6 @@ fn unsupported_crypt_filter<T>(encrypt: &Dictionary, cfm: Option<String>) -> Res
         cfm,
     }
     .into())
-}
-
-fn retry_owner_password(
-    err: Error,
-    password: &[u8],
-    inputs: &StandardHandlerInputs<'_>,
-) -> Result<Vec<u8>> {
-    match err {
-        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password(password, inputs),
-        err => Err(err),
-    }
-}
-
-fn retry_owner_password_v4(
-    err: Error,
-    password: &[u8],
-    inputs: &StandardHandlerInputs<'_>,
-) -> Result<Vec<u8>> {
-    match err {
-        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_v4(password, inputs),
-        err => Err(err),
-    }
-}
-
-fn retry_owner_password_r5(
-    err: Error,
-    password: &[u8],
-    inputs: &StandardHandlerR5Inputs<'_>,
-) -> Result<Vec<u8>> {
-    match err {
-        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_r5(password, inputs),
-        err => Err(err),
-    }
-}
-
-fn retry_owner_password_r6(
-    err: Error,
-    password: &[u8],
-    inputs: &StandardHandlerR5Inputs<'_>,
-) -> Result<Vec<u8>> {
-    match err {
-        Error::Encrypted(EncryptedError::BadPassword) => check_owner_password_r6(password, inputs),
-        err => Err(err),
-    }
 }
 
 fn required_integer(dict: &Dictionary, key: &'static str) -> Result<i64> {
