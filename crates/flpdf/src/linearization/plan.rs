@@ -883,20 +883,46 @@ impl LinearizationPlan {
             cap,
         )?;
 
-        // Pack Part 4 eligible objects (part4_other_pages_private ++ part4_other_pages_shared ++ part4_rest).
-        let part4_batches = Self::pack_into_batches(
-            self.part4_other_pages_private
-                .iter()
-                .chain(&self.part4_other_pages_shared)
-                .chain(&self.part4_rest)
-                .copied(),
+        // Pack Part 4 eligible objects.  Part 4 is NOT a single flat group: a
+        // batch must never co-locate objects with different page ownership,
+        // otherwise the resulting ObjStm container cannot be placed in a single
+        // page-private span and the Page Offset Hint Table's object_count /
+        // byte_length (which assume per-page ownership) and the linearization
+        // order would be corrupted.  Batch each ownership group independently:
+        //   (1) each non-first page's private objects (per_page_private_objects
+        //       index >= 1; index 0 is part2_objects, already excluded),
+        //   (2) part4_other_pages_shared (qpdf part8),
+        //   (3) part4_rest (qpdf part9: pages tree / info / orphans).
+        let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
+        for page_private in self.per_page_private_objects.iter().skip(1) {
+            part4_batches.extend(Self::pack_into_batches(
+                page_private.iter().copied(),
+                &part2_set,
+                &free_refs,
+                length_exclusions,
+                ctx,
+                pdf,
+                cap,
+            )?);
+        }
+        part4_batches.extend(Self::pack_into_batches(
+            self.part4_other_pages_shared.iter().copied(),
             &part2_set,
             &free_refs,
             length_exclusions,
             ctx,
             pdf,
             cap,
-        )?;
+        )?);
+        part4_batches.extend(Self::pack_into_batches(
+            self.part4_rest.iter().copied(),
+            &part2_set,
+            &free_refs,
+            length_exclusions,
+            ctx,
+            pdf,
+            cap,
+        )?);
 
         Ok(ObjStmBatchPlan {
             part3_batches,
@@ -928,6 +954,40 @@ impl LinearizationPlan {
         let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
         let part3_set: BTreeSet<ObjectRef> = self.part3_objects.iter().copied().collect();
 
+        // Part-4 ownership classification (same rationale as the Generate path):
+        // a batch must not co-locate objects with different page ownership, so
+        // Part-4 members are bucketed by owner — per non-first page private set,
+        // shared (qpdf part8), or rest (qpdf part9) — and chunked per bucket.
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+        enum Owner {
+            Page(usize),
+            Shared,
+            Rest,
+        }
+        let page_private_sets: Vec<BTreeSet<ObjectRef>> = self
+            .per_page_private_objects
+            .iter()
+            .skip(1)
+            .map(|v| v.iter().copied().collect())
+            .collect();
+        let shared_set: BTreeSet<ObjectRef> =
+            self.part4_other_pages_shared.iter().copied().collect();
+        let rest_set: BTreeSet<ObjectRef> = self.part4_rest.iter().copied().collect();
+        let owner_of = |r: &ObjectRef| -> Option<Owner> {
+            for (i, s) in page_private_sets.iter().enumerate() {
+                if s.contains(r) {
+                    return Some(Owner::Page(i));
+                }
+            }
+            if shared_set.contains(r) {
+                return Some(Owner::Shared);
+            }
+            if rest_set.contains(r) {
+                return Some(Owner::Rest);
+            }
+            None
+        };
+
         let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
 
@@ -935,9 +995,10 @@ impl LinearizationPlan {
         for (_container_num, mut members) in groups {
             members.sort_by_key(|(idx, _)| *idx);
 
-            // Partition eligible members by their destination part.
+            // Partition eligible members by destination part, and within Part 4
+            // by owner so cross-page-boundary co-location cannot occur.
             let mut p3_eligible: Vec<ObjectRef> = Vec::new();
-            let mut p4_eligible: Vec<ObjectRef> = Vec::new();
+            let mut p4_by_owner: BTreeMap<Owner, Vec<ObjectRef>> = BTreeMap::new();
 
             for (_idx, obj_ref) in members {
                 // Part-2 objects must never enter ObjStms.
@@ -953,21 +1014,24 @@ impl LinearizationPlan {
                 }
                 if part3_set.contains(&obj_ref) {
                     p3_eligible.push(obj_ref);
-                } else {
-                    // Everything else (part4_*) goes to part4.
-                    p4_eligible.push(obj_ref);
+                } else if let Some(owner) = owner_of(&obj_ref) {
+                    p4_by_owner.entry(owner).or_default().push(obj_ref);
                 }
+                // else: eligible but in no linearization Part — leave it as a
+                // plain indirect object (no batch).
             }
 
-            // Split into cap-sized batches per part.
+            // Split into cap-sized batches per part / per owner.
             for chunk in p3_eligible.chunks(cap) {
                 if !chunk.is_empty() {
                     part3_batches.push(chunk.to_vec());
                 }
             }
-            for chunk in p4_eligible.chunks(cap) {
-                if !chunk.is_empty() {
-                    part4_batches.push(chunk.to_vec());
+            for refs in p4_by_owner.values() {
+                for chunk in refs.chunks(cap) {
+                    if !chunk.is_empty() {
+                        part4_batches.push(chunk.to_vec());
+                    }
                 }
             }
         }
