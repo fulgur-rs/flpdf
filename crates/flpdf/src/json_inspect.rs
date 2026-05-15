@@ -282,6 +282,56 @@ pub struct QpdfMetadata {
     // jsonversion is always 2 in v2 output.
 }
 
+// ── StreamDataMode ────────────────────────────────────────────────────────────
+
+/// Controls how stream payloads are emitted in the qpdf JSON v2 output.
+///
+/// Applies to each `obj:N M R` entry in the `qpdf` top-level key when the
+/// resolved object is a Stream.
+#[derive(Debug, Clone, Default)]
+pub enum StreamDataMode {
+    /// Emit only the dict (default). The `stream` entry is `{ "dict": ... }`.
+    #[default]
+    None,
+    /// Emit the raw stream bytes as a base64 string under `data`.
+    /// Yields `{ "stream": { "data": "<base64>", "dict": ... } }`.
+    Inline,
+    /// Emit a side-file path under `datafile`.
+    /// Yields `{ "stream": { "datafile": "<prefix>-<obj_num:03>", "dict": ... } }`.
+    /// The CLI is responsible for actually writing the bytes; this layer only
+    /// computes the file name from `prefix` + the object number.
+    File { prefix: String },
+}
+
+// ── base64_encode ─────────────────────────────────────────────────────────────
+
+/// Encode `bytes` as a standard Base64 string (RFC 4648, with `=` padding).
+///
+/// No external dependencies: ~30 lines of pure Rust.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let combined = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((combined >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((combined >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((combined >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(combined & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 // ── build_qpdf_key ────────────────────────────────────────────────────────────
 
 /// `qpdf` トップレベル key の中身 (`[metadata, objects_map]`) を構築する。
@@ -291,12 +341,36 @@ pub struct QpdfMetadata {
 /// 2. The objects map with all indirect objects and the trailer, sorted alphabetically
 ///    by key.
 ///
+/// This is a thin wrapper around [`build_qpdf_key_with_stream_mode`] using
+/// [`StreamDataMode::None`] (the default — stream entries contain `dict` only).
+///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any object cannot be converted to JSON.
 pub fn build_qpdf_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
+) -> Result<JsonValue, ConvertError> {
+    build_qpdf_key_with_stream_mode(pdf, metadata, &StreamDataMode::None)
+}
+
+/// Like [`build_qpdf_key`], but accepts a [`StreamDataMode`] that controls
+/// whether each `obj:N M R` stream entry includes `data` (Inline) or
+/// `datafile` (File) alongside `dict`.
+///
+/// # Stream entry shapes
+///
+/// - `None`   → `{ "stream": { "dict": ... } }`
+/// - `Inline` → `{ "stream": { "data": "<base64>", "dict": ... } }`
+/// - `File`   → `{ "stream": { "datafile": "<prefix>-<obj_num:03>", "dict": ... } }`
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any object cannot be converted to JSON.
+pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    metadata: QpdfMetadata,
+    stream_mode: &StreamDataMode,
 ) -> Result<JsonValue, ConvertError> {
     // ── 1. Build metadata object (fixed key order per qpdf v2 spec) ────────
     let meta = JsonValue::Object(vec![
@@ -334,12 +408,34 @@ pub fn build_qpdf_key<R: Read + Seek>(
         let obj = pdf.resolve(oref)?;
         let json_val = match &obj {
             Object::Stream(stream) => {
-                // Stream: emit { "stream": { "dict": <dict> } }
+                // Stream: emit according to stream_mode.
                 let dict_json = dict_to_json(&stream.dict)?;
-                JsonValue::Object(vec![(
-                    "stream".to_string(),
-                    JsonValue::Object(vec![("dict".to_string(), dict_json)]),
-                )])
+                let stream_inner = match stream_mode {
+                    StreamDataMode::None => {
+                        // Default: dict only.
+                        JsonValue::Object(vec![("dict".to_string(), dict_json)])
+                    }
+                    StreamDataMode::Inline => {
+                        // Encode raw stream bytes as base64 under "data".
+                        // Key order: data, dict (alphabetical).
+                        let data_str = base64_encode(&stream.data);
+                        JsonValue::Object(vec![
+                            ("data".to_string(), JsonValue::String(data_str)),
+                            ("dict".to_string(), dict_json),
+                        ])
+                    }
+                    StreamDataMode::File { prefix } => {
+                        // Emit a side-file path under "datafile".
+                        // Naming: <prefix>-<obj_num:03>
+                        // Key order: datafile, dict (alphabetical).
+                        let datafile = format!("{prefix}-{:03}", oref.number);
+                        JsonValue::Object(vec![
+                            ("datafile".to_string(), JsonValue::String(datafile)),
+                            ("dict".to_string(), dict_json),
+                        ])
+                    }
+                };
+                JsonValue::Object(vec![("stream".to_string(), stream_inner)])
             }
             other => {
                 // Non-stream (including live Object::Null): emit { "value": <json> }.
@@ -2097,12 +2193,29 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
 /// Key order matches qpdf v2 output: top-level keys are emitted in the
 /// fixed order shown in qpdf's `--json=2` output, not alphabetical.
 ///
+/// This is a thin wrapper around [`build_qpdf_json_v2_with_options`] using
+/// [`StreamDataMode::None`] (the default — stream entries contain `dict` only).
+///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any section builder fails.
 pub fn build_qpdf_json_v2<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     decode_level: DecodeLevel,
+) -> Result<JsonValue, ConvertError> {
+    build_qpdf_json_v2_with_options(pdf, decode_level, &StreamDataMode::None)
+}
+
+/// Like [`build_qpdf_json_v2`], but also takes a [`StreamDataMode`] that is
+/// forwarded to the `qpdf` top-level key builder.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any section builder fails.
+pub fn build_qpdf_json_v2_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
 ) -> Result<JsonValue, ConvertError> {
     let mut pairs = match build_envelope(decode_level) {
         JsonValue::Object(p) => p,
@@ -2144,7 +2257,7 @@ pub fn build_qpdf_json_v2<R: Read + Seek>(
         pushed_inherited_page_resources: false,
         called_get_all_pages: true,
     };
-    let qpdf = build_qpdf_key(pdf, qpdf_metadata)?;
+    let qpdf = build_qpdf_key_with_stream_mode(pdf, qpdf_metadata, stream_mode)?;
     pairs.push(("qpdf".to_string(), qpdf));
 
     Ok(JsonValue::Object(pairs))
@@ -5812,5 +5925,255 @@ mod tests {
             matches!(enc.unwrap(), JsonValue::Object(_)),
             "encrypt must be an Object"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // flpdf-9hc.11.10: StreamDataMode tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // Helper: extract the stream inner object for obj:7 0 R from the
+    // build_qpdf_key_with_stream_mode result.
+    fn get_obj7_stream_inner(
+        pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>,
+        mode: &StreamDataMode,
+    ) -> Vec<(String, JsonValue)> {
+        let meta = QpdfMetadata {
+            pdf_version: "1.3".to_string(),
+            max_object_id: 7,
+            pushed_inherited_page_resources: false,
+            called_get_all_pages: true,
+        };
+        let JsonValue::Array(elems) =
+            build_qpdf_key_with_stream_mode(pdf, meta, mode).expect("build failed")
+        else {
+            panic!("expected Array");
+        };
+        let JsonValue::Object(map_pairs) = &elems[1] else {
+            panic!("objects_map is not an Object");
+        };
+        let obj7 = map_pairs
+            .iter()
+            .find(|(k, _)| k == "obj:7 0 R")
+            .map(|(_, v)| v)
+            .expect("obj:7 0 R not found");
+        let JsonValue::Object(obj7_pairs) = obj7 else {
+            panic!("obj:7 0 R is not an Object");
+        };
+        assert_eq!(obj7_pairs[0].0, "stream");
+        let JsonValue::Object(inner) = &obj7_pairs[0].1 else {
+            panic!("stream value is not an Object");
+        };
+        inner.clone()
+    }
+
+    // ── Test 1: StreamDataMode::None → stream entry has dict only ────────────
+
+    #[test]
+    fn stream_data_mode_none_emits_dict_only() {
+        let mut pdf = load_one_page_pdf();
+        let inner = get_obj7_stream_inner(&mut pdf, &StreamDataMode::None);
+        // Must have exactly one key: "dict"
+        assert_eq!(
+            inner.len(),
+            1,
+            "None mode: expected 1 key (dict), got {:?}",
+            inner.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        assert_eq!(inner[0].0, "dict");
+    }
+
+    // ── Test 2: StreamDataMode::Inline → data + dict; base64 round-trips ─────
+
+    #[test]
+    fn stream_data_mode_inline_emits_base64_data_and_dict() {
+        let mut pdf = load_one_page_pdf();
+
+        // First, capture the raw bytes of obj:7 to verify round-trip.
+        let oref = crate::ObjectRef::new(7, 0);
+        let obj7_raw = pdf.resolve(oref).expect("resolve obj:7");
+        let raw_bytes = match &obj7_raw {
+            Object::Stream(s) => s.data.clone(),
+            other => panic!("obj:7 is not a Stream: {other:?}"),
+        };
+
+        let inner = get_obj7_stream_inner(&mut pdf, &StreamDataMode::Inline);
+        // Must have exactly two keys: "data", "dict" (alphabetical)
+        assert_eq!(inner.len(), 2, "Inline mode: expected 2 keys");
+        assert_eq!(inner[0].0, "data", "first key must be 'data'");
+        assert_eq!(inner[1].0, "dict", "second key must be 'dict'");
+
+        // The data value must be a base64 string that decodes back to raw_bytes.
+        let JsonValue::String(b64) = &inner[0].1 else {
+            panic!("data is not a String");
+        };
+        let decoded = base64_decode_test_helper(b64);
+        assert_eq!(decoded, raw_bytes, "base64 round-trip failed");
+    }
+
+    // ── Test 3: StreamDataMode::File → datafile path + dict ──────────────────
+
+    #[test]
+    fn stream_data_mode_file_emits_datafile_and_dict() {
+        let mut pdf = load_one_page_pdf();
+        let inner = get_obj7_stream_inner(
+            &mut pdf,
+            &StreamDataMode::File {
+                prefix: "out".to_string(),
+            },
+        );
+        // Must have exactly two keys: "datafile", "dict" (alphabetical)
+        assert_eq!(inner.len(), 2, "File mode: expected 2 keys");
+        assert_eq!(inner[0].0, "datafile", "first key must be 'datafile'");
+        assert_eq!(inner[1].0, "dict", "second key must be 'dict'");
+
+        // datafile must be "<prefix>-<obj_num:03>" = "out-007" for obj:7
+        assert_eq!(inner[0].1, JsonValue::String("out-007".to_string()));
+    }
+
+    // ── Test 4: trailer is not affected by mode ───────────────────────────────
+
+    #[test]
+    fn stream_data_mode_trailer_always_has_value_wrapper() {
+        let mut pdf = load_one_page_pdf();
+        for mode in &[
+            StreamDataMode::None,
+            StreamDataMode::Inline,
+            StreamDataMode::File {
+                prefix: "x".to_string(),
+            },
+        ] {
+            let meta = QpdfMetadata {
+                pdf_version: "1.3".to_string(),
+                max_object_id: 7,
+                pushed_inherited_page_resources: false,
+                called_get_all_pages: true,
+            };
+            let JsonValue::Array(elems) =
+                build_qpdf_key_with_stream_mode(&mut pdf, meta, mode).expect("build failed")
+            else {
+                panic!("expected Array");
+            };
+            let JsonValue::Object(map_pairs) = &elems[1] else {
+                panic!("objects_map is not an Object");
+            };
+            let trailer = map_pairs
+                .iter()
+                .find(|(k, _)| k == "trailer")
+                .map(|(_, v)| v)
+                .expect("trailer not found");
+            let JsonValue::Object(trailer_pairs) = trailer else {
+                panic!("trailer is not an Object for mode {mode:?}");
+            };
+            assert_eq!(
+                trailer_pairs[0].0, "value",
+                "trailer must have 'value' key regardless of StreamDataMode ({mode:?})"
+            );
+        }
+    }
+
+    // ── Test 5: base64_encode unit tests ─────────────────────────────────────
+
+    #[test]
+    fn base64_encode_rfc4648_vectors() {
+        // RFC 4648 test vectors
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encode_all_byte_values() {
+        // Encode all 256 byte values; verify length is correct (no panics).
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let encoded = base64_encode(&all_bytes);
+        // 256 bytes → ceil(256/3)*4 = 344 chars
+        assert_eq!(encoded.len(), 344);
+        // Verify the round-trip using the test helper decoder.
+        let decoded = base64_decode_test_helper(&encoded);
+        assert_eq!(decoded, all_bytes);
+    }
+
+    // ── Test 6: build_qpdf_json_v2_with_options propagates stream_mode ────────
+
+    #[test]
+    fn build_qpdf_json_v2_with_options_inline_propagates_to_qpdf_key() {
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::Inline,
+        )
+        .expect("build failed");
+
+        // Navigate: v2["qpdf"][1]["obj:7 0 R"]["stream"]["data"]
+        let JsonValue::Object(top_pairs) = &v2 else {
+            panic!("expected Object at top level");
+        };
+        let qpdf_val = top_pairs
+            .iter()
+            .find(|(k, _)| k == "qpdf")
+            .map(|(_, v)| v)
+            .expect("qpdf key not found");
+        let JsonValue::Array(qpdf_arr) = qpdf_val else {
+            panic!("qpdf is not an Array");
+        };
+        let JsonValue::Object(obj_map) = &qpdf_arr[1] else {
+            panic!("qpdf[1] is not an Object");
+        };
+        let obj7 = obj_map
+            .iter()
+            .find(|(k, _)| k == "obj:7 0 R")
+            .map(|(_, v)| v)
+            .expect("obj:7 0 R not found in qpdf key");
+        let JsonValue::Object(obj7_pairs) = obj7 else {
+            panic!("obj:7 is not an Object");
+        };
+        let JsonValue::Object(stream_inner) = &obj7_pairs[0].1 else {
+            panic!("stream value is not Object");
+        };
+        // Inline mode: first key is "data"
+        assert_eq!(stream_inner[0].0, "data",
+            "Inline mode must produce 'data' key in stream entry via build_qpdf_json_v2_with_options");
+        assert!(
+            matches!(&stream_inner[0].1, JsonValue::String(_)),
+            "data must be a String"
+        );
+    }
+
+    // ── base64 decode helper (test-only) ─────────────────────────────────────
+
+    /// Simple base64 decoder used only in tests to verify round-trips.
+    /// Panics on invalid input.
+    fn base64_decode_test_helper(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => 0, // padding — value ignored
+                _ => panic!("invalid base64 char: {c}"),
+            }
+        }
+        let bytes = s.as_bytes();
+        assert_eq!(bytes.len() % 4, 0, "base64 length must be multiple of 4");
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            let (a, b, c, d) = (val(chunk[0]), val(chunk[1]), val(chunk[2]), val(chunk[3]));
+            let combined = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
+            out.push(((combined >> 16) & 0xFF) as u8);
+            if chunk[2] != b'=' {
+                out.push(((combined >> 8) & 0xFF) as u8);
+            }
+            if chunk[3] != b'=' {
+                out.push((combined & 0xFF) as u8);
+            }
+        }
+        out
     }
 }
