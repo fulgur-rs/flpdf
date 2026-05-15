@@ -2284,9 +2284,12 @@ pub fn filter_json_keys(v2: JsonValue, keys: &[JsonKey]) -> JsonValue {
     // Rebuild: always keep version + parameters first, then walk qpdf v2 order.
     let mut out: Vec<(String, JsonValue)> = Vec::new();
 
-    // Pass 1: copy the envelope keys (version, parameters) unconditionally.
-    for (k, v) in &pairs {
-        if k == "version" || k == "parameters" {
+    // Pass 1: copy the envelope keys in their fixed order (version,
+    // parameters) regardless of how they were laid out in the input. If
+    // either key is absent, it is simply skipped — the function contract is
+    // that the output never inverts the envelope order.
+    for envelope_key in ["version", "parameters"] {
+        if let Some((k, v)) = pairs.iter().find(|(k, _)| k == envelope_key) {
             out.push((k.clone(), v.clone()));
         }
     }
@@ -6521,5 +6524,57 @@ mod tests {
             }
         }
         out
+    }
+
+    // ── filter_json_keys: envelope order is fixed, regardless of input order
+    //
+    // Regression for CodeRabbit's PR #121 finding. The two-pass envelope
+    // copy used `for (k, v) in &pairs` which preserved the input order, so
+    // a caller that built `{ parameters, version, ... }` would get
+    // `{ parameters, version, ... }` back. The function contract is that
+    // the output is *always* `{ version, parameters, ... }`.
+
+    #[test]
+    fn filter_json_keys_normalizes_envelope_to_version_then_parameters() {
+        // Build the input with parameters first, version second — the
+        // reverse of the canonical order.
+        let v2 = JsonValue::Object(vec![
+            (
+                "parameters".to_string(),
+                JsonValue::Object(vec![(
+                    "decodelevel".to_string(),
+                    JsonValue::String("generalized".to_string()),
+                )]),
+            ),
+            ("version".to_string(), JsonValue::Integer(2)),
+            ("pages".to_string(), JsonValue::Array(vec![])),
+        ]);
+
+        let filtered = filter_json_keys(v2, &[JsonKey::Pages]);
+        let JsonValue::Object(pairs) = filtered else {
+            panic!("expected Object");
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["version", "parameters", "pages"],
+            "envelope must always be emitted as version, parameters, … even when the input has the opposite order"
+        );
+    }
+
+    #[test]
+    fn filter_json_keys_preserves_envelope_order_when_version_only_present() {
+        // Only version is present, parameters is missing — output must
+        // still start with version and not panic.
+        let v2 = JsonValue::Object(vec![
+            ("version".to_string(), JsonValue::Integer(2)),
+            ("pages".to_string(), JsonValue::Array(vec![])),
+        ]);
+        let filtered = filter_json_keys(v2, &[JsonKey::Pages]);
+        let JsonValue::Object(pairs) = filtered else {
+            panic!("expected Object");
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["version", "pages"]);
     }
 }
