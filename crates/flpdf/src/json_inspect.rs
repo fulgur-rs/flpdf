@@ -4505,6 +4505,74 @@ mod tests {
                 "stream entry for {stream_key} must have 4 keys in alphabetical order"
             );
         }
+
+        // ── qpdf-parity value assertions (matching qpdf --json output) ───────
+        // names dict: /F and /UF both map to "attachment.txt"
+        let JsonValue::Object(names) = get("names") else {
+            panic!("names must be Object");
+        };
+        let name_keys: Vec<&str> = names.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            name_keys.contains(&"/F") || name_keys.contains(&"/UF"),
+            "names must contain at least /F or /UF"
+        );
+        for (_key, val) in names {
+            assert_eq!(
+                *val,
+                JsonValue::String("attachment.txt".to_string()),
+                "each name entry must be 'attachment.txt'"
+            );
+        }
+
+        // preferredcontents must be a valid ref string (not null)
+        let JsonValue::String(preferred_contents_str) = get("preferredcontents") else {
+            panic!("preferredcontents must be a String ref");
+        };
+        assert!(
+            preferred_contents_str.ends_with(" R"),
+            "preferredcontents must be a ref string, got: {preferred_contents_str}"
+        );
+
+        // Value-level parity with qpdf output for each stream entry:
+        // checksum: 542266a1f565c3e5d8cfbd55eb7dfa40
+        // creationdate: 2026-01-01T00:00:00Z
+        // modificationdate: 2026-01-01T00:00:00Z
+        // mimetype: null (no /Subtype in fixture)
+        let JsonValue::Object(streams2) = get("streams") else {
+            panic!("streams must be Object");
+        };
+        for (stream_key, stream_val) in streams2 {
+            let JsonValue::Object(stream_entry) = stream_val else {
+                panic!("stream entry for {stream_key} must be Object");
+            };
+            let s_get = |k: &str| -> &JsonValue {
+                stream_entry
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, v)| v)
+                    .unwrap_or_else(|| panic!("key '{k}' not found in stream {stream_key}"))
+            };
+            assert_eq!(
+                *s_get("checksum"),
+                JsonValue::String("542266a1f565c3e5d8cfbd55eb7dfa40".to_string()),
+                "checksum mismatch for stream {stream_key}"
+            );
+            assert_eq!(
+                *s_get("creationdate"),
+                JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+                "creationdate mismatch for stream {stream_key}"
+            );
+            assert_eq!(
+                *s_get("modificationdate"),
+                JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+                "modificationdate mismatch for stream {stream_key}"
+            );
+            assert_eq!(
+                *s_get("mimetype"),
+                JsonValue::Null,
+                "mimetype must be null for stream {stream_key} (no /Subtype in fixture)"
+            );
+        }
     }
 
     // ── attachments Test 4: synthetic fixture — key order, priorities, values ──
