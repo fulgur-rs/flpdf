@@ -268,15 +268,20 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     }
 
     // -----------------------------------------------------------------------
-    // 7. /T must be within the last cross-reference table.
+    // 7. /T must be within the last cross-reference *section*.
     //
     // Different PDF producers use slightly different /T conventions:
     // - ISO 32000-1 Annex F: /T = byte offset of the xref keyword itself
     // - qpdf convention: /T = byte offset just before the first xref entry
     //   (i.e. offset of the last '\n' in the "xref\n0 N\n" header)
+    // - cross-reference *stream* (ObjStm-bearing / split-xref linearized
+    //   output, flpdf-9hc.5.8.4): there is no `xref` keyword at all — the
+    //   cross-reference data lives in an indirect XRef stream object and /T
+    //   points at that object's `<num> <gen> obj` header (the first-page xref
+    //   stream the main xref's `/Prev` chains back to).
     //
-    // We accept any /T that is within the xref section header (i.e. the xref
-    // keyword is reachable by scanning backwards within a small window).
+    // We accept either form: a classic `xref` keyword reachable by a short
+    // backscan, OR an XRef stream object header at the /T target.
     // -----------------------------------------------------------------------
     let t_obj = param_dict.get("T").cloned().unwrap_or(Object::Null);
     let t_val = as_u64(&t_obj, "T")?;
@@ -325,10 +330,37 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         }
     });
     let Some(xref_pos) = xref_pos else {
-        fail!(
-            "/T ({t_val}) is not within the last cross-reference section \
-             (no xref keyword token found in the backscan window before /T)"
+        // No classic `xref` keyword: this is a cross-reference *stream* file
+        // (ObjStm-bearing / split-xref linearized output).  /T must point at
+        // an indirect object header whose object is a `/Type /XRef` stream.
+        // The first-page xref stream is emitted before /E and the main xref's
+        // `/Prev` chains back to it, so /T = that object's `<num> <gen> obj`
+        // header offset.
+        let (xref_obj_num, _gen) =
+            parse_obj_header_at(&file_bytes[t_usize..]).ok_or_else(|| {
+                LinearizationCheckError::InvalidParam {
+                    message: format!(
+                        "/T ({t_val}) is not within the last cross-reference section \
+                     (no `xref` keyword in the backscan window and no `<num> <gen> obj` \
+                     header at /T for a cross-reference stream)"
+                    ),
+                }
+            })?;
+        let xref_obj = pdf
+            .resolve(ObjectRef::new(xref_obj_num, 0))
+            .map_err(LinearizationCheckError::from)?;
+        let is_xref_stream = matches!(
+            &xref_obj,
+            Object::Stream(s)
+                if matches!(s.dict.get("Type"), Some(Object::Name(t)) if t.as_slice() == b"XRef")
         );
+        if !is_xref_stream {
+            fail!(
+                "/T ({t_val}) points at object {xref_obj_num} which is not a \
+                 `/Type /XRef` cross-reference stream"
+            );
+        }
+        return Ok(());
     };
 
     // Tighten: /T must lie inside the xref subsection header itself
