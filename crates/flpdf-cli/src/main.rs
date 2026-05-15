@@ -75,6 +75,7 @@ struct Cli {
               "check", "linearize", "static_id", "dump_object",
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
+              "compress_streams", "linearize_pass1",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
