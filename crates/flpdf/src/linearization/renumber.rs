@@ -392,10 +392,8 @@ impl RenumberMap {
             return ObjStmRelocation::default();
         }
 
-        let member_set: BTreeSet<ObjectRef> = batches
-            .iter()
-            .flat_map(|b| b.iter().copied())
-            .collect();
+        let member_set: BTreeSet<ObjectRef> =
+            batches.iter().flat_map(|b| b.iter().copied()).collect();
 
         // Walk the existing layout (ascending new number, slot 0 skipped) and
         // rebuild it: keep slot 0, then re-emit every non-member slot

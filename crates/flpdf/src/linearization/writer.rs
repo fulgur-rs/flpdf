@@ -123,8 +123,8 @@ impl ObjStmLayout {
     /// This is the single source of truth for *which* objects are ObjStm
     /// members and *in what order* — consumed both by
     /// [`RenumberMap::relocate_objstm_members`] (slot allocation) and by
-    /// [`ObjStmLayout::build`] (container construction), so the two never
-    /// disagree about membership or pair-table order.
+    /// [`ObjStmLayout::build_from_batches`] (container construction), so the
+    /// two never disagree about membership or pair-table order.
     fn resolve_batches<R: Read + Seek>(
         plan: &LinearizationPlan,
         pdf: &mut Pdf<R>,
@@ -163,7 +163,9 @@ impl ObjStmLayout {
 
     /// The flat batch order (Part-3 then Part-4) fed to
     /// [`RenumberMap::relocate_objstm_members`].
-    fn flat_batches(batch_plan: &crate::linearization::plan::ObjStmBatchPlan) -> Vec<Vec<ObjectRef>> {
+    fn flat_batches(
+        batch_plan: &crate::linearization::plan::ObjStmBatchPlan,
+    ) -> Vec<Vec<ObjectRef>> {
         batch_plan
             .part3_batches
             .iter()
@@ -250,116 +252,6 @@ impl ObjStmLayout {
             member_to_container,
         })
     }
-
-    /// Legacy single-call builder (kept for the writer's internal unit tests
-    /// that do not exercise the relocation path).  Container numbers are
-    /// allocated deterministically above the highest `RenumberMap` slot.
-    #[cfg(test)]
-    fn build<R: Read + Seek>(
-        plan: &LinearizationPlan,
-        renumber: &RenumberMap,
-        pdf: &mut Pdf<R>,
-        options: &WriteOptions,
-    ) -> Result<Self> {
-        let config = planner_config_from_options(options);
-        let batch_plan = plan.objstm_batches(pdf, &config)?;
-
-        // Writer-level invariant (qpdf linearization rule, not encoded by the
-        // 5.8.1 planner): per-page *private* objects — the page dictionaries
-        // and direct private objects of pages 1..N — must remain plain
-        // indirects.  qpdf rejects a linearized file whose page dictionaries
-        // are compressed ("page dictionary for page X is compressed" +
-        // calculateLinearizationData internal error).  The 5.8.1 planner only
-        // protects the first-page (`part2_objects`) closure, so we drop any
-        // `part4_other_pages_private` member from the batches here.  This is
-        // an output-shaping filter, not a re-implementation of the eligibility
-        // predicate or the mode dispatch.  (Tracked as a 5.8.1 planner gap —
-        // see follow-up issue.)
-        let other_pages_private: std::collections::BTreeSet<ObjectRef> =
-            plan.part4_other_pages_private.iter().copied().collect();
-        let filter_batches = |batches: Vec<Vec<ObjectRef>>| -> Vec<Vec<ObjectRef>> {
-            batches
-                .into_iter()
-                .filter_map(|batch| {
-                    let kept: Vec<ObjectRef> = batch
-                        .into_iter()
-                        .filter(|r| !other_pages_private.contains(r))
-                        .collect();
-                    if kept.is_empty() {
-                        None
-                    } else {
-                        Some(kept)
-                    }
-                })
-                .collect()
-        };
-        let batch_plan = crate::linearization::plan::ObjStmBatchPlan {
-            part3_batches: filter_batches(batch_plan.part3_batches),
-            part4_batches: filter_batches(batch_plan.part4_batches),
-        };
-
-        if batch_plan.part3_batches.is_empty() && batch_plan.part4_batches.is_empty() {
-            return Ok(Self::default());
-        }
-
-        // First container number sits one past the highest renumber slot.
-        // `renumber.len()` already counts the param-dict and hint-stream
-        // reservations, so `len() + 1` is the next free object number.
-        let mut next_num: u32 = renumber.len() as u32 + 1;
-        let mut layout = Self::default();
-
-        let mut take = |batches: &[Vec<ObjectRef>],
-                        out: &mut Vec<ObjStmContainer>,
-                        map: &mut BTreeMap<ObjectRef, (u32, u32)>|
-         -> Result<()> {
-            for batch in batches {
-                if batch.is_empty() {
-                    continue;
-                }
-                let container_new_num = next_num;
-                next_num = next_num.checked_add(1).ok_or_else(|| {
-                    crate::Error::Unsupported(
-                        "linearization writer: ObjStm container number overflows u32".to_string(),
-                    )
-                })?;
-                let mut members = Vec::with_capacity(batch.len());
-                for (idx, &orig) in batch.iter().enumerate() {
-                    let new_ref = renumber.new_for_original(orig).ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "linearization writer: ObjStm member {orig} has no renumber \
-                             entry (planner / renumber inconsistency)"
-                        ))
-                    })?;
-                    map.insert(orig, (container_new_num, idx as u32));
-                    members.push((orig, new_ref));
-                }
-                out.push(ObjStmContainer {
-                    container_new_num,
-                    members,
-                });
-            }
-            Ok(())
-        };
-
-        let mut part3 = Vec::new();
-        let mut part4 = Vec::new();
-        let mut member_to_container = BTreeMap::new();
-        take(
-            &batch_plan.part3_batches,
-            &mut part3,
-            &mut member_to_container,
-        )?;
-        take(
-            &batch_plan.part4_batches,
-            &mut part4,
-            &mut member_to_container,
-        )?;
-
-        layout.part3 = part3;
-        layout.part4 = part4;
-        layout.member_to_container = member_to_container;
-        Ok(layout)
-    }
 }
 
 /// Build (and FlateDecode-wrap) the ObjStm container stream object for one
@@ -379,7 +271,6 @@ fn build_objstm_container_object<R: Read + Seek>(
     let stream = wrap_objstm_body(&body)?;
     Ok(Object::Stream(stream))
 }
-
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -689,7 +580,6 @@ fn write_main_xref_and_trailer(
 /// 4]` → `1 + 8 + 4 = 13` bytes per object.  Kept in one place so the
 /// first-page placeholder length and the back-patch entry encoder agree.
 const SPLIT_XREF_ENTRY_WIDTH: usize = 13;
-
 
 /// Byte ranges (inside the writer's `bytes` buffer) the first-page xref stream
 /// reserves for in-place back-patching once every downstream object offset and
