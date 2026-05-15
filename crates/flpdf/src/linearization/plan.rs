@@ -2335,6 +2335,145 @@ mod tests {
         );
     }
 
+    /// One source ObjStm whose **two** members both land in Part 4 (they are
+    /// eligible plain dicts reachable from neither page-1 nor any other page,
+    /// so `from_pdf` keeps them in `part4_rest`).  This is the fixture the
+    /// `chunks(cap)` split path actually needs: a single source ObjStm
+    /// contributing ≥2 eligible members to the *same* part.
+    fn objstm_two_part4_members_pdf_bytes() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        let catalog_offset = bytes.len() as u32;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let pages_offset = bytes.len() as u32;
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let page1_offset = bytes.len() as u32;
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        // ObjStm #7: members [10, 11] — two eligible plain dicts, referenced by
+        // nothing, so both land in part4_rest (same part, same source ObjStm).
+        let objstm_members: &[(u32, &[u8])] =
+            &[(10, b"<< /Marker 10 >>"), (11, b"<< /Marker 11 >>")];
+        let (stream_data, first) = build_objstm_payload_plan(objstm_members);
+        let n = objstm_members.len() as u32;
+        let objstm_offset = bytes.len() as u32;
+        bytes.extend_from_slice(
+            format!(
+                "7 0 obj\n<< /Type /ObjStm /N {n} /First {first} /Length {} /Filter /FlateDecode >>\nstream\n",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = bytes.len() as u32;
+        let mut xref_entries: Vec<u8> = Vec::new();
+        // 0..=11 plus xref stream obj 12 → Size 13.
+        append_xref_entry_plan(&mut xref_entries, 0, 0, 0); // 0 free
+        append_xref_entry_plan(&mut xref_entries, 1, catalog_offset, 0); // 1
+        append_xref_entry_plan(&mut xref_entries, 1, pages_offset, 0); // 2
+        append_xref_entry_plan(&mut xref_entries, 1, page1_offset, 0); // 3
+        for _ in 4..=6 {
+            append_xref_entry_plan(&mut xref_entries, 0, 0, 0); // 4..6 free
+        }
+        append_xref_entry_plan(&mut xref_entries, 1, objstm_offset, 0); // 7 ObjStm
+        for _ in 8..=9 {
+            append_xref_entry_plan(&mut xref_entries, 0, 0, 0); // 8..9 free
+        }
+        append_xref_entry_plan(&mut xref_entries, 2, 7, 0); // 10 in ObjStm 7 idx 0
+        append_xref_entry_plan(&mut xref_entries, 2, 7, 1); // 11 in ObjStm 7 idx 1
+        append_xref_entry_plan(&mut xref_entries, 1, xref_offset, 0); // 12 XRef
+
+        bytes.extend_from_slice(
+            format!(
+                "12 0 obj\n<< /Type /XRef /Size 13 /Root 1 0 R /W [1 3 1] /Index [0 13] /Length {} >>\nstream\n",
+                xref_entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    /// Regression for the `chunks(cap)` split path: a single source ObjStm
+    /// contributing two eligible members to the *same* part (Part 4) must be
+    /// split into two separate cap=1 batches, and coalesced into one at cap=2.
+    /// (The pre-existing cap test never had ≥2 same-source/same-part members,
+    /// so a broken `chunks(cap)` would have passed it unnoticed.)
+    #[test]
+    fn objstm_batches_preserve_cap_actually_splits_same_source_same_part() {
+        let bytes = objstm_two_part4_members_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let m10 = ObjectRef::new(10, 0);
+        let m11 = ObjectRef::new(11, 0);
+
+        // Both members are Part-4 (not in any page closure → part4_rest).
+        let part4: BTreeSet<ObjectRef> = plan
+            .part4_other_pages_private
+            .iter()
+            .chain(&plan.part4_other_pages_shared)
+            .chain(&plan.part4_rest)
+            .copied()
+            .collect();
+        assert!(
+            part4.contains(&m10) && part4.contains(&m11),
+            "fixture invariant: 10 0 R and 11 0 R must both be Part-4"
+        );
+
+        // cap=1: the two same-source same-part members must land in DIFFERENT
+        // batches (this is exactly what `chunks(cap)` must do).
+        let cap1 = PlannerConfig {
+            mode: crate::writer::object_streams::ObjectStreamMode::Preserve,
+            batch_size_cap: std::num::NonZeroUsize::new(1).unwrap(),
+        };
+        let bp1 = plan
+            .objstm_batches(&mut pdf, &cap1)
+            .expect("Preserve cap=1 must succeed");
+        let b10 = bp1.part4_batches.iter().position(|b| b.contains(&m10));
+        let b11 = bp1.part4_batches.iter().position(|b| b.contains(&m11));
+        assert!(
+            b10.is_some() && b11.is_some(),
+            "both members must be batched at cap=1; part4_batches={:?}",
+            bp1.part4_batches
+        );
+        assert_ne!(
+            b10, b11,
+            "cap=1: 10 0 R and 11 0 R (same source ObjStm, same part) must be \
+             in SEPARATE batches — chunks(cap) split path"
+        );
+        for b in &bp1.part4_batches {
+            assert!(b.len() <= 1, "cap=1 batch over capacity: {b:?}");
+        }
+
+        // cap=2: the same two members must coalesce into ONE batch, proving the
+        // split is cap-driven (not unconditional).
+        let cap2 = PlannerConfig {
+            mode: crate::writer::object_streams::ObjectStreamMode::Preserve,
+            batch_size_cap: std::num::NonZeroUsize::new(2).unwrap(),
+        };
+        let bp2 = plan
+            .objstm_batches(&mut pdf, &cap2)
+            .expect("Preserve cap=2 must succeed");
+        let same_batch = bp2
+            .part4_batches
+            .iter()
+            .any(|b| b.contains(&m10) && b.contains(&m11));
+        assert!(
+            same_batch,
+            "cap=2: 10 0 R and 11 0 R must share one batch; part4_batches={:?}",
+            bp2.part4_batches
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Generate: part3 objects go only to part3_batches, part4 to part4_batches
     // -----------------------------------------------------------------------
