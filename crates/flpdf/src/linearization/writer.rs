@@ -673,9 +673,20 @@ fn split_xref_common_id(options: &WriteOptions, source_trailer: &Dictionary) -> 
 /// `startxref` points at the main xref, so the chain is acyclic.
 ///
 /// `/Index [0, first_count]`: objects `0 ..= first_xref_slot`, all type-1
-/// (param dict, hint, catalog, Part-2, Part-3-plain, Part-3 containers, and
-/// the first-page xref object itself), so the stream carries a single
-/// contiguous range with no type-1-after-type-2 interleave.
+/// (param dict, hint, catalog, Part-2, Part-3-plain objects, and the
+/// first-page xref object itself), so the stream carries a single contiguous
+/// range with no type-1-after-type-2 interleave.
+///
+/// Note: every ObjStm container and member is numbered **above**
+/// `first_xref_slot` (and above `main_xref_slot`) by
+/// [`RenumberMap::relocate_objstm_members`], so none of them fall in this
+/// range — they live exclusively in the main xref's `/Index`.  Part-3
+/// (page-1 shared) objects are additionally kept *plain* by the planner
+/// (`LinearizationPlan::objstm_batches` unconditionally clears
+/// `part3_batches`, flpdf-9hc.5.8.3), so no Part-3 ObjStm container is ever
+/// emitted before `/E`.  Re-enabling Part-3 packing requires reconciling
+/// container numbering with this split-xref range (tracked by the
+/// `flpdf-ihb` epic); until then this range is exactly the Part-3-plain set.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
