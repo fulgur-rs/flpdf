@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn string_escape_low_control_u_form() {
-        // 0x01 must become 
+        // 0x01 must become \u0001
         let s = "\x01\x1F";
         assert_eq!(emit(&JsonValue::String(s.into())), "\"\\u0001\\u001F\"\n");
     }
