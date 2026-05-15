@@ -522,6 +522,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
             for oref in wanted_refs {
                 let obj = pdf2.resolve(oref)?;
                 if let Object::Stream(stream) = obj {
+                    // qpdf names side files `<prefix>-nnn` where nnn is the
+                    // object number zero-padded to at least 3 digits
+                    // (qpdf manual, --json-stream-prefix). Match that so
+                    // tooling written against qpdf's layout finds the files.
                     let side_path = format!("{prefix}-{:03}", oref.number);
                     std::fs::write(&side_path, &stream.data)?;
                 }
