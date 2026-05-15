@@ -1850,21 +1850,35 @@ pub fn build_attachments_section<R: Read + Seek>(
 /// Determine the qpdf method string ("none", "RC4", "AESv2", "AESv3") for a
 /// crypt filter name looked up from the /CF dictionary of `encrypt`.
 ///
-/// Returns `"none"` when the filter name is "Identity" or when no /CF entry
-/// exists. Returns an error only on malformed dictionaries.
+/// Returns `"none"` only for the explicit `Identity` selector or when there
+/// is no `/Encrypt` revision to derive a default from. When the selector is
+/// absent or the looked-up filter has no `/CFM`, the method falls back to
+/// the revision-based default used by the reader and the qpdf handler:
+///
+/// - `/R >= 5` → `"AESv3"`
+/// - `/R == 4` → `"AESv2"`
+/// - everything else (legacy) → `"RC4"`
 fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static str {
+    fn revision_default(encrypt: &Dictionary) -> &'static str {
+        match encrypt.get("R") {
+            Some(Object::Integer(r)) if *r >= 5 => "AESv3",
+            Some(Object::Integer(4)) => "AESv2",
+            _ => "RC4",
+        }
+    }
+
     let Some(selector) = selector else {
-        return "none";
+        return revision_default(encrypt);
     };
     if selector == "Identity" {
         return "none";
     }
     // Look up the CFM entry inside /CF/<selector>
     let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
-        return "none";
+        return revision_default(encrypt);
     };
     let Some(Object::Dictionary(filter)) = cf.get(selector) else {
-        return "none";
+        return revision_default(encrypt);
     };
     match filter.get("CFM") {
         Some(Object::Name(cfm)) => match cfm.as_slice() {
@@ -1872,9 +1886,9 @@ fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static st
             b"AESV3" => "AESv3",
             b"V2" => "RC4",
             b"None" => "none",
-            _ => "none",
+            _ => revision_default(encrypt),
         },
-        _ => "none",
+        _ => revision_default(encrypt),
     }
 }
 
@@ -5510,6 +5524,60 @@ mod tests {
         assert!(!pdf.is_encrypted());
         assert!(!pdf.owner_password_matched());
         assert!(!pdf.user_password_matched());
+    }
+
+    // Regression for CodeRabbit's PR #115 review: cf_method_string used to
+    // return "none" whenever /CF was missing or the selected filter had no
+    // /CFM, which silently disguised RC4/AESv2 documents as plaintext. It
+    // now falls back to the same revision-based default the reader uses.
+
+    #[test]
+    fn cf_method_string_defaults_to_aesv2_for_revision_4() {
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("R", Object::Integer(4));
+        // No /CF at all.
+        assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+        // /CF exists but the selector is missing.
+        let mut cf = Dictionary::new();
+        cf.insert("OtherCF", Object::Dictionary(Dictionary::new()));
+        encrypt.insert("CF", Object::Dictionary(cf));
+        assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+        // Selector found but its /CFM is missing.
+        let mut encrypt2 = Dictionary::new();
+        encrypt2.insert("R", Object::Integer(4));
+        let mut cf2 = Dictionary::new();
+        cf2.insert("StdCF", Object::Dictionary(Dictionary::new()));
+        encrypt2.insert("CF", Object::Dictionary(cf2));
+        assert_eq!(cf_method_string(&encrypt2, Some("StdCF")), "AESv2");
+    }
+
+    #[test]
+    fn cf_method_string_defaults_to_aesv3_for_revision_5_and_6() {
+        for r in [5i64, 6] {
+            let mut encrypt = Dictionary::new();
+            encrypt.insert("R", Object::Integer(r));
+            assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv3");
+            assert_eq!(cf_method_string(&encrypt, None), "AESv3");
+        }
+    }
+
+    #[test]
+    fn cf_method_string_defaults_to_rc4_for_legacy_revisions() {
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("R", Object::Integer(3));
+        assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "RC4");
+        // No /R at all -> legacy default too.
+        let empty = Dictionary::new();
+        assert_eq!(cf_method_string(&empty, Some("StdCF")), "RC4");
+    }
+
+    #[test]
+    fn cf_method_string_identity_selector_still_returns_none() {
+        // The "Identity" selector explicitly means no encryption for that
+        // path and must keep its "none" behavior regardless of /R.
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("R", Object::Integer(4));
+        assert_eq!(cf_method_string(&encrypt, Some("Identity")), "none");
     }
 
     #[test]
