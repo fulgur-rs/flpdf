@@ -2180,6 +2180,142 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
     }
 }
 
+// ── JsonKey / filter_json_keys ────────────────────────────────────────────────
+
+/// A top-level qpdf JSON v2 key that the caller may request via --json-key.
+///
+/// Note: "objects" and "objectinfo" are v1-era names; in qpdf JSON v2 the
+/// object information has been consolidated into the "qpdf" top-level key.
+/// We still accept them for qpdf compatibility but treat them as aliases
+/// for "qpdf" (i.e. requesting "objects" includes the "qpdf" key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JsonKey {
+    Acroform,
+    Attachments,
+    Encrypt,
+    /// v1 alias — maps to the `"qpdf"` top-level key in v2 output.
+    Objectinfo,
+    /// v1 alias — maps to the `"qpdf"` top-level key in v2 output.
+    Objects,
+    Outlines,
+    Pagelabels,
+    Pages,
+    Qpdf,
+}
+
+impl JsonKey {
+    /// All accepted key name strings in qpdf order (alphabetical).
+    ///
+    /// This list is the canonical source for the CLI error message:
+    /// `--json-key must be given as --json-key={acroform,...}`.
+    pub const ALL_NAMES: &'static [&'static str] = &[
+        "acroform",
+        "attachments",
+        "encrypt",
+        "objectinfo",
+        "objects",
+        "outlines",
+        "pagelabels",
+        "pages",
+        "qpdf",
+    ];
+
+    /// Parse a key name string. Returns `None` for unknown keys.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "acroform" => Some(JsonKey::Acroform),
+            "attachments" => Some(JsonKey::Attachments),
+            "encrypt" => Some(JsonKey::Encrypt),
+            "objectinfo" => Some(JsonKey::Objectinfo),
+            "objects" => Some(JsonKey::Objects),
+            "outlines" => Some(JsonKey::Outlines),
+            "pagelabels" => Some(JsonKey::Pagelabels),
+            "pages" => Some(JsonKey::Pages),
+            "qpdf" => Some(JsonKey::Qpdf),
+            _ => None,
+        }
+    }
+
+    /// The v2 top-level key name this filter maps to in the output JSON.
+    ///
+    /// `Objectinfo` and `Objects` are v1 aliases that map to `"qpdf"`.
+    fn output_key_name(self) -> &'static str {
+        match self {
+            JsonKey::Acroform => "acroform",
+            JsonKey::Attachments => "attachments",
+            JsonKey::Encrypt => "encrypt",
+            JsonKey::Objectinfo => "qpdf",
+            JsonKey::Objects => "qpdf",
+            JsonKey::Outlines => "outlines",
+            JsonKey::Pagelabels => "pagelabels",
+            JsonKey::Pages => "pages",
+            JsonKey::Qpdf => "qpdf",
+        }
+    }
+}
+
+/// Filter a fully-built qpdf JSON v2 document to only the requested keys.
+///
+/// `version` and `parameters` are always preserved (they are the envelope).
+/// `keys` may contain duplicates; the result still contains each key at
+/// most once. Returns the input unchanged when `keys` is empty (no filter).
+///
+/// When `Objects` or `Objectinfo` is requested, it is aliased to `Qpdf`
+/// (since v2 consolidates that information into the "qpdf" top-level key).
+pub fn filter_json_keys(v2: JsonValue, keys: &[JsonKey]) -> JsonValue {
+    // No filter — return unchanged.
+    if keys.is_empty() {
+        return v2;
+    }
+
+    // Collect the set of resolved output-key names that were requested.
+    let mut requested: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for k in keys {
+        requested.insert(k.output_key_name());
+    }
+
+    // Pattern-match the top-level Object; return as-is for any other variant.
+    let pairs = match v2 {
+        JsonValue::Object(p) => p,
+        other => return other,
+    };
+
+    // Rebuild: always keep version + parameters first, then walk qpdf v2 order.
+    let mut out: Vec<(String, JsonValue)> = Vec::new();
+
+    // Pass 1: copy the envelope keys (version, parameters) unconditionally.
+    for (k, v) in &pairs {
+        if k == "version" || k == "parameters" {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+
+    // Pass 2: walk the fixed qpdf v2 emission order and pick requested keys.
+    // Order: pages, pagelabels, acroform, attachments, encrypt, outlines, qpdf
+    const V2_ORDER: &[&str] = &[
+        "pages",
+        "pagelabels",
+        "acroform",
+        "attachments",
+        "encrypt",
+        "outlines",
+        "qpdf",
+    ];
+    for &section_name in V2_ORDER {
+        if !requested.contains(section_name) {
+            continue;
+        }
+        // Find this key in the input pairs (may be absent if caller built a
+        // partial document — just skip rather than panic).
+        if let Some((k, v)) = pairs.iter().find(|(k, _)| k == section_name) {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+
+    JsonValue::Object(out)
+}
+
 // ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
 
 /// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
@@ -6142,6 +6278,216 @@ mod tests {
             matches!(&stream_inner[0].1, JsonValue::String(_)),
             "data must be a String"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // JsonKey / filter_json_keys unit tests  (flpdf-9hc.11.11)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── JsonKey::from_str: all 9 accepted names ───────────────────────────────
+
+    #[test]
+    fn json_key_from_str_all_known() {
+        assert_eq!(JsonKey::from_str("acroform"), Some(JsonKey::Acroform));
+        assert_eq!(JsonKey::from_str("attachments"), Some(JsonKey::Attachments));
+        assert_eq!(JsonKey::from_str("encrypt"), Some(JsonKey::Encrypt));
+        assert_eq!(JsonKey::from_str("objectinfo"), Some(JsonKey::Objectinfo));
+        assert_eq!(JsonKey::from_str("objects"), Some(JsonKey::Objects));
+        assert_eq!(JsonKey::from_str("outlines"), Some(JsonKey::Outlines));
+        assert_eq!(JsonKey::from_str("pagelabels"), Some(JsonKey::Pagelabels));
+        assert_eq!(JsonKey::from_str("pages"), Some(JsonKey::Pages));
+        assert_eq!(JsonKey::from_str("qpdf"), Some(JsonKey::Qpdf));
+    }
+
+    // ── JsonKey::from_str: unknown names return None ──────────────────────────
+
+    #[test]
+    fn json_key_from_str_unknown_returns_none() {
+        assert_eq!(JsonKey::from_str(""), None);
+        assert_eq!(JsonKey::from_str("Pages"), None); // case-sensitive
+        assert_eq!(JsonKey::from_str("version"), None);
+        assert_eq!(JsonKey::from_str("parameters"), None);
+        assert_eq!(JsonKey::from_str("bogus"), None);
+    }
+
+    // ── ALL_NAMES ordering matches alphabetical qpdf error message order ──────
+
+    #[test]
+    fn json_key_all_names_order() {
+        assert_eq!(JsonKey::ALL_NAMES[0], "acroform");
+        assert_eq!(JsonKey::ALL_NAMES[1], "attachments");
+        assert_eq!(JsonKey::ALL_NAMES[2], "encrypt");
+        assert_eq!(JsonKey::ALL_NAMES[3], "objectinfo");
+        assert_eq!(JsonKey::ALL_NAMES[4], "objects");
+        assert_eq!(JsonKey::ALL_NAMES[5], "outlines");
+        assert_eq!(JsonKey::ALL_NAMES[6], "pagelabels");
+        assert_eq!(JsonKey::ALL_NAMES[7], "pages");
+        assert_eq!(JsonKey::ALL_NAMES[8], "qpdf");
+        assert_eq!(JsonKey::ALL_NAMES.len(), 9);
+    }
+
+    // ── output_key_name: aliasing ─────────────────────────────────────────────
+
+    #[test]
+    fn json_key_output_key_name_aliasing() {
+        // v1 aliases map to "qpdf"
+        assert_eq!(JsonKey::Objectinfo.output_key_name(), "qpdf");
+        assert_eq!(JsonKey::Objects.output_key_name(), "qpdf");
+        // canonical v2 names map to themselves
+        assert_eq!(JsonKey::Acroform.output_key_name(), "acroform");
+        assert_eq!(JsonKey::Attachments.output_key_name(), "attachments");
+        assert_eq!(JsonKey::Encrypt.output_key_name(), "encrypt");
+        assert_eq!(JsonKey::Outlines.output_key_name(), "outlines");
+        assert_eq!(JsonKey::Pagelabels.output_key_name(), "pagelabels");
+        assert_eq!(JsonKey::Pages.output_key_name(), "pages");
+        assert_eq!(JsonKey::Qpdf.output_key_name(), "qpdf");
+    }
+
+    // ── Helper: build a minimal v2-shaped JsonValue for filter tests ──────────
+
+    fn make_v2_doc() -> JsonValue {
+        // Construct a fake but structurally correct v2 document so that
+        // filter_json_keys has a real Object to work with.
+        JsonValue::Object(vec![
+            ("version".to_string(), JsonValue::Integer(2)),
+            (
+                "parameters".to_string(),
+                JsonValue::Object(vec![(
+                    "decodelevel".to_string(),
+                    JsonValue::String("generalized".to_string()),
+                )]),
+            ),
+            ("pages".to_string(), JsonValue::Array(vec![])),
+            ("pagelabels".to_string(), JsonValue::Array(vec![])),
+            ("acroform".to_string(), JsonValue::Null),
+            ("attachments".to_string(), JsonValue::Object(vec![])),
+            ("encrypt".to_string(), JsonValue::Null),
+            ("outlines".to_string(), JsonValue::Array(vec![])),
+            ("qpdf".to_string(), JsonValue::Array(vec![])),
+        ])
+    }
+
+    fn key_names(v: &JsonValue) -> Vec<&str> {
+        match v {
+            JsonValue::Object(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+            _ => panic!("expected Object"),
+        }
+    }
+
+    // ── filter_json_keys: empty keys → return input unchanged ─────────────────
+
+    #[test]
+    fn filter_json_keys_empty_returns_unchanged() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc.clone(), &[]);
+        // Should be structurally equal to the original.
+        assert_eq!(key_names(&filtered), key_names(&doc));
+    }
+
+    // ── filter_json_keys: single key [Pages] → version, parameters, pages ─────
+
+    #[test]
+    fn filter_json_keys_single_pages() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc, &[JsonKey::Pages]);
+        let names = key_names(&filtered);
+        assert_eq!(names, vec!["version", "parameters", "pages"]);
+    }
+
+    // ── filter_json_keys: [Pages, Pagelabels] → 4 keys in v2 order ───────────
+
+    #[test]
+    fn filter_json_keys_pages_and_pagelabels() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc, &[JsonKey::Pages, JsonKey::Pagelabels]);
+        let names = key_names(&filtered);
+        assert_eq!(names, vec!["version", "parameters", "pages", "pagelabels"]);
+    }
+
+    // ── filter_json_keys: [Objects] → aliased to qpdf ────────────────────────
+
+    #[test]
+    fn filter_json_keys_objects_alias_to_qpdf() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc, &[JsonKey::Objects]);
+        let names = key_names(&filtered);
+        assert_eq!(names, vec!["version", "parameters", "qpdf"]);
+    }
+
+    // ── filter_json_keys: [Objectinfo] → aliased to qpdf ─────────────────────
+
+    #[test]
+    fn filter_json_keys_objectinfo_alias_to_qpdf() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc, &[JsonKey::Objectinfo]);
+        let names = key_names(&filtered);
+        assert_eq!(names, vec!["version", "parameters", "qpdf"]);
+    }
+
+    // ── filter_json_keys: duplicate dedupe ([Pages, Pages]) ──────────────────
+
+    #[test]
+    fn filter_json_keys_dedupe_pages() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc, &[JsonKey::Pages, JsonKey::Pages]);
+        let names = key_names(&filtered);
+        assert_eq!(names, vec!["version", "parameters", "pages"]);
+    }
+
+    // ── filter_json_keys: [Objects, Qpdf] → only one "qpdf" in output ────────
+
+    #[test]
+    fn filter_json_keys_objects_and_qpdf_dedupe() {
+        let doc = make_v2_doc();
+        let filtered = filter_json_keys(doc, &[JsonKey::Objects, JsonKey::Qpdf]);
+        let names = key_names(&filtered);
+        assert_eq!(names, vec!["version", "parameters", "qpdf"]);
+    }
+
+    // ── filter_json_keys: key absent from input → not in output (no panic) ────
+
+    #[test]
+    fn filter_json_keys_absent_key_skipped() {
+        // Build a doc that intentionally lacks the "encrypt" section.
+        let partial_doc = JsonValue::Object(vec![
+            ("version".to_string(), JsonValue::Integer(2)),
+            (
+                "parameters".to_string(),
+                JsonValue::Object(vec![(
+                    "decodelevel".to_string(),
+                    JsonValue::String("generalized".to_string()),
+                )]),
+            ),
+            ("pages".to_string(), JsonValue::Array(vec![])),
+        ]);
+        // Request both "pages" (present) and "encrypt" (absent) — must not panic.
+        let filtered = filter_json_keys(partial_doc, &[JsonKey::Pages, JsonKey::Encrypt]);
+        let names = key_names(&filtered);
+        // Only "pages" is present; "encrypt" is silently skipped.
+        assert_eq!(names, vec!["version", "parameters", "pages"]);
+        assert!(!names.contains(&"encrypt"));
+    }
+
+    // ── filter_json_keys: qpdf v2 output order is preserved regardless of
+    //    request order (Qpdf before Pages requested → pages still before qpdf) ─
+
+    #[test]
+    fn filter_json_keys_output_order_fixed() {
+        let doc = make_v2_doc();
+        // Request in reverse v2 order.
+        let filtered = filter_json_keys(doc, &[JsonKey::Qpdf, JsonKey::Pages]);
+        let names = key_names(&filtered);
+        // Output must follow v2 order: version, parameters, pages, qpdf
+        assert_eq!(names, vec!["version", "parameters", "pages", "qpdf"]);
+    }
+
+    // ── filter_json_keys: non-Object input returned as-is (no panic) ─────────
+
+    #[test]
+    fn filter_json_keys_non_object_returned_as_is() {
+        let v = JsonValue::Integer(42);
+        let result = filter_json_keys(v, &[JsonKey::Pages]);
+        assert_eq!(result, JsonValue::Integer(42));
     }
 
     // ── base64 decode helper (test-only) ─────────────────────────────────────
