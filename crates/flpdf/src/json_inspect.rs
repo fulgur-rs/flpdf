@@ -1355,6 +1355,398 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
     ]))
 }
 
+// ── build_attachments_section ─────────────────────────────────────────────────
+
+/// Parse a PDF date string (ISO 32000-1 §7.9.4) into an ISO 8601 string.
+///
+/// The PDF date format is `D:YYYYMMDDhhmmss±HH'mm'` (or `Z` for UTC).
+/// Returns `None` if the bytes cannot be parsed as a date.
+fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
+    // Strip "D:" prefix if present
+    let s = std::str::from_utf8(bytes).ok()?;
+    let s = s.strip_prefix("D:").unwrap_or(s);
+
+    // Must have at least 4 chars for the year
+    if s.len() < 4 {
+        return None;
+    }
+
+    // Parse components with defaults
+    let year = &s[0..4];
+    // Validate year is numeric
+    if !year.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let month = if s.len() >= 6 { &s[4..6] } else { "01" };
+    let day = if s.len() >= 8 { &s[6..8] } else { "01" };
+    let hour = if s.len() >= 10 { &s[8..10] } else { "00" };
+    let minute = if s.len() >= 12 { &s[10..12] } else { "00" };
+    let second = if s.len() >= 14 { &s[12..14] } else { "00" };
+
+    // Parse timezone
+    let tz_str = if s.len() > 14 { &s[14..] } else { "" };
+    let tz = if tz_str.is_empty() || tz_str == "Z" || tz_str == "z" {
+        "Z".to_string()
+    } else if let Some(rest) = tz_str.strip_prefix('+') {
+        // +HH'mm' or +HH
+        parse_tz_offset('+', rest)
+    } else if let Some(rest) = tz_str.strip_prefix('-') {
+        parse_tz_offset('-', rest)
+    } else {
+        "Z".to_string()
+    };
+
+    Some(format!("{year}-{month}-{day}T{hour}:{minute}:{second}{tz}"))
+}
+
+/// Parse a timezone offset in the form `HH'mm'` or `HH` and return a string like `+HH:MM`.
+fn parse_tz_offset(sign: char, rest: &str) -> String {
+    // Format: HH'mm' (with literal apostrophes) or just HH
+    let rest = rest.trim_end_matches('\'');
+    let (hh, mm) = if rest.len() >= 5 && rest.as_bytes().get(2) == Some(&b'\'') {
+        (&rest[0..2], &rest[3..5])
+    } else if rest.len() >= 4 {
+        (&rest[0..2], &rest[2..4])
+    } else if rest.len() == 2 {
+        (rest, "00")
+    } else {
+        return "Z".to_string();
+    };
+    // Validate digits
+    if !hh.chars().all(|c| c.is_ascii_digit()) || !mm.chars().all(|c| c.is_ascii_digit()) {
+        return "Z".to_string();
+    }
+    // If +00:00, emit Z
+    if sign == '+' && hh == "00" && mm == "00" {
+        "Z".to_string()
+    } else {
+        format!("{sign}{hh}:{mm}")
+    }
+}
+
+/// Convert raw bytes to lowercase hex string.
+fn checksum_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Walk a name-tree node for `/EmbeddedFiles`, collecting `(name_string, filespec_ref)` pairs.
+///
+/// Both leaf nodes (`/Names`) and intermediate nodes (`/Kids`) are handled.
+/// The `seen` set prevents infinite loops on cyclic references.
+fn walk_embedded_files_name_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node: Object,
+    entries: &mut Vec<(String, crate::ObjectRef)>,
+    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), ConvertError> {
+    if depth > max_depth {
+        return Ok(());
+    }
+
+    let dict = match node {
+        Object::Dictionary(d) => d,
+        _ => return Ok(()),
+    };
+
+    // /Names: leaf node with [name1 ref1 name2 ref2 ...] pairs
+    if let Some(Object::Array(names)) = dict.get("Names") {
+        let names = names.clone();
+        let mut iter = names.into_iter();
+        while let (Some(name_obj), Some(ref_obj)) = (iter.next(), iter.next()) {
+            // name is a PDF string (text or byte string)
+            let name_str = match name_obj {
+                Object::String(bytes) => decode_pdf_text_string(&bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+                _ => continue,
+            };
+            // value should be an indirect reference to a filespec dict
+            let filespec_ref = match ref_obj {
+                Object::Reference(r) => r,
+                _ => continue,
+            };
+            entries.push((name_str, filespec_ref));
+        }
+        return Ok(());
+    }
+
+    // /Kids: intermediate node
+    if let Some(Object::Array(kids)) = dict.get("Kids") {
+        let kids = kids.clone();
+        for kid in kids {
+            let kid_ref = match kid {
+                Object::Reference(r) => r,
+                _ => continue,
+            };
+            if !seen.insert(kid_ref) {
+                continue; // cycle guard
+            }
+            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
+            walk_embedded_files_name_tree(pdf, child, entries, seen, depth + 1, max_depth)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a JSON entry for one filespec dictionary.
+///
+/// Returns an object with keys in alphabetical order:
+/// `description`, `filespec`, `names`, `preferredcontents`, `preferredname`, `streams`.
+fn filespec_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filespec_ref: crate::ObjectRef,
+) -> Result<JsonValue, ConvertError> {
+    let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
+
+    let filespec_obj = pdf.resolve(filespec_ref).map_err(ConvertError::from)?;
+    let filespec_dict = match filespec_obj {
+        Object::Dictionary(d) => d,
+        _ => {
+            // Malformed filespec — return a minimal entry
+            return Ok(JsonValue::Object(vec![
+                ("description".to_string(), JsonValue::Null),
+                ("filespec".to_string(), JsonValue::String(filespec_str)),
+                ("names".to_string(), JsonValue::Object(vec![])),
+                ("preferredcontents".to_string(), JsonValue::Null),
+                ("preferredname".to_string(), JsonValue::Null),
+                ("streams".to_string(), JsonValue::Object(vec![])),
+            ]));
+        }
+    };
+
+    // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
+    let description = match filespec_dict.get("Desc") {
+        Some(Object::String(bytes)) => {
+            let s = decode_pdf_text_string(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+            JsonValue::String(s)
+        }
+        _ => JsonValue::Null,
+    };
+
+    // names: collect /F, /UF, /DOS, /Mac, /Unix — each decoded as PDF text string
+    // Keys are in alphabetical order (they already are in BTree).
+    let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
+    let mut names_pairs: Vec<(String, JsonValue)> = Vec::new();
+    for key in &name_keys {
+        if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
+            let s = decode_pdf_text_string(bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+            names_pairs.push((format!("/{key}"), JsonValue::String(s)));
+        }
+    }
+
+    // preferredname: /UF > /F > /Unix > /Mac > /DOS
+    let preferred_name_key_order = ["UF", "F", "Unix", "Mac", "DOS"];
+    let preferredname = preferred_name_key_order
+        .iter()
+        .find_map(|key| {
+            if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
+                let s = decode_pdf_text_string(bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+                Some(JsonValue::String(s))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(JsonValue::Null);
+
+    // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
+    let ef_dict = match filespec_dict.get("EF") {
+        Some(Object::Dictionary(d)) => Some(d.clone()),
+        Some(Object::Reference(r)) => match pdf.resolve(*r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    // preferredcontents: /EF/UF > /EF/F > /EF/Unix > /EF/Mac > /EF/DOS
+    let preferred_ef_key_order = ["UF", "F", "Unix", "Mac", "DOS"];
+    let preferredcontents = if let Some(ref ef) = ef_dict {
+        preferred_ef_key_order
+            .iter()
+            .find_map(|key| {
+                if let Some(Object::Reference(r)) = ef.get(*key) {
+                    Some(JsonValue::String(format!(
+                        "{} {} R",
+                        r.number, r.generation
+                    )))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(JsonValue::Null)
+    } else {
+        JsonValue::Null
+    };
+
+    // streams: for each key in /EF, build a stream-info object
+    // Keys alphabetical: /DOS, /F, /Mac, /UF, /Unix
+    let ef_key_order = ["DOS", "F", "Mac", "UF", "Unix"];
+    let mut streams_pairs: Vec<(String, JsonValue)> = Vec::new();
+
+    if let Some(ref ef) = ef_dict {
+        for key in &ef_key_order {
+            let stream_ref = match ef.get(*key) {
+                Some(Object::Reference(r)) => *r,
+                _ => continue,
+            };
+
+            let stream_obj = pdf.resolve(stream_ref).map_err(ConvertError::from)?;
+            let stream = match stream_obj {
+                Object::Stream(s) => s,
+                _ => continue,
+            };
+
+            // mimetype: /Subtype name → bare string (no "/" prefix), or null
+            let mimetype = match stream.dict.get("Subtype") {
+                Some(Object::Name(bytes)) => {
+                    let s = String::from_utf8_lossy(bytes).into_owned();
+                    JsonValue::String(s)
+                }
+                _ => JsonValue::Null,
+            };
+
+            // /Params sub-dict
+            let params_dict = match stream.dict.get("Params") {
+                Some(Object::Dictionary(d)) => Some(d.clone()),
+                Some(Object::Reference(r)) => match pdf.resolve(*r).map_err(ConvertError::from)? {
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            // checksum: /Params /CheckSum bytes → lowercase hex, or null
+            let checksum = if let Some(ref p) = params_dict {
+                match p.get("CheckSum") {
+                    Some(Object::String(bytes)) => JsonValue::String(checksum_to_hex(bytes)),
+                    _ => JsonValue::Null,
+                }
+            } else {
+                JsonValue::Null
+            };
+
+            // creationdate: /Params /CreationDate → ISO 8601, or null
+            let creationdate = if let Some(ref p) = params_dict {
+                match p.get("CreationDate") {
+                    Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
+                        Some(s) => JsonValue::String(s),
+                        None => JsonValue::Null,
+                    },
+                    _ => JsonValue::Null,
+                }
+            } else {
+                JsonValue::Null
+            };
+
+            // modificationdate: /Params /ModDate → ISO 8601, or null
+            let modificationdate = if let Some(ref p) = params_dict {
+                match p.get("ModDate") {
+                    Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
+                        Some(s) => JsonValue::String(s),
+                        None => JsonValue::Null,
+                    },
+                    _ => JsonValue::Null,
+                }
+            } else {
+                JsonValue::Null
+            };
+
+            // Stream entry keys: checksum, creationdate, mimetype, modificationdate
+            let stream_entry = JsonValue::Object(vec![
+                ("checksum".to_string(), checksum),
+                ("creationdate".to_string(), creationdate),
+                ("mimetype".to_string(), mimetype),
+                ("modificationdate".to_string(), modificationdate),
+            ]);
+            streams_pairs.push((format!("/{key}"), stream_entry));
+        }
+    }
+
+    Ok(JsonValue::Object(vec![
+        ("description".to_string(), description),
+        ("filespec".to_string(), JsonValue::String(filespec_str)),
+        ("names".to_string(), JsonValue::Object(names_pairs)),
+        ("preferredcontents".to_string(), preferredcontents),
+        ("preferredname".to_string(), preferredname),
+        ("streams".to_string(), JsonValue::Object(streams_pairs)),
+    ]))
+}
+
+/// Build the qpdf JSON v2 `"attachments"` section.
+///
+/// Returns a [`JsonValue::Object`] where each key is an EmbeddedFiles name-tree
+/// entry name (decoded PDF string, bare without prefix) and each value is a
+/// filespec entry object.
+///
+/// Returns `JsonValue::Object(vec![])` when the document has no `/Names/EmbeddedFiles`.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any indirect object resolution fails.
+pub fn build_attachments_section<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<JsonValue, ConvertError> {
+    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+
+    // Resolve the Catalog.
+    let catalog_ref = match pdf.root_ref() {
+        Some(r) => r,
+        None => return Ok(JsonValue::Object(vec![])),
+    };
+    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog_dict = match catalog {
+        Object::Dictionary(d) => d,
+        _ => return Ok(JsonValue::Object(vec![])),
+    };
+
+    // /Names dictionary from catalog
+    let names_dict = match catalog_dict.get("Names") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => match pdf.resolve(*r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => d,
+            _ => return Ok(JsonValue::Object(vec![])),
+        },
+        _ => return Ok(JsonValue::Object(vec![])),
+    };
+
+    // /EmbeddedFiles name tree root
+    let ef_root = match names_dict.get("EmbeddedFiles") {
+        Some(Object::Dictionary(d)) => Object::Dictionary(d.clone()),
+        Some(Object::Reference(r)) => pdf.resolve(*r).map_err(ConvertError::from)?,
+        _ => return Ok(JsonValue::Object(vec![])),
+    };
+
+    // Walk the name tree to collect (name, filespec_ref) pairs
+    let mut raw_entries: Vec<(String, crate::ObjectRef)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    walk_embedded_files_name_tree(
+        pdf,
+        ef_root,
+        &mut raw_entries,
+        &mut seen,
+        0,
+        DEFAULT_MAX_PAGE_TREE_DEPTH,
+    )?;
+
+    // Sort by name (alphabetical)
+    raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Build the output object
+    let mut pairs: Vec<(String, JsonValue)> = Vec::new();
+    for (name, filespec_ref) in raw_entries {
+        let entry = filespec_to_json(pdf, filespec_ref)?;
+        pairs.push((name, entry));
+    }
+
+    Ok(JsonValue::Object(pairs))
+}
+
 // ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
 
 /// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
@@ -1389,6 +1781,9 @@ pub fn build_qpdf_json_v2<R: Read + Seek>(
 
     let acroform = build_acroform_section(pdf)?;
     pairs.push(("acroform".to_string(), acroform));
+
+    let attachments = build_attachments_section(pdf)?;
+    pairs.push(("attachments".to_string(), attachments));
 
     let outlines = build_outlines_section(pdf)?;
     pairs.push(("outlines".to_string(), outlines));
@@ -2596,7 +2991,7 @@ mod tests {
         let JsonValue::Object(pairs) = v2 else {
             panic!("expected Object at top level");
         };
-        // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, outlines, qpdf
+        // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, attachments, outlines, qpdf
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -2606,6 +3001,7 @@ mod tests {
                 "pages",
                 "pagelabels",
                 "acroform",
+                "attachments",
                 "outlines",
                 "qpdf"
             ]
@@ -3473,10 +3869,11 @@ mod tests {
                 "pages",
                 "pagelabels",
                 "acroform",
+                "attachments",
                 "outlines",
                 "qpdf"
             ],
-            "key order must match qpdf v2: acroform before outlines"
+            "key order must match qpdf v2: acroform, attachments, outlines"
         );
     }
 
@@ -3947,5 +4344,432 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert_eq!(child_fullname, JsonValue::String("group.name".to_string()));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // build_attachments_section tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fn load_attachment_pdf() -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../../tests/fixtures/compat/attachment-two-page.pdf");
+        let bytes = std::fs::read(&fixture).unwrap_or_else(|e| {
+            panic!(
+                "attachment-two-page.pdf not found at {}: {e}",
+                fixture.display()
+            )
+        });
+        crate::Pdf::open_mem_owned(bytes).expect("failed to open attachment-two-page.pdf")
+    }
+
+    /// Insert a /Names/EmbeddedFiles name-tree with one entry into an existing PDF.
+    fn patch_embedded_files(
+        pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>,
+        names_ref: crate::ObjectRef,
+        ef_root_ref: crate::ObjectRef,
+        filespec_ref: crate::ObjectRef,
+        filespec: Dictionary,
+        name: &[u8],
+    ) {
+        // Build the name tree leaf: /Names [name filespec_ref]
+        let mut ef_root = Dictionary::new();
+        ef_root.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(name.to_vec()),
+                Object::Reference(filespec_ref),
+            ]),
+        );
+        pdf.set_object(ef_root_ref, Object::Dictionary(ef_root));
+
+        // Build the /Names dict with /EmbeddedFiles
+        let mut names_dict = Dictionary::new();
+        names_dict.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
+        pdf.set_object(names_ref, Object::Dictionary(names_dict));
+
+        // Patch the catalog
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d,
+            _ => panic!("catalog is not a Dictionary"),
+        };
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        pdf.set_object(filespec_ref, Object::Dictionary(filespec));
+    }
+
+    // ── attachments Test 1: No /Names/EmbeddedFiles → empty object ───────────
+
+    #[test]
+    fn attachments_no_embedded_files_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+    }
+
+    // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────
+
+    #[test]
+    fn attachments_fixture_has_one_entry() {
+        let mut pdf = load_attachment_pdf();
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object, got {result:?}");
+        };
+        assert_eq!(
+            pairs.len(),
+            1,
+            "attachment-two-page.pdf must have exactly 1 attachment"
+        );
+        assert_eq!(
+            pairs[0].0, "attachment.txt",
+            "attachment name must be 'attachment.txt'"
+        );
+    }
+
+    // ── attachments Test 3: fixture entry filespec, preferredname, streams keys
+
+    #[test]
+    fn attachments_fixture_entry_fields() {
+        let mut pdf = load_attachment_pdf();
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Object(entry) = &pairs[0].1 else {
+            panic!("entry must be Object");
+        };
+
+        let get = |k: &str| -> &JsonValue {
+            entry
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("key '{k}' not found in entry"))
+        };
+
+        // Keys must be present
+        let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "description",
+                "filespec",
+                "names",
+                "preferredcontents",
+                "preferredname",
+                "streams"
+            ],
+            "entry keys must be in alphabetical order"
+        );
+
+        // description: null (no /Desc in fixture)
+        assert_eq!(
+            *get("description"),
+            JsonValue::Null,
+            "description must be null"
+        );
+
+        // filespec: must be a ref string
+        let JsonValue::String(filespec_str) = get("filespec") else {
+            panic!("filespec must be a String");
+        };
+        assert!(
+            filespec_str.ends_with(" R"),
+            "filespec must be a ref string like 'N M R', got: {filespec_str}"
+        );
+
+        // preferredname: "attachment.txt"
+        assert_eq!(
+            *get("preferredname"),
+            JsonValue::String("attachment.txt".to_string()),
+            "preferredname must be 'attachment.txt'"
+        );
+
+        // streams: must be an Object with at least one stream entry
+        let JsonValue::Object(streams) = get("streams") else {
+            panic!("streams must be Object");
+        };
+        assert!(!streams.is_empty(), "streams must not be empty");
+
+        // Each stream entry must have checksum, creationdate, mimetype, modificationdate
+        for (stream_key, stream_val) in streams {
+            let JsonValue::Object(stream_entry) = stream_val else {
+                panic!("stream entry for {stream_key} must be Object");
+            };
+            let stream_keys: Vec<&str> = stream_entry.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                stream_keys,
+                vec!["checksum", "creationdate", "mimetype", "modificationdate"],
+                "stream entry for {stream_key} must have 4 keys in alphabetical order"
+            );
+        }
+    }
+
+    // ── attachments Test 4: synthetic fixture — key order, priorities, values ──
+
+    #[test]
+    fn attachments_synthetic_key_order_and_priorities() {
+        let mut pdf = load_one_page_pdf();
+
+        // Refs for the embedded file stream
+        let stream_f_ref = crate::ObjectRef::new(300, 0);
+        let stream_uf_ref = crate::ObjectRef::new(301, 0);
+        let filespec_ref = crate::ObjectRef::new(302, 0);
+        let ef_root_ref = crate::ObjectRef::new(303, 0);
+        let names_ref = crate::ObjectRef::new(304, 0);
+
+        // Build the /EF/F stream with /Params
+        let mut f_params = Dictionary::new();
+        // 16 bytes for checksum
+        let checksum_bytes: Vec<u8> = (0u8..16).collect();
+        f_params.insert("CheckSum", Object::String(checksum_bytes.clone()));
+        f_params.insert(
+            "CreationDate",
+            Object::String(b"D:20260101000000Z".to_vec()),
+        );
+        f_params.insert(
+            "ModDate",
+            Object::String(b"D:20260202120000+09'00'".to_vec()),
+        );
+        let mut stream_f_dict = Dictionary::new();
+        stream_f_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        stream_f_dict.insert("Subtype", Object::Name(b"text/plain".to_vec()));
+        stream_f_dict.insert("Params", Object::Dictionary(f_params));
+        pdf.set_object(
+            stream_f_ref,
+            Object::Stream(crate::object::Stream::new(stream_f_dict, vec![])),
+        );
+
+        // /EF/UF stream (different stream, no /Subtype)
+        let mut stream_uf_dict = Dictionary::new();
+        stream_uf_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        pdf.set_object(
+            stream_uf_ref,
+            Object::Stream(crate::object::Stream::new(stream_uf_dict, vec![])),
+        );
+
+        // Build the /EF dict: both /F and /UF
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("F", Object::Reference(stream_f_ref));
+        ef_dict.insert("UF", Object::Reference(stream_uf_ref));
+
+        // Build filespec dict
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"f-name.txt".to_vec()));
+        filespec.insert("UF", Object::String(b"uf-name.txt".to_vec()));
+        filespec.insert("Desc", Object::String(b"My file description".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef_dict));
+
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"my-attachment.txt",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let JsonValue::Object(pairs) = &result else {
+            panic!("expected Object");
+        };
+
+        assert_eq!(pairs.len(), 1, "expected 1 attachment");
+        assert_eq!(pairs[0].0, "my-attachment.txt", "name mismatch");
+
+        let JsonValue::Object(entry) = &pairs[0].1 else {
+            panic!("entry must be Object");
+        };
+
+        let get = |k: &str| -> &JsonValue {
+            entry
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("key '{k}' not found"))
+        };
+
+        // description: bare string (no u: prefix)
+        assert_eq!(
+            *get("description"),
+            JsonValue::String("My file description".to_string()),
+            "description must be bare string"
+        );
+
+        // names: /F and /UF both present
+        let JsonValue::Object(names) = get("names") else {
+            panic!("names must be Object");
+        };
+        let name_keys: Vec<&str> = names.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            name_keys,
+            vec!["/F", "/UF"],
+            "names keys must be /F, /UF in order"
+        );
+        assert_eq!(
+            names[0].1,
+            JsonValue::String("f-name.txt".to_string()),
+            "/F name mismatch"
+        );
+        assert_eq!(
+            names[1].1,
+            JsonValue::String("uf-name.txt".to_string()),
+            "/UF name mismatch"
+        );
+
+        // preferredname: /UF wins over /F
+        assert_eq!(
+            *get("preferredname"),
+            JsonValue::String("uf-name.txt".to_string()),
+            "preferredname must be /UF (uf-name.txt)"
+        );
+
+        // preferredcontents: /EF/UF wins over /EF/F
+        assert_eq!(
+            *get("preferredcontents"),
+            JsonValue::String(format!(
+                "{} {} R",
+                stream_uf_ref.number, stream_uf_ref.generation
+            )),
+            "preferredcontents must be /EF/UF ref"
+        );
+
+        // streams: /F and /UF both present
+        let JsonValue::Object(streams) = get("streams") else {
+            panic!("streams must be Object");
+        };
+        let stream_keys: Vec<&str> = streams.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            stream_keys,
+            vec!["/F", "/UF"],
+            "streams keys must be /F, /UF in order"
+        );
+
+        // /F stream: check checksum hex, dates, mimetype
+        let JsonValue::Object(f_stream) = &streams[0].1 else {
+            panic!("/F stream entry must be Object");
+        };
+        let f_get = |k: &str| -> &JsonValue {
+            f_stream
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("key '{k}' not found in /F stream"))
+        };
+
+        // checksum: 16 bytes 0x00..0x0f → lowercase hex
+        let expected_hex: String = (0u8..16).map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            *f_get("checksum"),
+            JsonValue::String(expected_hex),
+            "checksum must be lowercase hex"
+        );
+
+        // creationdate: D:20260101000000Z → 2026-01-01T00:00:00Z
+        assert_eq!(
+            *f_get("creationdate"),
+            JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+            "creationdate mismatch"
+        );
+
+        // modificationdate: D:20260202120000+09'00' → 2026-02-02T12:00:00+09:00
+        assert_eq!(
+            *f_get("modificationdate"),
+            JsonValue::String("2026-02-02T12:00:00+09:00".to_string()),
+            "modificationdate mismatch"
+        );
+
+        // mimetype: bare "text/plain" (no "/" prefix, no "u:" prefix)
+        assert_eq!(
+            *f_get("mimetype"),
+            JsonValue::String("text/plain".to_string()),
+            "mimetype must be bare 'text/plain'"
+        );
+
+        // /UF stream: no /Subtype → mimetype null, no /Params → other fields null
+        let JsonValue::Object(uf_stream) = &streams[1].1 else {
+            panic!("/UF stream entry must be Object");
+        };
+        let uf_get = |k: &str| -> &JsonValue {
+            uf_stream
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("key '{k}' not found in /UF stream"))
+        };
+        assert_eq!(
+            *uf_get("mimetype"),
+            JsonValue::Null,
+            "/UF mimetype must be null"
+        );
+        assert_eq!(
+            *uf_get("checksum"),
+            JsonValue::Null,
+            "/UF checksum must be null"
+        );
+        assert_eq!(
+            *uf_get("creationdate"),
+            JsonValue::Null,
+            "/UF creationdate must be null"
+        );
+        assert_eq!(
+            *uf_get("modificationdate"),
+            JsonValue::Null,
+            "/UF modificationdate must be null"
+        );
+    }
+
+    // ── parse_pdf_date unit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_pdf_date_utc_z() {
+        assert_eq!(
+            parse_pdf_date(b"D:20260101000000Z"),
+            Some("2026-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_pdf_date_plus_offset() {
+        assert_eq!(
+            parse_pdf_date(b"D:20260202120000+09'00'"),
+            Some("2026-02-02T12:00:00+09:00".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_pdf_date_no_tz() {
+        // No timezone → Z
+        assert_eq!(
+            parse_pdf_date(b"D:20260101000000"),
+            Some("2026-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_pdf_date_year_only() {
+        // Short date: only year
+        assert_eq!(
+            parse_pdf_date(b"D:2026"),
+            Some("2026-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_pdf_date_invalid_returns_none() {
+        assert_eq!(parse_pdf_date(b"not-a-date"), None);
+        assert_eq!(parse_pdf_date(b"D:"), None);
+        assert_eq!(parse_pdf_date(b""), None);
+    }
+
+    #[test]
+    fn checksum_to_hex_roundtrip() {
+        let bytes: Vec<u8> = (0u8..16).collect();
+        let hex = checksum_to_hex(&bytes);
+        assert_eq!(hex, "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(hex.len(), 32);
     }
 }
