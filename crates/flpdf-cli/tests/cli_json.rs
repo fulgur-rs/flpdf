@@ -167,7 +167,9 @@ fn json_key_invalid_exits_nonzero_with_error() {
         input.path().to_str().unwrap(),
     ])
     .assert()
-    .failure()
+    // The acceptance criteria require exit code 2 specifically (not just
+    // any nonzero) so a regression to code 1 is caught.
+    .code(2)
     .stderr(predicate::str::contains("--json-key"));
 }
 
@@ -187,7 +189,8 @@ fn json_object_invalid_exits_nonzero_with_error() {
         input.path().to_str().unwrap(),
     ])
     .assert()
-    .failure()
+    // Exit code 2 specifically (see sibling test rationale).
+    .code(2)
     .stderr(predicate::str::contains("--json-object"))
     .stderr(predicate::str::contains("xyz"));
 }
@@ -327,4 +330,54 @@ fn json_key_pages_does_not_write_side_files_for_filtered_streams() {
         !std::path::Path::new(&side_file).exists(),
         "no side file should be written when qpdf section is filtered out (got {side_file})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: JSON sub-flags require --json.
+//
+// CodeRabbit flagged that --json-output / --json-key / --json-object /
+// --json-stream-data / --json-stream-prefix could be passed without --json,
+// in which case the JSON branch never ran and the flags were silently
+// ignored. Each now has clap `requires = "json"`, so using one without
+// --json is a usage error (exit code 2).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_key_without_json_flag_is_usage_error() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--json-key", "pages", input.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--json"));
+}
+
+#[test]
+fn json_output_without_json_flag_is_usage_error() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let out_path = temp.path().join("out.json");
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json-output",
+        out_path.to_str().unwrap(),
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("--json"));
+}
+
+#[test]
+fn json_stream_data_without_json_flag_is_usage_error() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json-stream-data",
+        "inline",
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("--json"));
 }
