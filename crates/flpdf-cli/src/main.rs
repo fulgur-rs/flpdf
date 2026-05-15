@@ -1,6 +1,10 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::{
     check_reader_with_options, filters, fonts,
+    json_inspect::{
+        build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects, DecodeLevel,
+        JsonKey, JsonObjectSelector, StreamDataMode,
+    },
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
@@ -44,6 +48,65 @@ struct Cli {
     show_npages: bool,
     #[arg(long)]
     show_pages: bool,
+
+    // ── JSON inspection flags ─────────────────────────────────────────────
+    // These mirror qpdf's --json / --json-output / --json-key / --json-object
+    // / --json-stream-data / --json-stream-prefix flags.
+    /// Enable JSON v2 output mode.  Pass `--json` alone or `--json=2` (qpdf
+    /// compatible).  The value, when given, must be supplied as `--json=2`
+    /// (with the equals sign) to avoid ambiguity with the positional input
+    /// argument.
+    #[arg(long, num_args = 0..=1, default_missing_value = "2",
+          require_equals = true,
+          value_name = "VERSION", value_parser = ["2"],
+          help = "Generate JSON v2 output (qpdf --json compatible)")]
+    json: Option<String>,
+
+    /// Write JSON output to PATH instead of stdout.
+    #[arg(
+        long = "json-output",
+        value_name = "PATH",
+        help = "Write JSON to PATH instead of stdout"
+    )]
+    json_output: Option<PathBuf>,
+
+    /// Limit JSON output to the specified top-level key (repeatable).
+    /// Valid keys: acroform, attachments, encrypt, objectinfo, objects,
+    /// outlines, pagelabels, pages, qpdf.
+    #[arg(
+        long = "json-key",
+        value_name = "KEY",
+        help = "Restrict JSON output to this top-level key (repeatable)"
+    )]
+    json_key: Vec<String>,
+
+    /// Restrict JSON qpdf section to a single object (repeatable).
+    /// Format: `trailer`, `N`, or `N,G`.
+    #[arg(
+        long = "json-object",
+        value_name = "SELECTOR",
+        help = "Restrict JSON qpdf section to a single object: trailer, N, or N,G (repeatable)"
+    )]
+    json_object: Vec<String>,
+
+    /// How to include stream data in JSON output.
+    /// `none` (default) omits data; `inline` base64-encodes it; `file` writes
+    /// side files named `<prefix>-NNN`.
+    #[arg(
+        long = "json-stream-data",
+        value_name = "MODE",
+        help = "Stream data inclusion: none (default), inline, file"
+    )]
+    json_stream_data: Option<String>,
+
+    /// Prefix for side-file names when --json-stream-data=file.
+    /// Defaults to the --json-output path (if given) or \"stream\".
+    #[arg(
+        long = "json-stream-prefix",
+        value_name = "PREFIX",
+        help = "Prefix for side files with --json-stream-data=file"
+    )]
+    json_stream_prefix: Option<String>,
 
     // qpdf-style top-level write flags. When `--linearize` is set together
     // with INPUT and OUTPUT, behave as if `flpdf rewrite --linearize ...`
@@ -268,7 +331,9 @@ impl From<CliPasswordMode> for PasswordMode {
 fn main() {
     let args = Cli::parse();
 
-    let result = if let Some(command) = args.command {
+    let result = if args.json.is_some() {
+        run_json(&args)
+    } else if let Some(command) = args.command {
         run_command(command)
     } else if let Some(object_ref) = args.dump_object.as_deref() {
         run_dump_object(args.input, args.repair, &args.password, object_ref)
@@ -332,6 +397,113 @@ fn main() {
         eprintln!("flpdf: {error}");
         std::process::exit(2);
     }
+}
+
+fn run_json(cli: &Cli) -> CliResult<()> {
+    // 1. Validate --json-key values before doing any I/O.
+    let mut json_keys: Vec<JsonKey> = Vec::new();
+    for raw in &cli.json_key {
+        match JsonKey::from_str(raw.as_str()) {
+            Some(k) => json_keys.push(k),
+            None => {
+                let names = JsonKey::ALL_NAMES.join(",");
+                eprintln!("flpdf: --json-key must be given as --json-key={{{names}}}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // 2. Validate --json-object selectors before doing any I/O.
+    let mut json_objects: Vec<JsonObjectSelector> = Vec::new();
+    for raw in &cli.json_object {
+        match JsonObjectSelector::from_str(raw.as_str()) {
+            Some(s) => json_objects.push(s),
+            None => {
+                eprintln!(
+                    "flpdf: --json-object selector \"{raw}\" must be 'trailer', 'N', or 'N,G'"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // 3. Resolve stream-data mode.
+    let has_json_output = cli.json_output.is_some();
+    let stream_data_raw = cli.json_stream_data.as_deref().unwrap_or({
+        if has_json_output {
+            "inline"
+        } else {
+            "none"
+        }
+    });
+
+    let prefix_default = || -> String {
+        cli.json_stream_prefix
+            .clone()
+            .or_else(|| {
+                cli.json_output
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "stream".to_string())
+    };
+
+    let stream_mode = match stream_data_raw {
+        "none" => StreamDataMode::None,
+        "inline" => StreamDataMode::Inline,
+        "file" => StreamDataMode::File {
+            prefix: prefix_default(),
+        },
+        other => {
+            eprintln!("flpdf: --json-stream-data must be none, inline, or file; got: {other}");
+            std::process::exit(2);
+        }
+    };
+
+    // 4. Open PDF.
+    let input = cli.input.as_ref().ok_or("missing input file")?;
+    let mut pdf = open_pdf(input, cli.repair, &cli.password)?;
+
+    // 5. Build JSON.
+    let mut v2 = build_qpdf_json_v2_with_options(&mut pdf, DecodeLevel::Generalized, &stream_mode)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+
+    // 6. Apply --json-key filter.
+    if !json_keys.is_empty() {
+        v2 = filter_json_keys(v2, &json_keys);
+    }
+
+    // 7. Apply --json-object filter.
+    if !json_objects.is_empty() {
+        v2 = filter_json_objects(v2, &json_objects);
+    }
+
+    // 8. Write JSON to output destination.
+    if let Some(ref out_path) = cli.json_output {
+        let mut file = File::create(out_path)?;
+        flpdf::json::write(&v2, &mut file)?;
+    } else {
+        let stdout = std::io::stdout();
+        let mut locked = stdout.lock();
+        flpdf::json::write(&v2, &mut locked)?;
+        locked.flush()?;
+    }
+
+    // 9. Write side files for stream-data=file mode.
+    if let StreamDataMode::File { ref prefix } = stream_mode {
+        // Re-open PDF to iterate streams and write side files.
+        let mut pdf2 = open_pdf(input, cli.repair, &cli.password)?;
+        let all_refs = pdf2.live_object_refs();
+        for oref in all_refs {
+            let obj = pdf2.resolve(oref)?;
+            if let Object::Stream(stream) = obj {
+                let side_path = format!("{prefix}-{:03}", oref.number);
+                std::fs::write(&side_path, &stream.data)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn run_command(command: Commands) -> CliResult<()> {
