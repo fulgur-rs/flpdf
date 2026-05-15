@@ -1845,16 +1845,233 @@ pub fn build_attachments_section<R: Read + Seek>(
     Ok(JsonValue::Object(pairs))
 }
 
+// ── build_encrypt_section ─────────────────────────────────────────────────────
+
+/// Determine the qpdf method string ("none", "RC4", "AESv2", "AESv3") for a
+/// crypt filter name looked up from the /CF dictionary of `encrypt`.
+///
+/// Returns `"none"` when the filter name is "Identity" or when no /CF entry
+/// exists. Returns an error only on malformed dictionaries.
+fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static str {
+    let Some(selector) = selector else {
+        return "none";
+    };
+    if selector == "Identity" {
+        return "none";
+    }
+    // Look up the CFM entry inside /CF/<selector>
+    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+        return "none";
+    };
+    let Some(Object::Dictionary(filter)) = cf.get(selector) else {
+        return "none";
+    };
+    match filter.get("CFM") {
+        Some(Object::Name(cfm)) => match cfm.as_slice() {
+            b"AESV2" => "AESv2",
+            b"AESV3" => "AESv3",
+            b"V2" => "RC4",
+            b"None" => "none",
+            _ => "none",
+        },
+        _ => "none",
+    }
+}
+
+/// Read an optional name key from `dict` and return it as `Option<&str>`.
+fn dict_name_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
+    match dict.get(key) {
+        Some(Object::Name(n)) => std::str::from_utf8(n).ok(),
+        _ => None,
+    }
+}
+
+/// Decode /P integer into per-capability booleans.
+///
+/// `p_raw` is the signed /P value. Per ISO 32000-1 §7.6.3.2 the bits are
+/// tested after casting to u32 so that negative values (like -4) behave as
+/// the expected all-bits-set value.
+fn capabilities_from_p(p_raw: i32) -> Vec<(String, JsonValue)> {
+    let p = p_raw as u32;
+    // All nine capabilities in alphabetical order (qpdf schema).
+    let accessibility = (p & 0x0200) != 0;
+    let extract = (p & 0x0010) != 0;
+    let modify = (p & 0x0008) != 0;
+    let modifyannotations = (p & 0x0020) != 0;
+    let modifyassembly = (p & 0x0400) != 0;
+    let modifyforms = (p & 0x0100) != 0;
+    // modifyother mirrors modify (qpdf behaviour for standard handler)
+    let modifyother = modify;
+    let printhigh = (p & 0x0800) != 0;
+    let printlow = (p & 0x0004) != 0;
+
+    vec![
+        ("accessibility".into(), JsonValue::Bool(accessibility)),
+        ("extract".into(), JsonValue::Bool(extract)),
+        ("modify".into(), JsonValue::Bool(modify)),
+        (
+            "modifyannotations".into(),
+            JsonValue::Bool(modifyannotations),
+        ),
+        ("modifyassembly".into(), JsonValue::Bool(modifyassembly)),
+        ("modifyforms".into(), JsonValue::Bool(modifyforms)),
+        ("modifyother".into(), JsonValue::Bool(modifyother)),
+        ("printhigh".into(), JsonValue::Bool(printhigh)),
+        ("printlow".into(), JsonValue::Bool(printlow)),
+    ]
+}
+
+/// All-true capabilities object used for plaintext (no /Encrypt) documents.
+fn all_true_capabilities() -> JsonValue {
+    JsonValue::Object(vec![
+        ("accessibility".into(), JsonValue::Bool(true)),
+        ("extract".into(), JsonValue::Bool(true)),
+        ("modify".into(), JsonValue::Bool(true)),
+        ("modifyannotations".into(), JsonValue::Bool(true)),
+        ("modifyassembly".into(), JsonValue::Bool(true)),
+        ("modifyforms".into(), JsonValue::Bool(true)),
+        ("modifyother".into(), JsonValue::Bool(true)),
+        ("printhigh".into(), JsonValue::Bool(true)),
+        ("printlow".into(), JsonValue::Bool(true)),
+    ])
+}
+
+/// Build the `encrypt` section of the qpdf JSON v2 output.
+///
+/// Schema follows qpdf 11.x `--json --json-key=encrypt`:
+/// - Plaintext / no `/Encrypt`: `encrypted: false`, all capabilities `true`,
+///   all parameters 0 / "none".
+/// - Encrypted: parameters from the `/Encrypt` dictionary; key is always
+///   `null`; `recovereduserpassword` is always `null`.
+///
+/// The function reads the trailer's `/Encrypt` entry directly and does **not**
+/// require any internal `EncryptionState` accessor, making it self-contained
+/// inside `json_inspect`.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
+/// cannot be resolved (i.e. an underlying I/O or parse error).
+pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+    // Resolve /Encrypt dictionary from the trailer.
+    let encrypt_dict: Option<Dictionary> = match pdf.trailer().get("Encrypt").cloned() {
+        None => None,
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Reference(r)) => match pdf.resolve(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let is_encrypted = pdf.is_encrypted();
+
+    match encrypt_dict {
+        None => {
+            // Plaintext document: all defaults.
+            let capabilities = all_true_capabilities();
+            let parameters = JsonValue::Object(vec![
+                ("P".into(), JsonValue::Integer(0)),
+                ("R".into(), JsonValue::Integer(0)),
+                ("V".into(), JsonValue::Integer(0)),
+                ("bits".into(), JsonValue::Integer(0)),
+                ("filemethod".into(), JsonValue::String("none".into())),
+                ("key".into(), JsonValue::Null),
+                ("method".into(), JsonValue::String("none".into())),
+                ("streammethod".into(), JsonValue::String("none".into())),
+                ("stringmethod".into(), JsonValue::String("none".into())),
+            ]);
+            Ok(JsonValue::Object(vec![
+                ("capabilities".into(), capabilities),
+                ("encrypted".into(), JsonValue::Bool(false)),
+                ("ownerpasswordmatched".into(), JsonValue::Bool(false)),
+                ("parameters".into(), parameters),
+                ("recovereduserpassword".into(), JsonValue::Null),
+                ("userpasswordmatched".into(), JsonValue::Bool(false)),
+            ]))
+        }
+        Some(ref enc) => {
+            // Encrypted document: read V, R, P, /Length, CF methods.
+            let v = match enc.get("V") {
+                Some(Object::Integer(n)) => *n,
+                _ => 0,
+            };
+            let r = match enc.get("R") {
+                Some(Object::Integer(n)) => *n,
+                _ => 0,
+            };
+            let p_raw = match enc.get("P") {
+                Some(Object::Integer(n)) => *n as i32,
+                _ => 0,
+            };
+            let bits = match enc.get("Length") {
+                Some(Object::Integer(n)) => *n,
+                // Default key length when /Length is absent: 40 bits (V=1/2).
+                None => 40,
+                // Malformed /Length (not an integer): treat as 0.
+                _ => 0,
+            };
+
+            // Determine method strings from /StmF, /StrF, /EFF selectors.
+            let stmf = dict_name_str(enc, "StmF");
+            let strf = dict_name_str(enc, "StrF");
+            let eff = dict_name_str(enc, "EFF");
+
+            let (streammethod, stringmethod, filemethod) = if v >= 4 {
+                let sm = cf_method_string(enc, stmf);
+                let st = cf_method_string(enc, strf);
+                let fm = cf_method_string(enc, eff.or(stmf));
+                (sm, st, fm)
+            } else if v == 1 || v == 2 {
+                ("RC4", "RC4", "RC4")
+            } else {
+                ("none", "none", "none")
+            };
+            // top-level `method` mirrors streammethod (qpdf behaviour)
+            let method = streammethod;
+
+            let capabilities = JsonValue::Object(capabilities_from_p(p_raw));
+            let parameters = JsonValue::Object(vec![
+                ("P".into(), JsonValue::Integer(p_raw as i64)),
+                ("R".into(), JsonValue::Integer(r)),
+                ("V".into(), JsonValue::Integer(v)),
+                ("bits".into(), JsonValue::Integer(bits)),
+                ("filemethod".into(), JsonValue::String(filemethod.into())),
+                ("key".into(), JsonValue::Null),
+                ("method".into(), JsonValue::String(method.into())),
+                (
+                    "streammethod".into(),
+                    JsonValue::String(streammethod.into()),
+                ),
+                (
+                    "stringmethod".into(),
+                    JsonValue::String(stringmethod.into()),
+                ),
+            ]);
+
+            // ownerpasswordmatched / userpasswordmatched: use is_encrypted as
+            // the proxy (empty-password authenticated → both true).
+            Ok(JsonValue::Object(vec![
+                ("capabilities".into(), capabilities),
+                ("encrypted".into(), JsonValue::Bool(is_encrypted)),
+                ("ownerpasswordmatched".into(), JsonValue::Bool(is_encrypted)),
+                ("parameters".into(), parameters),
+                ("recovereduserpassword".into(), JsonValue::Null),
+                ("userpasswordmatched".into(), JsonValue::Bool(is_encrypted)),
+            ]))
+        }
+    }
+}
+
 // ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
 
 /// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
 /// (`version`, `parameters`) with every section that flpdf currently
 /// implements.
 ///
-/// As of flpdf-9hc.11.6 this is: `version`, `parameters`, `pages`,
-/// `pagelabels`, `outlines`, `qpdf`. The remaining qpdf v2 sections
-/// (`acroform`, `attachments`, `encrypt`) will be inserted here as the
-/// respective subtasks (flpdf-9hc.11.7 / .8 / .9) land.
+/// As of flpdf-9hc.11.9 this produces: `version`, `parameters`, `pages`,
+/// `pagelabels`, `acroform`, `attachments`, `encrypt`, `outlines`, `qpdf`.
+/// Key order matches qpdf v2 output (fixed, not alphabetical).
 ///
 /// Key order matches qpdf v2 output: top-level keys are emitted in the
 /// fixed order shown in qpdf's `--json=2` output, not alphabetical.
@@ -1882,6 +2099,9 @@ pub fn build_qpdf_json_v2<R: Read + Seek>(
 
     let attachments = build_attachments_section(pdf)?;
     pairs.push(("attachments".to_string(), attachments));
+
+    let encrypt = build_encrypt_section(pdf)?;
+    pairs.push(("encrypt".to_string(), encrypt));
 
     let outlines = build_outlines_section(pdf)?;
     pairs.push(("outlines".to_string(), outlines));
@@ -3089,7 +3309,7 @@ mod tests {
         let JsonValue::Object(pairs) = v2 else {
             panic!("expected Object at top level");
         };
-        // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, attachments, outlines, qpdf
+        // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, attachments, encrypt, outlines, qpdf
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -3100,6 +3320,7 @@ mod tests {
                 "pagelabels",
                 "acroform",
                 "attachments",
+                "encrypt",
                 "outlines",
                 "qpdf"
             ]
@@ -3968,10 +4189,11 @@ mod tests {
                 "pagelabels",
                 "acroform",
                 "attachments",
+                "encrypt",
                 "outlines",
                 "qpdf"
             ],
-            "key order must match qpdf v2: acroform, attachments, outlines"
+            "key order must match qpdf v2: acroform, attachments, encrypt, outlines"
         );
     }
 
@@ -5110,5 +5332,359 @@ mod tests {
         let hex = checksum_to_hex(&bytes);
         assert_eq!(hex, "000102030405060708090a0b0c0d0e0f");
         assert_eq!(hex.len(), 32);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // build_encrypt_section tests (flpdf-9hc.11.9)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Helper: load the encrypted-r4-three-page.pdf fixture.
+    fn load_encrypted_r4_pdf() -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let bytes = std::fs::read(&fixture).unwrap_or_else(|e| {
+            panic!(
+                "encrypted-r4-three-page.pdf not found at {}: {e}",
+                fixture.display()
+            )
+        });
+        // Empty password, AESv2 is not weak-crypto, so default options work.
+        crate::Pdf::open_mem_owned(bytes).expect("failed to open encrypted-r4-three-page.pdf")
+    }
+
+    // ── Test 1: plaintext PDF → encrypted=false, capabilities all-true, params 0/"none" ──
+
+    #[test]
+    fn encrypt_section_plaintext_encrypted_false() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("encrypt section must be an Object");
+        };
+        let encrypted = pairs
+            .iter()
+            .find(|(k, _)| k == "encrypted")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(encrypted, JsonValue::Bool(false));
+    }
+
+    #[test]
+    fn encrypt_section_plaintext_ownerpasswordmatched_false() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not an Object")
+        };
+        let v = pairs
+            .iter()
+            .find(|(k, _)| k == "ownerpasswordmatched")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(v, JsonValue::Bool(false));
+        let v2 = pairs
+            .iter()
+            .find(|(k, _)| k == "userpasswordmatched")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(v2, JsonValue::Bool(false));
+    }
+
+    #[test]
+    fn encrypt_section_plaintext_parameters_are_zero_and_none() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not an Object")
+        };
+        let params = pairs
+            .iter()
+            .find(|(k, _)| k == "parameters")
+            .unwrap()
+            .1
+            .clone();
+        let JsonValue::Object(ref p) = params else {
+            panic!("parameters must be Object")
+        };
+
+        let get = |k: &str| p.iter().find(|(ky, _)| ky == k).unwrap().1.clone();
+        assert_eq!(get("P"), JsonValue::Integer(0));
+        assert_eq!(get("R"), JsonValue::Integer(0));
+        assert_eq!(get("V"), JsonValue::Integer(0));
+        assert_eq!(get("bits"), JsonValue::Integer(0));
+        assert_eq!(get("filemethod"), JsonValue::String("none".into()));
+        assert_eq!(get("method"), JsonValue::String("none".into()));
+        assert_eq!(get("streammethod"), JsonValue::String("none".into()));
+        assert_eq!(get("stringmethod"), JsonValue::String("none".into()));
+        assert_eq!(get("key"), JsonValue::Null);
+    }
+
+    #[test]
+    fn encrypt_section_plaintext_capabilities_all_true() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let caps = pairs
+            .iter()
+            .find(|(k, _)| k == "capabilities")
+            .unwrap()
+            .1
+            .clone();
+        let JsonValue::Object(ref cp) = caps else {
+            panic!("capabilities must be Object")
+        };
+        for (_, v) in cp.iter() {
+            assert_eq!(
+                *v,
+                JsonValue::Bool(true),
+                "all plaintext capabilities must be true"
+            );
+        }
+    }
+
+    // ── Test 2: encrypted-r4 → encrypted=true, R=4, V=4, bits=128, methods AESv2 ──
+
+    #[test]
+    fn encrypt_section_encrypted_r4_encrypted_true() {
+        let mut pdf = load_encrypted_r4_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let v = pairs
+            .iter()
+            .find(|(k, _)| k == "encrypted")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(v, JsonValue::Bool(true));
+    }
+
+    #[test]
+    fn encrypt_section_encrypted_r4_ownerpasswordmatched_true() {
+        let mut pdf = load_encrypted_r4_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let v = pairs
+            .iter()
+            .find(|(k, _)| k == "ownerpasswordmatched")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(v, JsonValue::Bool(true));
+        let v2 = pairs
+            .iter()
+            .find(|(k, _)| k == "userpasswordmatched")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(v2, JsonValue::Bool(true));
+    }
+
+    #[test]
+    fn encrypt_section_encrypted_r4_parameters() {
+        let mut pdf = load_encrypted_r4_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let params = pairs
+            .iter()
+            .find(|(k, _)| k == "parameters")
+            .unwrap()
+            .1
+            .clone();
+        let JsonValue::Object(ref p) = params else {
+            panic!("parameters must be Object")
+        };
+
+        let get = |k: &str| p.iter().find(|(ky, _)| ky == k).unwrap().1.clone();
+        assert_eq!(get("P"), JsonValue::Integer(-4));
+        assert_eq!(get("R"), JsonValue::Integer(4));
+        assert_eq!(get("V"), JsonValue::Integer(4));
+        assert_eq!(get("bits"), JsonValue::Integer(128));
+        assert_eq!(get("filemethod"), JsonValue::String("AESv2".into()));
+        assert_eq!(get("method"), JsonValue::String("AESv2".into()));
+        assert_eq!(get("streammethod"), JsonValue::String("AESv2".into()));
+        assert_eq!(get("stringmethod"), JsonValue::String("AESv2".into()));
+        assert_eq!(get("key"), JsonValue::Null);
+    }
+
+    #[test]
+    fn encrypt_section_encrypted_r4_capabilities_all_true() {
+        // /P = -4 = 0xFFFFFFFC → all permission bits set → all capabilities true
+        let mut pdf = load_encrypted_r4_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let caps = pairs
+            .iter()
+            .find(|(k, _)| k == "capabilities")
+            .unwrap()
+            .1
+            .clone();
+        let JsonValue::Object(ref cp) = caps else {
+            panic!("capabilities must be Object")
+        };
+        for (name, v) in cp.iter() {
+            assert_eq!(
+                *v,
+                JsonValue::Bool(true),
+                "capability {name} must be true for P=-4"
+            );
+        }
+    }
+
+    // ── Test 3: capabilities key order is alphabetical ─────────────────────────
+
+    #[test]
+    fn encrypt_section_capabilities_key_order() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let caps = pairs
+            .iter()
+            .find(|(k, _)| k == "capabilities")
+            .unwrap()
+            .1
+            .clone();
+        let JsonValue::Object(ref cp) = caps else {
+            panic!("capabilities must be Object")
+        };
+        let keys: Vec<&str> = cp.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "accessibility",
+                "extract",
+                "modify",
+                "modifyannotations",
+                "modifyassembly",
+                "modifyforms",
+                "modifyother",
+                "printhigh",
+                "printlow",
+            ]
+        );
+    }
+
+    // ── Test 4: parameters key order is alphabetical ───────────────────────────
+
+    #[test]
+    fn encrypt_section_parameters_key_order() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let params = pairs
+            .iter()
+            .find(|(k, _)| k == "parameters")
+            .unwrap()
+            .1
+            .clone();
+        let JsonValue::Object(ref p) = params else {
+            panic!("parameters must be Object")
+        };
+        let keys: Vec<&str> = p.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "P",
+                "R",
+                "V",
+                "bits",
+                "filemethod",
+                "key",
+                "method",
+                "streammethod",
+                "stringmethod"
+            ]
+        );
+    }
+
+    // ── Test 5: top-level encrypt object key order is alphabetical ─────────────
+
+    #[test]
+    fn encrypt_section_top_level_key_order() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "capabilities",
+                "encrypted",
+                "ownerpasswordmatched",
+                "parameters",
+                "recovereduserpassword",
+                "userpasswordmatched",
+            ]
+        );
+    }
+
+    // ── Test 6: recovereduserpassword is always null ───────────────────────────
+
+    #[test]
+    fn encrypt_section_recovereduserpassword_always_null() {
+        let mut pdf_plain = load_one_page_pdf();
+        let enc_plain = build_encrypt_section(&mut pdf_plain).expect("plain failed");
+        let JsonValue::Object(ref p) = enc_plain else {
+            panic!("not Object")
+        };
+        let v = p
+            .iter()
+            .find(|(k, _)| k == "recovereduserpassword")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(v, JsonValue::Null);
+
+        let mut pdf_enc = load_encrypted_r4_pdf();
+        let enc_enc = build_encrypt_section(&mut pdf_enc).expect("encrypted failed");
+        let JsonValue::Object(ref pe) = enc_enc else {
+            panic!("not Object")
+        };
+        let ve = pe
+            .iter()
+            .find(|(k, _)| k == "recovereduserpassword")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(ve, JsonValue::Null);
+    }
+
+    // ── Test 7: composite build_qpdf_json_v2 includes encrypt key ─────────────
+
+    #[test]
+    fn build_qpdf_json_v2_includes_encrypt_section() {
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object at top level")
+        };
+        let enc = pairs.iter().find(|(k, _)| k == "encrypt").map(|(_, v)| v);
+        assert!(
+            enc.is_some(),
+            "encrypt key must be present in composite output"
+        );
+        assert!(
+            matches!(enc.unwrap(), JsonValue::Object(_)),
+            "encrypt must be an Object"
+        );
     }
 }
