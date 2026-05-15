@@ -825,10 +825,12 @@ fn outline_entry_to_json<R: Read + Seek>(
 
     let object_str = format!("{} {} R", item_ref.number, item_ref.generation);
 
-    // action: /A — only emit ref string when /A is an indirect Reference.
+    // action: /A — any value (direct action dictionary, /URI, /GoTo, or an
+    // indirect reference) is converted through pdf_object_to_json so direct
+    // action dicts are preserved alongside Reference shapes.
     let action = match item_dict.get("A") {
-        Some(Object::Reference(r)) => JsonValue::String(format!("{} {} R", r.number, r.generation)),
-        _ => JsonValue::Null,
+        Some(v) => pdf_object_to_json(v)?,
+        None => JsonValue::Null,
     };
 
     // count: /Count integer.
@@ -2637,5 +2639,114 @@ mod tests {
         let title = entry.iter().find(|(k, _)| k == "title").unwrap().1.clone();
         // Must be bare "AB" — no "u:" prefix.
         assert_eq!(title, JsonValue::String("AB".to_string()));
+    }
+
+    // ── Test 8: Direct /A action dictionary is preserved (not dropped) ────────
+    //
+    // Regression for CodeRabbit's review: previously the `/A` field was only
+    // emitted when it was an indirect Reference; direct action dictionaries
+    // (e.g. `/A << /S /URI /URI (https://example.com) >>`) silently became
+    // null. The serializer must now run any /A value through
+    // pdf_object_to_json so direct actions, references, and other shapes all
+    // survive.
+
+    #[test]
+    fn outlines_direct_action_dictionary_is_preserved() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(item_ref));
+        outline_root.insert("Last", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        // /A is a direct URI action dictionary — must survive serialization.
+        let mut action = Dictionary::new();
+        action.insert("S", Object::Name(b"URI".to_vec()));
+        action.insert("URI", Object::String(b"https://example.com".to_vec()));
+
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Visit example".to_vec()));
+        item.insert("Parent", Object::Reference(outline_root_ref));
+        item.insert("A", Object::Dictionary(action));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = &result else {
+            panic!("expected Array");
+        };
+        let JsonValue::Object(entry) = &entries[0] else {
+            panic!("entry is not an Object");
+        };
+        let action_value = entry
+            .iter()
+            .find(|(k, _)| k == "action")
+            .map(|(_, v)| v)
+            .expect("action key missing");
+
+        let JsonValue::Object(action_pairs) = action_value else {
+            panic!(
+                "expected the direct /A dictionary to be preserved as an Object, got {:?}",
+                action_value
+            );
+        };
+        // /S /URI -> "/URI" Name string under key "/S"; URI text becomes "u:..."
+        let s_value = action_pairs
+            .iter()
+            .find(|(k, _)| k == "/S")
+            .map(|(_, v)| v)
+            .expect("/S key missing");
+        assert_eq!(s_value, &JsonValue::String("/URI".to_string()));
+        let uri_value = action_pairs
+            .iter()
+            .find(|(k, _)| k == "/URI")
+            .map(|(_, v)| v)
+            .expect("/URI key missing");
+        assert_eq!(
+            uri_value,
+            &JsonValue::String("u:https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn outlines_indirect_action_reference_still_emits_ref_string() {
+        // Verify the Reference path still works after the refactor.
+        let mut pdf = load_one_page_pdf();
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+        let action_ref = crate::ObjectRef::new(102, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(item_ref));
+        outline_root.insert("Last", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        let mut action = Dictionary::new();
+        action.insert("S", Object::Name(b"GoTo".to_vec()));
+        pdf.set_object(action_ref, Object::Dictionary(action));
+
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Go".to_vec()));
+        item.insert("Parent", Object::Reference(outline_root_ref));
+        item.insert("A", Object::Reference(action_ref));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = result else {
+            panic!("expected Array");
+        };
+        let JsonValue::Object(entry) = &entries[0] else {
+            panic!("entry is not an Object");
+        };
+        let action_value = entry
+            .iter()
+            .find(|(k, _)| k == "action")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(action_value, JsonValue::String("102 0 R".to_string()));
     }
 }
