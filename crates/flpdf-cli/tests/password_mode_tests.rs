@@ -110,5 +110,7 @@ fn auto_mode_is_regression_free_for_legacy_ascii_password() {
         .arg(fixture("v2-rc4-128-r3.pdf"))
         .arg("--password=user-v2")
         .arg("--allow-weak-crypto");
-    cmd.assert().success();
+    // RC4 (weak crypto) triggers a warning → exit 3 (qpdf-compatible:
+    // warnings found, no errors).
+    cmd.assert().code(3);
 }

@@ -18,6 +18,70 @@ use std::path::PathBuf;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+// ---------------------------------------------------------------------------
+// qpdf-compatible exit-code infrastructure (flpdf-9hc.23.2)
+//
+// Source: qpdf manual §"Exit Status"
+//   https://qpdf.readthedocs.io/en/stable/cli.html#exit-status
+// Confirmed by qpdf C header (qpdf/include/qpdf/Constants.h):
+//   qpdf_exit_success  = 0   (no errors or warnings)
+//   qpdf_exit_error    = 2   (errors found)
+//   qpdf_exit_warning  = 3   (warnings found, no errors)
+//
+// Note: exit code 1 is intentionally unused by qpdf (shells use it for
+// command-not-found); flpdf follows the same convention.
+//
+// Future subtasks (e.g. flpdf-9hc.3.17) should express their own
+// exit-code semantics by constructing a `CliExitError` with the appropriate
+// `ExitCode` variant — the enum is generic enough for `--is-encrypted` (0/2)
+// and `--requires-password` (0/2/3) once those subcommands are added.
+// ---------------------------------------------------------------------------
+
+/// qpdf-compatible CLI exit codes.
+///
+/// Matches `qpdf_exit_code_e` from `qpdf/include/qpdf/Constants.h`:
+/// - `Ok` = 0: success, no errors or warnings
+/// - `Errors` = 2: errors detected (file invalid / unprocessable)
+/// - `Warnings` = 3: warnings found but no errors (recoverable issues)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCode {
+    /// 0 — no errors or warnings detected.
+    Ok = 0,
+    /// 2 — errors found; file could not be fully processed.
+    Errors = 2,
+    /// 3 — warnings found (recoverable issues) but no hard errors.
+    Warnings = 3,
+}
+
+impl ExitCode {
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+/// An error type that carries an explicit [`ExitCode`] so that `main()` can
+/// use that code rather than defaulting to 2.
+///
+/// Use this (instead of a plain string error) whenever a CLI path needs to
+/// communicate a specific exit code to the shell (e.g. `--check` warning-only
+/// result → 3).  All other `CliResult::Err` values fall back to exit 2 via
+/// the existing generic handler in `main()`.
+#[derive(Debug)]
+pub struct CliExitError {
+    /// The exit code to pass to `std::process::exit`.
+    pub code: ExitCode,
+    /// Human-readable message printed to stderr.
+    pub message: String,
+}
+
+impl std::fmt::Display for CliExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CliExitError {}
+
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
@@ -432,6 +496,18 @@ fn main() {
     };
 
     if let Err(error) = result {
+        // If the error carries an explicit exit code (e.g. from run_check),
+        // honour it.  Unknown/generic errors fall back to exit 2 (qpdf
+        // convention for "error", unchanged from before this change).
+        if let Some(exit_err) = error.downcast_ref::<CliExitError>() {
+            // Only print a message when there is one; the caller may have
+            // already printed its own summary (e.g. run_check prints
+            // "PDF check succeeded" before returning exit 3 for warnings).
+            if !exit_err.message.is_empty() {
+                eprintln!("flpdf: {}", exit_err.message);
+            }
+            std::process::exit(exit_err.code.as_i32());
+        }
         eprintln!("flpdf: {error}");
         std::process::exit(2);
     }
@@ -684,12 +760,42 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         };
         eprintln!("{label}: {}", diagnostic.message);
     }
-    if report.valid {
-        println!("PDF check succeeded");
-        Ok(())
-    } else {
-        Err("PDF check failed".into())
+
+    // Map the check result to qpdf-compatible exit codes:
+    //   0 — no errors, no warnings (clean)
+    //   2 — errors found (invalid / unprocessable)
+    //   3 — warnings only, no errors (recoverable issues)
+    //
+    // Source: https://qpdf.readthedocs.io/en/stable/cli.html#exit-status
+    //         qpdf/include/qpdf/Constants.h: qpdf_exit_error=2, qpdf_exit_warning=3
+    let has_warnings = report
+        .diagnostics
+        .entries()
+        .iter()
+        .any(|d| d.severity == Severity::Warning);
+
+    if !report.valid {
+        // Errors found — exit 2.
+        return Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: "PDF check failed".to_string(),
+        }));
     }
+
+    if has_warnings {
+        // Warnings without errors — exit 3.  The success message has already
+        // been printed above; pass an empty message so main() does not emit
+        // a redundant "flpdf: ..." line.
+        println!("PDF check succeeded");
+        return Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        }));
+    }
+
+    // Clean — exit 0.
+    println!("PDF check succeeded");
+    Ok(())
 }
 
 fn run_rewrite(

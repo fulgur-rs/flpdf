@@ -888,7 +888,9 @@ pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
     let pi_id = Object::String(QPDF_STATIC_ID.to_vec());
     let first_id = match trailer.get("ID") {
         Some(Object::Array(values))
-            if values.len() == 2 && matches!(values[0], Object::String(_)) =>
+            if values.len() == 2
+                && matches!(values[0], Object::String(_))
+                && matches!(values[1], Object::String(_)) =>
         {
             values[0].clone()
         }
@@ -1412,4 +1414,68 @@ fn reencode_stream_flate(stream: &crate::Stream) -> Object {
         Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
     );
     Object::Stream(crate::Stream::new(new_dict, encoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id_array(d: &Dictionary) -> Vec<Object> {
+        match d.get("ID") {
+            Some(Object::Array(v)) => v.clone(),
+            other => panic!("expected /ID array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_static_id_preserves_first_when_both_elements_are_strings() {
+        let mut t = Dictionary::new();
+        t.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(b"permanent".to_vec()),
+                Object::String(b"changing".to_vec()),
+            ]),
+        );
+        apply_static_id(&mut t);
+        let v = id_array(&t);
+        assert_eq!(
+            v[0],
+            Object::String(b"permanent".to_vec()),
+            "element 1 must be preserved when /ID is a 2-string array"
+        );
+        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
+    }
+
+    #[test]
+    fn apply_static_id_falls_back_when_second_element_is_not_a_string() {
+        // `/ID [<valid> 123]` — arity 2 but element 2 is not a string.
+        // Both elements must fall back to the constant (qpdf parity); the
+        // old guard checked only element 1 and wrongly kept it.
+        let mut t = Dictionary::new();
+        t.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(b"permanent".to_vec()),
+                Object::Integer(123),
+            ]),
+        );
+        apply_static_id(&mut t);
+        let v = id_array(&t);
+        assert_eq!(
+            v[0],
+            Object::String(QPDF_STATIC_ID.to_vec()),
+            "malformed second element must force element 1 to the constant"
+        );
+        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
+    }
+
+    #[test]
+    fn apply_static_id_falls_back_when_id_is_missing() {
+        let mut t = Dictionary::new();
+        apply_static_id(&mut t);
+        let v = id_array(&t);
+        assert_eq!(v[0], Object::String(QPDF_STATIC_ID.to_vec()));
+        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
+    }
 }

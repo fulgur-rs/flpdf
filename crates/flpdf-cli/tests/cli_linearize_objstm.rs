@@ -169,32 +169,31 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
         "expected >=1 ObjStm container in linearized+generate output, found {n_objstm}"
     );
 
-    // Part placement: every ObjStm container that holds shared/catalog
-    // (Part-3) members must be emitted before /E; rest-of-doc containers
-    // after /E.  We assert the structural guarantee that at least one
-    // container exists strictly before /E OR after it, and that /E is a
-    // valid in-file boundary (containers never straddle it).
+    // Part placement: in Generate mode Part-3 (first-page shared/catalog)
+    // ObjStm packing is structurally disabled (see
+    // `LinearizationPlan::objstm_batches` / `objstm_batches_generate`), so
+    // every ObjStm container produced here is a Part-4 *rest-of-doc*
+    // container and must be emitted strictly *after* the /E boundary.  A
+    // placement regression that moved a container before /E (or that
+    // accidentally enabled Part-3 packing without updating this test) must
+    // fail here; `> e_off` for *every* marker is the real invariant, not the
+    // previous tautology (`all(p != e_off)` already implies each marker is
+    // on one side, so `any(<) || any(>)` could never fail).
     let e_off = parse_e_offset(&bytes) as usize;
     assert!(
         e_off < bytes.len(),
         "/E ({e_off}) must be a valid in-file offset"
     );
-    // Actually verify ObjStm container placement relative to /E (not just that
-    // /E is in range): markers must exist and each must be locatable on a
-    // definite side of the /E boundary (a placement regression that moved a
-    // container across /E or dropped it would now fail this).
     let marker_pos = objstm_marker_positions(&bytes);
     assert!(
         !marker_pos.is_empty(),
         "linearized+generate output must contain at least one ObjStm marker"
     );
     assert!(
-        marker_pos.iter().all(|&p| p != e_off),
-        "no ObjStm container dict may begin exactly at the /E boundary"
-    );
-    assert!(
-        marker_pos.iter().any(|&p| p < e_off) || marker_pos.iter().any(|&p| p > e_off),
-        "ObjStm containers must be locatable relative to the /E boundary"
+        marker_pos.iter().all(|&p| p > e_off),
+        "every ObjStm container must be emitted after /E ({e_off}) while \
+         Part-3 packing is disabled (Part-4 rest-of-doc only); got marker \
+         offsets {marker_pos:?}"
     );
 
     // Structural sanity via flpdf's own checker (back_patch + xref
