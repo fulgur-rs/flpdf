@@ -253,3 +253,78 @@ fn json_stream_data_file_creates_side_files() {
         "expected side file {side_file} to exist"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: --json-output alone must NOT default stream-data to inline.
+//
+// CodeRabbit flagged that defaulting to "inline" when --json-output is set
+// exposes stream content based on an unrelated flag and contradicts the
+// help text ("none (default)"). The CLI now only emits stream payloads
+// when --json-stream-data is set explicitly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_output_without_stream_data_flag_does_not_emit_stream_payload() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let out_path = temp.path().join("out.json");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "--json-output",
+        out_path.to_str().unwrap(),
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let content = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        !content.contains("\"data\""),
+        "default stream-data is 'none'; --json-output alone must not inline stream bytes (got data field)"
+    );
+    assert!(
+        !content.contains("\"datafile\""),
+        "default stream-data is 'none'; --json-output alone must not produce datafile entries"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: --json-key=pages + --json-stream-data=file must NOT write
+// side files for streams whose qpdf entry was filtered out.
+//
+// CodeRabbit flagged that side files were being written for every stream
+// regardless of --json-key / --json-object scoping, which both spams the
+// filesystem and exposes stream content the JSON output doesn't reference.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_key_pages_does_not_write_side_files_for_filtered_streams() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("sf").to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "--json-key",
+        "pages",
+        "--json-stream-data",
+        "file",
+        "--json-stream-prefix",
+        &prefix,
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    // --json-key=pages filters out the qpdf section entirely, so there
+    // should be no datafile references in the final JSON and therefore no
+    // side files should be written.
+    let side_file = format!("{prefix}-004");
+    assert!(
+        !std::path::Path::new(&side_file).exists(),
+        "no side file should be written when qpdf section is filtered out (got {side_file})"
+    );
+}
