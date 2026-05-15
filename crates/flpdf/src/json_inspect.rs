@@ -2319,6 +2319,144 @@ pub fn filter_json_keys(v2: JsonValue, keys: &[JsonKey]) -> JsonValue {
     JsonValue::Object(out)
 }
 
+// ── JsonObjectSelector / filter_json_objects ──────────────────────────────────
+
+/// A `--json-object` selector. Either a specific (obj_num, generation) or
+/// the special `trailer` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JsonObjectSelector {
+    /// A specific indirect object identified by (number, generation).
+    Object { number: u32, generation: u16 },
+    /// The trailer dictionary entry in the objects map.
+    Trailer,
+}
+
+impl JsonObjectSelector {
+    /// Parse a qpdf-style selector string: `"trailer"`, `"3"`, `"3,0"`.
+    ///
+    /// Returns `None` if the syntax is malformed (caller maps to the
+    /// actionable error required by the acceptance criteria).
+    ///
+    /// Rules:
+    /// - `"trailer"` → `Trailer` (exact lowercase match only)
+    /// - `"N"` → `Object { number: N, generation: 0 }`
+    /// - `"N,G"` → `Object { number: N, generation: G }`
+    /// - More than 2 comma-separated parts, empty string, non-numeric
+    ///   parts, negative numbers, or integer overflow → `None`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        if s == "trailer" {
+            return Some(JsonObjectSelector::Trailer);
+        }
+        if s.is_empty() {
+            return None;
+        }
+        let parts: Vec<&str> = s.splitn(3, ',').collect();
+        if parts.len() > 2 {
+            return None;
+        }
+        // Reject leading '+' or any non-digit characters to match qpdf's strict parsing.
+        let num_str = parts[0];
+        if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let number: u32 = num_str.parse().ok()?;
+
+        let generation: u16 = if parts.len() == 2 {
+            let gen_str = parts[1];
+            if gen_str.is_empty() || !gen_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            gen_str.parse().ok()?
+        } else {
+            0
+        };
+
+        Some(JsonObjectSelector::Object { number, generation })
+    }
+}
+
+/// Filter the `qpdf` top-level key's objects map to only the requested
+/// selectors. `version`, `parameters`, and every other top-level section
+/// (pages, pagelabels, etc.) are preserved untouched. The metadata
+/// (`qpdf[0]`) is also preserved.
+///
+/// When `selectors` is empty, the input is returned unchanged.
+///
+/// Selectors that match no object in the input are silently dropped (the
+/// resulting `qpdf[1]` is simply missing them), matching qpdf's behavior.
+pub fn filter_json_objects(v2: JsonValue, selectors: &[JsonObjectSelector]) -> JsonValue {
+    // No filter — return unchanged.
+    if selectors.is_empty() {
+        return v2;
+    }
+
+    // Build a HashSet of wanted object-map keys (deduped automatically).
+    let mut wanted: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(selectors.len());
+    for sel in selectors {
+        match sel {
+            JsonObjectSelector::Object { number, generation } => {
+                wanted.insert(format!("obj:{number} {generation} R"));
+            }
+            JsonObjectSelector::Trailer => {
+                wanted.insert("trailer".to_string());
+            }
+        }
+    }
+
+    // Pattern-match the top-level Object; return as-is for any other variant.
+    let mut pairs = match v2 {
+        JsonValue::Object(p) => p,
+        other => return other,
+    };
+
+    // Find the "qpdf" entry index; if absent return unchanged.
+    let qpdf_idx = match pairs.iter().position(|(k, _)| k == "qpdf") {
+        Some(i) => i,
+        None => return JsonValue::Object(pairs),
+    };
+
+    // Extract the qpdf value and validate it is Array([metadata, objects_map]).
+    let qpdf_val = std::mem::replace(
+        &mut pairs[qpdf_idx].1,
+        JsonValue::Null, // temporary placeholder
+    );
+
+    let mut arr = match qpdf_val {
+        JsonValue::Array(a) if a.len() == 2 => a,
+        other => {
+            // Restore and return unchanged.
+            pairs[qpdf_idx].1 = other;
+            return JsonValue::Object(pairs);
+        }
+    };
+
+    // arr[0] = metadata (preserve as-is), arr[1] = objects_map (filter).
+    let objects_map = std::mem::replace(&mut arr[1], JsonValue::Null);
+
+    let filtered_map = match objects_map {
+        JsonValue::Object(obj_pairs) => {
+            // Keep only pairs whose key is in `wanted`, preserving original order.
+            let kept: Vec<(String, JsonValue)> = obj_pairs
+                .into_iter()
+                .filter(|(k, _)| wanted.contains(k))
+                .collect();
+            JsonValue::Object(kept)
+        }
+        other => {
+            // Not an Object — restore and return unchanged.
+            arr[1] = other;
+            pairs[qpdf_idx].1 = JsonValue::Array(arr);
+            return JsonValue::Object(pairs);
+        }
+    };
+
+    arr[1] = filtered_map;
+    pairs[qpdf_idx].1 = JsonValue::Array(arr);
+    JsonValue::Object(pairs)
+}
+
 // ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
 
 /// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
@@ -6491,6 +6629,280 @@ mod tests {
         let v = JsonValue::Integer(42);
         let result = filter_json_keys(v, &[JsonKey::Pages]);
         assert_eq!(result, JsonValue::Integer(42));
+    }
+
+    // ── JsonObjectSelector::from_str ──────────────────────────────────────────
+
+    #[test]
+    fn json_object_selector_from_str_trailer() {
+        assert_eq!(
+            JsonObjectSelector::from_str("trailer"),
+            Some(JsonObjectSelector::Trailer)
+        );
+    }
+
+    #[test]
+    fn json_object_selector_from_str_num_only() {
+        assert_eq!(
+            JsonObjectSelector::from_str("3"),
+            Some(JsonObjectSelector::Object {
+                number: 3,
+                generation: 0
+            })
+        );
+    }
+
+    #[test]
+    fn json_object_selector_from_str_num_gen_zero() {
+        assert_eq!(
+            JsonObjectSelector::from_str("3,0"),
+            Some(JsonObjectSelector::Object {
+                number: 3,
+                generation: 0
+            })
+        );
+    }
+
+    #[test]
+    fn json_object_selector_from_str_num_gen_nonzero() {
+        assert_eq!(
+            JsonObjectSelector::from_str("3,5"),
+            Some(JsonObjectSelector::Object {
+                number: 3,
+                generation: 5
+            })
+        );
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_three_parts() {
+        assert_eq!(JsonObjectSelector::from_str("3,5,6"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_non_numeric() {
+        assert_eq!(JsonObjectSelector::from_str("abc"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_alpha_suffix() {
+        assert_eq!(JsonObjectSelector::from_str("3a"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_empty() {
+        assert_eq!(JsonObjectSelector::from_str(""), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_negative() {
+        assert_eq!(JsonObjectSelector::from_str("-3"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_overflow_u32() {
+        assert_eq!(JsonObjectSelector::from_str("999999999999"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_gen_non_numeric() {
+        assert_eq!(JsonObjectSelector::from_str("3,a"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_invalid_gen_overflow_u16() {
+        // 65536 overflows u16::MAX (65535)
+        assert_eq!(JsonObjectSelector::from_str("3,65536"), None);
+    }
+
+    #[test]
+    fn json_object_selector_from_str_uppercase_trailer_rejected() {
+        // qpdf uses lowercase only
+        assert_eq!(JsonObjectSelector::from_str("Trailer"), None);
+        assert_eq!(JsonObjectSelector::from_str("TRAILER"), None);
+    }
+
+    // ── Helper: build a minimal qpdf-array-shaped JsonValue for object filter tests
+
+    fn make_qpdf_doc_with_objects() -> JsonValue {
+        // Simulate a v2 doc with qpdf: [metadata, {obj:3 0 R, obj:5 0 R, trailer}]
+        let metadata = JsonValue::Object(vec![
+            ("jsonversion".to_string(), JsonValue::Integer(2)),
+            (
+                "pdfversion".to_string(),
+                JsonValue::String("1.4".to_string()),
+            ),
+            (
+                "pushedinheritedpageresources".to_string(),
+                JsonValue::Bool(false),
+            ),
+            ("calledgetallpages".to_string(), JsonValue::Bool(true)),
+            ("maxobjectid".to_string(), JsonValue::Integer(5)),
+        ]);
+        let objects_map = JsonValue::Object(vec![
+            (
+                "obj:3 0 R".to_string(),
+                JsonValue::Object(vec![("value".to_string(), JsonValue::Integer(42))]),
+            ),
+            (
+                "obj:5 0 R".to_string(),
+                JsonValue::Object(vec![("value".to_string(), JsonValue::Integer(99))]),
+            ),
+            (
+                "trailer".to_string(),
+                JsonValue::Object(vec![("value".to_string(), JsonValue::Object(vec![]))]),
+            ),
+        ]);
+        JsonValue::Object(vec![
+            ("version".to_string(), JsonValue::Integer(2)),
+            (
+                "parameters".to_string(),
+                JsonValue::Object(vec![(
+                    "decodelevel".to_string(),
+                    JsonValue::String("generalized".to_string()),
+                )]),
+            ),
+            ("pages".to_string(), JsonValue::Array(vec![])),
+            (
+                "qpdf".to_string(),
+                JsonValue::Array(vec![metadata, objects_map]),
+            ),
+        ])
+    }
+
+    fn qpdf_objects_keys(v: &JsonValue) -> Vec<&str> {
+        match v {
+            JsonValue::Object(pairs) => {
+                // find the "qpdf" key
+                let qpdf_arr = pairs.iter().find(|(k, _)| k == "qpdf").map(|(_, v)| v);
+                match qpdf_arr {
+                    Some(JsonValue::Array(arr)) if arr.len() == 2 => match &arr[1] {
+                        JsonValue::Object(obj_pairs) => {
+                            obj_pairs.iter().map(|(k, _)| k.as_str()).collect()
+                        }
+                        _ => vec![],
+                    },
+                    _ => vec![],
+                }
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+
+    // ── filter_json_objects: empty selectors → input unchanged ────────────────
+
+    #[test]
+    fn filter_json_objects_empty_selectors_unchanged() {
+        let doc = make_qpdf_doc_with_objects();
+        let filtered = filter_json_objects(doc.clone(), &[]);
+        // Full equality: every key including pages must be present.
+        assert_eq!(key_names(&filtered), key_names(&doc));
+        assert_eq!(
+            qpdf_objects_keys(&filtered),
+            vec!["obj:3 0 R", "obj:5 0 R", "trailer"]
+        );
+    }
+
+    // ── filter_json_objects: Object{3,0} → only obj:3 0 R in qpdf[1] ─────────
+
+    #[test]
+    fn filter_json_objects_single_object() {
+        let doc = make_qpdf_doc_with_objects();
+        let sel = JsonObjectSelector::Object {
+            number: 3,
+            generation: 0,
+        };
+        let filtered = filter_json_objects(doc, &[sel]);
+        assert_eq!(qpdf_objects_keys(&filtered), vec!["obj:3 0 R"]);
+        // pages and other top-level keys preserved
+        assert!(key_names(&filtered).contains(&"pages"));
+    }
+
+    // ── filter_json_objects: Trailer → only trailer in qpdf[1] ───────────────
+
+    #[test]
+    fn filter_json_objects_trailer_only() {
+        let doc = make_qpdf_doc_with_objects();
+        let filtered = filter_json_objects(doc, &[JsonObjectSelector::Trailer]);
+        assert_eq!(qpdf_objects_keys(&filtered), vec!["trailer"]);
+    }
+
+    // ── filter_json_objects: [Object{3,0}, Trailer] → both present ────────────
+
+    #[test]
+    fn filter_json_objects_object_and_trailer() {
+        let doc = make_qpdf_doc_with_objects();
+        let sels = vec![
+            JsonObjectSelector::Object {
+                number: 3,
+                generation: 0,
+            },
+            JsonObjectSelector::Trailer,
+        ];
+        let filtered = filter_json_objects(doc, &sels);
+        assert_eq!(qpdf_objects_keys(&filtered), vec!["obj:3 0 R", "trailer"]);
+    }
+
+    // ── filter_json_objects: non-existent object → qpdf[1] is empty Object ───
+
+    #[test]
+    fn filter_json_objects_missing_object_empty_result() {
+        let doc = make_qpdf_doc_with_objects();
+        let sel = JsonObjectSelector::Object {
+            number: 999,
+            generation: 0,
+        };
+        let filtered = filter_json_objects(doc, &[sel]);
+        assert_eq!(qpdf_objects_keys(&filtered), Vec::<&str>::new());
+    }
+
+    // ── filter_json_objects: duplicate selectors → dedupe ────────────────────
+
+    #[test]
+    fn filter_json_objects_duplicate_selectors_dedupe() {
+        let doc = make_qpdf_doc_with_objects();
+        let sel = JsonObjectSelector::Object {
+            number: 3,
+            generation: 0,
+        };
+        let filtered = filter_json_objects(doc, &[sel, sel]);
+        // dedupe: obj:3 0 R appears exactly once
+        assert_eq!(qpdf_objects_keys(&filtered), vec!["obj:3 0 R"]);
+    }
+
+    // ── filter_json_objects: no "qpdf" key → input returned unchanged ─────────
+
+    #[test]
+    fn filter_json_objects_no_qpdf_key_unchanged() {
+        // A doc without "qpdf" (e.g. after filter_json_keys removed it)
+        let doc = JsonValue::Object(vec![
+            ("version".to_string(), JsonValue::Integer(2)),
+            ("pages".to_string(), JsonValue::Array(vec![])),
+        ]);
+        let sel = JsonObjectSelector::Object {
+            number: 3,
+            generation: 0,
+        };
+        let filtered = filter_json_objects(doc, &[sel]);
+        assert_eq!(key_names(&filtered), vec!["version", "pages"]);
+    }
+
+    // ── filter_json_objects: envelope and other sections preserved ─────────────
+
+    #[test]
+    fn filter_json_objects_envelope_and_pages_preserved() {
+        let doc = make_qpdf_doc_with_objects();
+        let sel = JsonObjectSelector::Object {
+            number: 3,
+            generation: 0,
+        };
+        let filtered = filter_json_objects(doc, &[sel]);
+        // version, parameters, pages all still present
+        let names = key_names(&filtered);
+        assert!(names.contains(&"version"), "version missing");
+        assert!(names.contains(&"parameters"), "parameters missing");
+        assert!(names.contains(&"pages"), "pages missing");
+        assert!(names.contains(&"qpdf"), "qpdf missing");
     }
 
     // ── base64 decode helper (test-only) ─────────────────────────────────────
