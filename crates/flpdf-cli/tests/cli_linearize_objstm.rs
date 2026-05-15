@@ -9,10 +9,21 @@
 //!
 //! `qpdf --check-linearization` reporting *zero* warnings on ObjStm-bearing
 //! output is the explicit acceptance gate of the downstream subtask
-//! flpdf-9hc.5.8.4 (qpdf cross-check made ObjStm-aware), which is blocked on
-//! a split first-half / second-half xref-stream restructure + RenumberMap
-//! container-slot allocation. Those are tracked as follow-ups; this file only
-//! asserts 5.8.2's own acceptance.
+//! flpdf-9hc.5.8.4 (qpdf cross-check made ObjStm-aware).
+//!
+//! flpdf-9hc.5.8.4 status: delivered (a) the renumber container-before-member
+//! ordering fix (removes qpdf's "uncompressed object after a compressed one in
+//! a cross-reference stream" error for multi-container output) and (b) the
+//! `check.rs` cross-reference-*stream* awareness (the internal
+//! `check-linearization` now accepts xref-stream / ObjStm-bearing linearized
+//! output, not only classic-`xref`-keyword files).  Part-3 first-page shared
+//! object ObjStm packing remains deferred behind a safety valve
+//! (`plan.rs::objstm_batches` clears `part3_batches`): qpdf's
+//! `checkHSharedObject` numbers first-page shared objects *positionally* from
+//! the first-page object id, which is structurally incompatible with
+//! flpdf-56u's split-xref tail relocation; tracked as flpdf-ihb.  These tests
+//! therefore exercise Part-4 (rest-of-document) ObjStm packing, which IS
+//! qpdf-clean.
 
 use std::io::Cursor;
 use std::process::Command as StdCommand;
@@ -251,11 +262,11 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Acceptance gate of flpdf-9hc.5.8.4 (NOT 5.8.2): qpdf --check-linearization
-//    must report zero warnings on ObjStm-bearing linearized output.  This is
-//    blocked on the split first-half/second-half xref-stream restructure +
-//    RenumberMap container-slot allocation (see follow-up issues).  Kept as an
-//    ignored regression target so 5.8.4 can simply remove `#[ignore]`.
+// 3. Acceptance gate of flpdf-9hc.5.8.4: qpdf --check-linearization must
+//    report zero warnings on ObjStm-bearing linearized output (Part-4
+//    rest-of-document packing; Part-3 first-page packing stays behind the
+//    flpdf-ihb safety valve).  Also asserts the internal `check-linearization`
+//    accepts the same xref-stream output (5.8.4 check.rs ObjStm-awareness).
 // ---------------------------------------------------------------------------
 #[test]
 fn linearize_generate_qpdf_check_clean() {
@@ -275,6 +286,25 @@ fn linearize_generate_qpdf_check_clean() {
         ])
         .assert()
         .success();
+
+    // The output must actually contain an ObjStm container, otherwise this
+    // test would vacuously pass on plain (non-xref-stream) output.
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        count_objstm_containers(&bytes) >= 1,
+        "fixture must yield >=1 ObjStm container for this gate to be meaningful"
+    );
+
     let (ok, msg) = qpdf_check_linearization(&out);
     assert!(ok && msg.contains("no linearization errors"), "{msg}");
+
+    // flpdf-9hc.5.8.4 scope item 3: the internal linearization checker must
+    // accept cross-reference-*stream* (ObjStm-bearing) linearized output, not
+    // only classic-`xref`-keyword files.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["check-linearization", out.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("linearization OK"));
 }

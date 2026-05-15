@@ -843,15 +843,29 @@ impl LinearizationPlan {
             }
         };
 
-        // Interim scope reduction (flpdf-9hc.5.8.3): Part-3 page-1 shared
-        // objects stay plain indirect. Packing them into an ObjStm makes
-        // qpdf's first-page-section accounting reject the output and leaves
-        // their Shared Object Hint Table member length encoded as 0, because
-        // ObjStm-aware Part-3 hint encoding depends on the split
-        // first-half/second-half xref restructure tracked in flpdf-56u
-        // (which blocks flpdf-9hc.5.8.4). Part-4 (rest-of-document) packing is
-        // unaffected. Re-enable Part-3 packing by removing this clear once
-        // flpdf-56u + the Part-3 shared hint encoding land in 5.8.4.
+        // Safety valve: Part-3 page-1 shared objects stay plain indirect
+        // (flpdf-9hc.5.8.4 investigation; tracked as flpdf-ihb).
+        //
+        // Part-3 first-page shared-object ObjStm packing is structurally
+        // incompatible with flpdf-56u's split-xref tail relocation and cannot
+        // pass `qpdf --check-linearization`.  qpdf's `checkHSharedObject`
+        // (QPDF_linearization.cc) builds its index→object map *positionally*:
+        // the first `nshared_first_page` shared hint entries are assigned
+        // object numbers starting from `pages.at(0).getObjectID()` and
+        // incrementing by 1, so the first-page shared objects (or their
+        // ObjStm container) must occupy a contiguous low object-number block
+        // immediately after the first-page object.  flpdf-56u's
+        // `relocate_objstm_members` moves every ObjStm member + container to a
+        // high contiguous *tail* block (so the split first-page/main xref
+        // `/Index` ranges never interleave type-1 after type-2).  Those two
+        // constraints are mutually exclusive without redesigning the 56u
+        // relocation, which is out of scope for 5.8.4.  Empirically, removing
+        // this clear makes qpdf report "object count mismatch for page 0" and
+        // "shared object … in hint table but not computed list".  qpdf's own
+        // `--object-streams=generate` linearizer likewise leaves Part-3
+        // first-page shared objects uncompressed.  Part-4 (rest-of-document)
+        // packing is unaffected.  Re-enable by removing this clear once
+        // flpdf-ihb lands a section-aware renumber layout.
         plan.part3_batches.clear();
 
         Ok(plan)
