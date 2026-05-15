@@ -1128,11 +1128,19 @@ fn walk_acroform_fields<R: Read + Seek>(
             Some(Object::Name(n)) if n.as_slice() == b"Widget"
         );
         // Field-like markers that mean the kid acts as a (possibly unnamed)
-        // field even when /Subtype is /Widget. /Parent is intentionally NOT
-        // here: widget annotations are normally attached to a parent field
-        // via /Parent, so its presence alone doesn't make a kid a field.
-        let has_field_entries =
-            d.get("T").is_some() || d.get("FT").is_some() || d.get("Kids").is_some();
+        // field even when /Subtype is /Widget. Covers the merged widget+field
+        // case where the widget dictionary carries field state (value, flags,
+        // alternate / mapping names, etc.) directly. /Parent is intentionally
+        // NOT here: standalone widget annotations point back to their owning
+        // field via /Parent, so its presence alone doesn't make a kid a field.
+        let has_field_entries = d.get("T").is_some()
+            || d.get("FT").is_some()
+            || d.get("Kids").is_some()
+            || d.get("V").is_some()
+            || d.get("DV").is_some()
+            || d.get("Ff").is_some()
+            || d.get("TU").is_some()
+            || d.get("TM").is_some();
 
         if is_widget_subtype && !has_field_entries {
             // Pure widget annotation — collect ref string, do not recurse.
@@ -3678,6 +3686,90 @@ mod tests {
             annotations,
             JsonValue::Array(vec![JsonValue::String("202 0 R".to_string())]),
             "the widget kid must be listed in annotations, not promoted to a field"
+        );
+    }
+
+    // ── acroform: merged widget+field with /V is classified as field ─────────
+    //
+    // Regression for CodeRabbit's 4th-pass review on kid classification. A
+    // /Subtype /Widget dictionary that also carries field entries (/V, /DV,
+    // /Ff, /TU, /TM) but no /T, /FT, or /Kids is a "merged widget+field"
+    // dictionary — its local field state must be reflected in the JSON
+    // entry, so the serializer must classify it as a field and recurse.
+
+    #[test]
+    fn acroform_merged_widget_field_with_local_value_is_classified_as_field() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let parent_field_ref = crate::ObjectRef::new(201, 0);
+        let merged_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(vec![Object::Reference(parent_field_ref)]),
+        );
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut parent_field = Dictionary::new();
+        parent_field.insert("T", Object::String(b"address".to_vec()));
+        parent_field.insert("FT", Object::Name(b"Tx".to_vec()));
+        parent_field.insert("Kids", Object::Array(vec![Object::Reference(merged_ref)]));
+        pdf.set_object(parent_field_ref, Object::Dictionary(parent_field));
+
+        // Merged widget+field: /Subtype /Widget AND local /V (and /Ff).
+        // No /T, /FT, /Kids — but still a field that should appear in the
+        // flat list because it carries field state.
+        let mut merged = Dictionary::new();
+        merged.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        merged.insert("Parent", Object::Reference(parent_field_ref));
+        merged.insert("V", Object::String(b"42 Somewhere".to_vec()));
+        merged.insert("Ff", Object::Integer(4));
+        pdf.set_object(merged_ref, Object::Dictionary(merged));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        // Both parent and merged widget+field must appear.
+        assert_eq!(
+            fields.len(),
+            2,
+            "merged widget+field with /V must appear as a separate field entry"
+        );
+
+        // Second entry is the merged widget+field — verify its local /V and
+        // /Ff are emitted, not the parent's.
+        let JsonValue::Object(merged_entry) = &fields[1] else {
+            panic!("merged entry must be Object");
+        };
+        let value = merged_entry
+            .iter()
+            .find(|(k, _)| k == "value")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(value, JsonValue::String("u:42 Somewhere".to_string()));
+        let flags = merged_entry
+            .iter()
+            .find(|(k, _)| k == "fieldflags")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(flags, JsonValue::Integer(4));
+
+        // The merged widget must also list itself in annotations[] because
+        // it carries /Subtype /Widget.
+        let annotations = merged_entry
+            .iter()
+            .find(|(k, _)| k == "annotations")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(
+            annotations,
+            JsonValue::Array(vec![JsonValue::String("202 0 R".to_string())])
         );
     }
 
