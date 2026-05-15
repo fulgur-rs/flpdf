@@ -91,22 +91,28 @@ Every phase is idempotent — re-running is safe.
 4. **Merge** (normal PR, NOT gh-stack): cursor's base must be `main`
    (it is, since cursor is the lowest open sub; if not, a lower PR didn't
    merge — re-derive). Gate fully green →
-   `gh pr merge <cursor> --squash --delete-branch`.
-   - Use `--squash` (one commit per PR on main; consistent with the PR
-     template's per-PR change unit). `--delete-branch` removes the remote
-     branch, which makes GitHub **auto-retarget the next PR's base to
-     `main`**.
+   `gh pr merge <cursor> --rebase --delete-branch`.
+   - Use **`--rebase`** (NOT `--squash`). `--rebase` replays the PR's
+     commits onto main per-commit, so each patch lands individually —
+     which is exactly what lets the next branch's **plain**
+     `git rebase origin/main` drop them cleanly by patch-id. `--squash`
+     collapses them into one commit whose patch-id matches no individual
+     commit, breaking plain rebase — only use `--squash` if you also
+     switch the cascade to `git rebase --onto origin/main
+     "$(gh pr view <pr> --json commits --jq '.commits[0].oid')^"`. This
+     repo standardizes on **`--rebase` + plain rebase**. `--delete-branch`
+     makes GitHub **auto-retarget the next PR's base to `main`** (base
+     pointer only — the branch still needs the rebase below).
 5. **Cascade by hand** (replaces `gh stack sync`): only the **new cursor**
    (next sub) needs rebasing now — PRs further up still point at branches
    that still exist, so rebase them lazily when they each become cursor.
    For the new cursor branch `B`:
    - `git fetch origin --prune`
-   - First commit belonging to the PR (not the parent's):
-     `FIRST=$(gh pr view <B-pr> --json commits --jq '.commits[0].oid')`
-     — derived from GitHub, so no ledger needed.
-   - `git checkout B && git rebase --onto origin/main "$FIRST^" B`
-     (replays only B's own commits onto new main; drops the parent's
-     now-merged commits even though squash changed their hashes).
+   - `git checkout B && git rebase origin/main`
+     (the parent merged with `--rebase`, so git drops the parent's
+     now-on-main commits by patch-id and replays only B's own commits.
+     Verified in practice: this skill's own design PR rebased cleanly
+     onto main with zero conflicts after its `--rebase` merge.)
    - `git push --force-with-lease origin B`
    - Conflict during rebase → `git rebase --abort`, **stop → human**
      (no auto conflict resolution; the manual rebase is NOT atomic, so
@@ -133,10 +139,14 @@ Everything else (pause, rate-limit, CHANGES_REQUESTED) is automatic.
   `Resume review` **checkbox**, not a command.
 - Using `gh stack merge` / `gh stack sync` — this repo has NO registered
   gh-stack stack; those commands fail. Use `gh pr merge` + manual rebase.
-- Plain `git rebase origin/main` on the next branch instead of
-  `git rebase --onto origin/main "$FIRST^"` — a plain rebase replays the
-  parent's already-merged commits and explodes into conflicts / a bloated
-  diff. Always use `--onto` with the PR's first commit.
+- Merging the bottom PR with `--squash` while using a **plain**
+  `git rebase origin/main` cascade — squash makes the parent one commit
+  whose patch-id matches no individual child-carried commit, so the
+  rebase replays already-merged changes and explodes into conflicts / a
+  bloated diff. Either merge with `--rebase` (this repo's standard, plain
+  rebase works), or if you must squash, cascade with
+  `git rebase --onto origin/main "$(gh pr view <pr> --json commits --jq
+  '.commits[0].oid')^"`. Never mix `--squash` merge with plain rebase.
 - Omitting the qpdf byte-identical / Compat-matrix gate entirely.
 - Stopping on CHANGES_REQUESTED instead of triage→fix/followup.
 
