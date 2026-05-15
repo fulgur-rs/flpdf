@@ -150,11 +150,8 @@ impl ObjStmLayout {
         // an output-shaping filter, not a re-implementation of the eligibility
         // predicate or the mode dispatch.  (Tracked as a 5.8.1 planner gap —
         // see follow-up issue.)
-        let other_pages_private: std::collections::BTreeSet<ObjectRef> = plan
-            .part4_other_pages_private
-            .iter()
-            .copied()
-            .collect();
+        let other_pages_private: std::collections::BTreeSet<ObjectRef> =
+            plan.part4_other_pages_private.iter().copied().collect();
         let filter_batches = |batches: Vec<Vec<ObjectRef>>| -> Vec<Vec<ObjectRef>> {
             batches
                 .into_iter()
@@ -222,8 +219,16 @@ impl ObjStmLayout {
         let mut part3 = Vec::new();
         let mut part4 = Vec::new();
         let mut member_to_container = BTreeMap::new();
-        take(&batch_plan.part3_batches, &mut part3, &mut member_to_container)?;
-        take(&batch_plan.part4_batches, &mut part4, &mut member_to_container)?;
+        take(
+            &batch_plan.part3_batches,
+            &mut part3,
+            &mut member_to_container,
+        )?;
+        take(
+            &batch_plan.part4_batches,
+            &mut part4,
+            &mut member_to_container,
+        )?;
 
         layout.part3 = part3;
         layout.part4 = part4;
@@ -617,13 +622,11 @@ fn write_main_xref_stream_and_trailer(
 ) -> Result<(usize, usize)> {
     // The xref stream object is the next number after every emitted object.
     let xref_obj_num = total_count;
-    let final_size = xref_obj_num
-        .checked_add(1)
-        .ok_or_else(|| {
-            crate::Error::Unsupported(
-                "linearization writer: xref-stream /Size overflows u32".to_string(),
-            )
-        })?;
+    let final_size = xref_obj_num.checked_add(1).ok_or_else(|| {
+        crate::Error::Unsupported(
+            "linearization writer: xref-stream /Size overflows u32".to_string(),
+        )
+    })?;
 
     // Build member new-number → (container new-number, index) for the
     // type-2 xref entries.  The layout stores renumbered member refs in
@@ -1256,7 +1259,10 @@ pub fn write_linearized<R: Read + Seek>(
                     // still raised for *non-member* objects, where an absent
                     // probe length really does signal a planner / renumber
                     // or probe-coverage bug.
-                    if objstm_layout.member_to_container.contains_key(&h.object_ref) {
+                    if objstm_layout
+                        .member_to_container
+                        .contains_key(&h.object_ref)
+                    {
                         return Ok(0);
                     }
                     let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
@@ -1325,16 +1331,15 @@ pub fn write_linearized<R: Read + Seek>(
                         })?
                         .number
                 };
-                let first_part8_off =
-                    xref_offsets
-                        .get(&first_part8_lookup_num)
-                        .copied()
-                        .ok_or_else(|| {
-                            crate::Error::Unsupported(format!(
-                                "first Part-8 shared object (lookup #{}) has no probed offset",
-                                first_part8_lookup_num
-                            ))
-                        })?;
+                let first_part8_off = xref_offsets
+                    .get(&first_part8_lookup_num)
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "first Part-8 shared object (lookup #{}) has no probed offset",
+                            first_part8_lookup_num
+                        ))
+                    })?;
                 // Subtract hint stream total length so that qpdf's
                 // adjusted_offset() reconstructs the correct file offset.
                 so_table.header.location = first_part8_off
