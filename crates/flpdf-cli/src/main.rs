@@ -363,6 +363,11 @@ impl From<CliPasswordMode> for PasswordMode {
 fn main() {
     let args = Cli::parse();
 
+    // JSON mode takes the first branch, but this is unambiguous: clap's
+    // conflicts_with_all on --json (plus args_conflicts_with_subcommands on
+    // Cli) guarantees no other top-level mode or subcommand can be set at
+    // the same time, so the ordering here is a formality, not a precedence
+    // rule that could silently shadow another requested mode.
     let result = if args.json.is_some() {
         run_json(&args)
     } else if let Some(command) = args.command {
