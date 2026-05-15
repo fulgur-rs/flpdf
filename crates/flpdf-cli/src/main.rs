@@ -21,6 +21,12 @@ type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
+// Top-level option flags (--json, --check, --linearize, …) are mutually
+// exclusive with subcommands. Without this, `flpdf --json rewrite in out`
+// would parse as the rewrite subcommand while silently keeping --json,
+// never reaching the JSON branch. Conflicting instead surfaces the
+// ambiguity as a clean usage error.
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
