@@ -1361,8 +1361,17 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
 ///
 /// The PDF date format is `D:YYYYMMDDhhmmss±HH'mm'` (or `Z` for UTC).
 /// Returns `None` if the bytes cannot be parsed as a date.
+///
+/// The input is required to be pure ASCII: PDF dates are an ASCII-only
+/// format, and treating them as such avoids panicking on multibyte byte
+/// boundaries when caller code passes a stray non-ASCII string.
 fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
-    // Strip "D:" prefix if present
+    // PDF dates are ASCII-only. Reject any non-ASCII byte up front so the
+    // byte-index slicing below cannot land in the middle of a UTF-8
+    // multibyte sequence.
+    if !bytes.is_ascii() {
+        return None;
+    }
     let s = std::str::from_utf8(bytes).ok()?;
     let s = s.strip_prefix("D:").unwrap_or(s);
 
@@ -1371,18 +1380,36 @@ fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
         return None;
     }
 
-    // Parse components with defaults
+    // Validate each fixed-width component is all digits before slicing it.
+    let is_digits = |slice: &str| !slice.is_empty() && slice.bytes().all(|b| b.is_ascii_digit());
+
     let year = &s[0..4];
-    // Validate year is numeric
-    if !year.chars().all(|c| c.is_ascii_digit()) {
+    if !is_digits(year) {
         return None;
     }
 
-    let month = if s.len() >= 6 { &s[4..6] } else { "01" };
-    let day = if s.len() >= 8 { &s[6..8] } else { "01" };
-    let hour = if s.len() >= 10 { &s[8..10] } else { "00" };
-    let minute = if s.len() >= 12 { &s[10..12] } else { "00" };
-    let second = if s.len() >= 14 { &s[12..14] } else { "00" };
+    let month_default = "01";
+    let day_default = "01";
+    let zero_default = "00";
+
+    let take = |start: usize, end: usize, fallback: &'static str| -> Option<&str> {
+        if s.len() >= end {
+            let slice = &s[start..end];
+            if is_digits(slice) {
+                Some(slice)
+            } else {
+                None
+            }
+        } else {
+            Some(fallback)
+        }
+    };
+
+    let month = take(4, 6, month_default)?;
+    let day = take(6, 8, day_default)?;
+    let hour = take(8, 10, zero_default)?;
+    let minute = take(10, 12, zero_default)?;
+    let second = take(12, 14, zero_default)?;
 
     // Parse timezone
     let tz_str = if s.len() > 14 { &s[14..] } else { "" };
@@ -4831,6 +4858,27 @@ mod tests {
         assert_eq!(parse_pdf_date(b"not-a-date"), None);
         assert_eq!(parse_pdf_date(b"D:"), None);
         assert_eq!(parse_pdf_date(b""), None);
+    }
+
+    #[test]
+    fn parse_pdf_date_non_ascii_does_not_panic() {
+        // Regression: previously `&s[4..6]` could slice into the middle of
+        // a UTF-8 multibyte char (e.g. "é" is 0xC3 0xA9). The function now
+        // rejects any non-ASCII bytes up front and returns None cleanly.
+        // The test must NOT panic.
+        assert_eq!(parse_pdf_date("D:20260é0101".as_bytes()), None);
+        assert_eq!(parse_pdf_date("D:あいう".as_bytes()), None);
+        // The non-ASCII content can appear anywhere — even after a valid
+        // year prefix — and must still be rejected without panicking.
+        assert_eq!(parse_pdf_date("D:2026あ".as_bytes()), None);
+    }
+
+    #[test]
+    fn parse_pdf_date_non_digit_components_return_none() {
+        // Components past the year that aren't digits must not blindly
+        // pass through. Previously only the year was validated.
+        assert_eq!(parse_pdf_date(b"D:2026XX0101000000Z"), None);
+        assert_eq!(parse_pdf_date(b"D:20260101NN0000Z"), None);
     }
 
     #[test]
