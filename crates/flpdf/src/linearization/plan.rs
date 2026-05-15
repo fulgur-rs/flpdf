@@ -1908,13 +1908,15 @@ mod tests {
             .flat_map(|b| b.iter().copied())
             .collect();
 
-        // Interim scope reduction (flpdf-9hc.5.8.3, re-enabled by flpdf-56u):
-        // Part-3 page-1 shared objects are NOT packed — part3_batches is empty
-        // and the Resources dict (7 0 R) stays a plain indirect object.
+        // Permanent qpdf-observable-equivalent behavior: Part-3 page-1 shared
+        // objects are NOT packed (qpdf's own --object-streams=generate leaves
+        // them uncompressed) — part3_batches is empty and the Resources dict
+        // (7 0 R) stays a plain indirect object. flpdf-ihb tracks the
+        // qpdf-superseding "pack Part-3 too" option (non-epic, P3).
         let resources_ref = ObjectRef::new(7, 0);
         assert!(
             all_part3_batched.is_empty(),
-            "interim: part3_batches must be empty (Part-3 packing deferred to flpdf-56u)"
+            "part3_batches must be empty (Part-3 stays plain indirect; matches qpdf)"
         );
         assert!(
             !all_part4_batched.contains(&resources_ref),
@@ -2298,14 +2300,14 @@ mod tests {
             "ineligible /Type /XRef dict (6 0 R) must not appear in part4_batches"
         );
 
-        // ── Invariant 3: interim Part-3 packing is disabled ───────────────────
-        // flpdf-9hc.5.8.3 interim (re-enabled by flpdf-56u): Part-3 page-1
-        // shared objects stay plain indirect. 5 0 R (Resources, Part-3) must
-        // appear in NO batch — neither part3_batches (cleared) nor misrouted
-        // into part4_batches.
+        // ── Invariant 3: Part-3 packing is disabled (permanent) ───────────────
+        // Part-3 page-1 shared objects stay plain indirect, matching qpdf's
+        // own --object-streams=generate (which does not compress them). 5 0 R
+        // (Resources, Part-3) must appear in NO batch — neither part3_batches
+        // (cleared) nor misrouted into part4_batches.
         assert!(
             all_part3_batched.is_empty(),
-            "interim: part3_batches must be empty (Part-3 packing deferred to flpdf-56u)"
+            "part3_batches must be empty (Part-3 stays plain indirect; matches qpdf)"
         );
         assert!(
             !all_part4_batched.contains(&resources_ref),
@@ -2329,19 +2331,19 @@ mod tests {
         );
 
         // ── Invariant 5: Part-4 batches draw from one source ObjStm ───────────
-        // With interim Part-3 packing disabled, ObjStm 7 contributes only
-        // [2 0 R] to part4 (5 0 R is Part-3 → not packed); ObjStm 8 contributes
-        // [4 0 R] to part4. part3_batches is empty.
+        // Part-3 packing is permanently disabled (matches qpdf), so ObjStm 7
+        // contributes only [2 0 R] to part4 (5 0 R is Part-3 → not packed);
+        // ObjStm 8 contributes [4 0 R] to part4. part3_batches is empty.
         assert!(
             batch_plan.part3_batches.is_empty(),
-            "interim: part3_batches must be empty"
+            "part3_batches must be empty (Part-3 stays plain indirect; matches qpdf)"
         );
 
         // ── Invariant 6: Source-index ordering within each source ObjStm ──────
         // ObjStm 7 members in source-index order: 2 (idx 0), 3 (idx 1), 5 (idx 2).
-        // After filtering: 2 goes to part4; 3 is Part-2; 5 is Part-3 (not packed
-        // in the interim). Within the part4 contribution from ObjStm 7, ordering
-        // must respect idx.
+        // After filtering: 2 goes to part4; 3 is Part-2; 5 is Part-3 (never
+        // packed; matches qpdf). Within the part4 contribution from ObjStm 7,
+        // ordering must respect idx.
         // Here only obj 2 survives to part4 from ObjStm 7, so the batch from ObjStm 7
         // to part4 is [2 0 R] — a single element, trivially sorted.
         // ObjStm 8 part4 contribution: [4 0 R] (idx 0, sole survivor) — also trivial.
@@ -2411,11 +2413,11 @@ mod tests {
     /// exceed the cap are split into multiple batches per part.
     #[test]
     fn objstm_batches_preserve_cap_splits_large_groups() {
-        // Interim (flpdf-9hc.5.8.3, re-enabled by flpdf-56u): Part-3 packing is
-        // disabled, so ObjStm 7 contributes only 2 0 R to part4 (5 0 R is
-        // Part-3 → not packed); ObjStm 8 contributes 4 0 R to part4.
-        // With cap=1, each eligible member that lands in part4 forms its own
-        // batch (at most 1 per batch).
+        // Part-3 packing is permanently disabled (matches qpdf's own
+        // --object-streams=generate), so ObjStm 7 contributes only 2 0 R to
+        // part4 (5 0 R is Part-3 → not packed); ObjStm 8 contributes 4 0 R to
+        // part4. With cap=1, each eligible member that lands in part4 forms
+        // its own batch (at most 1 per batch).
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
@@ -2455,11 +2457,11 @@ mod tests {
         let page2_ref = ObjectRef::new(4, 0);
         assert!(
             batch_plan.part3_batches.is_empty(),
-            "interim: Part-3 (5 0 R) is not packed; part3_batches must be empty"
+            "Part-3 (5 0 R) is never packed; part3_batches must be empty (matches qpdf)"
         );
         assert!(
             !all_batched.contains(&resources_ref),
-            "interim: Part-3 object 5 0 R must NOT be batched"
+            "Part-3 object 5 0 R must NOT be batched (stays plain indirect; matches qpdf)"
         );
         assert!(
             all_batched.contains(&pages_ref),
