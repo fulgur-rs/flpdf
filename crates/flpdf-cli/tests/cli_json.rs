@@ -381,3 +381,28 @@ fn json_stream_data_without_json_flag_is_usage_error() {
     .code(2)
     .stderr(predicate::str::contains("--json"));
 }
+
+// ---------------------------------------------------------------------------
+// Regression: --json must not silently coexist with a subcommand.
+//
+// CodeRabbit flagged that `flpdf --json rewrite in out` parsed as the
+// rewrite subcommand while keeping --json, so the JSON branch never ran.
+// args_conflicts_with_subcommands now makes this a clean usage error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_flag_conflicts_with_subcommand() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let out_path = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "rewrite",
+        input.path().to_str().unwrap(),
+        out_path.to_str().unwrap(),
+    ])
+    .assert()
+    .code(2);
+}
