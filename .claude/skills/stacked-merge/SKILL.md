@@ -1,26 +1,52 @@
 ---
 name: stacked-merge
-description: Use when merging a stack of dependent PRs (gh-stack / epic sub-* branches) into main in this repo, when resuming a half-finished stack merge after a rate limit or session end, or when CodeRabbit is paused / rate-limited / requesting changes on a stack PR and you need to drive it to merge with minimal human intervention.
+description: Use when merging a chain of dependent PRs (epic/<id>/sub-* branches) into main in this repo, when resuming a half-finished stacked merge after a rate limit or session end, or when CodeRabbit is paused / rate-limited / requesting changes on such a PR and you need to drive it to merge with minimal human intervention.
 ---
 
 # Stacked PR Merge (flpdf)
 
 ## Overview
 
-Merge a stack (`epic/<id>/sub-1..N`) into `main` **bottom-to-top, one at a
-time**, fully autonomously. The full design and rationale live in
-`docs/plans/2026-05-16-resilient-stacked-merge-design.md` — **read it before
-first use**. This skill is the *how*; the design doc is the *why*. The gaps
-below are exactly the ones a capable agent gets wrong without this skill.
+Merge a chain of dependent PRs (`epic/<id>/sub-1..N`) into `main`
+**bottom-to-top, one at a time**, fully autonomously. The full design and
+rationale live in `docs/plans/2026-05-16-resilient-stacked-merge-design.md`
+— **read it before first use**. This skill is the *how*; the design doc is
+the *why*. The gaps below are exactly the ones a capable agent gets wrong
+without this skill.
 
-`main` is PR-only (GitHub ruleset). Never `git push origin main`.
+**This repo does NOT use gh-stack tooling for these PRs.** They are plain
+chained PRs (base pointers only); `gh stack view` errors with "not part of
+a stack". **Never use `gh stack merge` / `gh stack sync`** — they will fail
+or operate on the wrong thing. Merge as **normal PRs** with `gh pr merge`
+and do the cascade rebase **by hand** (below).
+
+`main` is PR-only (GitHub ruleset). Never `git push origin main` — merge
+only via `gh pr merge` (goes through the API, respects the ruleset).
 
 ## Resume / state
 
 No state file. Source of truth = GitHub + git + CodeRabbit comments.
 At session start derive: merged set (PR state==MERGED), `cursor` = lowest
-OPEN `sub-K`, cascade-pending (`git merge-base --is-ancestor origin/main
-<upstack>` is false). Every phase is idempotent — re-running is safe.
+sub-K that is **unmerged with its branch still ahead of main**, cascade-pending for the new cursor (`git merge-base
+--is-ancestor origin/main origin/<cursor-branch>` is false ⇒ needs the §5
+rebase). Also check for an interrupted manual rebase: if
+`.git/rebase-merge` or `.git/rebase-apply` exists, a previous cascade was
+cut off mid-conflict → resolve or `git rebase --abort` then **stop →
+human** (see Stop section).
+
+**Do NOT compute cursor as "lowest `state==OPEN` sub".** A middle sub can
+be **CLOSED-but-not-MERGED** with its branch still ahead of `origin/main`
+(work stranded; the next PR's base still points at it). Picking the next
+OPEN sub would lose that work and carry its ungated commits onto main via
+the child PR. So: for each sub bottom-up, if it is not MERGED **and**
+`git merge-base --is-ancestor origin/<sub-branch> origin/main` is false
+(branch has commits not on main), that sub is the cursor — even if its PR
+is CLOSED or draft. Recovery: `gh pr reopen <pr>` → `gh pr ready <pr>` →
+`gh pr edit <pr> --base main` if its old base branch was deleted (no
+auto-retarget happens while a PR is closed) → re-derive. If reopen fails
+→ **stop → human**.
+
+Every phase is idempotent — re-running is safe.
 
 ## Per-PR loop (cursor = lowest OPEN sub)
 
@@ -62,18 +88,39 @@ OPEN `sub-K`, cascade-pending (`git merge-base --is-ancestor origin/main
    - unsure if safe to defer → fix it, or human flag (never auto-defer).
    Then `@coderabbitai review`, re-enter step 2. Bounded iterations N;
    non-convergence → human flag. **No finding silently dropped.**
-4. **Merge**: gate fully green → `gh stack merge <cursor>` (bottom-only;
-   `delete_branch_on_merge` removes the remote branch).
-5. **Cascade**: `gh stack sync` (atomic; rebases upstack, re-points PR
-   bases). Conflict → it restores all branches and you **stop → human**
-   (no auto conflict resolution). Cascade force-pushes upstack ⇒ CodeRabbit
-   re-review + roborev re-kick fire — handled by step 2 / gate next loop.
+4. **Merge** (normal PR, NOT gh-stack): cursor's base must be `main`
+   (it is, since cursor is the lowest open sub; if not, a lower PR didn't
+   merge — re-derive). Gate fully green →
+   `gh pr merge <cursor> --squash --delete-branch`.
+   - Use `--squash` (one commit per PR on main; consistent with the PR
+     template's per-PR change unit). `--delete-branch` removes the remote
+     branch, which makes GitHub **auto-retarget the next PR's base to
+     `main`**.
+5. **Cascade by hand** (replaces `gh stack sync`): only the **new cursor**
+   (next sub) needs rebasing now — PRs further up still point at branches
+   that still exist, so rebase them lazily when they each become cursor.
+   For the new cursor branch `B`:
+   - `git fetch origin --prune`
+   - First commit belonging to the PR (not the parent's):
+     `FIRST=$(gh pr view <B-pr> --json commits --jq '.commits[0].oid')`
+     — derived from GitHub, so no ledger needed.
+   - `git checkout B && git rebase --onto origin/main "$FIRST^" B`
+     (replays only B's own commits onto new main; drops the parent's
+     now-merged commits even though squash changed their hashes).
+   - `git push --force-with-lease origin B`
+   - Conflict during rebase → `git rebase --abort`, **stop → human**
+     (no auto conflict resolution; the manual rebase is NOT atomic, so
+     leave B abandoned-but-restored, not half-rebased).
+   - This force-push changes B's head SHA ⇒ CodeRabbit re-review +
+     roborev re-kick needed — handled by step 1 gate / step 2 next loop.
 6. Loop to the new cursor.
 
 ## Stop → human (only these)
 
-Resolve non-convergence · CI failure not fixable · `gh stack sync` conflict ·
-Compat-matrix drift needing a decision · "defer-safety unknown" finding.
+Resolve non-convergence · CI failure not fixable · **manual cascade rebase
+conflict** (after `git rebase --abort`) · Compat-matrix drift needing a
+decision · "defer-safety unknown" finding · **CLOSED-not-MERGED middle sub
+whose `gh pr reopen` fails**.
 Everything else (pause, rate-limit, CHANGES_REQUESTED) is automatic.
 
 ## Common mistakes (from baseline testing)
@@ -84,7 +131,12 @@ Everything else (pause, rate-limit, CHANGES_REQUESTED) is automatic.
   cascade force-push leaves a stale approval that must not count.
 - Inventing `@coderabbitai resolve` for pause — pause is cleared by the
   `Resume review` **checkbox**, not a command.
-- Raw `gh pr merge` instead of `gh stack merge` / skipping `gh stack sync`.
+- Using `gh stack merge` / `gh stack sync` — this repo has NO registered
+  gh-stack stack; those commands fail. Use `gh pr merge` + manual rebase.
+- Plain `git rebase origin/main` on the next branch instead of
+  `git rebase --onto origin/main "$FIRST^"` — a plain rebase replays the
+  parent's already-merged commits and explodes into conflicts / a bloated
+  diff. Always use `--onto` with the PR's first commit.
 - Omitting the qpdf byte-identical / Compat-matrix gate entirely.
 - Stopping on CHANGES_REQUESTED instead of triage→fix/followup.
 
