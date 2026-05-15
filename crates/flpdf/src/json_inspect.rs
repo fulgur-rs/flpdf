@@ -2049,15 +2049,22 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
                 ),
             ]);
 
-            // ownerpasswordmatched / userpasswordmatched: use is_encrypted as
-            // the proxy (empty-password authenticated → both true).
+            // ownerpasswordmatched / userpasswordmatched come from the
+            // reader's authentication record so user-only-authenticated
+            // documents do not falsely report owner=true.
             Ok(JsonValue::Object(vec![
                 ("capabilities".into(), capabilities),
                 ("encrypted".into(), JsonValue::Bool(is_encrypted)),
-                ("ownerpasswordmatched".into(), JsonValue::Bool(is_encrypted)),
+                (
+                    "ownerpasswordmatched".into(),
+                    JsonValue::Bool(pdf.owner_password_matched()),
+                ),
                 ("parameters".into(), parameters),
                 ("recovereduserpassword".into(), JsonValue::Null),
-                ("userpasswordmatched".into(), JsonValue::Bool(is_encrypted)),
+                (
+                    "userpasswordmatched".into(),
+                    JsonValue::Bool(pdf.user_password_matched()),
+                ),
             ]))
         }
     }
@@ -5463,6 +5470,57 @@ mod tests {
             .1
             .clone();
         assert_eq!(v, JsonValue::Bool(true));
+    }
+
+    // Regression for CodeRabbit's flpdf-9hc.11.9 review: previously both
+    // owner and user password matched flags were derived from is_encrypted,
+    // so encrypted files that only authenticated as user would falsely
+    // report owner=true. The reader now tracks each independently, and
+    // build_encrypt_section reads them through the new accessors.
+
+    #[test]
+    fn encrypt_section_plaintext_password_match_flags_are_both_false() {
+        let mut pdf = load_one_page_pdf();
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let JsonValue::Object(ref pairs) = enc else {
+            panic!("not Object")
+        };
+        let owner = pairs
+            .iter()
+            .find(|(k, _)| k == "ownerpasswordmatched")
+            .unwrap()
+            .1
+            .clone();
+        let user = pairs
+            .iter()
+            .find(|(k, _)| k == "userpasswordmatched")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(owner, JsonValue::Bool(false));
+        assert_eq!(user, JsonValue::Bool(false));
+    }
+
+    #[test]
+    fn encrypt_section_pdf_accessor_independent_of_is_encrypted() {
+        // The Pdf::owner_password_matched / user_password_matched accessors
+        // must come from the authentication record, not be derived from
+        // is_encrypted. For plaintext PDFs both must be false.
+        let pdf = load_one_page_pdf();
+        assert!(!pdf.is_encrypted());
+        assert!(!pdf.owner_password_matched());
+        assert!(!pdf.user_password_matched());
+    }
+
+    #[test]
+    fn encrypt_section_encrypted_r4_pdf_accessors_both_true_for_empty_password() {
+        // For the bundled R4 fixture, the empty password authenticates as
+        // both user and owner, so both accessors should be true (qpdf does
+        // the same).
+        let pdf = load_encrypted_r4_pdf();
+        assert!(pdf.is_encrypted());
+        assert!(pdf.owner_password_matched());
+        assert!(pdf.user_password_matched());
     }
 
     #[test]
