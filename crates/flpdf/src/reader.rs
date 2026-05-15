@@ -285,13 +285,31 @@ impl<R: Read + Seek> Pdf<R> {
             user_password_matched,
             owner_password_matched,
         ) = if matches!(revision, 5 | 6) {
-            let inputs = standard_handler_r5_inputs(&encrypt)?;
+            // Error-variant firing order (must match qpdf, see flpdf-9hc.3.21):
+            //
+            //   1. Password authentication runs FIRST.  If neither the user nor
+            //      the owner password authenticates, return `BadPassword`.
+            //   2. ONLY after a password authenticates do we apply the
+            //      weak-crypto gate (`WeakCryptoNotAllowed`).  A correct
+            //      password against a weak (R=5) file with `--allow-weak-crypto`
+            //      absent still returns `WeakCryptoNotAllowed` — only the
+            //      ordering relative to `BadPassword` changes here.
+            //   3. A wrong-length `/U` or `/O` entry on this authentication
+            //      path is reported as `BadPassword` (an unusable credential
+            //      entry is indistinguishable from a wrong password to a
+            //      caller), not `Malformed`.  This is scoped to the auth path
+            //      via `standard_handler_r5_inputs` (its only caller); all
+            //      other `Malformed` reclassification is intentionally NOT done
+            //      (e.g. `/UE`/`/OE` length errors stay `Malformed`).
+            //
+            // Keep this ordering identical in the `else` (V<5 / V=4) branch
+            // below; do not re-introduce the weak-crypto-before-auth bug in
+            // either branch.
+            let inputs =
+                standard_handler_r5_inputs(&encrypt).map_err(map_uo_length_to_bad_password)?;
             let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
             let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
             let weak_crypto = revision == 5;
-            if weak_crypto && !options.allow_weak_crypto {
-                return Err(EncryptedError::WeakCryptoNotAllowed.into());
-            }
             let user_attempt = if revision == 5 {
                 check_user_password_r5(&password, &inputs)
             } else {
@@ -309,6 +327,10 @@ impl<R: Read + Seek> Pdf<R> {
                 (Err(_), Ok(key)) => key,
                 (Err(user_err), Err(_owner_err)) => return Err(user_err),
             };
+            // Authentication succeeded — now apply the weak-crypto gate.
+            if weak_crypto && !options.allow_weak_crypto {
+                return Err(EncryptedError::WeakCryptoNotAllowed.into());
+            }
             (
                 file_key,
                 stream_mode,
@@ -327,9 +349,14 @@ impl<R: Read + Seek> Pdf<R> {
                 || crypt_filters
                     .values()
                     .any(|mode| matches!(mode, EncryptionMode::Rc4));
-            if weak_crypto && !options.allow_weak_crypto {
-                return Err(EncryptedError::WeakCryptoNotAllowed.into());
-            }
+            // Same error-variant firing order as the R=5/R=6 branch above:
+            // password authentication runs FIRST (both failing →
+            // `BadPassword`); the weak-crypto gate (`WeakCryptoNotAllowed`)
+            // is applied ONLY after a password authenticates.  A correct
+            // password against an RC4 file without `--allow-weak-crypto`
+            // still returns `WeakCryptoNotAllowed`; only the ordering relative
+            // to `BadPassword` changes.  Do not move the gate back above the
+            // auth attempts (flpdf-9hc.3.21).
             let v4_path = inputs.v == 4 && inputs.r == 4;
             let user_attempt = if v4_path {
                 check_user_password_v4(&password, &inputs)
@@ -348,6 +375,10 @@ impl<R: Read + Seek> Pdf<R> {
                 (Err(_), Ok(key)) => key,
                 (Err(user_err), Err(_owner_err)) => return Err(user_err),
             };
+            // Authentication succeeded — now apply the weak-crypto gate.
+            if weak_crypto && !options.allow_weak_crypto {
+                return Err(EncryptedError::WeakCryptoNotAllowed.into());
+            }
             (
                 file_key,
                 stream_mode,
@@ -1098,6 +1129,30 @@ fn standard_handler_inputs<'a>(
         o,
         encrypt_metadata,
     })
+}
+
+/// Reclassify a wrong-length `/U` or `/O` `Malformed` error from
+/// [`standard_handler_r5_inputs`] as [`EncryptedError::BadPassword`].
+///
+/// Scoped to the V=5 R=5/R=6 authentication path (the sole caller of
+/// `standard_handler_r5_inputs`): a `/U` or `/O` entry that is not exactly
+/// 48 bytes is an unusable credential entry that is indistinguishable, from a
+/// caller's perspective, from supplying the wrong password — qpdf reports
+/// "invalid password" here, so we map to `BadPassword` for parity.
+///
+/// Only the `/U` / `/O` *length* error is remapped. `/UE` / `/OE` length
+/// errors, missing entries, and non-string entries stay `Malformed`: those are
+/// genuine structural defects, not credential mismatches. No broader
+/// `Malformed` reclassification is performed (flpdf-9hc.3.21).
+fn map_uo_length_to_bad_password(err: Error) -> Error {
+    match &err {
+        Error::Encrypted(EncryptedError::Malformed { reason })
+            if reason == "/U entry is not 48 bytes" || reason == "/O entry is not 48 bytes" =>
+        {
+            EncryptedError::BadPassword.into()
+        }
+        _ => err,
+    }
 }
 
 fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5Inputs<'_>> {
