@@ -1096,9 +1096,15 @@ fn walk_acroform_fields<R: Read + Seek>(
         .map(|v| matches!(v, Object::Name(n) if n.as_slice() == b"Widget"))
         .unwrap_or(false);
 
-    // /Kids — may contain sub-fields (with /T) or widget annotations (without /T).
-    let kids = match field_dict.get("Kids") {
-        Some(Object::Array(arr)) => arr.clone(),
+    // /Kids — may be a direct Array or an indirect Reference to an Array.
+    // Resolve the indirect form so we don't silently drop the entire kid
+    // chain when it lives in its own object.
+    let kids = match field_dict.get("Kids").cloned() {
+        Some(Object::Array(arr)) => arr,
+        Some(Object::Reference(r)) => match pdf.resolve(r).map_err(ConvertError::from)? {
+            Object::Array(arr) => arr,
+            _ => vec![],
+        },
         _ => vec![],
     };
 
@@ -1306,9 +1312,16 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
         _ => false,
     };
 
-    // /Fields array (top-level field refs).
-    let fields_array = match acroform_dict.get("Fields") {
-        Some(Object::Array(arr)) => arr.clone(),
+    // /Fields array (top-level field refs). Same as /Kids below: must
+    // accept both the direct Array form and an indirect Reference to an
+    // Array, so AcroForm dictionaries that store /Fields as its own object
+    // don't surface as an empty list.
+    let fields_array = match acroform_dict.get("Fields").cloned() {
+        Some(Object::Array(arr)) => arr,
+        Some(Object::Reference(r)) => match pdf.resolve(r).map_err(ConvertError::from)? {
+            Object::Array(arr) => arr,
+            _ => vec![],
+        },
         _ => vec![],
     };
 
@@ -3824,5 +3837,115 @@ mod tests {
             JsonValue::String("u:bob".to_string()),
             "local /V must win over parent's /V"
         );
+    }
+
+    // ── acroform: indirect /Fields and /Kids arrays are resolved ──────────────
+    //
+    // Regression for CodeRabbit's PR #116 finding. Both /Fields (at the
+    // AcroForm top level) and /Kids (per field) can be an indirect
+    // Reference to an Array. Without resolving the reference, the previous
+    // code returned an empty vec and silently dropped the whole subtree.
+
+    #[test]
+    fn acroform_indirect_fields_array_is_resolved() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let fields_array_ref = crate::ObjectRef::new(201, 0);
+        let field_ref = crate::ObjectRef::new(202, 0);
+
+        // /AcroForm /Fields is an indirect Reference to an Array.
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Reference(fields_array_ref));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        // The indirect /Fields target: an Array of references.
+        pdf.set_object(
+            fields_array_ref,
+            Object::Array(vec![Object::Reference(field_ref)]),
+        );
+
+        // One leaf field.
+        let mut field = Dictionary::new();
+        field.insert("T", Object::String(b"name".to_vec()));
+        field.insert("FT", Object::Name(b"Tx".to_vec()));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        assert_eq!(
+            fields.len(),
+            1,
+            "indirect /Fields array must be resolved, not dropped"
+        );
+        let JsonValue::Object(entry) = &fields[0] else {
+            panic!("entry must be Object");
+        };
+        let fullname = entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(fullname, JsonValue::String("name".to_string()));
+    }
+
+    #[test]
+    fn acroform_indirect_kids_array_is_resolved() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let parent_ref = crate::ObjectRef::new(201, 0);
+        let kids_array_ref = crate::ObjectRef::new(202, 0);
+        let child_ref = crate::ObjectRef::new(203, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(parent_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        // Parent field with /Kids as an indirect Reference (not a direct Array).
+        let mut parent_field = Dictionary::new();
+        parent_field.insert("T", Object::String(b"group".to_vec()));
+        parent_field.insert("FT", Object::Name(b"Tx".to_vec()));
+        parent_field.insert("Kids", Object::Reference(kids_array_ref));
+        pdf.set_object(parent_ref, Object::Dictionary(parent_field));
+
+        pdf.set_object(
+            kids_array_ref,
+            Object::Array(vec![Object::Reference(child_ref)]),
+        );
+
+        let mut child = Dictionary::new();
+        child.insert("T", Object::String(b"name".to_vec()));
+        child.insert("Parent", Object::Reference(parent_ref));
+        pdf.set_object(child_ref, Object::Dictionary(child));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let JsonValue::Object(top) = &result else {
+            panic!("expected Object");
+        };
+        let JsonValue::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        // parent + child must both show up; the indirect /Kids array must
+        // have been resolved.
+        assert_eq!(
+            fields.len(),
+            2,
+            "indirect /Kids array must be resolved so descendants are emitted"
+        );
+        let JsonValue::Object(child_entry) = &fields[1] else {
+            panic!("child entry must be Object");
+        };
+        let child_fullname = child_entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(child_fullname, JsonValue::String("group.name".to_string()));
     }
 }
