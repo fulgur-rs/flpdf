@@ -22,8 +22,39 @@ use flpdf::Pdf;
 
 const FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
 
+fn qpdf_available() -> bool {
+    StdCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Same skip policy as `cli_static_id.rs`: hard-fail on Linux CI (qpdf is a
+/// required oracle there), soft-skip locally / on Windows when qpdf is absent.
+#[must_use]
+fn skip_if_qpdf_missing() -> bool {
+    if qpdf_available() {
+        return false;
+    }
+    let on_ci = std::env::var_os("CI").is_some();
+    let on_windows = cfg!(target_os = "windows");
+    if on_ci && !on_windows {
+        panic!(
+            "qpdf is required for cli_linearize_objstm tests on CI (Linux); \
+             install qpdf in the workflow before running this test suite"
+        );
+    }
+    eprintln!(
+        "skipping qpdf cross-check: qpdf not available (target_os={}, CI={})",
+        std::env::consts::OS,
+        on_ci
+    );
+    true
+}
+
 fn qpdf_check_linearization(path: &std::path::Path) -> (bool, String) {
-    let out = StdCommand::new("/usr/bin/qpdf")
+    let out = StdCommand::new("qpdf")
         .args(["--check-linearization", path.to_str().unwrap()])
         .output()
         .expect("spawn qpdf");
@@ -162,12 +193,17 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
         .assert()
         .success();
 
-    let (ok, msg) = qpdf_check_linearization(&out_disable);
-    assert!(ok, "qpdf check must still pass on the disable path: {msg}");
-    assert!(
-        msg.contains("no linearization errors"),
-        "disable path must remain qpdf-clean: {msg}"
-    );
+    // qpdf cross-check is skipped when qpdf is unavailable (soft-skip locally,
+    // hard-fail on Linux CI) — the byte-identity assertions below do not need
+    // qpdf and always run.
+    if !skip_if_qpdf_missing() {
+        let (ok, msg) = qpdf_check_linearization(&out_disable);
+        assert!(ok, "qpdf check must still pass on the disable path: {msg}");
+        assert!(
+            msg.contains("no linearization errors"),
+            "disable path must remain qpdf-clean: {msg}"
+        );
+    }
 
     let dis = std::fs::read(&out_disable).unwrap();
     let def = std::fs::read(&out_default).unwrap();
@@ -197,6 +233,9 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
 #[test]
 #[ignore = "flpdf-9hc.5.8.4: needs split xref-stream linearized layout; tracked as follow-up"]
 fn linearize_generate_qpdf_check_clean() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("lin_gen.pdf");
     Command::cargo_bin("flpdf")
