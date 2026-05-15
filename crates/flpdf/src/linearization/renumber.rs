@@ -438,7 +438,17 @@ impl RenumberMap {
         let main_xref_slot = new_by_new_number.len() as u32;
         new_by_new_number.push(SENTINEL);
 
-        // Append container + member blocks, batch by batch.
+        // Append the container block first, then the member block
+        // (flpdf-9hc.5.8.4).  qpdf forbids a type-1 (uncompressed) xref entry
+        // after a type-2 (compressed) one within a single cross-reference
+        // stream.  Containers are type-1 and members are type-2, so with TWO
+        // or more containers (Part-3 + Part-4 once Part-3 packing is enabled)
+        // the original interleaved `[container, members, container, members]`
+        // order would place a later container's type-1 entry after an earlier
+        // batch's type-2 members — the interleave qpdf rejects.  Emitting
+        // every container first, then every member, keeps the main xref
+        // stream's `/Index` range strictly `type-1* type-2*` (still the
+        // single-container 56u layout when there is only one batch).
         let mut container_numbers: Vec<u32> = Vec::with_capacity(batches.len());
         for batch in batches {
             if batch.is_empty() {
@@ -447,6 +457,8 @@ impl RenumberMap {
             let container_num = new_by_new_number.len() as u32;
             new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
             container_numbers.push(container_num);
+        }
+        for batch in batches {
             for &member in batch {
                 assert!(
                     self.by_original.contains_key(&member),
@@ -935,5 +947,59 @@ mod tests {
             ..Default::default()
         };
         let _ = RenumberMap::from_plan(&plan);
+    }
+
+    /// flpdf-9hc.5.8.4: with two ObjStm batches the relocated layout must
+    /// place **all** container slots before **all** member slots, so each
+    /// split-xref `/Index` range stays strictly `type-1* type-2*` (qpdf
+    /// rejects a type-1 entry after a type-2 one in a cross-reference
+    /// stream).  The single-batch (flpdf-56u Part-4-only) layout is a
+    /// degenerate case of the same rule.
+    #[test]
+    fn relocate_orders_all_containers_before_all_members() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+
+        // Two batches: emulate a Part-3 batch (5 0 R) and a Part-4 batch
+        // (4 0 R, 7 0 R).  Both refs are present in the map (part3_objects /
+        // part4_other_pages_private of two_page_plan).
+        let batches = vec![
+            vec![ObjectRef::new(5, 0)],
+            vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+        ];
+        let relocation = rn.relocate_objstm_members(&batches);
+
+        assert_eq!(
+            relocation.container_numbers.len(),
+            2,
+            "two non-empty batches must yield two container numbers"
+        );
+        let c0 = relocation.container_numbers[0];
+        let c1 = relocation.container_numbers[1];
+        let members: Vec<u32> = batches
+            .iter()
+            .flatten()
+            .map(|&m| rn.new_for_original(m).unwrap().number)
+            .collect();
+
+        // Every container number must be strictly below every member number.
+        let max_container = c0.max(c1);
+        let min_member = *members.iter().min().unwrap();
+        assert!(
+            max_container < min_member,
+            "all containers ({c0}, {c1}) must precede all members ({members:?})"
+        );
+        // Containers are contiguous and recorded in batch order.
+        assert_eq!(
+            c1,
+            c0 + 1,
+            "container slots must be contiguous, batch-ordered"
+        );
+        // Reserved split-xref slots stay below the container block.
+        assert!(
+            relocation.main_xref_slot < c0,
+            "main xref slot ({}) must precede the container block ({c0})",
+            relocation.main_xref_slot
+        );
     }
 }
