@@ -601,6 +601,289 @@ fn r5_and_r6_reject_malformed_encrypt_metadata() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// flpdf-9hc.3.20: user_password_matched / owner_password_matched API parity
+//
+// Acceptance matrix: for each encryption version, opening with the USER
+// password must yield (user=true, owner=false), opening with the OWNER
+// password must yield (user=false, owner=true), and a plaintext document
+// must yield (user=false, owner=false).
+//
+// Unauthenticated encrypted PDFs are untestable because `Pdf::open_with_options`
+// returns `Err` on auth failure — there is no API that constructs an
+// authenticated-but-failed `Pdf` — so that sub-case is skipped with this note.
+//
+// Encryption versions covered:
+//   V=1/R=2  — encrypted_v1_owner_password_fixture (user="", owner="owner")
+//   V=4/R=4  — encrypted_v4_aes_known_password_fixture (user="", owner="ownerpass")
+//   V=5/R=5  — encrypted_r5_or_r6_minimal_pdf(5) (user="userpass", owner="ownerpass")
+//   V=5/R=6  — encrypted_r5_or_r6_minimal_pdf(6) (user="userpass", owner="ownerpass")
+// ---------------------------------------------------------------------------
+
+#[test]
+fn password_matched_flags_v1_r2_user_password() {
+    // V=1/R=2 (40-bit RC4, "V=2" shorthand in the design).
+    // encrypted_r2_reader_fixture is built with user password "" (empty string).
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r2_reader_fixture()),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        pdf.user_password_matched(),
+        "empty user password should match /U"
+    );
+    assert!(
+        !pdf.owner_password_matched(),
+        "empty user password must not match /O"
+    );
+}
+
+#[test]
+fn password_matched_flags_v1_r2_owner_password() {
+    // V=1/R=2 (40-bit RC4). Owner password is "owner".
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_v1_owner_password_fixture()),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"owner".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !pdf.user_password_matched(),
+        "owner password must not match /U"
+    );
+    assert!(
+        pdf.owner_password_matched(),
+        "owner password should match /O"
+    );
+}
+
+#[test]
+fn password_matched_flags_v4_r4_user_password() {
+    // V=4/R=4 (AES-128). User password is "".
+    let pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_aes_known_password_fixture(),
+    ))
+    .unwrap();
+
+    assert!(
+        pdf.user_password_matched(),
+        "empty user password should match /U"
+    );
+    assert!(
+        !pdf.owner_password_matched(),
+        "empty user password must not match /O"
+    );
+}
+
+#[test]
+fn password_matched_flags_v4_r4_owner_password() {
+    // V=4/R=4 (AES-128). Owner password is "ownerpass".
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_v4_aes_known_password_fixture()),
+        PdfOpenOptions {
+            password: b"ownerpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !pdf.user_password_matched(),
+        "owner password must not match /U"
+    );
+    assert!(
+        pdf.owner_password_matched(),
+        "owner password should match /O"
+    );
+}
+
+#[test]
+fn password_matched_flags_v5_r5_user_password() {
+    // V=5/R=5 (AES-256, deprecated). User password is "userpass".
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        pdf.user_password_matched(),
+        "user password should match /U for R=5"
+    );
+    assert!(
+        !pdf.owner_password_matched(),
+        "user password must not match /O for R=5"
+    );
+}
+
+#[test]
+fn password_matched_flags_v5_r5_owner_password() {
+    // V=5/R=5 (AES-256, deprecated). Owner password is "ownerpass".
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
+        PdfOpenOptions {
+            allow_weak_crypto: true,
+            password: b"ownerpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !pdf.user_password_matched(),
+        "owner password must not match /U for R=5"
+    );
+    assert!(
+        pdf.owner_password_matched(),
+        "owner password should match /O for R=5"
+    );
+}
+
+#[test]
+fn password_matched_flags_v5_r6_user_password() {
+    // V=5/R=6 (AES-256). User password is "userpass".
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(6)),
+        PdfOpenOptions {
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        pdf.user_password_matched(),
+        "user password should match /U for R=6"
+    );
+    assert!(
+        !pdf.owner_password_matched(),
+        "user password must not match /O for R=6"
+    );
+}
+
+#[test]
+fn password_matched_flags_v5_r6_owner_password() {
+    // V=5/R=6 (AES-256). Owner password is "ownerpass".
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(6)),
+        PdfOpenOptions {
+            password: b"ownerpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !pdf.user_password_matched(),
+        "owner password must not match /U for R=6"
+    );
+    assert!(
+        pdf.owner_password_matched(),
+        "owner password should match /O for R=6"
+    );
+}
+
+#[test]
+fn password_matched_flags_plaintext_document() {
+    // Unencrypted document: both flags must always be false.
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    assert!(
+        !pdf.user_password_matched(),
+        "plaintext PDF must have user_password_matched() == false"
+    );
+    assert!(
+        !pdf.owner_password_matched(),
+        "plaintext PDF must have owner_password_matched() == false"
+    );
+}
+
+/// V=4/R=4 AES-128 fixture with a known user password (empty string) and a
+/// known owner password ("ownerpass").  Built with Algorithm 3 to produce a
+/// correct /O entry so that `check_owner_password_v4` can verify it.
+fn encrypted_v4_aes_known_password_fixture() -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let p = -3904i32;
+    let o = r4_owner_key(b"ownerpass", b"");
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = r4_user_key(&file_key, &id0);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /StdCF /StrF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Compute the `/O` entry for a V=4/R=4 Standard Security Handler given a
+/// known owner password and user password (PDF §7.6.3.4 Algorithm 3, R=4 path).
+///
+/// This is the forward direction of `check_owner_password_v4` and is used
+/// only in test fixtures.
+fn r4_owner_key(owner_pw: &[u8], user_pw: &[u8]) -> [u8; 32] {
+    // Step 1: Pad/truncate the owner password to 32 bytes.
+    let mut padded_owner = [0u8; 32];
+    let n = owner_pw.len().min(32);
+    padded_owner[..n].copy_from_slice(&owner_pw[..n]);
+    padded_owner[n..].copy_from_slice(&PASSWORD_PADDING[..32 - n]);
+
+    // Step 2: MD5(padded_owner), then 50× MD5 (R>=3); take first 16 bytes.
+    let mut hasher = Md5::new();
+    hasher.update(padded_owner);
+    let mut digest = hasher.finalize().to_vec();
+    for _ in 0..50 {
+        let mut h = Md5::new();
+        h.update(&digest);
+        digest = h.finalize().to_vec();
+    }
+    let rc4_key = &digest[..16];
+
+    // Step 3: Pad/truncate the user password to 32 bytes.
+    let mut padded_user = [0u8; 32];
+    let m = user_pw.len().min(32);
+    padded_user[..m].copy_from_slice(&user_pw[..m]);
+    padded_user[m..].copy_from_slice(&PASSWORD_PADDING[..32 - m]);
+
+    // Step 4: 20 ascending RC4 passes (Algorithm 3 forward, R>=3).
+    let mut data = padded_user.to_vec();
+    for i in 0u8..20 {
+        let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
+        data = rc4_crypt(&xor_key, &data);
+    }
+
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&data[..32]);
+    o
+}
+
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let obj1_offset = bytes.len();
