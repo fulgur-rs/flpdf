@@ -66,7 +66,7 @@ use crate::linearization::hint_shared::SharedObjectHintTable;
 use crate::linearization::hint_stream::encode_hint_stream;
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::LinearizationPlan;
-use crate::linearization::renumber::RenumberMap;
+use crate::linearization::renumber::{ObjStmRelocation, RenumberMap};
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
@@ -118,18 +118,143 @@ impl ObjStmLayout {
         self.part3.is_empty() && self.part4.is_empty()
     }
 
-    /// Number of container objects (each consumes one fresh object number).
-    fn container_count(&self) -> usize {
-        self.part3.len() + self.part4.len()
+    /// Resolve the Part-tagged, writer-filtered ObjStm batch plan.
+    ///
+    /// This is the single source of truth for *which* objects are ObjStm
+    /// members and *in what order* — consumed both by
+    /// [`RenumberMap::relocate_objstm_members`] (slot allocation) and by
+    /// [`ObjStmLayout::build`] (container construction), so the two never
+    /// disagree about membership or pair-table order.
+    fn resolve_batches<R: Read + Seek>(
+        plan: &LinearizationPlan,
+        pdf: &mut Pdf<R>,
+        options: &WriteOptions,
+    ) -> Result<crate::linearization::plan::ObjStmBatchPlan> {
+        let config = planner_config_from_options(options);
+        let batch_plan = plan.objstm_batches(pdf, &config)?;
+
+        // Writer-level invariant (qpdf linearization rule, not encoded by the
+        // 5.8.1 planner): per-page *private* objects must remain plain
+        // indirects — qpdf rejects a linearized file whose page dictionaries
+        // are compressed.  Drop any `part4_other_pages_private` member here.
+        let other_pages_private: std::collections::BTreeSet<ObjectRef> =
+            plan.part4_other_pages_private.iter().copied().collect();
+        let filter_batches = |batches: Vec<Vec<ObjectRef>>| -> Vec<Vec<ObjectRef>> {
+            batches
+                .into_iter()
+                .filter_map(|batch| {
+                    let kept: Vec<ObjectRef> = batch
+                        .into_iter()
+                        .filter(|r| !other_pages_private.contains(r))
+                        .collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some(kept)
+                    }
+                })
+                .collect()
+        };
+        Ok(crate::linearization::plan::ObjStmBatchPlan {
+            part3_batches: filter_batches(batch_plan.part3_batches),
+            part4_batches: filter_batches(batch_plan.part4_batches),
+        })
     }
 
-    /// Build the layout from the planner's Part-tagged batches.
+    /// The flat batch order (Part-3 then Part-4) fed to
+    /// [`RenumberMap::relocate_objstm_members`].
+    fn flat_batches(batch_plan: &crate::linearization::plan::ObjStmBatchPlan) -> Vec<Vec<ObjectRef>> {
+        batch_plan
+            .part3_batches
+            .iter()
+            .chain(&batch_plan.part4_batches)
+            .cloned()
+            .collect()
+    }
+
+    /// Build the layout from an already-resolved batch plan, mapping every
+    /// member + container through the **relocated** `renumber` map.
     ///
-    /// Container numbers are allocated deterministically above the highest
-    /// `RenumberMap` slot (`renumber.len()`): Part-3 batches first, then
-    /// Part-4 batches.  Every member ref is mapped through `renumber`; a
-    /// missing entry is a planner / renumber inconsistency and is surfaced
-    /// loudly rather than silently dropping an object from the file.
+    /// `container_numbers` are the per-batch container object numbers returned
+    /// by [`RenumberMap::relocate_objstm_members`] (Part-3 batches first, then
+    /// Part-4), so the layout never re-derives numbers independently.  Every
+    /// member ref is mapped through `renumber`; a missing entry is a planner /
+    /// renumber inconsistency and is surfaced loudly.
+    fn build_from_batches(
+        batch_plan: &crate::linearization::plan::ObjStmBatchPlan,
+        container_numbers: &[u32],
+        renumber: &RenumberMap,
+    ) -> Result<Self> {
+        if batch_plan.part3_batches.is_empty() && batch_plan.part4_batches.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut member_to_container = BTreeMap::new();
+
+        let take = |batches: &[Vec<ObjectRef>],
+                    out: &mut Vec<ObjStmContainer>,
+                    map: &mut BTreeMap<ObjectRef, (u32, u32)>,
+                    container_iter: &mut std::vec::IntoIter<u32>|
+         -> Result<()> {
+            for batch in batches {
+                if batch.is_empty() {
+                    continue;
+                }
+                let container_new_num = container_iter.next().ok_or_else(|| {
+                    crate::Error::Unsupported(
+                        "linearization writer: ObjStm container-number stream exhausted \
+                         (renumber relocation / batch-plan inconsistency)"
+                            .to_string(),
+                    )
+                })?;
+                let mut members = Vec::with_capacity(batch.len());
+                for (idx, &orig) in batch.iter().enumerate() {
+                    let new_ref = renumber.new_for_original(orig).ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "linearization writer: ObjStm member {orig} has no renumber \
+                             entry (planner / renumber inconsistency)"
+                        ))
+                    })?;
+                    map.insert(orig, (container_new_num, idx as u32));
+                    members.push((orig, new_ref));
+                }
+                out.push(ObjStmContainer {
+                    container_new_num,
+                    members,
+                });
+            }
+            Ok(())
+        };
+
+        let container_numbers_vec: Vec<u32> = container_numbers.to_vec();
+        let mut container_iter = container_numbers_vec.into_iter();
+        let mut part3 = Vec::new();
+        let mut part4 = Vec::new();
+        take(
+            &batch_plan.part3_batches,
+            &mut part3,
+            &mut member_to_container,
+            &mut container_iter,
+        )?;
+        take(
+            &batch_plan.part4_batches,
+            &mut part4,
+            &mut member_to_container,
+            &mut container_iter,
+        )?;
+        let _ = container_iter;
+
+        Ok(Self {
+            part3,
+            part4,
+            member_to_container,
+        })
+    }
+
+    /// Legacy single-call builder (kept for the writer's internal unit tests
+    /// that do not exercise the relocation path).  Container numbers are
+    /// allocated deterministically above the highest `RenumberMap` slot.
+    #[cfg(test)]
     fn build<R: Read + Seek>(
         plan: &LinearizationPlan,
         renumber: &RenumberMap,
@@ -255,37 +380,6 @@ fn build_objstm_container_object<R: Read + Seek>(
     Ok(Object::Stream(stream))
 }
 
-/// Serialise xref-stream entry bytes with `W = [1, 8, 4]` for the dense
-/// object range `0..total_count`.  Mirrors the writer's
-/// `build_xref_stream_bytes` field widths exactly (type, 8-byte field 2,
-/// 4-byte field 3) so existing readers/qpdf parse it identically.
-fn build_linearized_xref_stream_bytes(
-    xref_offsets: &BTreeMap<u32, usize>,
-    member_to_container: &BTreeMap<u32, (u32, u32)>,
-    total_count: u32,
-) -> Vec<u8> {
-    let mut data = Vec::with_capacity(total_count as usize * 13);
-    // Object 0 — free head.
-    data.push(0);
-    data.extend_from_slice(&0u64.to_be_bytes());
-    data.extend_from_slice(&65535u32.to_be_bytes()[0..4]);
-    for number in 1..total_count {
-        if let Some(&off) = xref_offsets.get(&number) {
-            data.push(1);
-            data.extend_from_slice(&(off as u64).to_be_bytes());
-            data.extend_from_slice(&0u32.to_be_bytes()[0..4]);
-        } else if let Some(&(container, index)) = member_to_container.get(&number) {
-            data.push(2);
-            data.extend_from_slice(&u64::from(container).to_be_bytes());
-            data.extend_from_slice(&index.to_be_bytes()[0..4]);
-        } else {
-            data.push(0);
-            data.extend_from_slice(&0u64.to_be_bytes());
-            data.extend_from_slice(&0u32.to_be_bytes()[0..4]);
-        }
-    }
-    data
-}
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -591,46 +685,49 @@ fn write_main_xref_and_trailer(
     (xref_start, xref_first_entry_offset)
 }
 
-/// Write the Part 6 cross-reference **stream** (for ObjStm-bearing output)
-/// covering objects `0..total_count` plus the xref stream object itself,
-/// followed by a trailing `startxref`.
+/// Emit the **split** linearized cross-reference streams (flpdf-56u) for an
+/// ObjStm-bearing file: a first-page (Part-1) xref stream followed by the
+/// main (Part-6) xref stream, with the `/Prev` chain main → first.
 ///
-/// `total_count` here is the `/Size` value that already accounts for every
-/// plain object, every ObjStm container, and the param-dict / hint-stream
-/// reservations — i.e. `renumber.len() + 1 + container_count`.  The xref
-/// stream object is assigned object number `total_count` and `/Size` becomes
-/// `total_count + 1` so the dense `[0, /Size)` /Index range stays contiguous,
-/// matching the structure `write_pdf_full_rewrite` emits.
+/// qpdf's linearization checker forbids a type-1 (uncompressed) entry after a
+/// type-2 (compressed) one *within a single xref stream*.  The relocated
+/// `RenumberMap` numbers every non-member object (incl. both xref-stream
+/// objects and the containers) below the contiguous trailing block of
+/// type-2 members, so each stream carries a single contiguous `/Index`
+/// range with no interleave:
 ///
-/// Returns `(prev_offset, t_first_entry_offset)` chosen so the back-patcher's
-/// existing contract holds:
-/// * `/Prev` (`last_xref_keyword_offset`) = byte offset of the xref stream
-///   object header (qpdf's convention; equals the trailing `startxref`).
-/// * `/T` = `t_first_entry_offset - 1` = `prev_offset - 1` (the byte before
-///   the xref stream object header — qpdf's "byte before first entry"
-///   convention adapted to xref-stream form).
+/// * **first-page** xref stream (`relocation.first_xref_slot`): `/Index [0,
+///   first_xref_slot + 1]` — objects `0 ..= first_xref_slot`, all type-1
+///   (param dict, hint, catalog, Part-2, Part-3-plain, Part-3 containers,
+///   and the first-page xref object itself).
+/// * **main** xref stream (`relocation.main_xref_slot`): `/Index
+///   [main_xref_slot, Size − main_xref_slot]` — objects `main_xref_slot
+///   ..= last`, type-1 (the main xref object + remaining containers) then
+///   type-2 (all ObjStm members).
+///
+/// Both streams are emitted at the end of the body (PDF permits xref streams
+/// anywhere; qpdf validates `/T`, `/Prev` and `startxref` consistency, not
+/// physical position).  Returns `(main_xref_obj_offset,
+/// main_xref_obj_offset + 1)` so the caller's `/Prev` (= main xref object
+/// offset) and `/T` (= that − 1) contract is unchanged from the single-stream
+/// path.
 #[allow(clippy::too_many_arguments)]
-fn write_main_xref_stream_and_trailer(
+fn write_split_xref_streams_and_trailer(
     bytes: &mut Vec<u8>,
     xref_offsets: &BTreeMap<u32, usize>,
     objstm_layout: &ObjStmLayout,
-    total_count: u32,
+    relocation: &ObjStmRelocation,
+    total_count: u32, // /Size (relocated renumber.len() + 1) — already final
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
     options: &WriteOptions,
 ) -> Result<(usize, usize)> {
-    // The xref stream object is the next number after every emitted object.
-    let xref_obj_num = total_count;
-    let final_size = xref_obj_num.checked_add(1).ok_or_else(|| {
-        crate::Error::Unsupported(
-            "linearization writer: xref-stream /Size overflows u32".to_string(),
-        )
-    })?;
+    let final_size = total_count;
+    let first_xref_num = relocation.first_xref_slot;
+    let main_xref_num = relocation.main_xref_slot;
 
-    // Build member new-number → (container new-number, index) for the
-    // type-2 xref entries.  The layout stores renumbered member refs in
-    // pair-table order, so the index here matches the container body.
+    // member new-number → (container new-number, index) for type-2 entries.
     let mut member_new: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
     for container in objstm_layout.part3.iter().chain(&objstm_layout.part4) {
         for (idx, &(_orig, new_ref)) in container.members.iter().enumerate() {
@@ -638,25 +735,65 @@ fn write_main_xref_stream_and_trailer(
         }
     }
 
-    let xref_obj_offset = bytes.len();
+    // Helper: encode an `/Index [start, count]` slice of the dense table.
+    let encode_slice = |offs: &BTreeMap<u32, usize>, start: u32, count: u32| -> Result<Vec<u8>> {
+        let mut data = Vec::with_capacity(count as usize * 13);
+        for number in start..start + count {
+            if number == 0 {
+                data.push(0);
+                data.extend_from_slice(&0u64.to_be_bytes());
+                data.extend_from_slice(&65535u32.to_be_bytes()[0..4]);
+            } else if let Some(&off) = offs.get(&number) {
+                data.push(1);
+                data.extend_from_slice(&(off as u64).to_be_bytes());
+                data.extend_from_slice(&0u32.to_be_bytes()[0..4]);
+            } else if let Some(&(container, index)) = member_new.get(&number) {
+                data.push(2);
+                data.extend_from_slice(&u64::from(container).to_be_bytes());
+                data.extend_from_slice(&index.to_be_bytes()[0..4]);
+            } else {
+                data.push(0);
+                data.extend_from_slice(&0u64.to_be_bytes());
+                data.extend_from_slice(&0u32.to_be_bytes()[0..4]);
+            }
+        }
+        Ok(data)
+    };
 
-    // Object `xref_obj_num` (the xref stream itself) lives at `xref_obj_offset`.
-    let mut offsets_with_self = xref_offsets.clone();
-    offsets_with_self.insert(xref_obj_num, xref_obj_offset);
+    let common_id = || -> Option<Object> {
+        let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
+        if options.static_id {
+            let first_id = match source_trailer.get("ID") {
+                Some(Object::Array(values))
+                    if values.len() == 2 && matches!(values[0], Object::String(_)) =>
+                {
+                    values[0].clone()
+                }
+                _ => pi_bytes.clone(),
+            };
+            Some(Object::Array(vec![first_id, pi_bytes]))
+        } else {
+            source_trailer.get("ID").cloned()
+        }
+    };
 
-    let stream_data =
-        build_linearized_xref_stream_bytes(&offsets_with_self, &member_new, final_size);
+    // ---- First-page (Part-1) xref stream: /Index [0, first_xref_num + 1] ----
+    let first_count = first_xref_num
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("xref /Index overflow".to_string()))?;
+    let first_xref_offset = bytes.len();
+    let mut offs1 = xref_offsets.clone();
+    offs1.insert(first_xref_num, first_xref_offset);
 
-    // FlateDecode-compress the entry bytes (qpdf always compresses xref
-    // streams; readers expect /Filter to be honoured).
-    let mut encode_dict = Dictionary::new();
-    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = crate::filters::encode_stream_data(&encode_dict, &stream_data)?;
+    let first_data = encode_slice(&offs1, 0, first_count)?;
+    let mut enc_dict = Dictionary::new();
+    enc_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let first_encoded = crate::filters::encode_stream_data(&enc_dict, &first_data)?;
 
-    let mut dict = Dictionary::new();
-    dict.insert("Type", Object::Name(b"XRef".to_vec()));
-    dict.insert("Size", Object::Integer(i64::from(final_size)));
-    dict.insert(
+    let mut d1 = Dictionary::new();
+    d1.insert("Type", Object::Name(b"XRef".to_vec()));
+    d1.insert("Size", Object::Integer(i64::from(final_size)));
+    d1.insert(
         "W",
         Object::Array(vec![
             Object::Integer(1),
@@ -664,44 +801,83 @@ fn write_main_xref_stream_and_trailer(
             Object::Integer(4),
         ]),
     );
-    dict.insert(
+    d1.insert(
         "Index",
         Object::Array(vec![
             Object::Integer(0),
-            Object::Integer(i64::from(final_size)),
+            Object::Integer(i64::from(first_count)),
         ]),
     );
-    dict.insert("Root", Object::Reference(catalog_new_ref));
+    d1.insert("Root", Object::Reference(catalog_new_ref));
     if let Some(info_ref) = info_new_ref {
-        dict.insert("Info", Object::Reference(info_ref));
+        d1.insert("Info", Object::Reference(info_ref));
     }
-    // /ID — same policy as the classic Part-6 trailer / Part-1 trailer.
-    let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
-    if options.static_id {
-        let first_id = match source_trailer.get("ID") {
-            Some(Object::Array(values))
-                if values.len() == 2 && matches!(values[0], Object::String(_)) =>
-            {
-                values[0].clone()
-            }
-            _ => pi_bytes.clone(),
-        };
-        dict.insert("ID", Object::Array(vec![first_id, pi_bytes]));
-    } else if let Some(id_obj) = source_trailer.get("ID") {
-        dict.insert("ID", id_obj.clone());
+    if let Some(id) = common_id() {
+        d1.insert("ID", id);
     }
-    dict.insert("Length", Object::Integer(encoded.len() as i64));
-    dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-
-    let xref_stream = Object::Stream(Stream::new(dict, encoded));
-    bytes.extend_from_slice(format!("{xref_obj_num} 0 obj\n").as_bytes());
-    xref_stream.write_pdf(bytes);
+    d1.insert("Length", Object::Integer(first_encoded.len() as i64));
+    d1.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    bytes.extend_from_slice(format!("{first_xref_num} 0 obj\n").as_bytes());
+    Object::Stream(Stream::new(d1, first_encoded)).write_pdf(bytes);
     bytes.extend_from_slice(b"\nendobj\n");
-    bytes.extend_from_slice(format!("startxref\n{xref_obj_offset}\n%%EOF\n").as_bytes());
 
-    // /Prev = xref stream object offset; /T = that offset - 1 (caller applies
-    // the `saturating_sub(1)` on `last_xref_first_entry_offset`).
-    Ok((xref_obj_offset, xref_obj_offset + 1))
+    // ---- Main (Part-6) xref stream: /Index [main_xref_num, Size − main] ----
+    let main_count = final_size
+        .checked_sub(main_xref_num)
+        .ok_or_else(|| crate::Error::Unsupported("xref /Index underflow".to_string()))?;
+    let main_xref_offset = bytes.len();
+    let mut offs2 = xref_offsets.clone();
+    offs2.insert(first_xref_num, first_xref_offset);
+    offs2.insert(main_xref_num, main_xref_offset);
+
+    let main_data = encode_slice(&offs2, main_xref_num, main_count)?;
+    let mut enc_dict2 = Dictionary::new();
+    enc_dict2.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let main_encoded = crate::filters::encode_stream_data(&enc_dict2, &main_data)?;
+
+    let mut d2 = Dictionary::new();
+    d2.insert("Type", Object::Name(b"XRef".to_vec()));
+    d2.insert("Size", Object::Integer(i64::from(final_size)));
+    d2.insert(
+        "W",
+        Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(8),
+            Object::Integer(4),
+        ]),
+    );
+    d2.insert(
+        "Index",
+        Object::Array(vec![
+            Object::Integer(i64::from(main_xref_num)),
+            Object::Integer(i64::from(main_count)),
+        ]),
+    );
+    d2.insert("Root", Object::Reference(catalog_new_ref));
+    if let Some(info_ref) = info_new_ref {
+        d2.insert("Info", Object::Reference(info_ref));
+    }
+    if let Some(id) = common_id() {
+        d2.insert("ID", id);
+    }
+    // /Prev → first-page xref stream object offset (qpdf chains main → first).
+    d2.insert("Prev", Object::Integer(first_xref_offset as i64));
+    d2.insert("Length", Object::Integer(main_encoded.len() as i64));
+    d2.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    bytes.extend_from_slice(format!("{main_xref_num} 0 obj\n").as_bytes());
+    Object::Stream(Stream::new(d2, main_encoded)).write_pdf(bytes);
+    bytes.extend_from_slice(b"\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{main_xref_offset}\n%%EOF\n").as_bytes());
+
+    // qpdf's `/T` rule for a split linearized file is the byte just before
+    // the **first-page** cross-reference stream (the object the main xref's
+    // `/Prev` chains back to) — *not* the main xref.  The caller computes
+    // `/T = second_return.saturating_sub(1)`, so return `first_xref_offset`
+    // here (caller's `saturating_sub(1)` then yields `first_xref_offset −
+    // 1`).  The first element feeds the (now-unused on this path) Part-1
+    // trailer `/Prev`; keep it pointing at the main xref for callers that
+    // still read it for convergence diagnostics.
+    Ok((main_xref_offset, first_xref_offset))
 }
 
 /// Build the hint stream object bytes for a given compressed payload.
@@ -746,6 +922,7 @@ fn do_write_pass<R: Read + Seek>(
     options: &WriteOptions,
     source_trailer: &Dictionary,
     objstm_layout: &ObjStmLayout,
+    relocation: &ObjStmRelocation,
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -764,16 +941,29 @@ fn do_write_pass<R: Read + Seek>(
     let param_dict_absolute_offset = part1.obj1_offset;
     bytes.extend_from_slice(&part1.bytes);
     xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
-    let (_p1_xref_offset, first_trailer_prev_range) = write_part1_xref_and_trailer(
-        &mut bytes,
-        param_dict_absolute_offset,
-        param_dict_obj_number,
-        total_count,
-        catalog_new_ref,
-        info_new_ref,
-        options,
-        source_trailer,
-    );
+
+    // The classic Part-1 mini-xref + first trailer is only emitted on the
+    // non-ObjStm path.  For ObjStm-bearing output the first-page (Part-1)
+    // *xref stream* (written at end of body by `write_split_xref_streams_*`)
+    // takes its place — emitting both would leave a stray classic `xref`
+    // subsection that qpdf's linearization checker rejects.  Returning an
+    // empty `/Prev` range tells the back-patcher there is no Part-1 trailer
+    // `/Prev` to patch (the param dict's own `/Prev` is still patched).
+    let first_trailer_prev_range = if objstm_layout.is_empty() {
+        let (_p1_xref_offset, range) = write_part1_xref_and_trailer(
+            &mut bytes,
+            param_dict_absolute_offset,
+            param_dict_obj_number,
+            total_count,
+            catalog_new_ref,
+            info_new_ref,
+            options,
+            source_trailer,
+        );
+        range
+    } else {
+        0..0
+    };
 
     // Hint stream object
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
@@ -883,10 +1073,11 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
         )
     } else {
-        write_main_xref_stream_and_trailer(
+        write_split_xref_streams_and_trailer(
             &mut bytes,
             &xref_offsets,
             objstm_layout,
+            relocation,
             total_count,
             catalog_new_ref,
             info_new_ref,
@@ -1001,6 +1192,30 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // ObjStm relocation (flpdf-56u).
+    //
+    // qpdf's linearization checker forbids an uncompressed (type-1) xref
+    // entry appearing after a compressed (type-2) one within a cross-
+    // reference stream.  flpdf's classic slot allocation leaves ObjStm
+    // members at their low Part-3 slots while containers sit above
+    // `renumber.len()`, which interleaves type-1 and type-2 entries.
+    //
+    // Fix: resolve the writer-filtered batch plan ONCE, then relocate every
+    // member to a contiguous high-numbered block (qpdf "container < members,
+    // members trailing") and number each container directly below its
+    // members.  The resulting `local_renumber` is used everywhere downstream;
+    // when there are no ObjStm batches it is byte-identical to the input map
+    // (the relocation early-returns), so the Disable / non-ObjStm path is
+    // completely unchanged.
+    // ------------------------------------------------------------------
+    let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
+    let flat_batches = ObjStmLayout::flat_batches(&resolved_batch_plan);
+    let mut local_renumber = renumber.clone();
+    let relocation = local_renumber.relocate_objstm_members(&flat_batches);
+    let container_numbers = relocation.container_numbers.clone();
+    let renumber: &RenumberMap = &local_renumber;
+
     let eff_version = effective_pdf_version(pdf.version(), options, true);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
@@ -1022,26 +1237,25 @@ pub fn write_linearized<R: Read + Seek>(
     let hint_stream_new_num: u32 = renumber.hint_stream_slot();
 
     // ------------------------------------------------------------------
-    // Resolve the ObjStm layout once (stable across the convergence loop).
-    // Container numbers are allocated above every renumber slot, so the
-    // member pair tables never shift between iterations — only the
-    // surrounding byte offsets do (see the convergence note below).
+    // Build the ObjStm layout from the relocated map (stable across the
+    // convergence loop).  Container + member numbers now live INSIDE the
+    // renumber map (relocation appended them), so the pair tables never
+    // shift between iterations — only the surrounding byte offsets do.
     // ------------------------------------------------------------------
-    let objstm_layout = ObjStmLayout::build(plan, renumber, pdf, options)?;
-    let container_count = objstm_layout.container_count() as u32;
+    let objstm_layout =
+        ObjStmLayout::build_from_batches(&resolved_batch_plan, &container_numbers, renumber)?;
 
-    // Highest object number actually used in the output: the largest slot in
-    // the renumber map (`len()` already returns that), plus one fresh number
-    // per ObjStm container.  Adding 1 yields the /Size value (count =
-    // highest_number + 1, because object numbering is 1-based and Size counts
-    // the unused free-list entry at 0).  For the xref-stream Part-6 path the
-    // stream object consumes one more number; that final +1 is applied inside
-    // `write_main_xref_stream_and_trailer`.
+    // Highest object number actually used in the output.  After relocation
+    // the renumber map already counts every plain object, every ObjStm
+    // container, every member, AND both split xref-stream objects (the two
+    // reserved slots), so `len()` is the highest slot.  Adding 1 yields the
+    // /Size value (numbering is 1-based; Size counts the free entry at
+    // object 0).  No extra object number is consumed for the xref stream(s)
+    // on the ObjStm path — they live in their pre-reserved slots.
     let total_count: u32 = renumber
         .len()
         .checked_add(1)
         .and_then(|n| u32::try_from(n).ok())
-        .and_then(|n| n.checked_add(container_count))
         .ok_or_else(|| {
             crate::Error::Unsupported(
                 "linearization writer: /Size overflows u32 (too many objects / \
@@ -1122,6 +1336,7 @@ pub fn write_linearized<R: Read + Seek>(
             options,
             &source_trailer,
             &objstm_layout,
+            &relocation,
         )?;
 
         // ------------------------------------------------------------------
@@ -1451,6 +1666,7 @@ pub fn write_linearized<R: Read + Seek>(
                 options,
                 &source_trailer,
                 &objstm_layout,
+                &relocation,
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;

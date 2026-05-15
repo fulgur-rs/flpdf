@@ -258,7 +258,6 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
 //    ignored regression target so 5.8.4 can simply remove `#[ignore]`.
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "flpdf-9hc.5.8.4: needs split xref-stream linearized layout; tracked as follow-up"]
 fn linearize_generate_qpdf_check_clean() {
     if skip_if_qpdf_missing() {
         return;
