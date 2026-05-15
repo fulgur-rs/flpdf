@@ -867,9 +867,18 @@ impl LinearizationPlan {
         // constraints are mutually exclusive without redesigning the 56u
         // relocation, which is out of scope for 5.8.4.  Empirically, removing
         // this clear makes qpdf report "object count mismatch for page 0" and
-        // "shared object … in hint table but not computed list".  qpdf's own
-        // `--object-streams=generate` linearizer likewise leaves Part-3
-        // first-page shared objects uncompressed.  Part-4 (rest-of-document)
+        // "shared object … in hint table but not computed list".
+        //
+        // NOTE: qpdf itself *does* pack some Part-3 first-page shared objects
+        // (e.g. the font/resource dicts referenced by page 1) into an ObjStm.
+        // flpdf cannot match that member set while keeping
+        // `qpdf --check-linearization` clean, because 56u's split-xref tail
+        // relocation is incompatible with qpdf's positional shared-object
+        // numbering (above).  Matching qpdf's member set requires a
+        // section-aware renumber redesign — tracked as flpdf-ihb, and NOT
+        // required for epic 5.8 acceptance (the brainstorming-confirmed target
+        // is observable-equivalent: qpdf-clean + boundaries + round-trip + 3
+        // modes, not byte/member-set parity).  Part-4 (rest-of-document)
         // packing is unaffected.  Re-enable by removing this clear once
         // flpdf-ihb lands a section-aware renumber layout.
         plan.part3_batches.clear();
