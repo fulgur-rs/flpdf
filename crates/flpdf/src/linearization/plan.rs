@@ -2035,14 +2035,15 @@ mod tests {
 
         // Object 1: Catalog (plain indirect)
         let catalog_offset = bytes.len() as u32;
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-        );
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
         // ObjStm #7: members [2=Pages, 3=Page1, 5=Resources] at indices [0, 1, 2]
         let objstm1_members: &[(u32, &[u8])] = &[
             (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
-            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>",
+            ),
             (5, b"<< /Font << /F1 99 0 R >> >>"),
         ];
         let (stream1_data, first1) = build_objstm_payload_plan(objstm1_members);
@@ -2060,7 +2061,10 @@ mod tests {
 
         // ObjStm #8: members [4=Page2, 6=ineligible /Type /XRef dict] at indices [0, 1]
         let objstm2_members: &[(u32, &[u8])] = &[
-            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>"),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>",
+            ),
             (6, b"<< /Type /XRef >>"),
         ];
         let (stream2_data, first2) = build_objstm_payload_plan(objstm2_members);
@@ -2294,7 +2298,11 @@ mod tests {
             .expect("Preserve with cap=1 must succeed");
 
         // Each batch must have at most 1 member.
-        for batch in batch_plan.part3_batches.iter().chain(&batch_plan.part4_batches) {
+        for batch in batch_plan
+            .part3_batches
+            .iter()
+            .chain(&batch_plan.part4_batches)
+        {
             assert!(
                 batch.len() <= 1,
                 "with cap=1, each batch must have at most 1 member; got {} members: {batch:?}",
@@ -2313,9 +2321,18 @@ mod tests {
         let resources_ref = ObjectRef::new(5, 0);
         let pages_ref = ObjectRef::new(2, 0);
         let page2_ref = ObjectRef::new(4, 0);
-        assert!(all_batched.contains(&resources_ref), "5 0 R must be batched even with cap=1");
-        assert!(all_batched.contains(&pages_ref), "2 0 R must be batched even with cap=1");
-        assert!(all_batched.contains(&page2_ref), "4 0 R must be batched even with cap=1");
+        assert!(
+            all_batched.contains(&resources_ref),
+            "5 0 R must be batched even with cap=1"
+        );
+        assert!(
+            all_batched.contains(&pages_ref),
+            "2 0 R must be batched even with cap=1"
+        );
+        assert!(
+            all_batched.contains(&page2_ref),
+            "4 0 R must be batched even with cap=1"
+        );
     }
 
     // -----------------------------------------------------------------------
