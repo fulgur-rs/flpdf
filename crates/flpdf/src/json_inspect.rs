@@ -788,16 +788,210 @@ pub fn build_pagelabels_section<R: Read + Seek>(
     Ok(JsonValue::Array(result))
 }
 
+// ── build_outlines_section ────────────────────────────────────────────────────
+
+/// Walk a single outline item and return its JSON representation.
+///
+/// Each item has alphabetically-ordered keys: `action`, `count`, `dest`,
+/// `flags`, `kids`, `object`, `structureelement`, `title`.
+///
+/// The `seen` set prevents infinite loops due to cyclic `/First`/`/Next`
+/// links. `depth` / `max_depth` prevent unbounded recursion on deep trees.
+fn outline_entry_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    item_ref: crate::ObjectRef,
+    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<JsonValue, ConvertError> {
+    let item_obj = pdf.resolve(item_ref).map_err(ConvertError::from)?;
+    let item_dict = match item_obj {
+        Object::Dictionary(d) => d,
+        _ => {
+            // Not a dictionary — return a minimal entry with empty kids.
+            let object_str = format!("{} {} R", item_ref.number, item_ref.generation);
+            return Ok(JsonValue::Object(vec![
+                ("action".to_string(), JsonValue::Null),
+                ("count".to_string(), JsonValue::Null),
+                ("dest".to_string(), JsonValue::Null),
+                ("flags".to_string(), JsonValue::Null),
+                ("kids".to_string(), JsonValue::Array(vec![])),
+                ("object".to_string(), JsonValue::String(object_str)),
+                ("structureelement".to_string(), JsonValue::Null),
+                ("title".to_string(), JsonValue::Null),
+            ]));
+        }
+    };
+
+    let object_str = format!("{} {} R", item_ref.number, item_ref.generation);
+
+    // action: /A — only emit ref string when /A is an indirect Reference.
+    let action = match item_dict.get("A") {
+        Some(Object::Reference(r)) => JsonValue::String(format!("{} {} R", r.number, r.generation)),
+        _ => JsonValue::Null,
+    };
+
+    // count: /Count integer.
+    let count = match item_dict.get("Count") {
+        Some(Object::Integer(n)) => JsonValue::Integer(*n),
+        _ => JsonValue::Null,
+    };
+
+    // dest: /Dest — any value, converted via pdf_object_to_json.
+    let dest = match item_dict.get("Dest") {
+        Some(v) => pdf_object_to_json(v)?,
+        None => JsonValue::Null,
+    };
+
+    // flags: /F integer.
+    let flags = match item_dict.get("F") {
+        Some(Object::Integer(n)) => JsonValue::Integer(*n),
+        _ => JsonValue::Null,
+    };
+
+    // structureelement: /SE — only emit ref string when indirect Reference.
+    let structureelement = match item_dict.get("SE") {
+        Some(Object::Reference(r)) => JsonValue::String(format!("{} {} R", r.number, r.generation)),
+        _ => JsonValue::Null,
+    };
+
+    // title: /Title — decode as PDF text string, bare (no u:/b: prefix).
+    let title = match item_dict.get("Title") {
+        Some(Object::String(bytes)) => match decode_pdf_text_string(bytes) {
+            Some(s) => JsonValue::String(s),
+            None => JsonValue::Null,
+        },
+        _ => JsonValue::Null,
+    };
+
+    // kids: walk /First → /Next chain if depth allows.
+    let kids = if depth >= max_depth {
+        vec![]
+    } else {
+        // Get the /First reference for this item's children.
+        let first_ref = match item_dict.get("First") {
+            Some(Object::Reference(r)) => Some(*r),
+            _ => None,
+        };
+        collect_outline_chain(pdf, first_ref, seen, depth + 1, max_depth)?
+    };
+
+    Ok(JsonValue::Object(vec![
+        ("action".to_string(), action),
+        ("count".to_string(), count),
+        ("dest".to_string(), dest),
+        ("flags".to_string(), flags),
+        ("kids".to_string(), JsonValue::Array(kids)),
+        ("object".to_string(), JsonValue::String(object_str)),
+        ("structureelement".to_string(), structureelement),
+        ("title".to_string(), title),
+    ]))
+}
+
+/// Walk an outline item chain starting at `first_ref`, following `/Next`
+/// links, and return JSON entries for each item (recursively expanding kids).
+///
+/// `seen` is a shared cycle guard across the entire outline tree.
+fn collect_outline_chain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    first_ref: Option<crate::ObjectRef>,
+    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<Vec<JsonValue>, ConvertError> {
+    let mut entries = Vec::new();
+    let mut current = first_ref;
+
+    while let Some(item_ref) = current {
+        // Cycle guard: skip if already visited.
+        if !seen.insert(item_ref) {
+            break;
+        }
+
+        let entry = outline_entry_to_json(pdf, item_ref, seen, depth, max_depth)?;
+        entries.push(entry);
+
+        // Advance to the next sibling — must re-resolve to get /Next
+        // (outline_entry_to_json consumed the object).
+        let item_obj = pdf.resolve(item_ref).map_err(ConvertError::from)?;
+        current = match &item_obj {
+            Object::Dictionary(d) => match d.get("Next") {
+                Some(Object::Reference(r)) => Some(*r),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+
+    Ok(entries)
+}
+
+/// Build the qpdf JSON v2 `"outlines"` section.
+///
+/// Returns a [`JsonValue::Array`] where each element is a JSON object
+/// representing one root-level outline item (with `kids` recursively
+/// expanded).  Returns `JsonValue::Array(vec![])` when the document has no
+/// `/Outlines` entry or the outline dictionary has no `/First` child.
+///
+/// Each entry has keys in alphabetical order:
+/// `action`, `count`, `dest`, `flags`, `kids`, `object`,
+/// `structureelement`, `title`.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if any indirect object resolution fails.
+pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+
+    // Resolve the Catalog.
+    let catalog_ref = match pdf.root_ref() {
+        Some(r) => r,
+        None => return Ok(JsonValue::Array(vec![])),
+    };
+    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog_dict = match catalog {
+        Object::Dictionary(d) => d,
+        _ => return Ok(JsonValue::Array(vec![])),
+    };
+
+    // Look up /Outlines. May be absent, a direct Dictionary, or a Reference.
+    let outlines_val = match catalog_dict.get("Outlines") {
+        Some(v) => v.clone(),
+        None => return Ok(JsonValue::Array(vec![])),
+    };
+
+    // Resolve indirect reference if needed.
+    let outlines_dict = match outlines_val {
+        Object::Reference(r) => match pdf.resolve(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => d,
+            _ => return Ok(JsonValue::Array(vec![])),
+        },
+        Object::Dictionary(d) => d,
+        _ => return Ok(JsonValue::Array(vec![])),
+    };
+
+    // Get the /First reference for the root outline chain.
+    let first_ref = match outlines_dict.get("First") {
+        Some(Object::Reference(r)) => Some(*r),
+        _ => return Ok(JsonValue::Array(vec![])),
+    };
+
+    let mut seen = std::collections::BTreeSet::new();
+    let entries = collect_outline_chain(pdf, first_ref, &mut seen, 0, DEFAULT_MAX_PAGE_TREE_DEPTH)?;
+
+    Ok(JsonValue::Array(entries))
+}
+
 // ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
 
 /// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
 /// (`version`, `parameters`) with every section that flpdf currently
 /// implements.
 ///
-/// As of flpdf-9hc.11.5 this is: `version`, `parameters`, `pages`,
-/// `pagelabels`, `qpdf`. The remaining qpdf v2 sections (`acroform`,
-/// `attachments`, `encrypt`, `outlines`) will be inserted here as the
-/// respective subtasks (flpdf-9hc.11.6 / .7 / .8 / .9) land.
+/// As of flpdf-9hc.11.6 this is: `version`, `parameters`, `pages`,
+/// `pagelabels`, `outlines`, `qpdf`. The remaining qpdf v2 sections
+/// (`acroform`, `attachments`, `encrypt`) will be inserted here as the
+/// respective subtasks (flpdf-9hc.11.7 / .8 / .9) land.
 ///
 /// Key order matches qpdf v2 output: top-level keys are emitted in the
 /// fixed order shown in qpdf's `--json=2` output, not alphabetical.
@@ -819,6 +1013,9 @@ pub fn build_qpdf_json_v2<R: Read + Seek>(
 
     let pagelabels = build_pagelabels_section(pdf)?;
     pairs.push(("pagelabels".to_string(), pagelabels));
+
+    let outlines = build_outlines_section(pdf)?;
+    pairs.push(("outlines".to_string(), outlines));
 
     // qpdf metadata: maxobjectid is the highest object id present in the
     // xref table, *including* deleted/free entries — qpdf's JSON v2 spec
@@ -2023,11 +2220,18 @@ mod tests {
         let JsonValue::Object(pairs) = v2 else {
             panic!("expected Object at top level");
         };
-        // qpdf-style fixed order: version, parameters, pages, pagelabels, qpdf
+        // qpdf-style fixed order: version, parameters, pages, pagelabels, outlines, qpdf
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["version", "parameters", "pages", "pagelabels", "qpdf"]
+            vec![
+                "version",
+                "parameters",
+                "pages",
+                "pagelabels",
+                "outlines",
+                "qpdf"
+            ]
         );
     }
 
@@ -2099,5 +2303,339 @@ mod tests {
             .expect("pdfversion missing");
         // one-page.pdf header is "%PDF-1.3".
         assert_eq!(*pdf_version, JsonValue::String("1.3".to_string()));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // build_outlines_section tests (flpdf-9hc.11.6)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Helper: inject a synthetic /Outlines tree into the catalog of `pdf`.
+    ///
+    /// Creates the outline root dict at `outline_root_ref`, then places it
+    /// in the catalog's /Outlines entry.
+    fn patch_outline_root(
+        pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>,
+        outline_root_ref: crate::ObjectRef,
+        outline_root: Dictionary,
+    ) {
+        // Wire catalog → outline root.
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d,
+            _ => panic!("catalog is not a Dictionary"),
+        };
+        catalog.insert("Outlines", Object::Reference(outline_root_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        pdf.set_object(outline_root_ref, Object::Dictionary(outline_root));
+    }
+
+    // ── Test 1: No /Outlines → empty array ───────────────────────────────────
+
+    #[test]
+    fn outlines_missing_returns_empty_array() {
+        // one-page.pdf has no /Outlines — must return [].
+        let mut pdf = load_one_page_pdf();
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![]),
+            "missing /Outlines must yield empty array"
+        );
+    }
+
+    // ── Test 1b: All compat fixtures produce empty outlines ──────────────────
+
+    #[test]
+    fn outlines_compat_fixtures_all_empty() {
+        let fixtures = ["one-page.pdf", "three-page.pdf", "attachment-two-page.pdf"];
+        for name in fixtures {
+            let mut pdf = load_fixture_pdf(name);
+            let result = build_outlines_section(&mut pdf)
+                .unwrap_or_else(|e| panic!("{name}: build_outlines_section failed: {e:?}"));
+            assert_eq!(
+                result,
+                JsonValue::Array(vec![]),
+                "{name}: expected empty outlines array"
+            );
+        }
+    }
+
+    // ── Test 2: Single entry — synthetic PDF ─────────────────────────────────
+
+    #[test]
+    fn outlines_single_entry() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+
+        // Create outline root dictionary pointing to the single item.
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(item_ref));
+        outline_root.insert("Last", Object::Reference(item_ref));
+        outline_root.insert("Count", Object::Integer(1));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        // Create a single outline item.
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Chapter 1".to_vec()));
+        item.insert("Parent", Object::Reference(outline_root_ref));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = &result else {
+            panic!("expected Array, got {result:?}");
+        };
+        assert_eq!(entries.len(), 1, "expected 1 outline entry");
+
+        let JsonValue::Object(entry) = &entries[0] else {
+            panic!("entry is not an Object");
+        };
+
+        // Key order: action, count, dest, flags, kids, object, structureelement, title
+        let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "action",
+                "count",
+                "dest",
+                "flags",
+                "kids",
+                "object",
+                "structureelement",
+                "title"
+            ],
+            "key order must be alphabetical"
+        );
+
+        // action, count, dest, flags, structureelement = Null (absent in item)
+        assert_eq!(entry[0].1, JsonValue::Null, "action must be Null");
+        assert_eq!(entry[1].1, JsonValue::Null, "count must be Null");
+        assert_eq!(entry[2].1, JsonValue::Null, "dest must be Null");
+        assert_eq!(entry[3].1, JsonValue::Null, "flags must be Null");
+        // kids = [] (no /First in item)
+        assert_eq!(entry[4].1, JsonValue::Array(vec![]), "kids must be empty");
+        // object = "101 0 R"
+        assert_eq!(
+            entry[5].1,
+            JsonValue::String("101 0 R".to_string()),
+            "object mismatch"
+        );
+        assert_eq!(entry[6].1, JsonValue::Null, "structureelement must be Null");
+        // title = bare "Chapter 1" (no u: prefix)
+        assert_eq!(
+            entry[7].1,
+            JsonValue::String("Chapter 1".to_string()),
+            "title must be bare string without u: prefix"
+        );
+    }
+
+    // ── Test 3: Hierarchical tree (parent + 2 children) ──────────────────────
+
+    #[test]
+    fn outlines_hierarchical_tree() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let parent_ref = crate::ObjectRef::new(101, 0);
+        let child1_ref = crate::ObjectRef::new(102, 0);
+        let child2_ref = crate::ObjectRef::new(103, 0);
+
+        // Outline root → parent.
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(parent_ref));
+        outline_root.insert("Last", Object::Reference(parent_ref));
+        outline_root.insert("Count", Object::Integer(3)); // parent + 2 children
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        // Parent item with 2 children.
+        let mut parent = Dictionary::new();
+        parent.insert("Title", Object::String(b"Part 1".to_vec()));
+        parent.insert("Parent", Object::Reference(outline_root_ref));
+        parent.insert("First", Object::Reference(child1_ref));
+        parent.insert("Last", Object::Reference(child2_ref));
+        parent.insert("Count", Object::Integer(2));
+        pdf.set_object(parent_ref, Object::Dictionary(parent));
+
+        // Child 1.
+        let mut child1 = Dictionary::new();
+        child1.insert("Title", Object::String(b"Chapter 1".to_vec()));
+        child1.insert("Parent", Object::Reference(parent_ref));
+        child1.insert("Next", Object::Reference(child2_ref));
+        pdf.set_object(child1_ref, Object::Dictionary(child1));
+
+        // Child 2.
+        let mut child2 = Dictionary::new();
+        child2.insert("Title", Object::String(b"Chapter 2".to_vec()));
+        child2.insert("Parent", Object::Reference(parent_ref));
+        child2.insert("Prev", Object::Reference(child1_ref));
+        pdf.set_object(child2_ref, Object::Dictionary(child2));
+
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(root_entries) = &result else {
+            panic!("expected Array");
+        };
+        assert_eq!(root_entries.len(), 1, "root chain has 1 entry (parent)");
+
+        let JsonValue::Object(parent_entry) = &root_entries[0] else {
+            panic!("parent entry is not an Object");
+        };
+        // kids should contain 2 children.
+        let kids_val = &parent_entry.iter().find(|(k, _)| k == "kids").unwrap().1;
+        let JsonValue::Array(kids) = kids_val else {
+            panic!("kids is not an Array");
+        };
+        assert_eq!(kids.len(), 2, "parent must have 2 children in kids");
+
+        // Verify child titles.
+        let get_title = |entry: &JsonValue| {
+            let JsonValue::Object(pairs) = entry else {
+                panic!("kid entry is not an Object");
+            };
+            pairs.iter().find(|(k, _)| k == "title").unwrap().1.clone()
+        };
+        assert_eq!(
+            get_title(&kids[0]),
+            JsonValue::String("Chapter 1".to_string())
+        );
+        assert_eq!(
+            get_title(&kids[1]),
+            JsonValue::String("Chapter 2".to_string())
+        );
+    }
+
+    // ── Test 4: Cycle guard — /Next pointing to itself ────────────────────────
+
+    #[test]
+    fn outlines_cycle_guard_prevents_infinite_loop() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+
+        // Outline root → item.
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(item_ref));
+        outline_root.insert("Last", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        // Item whose /Next points back to itself (cycle).
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Loop".to_vec()));
+        item.insert("Parent", Object::Reference(outline_root_ref));
+        item.insert("Next", Object::Reference(item_ref)); // self-loop!
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        // Must not hang; must return exactly 1 entry (the item itself, not looped).
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = &result else {
+            panic!("expected Array");
+        };
+        assert_eq!(
+            entries.len(),
+            1,
+            "cycle guard must stop after 1 entry, got {}",
+            entries.len()
+        );
+    }
+
+    // ── Test 5: Broken /Parent link does not crash ────────────────────────────
+
+    #[test]
+    fn outlines_broken_parent_link_does_not_crash() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+
+        // Outline root → item.
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(item_ref));
+        outline_root.insert("Last", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        // Item with a /Parent pointing to a non-existent object (broken link).
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Broken Parent".to_vec()));
+        item.insert("Parent", Object::Reference(crate::ObjectRef::new(999, 0))); // non-existent
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        // Must not crash — /Parent is never followed by our implementation.
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = &result else {
+            panic!("expected Array");
+        };
+        assert_eq!(entries.len(), 1, "expected 1 entry despite broken /Parent");
+        let JsonValue::Object(entry) = &entries[0] else {
+            panic!("entry is not an Object");
+        };
+        let title = entry.iter().find(|(k, _)| k == "title").unwrap().1.clone();
+        assert_eq!(title, JsonValue::String("Broken Parent".to_string()));
+    }
+
+    // ── Test 6: build_qpdf_json_v2 includes outlines section ─────────────────
+
+    #[test]
+    fn build_qpdf_json_v2_includes_outlines_section() {
+        let mut pdf = load_one_page_pdf();
+        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_qpdf_json_v2 failed");
+        let JsonValue::Object(pairs) = v2 else {
+            panic!("expected Object at top level");
+        };
+        let outlines = pairs
+            .iter()
+            .find(|(k, _)| k == "outlines")
+            .map(|(_, v)| v)
+            .expect("outlines key must be present in composite output");
+        assert!(
+            matches!(outlines, JsonValue::Array(_)),
+            "outlines must be an Array"
+        );
+        // one-page.pdf has no /Outlines → must be empty array
+        assert_eq!(
+            *outlines,
+            JsonValue::Array(vec![]),
+            "one-page.pdf has no outlines"
+        );
+    }
+
+    // ── Test 7: Unicode title via UTF-16BE BOM ────────────────────────────────
+
+    #[test]
+    fn outlines_utf16be_title_decoded_as_bare_string() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(item_ref));
+        outline_root.insert("Last", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        // UTF-16BE BOM + "AB" (0x0041 0x0042)
+        let title_bytes = vec![0xFE, 0xFF, 0x00, 0x41, 0x00, 0x42];
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(title_bytes));
+        item.insert("Parent", Object::Reference(outline_root_ref));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = &result else {
+            panic!("expected Array");
+        };
+        let JsonValue::Object(entry) = &entries[0] else {
+            panic!("entry is not an Object");
+        };
+        let title = entry.iter().find(|(k, _)| k == "title").unwrap().1.clone();
+        // Must be bare "AB" — no "u:" prefix.
+        assert_eq!(title, JsonValue::String("AB".to_string()));
     }
 }
