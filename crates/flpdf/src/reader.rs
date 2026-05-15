@@ -446,16 +446,27 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.object_refs()
     }
 
-    /// Object refs that the cross-reference table marks as live — i.e. excluding
-    /// free entries (`XrefOffset::Free`) and any explicit deletions. A live
-    /// reference may still resolve to `Object::Null`; that is a real null
-    /// indirect object, not an absent one.
+    /// Object refs that the cross-reference table marks as live.
+    ///
+    /// Excludes:
+    /// - `Deleted` — free entries (from `XrefOffset::Free`) and explicit
+    ///   `delete_object()` calls,
+    /// - `Missing` — referenced but never present in any xref,
+    /// - `Reserved` — forward-reference placeholders that
+    ///   [`Pdf::resolve`] returns as `Object::Null` (no real indirect
+    ///   object behind them).
+    ///
+    /// A `live_object_refs()` entry may still resolve to `Object::Null`; that
+    /// is a real null indirect object (e.g. `1 0 obj null endobj`), not an
+    /// absent one.
     pub fn live_object_refs(&self) -> Vec<ObjectRef> {
         self.cache
             .entries()
             .iter()
             .filter_map(|(object_ref, entry)| match entry {
-                crate::cache::CacheEntry::Deleted | crate::cache::CacheEntry::Missing => None,
+                crate::cache::CacheEntry::Deleted
+                | crate::cache::CacheEntry::Missing
+                | crate::cache::CacheEntry::Reserved => None,
                 _ => Some(*object_ref),
             })
             .collect()
