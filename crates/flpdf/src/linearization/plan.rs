@@ -30,6 +30,10 @@
 //!
 //! The four parts are always disjoint (invariant preserved by construction).
 
+use crate::writer::object_streams::{
+    collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm,
+    ObjectStreamMode, PlannerConfig,
+};
 use crate::{Object, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
@@ -768,6 +772,252 @@ impl Default for LinearizationPlan {
 }
 
 // ---------------------------------------------------------------------------
+// ObjStm batch planning
+// ---------------------------------------------------------------------------
+
+/// Part-tagged ObjStm batch plan produced by [`LinearizationPlan::objstm_batches`].
+///
+/// Each inner `Vec<ObjectRef>` describes one ObjStm container; the contained
+/// refs are still **original** (pre-renumber) object references.  Renumbering
+/// and actual container-object allocation happen in downstream subtasks (5.8.2+).
+///
+/// # Part constraints
+///
+/// * `part3_batches` — containers that belong in the first-page section
+///   (ISO 32000-1 Annex F Part 3: shared/catalog objects).
+/// * `part4_batches` — containers that belong after `/E` (Part 4: remaining
+///   document objects from `part4_other_pages_private`, `part4_other_pages_shared`,
+///   and `part4_rest`).
+///
+/// ObjStm containers can never span the Part-3 / Part-4 boundary.
+/// `part2_objects` (first-page closure exclusives) are **never** placed in
+/// either batch list — they stay as plain indirect objects.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObjStmBatchPlan {
+    /// ObjStm batches for Part 3 (shared/catalog) objects.
+    pub part3_batches: Vec<Vec<ObjectRef>>,
+    /// ObjStm batches for Part 4 (rest-of-document) objects.
+    pub part4_batches: Vec<Vec<ObjectRef>>,
+}
+
+// These items are consumed by the upcoming ObjStm linearized writer (5.8.2+);
+// suppress dead_code until that code lands.
+#[allow(dead_code)]
+impl LinearizationPlan {
+    /// Build a Part-tagged ObjStm packing plan from this `LinearizationPlan`.
+    ///
+    /// # Mode behaviour
+    ///
+    /// | Mode | Result |
+    /// |------|--------|
+    /// | `Disable` | Both batch lists are empty (no ObjStms emitted). |
+    /// | `Generate` | Eligible Part-3 objects are packed into `part3_batches`; eligible Part-4 objects into `part4_batches`. |
+    /// | `Preserve` | Existing source ObjStm membership is re-used, but any member in `part2_objects` or ineligible per [`is_eligible_for_objstm`] is silently dropped. Members that span the Part-3/Part-4 boundary are split into separate batches per part. If the source document contained no ObjStms, both batch lists are empty (no fall-through to Generate). |
+    ///
+    /// # Invariants
+    ///
+    /// * No ref from `part2_objects` appears in any batch.
+    /// * Ineligible objects (streams, gen > 0, encryption dict, linearization
+    ///   param dict, `/Type /ObjStm`, `/Type /XRef`) are excluded via the
+    ///   shared [`is_eligible_for_objstm`] predicate.
+    /// * Cap (`DEFAULT_BATCH_SIZE_CAP`) is applied independently per Part.
+    pub(crate) fn objstm_batches<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        config: &PlannerConfig,
+    ) -> crate::Result<ObjStmBatchPlan> {
+        if config.mode == ObjectStreamMode::Disable {
+            return Ok(ObjStmBatchPlan::default());
+        }
+
+        let ctx = eligibility_context(pdf)?;
+        let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
+
+        match config.mode {
+            ObjectStreamMode::Disable => unreachable!(),
+            ObjectStreamMode::Generate => {
+                self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions)
+            }
+            ObjectStreamMode::Preserve => {
+                self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)
+            }
+        }
+    }
+
+    /// Generate mode: pack eligible Part-3 and Part-4 objects into fresh ObjStm batches.
+    fn objstm_batches_generate<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        config: &PlannerConfig,
+        ctx: &crate::writer::object_streams::EligibilityContext,
+        length_exclusions: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<ObjStmBatchPlan> {
+        use crate::XrefOffset;
+
+        let cap = config.batch_size_cap.get();
+
+        // Build a free-ref exclusion set so we don't accidentally pack deleted
+        // objects (resolves to Null but may be in object_refs()).
+        let source_entries = pdf.source_xref_entries();
+        let free_refs: BTreeSet<ObjectRef> = source_entries
+            .iter()
+            .filter_map(|(r, offset)| {
+                if matches!(offset, XrefOffset::Free { .. }) {
+                    Some(*r)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
+
+        // Pack Part 3 eligible objects.
+        let part3_batches = Self::pack_into_batches(
+            self.part3_objects.iter().copied(),
+            &part2_set,
+            &free_refs,
+            length_exclusions,
+            ctx,
+            pdf,
+            cap,
+        )?;
+
+        // Pack Part 4 eligible objects (part4_other_pages_private ++ part4_other_pages_shared ++ part4_rest).
+        let part4_batches = Self::pack_into_batches(
+            self.part4_other_pages_private
+                .iter()
+                .chain(&self.part4_other_pages_shared)
+                .chain(&self.part4_rest)
+                .copied(),
+            &part2_set,
+            &free_refs,
+            length_exclusions,
+            ctx,
+            pdf,
+            cap,
+        )?;
+
+        Ok(ObjStmBatchPlan {
+            part3_batches,
+            part4_batches,
+        })
+    }
+
+    /// Preserve mode: reconstruct source ObjStm grouping, splitting cross-boundary batches.
+    fn objstm_batches_preserve<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        config: &PlannerConfig,
+        ctx: &crate::writer::object_streams::EligibilityContext,
+        length_exclusions: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<ObjStmBatchPlan> {
+        use crate::XrefOffset;
+
+        let cap = config.batch_size_cap.get();
+        let entries = pdf.source_xref_entries();
+
+        // Build source ObjStm groups: container_number → [(index, ref)]
+        let mut groups: BTreeMap<u32, Vec<(u32, ObjectRef)>> = BTreeMap::new();
+        for (obj_ref, offset) in &entries {
+            if let XrefOffset::Compressed { stream, index } = offset {
+                groups.entry(*stream).or_default().push((*index, *obj_ref));
+            }
+        }
+
+        let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
+        let part3_set: BTreeSet<ObjectRef> = self.part3_objects.iter().copied().collect();
+
+        let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
+
+        // Iterate containers in ascending container-number order.
+        for (_container_num, mut members) in groups {
+            members.sort_by_key(|(idx, _)| *idx);
+
+            // Partition eligible members by their destination part.
+            let mut p3_eligible: Vec<ObjectRef> = Vec::new();
+            let mut p4_eligible: Vec<ObjectRef> = Vec::new();
+
+            for (_idx, obj_ref) in members {
+                // Part-2 objects must never enter ObjStms.
+                if part2_set.contains(&obj_ref) {
+                    continue;
+                }
+                if length_exclusions.contains(&obj_ref) {
+                    continue;
+                }
+                let obj = pdf.resolve(obj_ref)?;
+                if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
+                    continue;
+                }
+                if part3_set.contains(&obj_ref) {
+                    p3_eligible.push(obj_ref);
+                } else {
+                    // Everything else (part4_*) goes to part4.
+                    p4_eligible.push(obj_ref);
+                }
+            }
+
+            // Split into cap-sized batches per part.
+            for chunk in p3_eligible.chunks(cap) {
+                if !chunk.is_empty() {
+                    part3_batches.push(chunk.to_vec());
+                }
+            }
+            for chunk in p4_eligible.chunks(cap) {
+                if !chunk.is_empty() {
+                    part4_batches.push(chunk.to_vec());
+                }
+            }
+        }
+
+        Ok(ObjStmBatchPlan {
+            part3_batches,
+            part4_batches,
+        })
+    }
+
+    /// Helper: iterate `candidates`, filter by eligibility, and pack into cap-sized batches.
+    ///
+    /// Objects in `part2_set` or `free_refs` are skipped unconditionally.
+    fn pack_into_batches<R: Read + Seek>(
+        candidates: impl Iterator<Item = ObjectRef>,
+        part2_set: &BTreeSet<ObjectRef>,
+        free_refs: &BTreeSet<ObjectRef>,
+        length_exclusions: &BTreeSet<ObjectRef>,
+        ctx: &crate::writer::object_streams::EligibilityContext,
+        pdf: &mut Pdf<R>,
+        cap: usize,
+    ) -> crate::Result<Vec<Vec<ObjectRef>>> {
+        let mut current_batch: Vec<ObjectRef> = Vec::new();
+        let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
+
+        for obj_ref in candidates {
+            if part2_set.contains(&obj_ref) || free_refs.contains(&obj_ref) {
+                continue;
+            }
+            if length_exclusions.contains(&obj_ref) {
+                continue;
+            }
+            let obj = pdf.resolve(obj_ref)?;
+            if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
+                continue;
+            }
+            current_batch.push(obj_ref);
+            if current_batch.len() >= cap {
+                batches.push(std::mem::take(&mut current_batch));
+            }
+        }
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+
+        Ok(batches)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -1466,5 +1716,276 @@ mod tests {
 
         // Disjoint invariant must hold.
         assert!(plan.parts_are_disjoint());
+    }
+
+    // =======================================================================
+    // Tests for ObjStmBatchPlan (flpdf-9hc.5.8.1)
+    // =======================================================================
+
+    /// Config helpers
+    fn generate_config() -> PlannerConfig {
+        PlannerConfig {
+            mode: ObjectStreamMode::Generate,
+            batch_size_cap: std::num::NonZeroUsize::new(100).unwrap(),
+        }
+    }
+
+    fn preserve_config() -> PlannerConfig {
+        PlannerConfig {
+            mode: ObjectStreamMode::Preserve,
+            batch_size_cap: std::num::NonZeroUsize::new(100).unwrap(),
+        }
+    }
+
+    fn disable_config() -> PlannerConfig {
+        PlannerConfig {
+            mode: ObjectStreamMode::Disable,
+            batch_size_cap: std::num::NonZeroUsize::new(100).unwrap(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // (d) Disable mode: empty plan
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_disable_yields_empty_plan() {
+        let bytes = three_page_shared_content_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &disable_config()).unwrap();
+        assert!(
+            batch_plan.part3_batches.is_empty(),
+            "Disable must produce no part3 batches"
+        );
+        assert!(
+            batch_plan.part4_batches.is_empty(),
+            "Disable must produce no part4 batches"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (a) Generate: part3/part4 eligible objects end up in correct batches
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_generate_assigns_part3_and_part4() {
+        // three_page_shared_content fixture:
+        //   Part 3: 7 0 R (Resources dict, shared) → eligible non-stream dict
+        //   Part 4 (part4_other_pages_shared): 8 0 R (content stream) → INELIGIBLE (stream)
+        //   Part 4 (part4_rest): 1 0 R (Catalog), 2 0 R (Pages node)
+        //
+        // Eligible in Part 3: 7 0 R (dict, gen 0)
+        // Ineligible in Part 3: none
+        // Eligible in Part 4: those among part4_* that are plain dicts (1 0 R Catalog, 2 0 R Pages)
+        // Ineligible in Part 4: 8 0 R (stream), page dicts (streams? no they're dicts),
+        //   page dicts 4 0 R, 5 0 R are plain dicts → eligible
+        //   9 0 R (Font dict) → eligible (in part3)
+        let bytes = three_page_shared_content_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+
+        // Every part3_object that is eligible must appear in part3_batches.
+        let all_part3_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let all_part4_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part4_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        // Resources dict (7 0 R) is in part3_objects and is eligible → part3_batches.
+        let resources_ref = ObjectRef::new(7, 0);
+        if plan.part3_objects.contains(&resources_ref) {
+            assert!(
+                all_part3_batched.contains(&resources_ref),
+                "eligible part3 object 7 0 R must be in part3_batches"
+            );
+            assert!(
+                !all_part4_batched.contains(&resources_ref),
+                "part3 object 7 0 R must NOT be in part4_batches"
+            );
+        }
+
+        // Part4 objects that are plain dicts (page 2: 4 0 R, page 3: 5 0 R) → part4_batches.
+        // 8 0 R is a stream → ineligible, must NOT be in any batch.
+        let shared_content = ObjectRef::new(8, 0);
+        assert!(
+            !all_part3_batched.contains(&shared_content),
+            "stream 8 0 R must NOT be in part3_batches"
+        );
+        assert!(
+            !all_part4_batched.contains(&shared_content),
+            "stream 8 0 R must NOT be in part4_batches (streams are ineligible)"
+        );
+
+        // No batch object should come from part3 AND part4 at the same time.
+        let intersection: Vec<_> = all_part3_batched.intersection(&all_part4_batched).collect();
+        assert!(
+            intersection.is_empty(),
+            "part3_batches and part4_batches must be disjoint; overlap: {intersection:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (b) part2_objects must NEVER appear in any batch (all modes)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_generate_never_places_part2_in_batches() {
+        let bytes = three_page_shared_content_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+
+        let part2_set: std::collections::BTreeSet<ObjectRef> =
+            plan.part2_objects.iter().copied().collect();
+
+        let all_batched: Vec<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .chain(&batch_plan.part4_batches)
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        for r in &all_batched {
+            assert!(
+                !part2_set.contains(r),
+                "part2 object {r} must never appear in any ObjStm batch"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // (b) same for two-page fixture in Generate mode
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_two_page_generate_part2_not_in_batches() {
+        let bytes = two_page_shared_font_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+
+        let part2_set: std::collections::BTreeSet<ObjectRef> =
+            plan.part2_objects.iter().copied().collect();
+        let all_batched: Vec<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .chain(&batch_plan.part4_batches)
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        for r in &all_batched {
+            assert!(
+                !part2_set.contains(r),
+                "part2 object {r} must never appear in any ObjStm batch (two-page fixture)"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // (c) Ineligible objects excluded (streams, gen>0, etc.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_generate_excludes_ineligible_objects() {
+        // two_page_shared_font fixture:
+        //   6 0 R content stream (part2)   → excluded by part2 rule + stream ineligibility
+        //   7 0 R content stream (part4)   → ineligible (stream), must not be in any batch
+        //   8 0 R font (part3)             → eligible plain dict
+        let bytes = two_page_shared_font_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+
+        let all_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .chain(&batch_plan.part4_batches)
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        // 6 0 R: content stream (page 1 only) → part2 + stream ineligible
+        let page1_content = ObjectRef::new(6, 0);
+        assert!(
+            !all_batched.contains(&page1_content),
+            "stream 6 0 R (page-1 content, part2) must not be in any batch"
+        );
+
+        // 7 0 R: content stream (page 2 only) → part4 but stream ineligible
+        let page2_content = ObjectRef::new(7, 0);
+        assert!(
+            !all_batched.contains(&page2_content),
+            "stream 7 0 R (page-2 content, part4) must not be in any batch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (e) Preserve mode on fixture with no source ObjStms → empty plan
+    //     (no fall-through to Generate)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_preserve_no_source_objstms_yields_empty_plan() {
+        // two_page_shared_font_bytes is a PDF-1.4 with traditional xref table.
+        // No source ObjStms → Preserve must yield empty batches.
+        let bytes = two_page_shared_font_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &preserve_config()).unwrap();
+        assert!(
+            batch_plan.part3_batches.is_empty(),
+            "Preserve with no source ObjStms must produce no part3 batches (no fall-through to Generate)"
+        );
+        assert!(
+            batch_plan.part4_batches.is_empty(),
+            "Preserve with no source ObjStms must produce no part4 batches"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Generate: part3 objects go only to part3_batches, part4 to part4_batches
+    // -----------------------------------------------------------------------
+    #[test]
+    fn objstm_batches_generate_cross_part_placement() {
+        // Use two-page fixture: Part3 = Resources (5 0 R) + Font (8 0 R)
+        //                       Part4 = page 2 dict (4 0 R) + content stream (7 0 R ineligible)
+        let bytes = two_page_shared_font_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+
+        let all_part3_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let all_part4_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part4_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        // Verify no part3 object appears in part4_batches and vice versa.
+        let part3_set: std::collections::BTreeSet<ObjectRef> =
+            plan.part3_objects.iter().copied().collect();
+        for r in &all_part3_batched {
+            assert!(
+                part3_set.contains(r),
+                "object {r} in part3_batches must come from part3_objects"
+            );
+        }
+        for r in &all_part4_batched {
+            assert!(
+                !part3_set.contains(r),
+                "part3 object {r} must not appear in part4_batches"
+            );
+        }
     }
 }

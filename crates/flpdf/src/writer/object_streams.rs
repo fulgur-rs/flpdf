@@ -179,7 +179,7 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 /// Collect the set of ObjectRefs that serve as indirect /Length targets of any
 /// ObjStm stream in the document.  ISO 32000-1 §7.5.7 prohibits those objects
 /// from being stored inside an ObjStm themselves.
-fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Seek>(
+pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let mut excluded = BTreeSet::new();
