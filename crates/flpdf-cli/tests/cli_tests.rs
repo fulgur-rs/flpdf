@@ -60,10 +60,11 @@ fn check_allows_rc4_encrypted_input_with_warning_when_opted_in() {
     std::fs::write(&input, encrypted_v1_owner_password_fixture()).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    // Weak-crypto warning → exit 3 (qpdf-compatible: warnings found, no errors).
     cmd.args(["--check", "--allow-weak-crypto", "--password=owner"])
         .arg(&input)
         .assert()
-        .success()
+        .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
         .stderr(predicate::str::contains("warning"))
         .stderr(predicate::str::contains("weak crypto"));
@@ -501,9 +502,11 @@ fn check_with_repair_accepts_corrupt_xref() {
     std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    // Repair produces a "xref repaired" warning → exit 3 (qpdf-compatible:
+    // warnings found, no errors).
     cmd.args(["--repair", "--check", input.to_str().unwrap()])
         .assert()
-        .success()
+        .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"));
 }
 
