@@ -447,3 +447,32 @@ fn json_flag_conflicts_with_show_info() {
         .assert()
         .code(2);
 }
+
+#[test]
+fn json_flag_conflicts_with_linearize_pass1() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let p1 = temp.path().join("pass1.bin");
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "--linearize-pass1",
+        p1.to_str().unwrap(),
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2);
+}
+
+#[test]
+fn json_flag_conflicts_with_compress_streams() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "--compress-streams=n",
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2);
+}
