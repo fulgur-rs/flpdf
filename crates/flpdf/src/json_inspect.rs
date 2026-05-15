@@ -320,15 +320,12 @@ pub fn build_qpdf_key<R: Read + Seek>(
     ]);
 
     // ── 2. Build objects_map ───────────────────────────────────────────────
-    // Use live_object_refs() so that free / deleted xref entries are excluded
-    // at the xref-status level. A live indirect object that *is* null (e.g.
-    // `1 0 obj null endobj`) is then emitted as `{ "value": null }` like any
-    // other non-stream live object — qpdf does the same.
-    let all_refs: Vec<crate::ObjectRef> = pdf
-        .live_object_refs()
-        .into_iter()
-        .filter(|r| r.number != 0)
-        .collect();
+    // live_object_refs() already excludes Free / Deleted / Missing / Reserved
+    // entries at the xref-status level, so any ref returned here is a real
+    // indirect object that we should emit. A live indirect object that *is*
+    // null (e.g. `1 0 obj null endobj`) is emitted as `{ "value": null }`,
+    // matching qpdf.
+    let all_refs: Vec<crate::ObjectRef> = pdf.live_object_refs();
 
     let mut map_pairs: Vec<(String, JsonValue)> = Vec::new();
 
