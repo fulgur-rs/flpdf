@@ -54,8 +54,11 @@ pub struct RotateOp {
 ///
 /// The algorithm:
 /// 1. Add 45 to bias toward the *nearest* 90° boundary.
-/// 2. Integer-divide by 90 (Euclidean, so the quotient is non-negative even for
-///    negative inputs) to obtain the nearest multiple index.
+/// 2. Integer-divide by 90 with `div_euclid` (its remainder is always in
+///    `[0, 90)`) to obtain the nearest-multiple index. The quotient itself may
+///    be negative for sufficiently negative inputs (e.g. `-46 → -1`); it is the
+///    final `rem_euclid(360)` in step 4 — not this division — that guarantees a
+///    non-negative result.
 /// 3. Multiply back by 90 to recover the snapped angle.
 /// 4. Take `rem_euclid(360)` to wrap into `[0, 360)`.
 ///
@@ -87,9 +90,10 @@ fn normalize_rotate_i64(deg: i64) -> i32 {
     // Round `deg` to the nearest 90° boundary, then keep within [0, 360).
     // Widen to i128: `deg + 45` would overflow i64 for inputs near
     // `i64::MAX`/`i64::MIN`.
-    // `div_euclid` gives a non-negative quotient even for negative `deg`;
-    // `rem_euclid` ensures the final result is non-negative even when
-    // `(deg + 45).div_euclid(90) * 90` is negative (e.g. -45 → -1*90 = -90).
+    // `div_euclid`'s remainder is always in `[0, 90)`, but its quotient can be
+    // negative for sufficiently negative `deg` (e.g. `deg + 45 == -1` → `-1`).
+    // The final `rem_euclid(360)` is what guarantees a non-negative result in
+    // `[0, 360)`, even when `(deg + 45).div_euclid(90) * 90` is negative.
     let snapped = (deg as i128 + 45).div_euclid(90) * 90;
     snapped.rem_euclid(360) as i32
 }
@@ -212,7 +216,9 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] if any of the supplied `ObjectRef`s does not
-/// resolve to a dictionary, or if the page-tree depth limit is exceeded.
+/// resolve to a dictionary, does not resolve to a leaf `/Page` object (e.g. it
+/// points at a `/Pages` tree node), or if the page-tree depth limit is
+/// exceeded.
 pub fn apply_rotate_to_pages<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pages: &[ObjectRef],
@@ -234,6 +240,20 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"
             )));
         };
+
+        // Guard: only leaf `/Page` objects are valid targets. Writing /Rotate
+        // onto a `/Pages` tree node (or any non-Page dict) would change the
+        // inherited rotation of every descendant page, violating the
+        // per-leaf-page contract.
+        let is_leaf_page = matches!(
+            page_dict.get("Type"),
+            Some(Object::Name(t)) if t.as_slice() == b"Page"
+        );
+        if !is_leaf_page {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a leaf /Page (missing or non-/Page /Type), cannot set /Rotate"
+            )));
+        }
 
         // 4. Materialize the new /Rotate on the leaf.
         //    We always write it explicitly (even for 0) so the leaf is no longer
@@ -610,6 +630,33 @@ mod tests {
             panic!("not a dict")
         };
         assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+    }
+
+    #[test]
+    fn rejects_pages_tree_node_target() {
+        // Passing the intermediate /Pages node (2 0 R) must error rather than
+        // silently writing /Rotate onto it (which would change inherited
+        // rotation for every descendant page).
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let pages_ref = ObjectRef::new(2, 0);
+
+        let op = RotateOp {
+            mode: RotateMode::Assign,
+            degrees: 90,
+        };
+        let err = apply_rotate_to_pages(&mut pdf, &[pages_ref], &op).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported for /Pages node, got {err:?}"
+        );
+
+        // The /Pages node must remain untouched (no /Rotate written).
+        let obj = pdf.resolve(pages_ref).unwrap();
+        let Object::Dictionary(dict) = obj else {
+            panic!("not a dict")
+        };
+        assert_eq!(dict.get("Rotate"), None, "/Pages node must not gain /Rotate");
     }
 
     // -----------------------------------------------------------------------
