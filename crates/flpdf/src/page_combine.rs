@@ -177,9 +177,11 @@ impl CombinedPlan {
 
         for (i, spec) in specs.iter().enumerate() {
             let file = std::fs::File::open(&spec.path).map_err(|e| {
-                Error::Unsupported(format!(
-                    "input {i}: cannot open '{}': {e}",
-                    spec.path.display()
+                // Preserve Error::Io so callers can distinguish file-not-found from
+                // encryption errors and parse failures.
+                Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("input {i}: cannot open '{}': {e}", spec.path.display()),
                 ))
             })?;
             let reader = BufReader::new(file);
@@ -191,8 +193,15 @@ impl CombinedPlan {
                     .unwrap_or_default(),
                 ..PdfOpenOptions::default()
             };
-            let pdf = Pdf::open_with_options(reader, opts).map_err(|e| {
-                Error::Unsupported(format!("input {i} ('{}'): {e}", spec.path.display()))
+            // Preserve Error::Encrypted so CLI layers can pattern-match on it
+            // for exit-code decisions (e.g. bad password vs. unsupported feature).
+            // Only Unsupported/Parse are promoted to Unsupported with input context.
+            let pdf = Pdf::open_with_options(reader, opts).map_err(|e| match e {
+                Error::Encrypted(_) => e,
+                Error::Io(_) => e,
+                other => {
+                    Error::Unsupported(format!("input {i} ('{}'): {other}", spec.path.display()))
+                }
             })?;
             opened.push((pdf, spec.range.clone()));
         }
@@ -557,5 +566,68 @@ mod tests {
             msg.contains("at least one input"),
             "expected actionable message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn from_specs_nonexistent_file_preserves_io_error_variant() {
+        let spec = InputSpec::new(
+            "/nonexistent/path/to/file.pdf",
+            None,
+            PageRange::parse("").unwrap(),
+        );
+        let err = CombinedPlan::from_specs(vec![spec]).unwrap_err();
+        // Error::Io must be preserved so CLI layers can distinguish IO failures.
+        assert!(
+            matches!(err, Error::Io(_)),
+            "expected Error::Io, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // from_specs — happy path (write a real file to disk and read it back)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_specs_two_files_concatenate_in_order() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let path_a = dir.join("flpdf_test_combine_a.pdf");
+        let path_b = dir.join("flpdf_test_combine_b.pdf");
+
+        // Write 3-page and 2-page PDFs to disk.
+        std::fs::File::create(&path_a)
+            .unwrap()
+            .write_all(&build_n_page_pdf(3))
+            .unwrap();
+        std::fs::File::create(&path_b)
+            .unwrap()
+            .write_all(&build_n_page_pdf(2))
+            .unwrap();
+
+        let specs = vec![
+            InputSpec::new(&path_a, None, PageRange::parse("1,3").unwrap()),
+            InputSpec::new(&path_b, None, PageRange::parse("").unwrap()),
+        ];
+        let plan = CombinedPlan::from_specs(specs).unwrap();
+
+        // A selected pages 1,3 (2 pages) + B all pages (2 pages)
+        assert_eq!(plan.input_count(), 2);
+        assert_eq!(plan.total_page_count(), 4);
+        assert_eq!(plan.base_index(), 0);
+
+        let flat = plan.flat_pages();
+        assert_eq!(flat[0].source_index, 0);
+        assert_eq!(flat[0].page.index_1based, 1);
+        assert_eq!(flat[1].source_index, 0);
+        assert_eq!(flat[1].page.index_1based, 3);
+        assert_eq!(flat[2].source_index, 1);
+        assert_eq!(flat[2].page.index_1based, 1);
+        assert_eq!(flat[3].source_index, 1);
+        assert_eq!(flat[3].page.index_1based, 2);
+
+        // Clean up temp files.
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
     }
 }
