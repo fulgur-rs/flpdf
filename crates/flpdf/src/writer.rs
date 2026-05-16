@@ -1393,14 +1393,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             let stream_data = match options.compress_streams {
                 CompressStreams::Yes => {
                     let mut encode_dict = Dictionary::new();
-                    encode_dict
-                        .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
                     match filters::encode_stream_data(&encode_dict, &raw_xref_bytes) {
                         Ok(compressed) => {
-                            xref_dict.insert(
-                                "Filter",
-                                Object::Name(b"FlateDecode".to_vec()),
-                            );
+                            xref_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
                             compressed
                         }
                         // Compression failure is essentially impossible for
@@ -1476,10 +1472,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// identical to qpdf's, but the raw compressed bytes differ.  This is
 /// intentional: byte-identical agreement with qpdf is not a goal for this
 /// toggle.  See [`CompressStreams`] for the full policy statement.
-pub fn apply_stream_compress_policy(
-    stream: &crate::Stream,
-    policy: CompressStreams,
-) -> Object {
+pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
         Ok(d) => d,
