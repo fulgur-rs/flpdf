@@ -1004,8 +1004,10 @@ fn one_page_pdf_with_unused_resource() -> Vec<u8> {
 
 /// A two-page PDF where each page has multiple /Contents streams.
 fn two_page_pdf_with_multi_contents() -> Vec<u8> {
+    // Object numbers are consecutive (1..=7) so the positionally-built
+    // xref table below stays consistent with the object numbers.
     let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
-    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 7 0 R] >>\nendobj\n";
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 6 0 R] >>\nendobj\n";
     // Page 1: two /Contents streams (4 0 R and 5 0 R).
     let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] >>\nendobj\n";
     let c1 = b"q Q";
@@ -1020,11 +1022,11 @@ fn two_page_pdf_with_multi_contents() -> Vec<u8> {
         c2.len(),
         String::from_utf8_lossy(c2)
     );
-    // Page 2: single /Contents.
-    let obj7 = b"7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R >>\nendobj\n";
+    // Page 2: single /Contents (7 0 R).
+    let obj6 = b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R >>\nendobj\n";
     let c3 = b"q Q";
-    let obj8 = format!(
-        "8 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+    let obj7 = format!(
+        "7 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
         c3.len(),
         String::from_utf8_lossy(c3)
     );
@@ -1034,8 +1036,8 @@ fn two_page_pdf_with_multi_contents() -> Vec<u8> {
         obj3.to_vec(),
         obj4.into_bytes(),
         obj5.into_bytes(),
-        obj7.to_vec(),
-        obj8.into_bytes(),
+        obj6.to_vec(),
+        obj7.into_bytes(),
     ];
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -1148,6 +1150,12 @@ fn rewrite_normalize_content_n_accepted_and_produces_valid_output() {
         .success();
 
     assert!(output.exists());
+    // The produced PDF must be structurally valid.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
 }
 
 // ── coalesce-contents ─────────────────────────────────────────────────────────
@@ -1239,6 +1247,12 @@ fn rewrite_remove_unreferenced_resources_no_accepted() {
         .success();
 
     assert!(output.exists());
+    // The produced PDF must be structurally valid.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
 }
 
 // ── newline-before-endstream ──────────────────────────────────────────────────
