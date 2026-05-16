@@ -76,11 +76,13 @@ pub struct RotateOp {
 /// - ` 44` → `  0`  (rounded down — nearest boundary)
 pub fn normalize_rotate(deg: i32) -> i32 {
     // Round `deg` to the nearest 90° boundary, then keep within [0, 360).
+    // Widen to i64 first: `deg + 45` would overflow i32 for inputs near
+    // `i32::MAX`/`i32::MIN` (and `RotateOp::degrees` accepts any i32).
     // `div_euclid` gives a non-negative quotient even for negative `deg`;
     // `rem_euclid` ensures the final result is non-negative even when
     // `(deg + 45).div_euclid(90) * 90` is negative (e.g. -45 → -1*90 = -90).
-    let snapped = (deg + 45).div_euclid(90) * 90;
-    snapped.rem_euclid(360)
+    let snapped = (deg as i64 + 45).div_euclid(90) * 90;
+    snapped.rem_euclid(360) as i32
 }
 
 /// Compute the final `/Rotate` value for a page given `existing` (the resolved,
@@ -287,6 +289,16 @@ mod tests {
         assert_eq!(normalize_rotate(134), 90);
         // 135 → rounds up to 180
         assert_eq!(normalize_rotate(135), 180);
+    }
+
+    #[test]
+    fn normalize_extreme_i32_inputs_do_not_overflow() {
+        // `deg + 45` must not overflow i32 near the bounds; widening to i64
+        // keeps these well-defined instead of panicking (debug) / wrapping.
+        let max = normalize_rotate(i32::MAX);
+        let min = normalize_rotate(i32::MIN);
+        assert!(matches!(max, 0 | 90 | 180 | 270));
+        assert!(matches!(min, 0 | 90 | 180 | 270));
     }
 
     // -----------------------------------------------------------------------
