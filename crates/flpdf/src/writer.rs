@@ -1471,7 +1471,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// parameters than qpdf's internal zlib build.  The decoded bytes are
 /// identical to qpdf's, but the raw compressed bytes differ.  This is
 /// intentional: byte-identical agreement with qpdf is not a goal for this
-/// toggle.  See [`CompressStreams`] for the full policy statement.
+/// toggle (the held-for-review zlib-parity decision, flpdf-9hc.12.5).
+/// See [`CompressStreams`] for the full policy statement.
 pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
