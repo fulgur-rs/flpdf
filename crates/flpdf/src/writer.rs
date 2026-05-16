@@ -1435,9 +1435,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
 /// Apply the stream compression policy to a single stream object.
 ///
-/// This is the single choke-point through which **all** stream emission in
-/// the full-rewrite path flows, ensuring a consistent policy across every
-/// writer route.  (`write_qdf` is exempt — it is a debug-dump path that
+/// This is the choke-point for re-emitting **regular indirect stream
+/// objects** in the full-rewrite path. The cross-reference stream and
+/// object-stream (ObjStm) containers apply the same `CompressStreams`
+/// policy on their own dedicated branches (the xref-stream branch below
+/// and [`object_streams::wrap_objstm_body`]); they do not flow through
+/// this function. (`write_qdf` is exempt — it is a debug-dump path that
 /// emits source bytes verbatim by design and does not consult this function.)
 ///
 /// # Policy: `CompressStreams::Yes` (default)
