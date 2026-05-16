@@ -1049,8 +1049,7 @@ mod tests {
             first_offset: 4,
             n_members: 1,
         };
-        let stream =
-            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
+        let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         assert_eq!(
             stream.dict.get("Type"),
@@ -1088,8 +1087,7 @@ mod tests {
         let body = emit_objstm_body_from_resolved(&members).unwrap();
         let original_bytes = body.bytes.clone();
 
-        let stream =
-            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
+        let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         let decoded = crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
         assert_eq!(
@@ -1107,8 +1105,7 @@ mod tests {
 
         let body =
             emit_objstm_body_from_resolved(&[(ref1, obj1.clone()), (ref2, obj2.clone())]).unwrap();
-        let stream =
-            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
+        let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         let parsed0 = crate::reader::parse_object_stream_entry(&stream, 0).unwrap();
         let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
@@ -1124,8 +1121,7 @@ mod tests {
             first_offset: 0,
             n_members: 0,
         };
-        let stream =
-            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
+        let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         assert_eq!(
             stream.dict.get("N"),

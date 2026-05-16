@@ -64,11 +64,10 @@ fn compress_yes_adds_flate_to_unfiltered_stream() {
     );
 
     // Round-trip: decode must recover the original bytes.
-    let decoded = filters::decode_stream_data(&out.dict, &out.data)
-        .expect("FlateDecode round-trip decode");
+    let decoded =
+        filters::decode_stream_data(&out.dict, &out.data).expect("FlateDecode round-trip decode");
     assert_eq!(
-        decoded,
-        raw,
+        decoded, raw,
         "Yes mode: decoded output must equal original raw bytes"
     );
 }
@@ -117,9 +116,11 @@ fn compress_no_removes_filter_from_flate_stream() {
     );
 
     // Round-trip: a PDF reader with no /Filter sees data as-is.
-    let decoded = filters::decode_stream_data(&out.dict, &out.data)
-        .expect("unfiltered decode");
-    assert_eq!(decoded, raw, "No mode: round-trip must recover original data");
+    let decoded = filters::decode_stream_data(&out.dict, &out.data).expect("unfiltered decode");
+    assert_eq!(
+        decoded, raw,
+        "No mode: round-trip must recover original data"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +224,7 @@ fn compress_yes_does_not_double_compress_flate_stream() {
     let decoded = filters::decode_stream_data(&out.dict, &out.data)
         .expect("decode should succeed after Yes mode");
     assert_eq!(
-        decoded,
-        raw,
+        decoded, raw,
         "Yes mode: double-compress guard — round-trip must recover original data"
     );
 }
@@ -240,7 +240,8 @@ fn build_minimal_pdf_with_flate_stream() -> (Vec<u8>, Vec<u8>) {
     use flate2::Compression;
     use std::io::Write;
 
-    let raw: Vec<u8> = b"The quick brown fox jumps over the lazy dog. Payload for compress test.".to_vec();
+    let raw: Vec<u8> =
+        b"The quick brown fox jumps over the lazy dog. Payload for compress test.".to_vec();
 
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&raw).unwrap();
@@ -310,8 +311,8 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
     );
 
     // Round-trip: unfiltered data must equal the original payload.
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data)
-        .expect("unfiltered read-back");
+    let decoded =
+        filters::decode_stream_data(&stream.dict, &stream.data).expect("unfiltered read-back");
     assert_eq!(
         decoded, original_raw,
         "compress_streams=No: decoded output must equal original payload"
@@ -347,8 +348,8 @@ fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
     );
 
     // Round-trip must recover original payload.
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data)
-        .expect("FlateDecode read-back");
+    let decoded =
+        filters::decode_stream_data(&stream.dict, &stream.data).expect("FlateDecode read-back");
     assert_eq!(
         decoded, original_raw,
         "compress_streams=Yes: decoded output must equal original payload"
