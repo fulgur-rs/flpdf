@@ -62,8 +62,8 @@
 //! pruning layer (8.9) to remove, mirroring the precedent set by
 //! [`crate::page_split`]. They do not affect output validity.
 
-use crate::page_rotate::resolve_inherited_rotate;
-use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
+use crate::pages::{resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
@@ -104,7 +104,8 @@ pub struct RebuildResult {
 /// Per ISO 32000-1 §7.3.9 a `null` value is equivalent to the key being
 /// absent, so it falls through to the parent. A `null` (or absent) `/Parent`
 /// terminates the walk. Cycles and over-deep trees are bounded the same way
-/// as [`resolve_inherited_rotate`] / [`resolve_inherited_resources`].
+/// as [`crate::page_rotate::resolve_inherited_rotate`] /
+/// [`crate::pages::resolve_inherited_resources`].
 ///
 /// Returns `Ok(None)` when no node in the chain carries the key.
 fn resolve_inherited_raw<R: Read + Seek>(
@@ -236,8 +237,8 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         //    chain, BEFORE any reparent severs it. /Rotate and /Resources
         //    reuse the existing dedicated resolvers; the rest use the raw
         //    walk so malformed values round-trip unchanged.
-        let inherited_resources = resolve_inherited_resources(pdf, src)?;
-        let inherited_rotate = resolve_inherited_rotate(pdf, src)?;
+        let inherited_resources = resolve_inherited_resources_with_max_depth(pdf, src, max_depth)?;
+        let inherited_rotate = resolve_inherited_rotate_with_max_depth(pdf, src, max_depth)?;
         let inherited_mediabox = resolve_inherited_raw(pdf, src, "MediaBox", max_depth)?;
         let inherited_cropbox = resolve_inherited_raw(pdf, src, "CropBox", max_depth)?;
 
