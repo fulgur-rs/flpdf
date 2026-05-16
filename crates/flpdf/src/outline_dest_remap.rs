@@ -362,8 +362,11 @@ fn prune_name_pairs<R: Read + Seek>(
             }
             None => {
                 // No resolvable page ref (external/malformed). Keep
-                // conservatively in its original stored form; don't add to
-                // surviving_names (we can't verify the page).
+                // conservatively in its original stored form, and record the
+                // name as surviving — matching prune_legacy_dests — so an
+                // outline item with a string /Dest to this conserved named
+                // destination is not wrongly dropped.
+                surviving_names.insert(name_bytes.clone());
                 result.push(name_obj);
                 result.push(dest_obj);
             }
@@ -650,16 +653,26 @@ fn item_survives<R: Read + Seek>(
     if let Some(dest) = dest_val {
         return dest_survives(pdf, dest, surviving, surviving_names);
     }
-    // Then /A (action).
-    if let Some(Object::Dictionary(a)) = action_val {
-        // Only handle GoTo actions (/S /GoTo).
-        let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-        if is_goto {
-            if let Some(d) = a.get("D") {
-                return dest_survives(pdf, d, surviving, surviving_names);
+    // Then /A (action) — may itself be an indirect reference to the action dict.
+    if let Some(action) = action_val {
+        let resolved;
+        let action = match action {
+            Object::Reference(r) => {
+                resolved = pdf.resolve(*r)?;
+                &resolved
+            }
+            other => other,
+        };
+        if let Object::Dictionary(a) = action {
+            // Only handle GoTo actions (/S /GoTo).
+            let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+            if is_goto {
+                if let Some(d) = a.get("D").cloned() {
+                    return dest_survives(pdf, &d, surviving, surviving_names);
+                }
             }
         }
-        // Non-GoTo actions (URI, Launch, etc.) — keep conservatively.
+        // Non-GoTo / non-dict actions (URI, Launch, etc.) — keep conservatively.
         return Ok(true);
     }
     // No dest and no action → keep (title-only entry, no navigation).
@@ -779,15 +792,36 @@ fn remap_item_dest<R: Read + Seek>(
         // already updated.
     }
 
-    // /A /GoTo /D (action form) — array, dict, or indirect reference.
-    if let Some(Object::Dictionary(mut action)) = d.get("A").cloned() {
-        let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-        if is_goto {
-            if let Some(d_val) = action.get("D").cloned() {
-                if let Some(remapped) = remap_dest_value(pdf, &d_val, surviving)? {
-                    action.insert("D", remapped);
-                    d.insert("A", Object::Dictionary(action));
-                    changed = true;
+    // /A /GoTo /D (action form). /A may be an indirect reference to the
+    // action dict; resolve one level so an indirect GoTo action's /D is
+    // still pruned/remapped.
+    if let Some(a_val) = d.get("A").cloned() {
+        let action_target = match &a_val {
+            Object::Reference(ar) => Some(*ar),
+            _ => None,
+        };
+        let action_obj = match &a_val {
+            Object::Reference(ar) => pdf.resolve(*ar)?,
+            other => other.clone(),
+        };
+        if let Object::Dictionary(mut action) = action_obj {
+            let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+            if is_goto {
+                if let Some(d_val) = action.get("D").cloned() {
+                    if let Some(remapped) = remap_dest_value(pdf, &d_val, surviving)? {
+                        action.insert("D", remapped);
+                        match action_target {
+                            Some(ar) => {
+                                // Rewrite the referenced action object in place;
+                                // /A keeps pointing at the same object number.
+                                pdf.set_object(ar, Object::Dictionary(action));
+                            }
+                            None => {
+                                d.insert("A", Object::Dictionary(action));
+                                changed = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1673,5 +1707,95 @@ mod tests {
             panic!("obj 40 should stay a dest array");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn indirect_goto_action_remapped_and_dropped() {
+        // /A is an *indirect ref* to a GoTo action. Item 20's action -> page 1
+        // (kept), item 21's -> page 2 (removed).
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 21 0 R /Count 2 >>",
+                ),
+                (
+                    20,
+                    "<< /Title (P1) /Parent 10 0 R /Next 21 0 R /A 50 0 R >>",
+                ),
+                (
+                    21,
+                    "<< /Title (P2) /Parent 10 0 R /Prev 20 0 R /A 51 0 R >>",
+                ),
+                (50, "<< /S /GoTo /D [3 0 R /Fit] >>"),
+                (51, "<< /S /GoTo /D [4 0 R /Fit] >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let root = dict_of(&mut pdf, ObjectRef::new(10, 0));
+        assert_eq!(root.get_ref("First"), Some(ObjectRef::new(20, 0)));
+        assert_eq!(root.get_ref("Last"), Some(ObjectRef::new(20, 0)));
+        let item20 = dict_of(&mut pdf, ObjectRef::new(20, 0));
+        assert_eq!(item20.get_ref("A"), Some(ObjectRef::new(50, 0)));
+        let action50 = dict_of(&mut pdf, ObjectRef::new(50, 0));
+        let Some(Object::Array(arr)) = action50.get("D") else {
+            panic!("/D array expected on action 50");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn conserved_no_page_named_dest_keeps_string_dest_outline_item() {
+        // Named dest (ext) has no resolvable page ref (action-form, no page).
+        // It is kept conservatively; the outline item with /Dest (ext) must
+        // therefore also survive (regression: name not added to
+        // surviving_names previously dropped the item).
+        let bytes = build_min_pdf(
+            &[
+                (
+                    1,
+                    "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names 11 0 R >>",
+                ),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (
+                    30,
+                    "<< /Limits [(ext) (ext)] \
+                     /Names [(ext) << /S /GoTo /D (somewhere) >>] >>",
+                ),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+                ),
+                (20, "<< /Title (E) /Parent 10 0 R /Dest (ext) >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        // Keep page 1 only; the named dest has no page ref so it is conserved.
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        let outlines = cat
+            .get_ref("Outlines")
+            .expect("/Outlines should survive (item kept)");
+        let root = dict_of(&mut pdf, outlines);
+        assert_eq!(
+            root.get_ref("First"),
+            Some(ObjectRef::new(20, 0)),
+            "string-dest item to a conserved named dest must be kept"
+        );
     }
 }
