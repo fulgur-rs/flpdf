@@ -67,7 +67,7 @@ pub struct PagePlan {
 impl PagePlan {
     /// Build a plan from a [`PageRange`] expression.
     ///
-    /// Enumerates the document's pages via [`pages::page_refs`], resolves the
+    /// Enumerates the document's pages via [`crate::pages::page_refs`], resolves the
     /// range against the page count, and maps each resolved 1-based number to
     /// the corresponding [`ObjectRef`].
     ///
