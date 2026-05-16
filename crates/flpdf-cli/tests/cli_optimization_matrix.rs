@@ -331,18 +331,15 @@ fn coalesce_contents_merges_array_to_single_stream() {
     }
 }
 
-/// Collect `(operator, operand_count)` pairs from a content stream for
-/// semantic comparison (order-sensitive, but ignores whitespace differences).
-fn collect_content_tokens(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
+/// Collect `ContentToken::Op` entries (operator + operand values) from a content
+/// stream for semantic comparison (order-sensitive, but ignores whitespace
+/// differences).  InlineImage and Comment tokens are excluded because the
+/// coalesce fixture contains only text operators; excluding them keeps the
+/// filter consistent with the original while comparing full operand values.
+fn collect_content_tokens(bytes: &[u8]) -> Vec<ContentToken> {
     ContentStreamParser::new(bytes)
         .filter_map(|t| t.ok())
-        .filter_map(|t| match t {
-            ContentToken::Op {
-                operator,
-                operands,
-            } => Some((operator, operands.len())),
-            _ => None,
-        })
+        .filter(|t| matches!(t, ContentToken::Op { .. }))
         .collect()
 }
 
