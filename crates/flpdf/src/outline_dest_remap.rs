@@ -228,7 +228,7 @@ fn prune_name_tree<R: Read + Seek>(
         // Leaf node: /Names is a flat [(name, dest), ...] array.
         let names_val = node.get("Names").cloned();
         if let Some(Object::Array(pairs)) = names_val {
-            let filtered = prune_name_pairs(pairs, surviving, surviving_names);
+            let filtered = prune_name_pairs(pdf, pairs, surviving, surviving_names)?;
             if filtered.is_empty() {
                 return Ok(true); // Node is now empty.
             }
@@ -307,11 +307,12 @@ fn prune_name_tree<R: Read + Seek>(
 /// Filter a flat name-pairs array `[(name_str, dest_obj), ...]` keeping only
 /// entries whose dest resolves to a surviving page.  Adds kept names to
 /// `surviving_names`. Returns the filtered array.
-fn prune_name_pairs(
+fn prune_name_pairs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     pairs: Vec<Object>,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &mut BTreeSet<Vec<u8>>,
-) -> Vec<Object> {
+) -> Result<Vec<Object>> {
     let mut result: Vec<Object> = Vec::new();
     let mut i = 0;
     while i + 1 < pairs.len() {
@@ -324,32 +325,51 @@ fn prune_name_pairs(
             _ => continue, // Malformed — skip.
         };
 
-        let page_ref = dest_page_ref(&dest_obj);
-        let keep = match page_ref {
+        // A name-tree dest value may itself be an indirect reference to the
+        // real `[pageRef /Fit ...]` array/dict. Resolve one level so the page
+        // ref is detected; without this an indirect dest to a removed page
+        // would be kept, leaving a dangling destination.
+        let indirect_target = match &dest_obj {
+            Object::Reference(r) => Some(*r),
+            _ => None,
+        };
+        let concrete = match &dest_obj {
+            Object::Reference(r) => pdf.resolve(*r)?,
+            other => other.clone(),
+        };
+
+        match dest_page_ref(&concrete) {
             Some(r) => {
                 if let Some(&new_ref) = surviving.get(&r) {
-                    // Remap dest's page ref.
-                    let remapped = remap_dest_page_ref(dest_obj, new_ref);
                     surviving_names.insert(name_bytes.clone());
-                    result.push(name_obj);
-                    result.push(remapped);
-                    true
-                } else {
-                    false // Page was removed.
+                    let remapped = remap_dest_page_ref(concrete, new_ref);
+                    match indirect_target {
+                        Some(dr) => {
+                            // Remap inside the referenced object; keep the
+                            // name -> <ref> pair pointing at the same object.
+                            pdf.set_object(dr, remapped);
+                            result.push(name_obj);
+                            result.push(dest_obj);
+                        }
+                        None => {
+                            result.push(name_obj);
+                            result.push(remapped);
+                        }
+                    }
                 }
+                // else: target page removed -> drop the pair. Any orphaned
+                // indirect dest object is collected by subset GC (8.9).
             }
             None => {
-                // Dest has no resolvable page ref (e.g. external or malformed).
-                // Keep it conservatively but don't add to surviving_names
-                // (we can't verify the page).
+                // No resolvable page ref (external/malformed). Keep
+                // conservatively in its original stored form; don't add to
+                // surviving_names (we can't verify the page).
                 result.push(name_obj);
                 result.push(dest_obj);
-                true
             }
-        };
-        let _ = keep;
+        }
     }
-    result
+    Ok(result)
 }
 
 /// Prune a legacy (PDF 1.1) `/Dests` dictionary in place.
@@ -371,13 +391,31 @@ fn prune_legacy_dests<R: Read + Seek>(
             Some(v) => v,
             None => continue,
         };
-        let page_ref = dest_page_ref(&val);
-        match page_ref {
+        // A /Dests value may be an indirect reference to the real dest
+        // array/dict; resolve one level so an indirect dest to a removed
+        // page is not left dangling.
+        let indirect_target = match &val {
+            Object::Reference(r) => Some(*r),
+            _ => None,
+        };
+        let concrete = match &val {
+            Object::Reference(r) => pdf.resolve(*r)?,
+            other => other.clone(),
+        };
+        match dest_page_ref(&concrete) {
             Some(r) => {
                 if let Some(&new_ref) = surviving.get(&r) {
                     surviving_names.insert(key.clone());
-                    let remapped = remap_dest_page_ref(val, new_ref);
-                    new_dests.insert(key, remapped);
+                    let remapped = remap_dest_page_ref(concrete, new_ref);
+                    match indirect_target {
+                        Some(dr) => {
+                            pdf.set_object(dr, remapped);
+                            // dict entry keeps pointing at the same object.
+                        }
+                        None => {
+                            new_dests.insert(key, remapped);
+                        }
+                    }
                 } else {
                     new_dests.remove(&key);
                 }
@@ -461,13 +499,12 @@ fn collect_siblings<R: Read + Seek>(
                     if let Object::Dictionary(mut d) = item_obj2 {
                         d.remove("First");
                         d.remove("Last");
-                        // Reset Count to 0 (item has no visible descendants).
-                        // Preserve sign (negative = closed), set magnitude to 0.
-                        let count_sign = match d.get("Count") {
-                            Some(Object::Integer(n)) if *n < 0 => -1i64,
-                            _ => 0i64,
-                        };
-                        d.insert("Count", Object::Integer(count_sign));
+                        // With no children, the item has zero descendants, so
+                        // /Count must not survive: a closed-sign (-1) value
+                        // would claim a hidden child that no longer exists.
+                        // Per ISO 32000-1 §12.3.3, an item with no descendants
+                        // omits /Count entirely.
+                        d.remove("Count");
                         pdf.set_object(item_ref, Object::Dictionary(d));
                     }
                 } else {
@@ -1375,5 +1412,127 @@ mod tests {
         let item20 = dict_of(&mut pdf, ObjectRef::new(20, 0));
         assert!(item20.get_ref("Next").is_none());
         assert!(item20.get_ref("Prev").is_none());
+    }
+
+    /// Build a minimal raw PDF from a list of `(objnum, body)` pairs plus a
+    /// trailer dict body. Shared by the regression tests below.
+    fn build_min_pdf(objs: &[(u32, &str)], trailer_extra: &str) -> Vec<u8> {
+        let mut raw: Vec<u8> = b"%PDF-1.5\n".to_vec();
+        let mut offs: BTreeMap<u32, usize> = BTreeMap::new();
+        for (num, body) in objs {
+            offs.insert(*num, raw.len());
+            raw.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let max_num = objs.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let xref_pos = raw.len();
+        raw.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_num + 1).as_bytes());
+        for i in 1..=max_num {
+            if let Some(&off) = offs.get(&i) {
+                raw.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            } else {
+                raw.extend_from_slice(b"0000000000 65535 f \n");
+            }
+        }
+        raw.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R {trailer_extra} >>\nstartxref\n{}\n%%EOF\n",
+                max_num + 1,
+                xref_pos
+            )
+            .as_bytes(),
+        );
+        raw
+    }
+
+    #[test]
+    fn indirect_named_dest_remapped_and_pruned() {
+        // Named dest values are *indirect references* to the dest arrays
+        // (obj 40 -> page 1 kept, obj 41 -> page 2 removed). Before the fix
+        // dest_page_ref ignored Object::Reference, so the removed-page dest
+        // was kept (dangling) and the surviving one was never remapped.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (
+                    30,
+                    "<< /Limits [(d1) (d2)] /Names [(d1) 40 0 R (d2) 41 0 R] >>",
+                ),
+                (40, "[3 0 R /XYZ 0 792 0]"),
+                (41, "[4 0 R /XYZ 0 792 0]"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // Name tree leaf: only (d1) survives; (d2) -> removed page is dropped.
+        let leaf = dict_of(&mut pdf, ObjectRef::new(30, 0));
+        let Some(Object::Array(names)) = leaf.get("Names").cloned() else {
+            panic!("/Names array expected");
+        };
+        let kept_names: Vec<&[u8]> = names
+            .iter()
+            .filter_map(|o| match o {
+                Object::String(b) | Object::Name(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept_names, vec![b"d1".as_slice()]);
+        // (d1) still points at indirect object 40, whose page ref is remapped.
+        assert!(names
+            .iter()
+            .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(40, 0))));
+        let dest40 = pdf.resolve(ObjectRef::new(40, 0)).unwrap();
+        let Object::Array(arr) = dest40 else {
+            panic!("obj 40 should remain a dest array");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn surviving_parent_with_all_children_dropped_has_no_count() {
+        // Item 20 points at kept page 1; its only child 21 points at removed
+        // page 2 and the parent is closed (/Count -1). After pruning, item 20
+        // must not keep /Count -1 (which would claim a hidden child).
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+                ),
+                (
+                    20,
+                    "<< /Title (P1) /Parent 10 0 R /Dest [3 0 R /Fit] \
+                     /First 21 0 R /Last 21 0 R /Count -1 >>",
+                ),
+                (
+                    21,
+                    "<< /Title (P2 sub) /Parent 20 0 R /Dest [4 0 R /Fit] >>",
+                ),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let item20 = dict_of(&mut pdf, ObjectRef::new(20, 0));
+        assert!(item20.get_ref("First").is_none());
+        assert!(item20.get_ref("Last").is_none());
+        assert!(
+            item20.get("Count").is_none(),
+            "childless item must not retain /Count (was -1), got {:?}",
+            item20.get("Count")
+        );
     }
 }
