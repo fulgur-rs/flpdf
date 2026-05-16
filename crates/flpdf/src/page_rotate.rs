@@ -52,16 +52,17 @@ pub struct RotateOp {
 
 /// Normalize any integer degrees value to one of `{0, 90, 180, 270}`.
 ///
-/// The formula `((deg % 360) + 360) % 360` maps any `i32` into `[0, 360)` via
-/// Euclidean remainder, and then the result is *rounded* to the nearest multiple
-/// of 90.
+/// The algorithm:
+/// 1. Add 45 to bias toward the *nearest* 90° boundary.
+/// 2. Integer-divide by 90 (Euclidean, so the quotient is non-negative even for
+///    negative inputs) to obtain the nearest multiple index.
+/// 3. Multiply back by 90 to recover the snapped angle.
+/// 4. Take `rem_euclid(360)` to wrap into `[0, 360)`.
 ///
-/// **Rounding rule for non-multiples-of-90 inputs**: we snap to the nearest 90°
-/// boundary using `((deg + 45).div_euclid(90) * 90).rem_euclid(360)`.  This
-/// matches qpdf's documented behaviour (qpdf source `QPDFPageObjectHelper.cc`,
-/// function `rotate`): values that are not already multiples of 90 are invalid
-/// per the PDF specification (ISO 32000-1 §7.7.3.3 Table 30) but qpdf normalizes
-/// them rather than erroring.  We do the same.
+/// **Non-multiples-of-90 inputs**: ISO 32000-1 §7.7.3.3 Table 30 restricts
+/// `/Rotate` to `{0, 90, 180, 270}`, but malformed PDFs sometimes carry other
+/// values.  Rather than rejecting them, we snap to the nearest valid boundary —
+/// the same policy qpdf uses (normalize rather than error).
 ///
 /// Examples:
 /// - `  0` → `  0`
@@ -642,5 +643,89 @@ mod tests {
             Some(&Object::Integer(270)),
             "expected inherited+add materialized on leaf"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-page test: each leaf is updated independently.
+    // -----------------------------------------------------------------------
+
+    /// Build a PDF with two pages that each have their own /Rotate value.
+    ///
+    /// Object layout:
+    ///   1 0 R  Catalog
+    ///   2 0 R  Pages  (/Kids [3 0 R 4 0 R])
+    ///   3 0 R  Page   (/Rotate = page1_rotate if Some)
+    ///   4 0 R  Page   (/Rotate = page2_rotate if Some)
+    fn build_two_page_pdf(page1_rotate: Option<i32>, page2_rotate: Option<i32>) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        let page1_str = if let Some(r) = page1_rotate {
+            format!(
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate {r} >>\nendobj\n"
+            )
+        } else {
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_string()
+        };
+        pdf.extend_from_slice(page1_str.as_bytes());
+
+        let off4 = pdf.len() as u64;
+        let page2_str = if let Some(r) = page2_rotate {
+            format!(
+                "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate {r} >>\nendobj\n"
+            )
+        } else {
+            "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_string()
+        };
+        pdf.extend_from_slice(page2_str.as_bytes());
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn apply_to_multiple_pages_each_updated_independently() {
+        // Page 1: /Rotate 90; Page 2: /Rotate 0.  Add 90 to both.
+        // Expected: page 1 → 180, page 2 → 90.
+        let bytes = build_two_page_pdf(Some(90), Some(0));
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let page1 = ObjectRef::new(3, 0);
+        let page2 = ObjectRef::new(4, 0);
+
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: 90,
+        };
+        apply_rotate_to_pages(&mut pdf, &[page1, page2], &op).unwrap();
+
+        let obj1 = pdf.resolve(page1).unwrap();
+        let Object::Dictionary(dict1) = obj1 else {
+            panic!("not a dict")
+        };
+        assert_eq!(dict1.get("Rotate"), Some(&Object::Integer(180)), "page 1");
+
+        let obj2 = pdf.resolve(page2).unwrap();
+        let Object::Dictionary(dict2) = obj2 else {
+            panic!("not a dict")
+        };
+        assert_eq!(dict2.get("Rotate"), Some(&Object::Integer(90)), "page 2");
     }
 }
