@@ -1589,7 +1589,23 @@ fn run_page_extraction(
     }
 
     let specs = parse_pages_segment(&page_ops.pages)?;
-    let inputs = resolve_page_specs(&specs, primary_input)?;
+    let mut inputs = resolve_page_specs(&specs, primary_input)?;
+
+    // CombinedPlan::from_specs (below) opens each input using only the
+    // segment-local InputSpec password. For `--pages . ...` on an encrypted
+    // primary input where the user supplied the top-level `--password`, the
+    // spec carries no password and the planning open would fail before the
+    // later open_pdf(..., &src_pw) path applies it. Backfill the top-level
+    // password into specs that lack their own so planning and the rebuild
+    // open use the same credential. (Single-document scope is enforced just
+    // below, so every spec resolves to the primary input.)
+    if let Some(top_pw) = &password.password {
+        for spec in &mut inputs {
+            if spec.password.is_none() {
+                spec.password = Some(top_pw.clone());
+            }
+        }
+    }
 
     // ── Single-document scope enforcement ────────────────────────────────
     // Compare *canonicalized* source paths so the same file spelled
