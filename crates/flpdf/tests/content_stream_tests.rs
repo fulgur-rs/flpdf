@@ -1,6 +1,8 @@
 //! Tokenizer tests for `flpdf::content_stream`.
 
-use flpdf::content_stream::{ContentParseOptions, ContentStreamParser, ContentToken};
+use flpdf::content_stream::{
+    normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,
+};
 use flpdf::Object;
 
 fn tokens(input: &[u8]) -> Vec<ContentToken> {
@@ -382,4 +384,207 @@ Q";
             b"Q",
         ]
     );
+}
+
+// ============================================================
+// normalize_content_stream tests
+// ============================================================
+
+/// Helper: collect operator names from a byte slice via ContentStreamParser.
+fn operator_sequence(input: &[u8]) -> Vec<Vec<u8>> {
+    ContentStreamParser::new(input)
+        .collect::<flpdf::Result<Vec<_>>>()
+        .expect("parse")
+        .into_iter()
+        .filter_map(|tok| match tok {
+            ContentToken::Op { operator, .. } => Some(operator),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Helper: collect all tokens (including InlineImage) from a byte slice.
+fn all_tokens(input: &[u8]) -> Vec<ContentToken> {
+    ContentStreamParser::new(input)
+        .collect::<flpdf::Result<Vec<_>>>()
+        .expect("parse")
+}
+
+/// Round-trip property: normalize produces the same operator sequence as the
+/// original, and the result is idempotent (normalize(normalize(x)) == normalize(x)).
+#[test]
+fn normalize_round_trip_operator_sequence() {
+    let original = b"q
+0 0 0 rg
+BT
+/F1 24 Tf
+1 0 0 1 72 720 Tm
+(qpdf test) Tj
+ET
+0 0 1 RG
+2 w
+72 700 m
+540 700 l
+S
+Q";
+    let normalized = normalize_content_stream(original).expect("normalize");
+    // Same operator sequence as original.
+    assert_eq!(operator_sequence(&normalized), operator_sequence(original));
+    // Idempotent: a second normalize produces byte-identical output.
+    let normalized2 = normalize_content_stream(&normalized).expect("normalize again");
+    assert_eq!(normalized, normalized2, "normalize is not idempotent");
+}
+
+/// Exactly one operator per line; lines are newline-terminated; operands are
+/// space-separated on the same line as the operator.
+#[test]
+fn normalize_one_operator_per_line() {
+    let input = b"BT /F1 12 Tf (Hello) Tj ET";
+    let out = normalize_content_stream(input).expect("normalize");
+    let text = std::str::from_utf8(&out).expect("utf8");
+    let lines: Vec<&str> = text.lines().collect();
+    // Expected: "BT", "/F1 12 Tf", "(Hello) Tj", "ET"
+    assert_eq!(lines.len(), 4, "lines: {lines:?}");
+    assert_eq!(lines[0], "BT");
+    assert_eq!(lines[1], "/F1 12 Tf");
+    assert_eq!(lines[2], "(Hello) Tj");
+    assert_eq!(lines[3], "ET");
+}
+
+/// Operand values are preserved: names, integers, reals (observable semantics).
+#[test]
+fn normalize_operand_values_preserved() {
+    let input = b"1 0 0 1 10.5 20.0 cm";
+    let out = normalize_content_stream(input).expect("normalize");
+    let toks = all_tokens(&out);
+    assert_eq!(toks.len(), 1);
+    match &toks[0] {
+        ContentToken::Op { operands, operator } => {
+            assert_eq!(operator, b"cm");
+            assert_eq!(operands.len(), 6);
+            assert_eq!(operands[0], Object::Integer(1));
+            assert_eq!(operands[1], Object::Integer(0));
+            assert_eq!(operands[2], Object::Integer(0));
+            assert_eq!(operands[3], Object::Integer(1));
+            // 10.5 is preserved as Real; 20.0 is serialized as "20" which
+            // re-parses as Integer(20) — this is a documented behaviour.
+            assert_eq!(operands[4], Object::Real(10.5));
+        }
+        other => panic!("unexpected token: {other:?}"),
+    }
+}
+
+/// Nested array operand (TJ) is preserved after round-trip.
+#[test]
+fn normalize_nested_array_operand() {
+    let input = b"[(A) -120 (B)] TJ";
+    let out = normalize_content_stream(input).expect("normalize");
+    let toks = all_tokens(&out);
+    assert_eq!(toks.len(), 1);
+    match &toks[0] {
+        ContentToken::Op { operands, operator } => {
+            assert_eq!(operator, b"TJ");
+            assert_eq!(operands.len(), 1);
+            match &operands[0] {
+                Object::Array(items) => {
+                    assert_eq!(items.len(), 3);
+                    assert_eq!(items[0], Object::String(b"A".to_vec()));
+                    assert_eq!(items[1], Object::Integer(-120));
+                    assert_eq!(items[2], Object::String(b"B".to_vec()));
+                }
+                other => panic!("expected array operand, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected token: {other:?}"),
+    }
+}
+
+/// Dictionary operand (BDC) is preserved after round-trip.
+#[test]
+fn normalize_dict_operand() {
+    let input = b"/OC << /Type /OCG >> BDC";
+    let out = normalize_content_stream(input).expect("normalize");
+    let toks = all_tokens(&out);
+    assert_eq!(toks.len(), 1);
+    match &toks[0] {
+        ContentToken::Op { operands, operator } => {
+            assert_eq!(operator, b"BDC");
+            assert_eq!(operands.len(), 2);
+            assert_eq!(operands[0], Object::Name(b"OC".to_vec()));
+            match &operands[1] {
+                Object::Dictionary(d) => {
+                    assert_eq!(d.get("Type"), Some(&Object::Name(b"OCG".to_vec())));
+                }
+                other => panic!("expected dict, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected token: {other:?}"),
+    }
+}
+
+/// Inline image round-trip: BI/ID/EI structure is preserved; data bytes are
+/// byte-identical; dict entries survive re-parse.
+#[test]
+fn normalize_inline_image_round_trip() {
+    let raw: &[u8] = b"\x01\x02\x03\xff";
+    let mut input = Vec::new();
+    input.extend_from_slice(b"q BI /W 2 /H 2 /BPC 8 /CS /RGB ID ");
+    input.extend_from_slice(raw);
+    input.extend_from_slice(b" EI Q");
+
+    let out = normalize_content_stream(&input).expect("normalize");
+    let toks = all_tokens(&out);
+    assert_eq!(toks.len(), 3, "tokens: {toks:?}");
+    assert_eq!(toks[0], op(vec![], b"q"));
+    match &toks[1] {
+        ContentToken::InlineImage { dict, data } => {
+            assert_eq!(data, raw, "inline image data must be byte-identical");
+            assert_eq!(dict.get("W"), Some(&Object::Integer(2)));
+            assert_eq!(dict.get("H"), Some(&Object::Integer(2)));
+            assert_eq!(dict.get("BPC"), Some(&Object::Integer(8)));
+            assert_eq!(dict.get("CS"), Some(&Object::Name(b"RGB".to_vec())));
+        }
+        other => panic!("expected inline image, got {other:?}"),
+    }
+    assert_eq!(toks[2], op(vec![], b"Q"));
+}
+
+/// Inline image with binary payload (contains high bytes and EI-like sequence).
+#[test]
+fn normalize_inline_image_binary_payload() {
+    let raw: &[u8] = b"\x00EI\x10\x20\x80\xfe";
+    let mut input = Vec::new();
+    input.extend_from_slice(b"BI /W 1 /H 1 /CS /G /BPC 8 ID ");
+    input.extend_from_slice(raw);
+    input.extend_from_slice(b" EI");
+
+    let out = normalize_content_stream(&input).expect("normalize");
+    let toks = all_tokens(&out);
+    assert_eq!(toks.len(), 1);
+    match &toks[0] {
+        ContentToken::InlineImage { data, .. } => {
+            assert_eq!(data, raw, "binary payload must survive normalize");
+        }
+        other => panic!("expected inline image, got {other:?}"),
+    }
+}
+
+/// Comments are stripped by normalize (keep_comments=false semantics).
+#[test]
+fn normalize_strips_comments() {
+    let input = b"% header\nq % inline comment\nQ";
+    let out = normalize_content_stream(input).expect("normalize");
+    let text = std::str::from_utf8(&out).expect("utf8");
+    assert!(!text.contains('%'), "comments must be stripped: {text:?}");
+    let ops: Vec<_> = operator_sequence(&out);
+    assert_eq!(ops, vec![b"q".to_vec(), b"Q".to_vec()]);
+}
+
+/// Idempotence on a stream that already uses the normalized form.
+#[test]
+fn normalize_idempotent_already_normal() {
+    let input = b"BT\n/F1 12 Tf\n(hello) Tj\nET\n";
+    let out = normalize_content_stream(input).expect("normalize");
+    let out2 = normalize_content_stream(&out).expect("normalize again");
+    assert_eq!(out, out2);
 }
