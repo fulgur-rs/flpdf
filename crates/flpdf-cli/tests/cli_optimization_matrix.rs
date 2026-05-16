@@ -655,13 +655,18 @@ fn newline_before_endstream_y_always_inserts_newline() {
     );
 
     let output_bytes = std::fs::read(&output).unwrap();
-    let keyword = b"endstream";
+    // Use the structural helper to find only genuine endstream keyword positions,
+    // skipping any accidental matches inside compressed payload bytes.
+    let mut out_pdf = Pdf::open(Cursor::new(output_bytes.clone())).unwrap();
+    let endstream_offsets = real_endstream_offsets(&output_bytes, &mut out_pdf);
 
-    let mut found = false;
+    assert!(
+        !endstream_offsets.is_empty(),
+        "newline-before-endstream=y: no stream objects found in output"
+    );
+
     let mut violations = 0usize;
-
-    for start in find_all_occurrences(&output_bytes, keyword) {
-        found = true;
+    for &start in &endstream_offsets {
         if start == 0 || output_bytes[start - 1] != b'\n' {
             violations += 1;
             eprintln!(
@@ -672,10 +677,6 @@ fn newline_before_endstream_y_always_inserts_newline() {
         }
     }
 
-    assert!(
-        found,
-        "newline-before-endstream=y: no `endstream` keyword found in output"
-    );
     assert_eq!(
         violations, 0,
         "newline-before-endstream=y: {violations} `endstream` keyword(s) not preceded by \\n"
@@ -734,15 +735,18 @@ fn newline_before_endstream_n_omits_extra_newline_for_eol_terminated_payload() {
     );
 
     let output_bytes = std::fs::read(&output).unwrap();
-    let keyword = b"endstream";
 
-    let occurrences = find_all_occurrences(&output_bytes, keyword);
+    // Use the structural helper to find only genuine endstream keyword positions,
+    // skipping any accidental matches inside compressed or raw payload bytes.
+    let mut out_pdf = Pdf::open(Cursor::new(output_bytes.clone())).unwrap();
+    let endstream_offsets = real_endstream_offsets(&output_bytes, &mut out_pdf);
+
     assert!(
-        !occurrences.is_empty(),
-        "newline-before-endstream=n: no `endstream` keyword found in output"
+        !endstream_offsets.is_empty(),
+        "newline-before-endstream=n: no stream objects found in output"
     );
 
-    // For every `endstream` occurrence, verify that an extra newline was NOT
+    // For every real `endstream` position, verify that an extra newline was NOT
     // inserted when the payload already ends with `\n`.
     //
     // Concretely: if byte[idx-1] == '\n' (the payload's own trailing newline),
@@ -751,7 +755,7 @@ fn newline_before_endstream_n_omits_extra_newline_for_eol_terminated_payload() {
     // applicable for the "omit" direction (an extra '\n' is correctly inserted
     // for parseability in that case).
     let mut found_eol_terminated = false;
-    for &start in &occurrences {
+    for &start in &endstream_offsets {
         if start >= 2 && output_bytes[start - 1] == b'\n' {
             // The payload ends with '\n'.  With flag=n, no extra '\n' is added,
             // so byte[start-2] must NOT be '\n'.
@@ -826,6 +830,95 @@ fn combination_normalize_coalesce_compress_succeeds() {
     if !skip_if_qpdf_missing() {
         assert_qpdf_check(&output);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structural endstream-offset helper
+// ---------------------------------------------------------------------------
+
+/// Return the byte offsets (in `output_bytes`) of the `endstream` keyword that
+/// immediately follows each real stream payload in the PDF.
+///
+/// The function uses `Pdf::live_object_refs()` + `Pdf::resolve()` to enumerate
+/// every indirect stream object, then locates its payload in `output_bytes` via
+/// the unique anchor `stream\n<data>` (or `stream\r\n<data>`).  This avoids the
+/// false-positive problem caused by accidentally matching `endstream` bytes
+/// embedded inside a compressed payload.
+///
+/// # Panics
+/// Panics if an anchor cannot be found (indicates a real fixture mismatch).
+fn real_endstream_offsets(output_bytes: &[u8], out_pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<usize> {
+    let refs = out_pdf.live_object_refs();
+    let mut offsets = Vec::new();
+
+    for oref in refs {
+        let obj = out_pdf.resolve(oref).expect("resolve must succeed");
+        let stream = match obj {
+            Object::Stream(s) => s,
+            _ => continue,
+        };
+
+        // Build anchors: the `stream` keyword + EOL + encoded payload bytes
+        // appear exactly once in the raw output per stream object.
+        let data = &stream.data;
+        let mut anchor_lf = b"stream\n".to_vec();
+        anchor_lf.extend_from_slice(data);
+        let mut anchor_crlf = b"stream\r\n".to_vec();
+        anchor_crlf.extend_from_slice(data);
+
+        // Try \n anchor first, fall back to \r\n.
+        let anchor = if find_all_occurrences(output_bytes, &anchor_lf).len() == 1 {
+            anchor_lf
+        } else if find_all_occurrences(output_bytes, &anchor_crlf).len() == 1 {
+            anchor_crlf
+        } else {
+            // Try a shorter anchor using only the stream keyword + first 32 bytes
+            // for very short or empty payloads where the data alone may be ambiguous.
+            let prefix: &[u8] = &data[..data.len().min(32)];
+            let mut short_lf = b"stream\n".to_vec();
+            short_lf.extend_from_slice(prefix);
+            let short_hits = find_all_occurrences(output_bytes, &short_lf);
+            if short_hits.len() == 1 {
+                anchor_lf = short_lf;
+                anchor_lf
+            } else {
+                panic!(
+                    "real_endstream_offsets: could not uniquely anchor stream payload for {:?} \
+                     (data len={}, lf hits={}, crlf hits={}). \
+                     Fixture may need updating.",
+                    oref,
+                    data.len(),
+                    find_all_occurrences(output_bytes, &anchor_lf).len(),
+                    find_all_occurrences(output_bytes, &anchor_crlf).len(),
+                )
+            }
+        };
+
+        let anchor_pos = find_all_occurrences(output_bytes, &anchor)[0];
+        // `after_payload` points to the first byte after the encoded stream data.
+        // Between this position and the `endstream` keyword, ISO 32000-1 §7.3.8.1
+        // allows an optional EOL (the y/n flag controls whether one is inserted).
+        // Scan forward up to 4 bytes to locate the actual `endstream` start.
+        let after_payload = anchor_pos + anchor.len();
+        let endstream_kw = b"endstream";
+        let endstream_off = (after_payload..after_payload + 4)
+            .find(|&pos| {
+                pos + endstream_kw.len() <= output_bytes.len()
+                    && &output_bytes[pos..pos + endstream_kw.len()] == endstream_kw
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "real_endstream_offsets: `endstream` not found within 4 bytes after payload \
+                     for {:?} at offset {}. bytes: {:?}",
+                    oref,
+                    after_payload,
+                    &output_bytes[after_payload..after_payload.min(output_bytes.len() - 1) + 16]
+                )
+            });
+        offsets.push(endstream_off);
+    }
+
+    offsets
 }
 
 // ---------------------------------------------------------------------------
