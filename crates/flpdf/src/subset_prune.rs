@@ -105,8 +105,19 @@ pub fn prune_after_subset<R: Read + Seek>(
     // "unreachable" set after.
     let all_live = pdf.live_object_refs();
 
-    // Mark: traverse the object graph from /Root.
-    let reachable = collect_reachable(pdf, root_ref)?;
+    // Mark: traverse the object graph from /Root AND from the trailer.
+    //
+    // The PDF trailer can reference objects that are NOT reachable from /Root,
+    // most notably /Info (document information dictionary) and /Encrypt
+    // (encryption dictionary for encrypted PDFs).  We must protect these from
+    // the sweep pass by seeding the reachability walk with them too.
+    let trailer_refs = {
+        let trailer_clone = Object::Dictionary(pdf.trailer().clone());
+        let mut refs: Vec<ObjectRef> = Vec::new();
+        walk_refs(&trailer_clone, &mut refs);
+        refs
+    };
+    let reachable = collect_reachable(pdf, root_ref, trailer_refs)?;
 
     // Sweep: delete every live object that was not reached.
     for obj_ref in all_live {
@@ -120,8 +131,12 @@ pub fn prune_after_subset<R: Read + Seek>(
 
 // ── Reachability walker ───────────────────────────────────────────────────────
 
-/// Transitively collect every `ObjectRef` reachable from `start` by following
-/// all `Object::Reference` values encountered while resolving objects.
+/// Transitively collect every `ObjectRef` reachable from `start` (and any
+/// additional seeds in `extra_seeds`) by following all `Object::Reference`
+/// values encountered while resolving objects.
+///
+/// `extra_seeds` is used to protect objects referenced by the PDF trailer
+/// (e.g. `/Info`, `/Encrypt`) that are NOT reachable through `/Root`.
 ///
 /// Cycles are handled by the `visited` set: an object already in the set is
 /// not resolved again.  Object-number 0 (the free-list head) is never
@@ -134,9 +149,11 @@ pub fn prune_after_subset<R: Read + Seek>(
 fn collect_reachable<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
+    extra_seeds: Vec<ObjectRef>,
 ) -> Result<BTreeSet<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut queue: Vec<ObjectRef> = vec![start];
+    queue.extend(extra_seeds);
 
     while let Some(current) = queue.pop() {
         if current.number == 0 {
@@ -496,6 +513,10 @@ mod tests {
         // Object 3 (intermediate node) is now orphaned and should be GC'd.
         // Objects 4, 5 (pages), 6 (resources), 7, 8 (streams) should survive.
         assert!(
+            !is_live(&mut pdf, ObjectRef::new(3, 0)),
+            "intermediate /Pages node (obj 3) must be GC'd after rebuild+prune"
+        );
+        assert!(
             is_live(&mut pdf, ObjectRef::new(4, 0)),
             "page1 must survive"
         );
@@ -536,7 +557,12 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)]).unwrap();
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
 
-        // xref-level: page2 (5) and its content stream (8) should be gone.
+        // xref-level: intermediate /Pages node (3), page2 (5) and its content
+        // stream (8) should be gone.
+        assert!(
+            !is_live(&mut pdf, ObjectRef::new(3, 0)),
+            "intermediate /Pages node (obj 3) must be GC'd"
+        );
         assert!(
             !is_live(&mut pdf, ObjectRef::new(5, 0)),
             "page2 must be GC'd"
@@ -589,6 +615,82 @@ mod tests {
         assert!(
             report.valid,
             "pruned PDF must be valid: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// Build a 2-page PDF where the trailer has an /Info reference.
+    /// After extracting page 1, the /Info object must NOT be GC'd.
+    ///
+    /// Object layout:
+    ///   1  Catalog  (/Pages 2)
+    ///   2  Pages root  (/Kids [3 4])
+    ///   3  Page 1 dict
+    ///   4  Page 2 dict
+    ///   5  /Info dict  (referenced from trailer, NOT from /Root)
+    fn build_pdf_with_info() -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+
+        let objs: Vec<(u32, &str)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (Test Document) /Author (Test Author) >>"),
+        ];
+
+        for (n, s) in &objs {
+            offs.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+
+        let xref_start = out.len() as u64;
+        let total = 6u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
+        }
+        // Trailer references /Info 5 0 R directly — not through /Root.
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {total} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// Regression: /Info object referenced from the trailer (not from /Root)
+    /// must NOT be deleted by the xref-level GC pass.
+    #[test]
+    fn trailer_info_object_survives_gc() {
+        let bytes = build_pdf_with_info();
+        let mut pdf = open(bytes);
+
+        // Keep only page 1 (obj 3); page 2 (obj 4) becomes unreachable.
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
+
+        // /Info (obj 5) is referenced from the trailer — it must survive.
+        assert!(
+            is_live(&mut pdf, ObjectRef::new(5, 0)),
+            "/Info object (trailer ref) must NOT be GC'd"
+        );
+
+        // Page 2 (obj 4) is not reachable from anywhere and must be GC'd.
+        assert!(
+            !is_live(&mut pdf, ObjectRef::new(4, 0)),
+            "page 2 should be GC'd"
+        );
+
+        // Output must still be valid.
+        let mut out: Vec<u8> = Vec::new();
+        write_pdf(&mut pdf, &mut out).unwrap();
+        let report = check_reader(Cursor::new(out)).unwrap();
+        assert!(
+            report.valid,
+            "pruned PDF with /Info must be valid: {:?}",
             report.diagnostics
         );
     }
