@@ -77,7 +77,8 @@ pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use security::password::PasswordMode;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
-    write_pdf_with_options, write_qdf, CompressStreams, ObjectStreamMode, WriteOptions,
+    write_pdf_with_options, write_qdf, write_stream_to_buf, CompressStreams,
+    NewlineBeforeEndstream, ObjectStreamMode, WriteOptions,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
