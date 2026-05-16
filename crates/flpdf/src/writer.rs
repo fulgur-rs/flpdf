@@ -7,6 +7,45 @@ use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefO
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 
+/// Controls whether the full-rewrite path applies FlateDecode compression to
+/// output streams.
+///
+/// # Byte-vs-observable policy
+///
+/// flpdf uses zlib (via the `flate2` crate) with `Compression::default()`,
+/// which selects a different compression level and block layout than qpdf's
+/// internal zlib build.  As a result, **flpdf's FlateDecode output is
+/// observably equivalent to qpdf's (same decoded bytes) but will not be
+/// byte-identical**.  The acceptance criterion for this toggle is round-trip
+/// correctness (decoded bytes match), not byte-identical agreement with qpdf.
+///
+/// This tradeoff is intentional and documented here to avoid spending time
+/// chasing byte-level zlib parity, which would require re-implementing qpdf's
+/// exact compression parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressStreams {
+    /// Apply FlateDecode to every output stream that does not already carry a
+    /// filter chain flpdf cannot re-encode (e.g. DCTDecode, JPXDecode).
+    ///
+    /// For the full-rewrite path this means: decode the source stream through
+    /// its declared filter pipeline and re-emit the result with a single
+    /// `/FlateDecode` filter.  Streams whose decode or re-encode fails are
+    /// emitted verbatim (the fallback preserves readability).
+    ///
+    /// This is the default — matching qpdf's behaviour for a plain
+    /// `qpdf in.pdf out.pdf` invocation.
+    #[default]
+    Yes,
+    /// Emit every output stream without any FlateDecode compression.
+    ///
+    /// For the full-rewrite path: decode the source stream and write the raw
+    /// bytes without any `/Filter`.  Streams whose decode fails (e.g. because
+    /// the declared filter is `DCTDecode` / `JPXDecode` and the image data is
+    /// opaque to flpdf) are passed through verbatim — their original `/Filter`
+    /// chain is preserved so the output remains readable.
+    No,
+}
+
 /// Options controlling [`write_pdf_with_options`].
 ///
 /// Constructed via `Default::default()` or struct literal. The struct is
@@ -56,6 +95,18 @@ pub struct WriteOptions {
     /// Only consulted by writer paths that emit ObjStms; the incremental copy
     /// path that simply appends to the source bytes ignores it.
     pub object_streams: ObjectStreamMode,
+
+    /// Stream compression policy for the full-rewrite path.
+    ///
+    /// [`CompressStreams::Yes`] (the default) decodes each stream and
+    /// re-encodes it with a single `/FlateDecode` filter, matching qpdf's
+    /// default behaviour.  [`CompressStreams::No`] decodes each stream and
+    /// emits the raw bytes without any filter; streams that cannot be decoded
+    /// (e.g. `DCTDecode`/`JPXDecode` image data) are passed through verbatim.
+    ///
+    /// Only consulted by the full-rewrite path (`full_rewrite = true`).
+    /// The incremental-update path and `write_qdf` are unaffected.
+    pub compress_streams: CompressStreams,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
@@ -1159,7 +1210,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         );
 
         if let Object::Stream(stream) = object {
-            let reencoded = reencode_stream_flate(&stream);
+            let reencoded = apply_stream_compress_policy(&stream, options.compress_streams);
             reencoded.write_pdf(&mut bytes);
         } else {
             object.write_pdf(&mut bytes);
@@ -1173,7 +1224,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_ref = container_refs[batch_idx];
         let body = object_streams::emit_objstm_body(pdf, batch)?;
-        let stream = object_streams::wrap_objstm_body(&body)?;
+        let stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
 
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
@@ -1294,7 +1345,14 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // single Index range suffices.
             let ranges: Vec<(u32, u32)> = vec![(0, final_object_count as u32)];
 
-            let stream_data = build_xref_stream_bytes(&xref_entries, &ranges)?;
+            // Build the raw xref entry bytes (binary format: field widths
+            // declared in /W).  This is structural PDF data, not a content
+            // stream, so `apply_stream_compress_policy` is not used here.
+            // Instead we apply the compress_streams toggle directly: when
+            // `CompressStreams::Yes` the raw bytes are FlateDecode-compressed
+            // (matching qpdf's default behaviour for xref streams); when
+            // `CompressStreams::No` they are stored without any filter.
+            let raw_xref_bytes = build_xref_stream_bytes(&xref_entries, &ranges)?;
 
             let mut index_array = Vec::with_capacity(ranges.len() * 2);
             for &(start, count) in &ranges {
@@ -1308,9 +1366,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 xref_dict.remove("Encrypt");
             }
             // The trailer may carry filter keys from the input's xref stream
-            // (e.g. /Filter /FlateDecode). We're emitting freshly built raw
-            // entry bytes via `Stream::new`, so any stale filter declaration
-            // would make readers attempt to decode raw bytes as compressed.
+            // (e.g. /Filter /FlateDecode). We're emitting freshly built bytes
+            // via `Stream::new`, so any stale filter declaration would make
+            // readers attempt to decode the new bytes under the wrong codec.
+            // We set /Filter (or omit it) based on compress_streams below.
             xref_dict.remove("Filter");
             xref_dict.remove("DecodeParms");
             xref_dict.remove("F");
@@ -1328,6 +1387,34 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             );
             xref_dict.insert("Index", Object::Array(index_array));
             xref_dict.insert("Root", Object::Reference(root_ref));
+
+            // Apply the compress_streams policy: FlateDecode-compress the xref
+            // binary payload when Yes, or store raw bytes when No.
+            let stream_data = match options.compress_streams {
+                CompressStreams::Yes => {
+                    let mut encode_dict = Dictionary::new();
+                    encode_dict
+                        .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    match filters::encode_stream_data(&encode_dict, &raw_xref_bytes) {
+                        Ok(compressed) => {
+                            xref_dict.insert(
+                                "Filter",
+                                Object::Name(b"FlateDecode".to_vec()),
+                            );
+                            compressed
+                        }
+                        // Compression failure is essentially impossible for
+                        // in-memory zlib, but fall back to raw bytes so we
+                        // never emit an unreadable xref stream.
+                        Err(_) => raw_xref_bytes,
+                    }
+                }
+                CompressStreams::No => {
+                    // No filter: store the structural binary directly.
+                    raw_xref_bytes
+                }
+            };
+
             xref_dict.insert(
                 "Length",
                 Object::Integer(i64::try_from(stream_data.len()).map_err(|_| {
@@ -1350,54 +1437,64 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     Ok(())
 }
 
-/// Decode a stream's filter chain and re-encode with a single `/FlateDecode`
-/// filter.  On any error (unsupported filter, corrupt data, etc.) the original
-/// stream object is returned unchanged so the caller can still emit a readable
-/// — if not fully normalized — PDF.
+/// Apply the stream compression policy to a single stream object.
 ///
-/// # Filter policy
+/// This is the single choke-point through which **all** stream emission in
+/// the full-rewrite path flows, ensuring a consistent policy across every
+/// writer route.  (`write_qdf` is exempt — it is a debug-dump path that
+/// emits source bytes verbatim by design and does not consult this function.)
 ///
-/// Streams that decode and re-encode successfully are normalised to a single
-/// `/FlateDecode` filter, regardless of what chain the input declared (e.g.
-/// `[/ASCII85Decode /FlateDecode]` or raw uncompressed bytes).  This matches
-/// qpdf's default passthrough mode, which emits every stream as `/FlateDecode`
-/// when no special flags are given.
+/// # Policy: `CompressStreams::Yes` (default)
 ///
-/// **Fallback for unsupported / corrupt inputs.**  When `decode_stream_data` or
-/// `encode_stream_data` returns an error (e.g. the source declares a filter the
-/// pipeline does not implement, or the stream data is corrupt), the original
-/// stream — including its `/Filter` chain — is preserved verbatim.  Callers
-/// must not assume every emitted stream carries `/FlateDecode`; the guarantee
-/// only holds for inputs the filter pipeline can round-trip.
+/// Decode the stream through its declared filter pipeline and re-encode with a
+/// single `/FlateDecode` filter.  This matches qpdf's default passthrough mode.
 ///
-/// Opt-out flags such as `--qdf` or `--ascii85` are not implemented here;
-/// if those behaviours are needed they should be addressed in a separate issue.
-fn reencode_stream_flate(stream: &crate::Stream) -> Object {
+/// Streams whose decode succeeds but re-encode fails (vanishingly rare for
+/// in-memory zlib) are returned verbatim.
+///
+/// # Policy: `CompressStreams::No`
+///
+/// Decode the stream and emit the raw bytes without any `/Filter`.  The
+/// filter-related keys (`/Filter`, `/DecodeParms`, `/F`, `/FFilter`,
+/// `/FDecodeParms`) are stripped from the output dictionary.
+///
+/// # Fallback for unsupported / corrupt inputs
+///
+/// When `decode_stream_data` returns an error — e.g. because the declared
+/// filter is `DCTDecode` or `JPXDecode` (image codecs not implemented by
+/// flpdf) or because the stream data is corrupt — the original stream is
+/// returned **unchanged** (dict + data verbatim).  This preserves readability:
+/// a PDF reader that understands the codec can still decode the stream, and we
+/// do not corrupt the data by emitting uninterpreted bytes under a wrong
+/// (or missing) filter declaration.
+///
+/// # Byte-vs-observable note
+///
+/// For `CompressStreams::Yes`, flpdf's FlateDecode output uses
+/// `flate2::Compression::default()`, which selects different compression
+/// parameters than qpdf's internal zlib build.  The decoded bytes are
+/// identical to qpdf's, but the raw compressed bytes differ.  This is
+/// intentional: byte-identical agreement with qpdf is not a goal for this
+/// toggle.  See [`CompressStreams`] for the full policy statement.
+pub fn apply_stream_compress_policy(
+    stream: &crate::Stream,
+    policy: CompressStreams,
+) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
         Ok(d) => d,
         Err(_) => {
-            // Decode failure: emit the stream with its original dict/data.
+            // Decode failure (unsupported codec or corrupt data): emit verbatim.
+            // The original /Filter chain is preserved so downstream readers
+            // (e.g. image renderers) can still interpret the stream correctly.
             return Object::Stream(stream.clone());
         }
     };
 
-    // Re-encode with a minimal FlateDecode dict.  If encoding fails (which
-    // should be vanishingly rare for in-memory zlib), keep the original
-    // stream verbatim — declaring /FlateDecode on uncompressed bytes would
-    // produce an unreadable PDF.
-    let mut encode_dict = Dictionary::new();
-    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
-        Ok(e) => e,
-        Err(_) => return Object::Stream(stream.clone()),
-    };
-
-    // Build a new stream dict: copy everything from the original except the
-    // filter-related keys (which we replace) and Length (which we update).
+    // Build a new dict: strip all filter-related keys, update /Length.
     // `/F` carries an external-file reference for the stream data, so we
     // strip it as well — otherwise readers may try to load the old external
-    // file instead of the new embedded Flate stream we just produced.
+    // file instead of the new embedded stream we just produced.
     let mut new_dict = stream.dict.clone();
     new_dict.remove("Filter");
     new_dict.remove("DecodeParms");
@@ -1405,15 +1502,38 @@ fn reencode_stream_flate(stream: &crate::Stream) -> Object {
     new_dict.remove("FFilter");
     new_dict.remove("FDecodeParms");
 
-    // Always apply FlateDecode — even if the encoded result is larger than the
-    // raw data (which can happen for small streams).  This guarantees that the
-    // output always has a single well-known filter regardless of stream size.
-    new_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    new_dict.insert(
-        "Length",
-        Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
-    );
-    Object::Stream(crate::Stream::new(new_dict, encoded))
+    match policy {
+        CompressStreams::Yes => {
+            // Re-encode with a minimal FlateDecode dict.  If encoding fails
+            // (vanishingly rare for in-memory zlib), keep the original stream
+            // verbatim — declaring /FlateDecode on uncompressed bytes would
+            // produce an unreadable PDF.
+            let mut encode_dict = Dictionary::new();
+            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
+                Ok(e) => e,
+                Err(_) => return Object::Stream(stream.clone()),
+            };
+
+            // Always apply FlateDecode — even if the encoded result is larger
+            // than the raw data (which can happen for small streams).  This
+            // guarantees a single well-known filter regardless of stream size.
+            new_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            new_dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
+            );
+            Object::Stream(crate::Stream::new(new_dict, encoded))
+        }
+        CompressStreams::No => {
+            // Emit raw (decoded) bytes without any filter.
+            new_dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(decoded.len()).unwrap_or(i64::MAX)),
+            );
+            Object::Stream(crate::Stream::new(new_dict, decoded))
+        }
+    }
 }
 
 #[cfg(test)]

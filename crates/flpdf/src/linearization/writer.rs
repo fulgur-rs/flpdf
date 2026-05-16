@@ -268,7 +268,9 @@ fn build_objstm_container_object<R: Read + Seek>(
         resolved.push((new_ref, renumbered));
     }
     let body = emit_objstm_body_from_resolved(&resolved)?;
-    let stream = wrap_objstm_body(&body)?;
+    // Linearized output always uses FlateDecode for ObjStm containers —
+    // the linearization writer does not expose a CompressStreams knob.
+    let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes)?;
     Ok(Object::Stream(stream))
 }
 
