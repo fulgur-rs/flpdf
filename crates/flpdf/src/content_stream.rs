@@ -356,3 +356,90 @@ impl<'a> Iterator for ContentStreamParser<'a> {
         item
     }
 }
+
+/// Normalize a PDF content stream into a canonical, one-operator-per-line form.
+///
+/// # Normalization rules
+///
+/// 1. Comments are stripped (equivalent to `keep_comments = false`).
+/// 2. Each operator is emitted on its own line, preceded by its operands
+///    separated by single ASCII spaces.  The line is terminated with `\n`.
+/// 3. Operands are serialized with [`Object::write_pdf`]: integers as decimal,
+///    reals via `f64::to_string()` (see note below), names as `/Name`, literal
+///    strings as `(…)`, binary strings as `<hex>`, arrays and dictionaries in
+///    the standard PDF syntax.
+/// 4. Inline images are re-emitted as `BI\n /K v\n …\n ID\n<raw-data>\nEI\n`.
+///    The raw image bytes are written verbatim (no encoding); one `\n` separator
+///    is inserted after `ID` and before `EI`, as required by ISO 32000-1 §7.8.2.
+///
+/// # Observable-equivalence vs. byte-equality with qpdf
+///
+/// The goal is **observable equivalence** (re-parsing the output yields the same
+/// operator sequence and operand values as the input), *not* byte-for-byte
+/// identity with qpdf's `--normalize-content` output. Known divergences:
+///
+/// - **Integer-valued reals**: `f64::to_string()` drops trailing `.0`, so
+///   `Real(1.0)` is serialized as `"1"` and re-parsed as `Integer(1)`. This is
+///   semantically identical for all PDF operators. qpdf preserves the decimal
+///   point for integer-valued reals; flpdf does not.
+/// - **Dictionary key ordering**: `Dictionary` uses `BTreeMap` (lexicographic
+///   order). qpdf may preserve insertion order in some cases.
+/// - **Token separation**: a single space is always emitted between operands,
+///   regardless of whether adjacent tokens are PDF delimiters. qpdf may omit
+///   spaces between adjacent delimiter tokens (e.g. `>>`/`<<`). Both forms
+///   parse identically.
+/// - **Inline image dict key ordering**: same BTreeMap-lex caveat as above.
+///
+/// The output is idempotent: `normalize(normalize(x)) == normalize(x)` for all
+/// well-formed inputs (byte-identical after the first pass).
+///
+/// # Errors
+///
+/// Returns an error if `input` is not a well-formed content stream
+/// (propagated from [`ContentStreamParser`]).
+pub fn normalize_content_stream(input: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len());
+    for token in ContentStreamParser::new(input) {
+        match token? {
+            ContentToken::Op { operands, operator } => {
+                // Emit all operands space-separated, then the operator, then newline.
+                for (i, operand) in operands.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b' ');
+                    }
+                    operand.write_pdf(&mut out);
+                }
+                if !operands.is_empty() {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(&operator);
+                out.push(b'\n');
+            }
+            ContentToken::InlineImage { dict, data } => {
+                // BI header
+                out.extend_from_slice(b"BI\n");
+                for (key, value) in dict.iter() {
+                    out.extend_from_slice(b" /");
+                    out.extend_from_slice(key);
+                    out.push(b' ');
+                    value.write_pdf(&mut out);
+                    out.push(b'\n');
+                }
+                // ID separator (one \n counts as the required whitespace byte
+                // per ISO 32000-1 §7.8.2; the parser strips exactly one ws byte
+                // after ID and one before EI, so we must re-insert one on each side)
+                out.extend_from_slice(b"ID\n");
+                out.extend_from_slice(&data);
+                // EI separator then EI keyword
+                out.push(b'\n');
+                out.extend_from_slice(b"EI\n");
+            }
+            ContentToken::Comment(_) => {
+                // Comments are always stripped by normalize; the parser is
+                // constructed with keep_comments=false (the default), so this
+                // branch is unreachable in practice.
+            }
+        }
+    }
+    Ok(out)
+}
