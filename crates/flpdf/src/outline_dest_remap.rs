@@ -475,7 +475,7 @@ fn collect_siblings<R: Read + Seek>(
         let action_val = item.get("A").cloned();
 
         // Determine whether this item points at a surviving page.
-        let keep = item_survives(&dest_val, &action_val, surviving, surviving_names);
+        let keep = item_survives(pdf, &dest_val, &action_val, surviving, surviving_names)?;
 
         if keep {
             // Recurse into children if any.
@@ -639,15 +639,16 @@ fn count_visible_in_chain<R: Read + Seek>(
 // ---------------------------------------------------------------------------
 
 /// Determine whether an outline item should be kept, given its `/Dest` and `/A`.
-fn item_survives(
+fn item_survives<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     dest_val: &Option<Object>,
     action_val: &Option<Object>,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &BTreeSet<Vec<u8>>,
-) -> bool {
+) -> Result<bool> {
     // Check /Dest first.
     if let Some(dest) = dest_val {
-        return dest_survives(dest, surviving, surviving_names);
+        return dest_survives(pdf, dest, surviving, surviving_names);
     }
     // Then /A (action).
     if let Some(Object::Dictionary(a)) = action_val {
@@ -655,23 +656,35 @@ fn item_survives(
         let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
         if is_goto {
             if let Some(d) = a.get("D") {
-                return dest_survives(d, surviving, surviving_names);
+                return dest_survives(pdf, d, surviving, surviving_names);
             }
         }
         // Non-GoTo actions (URI, Launch, etc.) — keep conservatively.
-        return true;
+        return Ok(true);
     }
     // No dest and no action → keep (title-only entry, no navigation).
-    true
+    Ok(true)
 }
 
 /// `true` when `dest` resolves to a surviving page or is a surviving named dest.
-fn dest_survives(
+///
+/// Resolves one level of `Object::Reference`: an outline `/Dest` or `/A /D`
+/// may be an indirect reference to the real `[pageRef /Fit ...]` array/dict.
+fn dest_survives<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     dest: &Object,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &BTreeSet<Vec<u8>>,
-) -> bool {
-    match dest {
+) -> Result<bool> {
+    let concrete;
+    let dest = match dest {
+        Object::Reference(r) => {
+            concrete = pdf.resolve(*r)?;
+            &concrete
+        }
+        other => other,
+    };
+    Ok(match dest {
         // Array form: [pageRef /XYZ ...] or [pageRef /Fit].
         Object::Array(arr) => {
             if let Some(Object::Reference(page_ref)) = arr.first() {
@@ -681,11 +694,19 @@ fn dest_survives(
                 true
             }
         }
+        // Dictionary form `<< /D [pageRef ...] >>`.
+        Object::Dictionary(d) => match d.get("D") {
+            Some(Object::Array(arr)) => match arr.first() {
+                Some(Object::Reference(page_ref)) => surviving.contains_key(page_ref),
+                _ => true,
+            },
+            _ => true,
+        },
         // String or name form: a named destination.
         Object::String(name) | Object::Name(name) => surviving_names.contains(name.as_slice()),
         // Other forms — keep conservatively.
         _ => true,
-    }
+    })
 }
 
 /// Extract the page `ObjectRef` from a destination value, if it is the array
@@ -722,6 +743,15 @@ fn remap_dest_page_ref(dest: Object, new_ref: ObjectRef) -> Object {
             }
             Object::Array(arr)
         }
+        // Dictionary form `<< /D [pageRef /Fit ...] >>`: recurse into /D so the
+        // page ref inside is remapped (dest_page_ref accepts this form, so
+        // remap must too, or a kept dict-dest keeps its old page ref).
+        Object::Dictionary(mut d) => {
+            if let Some(d_val) = d.get("D").cloned() {
+                d.insert("D", remap_dest_page_ref(d_val, new_ref));
+            }
+            Object::Dictionary(d)
+        }
         other => other,
     }
 }
@@ -739,33 +769,25 @@ fn remap_item_dest<R: Read + Seek>(
 
     let mut changed = false;
 
-    // /Dest (array form).
+    // /Dest — array, dict, or an indirect reference to either.
     if let Some(dest) = d.get("Dest").cloned() {
-        if let Object::Array(ref arr) = dest {
-            if let Some(Object::Reference(old_ref)) = arr.first() {
-                if let Some(&new_ref) = surviving.get(old_ref) {
-                    d.insert("Dest", remap_dest_page_ref(dest.clone(), new_ref));
-                    changed = true;
-                }
-            }
+        if let Some(remapped) = remap_dest_value(pdf, &dest, surviving)? {
+            d.insert("Dest", remapped);
+            changed = true;
         }
         // String/name-form dest: no page ref to remap here; the name tree was
         // already updated.
     }
 
-    // /A /GoTo /D (action form).
+    // /A /GoTo /D (action form) — array, dict, or indirect reference.
     if let Some(Object::Dictionary(mut action)) = d.get("A").cloned() {
         let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
         if is_goto {
             if let Some(d_val) = action.get("D").cloned() {
-                if let Object::Array(ref arr) = d_val {
-                    if let Some(Object::Reference(old_ref)) = arr.first() {
-                        if let Some(&new_ref) = surviving.get(old_ref) {
-                            action.insert("D", remap_dest_page_ref(d_val.clone(), new_ref));
-                            d.insert("A", Object::Dictionary(action));
-                            changed = true;
-                        }
-                    }
+                if let Some(remapped) = remap_dest_value(pdf, &d_val, surviving)? {
+                    action.insert("D", remapped);
+                    d.insert("A", Object::Dictionary(action));
+                    changed = true;
                 }
             }
         }
@@ -775,6 +797,36 @@ fn remap_item_dest<R: Read + Seek>(
         pdf.set_object(item_ref, Object::Dictionary(d));
     }
     Ok(())
+}
+
+/// Remap a `/Dest` or `/A /D` value to its surviving page ref.
+///
+/// Returns `Some(new_value)` to store back in the owning dict when a change is
+/// needed, or `None` when nothing should change (page absent from `surviving`,
+/// or no resolvable page ref). For an indirect destination the referenced
+/// object is rewritten in place and `None` is returned (the owning dict keeps
+/// pointing at the same object number).
+fn remap_dest_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest: &Object,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Option<Object>> {
+    if let Object::Reference(dr) = dest {
+        let concrete = pdf.resolve(*dr)?;
+        if let Some(old) = dest_page_ref(&concrete) {
+            if let Some(&new_ref) = surviving.get(&old) {
+                let remapped = remap_dest_page_ref(concrete, new_ref);
+                pdf.set_object(*dr, remapped);
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(old) = dest_page_ref(dest) {
+        if let Some(&new_ref) = surviving.get(&old) {
+            return Ok(Some(remap_dest_page_ref(dest.clone(), new_ref)));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1534,5 +1586,92 @@ mod tests {
             "childless item must not retain /Count (was -1), got {:?}",
             item20.get("Count")
         );
+    }
+
+    #[test]
+    fn dict_form_named_dest_page_ref_is_remapped() {
+        // Named dest value is the dictionary form << /D [pageRef /Fit] >>.
+        // dest_page_ref accepts it, so remap must rewrite the page ref inside
+        // /D; otherwise a kept dict-dest keeps a stale (soon-dangling) ref.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (
+                    30,
+                    "<< /Limits [(d1) (d1)] /Names [(d1) << /D [3 0 R /Fit] >>] >>",
+                ),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let leaf = dict_of(&mut pdf, ObjectRef::new(30, 0));
+        let Some(Object::Array(names)) = leaf.get("Names").cloned() else {
+            panic!("/Names array expected");
+        };
+        // (d1) survives; its dict-form dest /D page ref is remapped.
+        let dest = &names[1];
+        let Object::Dictionary(dd) = dest else {
+            panic!("dict-form dest expected, got {dest:?}");
+        };
+        let Some(Object::Array(arr)) = dd.get("D") else {
+            panic!("/D array expected");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn indirect_outline_item_dest_remapped_and_dropped() {
+        // Item 20 /Dest is an *indirect ref* (40 0 R) to [3 0 R /Fit] (page 1,
+        // kept). Item 21 /Dest is 41 0 R -> [4 0 R /Fit] (page 2, removed).
+        // Pre-fix: indirect /Dest was kept unconditionally and never remapped.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 21 0 R /Count 2 >>",
+                ),
+                (
+                    20,
+                    "<< /Title (P1) /Parent 10 0 R /Next 21 0 R /Dest 40 0 R >>",
+                ),
+                (
+                    21,
+                    "<< /Title (P2) /Parent 10 0 R /Prev 20 0 R /Dest 41 0 R >>",
+                ),
+                (40, "[3 0 R /Fit]"),
+                (41, "[4 0 R /Fit]"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // Only item 20 survives (its indirect dest -> kept page 1).
+        let root = dict_of(&mut pdf, ObjectRef::new(10, 0));
+        assert_eq!(root.get_ref("First"), Some(ObjectRef::new(20, 0)));
+        assert_eq!(root.get_ref("Last"), Some(ObjectRef::new(20, 0)));
+        let item20 = dict_of(&mut pdf, ObjectRef::new(20, 0));
+        assert!(item20.get_ref("Next").is_none());
+        assert_eq!(item20.get_ref("Dest"), Some(ObjectRef::new(40, 0)));
+        // The referenced dest object 40 had its page ref remapped in place.
+        let dest40 = pdf.resolve(ObjectRef::new(40, 0)).unwrap();
+        let Object::Array(arr) = dest40 else {
+            panic!("obj 40 should stay a dest array");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
     }
 }
