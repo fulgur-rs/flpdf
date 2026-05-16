@@ -384,6 +384,285 @@ fn test_inline_resources_pruned() {
     );
 }
 
+// ── NEW TESTS for roborev #802 ────────────────────────────────────────────────
+
+// Helper: build a PDF from raw bytes with an explicit xref table.
+// `objects` is a list of (object_number, raw_bytes).
+// Caller must include Catalog (1 0 R), Pages (2 0 R) and any page/other objects.
+fn build_pdf_raw(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    let mut offsets: Vec<(u32, u64)> = Vec::new();
+    for (num, body) in objects {
+        let off = pdf.len() as u64;
+        offsets.push((*num, off));
+        pdf.extend_from_slice(body);
+    }
+
+    let xref_start = pdf.len() as u64;
+    let max_num = offsets.iter().map(|(n, _)| *n).max().unwrap_or(2);
+    let total = max_num as usize + 1;
+    let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+    for i in 1..=max_num {
+        if let Some((_, off)) = offsets.iter().find(|(n, _)| *n == i) {
+            xref.push_str(&format!("{:010} 00000 n \n", off));
+        } else {
+            xref.push_str("0000000000 65535 f \n");
+        }
+    }
+    pdf.extend_from_slice(xref.as_bytes());
+    let trailer = format!(
+        "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+    );
+    pdf.extend_from_slice(trailer.as_bytes());
+    pdf
+}
+
+// ── Test (f): indirect category sub-dict (/Font N 0 R) ───────────────────────
+//
+// /Resources << /Font 6 0 R >> where 6 0 R = << /F1 << >> /F2 << >> >>
+// Content uses only /F1. After pruning:
+//   - pdf.resolve(6 0 R) must return a dict containing only F1.
+//   - F2 must be absent.
+
+#[test]
+fn test_f_indirect_category_subdict_pruned() {
+    // Object layout:
+    //   1 0 R  Catalog
+    //   2 0 R  Pages
+    //   3 0 R  Page
+    //   4 0 R  content stream (uses /F1)
+    //   5 0 R  /Resources dict  << /Font 6 0 R >>
+    //   6 0 R  /Font sub-dict   << /F1 << >> /F2 << >> >>
+
+    let content_body = b"BT /F1 12 Tf (Hello) Tj ET";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, content_body)),
+        (5, obj_bytes(5, "<< /Font 6 0 R >>")),
+        (
+            6,
+            obj_bytes(6, "<< /F1 << /Type /Font >> /F2 << /Type /Font >> >>"),
+        ),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    // Verify the indirect Font sub-dict (6 0 R) was updated in-place.
+    let font_obj = pdf.resolve(ObjectRef::new(6, 0)).expect("resolve font dict");
+    let Object::Dictionary(font_dict) = font_obj else {
+        panic!("6 0 R is not a dictionary");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "F1 must be kept: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "F2 must be pruned from indirect Font sub-dict: {keys:?}"
+    );
+}
+
+// ── Test (g): single page inheriting ancestor inline /Resources — Yes prunes ──
+//
+// /Pages node has an inline /Resources << /Font << /F1 << >> /F2 << >> >> >>
+// Single page has no /Resources of its own, so it inherits.
+// Content uses only /F1. Yes mode must prune /F2 from the /Pages dict.
+
+#[test]
+fn test_g_ancestor_inline_resources_single_page_yes_prunes() {
+    // Object layout:
+    //   1 0 R  Catalog
+    //   2 0 R  Pages  (has inline /Resources with F1 + F2)
+    //   3 0 R  Page   (no /Resources → inherits from 2 0 R)
+    //   4 0 R  content stream (uses only /F1)
+
+    let content_body = b"BT /F1 12 Tf (Hello) Tj ET";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>",
+            ),
+        ),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, content_body)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    // The /Pages dict (2 0 R) should now have only F1 in its inline /Resources.
+    let pages_obj = pdf.resolve(ObjectRef::new(2, 0)).expect("resolve Pages");
+    let Object::Dictionary(pages_dict) = pages_obj else {
+        panic!("2 0 R is not a dictionary");
+    };
+    let Object::Dictionary(res) = pages_dict.get("Resources").expect("Resources key") else {
+        panic!("Resources is not a dict");
+    };
+    let Object::Dictionary(fonts) = res.get("Font").expect("Font key") else {
+        panic!("Font is not a dict");
+    };
+    let keys: Vec<String> = fonts
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "F1 must remain in ancestor inline: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "F2 must be pruned from ancestor inline (single-page Yes): {keys:?}"
+    );
+}
+
+// ── Test (h): two pages inheriting same ancestor inline /Resources ─────────────
+//
+// /Pages has inline /Resources << /Font << /F1 << >> /F2 << >> /F3 << >> >> >>
+// Page A uses /F1; Page B uses /F2; neither uses /F3.
+// Auto mode: ancestor inline shared → NOT pruned (both F1, F2, F3 remain).
+// Yes mode: union = {F1, F2} → F3 pruned, F1 + F2 kept.
+
+#[test]
+fn test_h_ancestor_inline_resources_two_pages_auto_not_pruned() {
+    // 1=Catalog, 2=Pages(inline /Resources F1+F2+F3), 3=Page1, 4=Page2,
+    // 5=content1(uses F1), 6=content2(uses F2)
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> /F3 << /Type /Font >> >> >> >>",
+            ),
+        ),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+            ),
+        ),
+        (
+            4,
+            obj_bytes(
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>",
+            ),
+        ),
+        (5, stream_obj(5, content1)),
+        (6, stream_obj(6, content2)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    // Auto mode: shared ancestor inline → nothing pruned.
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes.clone())).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Auto).expect("prune");
+
+    let pages_obj = pdf.resolve(ObjectRef::new(2, 0)).expect("resolve Pages");
+    let Object::Dictionary(pages_dict) = pages_obj else {
+        panic!("2 0 R is not a dict");
+    };
+    let Object::Dictionary(res) = pages_dict.get("Resources").expect("Resources") else {
+        panic!("Resources not a dict");
+    };
+    let Object::Dictionary(fonts) = res.get("Font").expect("Font") else {
+        panic!("Font not a dict");
+    };
+    let keys: Vec<String> = fonts
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(keys.contains(&"F1".to_string()), "Auto: F1 must remain: {keys:?}");
+    assert!(keys.contains(&"F2".to_string()), "Auto: F2 must remain: {keys:?}");
+    assert!(keys.contains(&"F3".to_string()), "Auto: F3 must remain (shared ancestor): {keys:?}");
+}
+
+#[test]
+fn test_h2_ancestor_inline_resources_two_pages_yes_union_prunes() {
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> /F3 << /Type /Font >> >> >> >>",
+            ),
+        ),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+            ),
+        ),
+        (
+            4,
+            obj_bytes(
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>",
+            ),
+        ),
+        (5, stream_obj(5, content1)),
+        (6, stream_obj(6, content2)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    // Yes mode: union = {F1, F2}, so F3 pruned.
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let pages_obj = pdf.resolve(ObjectRef::new(2, 0)).expect("resolve Pages");
+    let Object::Dictionary(pages_dict) = pages_obj else {
+        panic!("2 0 R is not a dict");
+    };
+    let Object::Dictionary(res) = pages_dict.get("Resources").expect("Resources") else {
+        panic!("Resources not a dict");
+    };
+    let Object::Dictionary(fonts) = res.get("Font").expect("Font") else {
+        panic!("Font not a dict");
+    };
+    let keys: Vec<String> = fonts
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(keys.contains(&"F1".to_string()), "Yes: F1 must remain (p1 uses it): {keys:?}");
+    assert!(keys.contains(&"F2".to_string()), "Yes: F2 must remain (p2 uses it): {keys:?}");
+    assert!(
+        !keys.contains(&"F3".to_string()),
+        "Yes: F3 must be pruned (neither page uses it): {keys:?}"
+    );
+}
+
 // ── Test: /ExtGState, /Shading, /Pattern, /ColorSpace, /Properties pruning ───
 
 #[test]
