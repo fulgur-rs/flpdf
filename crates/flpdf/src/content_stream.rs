@@ -155,12 +155,25 @@ impl<'a> ContentStreamParser<'a> {
                 b'/' | b'(' | b'[' => true,
                 b'<' => true, // hex string or `<<` dictionary
                 b'+' | b'-' | b'.' | b'0'..=b'9' => true,
-                b't' => self.input[self.pos..].starts_with(b"true"),
-                b'f' => self.input[self.pos..].starts_with(b"false"),
-                b'n' => self.input[self.pos..].starts_with(b"null"),
+                b't' => self.keyword_operand(b"true"),
+                b'f' => self.keyword_operand(b"false"),
+                b'n' => self.keyword_operand(b"null"),
                 _ => false,
             },
         }
+    }
+
+    /// Is the input at `pos` exactly the keyword `kw` followed by a token
+    /// boundary (EOF, whitespace, or a delimiter)? Without the boundary
+    /// check an extension operator like `nullop` or `trueColor` would be
+    /// mis-split into a `null`/`true` operand plus a shorter operator.
+    fn keyword_operand(&self, kw: &[u8]) -> bool {
+        let rest = &self.input[self.pos..];
+        rest.starts_with(kw)
+            && match rest.get(kw.len()) {
+                None => true,
+                Some(b) => is_ws(*b) || is_delimiter(*b),
+            }
     }
 
     /// Parse a single operand using the shared object lexer.
