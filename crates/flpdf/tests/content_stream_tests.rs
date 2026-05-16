@@ -10,9 +10,14 @@ fn tokens(input: &[u8]) -> Vec<ContentToken> {
 }
 
 fn tokens_keep_comments(input: &[u8]) -> Vec<ContentToken> {
-    ContentStreamParser::with_options(input, ContentParseOptions { keep_comments: true })
-        .collect::<flpdf::Result<Vec<_>>>()
-        .expect("tokenize")
+    ContentStreamParser::with_options(
+        input,
+        ContentParseOptions {
+            keep_comments: true,
+        },
+    )
+    .collect::<flpdf::Result<Vec<_>>>()
+    .expect("tokenize")
 }
 
 fn op(operands: Vec<Object>, operator: &[u8]) -> ContentToken {
@@ -29,7 +34,10 @@ fn text_showing_block() {
         toks,
         vec![
             op(vec![], b"BT"),
-            op(vec![Object::Name(b"F1".to_vec()), Object::Integer(12)], b"Tf"),
+            op(
+                vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+                b"Tf"
+            ),
             op(vec![Object::String(b"Hello World".to_vec())], b"Tj"),
             op(vec![], b"ET"),
         ]
@@ -96,9 +104,7 @@ fn path_with_starred_and_quote_operators() {
 #[test]
 fn nested_array_and_dict_operands() {
     // TJ array operand, and a BDC with a properties dictionary operand.
-    let toks = tokens(
-        b"[(A) -120 (B) [(C) 5] ] TJ /OC << /Type /OCG /Nested [1 [2 3]] >> BDC",
-    );
+    let toks = tokens(b"[(A) -120 (B) [(C) 5] ] TJ /OC << /Type /OCG /Nested [1 [2 3]] >> BDC");
     assert_eq!(toks.len(), 2);
     match &toks[0] {
         ContentToken::Op { operands, operator } => {

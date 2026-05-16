@@ -186,12 +186,7 @@ impl<'a> ContentStreamParser<'a> {
                     let mut parser = Parser::new_no_reference(&self.input[self.pos..]);
                     let key = match parser.parse_one_object()? {
                         Object::Name(name) => name,
-                        _ => {
-                            return Err(Error::parse(
-                                self.pos,
-                                "inline image key is not a name",
-                            ))
-                        }
+                        _ => return Err(Error::parse(self.pos, "inline image key is not a name")),
                     };
                     self.pos += parser.position();
                     // Value
@@ -241,18 +236,14 @@ impl<'a> ContentStreamParser<'a> {
                             .get(self.pos - 1)
                             .is_some_and(|b| is_ws(*b) || is_delimiter(*b));
                     let after = self.peek_at(2);
-                    let after_ok =
-                        after.is_none_or(|b| is_ws(b) || is_delimiter(b));
+                    let after_ok = after.is_none_or(|b| is_ws(b) || is_delimiter(b));
                     if prev_ok && after_ok {
                         // Data excludes the whitespace separator that
                         // precedes `EI` (consistent with the one stripped
                         // right after `ID`).
                         let mut data_end = self.pos;
                         if data_end > data_start
-                            && self
-                                .input
-                                .get(data_end - 1)
-                                .is_some_and(|b| is_ws(*b))
+                            && self.input.get(data_end - 1).is_some_and(|b| is_ws(*b))
                         {
                             data_end -= 1;
                         }

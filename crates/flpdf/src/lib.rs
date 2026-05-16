@@ -63,9 +63,7 @@ pub(crate) mod security;
 
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{check_reader, check_reader_strict, check_reader_with_options, CheckReport};
-pub use content_stream::{
-    ContentParseOptions, ContentStreamParser, ContentToken,
-};
+pub use content_stream::{ContentParseOptions, ContentStreamParser, ContentToken};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use error::{EncryptedError, Error, Result};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
