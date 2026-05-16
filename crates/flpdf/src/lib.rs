@@ -42,6 +42,7 @@ pub(crate) mod ascii85;
 pub(crate) mod ascii_hex;
 pub mod cache;
 pub mod check;
+pub mod page_document_helper;
 pub mod content_stream;
 pub mod diagnostics;
 pub mod error;
@@ -95,6 +96,7 @@ pub use page_rotate::{
     apply_rotate_to_pages, compose_rotate, normalize_rotate, resolve_inherited_rotate,
     resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
+pub use page_document_helper::PageDocumentHelper;
 pub use page_split::{digit_width, split_output_path, split_pages};
 pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
