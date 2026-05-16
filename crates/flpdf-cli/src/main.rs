@@ -297,7 +297,7 @@ struct PageOpArgs {
     /// `run_page_extraction`.
     #[arg(
         long = "pages",
-        num_args = 0..,
+        num_args = 1..,
         value_terminator = "--",
         allow_hyphen_values = true,
         value_name = "SPEC",
@@ -1191,6 +1191,33 @@ fn run_command(command: Commands) -> CliResult<()> {
                     );
                     std::process::exit(1);
                 }
+                // The page-operation pipeline owns the write and does not run
+                // the rewrite-only passes. Silently dropping them would make
+                // `rewrite --rotate=90 --normalize-content=y ...` partially
+                // succeed; reject the unsupported combination loudly instead.
+                if normalize_content || coalesce_contents || cmd.remove_restrictions {
+                    eprintln!(
+                        "flpdf: --normalize-content / --coalesce-contents / \
+                         --remove-restrictions are not applied in the \
+                         --pages/--rotate/--split-pages/--collate pipeline; \
+                         rerun without them or without the page operation"
+                    );
+                    std::process::exit(1);
+                }
+                // The decorate path (--rotate/--split-pages without --pages)
+                // does not thread remove_unreferenced_resources; an explicit
+                // Yes/No would be silently dropped, so reject it. Auto (the
+                // default) is allowed: there is no extracted subset to prune.
+                if cmd.page_ops.pages.is_empty()
+                    && remove_unref != CliRemoveUnreferencedResources::Auto
+                {
+                    eprintln!(
+                        "flpdf: --remove-unreferenced-resources is not applied \
+                         with --rotate/--split-pages alone; rerun without it \
+                         or add --pages"
+                    );
+                    std::process::exit(1);
+                }
                 return if !cmd.page_ops.pages.is_empty() {
                     run_page_extraction(
                         &cmd.input,
@@ -1538,10 +1565,15 @@ fn resolve_page_specs(
 /// honoured (a documented divergence — full per-input groups are out of scope
 /// for 8.12; see flpdf-9hc.8.13's matrix).
 fn parse_collate_n(raw: &str) -> CliResult<usize> {
-    let first = raw.split(',').next().unwrap_or(raw);
-    let n: usize = first
-        .parse()
-        .map_err(|_| format!("--collate: expected a positive integer, got {raw:?}"))?;
+    // Only a single positive integer is supported. Silently using the first
+    // value of `--collate=1,2` would emit a different page order than the
+    // user asked for, so reject comma-separated group lists explicitly.
+    let n: usize = raw.parse().map_err(|_| {
+        format!(
+            "--collate: expected a single positive integer, got {raw:?} \
+             (comma-separated group lists are not supported)"
+        )
+    })?;
     if n == 0 {
         return Err("--collate: group size must be >= 1".into());
     }
