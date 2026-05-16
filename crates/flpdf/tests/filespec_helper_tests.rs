@@ -333,3 +333,141 @@ fn fixture_attachment_two_page() {
     let cs = cs.expect("Some checksum");
     assert_eq!(cs.len(), 16);
 }
+
+// ── /EF key priority order (UF > F > Unix > Mac > DOS) ───────────────────────
+
+/// Build a PDF whose `/EF` sub-dict maps the given key→stream pairs.
+/// Each `(key, payload)` becomes a distinct `/EmbeddedFile` stream so the
+/// caller can tell which key was selected by inspecting the returned payload.
+fn build_pdf_with_ef_keys(pairs: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ 4 0 R ] /Count 1 >>\nendobj\n");
+    offsets.insert(4, out.len() as u64);
+    out.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 612 792 ] >>\nendobj\n",
+    );
+
+    // Streams start at object number 6; build the /EF dict referencing them.
+    let mut ef_entries = String::new();
+    for (i, (key, _)) in pairs.iter().enumerate() {
+        let obj = 6 + i as u32;
+        ef_entries.push_str(&format!("/{key} {obj} 0 R "));
+    }
+    offsets.insert(5, out.len() as u64);
+    let filespec = format!(
+        "5 0 obj\n<< /Type /Filespec /F (a.txt) /EF << {ef_entries}>> >>\nendobj\n"
+    );
+    out.extend_from_slice(filespec.as_bytes());
+
+    for (i, (_, payload)) in pairs.iter().enumerate() {
+        let obj = 6 + i as u32;
+        offsets.insert(obj, out.len() as u64);
+        let hdr = format!(
+            "{obj} 0 obj\n<< /Type /EmbeddedFile /Length {} >>\nstream\n",
+            payload.len()
+        );
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    let xref_start = out.len() as u64;
+    let n = 6 + pairs.len() as u32;
+    out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for i in 1..n {
+        let off = offsets.get(&i).copied().unwrap_or(0);
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn embedded_file_prefers_uf_over_f() {
+    // /F and /UF point at different streams; /UF must win.
+    let bytes = build_pdf_with_ef_keys(&[("F", b"from-F"), ("UF", b"from-UF")]);
+    let mut pdf = open(bytes);
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.payload().expect("payload()"), b"from-UF".to_vec());
+}
+
+#[test]
+fn embedded_file_falls_back_to_platform_keys() {
+    // Only /Unix present — must still resolve via the fallback chain.
+    let bytes = build_pdf_with_ef_keys(&[("Unix", b"unix-payload")]);
+    let mut pdf = open(bytes);
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.payload().expect("payload()"), b"unix-payload".to_vec());
+}
+
+// ── Indirect /Params reference resolution ────────────────────────────────────
+
+#[test]
+fn params_indirect_reference_resolves() {
+    // EmbeddedFile stream's /Params is an indirect reference (7 0 R).
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ 4 0 R ] /Count 1 >>\nendobj\n");
+    offsets.insert(4, out.len() as u64);
+    out.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 612 792 ] >>\nendobj\n",
+    );
+    offsets.insert(5, out.len() as u64);
+    out.extend_from_slice(
+        b"5 0 obj\n<< /Type /Filespec /F (a.txt) /EF << /F 6 0 R >> >>\nendobj\n",
+    );
+    let payload = b"indirect-params";
+    offsets.insert(6, out.len() as u64);
+    out.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /EmbeddedFile /Length {} /Params 7 0 R >>\nstream\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.insert(7, out.len() as u64);
+    out.extend_from_slice(
+        b"7 0 obj\n<< /Size 15 /CheckSum (0123456789abcdef) /CreationDate (D:20260101000000Z) >>\nendobj\n",
+    );
+    let xref_start = out.len() as u64;
+    let n = 8u32;
+    out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for i in 1..n {
+        let off = offsets.get(&i).copied().unwrap_or(0);
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+
+    let mut pdf = open(out);
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.size().expect("size()"), Some(15));
+    assert_eq!(
+        ef.checksum().expect("checksum()"),
+        Some(b"0123456789abcdef".to_vec())
+    );
+    assert_eq!(
+        ef.creation_date().expect("creation_date()"),
+        Some(b"D:20260101000000Z".to_vec())
+    );
+}

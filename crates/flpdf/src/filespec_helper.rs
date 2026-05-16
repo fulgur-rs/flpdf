@@ -86,15 +86,34 @@ pub struct EmbeddedFileStream<'a, R: Read + Seek> {
     /// The resolved `/EmbeddedFile` stream.  Stored by value because `Stream`
     /// owns its data, and we need the dict reference to survive across calls.
     stream: Stream,
-    /// Kept so that future extensions (e.g. following indirect `/Params`) can
-    /// re-resolve objects.
+    /// The `/Params` sub-dictionary, resolved at construction time so that
+    /// metadata accessors stay `&self`.  `/Params` may be given as an
+    /// indirect reference, which is dereferenced here.
+    params: Option<Dictionary>,
+    /// Kept to hold the document borrow for the wrapper's lifetime,
+    /// mirroring [`FileSpec`]'s exclusive-borrow semantics.
     #[allow(dead_code)]
     pdf: &'a mut Pdf<R>,
 }
 
 impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
-    fn new(stream: Stream, pdf: &'a mut Pdf<R>) -> Self {
-        Self { stream, pdf }
+    fn new(stream: Stream, pdf: &'a mut Pdf<R>) -> Result<Self> {
+        let params = match stream.dict.get("Params") {
+            Some(Object::Dictionary(d)) => Some(d.clone()),
+            Some(Object::Reference(r)) => {
+                let r = *r;
+                match pdf.resolve(r)? {
+                    Object::Dictionary(d) => Some(d),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(Self {
+            stream,
+            params,
+            pdf,
+        })
     }
 
     /// Decode and return the raw payload bytes.
@@ -141,11 +160,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     /// Return the `/Params` sub-dictionary, if present.
+    ///
+    /// Resolved at construction time, so an indirect `/Params` reference is
+    /// already dereferenced here.
     fn params(&self) -> Option<&Dictionary> {
-        match self.stream.dict.get("Params") {
-            Some(Object::Dictionary(d)) => Some(d),
-            _ => None,
-        }
+        self.params.as_ref()
     }
 
     /// Return `/Params /CreationDate` as a raw PDF date byte sequence.
@@ -298,12 +317,14 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Resolve and return the embedded file stream.
     ///
     /// The lookup priority for the `/EF` sub-dictionary key is
-    /// `/F` first, then `/UF` as a fallback, mirroring the preference order
-    /// documented in ISO 32000-1 §7.11.4 and used throughout this crate.
+    /// `/UF`, `/F`, `/Unix`, `/Mac`, `/DOS` — the same preference order
+    /// qpdf applies (Unicode name first), consistent with ISO 32000-1
+    /// §7.11.4. The first key that resolves to an `/EmbeddedFile` stream
+    /// reference is used.
     ///
     /// Returns `Ok(None)` when the `/Filespec` dictionary has no `/EF` entry
-    /// or when none of the standard keys (`/F`, `/UF`) resolve to an
-    /// `/EmbeddedFile` stream.
+    /// or when none of the standard keys (`/UF`, `/F`, `/Unix`, `/Mac`,
+    /// `/DOS`) resolve to an `/EmbeddedFile` stream.
     ///
     /// # Errors
     ///
@@ -342,21 +363,26 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             _ => return Ok(None),
         };
 
-        // Try /F first, then /UF as fallback.
-        let ef_ref: ObjectRef = match ef_dict.get("F").or_else(|| ef_dict.get("UF")) {
-            Some(Object::Reference(r)) => *r,
-            _ => return Ok(None),
+        // qpdf preference order: Unicode name first, then platform-specific.
+        let ef_ref: ObjectRef = match ["UF", "F", "Unix", "Mac", "DOS"]
+            .iter()
+            .find_map(|k| match ef_dict.get(k) {
+                Some(Object::Reference(r)) => Some(*r),
+                _ => None,
+            }) {
+            Some(r) => r,
+            None => return Ok(None),
         };
 
         let stream: Stream = match self.pdf.resolve(ef_ref)? {
             Object::Stream(s) => s,
             _ => {
                 return Err(Error::Unsupported(format!(
-                    "/EF /F resolves to a non-stream object at {ef_ref}"
+                    "/EF embedded-file key resolves to a non-stream object at {ef_ref}"
                 )))
             }
         };
 
-        Ok(Some(EmbeddedFileStream::new(stream, self.pdf)))
+        EmbeddedFileStream::new(stream, self.pdf).map(Some)
     }
 }
