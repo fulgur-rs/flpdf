@@ -508,6 +508,32 @@ struct PasswordArgs {
     /// Permit deprecated RC4-backed handlers and revision 5 encryption.
     #[arg(long = "allow-weak-crypto")]
     allow_weak_crypto: bool,
+    /// Interpret --password as the precomputed file encryption key in hex,
+    /// not a user/owner password (qpdf --password-is-hex-key).
+    #[arg(
+        long = "password-is-hex-key",
+        long_help = "Interpret the --password value as the precomputed file \
+encryption key encoded as hex, NOT a user or owner password. All \
+password→key derivation (Algorithm 2 / 2.A / 2.B / 6 / 7) is skipped and the \
+decoded bytes are used directly as the file key for stream/string \
+decryption. Upper- or lower-case hex and embedded whitespace are accepted; \
+the decoded key must be at most 32 bytes. Mirrors qpdf \
+--password-is-hex-key. Pair with `show-encryption-key` to recover the key \
+from a known password, then reopen the file with that key."
+    )]
+    password_is_hex_key: bool,
+    /// Accepted for qpdf script compatibility; currently a documented no-op.
+    #[arg(
+        long = "suppress-password-recovery",
+        long_help = "Accepted for qpdf script compatibility. qpdf retries \
+alternate password encodings (UTF-8 / PDFDocEncoding) when authentication \
+fails on V<5 documents; this flag disables that recovery. flpdf performs a \
+single authentication attempt with no encoding fallback, so there is no \
+recovery to suppress: this flag is a DOCUMENTED NO-OP. It is parsed without \
+error so scripts passing it do not break, and the contract is reserved so \
+encoding fallback can be added later without changing the CLI surface."
+    )]
+    suppress_password_recovery: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -1517,6 +1543,11 @@ fn open_pdf(
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
     let allow_weak_crypto = password.allow_weak_crypto;
+    let password_is_hex_key = password.password_is_hex_key;
+    // `--suppress-password-recovery` is a documented no-op (see PasswordArgs):
+    // flpdf has no encoding-recovery path to suppress. Bind it so the field is
+    // observed by the compiler and the intent is explicit at the wiring site.
+    let _suppress_password_recovery = password.suppress_password_recovery;
     let password_mode = password.password_mode.into();
     let password = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
@@ -1537,6 +1568,7 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         password,
         password_mode,
         allow_weak_crypto,
+        password_is_hex_key,
     })
 }
 
