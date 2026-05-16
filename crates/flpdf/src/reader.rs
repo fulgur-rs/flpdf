@@ -139,6 +139,54 @@ enum EncryptionMode {
     Aes256,
 }
 
+impl EncryptionMode {
+    /// qpdf's `show_encryption_method()` spelling for this method.
+    ///
+    /// Source: qpdf `libqpdf/QPDFJob.cc` `show_encryption_method()` —
+    /// `e_rc4`→"RC4", `e_aes`→"AESv2", `e_aesv3`→"AESv3", `e_none`→"none".
+    /// flpdf's `Identity` (no-op crypt filter) maps to qpdf's `e_none`/"none".
+    fn qpdf_name(self) -> &'static str {
+        match self {
+            EncryptionMode::Rc4 => "RC4",
+            EncryptionMode::Aes128 => "AESv2",
+            EncryptionMode::Aes256 => "AESv3",
+            EncryptionMode::Identity => "none",
+        }
+    }
+}
+
+/// Read-only snapshot of an encrypted document's `/Encrypt` parameters,
+/// surfaced for the `show-encryption` inspection subcommand
+/// (flpdf-9hc.3.17). Built by re-reading the `/Encrypt` dictionary plus the
+/// already-authenticated [`EncryptionState`]; does not run or alter
+/// authentication.
+#[derive(Debug, Clone)]
+pub struct EncryptionInfo {
+    /// `/V` encryption algorithm version.
+    pub v: i64,
+    /// `/R` standard security handler revision.
+    pub r: i64,
+    /// Key length in bits (`/Length`, defaulting to 40 when absent for V<5;
+    /// 256 for V=5).
+    pub length_bits: i64,
+    /// `/Filter` security handler name (e.g. `Standard`).
+    pub filter: String,
+    /// Raw signed `/P` permission bits.
+    pub permissions: Permissions,
+    /// `/EncryptMetadata` flag (defaults to true when absent).
+    pub encrypt_metadata: bool,
+    /// qpdf-style method name for the stream crypt filter (`StmF`).
+    pub stream_method: &'static str,
+    /// qpdf-style method name for the string crypt filter (`StrF`).
+    pub string_method: &'static str,
+    /// qpdf-style method name for the embedded-file crypt filter (`EFF`),
+    /// when the document declares one.
+    pub eff_method: Option<&'static str>,
+    /// Named crypt filters from `/CF` mapped to their qpdf-style method
+    /// names, e.g. `StdCF` → `AESv2`.
+    pub named_crypt_filters: Vec<(String, &'static str)>,
+}
+
 /// Options for opening a PDF document.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PdfOpenOptions {
@@ -230,6 +278,86 @@ impl<R: Read + Seek> Pdf<R> {
         self.encryption
             .as_ref()
             .is_some_and(|encryption| encryption.owner_password_matched)
+    }
+
+    /// The derived file encryption key, if the document was opened as an
+    /// encrypted file. `None` for plaintext PDFs.
+    ///
+    /// Read-only accessor for the `show-encryption-key` inspection
+    /// subcommand (flpdf-9hc.3.17); does not run or alter authentication.
+    pub fn encryption_file_key(&self) -> Option<&[u8]> {
+        self.encryption
+            .as_ref()
+            .map(|encryption| encryption.file_key.as_slice())
+    }
+
+    /// Read-only snapshot of the `/Encrypt` parameters for the
+    /// `show-encryption` inspection subcommand (flpdf-9hc.3.17).
+    ///
+    /// Returns `None` for plaintext PDFs. Re-reads the `/Encrypt` dictionary
+    /// (for V/R/Length/Filter/CF, which the authenticated [`EncryptionState`]
+    /// does not retain verbatim) and combines it with the already-resolved
+    /// crypt-filter methods. This does NOT re-run or alter authentication
+    /// (layer-2 owns that ordering); it only reflects state from a document
+    /// already opened successfully.
+    pub fn encryption_info(&mut self) -> Result<Option<EncryptionInfo>> {
+        if self.encryption.is_none() {
+            return Ok(None);
+        }
+        let Some(encrypt) = self.encrypt_dictionary()? else {
+            return Ok(None);
+        };
+        let v = required_integer(&encrypt, "V")?;
+        let r = required_integer(&encrypt, "R")?;
+        let filter = required_name(&encrypt, "Filter")?.to_string();
+        // /Length is in bits and absent for V<5 (defaulting to 40 per the
+        // Standard handler); V=5 always uses a 256-bit key.
+        let length_bits = match encrypt.get("Length") {
+            Some(Object::Integer(value)) => *value,
+            _ if v >= 5 => 256,
+            _ => 40,
+        };
+
+        // EFF: optional crypt-filter selector for embedded files. Resolve it
+        // through the same named-CF map used for StmF/StrF.
+        let eff_selector = crypt_filter_selector(&encrypt, "EFF")?;
+
+        let encryption = self
+            .encryption
+            .as_ref()
+            .expect("checked is_some above; authenticate_if_encrypted set it");
+        let permissions = encryption.permissions;
+        let encrypt_metadata = encryption.encrypt_metadata;
+        let stream_method = encryption.stream_mode.qpdf_name();
+        let string_method = encryption.string_mode.qpdf_name();
+        let eff_method = eff_selector.and_then(|selector| {
+            if selector == "Identity" {
+                Some(EncryptionMode::Identity.qpdf_name())
+            } else {
+                encryption
+                    .crypt_filters
+                    .get(selector.as_bytes())
+                    .map(|mode| mode.qpdf_name())
+            }
+        });
+        let named_crypt_filters = encryption
+            .crypt_filters
+            .iter()
+            .map(|(name, mode)| (String::from_utf8_lossy(name).into_owned(), mode.qpdf_name()))
+            .collect();
+
+        Ok(Some(EncryptionInfo {
+            v,
+            r,
+            length_bits,
+            filter,
+            permissions,
+            encrypt_metadata,
+            stream_method,
+            string_method,
+            eff_method,
+            named_crypt_filters,
+        }))
     }
 
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {

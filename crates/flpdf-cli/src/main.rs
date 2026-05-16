@@ -256,6 +256,79 @@ enum Commands {
         about = "Show a stream object's decoded (or raw) data"
     )]
     ShowStream(ShowStreamCommand),
+    #[command(
+        name = "show-encryption",
+        about = "Show encryption parameters (qpdf --show-encryption compatible)",
+        long_about = "\
+Print a parseable, greppable encryption report for FILE.
+
+The qpdf `--show-encryption` lines are emitted verbatim (`R = `, `P = `,
+the `extract/print/modify ...: allowed|not allowed` block, and the
+`stream/string/file encryption method:` lines for V>=4) so scripts that
+grep qpdf output also work here. flpdf adds extra leading lines
+(`V = `, `Length = `, `Filter = `, `EncryptMetadata = `, and per-named
+`CF /<name> = <method>`) before the qpdf block.
+
+Divergences from qpdf, by design (flpdf-9hc.3.17): flpdf does not recover
+the cleartext user password, so qpdf's `User password = <value>` line is
+omitted (a grep for it simply misses rather than getting wrong data).
+`Supplied password is owner/user password` is printed from the
+authenticated state. If FILE is not encrypted, prints qpdf's
+`File is not encrypted` and exits 0. Requires a correct password to open
+the document (same as the other inspection subcommands)."
+    )]
+    ShowEncryption(EncryptionInspectCommand),
+    #[command(
+        name = "is-encrypted",
+        about = "Exit 0 if FILE is encrypted, 2 if not (qpdf --is-encrypted)",
+        long_about = "\
+Silently exit 0 if FILE is encrypted, 2 if it is not encrypted. Works for
+password-protected files even without the password. Mirrors qpdf
+`--is-encrypted` (qpdf_exit_is_not_encrypted=2)."
+    )]
+    IsEncrypted(IsEncryptedCommand),
+    #[command(
+        name = "requires-password",
+        about = "Exit 0/2/3 reporting whether a password is required (qpdf --requires-password)",
+        long_about = "\
+Silently exit reporting FILE's password requirement (qpdf
+--requires-password):
+  0 = encrypted and a password other than the one supplied is required
+  2 = not encrypted (qpdf_exit_is_not_encrypted)
+  3 = encrypted and the supplied/empty password opens it
+      (qpdf_exit_correct_password)"
+    )]
+    RequiresPassword(EncryptionInspectCommand),
+    #[command(
+        name = "show-encryption-key",
+        about = "Print the file encryption key as lowercase hex (qpdf --show-encryption-key)",
+        long_about = "\
+Authenticate FILE with the supplied/empty password, then print the
+derived file encryption key as lowercase hex. Mirrors qpdf
+`--show-encryption-key`. Errors (exit 2) if FILE is not encrypted or the
+password is incorrect."
+    )]
+    ShowEncryptionKey(EncryptionInspectCommand),
+}
+
+/// Args for inspection subcommands that authenticate the document
+/// (`show-encryption`, `requires-password`, `show-encryption-key`).
+#[derive(Debug, ClapArgs)]
+struct EncryptionInspectCommand {
+    input: PathBuf,
+    #[arg(long)]
+    repair: bool,
+    #[command(flatten)]
+    password: PasswordArgs,
+}
+
+/// Args for `is-encrypted`. No password: qpdf detects encryption without
+/// authenticating, so a password would be meaningless here.
+#[derive(Debug, ClapArgs)]
+struct IsEncryptedCommand {
+    input: PathBuf,
+    #[arg(long)]
+    repair: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -712,6 +785,14 @@ fn run_command(command: Commands) -> CliResult<()> {
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair, &cmd.password),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
+        Commands::ShowEncryption(cmd) => run_show_encryption(&cmd.input, cmd.repair, &cmd.password),
+        Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair),
+        Commands::RequiresPassword(cmd) => {
+            run_requires_password(&cmd.input, cmd.repair, &cmd.password)
+        }
+        Commands::ShowEncryptionKey(cmd) => {
+            run_show_encryption_key(&cmd.input, cmd.repair, &cmd.password)
+        }
         Commands::Rewrite(cmd) => {
             if let Some(ref v) = cmd.force_version {
                 if parse_pdf_version(v).is_none() {
@@ -1115,6 +1196,237 @@ fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs)
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Encryption inspection subcommands (flpdf-9hc.3.17)
+//
+// qpdf exit-code semantics for these subcommands, from
+// qpdf/include/qpdf/Constants.h `enum qpdf_exit_code_e`:
+//   qpdf_exit_success           = 0
+//   qpdf_exit_error             = 2
+//   qpdf_exit_is_not_encrypted  = 2   (--is-encrypted / --requires-password)
+//   qpdf_exit_correct_password  = 3   (--requires-password)
+// and the qpdf manual "Exit Status" / option tables:
+//   https://qpdf.readthedocs.io/en/stable/cli.html
+//
+// The layer-1 `ExitCode` enum is generic (Ok=0, Errors=2, Warnings=3); these
+// subcommands reuse the numeric values 2 and 3 with subcommand-specific
+// MEANINGS (not "errors"/"warnings"), documented at each construction site.
+// ---------------------------------------------------------------------------
+
+/// Outcome of attempting to open a possibly-encrypted document for an
+/// inspection subcommand, where (unlike normal processing) a failed
+/// password attempt is informative rather than fatal.
+enum EncryptionProbe {
+    /// Opened successfully. The bool is `Pdf::is_encrypted()`.
+    Opened { encrypted: bool },
+    /// The file is encrypted but the supplied/empty password did not
+    /// authenticate (or the document needs the weak-crypto opt-in to open
+    /// at all). qpdf can still report "encrypted" / "password required"
+    /// without authenticating, so this is a normal classification here,
+    /// not an error.
+    EncryptedAuthFailed,
+}
+
+/// Open `input`, treating `BadPassword` / `WeakCryptoNotAllowed` as
+/// "the file is encrypted but we could not authenticate" rather than a
+/// hard error. This mirrors qpdf's ability to answer `--is-encrypted` /
+/// `--requires-password` for password-protected files without the password.
+fn probe_encryption(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<EncryptionProbe> {
+    let file = File::open(input)?;
+    match Pdf::open_with_options(BufReader::new(file), pdf_open_options(repair, password)?) {
+        Ok(pdf) => Ok(EncryptionProbe::Opened {
+            encrypted: pdf.is_encrypted(),
+        }),
+        // A wrong/empty password or a weak-crypto file we declined to open:
+        // the document is definitely encrypted, we just have not (or cannot,
+        // without --allow-weak-crypto) authenticate it. qpdf treats both as
+        // "encrypted, password required".
+        Err(flpdf::Error::Encrypted(
+            flpdf::EncryptedError::BadPassword | flpdf::EncryptedError::WeakCryptoNotAllowed,
+        )) => Ok(EncryptionProbe::EncryptedAuthFailed),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// `is-encrypted FILE`: exit 0 if encrypted, exit 2 if not.
+///
+/// qpdf `--is-encrypted` (qpdf manual): exit 0 = encrypted, exit 2 = not
+/// encrypted (`qpdf_exit_is_not_encrypted = 2`). No required stdout.
+fn run_is_encrypted(input: &PathBuf, repair: bool) -> CliResult<()> {
+    // No password is taken/used: qpdf detects encryption structurally
+    // (presence of /Encrypt) without authenticating, so we deliberately
+    // probe with an empty password and accept the auth-failed outcome.
+    let encrypted = match probe_encryption(input, repair, &PasswordArgs::default())? {
+        EncryptionProbe::Opened { encrypted } => encrypted,
+        EncryptionProbe::EncryptedAuthFailed => true,
+    };
+    if encrypted {
+        Ok(()) // exit 0 — file is encrypted.
+    } else {
+        // Exit 2 — NOT an error here: qpdf_exit_is_not_encrypted = 2 means
+        // "file is not encrypted" for --is-encrypted specifically.
+        Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        }))
+    }
+}
+
+/// `requires-password FILE [--password ...]`: qpdf `--requires-password`.
+///
+/// Exit codes (qpdf manual + Constants.h):
+///   2 = not encrypted              (qpdf_exit_is_not_encrypted)
+///   3 = encrypted, supplied/empty password opens it
+///       (qpdf_exit_correct_password — no further password required)
+///   0 = encrypted, a password other than the one supplied is required
+fn run_requires_password(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    match probe_encryption(input, repair, password)? {
+        EncryptionProbe::Opened { encrypted: false } => {
+            // Exit 2 — qpdf_exit_is_not_encrypted: file is not encrypted.
+            Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
+        EncryptionProbe::Opened { encrypted: true } => {
+            // Exit 3 — qpdf_exit_correct_password: encrypted, but the
+            // supplied/empty password opened it, so no other password is
+            // required. Reuses ExitCode::Warnings's numeric 3 with this
+            // subcommand-specific meaning.
+            Err(Box::new(CliExitError {
+                code: ExitCode::Warnings,
+                message: String::new(),
+            }))
+        }
+        EncryptionProbe::EncryptedAuthFailed => {
+            // Exit 0 — encrypted and a password OTHER than the one supplied
+            // is required (qpdf manual: "a password, other than as
+            // supplied, is required").
+            Ok(())
+        }
+    }
+}
+
+/// `show-encryption-key FILE [--password ...]`: qpdf `--show-encryption-key`.
+///
+/// Authenticate, then print the derived file encryption key as lowercase
+/// hex. Not encrypted or wrong password → error (exit 2), matching qpdf
+/// (which errors when it cannot derive the key).
+fn run_show_encryption_key(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<()> {
+    let pdf = open_pdf(input, repair, password)?;
+    match pdf.encryption_file_key() {
+        Some(key) => {
+            println!("{}", hex_lower(key));
+            Ok(())
+        }
+        None => {
+            // qpdf --show-encryption-key requires an encrypted file; exit 2.
+            Err("file is not encrypted; no encryption key to show".into())
+        }
+    }
+}
+
+/// `show-encryption FILE [--password ...]`: qpdf `--show-encryption`.
+///
+/// See the subcommand `long_about` for the exact format and the documented
+/// divergences from qpdf (no recovered cleartext user password).
+fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    // qpdf prints "File is not encrypted" and exits 0 for plaintext files.
+    // open_pdf succeeds for plaintext input, so detect that case first.
+    let mut pdf = open_pdf(input, repair, password)?;
+    let Some(info) = pdf.encryption_info()? else {
+        println!("File is not encrypted");
+        return Ok(());
+    };
+
+    // ── flpdf-specific leading lines (placed BEFORE the qpdf block so a
+    //    qpdf-compatible grep still matches the qpdf lines verbatim) ──
+    println!("V = {}", info.v);
+    println!("Length = {}", info.length_bits);
+    println!("Filter = {}", info.filter);
+    println!(
+        "EncryptMetadata = {}",
+        if info.encrypt_metadata {
+            "true"
+        } else {
+            "false"
+        }
+    );
+    let mut cf_names: Vec<_> = info.named_crypt_filters.clone();
+    cf_names.sort();
+    for (name, method) in &cf_names {
+        println!("CF /{name} = {method}");
+    }
+
+    // ── Verbatim qpdf `--show-encryption` lines (source:
+    //    qpdf libqpdf/QPDFJob.cc QPDFJob::showEncryption) ──
+    println!("R = {}", info.r);
+    println!("P = {}", info.permissions.raw());
+    // qpdf prints `User password = <recovered cleartext>` here; flpdf does
+    // not recover the cleartext user password (documented divergence), so
+    // that line is intentionally omitted.
+    if pdf.owner_password_matched() {
+        println!("Supplied password is owner password");
+    }
+    if pdf.user_password_matched() {
+        println!("Supplied password is user password");
+    }
+
+    // qpdf's allow* booleans are revision-dependent. Replicate the exact
+    // bit logic from qpdf libqpdf/QPDF_encryption.cc (P(n) = bit n-1 of the
+    // signed /P value, 1-based as in the PDF spec).
+    let p = info.permissions.raw();
+    let r = info.r;
+    let bit = |n: u32| (p >> (n - 1)) & 1 == 1;
+    let allow_print_low = bit(3);
+    let allow_extract_all = bit(5);
+    let allow_accessibility = if r < 3 { bit(5) } else { bit(10) };
+    let allow_print_high = allow_print_low && (r < 3 || bit(12));
+    let allow_modify_assembly = if r < 3 { bit(4) } else { bit(11) };
+    let allow_modify_form = if r < 3 { bit(6) } else { bit(9) };
+    let allow_modify_annotation = bit(6);
+    let allow_modify_other = bit(4);
+    let allow_modify_all = allow_modify_annotation
+        && allow_modify_other
+        && (r < 3 || (allow_modify_form && allow_modify_assembly));
+    let show = |v: bool| if v { "allowed" } else { "not allowed" };
+    println!("extract for accessibility: {}", show(allow_accessibility));
+    println!("extract for any purpose: {}", show(allow_extract_all));
+    println!("print low resolution: {}", show(allow_print_low));
+    println!("print high resolution: {}", show(allow_print_high));
+    println!("modify document assembly: {}", show(allow_modify_assembly));
+    println!("modify forms: {}", show(allow_modify_form));
+    println!("modify annotations: {}", show(allow_modify_annotation));
+    println!("modify other: {}", show(allow_modify_other));
+    println!("modify anything: {}", show(allow_modify_all));
+    if info.v >= 4 {
+        println!("stream encryption method: {}", info.stream_method);
+        println!("string encryption method: {}", info.string_method);
+        // qpdf prints the embedded-file ("file") method. When the document
+        // declares no /EFF, qpdf falls back to the stream method.
+        let file_method = info.eff_method.unwrap_or(info.stream_method);
+        println!("file encryption method: {file_method}");
+    }
+    Ok(())
+}
+
+/// Lowercase hex encoding (qpdf `--show-encryption-key` format).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 fn open_pdf(
