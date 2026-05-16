@@ -134,6 +134,59 @@ fn coalesce_joins_two_streams_with_newline() {
     );
 }
 
+#[test]
+fn coalesce_preserves_first_stream_non_filter_dict_entries() {
+    // First stream carries an extra non-filter dict entry. It must survive
+    // coalesce; encode-form keys (Filter/Length) must be stripped since the
+    // coalesced data is raw decoded bytes.
+    let seg1 = b"q Q";
+    let seg2 = b"BT ET";
+    let s1 = format!(
+        "4 0 obj\n<< /Length {} /Filter /ASCIIHexDecode /MyMeta (keepme) >>\nstream\n",
+        // ASCIIHex of seg1 so the declared filter is internally consistent.
+        seg1.iter().map(|b| format!("{b:02x}")).collect::<String>().len() + 1
+    );
+    let mut s1_bytes = s1.into_bytes();
+    s1_bytes.extend(
+        seg1.iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .into_bytes(),
+    );
+    s1_bytes.extend_from_slice(b">\nendstream\nendobj\n");
+
+    let s2 = stream_obj(5, seg2);
+    let bytes = build_pdf("[4 0 R 5 0 R]", &[(4, s1_bytes), (5, s2)]);
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    let page_ref = ObjectRef::new(3, 0);
+    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+
+    let Object::Dictionary(page_dict) = pdf.resolve(page_ref).unwrap() else {
+        panic!("page not a dict");
+    };
+    let Object::Reference(new_ref) = page_dict.get("Contents").unwrap() else {
+        panic!("/Contents not a Reference");
+    };
+    let Object::Stream(s) = pdf.resolve(*new_ref).unwrap() else {
+        panic!("not a stream");
+    };
+
+    assert_eq!(
+        s.dict.get("MyMeta"),
+        Some(&Object::String(b"keepme".to_vec())),
+        "non-filter dict entry from first stream must be preserved"
+    );
+    assert!(
+        s.dict.get("Filter").is_none(),
+        "/Filter must be stripped (data is raw decoded bytes)"
+    );
+    assert!(
+        s.dict.get("Length").is_none(),
+        "/Length must be stripped (writer re-derives it)"
+    );
+}
+
 /// Three streams are all coalesced in order.
 #[test]
 fn coalesce_joins_three_streams_in_order() {

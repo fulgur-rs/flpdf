@@ -306,6 +306,11 @@ pub fn coalesce_page_contents<R: Read + Seek>(
 
     // ── 3. Decode each stream and concatenate with '\n' separators ─────────────
     let mut coalesced: Vec<u8> = Vec::new();
+    // Preserve the first content stream's non-filter dictionary entries so
+    // stream-level metadata in the input is not silently dropped. Keys that
+    // describe the encoded form are stripped because the coalesced data is
+    // raw decoded bytes (the writer re-derives Length / re-applies a filter).
+    let mut new_dict: Option<Dictionary> = None;
     for (i, elem) in refs.iter().enumerate() {
         let stream: Stream = match elem {
             Object::Reference(r) => {
@@ -327,6 +332,14 @@ pub fn coalesce_page_contents<R: Read + Seek>(
                 )));
             }
         };
+
+        if i == 0 {
+            let mut d = stream.dict.clone();
+            for key in ["Filter", "DecodeParms", "DP", "Length", "DL"] {
+                d.remove(key);
+            }
+            new_dict = Some(d);
+        }
 
         let decoded = decode_stream_data(&stream.dict, &stream.data)?;
         if i > 0 {
@@ -351,7 +364,7 @@ pub fn coalesce_page_contents<R: Read + Seek>(
     let new_stream_ref = ObjectRef::new(new_num, 0);
 
     // ── 5. Build the new Stream (no filter: raw decoded bytes; writer handles re-encode) ─
-    let new_stream = Stream::new(Dictionary::new(), coalesced);
+    let new_stream = Stream::new(new_dict.unwrap_or_default(), coalesced);
     pdf.set_object(new_stream_ref, Object::Stream(new_stream));
 
     // ── 6. Re-resolve the page dictionary (it may have been evicted) and patch /Contents ─
