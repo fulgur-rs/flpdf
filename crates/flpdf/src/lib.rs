@@ -38,6 +38,7 @@
 //! [`ObjectRef::parse`].
 
 pub mod acroform_field_prune;
+pub mod annotation_helper;
 pub(crate) mod ascii85;
 pub(crate) mod ascii_hex;
 pub mod cache;
@@ -80,6 +81,7 @@ pub use acroform_field_prune::{
     prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
+pub use annotation_helper::{AnnotationObjectHelper, FormFieldObjectHelper};
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{check_reader, check_reader_strict, check_reader_with_options, CheckReport};
 pub use content_stream::{
