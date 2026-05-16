@@ -1447,3 +1447,273 @@ fn test_medium2_non_utf8_xobject_name_form_font_kept() {
         "medium2: /F2 must be PRUNED (unused): {font_keys:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// roborev medium 指摘1 (resources.rs:552): visited がスタック-local でない
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Bug scenario:
+//   - Form Fa (7 0 R) has its own /Resources with /XObject << /Fx 8 0 R >>.
+//     Fa's content invokes /Fx via Do.
+//   - Form Fx (8 0 R) has NO /Resources — it inherits the calling scope.
+//     Fx's content uses BT /F1 10 Tf.
+//   - Page /Resources has /XObject << /Fa 7 0 R /Fx 8 0 R >> and /Font << /F1 >>.
+//   - Page content: /Fa Do /Fx Do  (Fa first, so Fx is visited inside Fa's scope
+//     with form_used as accumulator, then Fa returns).
+//
+// With the old "global visited" bug:
+//   1. Page processes /Fa Do → recurse into Fa (own /Resources).
+//      Fa's Do invokes /Fx → visited.insert(8 0 R) → recurse into Fx.
+//      Fx uses /F1, but accumulator is form_used (Fa's throwaway) → F1 NOT
+//      recorded in page `used`.
+//      Return from Fx; 8 0 R stays in visited (never removed).
+//   2. Page processes /Fx Do → visited contains 8 0 R → skipped entirely.
+//      F1 never recorded → F1 incorrectly pruned.
+//
+// With the stack-pop fix:
+//   1. Recurse Fa → recurse Fx → pop Fx from visited on return from Fx.
+//   2. Page /Fx Do: insert 8 0 R (fresh), recurse Fx in PAGE scope → F1 recorded
+//      in page `used` → F1 kept.
+
+#[test]
+fn test_roborev_medium_visited_stack_pop_shared_fx_not_blocked() {
+    // Form Fx (8 0 R): no own /Resources, content uses /F1.
+    let fx_content = b"BT /F1 10 Tf (from Fx) Tj ET";
+    let fx_stream = {
+        let mut b = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            fx_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(fx_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+
+    // Form Fa (7 0 R): has own /Resources with /XObject << /Fx 8 0 R >>.
+    // Fa's content invokes /Fx via Do.
+    let fa_content = b"/Fx Do";
+    let fa_stream = {
+        let res = "/Resources << /XObject << /Fx 8 0 R >> >>";
+        let mut b = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} {} >>\nstream\n",
+            fa_content.len(),
+            res
+        )
+        .into_bytes();
+        b.extend_from_slice(fa_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+
+    // Page content: invoke Fa first, then Fx directly.
+    let page_content = b"/Fa Do /Fx Do";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, page_content)),
+        // Page /Resources: /Font { F1 }, /XObject { Fa, Fx }
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> >> \
+                   /XObject << /Fa 7 0 R /Fx 8 0 R >> >>",
+            ),
+        ),
+        (7, fa_stream),
+        (8, fx_stream),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let font_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        font_keys.contains(&"F1".to_string()),
+        "visited stack-pop: /F1 must be KEPT — page's direct /Fx Do uses F1 via inherited scope; \
+         old bug: Fx skipped because visited contains its ref from Fa's scope: {font_keys:?}"
+    );
+}
+
+// Regression: true cycle (Fx → Fx via own /Resources) must not infinite-loop.
+#[test]
+fn test_roborev_medium_true_cycle_no_infinite_loop() {
+    // Fx (6 0 R) has own /Resources << /XObject << /Fx 6 0 R >> >>.
+    // Fx's content: /Fx Do  → self-reference → must be caught by cycle guard.
+    let fx_content = b"/Fx Do";
+    let fx_stream = {
+        let res = "/Resources << /XObject << /Fx 6 0 R >> >>";
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} {} >>\nstream\n",
+            fx_content.len(),
+            res
+        )
+        .into_bytes();
+        b.extend_from_slice(fx_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+
+    let page_content = b"/Fx Do";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, page_content)),
+        (
+            5,
+            obj_bytes(5, "<< /XObject << /Fx 6 0 R >> >>"),
+        ),
+        (6, fx_stream),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    // Must complete without hanging or panicking.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must not loop or panic on true cycle");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// roborev low 指摘2 (resources.rs:242): synthetic group key 衝突
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Bug scenario:
+//   - Page 1 (object 3 0 R) has a page-INLINE /Resources containing /Font 6 0 R.
+//     Page 1 content uses /F1.
+//   - Page 2 (object 4 0 R) has /Resources pointing to an indirect object at
+//     ObjectRef(3, 1) (same object number as page 1, different generation).
+//     Page 2 content uses /F2.
+//   - Font sub-dict 6 0 R: /F1 /F2 /F3 (F3 unused by either page).
+//
+// With the old bug (synthetic key = ObjectRef::new(page_refs[i].number, 1)):
+//   Page 1's PageInline group gets synthetic key ObjectRef(3, 1).
+//   Page 2's Indirect group key is ObjectRef(3, 1) (the real ref).
+//   → Both groups map to the SAME entry in cat_ref_seen_groups.
+//   → 6 0 R's group_count stays at 1 (two groups counted as one).
+//   → Yes mode misses F2 from page 2's union → F2 incorrectly pruned.
+//
+// With the ResGroupKey enum fix:
+//   Page 1 → ResGroupKey::PageInline(ObjectRef(3, 0))
+//   Page 2 → ResGroupKey::Indirect(ObjectRef(3, 1))
+//   → Distinct variants → group_count == 2 → union {F1, F2} → F3 pruned, F1+F2 kept.
+//
+// Standard PDF xref tables cannot hold two entries for the same object number
+// simultaneously, so we reproduce the collision by injecting the gen-1 object
+// directly into the Pdf cache via `set_object` after opening a base PDF, and
+// by patching page 2's /Resources reference to point at it.
+
+#[test]
+fn test_roborev_low_page_inline_group_key_no_collision_with_gen1_indirect() {
+    // Base PDF (two pages, page-inline /Resources on page 1):
+    //   1 0 R  Catalog
+    //   2 0 R  Pages /Kids [3 0 R 4 0 R]
+    //   3 0 R  Page 1 — inline /Resources << /Font 6 0 R >>  /Contents 7 0 R
+    //   4 0 R  Page 2 — (stub; /Resources will be injected below)   /Contents 8 0 R
+    //   6 0 R  Shared Font sub-dict: /F1 /F2 /F3
+    //   7 0 R  Content stream page 1: uses /F1
+    //   8 0 R  Content stream page 2: uses /F2
+
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+        ),
+        // Page 1: inline /Resources with /Font 6 0 R.
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                   /Contents 7 0 R /Resources << /Font 6 0 R >> >>",
+            ),
+        ),
+        // Page 2: initially no /Resources (we inject 3 1 R below).
+        (
+            4,
+            obj_bytes(
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R >>",
+            ),
+        ),
+        // Font sub-dict: F1, F2, F3.
+        (
+            6,
+            obj_bytes(
+                6,
+                "<< /F1 << /Type /Font >> /F2 << /Type /Font >> /F3 << /Type /Font >> >>",
+            ),
+        ),
+        (7, stream_obj(7, content1)),
+        (8, stream_obj(8, content2)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    // Inject the generation-1 /Resources object for page 2 into the cache.
+    // ObjectRef(3, 1) has the same object number as page 1 (3 0 R) but a
+    // different generation, reproducing the old key collision.
+    let res_31_ref = ObjectRef::new(3, 1);
+    {
+        let mut res31 = Dictionary::new();
+        res31.insert("Font", Object::Reference(ObjectRef::new(6, 0)));
+        pdf.set_object(res_31_ref, Object::Dictionary(res31));
+    }
+
+    // Patch page 2 (4 0 R) to point its /Resources at the injected (3, 1) object.
+    {
+        let page2_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve page 2");
+        let Object::Dictionary(mut page2) = page2_obj else {
+            panic!("page 2 not a dict");
+        };
+        page2.insert("Resources", Object::Reference(res_31_ref));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(page2));
+    }
+
+    // Yes mode: union = {F1, F2}, F3 pruned.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let font_obj = pdf
+        .resolve(ObjectRef::new(6, 0))
+        .expect("resolve font dict");
+    let Object::Dictionary(font_dict) = font_obj else {
+        panic!("6 0 R not a dict");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "low2: F1 must remain (page1 inline uses it): {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "low2: F2 must remain (page2 via injected gen-1 indirect uses it): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F3".to_string()),
+        "low2: F3 must be pruned (neither page uses it): {keys:?}"
+    );
+}

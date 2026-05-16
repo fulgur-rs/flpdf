@@ -47,6 +47,25 @@ struct CatRefInfo {
     used_union: BTreeSet<Vec<u8>>,
 }
 
+/// Canonical identifier for a top-level `/Resources` group.
+///
+/// Used as the key in `cat_ref_seen_groups` so that distinct group types never
+/// collide even when they share the same `ObjectRef` number.
+///
+/// `PageInline` stores the page's own `ObjectRef` (generation 0) without
+/// inventing a synthetic generation-1 value, eliminating the collision described
+/// in roborev low 指摘2: a real indirect `(N, 1)` object and a page-inline
+/// group for page object `(N, 0)` could previously share the same synthetic key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResGroupKey {
+    /// `/Resources` is an indirect object at the given ref.
+    Indirect(ObjectRef),
+    /// `/Resources` is an inline dict on the ancestor `/Pages` node at the given ref.
+    AncestorInline(ObjectRef),
+    /// `/Resources` is an inline dict on the page dict itself; key is the page's ObjectRef.
+    PageInline(ObjectRef),
+}
+
 // ── Resource location ─────────────────────────────────────────────────────────
 
 /// Where a page's `/Resources` dictionary physically lives.
@@ -259,7 +278,7 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     //
     // We track (cat_ref, seen_top_level_groups) to avoid double-counting when
     // multiple pages share the same top-level Indirect /Resources.
-    let mut cat_ref_seen_groups: BTreeMap<CatRefKey, BTreeSet<ObjectRef>> = BTreeMap::new();
+    let mut cat_ref_seen_groups: BTreeMap<CatRefKey, BTreeSet<ResGroupKey>> = BTreeMap::new();
 
     for (i, loc) in page_res_loc.iter().enumerate() {
         // Resolve this page's top-level /Resources dict (if any).
@@ -294,14 +313,15 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
             continue;
         };
 
-        // The canonical key for this top-level resources group:
-        // use the loc discriminant so each distinct group is counted once.
-        let group_key: ObjectRef = match loc {
-            ResourcesLoc::Indirect(r) => *r,
-            ResourcesLoc::AncestorInline(a) => *a,
-            // PageInline and None: use a synthetic per-page ObjectRef
-            // (generation = 1 to distinguish from real refs).
-            _ => ObjectRef::new(page_refs[i].number, 1),
+        // The canonical key for this top-level resources group.
+        // Use the typed ResGroupKey enum so that PageInline(page_ref) never
+        // collides with a real Indirect(ObjectRef) even when the object numbers
+        // happen to be identical (roborev low 指摘2).
+        let group_key: ResGroupKey = match loc {
+            ResourcesLoc::Indirect(r) => ResGroupKey::Indirect(*r),
+            ResourcesLoc::AncestorInline(a) => ResGroupKey::AncestorInline(*a),
+            ResourcesLoc::PageInline => ResGroupKey::PageInline(page_refs[i]),
+            ResourcesLoc::None => unreachable!("None loc filtered above by res_dict_opt"),
         };
 
         // What used-names does this group contribute?
@@ -637,13 +657,17 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(());
     };
 
+    // For indirect XObject references, record the ObjectRef so we can do
+    // stack-pop cycle detection (see below).  Direct streams cannot form cycles
+    // in well-formed PDFs, so no entry is needed for them.
+    let indirect_ref: Option<ObjectRef> = match &xobj_val {
+        Object::Reference(r) => Some(*r),
+        _ => None,
+    };
+
     // Resolve to a Stream, handling both indirect references and direct streams.
     let stream: crate::object::Stream = match xobj_val {
         Object::Reference(xobj_ref) => {
-            // Cycle guard for indirect references.
-            if !visited.insert(xobj_ref) {
-                return Ok(());
-            }
             let obj = pdf.resolve(xobj_ref)?;
             match obj {
                 Object::Stream(s) => s,
@@ -678,6 +702,29 @@ fn recurse_form_xobject<R: Read + Seek>(
     // indirect /Resources still means the Form owns its resource scope.
     let form_has_own_resources = stream.dict.get("Resources").is_some();
 
+    // ── Cycle guard (stack-pop style, roborev medium 指摘1) ──────────────────
+    //
+    // The cycle check is deferred until just before recursion so that early
+    // returns above (non-Stream, non-Form, decode failure) never leave the
+    // ObjectRef stranded in `visited`.
+    //
+    // By inserting here and removing *after* the recursive call returns, `visited`
+    // acts as a "currently on the call stack" set rather than a "ever visited"
+    // set.  This means that the same XObject can be legitimately visited via
+    // multiple independent paths (e.g. first inside a Form with its own
+    // /Resources, then directly from the page scope) without the first path
+    // blocking the second.
+    //
+    // True cycles (A → B → A) are still caught: while recursing into A, `visited`
+    // contains A; when B tries to recurse into A again, `insert` returns false
+    // and we return immediately, breaking the loop.  Once B returns and we remove
+    // A from `visited`, no infinite loop is possible.
+    if let Some(r) = indirect_ref {
+        if !visited.insert(r) {
+            return Ok(()); // cycle detected — already on the current call stack
+        }
+    }
+
     if form_has_own_resources {
         // Resolve the Form's own /Resources dict (may be direct or indirect).
         let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
@@ -706,6 +753,11 @@ fn recurse_form_xobject<R: Read + Seek>(
         // No /Resources key → Form inherits the calling scope's resources.
         // Attribute all references to the page's used set (original behaviour).
         collect_from_stream(pdf, &form_bytes, page_resources, used, visited, depth + 1)?;
+    }
+
+    // ── Stack pop: remove from visited so sibling/later paths can visit this ref ─
+    if let Some(r) = indirect_ref {
+        visited.remove(&r);
     }
 
     Ok(())
