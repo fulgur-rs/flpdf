@@ -56,10 +56,16 @@ fn qpdf_available() -> bool {
     if !Path::new(QPDF).exists() {
         return false;
     }
-    // `qpdf --version` → e.g. "qpdf version 11.9.0\n...". Only treat the
-    // pinned version as a valid oracle for these cells.
+    // `qpdf --version` first stdout line is exactly "qpdf version <v>".
+    // Require an *exact* first-line match so a patched/suffixed build
+    // (e.g. "11.9.0-ubuntu2") or an unrelated bundled-library version line
+    // is not mistaken for the pinned oracle.
     match Shell::new(QPDF).arg("--version").output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(EXPECTED_QPDF_VERSION),
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines().next().map(str::trim)
+                == Some(&format!("qpdf version {EXPECTED_QPDF_VERSION}"))
+        }
         Err(_) => false,
     }
 }
