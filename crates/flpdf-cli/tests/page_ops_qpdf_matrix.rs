@@ -529,7 +529,7 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
 // ===========================================================================
 
 #[test]
-#[ignore = "flpdf-split-pages-1-single-number-naming: --split-pages=1 emits range-form -1-1.pdf; qpdf 11.9.0 emits single-number -1.pdf. Layer flpdf-9hc.8.7 (page_split::split_output_path / unit test split_pages_single_chunk_size_one). Not in the documented divergence list — needs a bd follow-up at layer 8.7."]
+#[ignore = "flpdf-s5e: --split-pages=1 emits range-form -1-1.pdf; qpdf 11.9.0 emits single-number -1.pdf. Real divergence in layer flpdf-9hc.8.7 (page_split::split_output_path). Tracked as bug flpdf-s5e (P2, child of epic flpdf-9hc.8); un-ignore once fixed in the 8.7 layer."]
 fn split_pages_one_filename_matches_qpdf() {
     // qpdf 11.9.0: `3p --split-pages=1` → q-1.pdf, q-2.pdf, q-3.pdf.
     // flpdf produces f-1-1.pdf, f-2-2.pdf, f-3-3.pdf (range form for every
@@ -867,7 +867,7 @@ fn pages_secondary_encrypted_input_is_expected_scope_error() {
 }
 
 #[test]
-#[ignore = "flpdf-pages-toplevel-password-not-threaded: with an encrypted PRIMARY input + top-level --password, `--pages . RANGE --` fails with 'incorrect password' because the top-level password is not forwarded to CombinedPlan::from_specs's planning open (only to the later rebuild open). Layer flpdf-9hc.8.12 (run_page_extraction in crates/flpdf-cli/src/main.rs). Proven not an auth/AES-256 gap: plain `rewrite enc3.pdf --password=secretpw out.pdf` succeeds. Needs a bd follow-up at layer 8.12."]
+#[ignore = "flpdf-1uh: with an encrypted PRIMARY input + top-level --password, `--pages . RANGE --` fails with 'incorrect password' because the top-level password is not forwarded to CombinedPlan::from_specs's planning open (only to the later rebuild open). Layer flpdf-9hc.8.12 (run_page_extraction in crates/flpdf-cli/src/main.rs). Proven not an auth/AES-256 gap: plain `rewrite enc3.pdf --password=secretpw out.pdf` succeeds. Tracked as bug flpdf-1uh (P2, child of epic flpdf-9hc.8); un-ignore once fixed in the 8.12 layer."]
 fn pages_primary_encrypted_toplevel_password_threads_through() {
     // Repro: encrypted primary, top-level --password=secretpw, --pages . 2-3.
     // Expected (matching qpdf's auth model): the planning stage should open
