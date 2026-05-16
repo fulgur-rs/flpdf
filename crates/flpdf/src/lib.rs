@@ -58,6 +58,7 @@ pub mod pages;
 pub mod parser;
 pub mod reader;
 pub mod resources;
+pub mod rotate_spec;
 pub(crate) mod run_length;
 pub mod writer;
 pub mod xref;
@@ -83,6 +84,7 @@ pub use page_rotate::{
 pub use parser::parse_object;
 pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};
 pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
+pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
