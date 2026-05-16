@@ -104,37 +104,68 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     };
 
     let outlines_ref = catalog.get_ref("Outlines");
-    let names_ref = catalog.get_ref("Names");
 
     // --- Step 2: Prune named destinations ---------------------------------
     // We need to know which named destinations survive before processing
     // outline string-form /Dest references.
     let mut surviving_names: BTreeSet<Vec<u8>> = BTreeSet::new();
 
-    // 2a. /Names /Dests name-tree
-    if let Some(names_dict_ref) = names_ref {
-        let names_dict_obj = pdf.resolve(names_dict_ref)?;
-        if let Object::Dictionary(names_dict) = names_dict_obj {
-            if let Some(dests_ref) = names_dict.get_ref("Dests") {
-                let dests_empty =
-                    prune_name_tree(pdf, dests_ref, &surviving, &mut surviving_names)?;
-                if dests_empty {
-                    // All named dests were pruned — remove /Dests from /Names dict
-                    // so no dangling ref remains.
-                    let names_dict_obj2 = pdf.resolve(names_dict_ref)?;
-                    if let Object::Dictionary(mut nd) = names_dict_obj2 {
-                        nd.remove("Dests");
-                        if nd.iter().next().is_none() {
-                            // /Names dict is now completely empty — remove /Names from catalog.
-                            let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                            if let Object::Dictionary(mut cat) = catalog_obj3 {
-                                cat.remove("Names");
-                                pdf.set_object(catalog_ref, Object::Dictionary(cat));
-                            }
-                        } else {
-                            pdf.set_object(names_dict_ref, Object::Dictionary(nd));
-                        }
+    // 2a. /Names /Dests name-tree. /Names may be an indirect reference OR a
+    // direct dictionary on the catalog; /Dests inside it likewise.
+    enum NamesLoc {
+        Indirect(ObjectRef),
+        DirectInCatalog,
+    }
+    let (names_loc, mut names_dict) = match catalog.get("Names").cloned() {
+        Some(Object::Reference(r)) => match pdf.resolve(r)? {
+            Object::Dictionary(d) => (Some(NamesLoc::Indirect(r)), d),
+            _ => (None, crate::Dictionary::default()),
+        },
+        Some(Object::Dictionary(d)) => (Some(NamesLoc::DirectInCatalog), d),
+        _ => (None, crate::Dictionary::default()),
+    };
+    if let Some(names_loc) = names_loc {
+        let dests_empty = match names_dict.get("Dests").cloned() {
+            Some(Object::Reference(dr)) => {
+                prune_name_tree(pdf, dr, &surviving, &mut surviving_names)?
+            }
+            Some(Object::Dictionary(node)) => {
+                let (new_node, empty) =
+                    prune_name_tree_node_dict(pdf, node, &surviving, &mut surviving_names)?;
+                if !empty {
+                    names_dict.insert("Dests", Object::Dictionary(new_node));
+                }
+                empty
+            }
+            // No /Dests (other name-tree keys only) — nothing to prune here.
+            _ => false,
+        };
+        if dests_empty {
+            // All named dests pruned — drop /Dests so no dangling ref remains.
+            names_dict.remove("Dests");
+        }
+        let names_now_empty = names_dict.iter().next().is_none();
+        match names_loc {
+            NamesLoc::Indirect(r) => {
+                if names_now_empty {
+                    let catalog_obj3 = pdf.resolve(catalog_ref)?;
+                    if let Object::Dictionary(mut cat) = catalog_obj3 {
+                        cat.remove("Names");
+                        pdf.set_object(catalog_ref, Object::Dictionary(cat));
                     }
+                } else {
+                    pdf.set_object(r, Object::Dictionary(names_dict));
+                }
+            }
+            NamesLoc::DirectInCatalog => {
+                let catalog_obj3 = pdf.resolve(catalog_ref)?;
+                if let Object::Dictionary(mut cat) = catalog_obj3 {
+                    if names_now_empty {
+                        cat.remove("Names");
+                    } else {
+                        cat.insert("Names", Object::Dictionary(names_dict));
+                    }
+                    pdf.set_object(catalog_ref, Object::Dictionary(cat));
                 }
             }
         }
@@ -316,6 +347,68 @@ fn prune_name_tree<R: Read + Seek>(
     Ok(true) // Node has neither /Names nor /Kids — treat as empty.
 }
 
+/// Like [`prune_name_tree`] but for a name-tree root held as a *direct*
+/// dictionary (e.g. a `/Names /Dests` value embedded directly rather than via
+/// an indirect reference). Returns the rebuilt node dict and whether it became
+/// empty. Child `/Kids` (always indirect) delegate to [`prune_name_tree`].
+fn prune_name_tree_node_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node: crate::Dictionary,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving_names: &mut BTreeSet<Vec<u8>>,
+) -> Result<(crate::Dictionary, bool)> {
+    if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
+        let filtered = prune_name_pairs(pdf, pairs, surviving, surviving_names)?;
+        if filtered.is_empty() {
+            return Ok((node, true));
+        }
+        let mut d = node.clone();
+        let limits = compute_limits(&filtered);
+        d.insert("Names", Object::Array(filtered));
+        if let Some(lim) = limits {
+            d.insert("Limits", lim);
+        } else {
+            d.remove("Limits");
+        }
+        return Ok((d, false));
+    }
+    if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
+        let child_refs: Vec<ObjectRef> = kids
+            .iter()
+            .filter_map(|k| match k {
+                Object::Reference(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        let mut surviving_kids: Vec<ObjectRef> = Vec::new();
+        for child_ref in child_refs {
+            if !prune_name_tree(pdf, child_ref, surviving, surviving_names)? {
+                surviving_kids.push(child_ref);
+            }
+        }
+        if surviving_kids.is_empty() {
+            return Ok((node, true));
+        }
+        let mut d = node.clone();
+        d.insert(
+            "Kids",
+            Object::Array(
+                surviving_kids
+                    .iter()
+                    .map(|&r| Object::Reference(r))
+                    .collect(),
+            ),
+        );
+        if let Some(lim) = merge_node_limits(pdf, &surviving_kids)? {
+            d.insert("Limits", lim);
+        } else {
+            d.remove("Limits");
+        }
+        return Ok((d, false));
+    }
+    Ok((node, true))
+}
+
 /// Filter a flat name-pairs array `[(name_str, dest_obj), ...]` keeping only
 /// entries whose dest resolves to a surviving page.  Adds kept names to
 /// `surviving_names`. Returns the filtered array.
@@ -337,35 +430,24 @@ fn prune_name_pairs<R: Read + Seek>(
             _ => continue, // Malformed — skip.
         };
 
-        // A name-tree dest value may itself be an indirect reference to the
-        // real `[pageRef /Fit ...]` array/dict. Resolve one level so the page
-        // ref is detected; without this an indirect dest to a removed page
-        // would be kept, leaving a dangling destination.
-        let indirect_target = match &dest_obj {
-            Object::Reference(r) => Some(*r),
-            _ => None,
-        };
-        let concrete = match &dest_obj {
-            Object::Reference(r) => pdf.resolve(*r)?,
-            other => other.clone(),
-        };
-
-        match dest_page_ref(&concrete) {
-            Some(r) => {
-                if let Some(&new_ref) = surviving.get(&r) {
+        // A name-tree dest value may be inline, an indirect reference, or a
+        // dict whose /D is inline/indirect. dest_page_ref_resolved + the
+        // recursive remap_dest_value handle every form uniformly.
+        match dest_page_ref_resolved(pdf, &dest_obj)? {
+            Some(page_ref) => {
+                if surviving.contains_key(&page_ref) {
                     surviving_names.insert(name_bytes.clone());
-                    let remapped = remap_dest_page_ref(concrete, new_ref);
-                    match indirect_target {
-                        Some(dr) => {
-                            // Remap inside the referenced object; keep the
-                            // name -> <ref> pair pointing at the same object.
-                            pdf.set_object(dr, remapped);
+                    match remap_dest_value(pdf, &dest_obj, surviving)? {
+                        // Inline value changed -> store the new form.
+                        Some(updated) => {
                             result.push(name_obj);
-                            result.push(dest_obj);
+                            result.push(updated);
                         }
+                        // Remapped in place (indirect) or already correct ->
+                        // keep the original stored form.
                         None => {
                             result.push(name_obj);
-                            result.push(remapped);
+                            result.push(dest_obj);
                         }
                     }
                 }
@@ -419,31 +501,17 @@ fn prune_dests_dict<R: Read + Seek>(
             Some(v) => v,
             None => continue,
         };
-        // A /Dests value may be an indirect reference to the real dest
-        // array/dict; resolve one level so an indirect dest to a removed
-        // page is not left dangling.
-        let indirect_target = match &val {
-            Object::Reference(r) => Some(*r),
-            _ => None,
-        };
-        let concrete = match &val {
-            Object::Reference(r) => pdf.resolve(*r)?,
-            other => other.clone(),
-        };
-        match dest_page_ref(&concrete) {
-            Some(r) => {
-                if let Some(&new_ref) = surviving.get(&r) {
+        // A /Dests value may be inline, an indirect reference, or a dict
+        // whose /D is inline/indirect — all handled uniformly.
+        match dest_page_ref_resolved(pdf, &val)? {
+            Some(page_ref) => {
+                if surviving.contains_key(&page_ref) {
                     surviving_names.insert(key.clone());
-                    let remapped = remap_dest_page_ref(concrete, new_ref);
-                    match indirect_target {
-                        Some(dr) => {
-                            pdf.set_object(dr, remapped);
-                            // dict entry keeps pointing at the same object.
-                        }
-                        None => {
-                            new_dests.insert(key, remapped);
-                        }
+                    if let Some(updated) = remap_dest_value(pdf, &val, surviving)? {
+                        new_dests.insert(key, updated);
                     }
+                    // else: remapped in place (indirect) -> dict entry keeps
+                    // pointing at the same object.
                 } else {
                     new_dests.remove(&key);
                 }
@@ -712,84 +780,26 @@ fn dest_survives<R: Read + Seek>(
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &BTreeSet<Vec<u8>>,
 ) -> Result<bool> {
+    // String/name form is a *named* destination — resolve one indirection
+    // level for detection, then check the surviving-names set.
     let concrete;
-    let dest = match dest {
+    let head = match dest {
         Object::Reference(r) => {
             concrete = pdf.resolve(*r)?;
             &concrete
         }
         other => other,
     };
-    Ok(match dest {
-        // Array form: [pageRef /XYZ ...] or [pageRef /Fit].
-        Object::Array(arr) => {
-            if let Some(Object::Reference(page_ref)) = arr.first() {
-                surviving.contains_key(page_ref)
-            } else {
-                // No page ref in array (malformed) — keep conservatively.
-                true
-            }
-        }
-        // Dictionary form `<< /D [pageRef ...] >>`.
-        Object::Dictionary(d) => match d.get("D") {
-            Some(Object::Array(arr)) => match arr.first() {
-                Some(Object::Reference(page_ref)) => surviving.contains_key(page_ref),
-                _ => true,
-            },
-            _ => true,
-        },
-        // String or name form: a named destination.
-        Object::String(name) | Object::Name(name) => surviving_names.contains(name.as_slice()),
-        // Other forms — keep conservatively.
-        _ => true,
+    if let Object::String(name) | Object::Name(name) = head {
+        return Ok(surviving_names.contains(name.as_slice()));
+    }
+    // Otherwise it is (or resolves to) an explicit page destination. Resolve
+    // every indirection level uniformly; an unresolvable page ref (external /
+    // malformed) is kept conservatively.
+    Ok(match dest_page_ref_resolved(pdf, dest)? {
+        Some(page_ref) => surviving.contains_key(&page_ref),
+        None => true,
     })
-}
-
-/// Extract the page `ObjectRef` from a destination value, if it is the array
-/// form `[pageRef /FitType ...]`.
-fn dest_page_ref(dest: &Object) -> Option<ObjectRef> {
-    match dest {
-        Object::Array(arr) => {
-            if let Some(Object::Reference(r)) = arr.first() {
-                Some(*r)
-            } else {
-                None
-            }
-        }
-        Object::Dictionary(d) => {
-            // Some dest forms are dicts with a /D key.
-            if let Some(d_val) = d.get("D") {
-                dest_page_ref(d_val)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Remap the page reference inside a destination to `new_ref`.
-fn remap_dest_page_ref(dest: Object, new_ref: ObjectRef) -> Object {
-    match dest {
-        Object::Array(mut arr) => {
-            if let Some(first) = arr.first_mut() {
-                if matches!(first, Object::Reference(_)) {
-                    *first = Object::Reference(new_ref);
-                }
-            }
-            Object::Array(arr)
-        }
-        // Dictionary form `<< /D [pageRef /Fit ...] >>`: recurse into /D so the
-        // page ref inside is remapped (dest_page_ref accepts this form, so
-        // remap must too, or a kept dict-dest keeps its old page ref).
-        Object::Dictionary(mut d) => {
-            if let Some(d_val) = d.get("D").cloned() {
-                d.insert("D", remap_dest_page_ref(d_val, new_ref));
-            }
-            Object::Dictionary(d)
-        }
-        other => other,
-    }
 }
 
 /// Remap the page reference in an outline item's `/Dest` or `/A /D` field.
@@ -868,22 +878,66 @@ fn remap_dest_value<R: Read + Seek>(
     dest: &Object,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<Option<Object>> {
-    if let Object::Reference(dr) = dest {
-        let concrete = pdf.resolve(*dr)?;
-        if let Some(old) = dest_page_ref(&concrete) {
-            if let Some(&new_ref) = surviving.get(&old) {
-                let remapped = remap_dest_page_ref(concrete, new_ref);
-                pdf.set_object(*dr, remapped);
+    match dest {
+        // Indirect: resolve, recurse, and if the referenced object changed,
+        // rewrite it in place. The caller keeps pointing at the same ref.
+        Object::Reference(dr) => {
+            let concrete = pdf.resolve(*dr)?;
+            if let Some(updated) = remap_dest_value(pdf, &concrete, surviving)? {
+                pdf.set_object(*dr, updated);
             }
+            Ok(None)
         }
-        return Ok(None);
-    }
-    if let Some(old) = dest_page_ref(dest) {
-        if let Some(&new_ref) = surviving.get(&old) {
-            return Ok(Some(remap_dest_page_ref(dest.clone(), new_ref)));
+        // Array form `[pageRef /Fit ...]`.
+        Object::Array(arr) => {
+            if let Some(Object::Reference(old)) = arr.first() {
+                if let Some(&new_ref) = surviving.get(old) {
+                    let mut a = arr.clone();
+                    a[0] = Object::Reference(new_ref);
+                    return Ok(Some(Object::Array(a)));
+                }
+            }
+            Ok(None)
         }
+        // Dictionary form `<< /D <dest> >>` — /D may itself be inline or an
+        // indirect reference; recurse so either is remapped.
+        Object::Dictionary(d) => {
+            if let Some(d_val) = d.get("D").cloned() {
+                if let Some(updated) = remap_dest_value(pdf, &d_val, surviving)? {
+                    let mut nd = d.clone();
+                    nd.insert("D", updated);
+                    return Ok(Some(Object::Dictionary(nd)));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
     }
-    Ok(None)
+}
+
+/// pdf-aware page-ref extraction. Resolves one level at each indirection
+/// (the dest value itself, or a dictionary's `/D`) so every indirection form
+/// — inline array, dict `/D`, indirect dest, dict whose `/D` is indirect — is
+/// classified uniformly. Returns `None` for named/string/external dests.
+fn dest_page_ref_resolved<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest: &Object,
+) -> Result<Option<ObjectRef>> {
+    match dest {
+        Object::Reference(r) => {
+            let c = pdf.resolve(*r)?;
+            dest_page_ref_resolved(pdf, &c)
+        }
+        Object::Array(arr) => Ok(match arr.first() {
+            Some(Object::Reference(r)) => Some(*r),
+            _ => None,
+        }),
+        Object::Dictionary(d) => match d.get("D").cloned() {
+            Some(v) => dest_page_ref_resolved(pdf, &v),
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,6 +1910,111 @@ mod tests {
         );
         let Some(Object::Array(arr)) = dests.get("d1") else {
             panic!("d1 should survive as an array dest");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn dict_form_dest_with_indirect_d_is_resolved() {
+        // Named dest is dict form whose /D is an *indirect* ref:
+        //   (d1) << /D 40 0 R >>   40 -> [3 0 R /Fit]  (page 1 kept)
+        //   (d2) << /D 41 0 R >>   41 -> [4 0 R /Fit]  (page 2 removed)
+        // Pre-fix: dest_page_ref didn't follow Reference through /D, so d2
+        // (dangling) was kept and d1 never remapped.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (
+                    30,
+                    "<< /Limits [(d1) (d2)] \
+                     /Names [(d1) << /D 40 0 R >> (d2) << /D 41 0 R >>] >>",
+                ),
+                (40, "[3 0 R /Fit]"),
+                (41, "[4 0 R /Fit]"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let leaf = dict_of(&mut pdf, ObjectRef::new(30, 0));
+        let Some(Object::Array(names)) = leaf.get("Names").cloned() else {
+            panic!("/Names array expected");
+        };
+        let kept: Vec<&[u8]> = names
+            .iter()
+            .filter_map(|o| match o {
+                Object::String(b) | Object::Name(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec![b"d1".as_slice()], "d2 -> removed page dropped");
+        // obj 40 (referenced by d1's /D) had its page ref remapped in place.
+        let dest40 = pdf.resolve(ObjectRef::new(40, 0)).unwrap();
+        let Object::Array(arr) = dest40 else {
+            panic!("obj 40 should remain a dest array");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn names_direct_dictionary_on_catalog_is_pruned() {
+        // /Names is a *direct* dictionary on the catalog (not an indirect
+        // ref). get_ref() only matched references, so the whole name tree was
+        // skipped — leaving named dests to removed pages dangling.
+        let bytes = build_min_pdf(
+            &[
+                (
+                    1,
+                    "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 30 0 R >> >>",
+                ),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    30,
+                    "<< /Limits [(d1) (d2)] \
+                     /Names [(d1) [3 0 R /Fit] (d2) [4 0 R /Fit]] >>",
+                ),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // Catalog still carries a direct /Names dict, written back after prune.
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        assert!(
+            matches!(cat.get("Names"), Some(Object::Dictionary(_))),
+            "/Names should remain a direct dict on the catalog"
+        );
+        let leaf = dict_of(&mut pdf, ObjectRef::new(30, 0));
+        let Some(Object::Array(names)) = leaf.get("Names").cloned() else {
+            panic!("/Names array expected in leaf");
+        };
+        // d2 dropped (page 2 removed); d1 remapped to new page-1 ref.
+        let kept: Vec<&[u8]> = names
+            .iter()
+            .filter_map(|o| match o {
+                Object::String(b) | Object::Name(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec![b"d1".as_slice()]);
+        let pos = names
+            .iter()
+            .position(|o| matches!(o, Object::String(b) | Object::Name(b) if b == b"d1"))
+            .unwrap();
+        let Object::Array(arr) = &names[pos + 1] else {
+            panic!("d1 dest array expected");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
     }
