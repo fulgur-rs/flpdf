@@ -61,8 +61,8 @@ pub struct RotateOp {
 ///
 /// **Non-multiples-of-90 inputs**: ISO 32000-1 §7.7.3.3 Table 30 restricts
 /// `/Rotate` to `{0, 90, 180, 270}`, but malformed PDFs sometimes carry other
-/// values.  Rather than rejecting them, we snap to the nearest valid boundary —
-/// the same policy qpdf uses (normalize rather than error).
+/// values.  Our policy is to snap to the nearest valid boundary rather than
+/// rejecting them, so a malformed `/Rotate` never aborts a page operation.
 ///
 /// Examples:
 /// - `  0` → `  0`
