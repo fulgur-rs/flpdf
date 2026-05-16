@@ -230,19 +230,30 @@ impl<'a> ContentStreamParser<'a> {
                     return Err(Error::parse(self.pos, "inline image missing EI"));
                 }
                 Some(b'E') if self.peek_at(1) == Some(b'I') => {
+                    // Per ISO 32000-1 §7.8.2 the terminating `EI` must be
+                    // preceded by whitespace. Accepting a delimiter here
+                    // would false-match binary image data containing byte
+                    // sequences like `>EI ` and truncate the image.
                     let prev_ok = self.pos == data_start
-                        || self
-                            .input
-                            .get(self.pos - 1)
-                            .is_some_and(|b| is_ws(*b) || is_delimiter(*b));
+                        || self.input.get(self.pos - 1).is_some_and(|b| is_ws(*b));
                     let after = self.peek_at(2);
                     let after_ok = after.is_none_or(|b| is_ws(b) || is_delimiter(b));
                     if prev_ok && after_ok {
                         // Data excludes the whitespace separator that
-                        // precedes `EI` (consistent with the one stripped
-                        // right after `ID`).
+                        // precedes `EI`. This must mirror the post-`ID`
+                        // separator handling: a `\r\n` pair is one
+                        // separator (strip 2 bytes), otherwise a single
+                        // whitespace byte (strip 1). Stripping only one
+                        // byte off a `\r\n` terminator would leave a
+                        // stray `\r` in `data` and change the payload on
+                        // re-serialization.
                         let mut data_end = self.pos;
-                        if data_end > data_start
+                        if data_end >= data_start + 2
+                            && self.input.get(data_end - 2) == Some(&b'\r')
+                            && self.input.get(data_end - 1) == Some(&b'\n')
+                        {
+                            data_end -= 2;
+                        } else if data_end > data_start
                             && self.input.get(data_end - 1).is_some_and(|b| is_ws(*b))
                         {
                             data_end -= 1;
