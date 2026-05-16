@@ -181,6 +181,52 @@ fn inline_image_with_binary_payload_and_crlf() {
 }
 
 #[test]
+fn inline_image_data_with_delimiter_before_ei_not_truncated() {
+    // Image data contains `}EI ` and `/EI ` — a delimiter immediately
+    // before `EI` followed by whitespace. Per ISO 32000-1 §7.8.2 the real
+    // terminating `EI` must be preceded by whitespace, so these embedded
+    // sequences must NOT end the image.
+    let raw: &[u8] = b"\x01}EI \x02/EI \xff";
+    let mut input = Vec::new();
+    input.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 /CS /G ID ");
+    input.extend_from_slice(raw);
+    input.extend_from_slice(b" EI");
+
+    let toks = tokens(&input);
+    assert_eq!(toks.len(), 1, "delimiter+EI inside data must not terminate");
+    match &toks[0] {
+        ContentToken::InlineImage { data, .. } => {
+            assert_eq!(data, raw, "image data must be preserved byte-identical");
+        }
+        other => panic!("expected inline image, got {other:?}"),
+    }
+}
+
+#[test]
+fn inline_image_crlf_before_ei_strips_full_separator() {
+    // `ID` separator is CRLF and the `EI` is also preceded by CRLF. Both
+    // separators must be stripped wholly: a single-byte strip before `EI`
+    // would leave a stray `\r` at the end of `data`, changing the payload.
+    let raw: &[u8] = b"\x00\x10\xff\x7f";
+    let mut input = Vec::new();
+    input.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 /CS /G ID\r\n");
+    input.extend_from_slice(raw);
+    input.extend_from_slice(b"\r\nEI");
+
+    let toks = tokens(&input);
+    assert_eq!(toks.len(), 1);
+    match &toks[0] {
+        ContentToken::InlineImage { data, .. } => {
+            assert_eq!(
+                data, raw,
+                "CRLF before EI must be stripped fully (no trailing \\r)"
+            );
+        }
+        other => panic!("expected inline image, got {other:?}"),
+    }
+}
+
+#[test]
 fn comments_stripped_by_default() {
     let toks = tokens(b"% header comment\n1 0 0 1 0 0 cm % trailing\nBT ET");
     assert_eq!(
