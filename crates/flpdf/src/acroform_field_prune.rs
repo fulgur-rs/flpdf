@@ -39,7 +39,10 @@
 //! **flpdf matches qpdf exactly** on the above points:
 //!   - Field survival is determined at the **top-level `/Fields`** granularity.
 //!   - `/Kids` of a kept field are **not** pruned (matching qpdf).
-//!   - Widget `/P` is updated for widgets found on retained pages.
+//!   - Widget `/P` is updated for widgets on retained pages.
+//!   - Widget `/P` is **removed** for widgets in kept fields' `/Kids` whose
+//!     page was dropped, preventing dangling refs after GC (matching qpdf:
+//!     B2 had no `/P` in the pages-1,2 extract output).
 //!   - Empty `/Fields` → `/AcroForm` removed from catalog.
 //!
 //! # Scope — single document only
@@ -99,25 +102,15 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     result: &RebuildResult,
     max_depth: usize,
 ) -> Result<()> {
-    // ── Step 1: build the "old page ref → first new page ref" map ─────────
-    // Same first-occurrence rule used by outline_dest_remap (qpdf-equivalent:
-    // duplicate-page selections resolve to the first new page).
-    let page_remap: BTreeMap<ObjectRef, ObjectRef> = result
-        .ref_map
-        .iter()
-        .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
-        .collect();
-
-    // ── Step 2: collect widget ObjectRefs found on retained pages ─────────
+    // ── Step 1: collect widget ObjectRefs found on retained pages ─────────
     // Walk each retained page's /Annots array.  For every entry whose
     // resolved /Subtype is /Widget, record the widget ref AND the new page
-    // ref it lives on.
+    // ref it lives on (first-occurrence rule: ref_map[old][0], matching the
+    // /P update rule used by outline_dest_remap for /Dest).
     //
     // Note: widgets added by *duplicate* page selections share their
     // ObjectRef with the original page's widget (rebuild_page_tree clones
     // only the *page dictionary*, not sub-objects like annotation dicts).
-    // We record only the first-occurrence page ref (ref_map[old][0]),
-    // matching the /P update rule used by outline_dest_remap for /Dest.
     let mut widget_to_page: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
     for (&_old_page, new_refs) in &result.ref_map {
         let Some(&new_page) = new_refs.first() else {
@@ -188,12 +181,34 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         }
     }
 
-    // ── Step 5: update /P on widgets found on retained pages ─────────────
-    // For each widget on a retained page, set /P to the (new) page ObjectRef.
-    // This matches the observed qpdf behaviour for both merged field+widget
-    // objects and pure-widget objects in /Kids.
+    // ── Step 5: update /P on retained widgets; strip /P from dropped widgets ─
+    // For each widget on a retained page, set /P to the (new) page ObjectRef,
+    // matching observed qpdf behaviour for both merged field+widget objects
+    // and pure-widget objects in /Kids.
+    //
+    // For dropped-page widgets that remain in a kept field's /Kids (qpdf does
+    // not prune /Kids), we must *remove* /P so the widget does not hold a
+    // dangling reference to the orphaned page dict after prune_after_subset
+    // GCs it (qpdf 11.9.0 observed: B2 had no /P in pages-1,2 output).
     for (&widget_ref, &new_page_ref) in &widget_to_page {
         update_widget_page_ref(pdf, widget_ref, new_page_ref)?;
+    }
+    // Collect all widget refs reachable from kept fields; strip /P from any
+    // that are NOT in widget_to_page (i.e. live in a kept field's /Kids but
+    // were on a dropped page).
+    for field_val in &kept_fields {
+        let field_ref = match field_val {
+            Object::Reference(r) => *r,
+            _ => continue,
+        };
+        strip_dropped_widget_p_refs(
+            pdf,
+            field_ref,
+            &widget_to_page,
+            &mut BTreeSet::new(),
+            0,
+            max_depth,
+        )?;
     }
 
     // ── Step 6: write back pruned /AcroForm or remove it ─────────────────
@@ -226,16 +241,6 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
             }
         }
     }
-
-    // ── Step 7: remap old-page /P refs for widgets on OLD page refs ───────
-    // rebuild_page_tree mutates existing page dicts in place (first occurrence)
-    // so the "old" page refs ARE the "new" page refs for first occurrences.
-    // However we still must handle the case where page_remap gives a different
-    // new ref (duplicate pages). For completeness, scan ALL widget_to_page
-    // entries above already set the correct /P (new_page_ref comes from
-    // new_refs.first()), so no additional pass is needed here.
-    // The page_remap variable is retained for documentation; suppress lint.
-    let _ = page_remap;
 
     Ok(())
 }
@@ -380,6 +385,99 @@ fn update_widget_page_ref<R: Read + Seek>(
         dict.insert("P", Object::Reference(new_page_ref));
         pdf.set_object(widget_ref, Object::Dictionary(dict));
     }
+    Ok(())
+}
+
+/// Walk a kept field's `/Kids` tree and remove `/P` from any widget that is
+/// **not** in `widget_to_page` (i.e. its page was dropped).  This prevents
+/// dangling indirect references after `prune_after_subset` GCs the orphaned
+/// page objects, matching qpdf's observed output (B2 had no `/P` in the
+/// pages-1,2 extraction result).
+///
+/// `visited` / `depth` / `max_depth` guard against cycles and over-deep trees.
+fn strip_dropped_widget_p_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    widget_to_page: &BTreeMap<ObjectRef, ObjectRef>,
+    visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<()> {
+    if depth > max_depth {
+        return Ok(());
+    }
+    if !visited.insert(field_ref) {
+        return Ok(()); // Cycle guard.
+    }
+
+    let field_obj = pdf.resolve(field_ref)?;
+    let Object::Dictionary(field_dict) = field_obj else {
+        return Ok(());
+    };
+
+    let kids_val = match field_dict.get("Kids").cloned() {
+        Some(v) => v,
+        None => {
+            // Leaf node with no /Kids. If it is a widget dict not in
+            // widget_to_page, remove /P (it was on a dropped page).
+            // Merged field+widget dicts also have /Subtype /Widget; they are
+            // already handled by update_widget_page_ref for retained ones.
+            // For dropped ones, field_has_retained_widget returns false so the
+            // field is not in kept_fields at all — we don't reach here for them.
+            return Ok(());
+        }
+    };
+
+    let kids_arr: Vec<Object> = match kids_val {
+        Object::Array(arr) => arr,
+        Object::Reference(r) => match pdf.resolve(r)? {
+            Object::Array(arr) => arr,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+
+    for kid_val in &kids_arr {
+        let kid_ref = match kid_val {
+            Object::Reference(r) => *r,
+            _ => continue,
+        };
+
+        // Resolve the kid to check if it is a widget dict.
+        let kid_obj = pdf.resolve(kid_ref)?;
+        let Object::Dictionary(kid_dict) = kid_obj else {
+            continue;
+        };
+
+        let is_widget = matches!(
+            kid_dict.get("Subtype"),
+            Some(Object::Name(n)) if n.as_slice() == b"Widget"
+        );
+
+        if is_widget {
+            if !widget_to_page.contains_key(&kid_ref) {
+                // Widget on a dropped page — remove stale /P.
+                let kid_obj2 = pdf.resolve(kid_ref)?;
+                if let Object::Dictionary(mut d) = kid_obj2 {
+                    d.remove("P");
+                    pdf.set_object(kid_ref, Object::Dictionary(d));
+                }
+            }
+            // Pure widget kids do not have /Kids of their own (spec: a widget
+            // annotation is a leaf); no need to recurse.
+        } else {
+            // Sub-field: recurse.
+            strip_dropped_widget_p_refs(
+                pdf,
+                kid_ref,
+                widget_to_page,
+                visited,
+                depth + 1,
+                max_depth,
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -620,28 +718,62 @@ mod tests {
     }
 
     /// Widget /P updated to new page ref for retained-page widgets.
+    ///
+    /// The test explicitly verifies the update fires by first stripping /P
+    /// from the widgets, then running prune and asserting it is re-set.
     #[test]
     fn widget_p_updated_to_new_page_ref() {
         let mut pdf = open(build_acroform_pdf());
+
+        // Pre-condition: strip /P from FieldA (7) and B1 (9) to confirm the
+        // update is driven by our code, not just a pre-existing correct value.
+        for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
+            let Object::Dictionary(mut d) = pdf.resolve(r).unwrap() else {
+                panic!("expected dict for {r}");
+            };
+            d.remove("P");
+            pdf.set_object(r, Object::Dictionary(d));
+        }
+
         // Extract pages 1 and 2 (objects 3 and 4).
         let sel = [ObjectRef::new(3, 0), ObjectRef::new(4, 0)];
         let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
 
-        // FieldA (7): /P should point to the (unchanged) page-1 ref 3 0 R.
+        // FieldA (7): /P should be set to page-1 ref 3 0 R.
         let field_a = dict_of(&mut pdf, ObjectRef::new(7, 0));
         assert_eq!(
             field_a.get("P"),
             Some(&Object::Reference(ObjectRef::new(3, 0))),
-            "FieldA /P should be updated to new page-1 ref"
+            "FieldA /P should be set to page-1 ref"
         );
 
-        // B1 (9): /P should point to page-2 ref 4 0 R.
+        // B1 (9): /P should be set to page-2 ref 4 0 R.
         let b1 = dict_of(&mut pdf, ObjectRef::new(9, 0));
         assert_eq!(
             b1.get("P"),
             Some(&Object::Reference(ObjectRef::new(4, 0))),
-            "B1 /P should be updated to new page-2 ref"
+            "B1 /P should be set to page-2 ref"
+        );
+    }
+
+    /// Dropped-page widget in a kept field's /Kids must have /P removed
+    /// (prevents dangling ref after prune_after_subset GCs the orphaned page;
+    /// matches qpdf: B2 had no /P in pages-1,2 extract output).
+    #[test]
+    fn dropped_page_widget_p_removed() {
+        let mut pdf = open(build_acroform_pdf());
+        // Extract pages 1 and 2 — B2 (obj 10, on dropped page 3) stays in
+        // FieldB /Kids but its /P should be stripped.
+        let sel = [ObjectRef::new(3, 0), ObjectRef::new(4, 0)];
+        let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        let b2 = dict_of(&mut pdf, ObjectRef::new(10, 0));
+        assert!(
+            b2.get("P").is_none(),
+            "B2 (dropped page) /P should be removed; got {:?}",
+            b2.get("P")
         );
     }
 
