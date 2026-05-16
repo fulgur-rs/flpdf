@@ -630,7 +630,7 @@ fn collect_siblings<R: Read + Seek>(
             dropped.insert(item_ref);
             // Children of dropped items are also dropped (recursive).
             if let Some(child_first) = first_child {
-                drop_subtree(pdf, child_first, dropped)?;
+                drop_subtree(pdf, child_first, dropped, depth + 1, max_depth)?;
             }
         }
 
@@ -645,20 +645,29 @@ fn drop_subtree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     first_ref: ObjectRef,
     dropped: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<()> {
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Mirror collect_siblings' guard: a hostile/cyclic outline (deep /First
+    // chains, or /First/Next back-edges) must not recurse unbounded.
+    if depth >= max_depth {
+        return Err(Error::Unsupported(format!(
+            "outline_dest_remap: depth limit {max_depth} exceeded at {first_ref}"
+        )));
+    }
     let mut current = Some(first_ref);
     while let Some(item_ref) = current {
-        if !visited.insert(item_ref) {
+        // `dropped` doubles as the cross-recursion visited set: if this item
+        // was already recorded, a /Next or /First back-edge cycle led here.
+        if !dropped.insert(item_ref) {
             break;
         }
-        dropped.insert(item_ref);
         let item_obj = pdf.resolve(item_ref)?;
         let Object::Dictionary(item) = item_obj else {
             break;
         };
         if let Some(child_first) = item.get_ref("First") {
-            drop_subtree(pdf, child_first, dropped)?;
+            drop_subtree(pdf, child_first, dropped, depth + 1, max_depth)?;
         }
         current = item.get_ref("Next");
     }
