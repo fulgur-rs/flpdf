@@ -56,6 +56,7 @@ pub mod outline_dest_remap;
 pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
+pub mod page_object_helper;
 pub mod page_plan;
 pub mod page_range;
 pub mod page_rotate;
@@ -91,6 +92,7 @@ pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_wi
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
+pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_rotate::{
