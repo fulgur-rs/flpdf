@@ -550,10 +550,12 @@ fn test_h_form_own_resources_do_not_pollute_page_used() {
     let Object::Dictionary(res) = res_obj else {
         panic!("not a dict")
     };
-    let xobj_entry = res.get("XObject");
+    let Some(Object::Dictionary(xobj_dict)) = res.get("XObject") else {
+        panic!("test_h: /XObject sub-dict must remain: {res:?}");
+    };
     assert!(
-        xobj_entry.is_some(),
-        "test_h: /XObject sub-dict must remain: {res:?}"
+        xobj_dict.get("Fm0").is_some(),
+        "test_h: /XObject/Fm0 must remain: {xobj_dict:?}"
     );
 }
 
@@ -605,6 +607,20 @@ fn test_i_form_no_resources_inherits_page_scope() {
     assert!(
         font_keys.contains(&"F1".to_string()),
         "test_i: page /Font/F1 must be kept (Form inherits page scope and uses F1): {font_keys:?}"
+    );
+
+    let Object::Dictionary(res_dict) = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources")
+    else {
+        panic!("test_i: resources is not a dict");
+    };
+    let Some(Object::Dictionary(xobj_dict)) = res_dict.get("XObject") else {
+        panic!("test_i: /XObject sub-dict must remain: {res_dict:?}");
+    };
+    assert!(
+        xobj_dict.get("Fm0").is_some(),
+        "test_i: /XObject/Fm0 must remain: {xobj_dict:?}"
     );
 }
 
