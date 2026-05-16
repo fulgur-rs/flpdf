@@ -25,6 +25,10 @@ use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+/// Resource names referenced by a content scope, keyed by category
+/// (`Font`, `XObject`, …) → set of referenced names.
+type UsedNames = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
+
 // ── Resource location ─────────────────────────────────────────────────────────
 
 /// Where a page's `/Resources` dictionary physically lives.
@@ -152,13 +156,11 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     // For Yes mode we need the union grouped by resources-ref.
 
     // Map from indirect resources ObjectRef → union of used names per category.
-    let mut ref_used: BTreeMap<ObjectRef, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>> = BTreeMap::new();
+    let mut ref_used: BTreeMap<ObjectRef, UsedNames> = BTreeMap::new();
     // Map from ancestor /Pages ObjectRef → union of used names (AncestorInline case).
-    let mut ancestor_inline_used: BTreeMap<ObjectRef, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>> =
-        BTreeMap::new();
+    let mut ancestor_inline_used: BTreeMap<ObjectRef, UsedNames> = BTreeMap::new();
     // For pages with PageInline /Resources, store per-page used names keyed by index.
-    let mut inline_used: Vec<Option<BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>>> =
-        vec![None; page_refs.len()];
+    let mut inline_used: Vec<Option<UsedNames>> = vec![None; page_refs.len()];
 
     for (i, &page_ref) in page_refs.iter().enumerate() {
         // Determine if this page's resources are shared (for Auto mode skip).
@@ -288,13 +290,13 @@ fn resources_location<R: Read + Seek>(
 fn collect_used_names_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> Result<BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>> {
+) -> Result<UsedNames> {
     let content_bytes = crate::pages::page_content_bytes(pdf, page_ref)?;
 
     // Resolve the page's own /Resources for Form recursion scoping.
     let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
 
-    let mut used: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
+    let mut used: UsedNames = BTreeMap::new();
     let mut visited_xobjects: BTreeSet<ObjectRef> = BTreeSet::new();
 
     collect_from_stream(
@@ -316,7 +318,7 @@ fn collect_from_stream<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     stream_bytes: &[u8],
     resources: Option<&Dictionary>,
-    used: &mut BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let parser = ContentStreamParser::new(stream_bytes);
@@ -334,9 +336,7 @@ fn collect_from_stream<R: Read + Seek>(
                 let cs_val = dict.get("CS").or_else(|| dict.get("ColorSpace")).cloned();
                 if let Some(Object::Name(name)) = cs_val {
                     if !is_builtin_color_space(&name) {
-                        used.entry(b"ColorSpace".to_vec())
-                            .or_default()
-                            .insert(name);
+                        used.entry(b"ColorSpace".to_vec()).or_default().insert(name);
                     }
                 }
             }
@@ -353,7 +353,7 @@ fn process_operator<R: Read + Seek>(
     operator: &[u8],
     operands: &[Object],
     resources: Option<&Dictionary>,
-    used: &mut BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     match operator {
@@ -448,15 +448,15 @@ fn recurse_form_xobject<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_name: &[u8],
     page_resources: Option<&Dictionary>,
-    used: &mut BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     // Locate the XObject sub-dictionary in the current /Resources scope.
     let xobj_ref = match page_resources {
         Some(res) => match res.get("XObject") {
-            Some(Object::Dictionary(xobj_dict)) => xobj_dict.get_ref(
-                std::str::from_utf8(xobject_name).unwrap_or(""),
-            ),
+            Some(Object::Dictionary(xobj_dict)) => {
+                xobj_dict.get_ref(std::str::from_utf8(xobject_name).unwrap_or(""))
+            }
             _ => None,
         },
         None => None,
@@ -498,19 +498,18 @@ fn recurse_form_xobject<R: Read + Seek>(
 
     if form_has_own_resources {
         // Resolve the Form's own /Resources dict (may be direct or indirect).
-        let form_resources: Option<Dictionary> =
-            match stream.dict.get("Resources").cloned() {
-                Some(Object::Dictionary(d)) => Some(d),
-                Some(Object::Reference(r)) => match pdf.resolve(r)? {
-                    Object::Dictionary(d) => Some(d),
-                    _ => None, // broken ref → treat as empty own scope
-                },
-                _ => None,
-            };
+        let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
+            Some(Object::Dictionary(d)) => Some(d),
+            Some(Object::Reference(r)) => match pdf.resolve(r)? {
+                Object::Dictionary(d) => Some(d),
+                _ => None, // broken ref → treat as empty own scope
+            },
+            _ => None,
+        };
 
         // Use a throwaway accumulator so that resource names referenced inside
         // the Form do NOT pollute the calling page's used set.
-        let mut form_used: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        let mut form_used: UsedNames = BTreeMap::new();
         collect_from_stream(
             pdf,
             &form_bytes,
@@ -534,7 +533,7 @@ fn recurse_form_xobject<R: Read + Seek>(
 fn prune_resources_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     res_ref: ObjectRef,
-    used: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &UsedNames,
 ) -> Result<()> {
     let obj = pdf.resolve(res_ref)?;
     let Object::Dictionary(mut res_dict) = obj else {
@@ -551,7 +550,7 @@ fn prune_resources_object<R: Read + Seek>(
 fn prune_inline_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-    used: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &UsedNames,
 ) -> Result<()> {
     let page_obj = pdf.resolve(page_ref)?;
     let Object::Dictionary(mut page_dict) = page_obj else {
@@ -581,7 +580,7 @@ fn prune_inline_resources<R: Read + Seek>(
 fn prune_ancestor_inline_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     ancestor_ref: ObjectRef,
-    used: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &UsedNames,
 ) -> Result<()> {
     let ancestor_obj = pdf.resolve(ancestor_ref)?;
     let Object::Dictionary(mut ancestor_dict) = ancestor_obj else {
@@ -610,7 +609,7 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
 fn apply_pruning<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     res_dict: &mut Dictionary,
-    used: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    used: &UsedNames,
 ) -> Result<()> {
     for &category in RESOURCE_CATEGORIES {
         let cat_key = category.as_bytes();

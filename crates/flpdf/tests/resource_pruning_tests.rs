@@ -55,17 +55,12 @@ fn build_pdf(page_dicts: &[&str], extra: &[(u32, Vec<u8>)]) -> Vec<u8> {
         .collect();
     let kids = pages_ref_list.join(" ");
     let count = page_dicts.len();
-    pdf.extend_from_slice(
-        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n").as_bytes(),
-    );
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
     let off2 = pdf.len() as u64;
     offsets.push((2, off2));
     pdf.extend_from_slice(
-        format!(
-            "2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {count} >>\nendobj\n"
-        )
-        .as_bytes(),
+        format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {count} >>\nendobj\n").as_bytes(),
     );
 
     for (i, page_body) in page_dicts.iter().enumerate() {
@@ -98,9 +93,8 @@ fn build_pdf(page_dicts: &[&str], extra: &[(u32, Vec<u8>)]) -> Vec<u8> {
         }
     }
     pdf.extend_from_slice(xref.as_bytes());
-    let trailer = format!(
-        "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-    );
+    let trailer =
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     pdf.extend_from_slice(trailer.as_bytes());
     pdf
 }
@@ -133,7 +127,10 @@ fn test_a_unused_font_pruned_used_font_kept() {
         // resources dict as indirect object
         (
             5,
-            obj_bytes(5, "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>"),
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
         ),
     ];
     // page: /Contents 4 0 R /Resources 5 0 R
@@ -144,21 +141,24 @@ fn test_a_unused_font_pruned_used_font_kept() {
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
     let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
-    assert!(keys.contains(&"F1".to_string()), "F1 must be kept: {keys:?}");
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "F1 must be kept: {keys:?}"
+    );
     assert!(
         !keys.contains(&"F2".to_string()),
         "F2 must be pruned: {keys:?}"
     );
 
     // Verify re-parsing the content stream still works (rendering-safe check).
-    let content = flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
-        .expect("content bytes");
+    let content =
+        flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).expect("content bytes");
     let tokens: Vec<_> = ContentStreamParser::new(&content)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse");
-    let has_tf = tokens.iter().any(|t| {
-        matches!(t, ContentToken::Op { operator, .. } if operator == b"Tf")
-    });
+    let has_tf = tokens
+        .iter()
+        .any(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"Tf"));
     assert!(has_tf, "Tf operator must survive");
 }
 
@@ -195,8 +195,7 @@ fn test_b_form_xobject_recurse_font_kept() {
             obj_bytes(
                 5,
                 "<< /XObject << /Fm0 6 0 R >> /Font << /F1 << /Type /Font >> >> >>",
-            )
-            .into(),
+            ),
         ),
     ];
 
@@ -234,8 +233,7 @@ fn test_c_auto_shared_resources_not_pruned() {
             obj_bytes(
                 5,
                 "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
-            )
-            .into(),
+            ),
         ),
         // content streams (7 and 8 avoid collision with page objects 3 and 4)
         (7u32, stream_obj(7, content1)),
@@ -282,8 +280,7 @@ fn test_d_yes_shared_resources_pruned_to_union() {
             obj_bytes(
                 5,
                 "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> /F3 << /Type /Font >> >> >>",
-            )
-            .into(),
+            ),
         ),
         (7u32, stream_obj(7, content1)),
         (8, stream_obj(8, content2)),
@@ -321,7 +318,10 @@ fn test_e_no_mode_no_changes() {
         (4u32, stream_obj(4, content_body)),
         (
             5,
-            obj_bytes(5, "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>"),
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
         ),
     ];
     let page_body = "/Contents 4 0 R /Resources 5 0 R";
@@ -412,9 +412,8 @@ fn build_pdf_raw(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
         }
     }
     pdf.extend_from_slice(xref.as_bytes());
-    let trailer = format!(
-        "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-    );
+    let trailer =
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     pdf.extend_from_slice(trailer.as_bytes());
     pdf
 }
@@ -460,7 +459,9 @@ fn test_f_indirect_category_subdict_pruned() {
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
     // Verify the indirect Font sub-dict (6 0 R) was updated in-place.
-    let font_obj = pdf.resolve(ObjectRef::new(6, 0)).expect("resolve font dict");
+    let font_obj = pdf
+        .resolve(ObjectRef::new(6, 0))
+        .expect("resolve font dict");
     let Object::Dictionary(font_dict) = font_obj else {
         panic!("6 0 R is not a dictionary");
     };
@@ -543,8 +544,12 @@ fn test_h_form_own_resources_do_not_pollute_page_used() {
     );
 
     // /XObject/Fm0 must still exist (the page Do-invokes it).
-    let res_obj = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve resources");
-    let Object::Dictionary(res) = res_obj else { panic!("not a dict") };
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
+    let Object::Dictionary(res) = res_obj else {
+        panic!("not a dict")
+    };
     let xobj_entry = res.get("XObject");
     assert!(
         xobj_entry.is_some(),
@@ -725,9 +730,18 @@ fn test_h_ancestor_inline_resources_two_pages_auto_not_pruned() {
         .iter()
         .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
         .collect();
-    assert!(keys.contains(&"F1".to_string()), "Auto: F1 must remain: {keys:?}");
-    assert!(keys.contains(&"F2".to_string()), "Auto: F2 must remain: {keys:?}");
-    assert!(keys.contains(&"F3".to_string()), "Auto: F3 must remain (shared ancestor): {keys:?}");
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "Auto: F1 must remain: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "Auto: F2 must remain: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F3".to_string()),
+        "Auto: F3 must remain (shared ancestor): {keys:?}"
+    );
 }
 
 #[test]
@@ -780,8 +794,14 @@ fn test_h2_ancestor_inline_resources_two_pages_yes_union_prunes() {
         .iter()
         .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
         .collect();
-    assert!(keys.contains(&"F1".to_string()), "Yes: F1 must remain (p1 uses it): {keys:?}");
-    assert!(keys.contains(&"F2".to_string()), "Yes: F2 must remain (p2 uses it): {keys:?}");
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "Yes: F1 must remain (p1 uses it): {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "Yes: F2 must remain (p2 uses it): {keys:?}"
+    );
     assert!(
         !keys.contains(&"F3".to_string()),
         "Yes: F3 must be pruned (neither page uses it): {keys:?}"
@@ -806,17 +826,16 @@ fn test_other_categories_pruned() {
         /Shading << /Sh1 << /ShadingType 2 >> /Sh2 << /ShadingType 2 >> >> \
         /Properties << /Prop1 << >> /Prop2 << >> >> \
     >>";
-    let extra = vec![
-        (4u32, stream_obj(4, content)),
-        (5, obj_bytes(5, res_body)),
-    ];
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, res_body))];
     let page_body = "/Contents 4 0 R /Resources 5 0 R";
     let pdf_bytes = build_pdf(&[page_body], &extra);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
-    let res_obj = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve resources");
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
     let Object::Dictionary(res) = res_obj else {
         panic!("resources not a dict");
     };
@@ -832,20 +851,44 @@ fn test_other_categories_pruned() {
     }
 
     let gs_keys = sub_keys(&res, "ExtGState");
-    assert!(gs_keys.contains(&"GS1".to_string()), "GS1 kept: {gs_keys:?}");
-    assert!(!gs_keys.contains(&"GS2".to_string()), "GS2 pruned: {gs_keys:?}");
+    assert!(
+        gs_keys.contains(&"GS1".to_string()),
+        "GS1 kept: {gs_keys:?}"
+    );
+    assert!(
+        !gs_keys.contains(&"GS2".to_string()),
+        "GS2 pruned: {gs_keys:?}"
+    );
 
     let cs_keys = sub_keys(&res, "ColorSpace");
-    assert!(cs_keys.contains(&"CS1".to_string()), "CS1 kept: {cs_keys:?}");
-    assert!(!cs_keys.contains(&"CS2".to_string()), "CS2 pruned: {cs_keys:?}");
+    assert!(
+        cs_keys.contains(&"CS1".to_string()),
+        "CS1 kept: {cs_keys:?}"
+    );
+    assert!(
+        !cs_keys.contains(&"CS2".to_string()),
+        "CS2 pruned: {cs_keys:?}"
+    );
 
     let pat_keys = sub_keys(&res, "Pattern");
-    assert!(pat_keys.contains(&"Pat1".to_string()), "Pat1 kept: {pat_keys:?}");
-    assert!(!pat_keys.contains(&"Pat2".to_string()), "Pat2 pruned: {pat_keys:?}");
+    assert!(
+        pat_keys.contains(&"Pat1".to_string()),
+        "Pat1 kept: {pat_keys:?}"
+    );
+    assert!(
+        !pat_keys.contains(&"Pat2".to_string()),
+        "Pat2 pruned: {pat_keys:?}"
+    );
 
     let sh_keys = sub_keys(&res, "Shading");
-    assert!(sh_keys.contains(&"Sh1".to_string()), "Sh1 kept: {sh_keys:?}");
-    assert!(!sh_keys.contains(&"Sh2".to_string()), "Sh2 pruned: {sh_keys:?}");
+    assert!(
+        sh_keys.contains(&"Sh1".to_string()),
+        "Sh1 kept: {sh_keys:?}"
+    );
+    assert!(
+        !sh_keys.contains(&"Sh2".to_string()),
+        "Sh2 pruned: {sh_keys:?}"
+    );
 
     let prop_keys = sub_keys(&res, "Properties");
     assert!(
