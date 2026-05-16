@@ -205,6 +205,168 @@ fn collect_content_streams<R: Read + Seek>(
     }
 }
 
+/// Coalesce a page's `/Contents` array into a single stream.
+///
+/// When a PDF page's `/Contents` entry is an array of two or more stream
+/// references, this function:
+///
+/// 1. Decodes each stream through its filter pipeline.
+/// 2. Joins the decoded bytes with a single `b'\n'` separator between segments
+///    (matching qpdf's `--coalesce-contents` semantics — ISO 32000-1 §7.8.2
+///    allows any whitespace between concatenated content streams, and newline
+///    is qpdf's choice).
+/// 3. Stores the result as a new indirect `Stream` object (no filter applied —
+///    re-encoding is the responsibility of the write path / flpdf-9hc.12.5).
+/// 4. Updates the page dictionary's `/Contents` entry to reference the new
+///    single stream object.
+///
+/// **No `q`/`Q` framing is inserted.** ISO 32000-1 §7.8.2 specifies that
+/// adjacent content streams are concatenated as if they formed a single stream;
+/// the standard does not require wrapping. The acceptance criterion
+/// "nested q/Q balance preserved" means that the `\n` separator guarantees
+/// tokens from adjacent segments are never lexically merged (e.g. a trailing
+/// number `12` and a leading digit `0` would form `120` without the newline).
+///
+/// # No-op cases
+///
+/// - `/Contents` absent → returns `Ok(())` (empty page, unchanged).
+/// - `/Contents` is a single reference or a direct `Stream` → returns `Ok(())`
+///   (already a single stream, no mutation needed).
+/// - `/Contents` is an array with exactly **one** element → treated as a
+///   single stream (no mutation needed).
+///
+/// Only when `/Contents` is an array with **two or more** elements does the
+/// function perform a write.
+///
+/// # Errors
+///
+/// Propagates any error from [`Pdf::resolve`] or
+/// [`crate::filters::decode_stream_data`], or returns [`Error::Unsupported`]
+/// when the page object or its `/Contents` elements have unexpected types.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{pages, Pdf};
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// let page_refs = pages::page_refs(&mut pdf)?;
+/// for page_ref in page_refs {
+///     pages::coalesce_page_contents(&mut pdf, page_ref)?;
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn coalesce_page_contents<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<()> {
+    // ── 1. Resolve the page dictionary ────────────────────────────────────────
+    let page_obj = pdf.resolve(page_ref)?;
+    let Object::Dictionary(page_dict) = page_obj else {
+        return Err(Error::Unsupported(format!(
+            "object {page_ref} is not a dictionary, cannot coalesce /Contents"
+        )));
+    };
+
+    // Verify /Type is /Page (same check as page_content_bytes).
+    match page_dict.get("Type") {
+        Some(Object::Name(name)) if name.as_slice() == b"Page" => {}
+        Some(Object::Name(name)) => {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} has /Type /{}, expected /Page",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        Some(_) => {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} has a non-name /Type entry"
+            )));
+        }
+        None => {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} has no /Type entry"
+            )));
+        }
+    }
+
+    // ── 2. Extract /Contents; skip if absent or already a single stream ───────
+    let contents = match page_dict.get("Contents").cloned() {
+        None => return Ok(()), // empty page
+        Some(c) => c,
+    };
+
+    // Collect references: only an Array with ≥2 elements triggers coalesce.
+    let refs: Vec<Object> = match &contents {
+        Object::Array(elems) if elems.len() >= 2 => elems.clone(),
+        // Single-element array, direct Stream, or Reference: no-op.
+        _ => return Ok(()),
+    };
+
+    // ── 3. Decode each stream and concatenate with '\n' separators ─────────────
+    let mut coalesced: Vec<u8> = Vec::new();
+    for (i, elem) in refs.iter().enumerate() {
+        let stream: Stream = match elem {
+            Object::Reference(r) => {
+                let resolved = pdf.resolve(*r)?;
+                match resolved {
+                    Object::Stream(s) => s,
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "/Contents array element {r} on page {page_ref} does not resolve to a stream"
+                        )));
+                    }
+                }
+            }
+            Object::Stream(s) => s.clone(),
+            other => {
+                let type_name = object_type_name(other);
+                return Err(Error::Unsupported(format!(
+                    "/Contents array element of type {type_name} on page {page_ref} is not a stream or reference"
+                )));
+            }
+        };
+
+        let decoded = decode_stream_data(&stream.dict, &stream.data)?;
+        if i > 0 {
+            coalesced.push(b'\n');
+        }
+        coalesced.extend_from_slice(&decoded);
+    }
+
+    // ── 4. Allocate a fresh object number for the coalesced stream ─────────────
+    let new_num: u32 = pdf
+        .object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "coalesce_page_contents: object number overflow allocating new stream".to_string(),
+            )
+        })?;
+    let new_stream_ref = ObjectRef::new(new_num, 0);
+
+    // ── 5. Build the new Stream (no filter: raw decoded bytes; writer handles re-encode) ─
+    let new_stream = Stream::new(Dictionary::new(), coalesced);
+    pdf.set_object(new_stream_ref, Object::Stream(new_stream));
+
+    // ── 6. Re-resolve the page dictionary (it may have been evicted) and patch /Contents ─
+    let page_obj2 = pdf.resolve(page_ref)?;
+    let Object::Dictionary(mut new_page_dict) = page_obj2 else {
+        return Err(Error::Unsupported(format!(
+            "object {page_ref} unexpectedly not a dictionary after coalesce"
+        )));
+    };
+    new_page_dict.insert("Contents", Object::Reference(new_stream_ref));
+    pdf.set_object(page_ref, Object::Dictionary(new_page_dict));
+
+    Ok(())
+}
+
 fn object_type_name(obj: &Object) -> &'static str {
     match obj {
         Object::Null => "null",
