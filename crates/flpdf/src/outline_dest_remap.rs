@@ -145,8 +145,20 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     let Object::Dictionary(catalog2) = catalog_obj2 else {
         return Ok(());
     };
-    if let Some(dests_obj_ref) = catalog2.get_ref("Dests") {
-        prune_legacy_dests(pdf, dests_obj_ref, &surviving, &mut surviving_names)?;
+    match catalog2.get("Dests").cloned() {
+        Some(Object::Reference(dests_obj_ref)) => {
+            prune_legacy_dests(pdf, dests_obj_ref, &surviving, &mut surviving_names)?;
+        }
+        Some(Object::Dictionary(dests)) => {
+            // Legacy /Dests held as a direct dictionary on the catalog.
+            let new_dests = prune_dests_dict(pdf, dests, &surviving, &mut surviving_names)?;
+            let catalog_obj3 = pdf.resolve(catalog_ref)?;
+            if let Object::Dictionary(mut cat) = catalog_obj3 {
+                cat.insert("Dests", Object::Dictionary(new_dests));
+                pdf.set_object(catalog_ref, Object::Dictionary(cat));
+            }
+        }
+        _ => {}
     }
 
     // --- Step 3: Remap / drop the outline tree ----------------------------
@@ -375,7 +387,7 @@ fn prune_name_pairs<R: Read + Seek>(
     Ok(result)
 }
 
-/// Prune a legacy (PDF 1.1) `/Dests` dictionary in place.
+/// Prune a legacy (PDF 1.1) `/Dests` dictionary held as an indirect object.
 fn prune_legacy_dests<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dests_ref: ObjectRef,
@@ -386,7 +398,20 @@ fn prune_legacy_dests<R: Read + Seek>(
     let Object::Dictionary(dests) = dests_obj else {
         return Ok(());
     };
+    let new_dests = prune_dests_dict(pdf, dests, surviving, surviving_names)?;
+    pdf.set_object(dests_ref, Object::Dictionary(new_dests));
+    Ok(())
+}
 
+/// Prune/remap every entry of a legacy `/Dests` dictionary, returning the new
+/// dictionary. Used for both the indirect-object and the direct-in-catalog
+/// forms (a legacy `/Dests` may be a direct dictionary on the catalog).
+fn prune_dests_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dests: crate::Dictionary,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving_names: &mut BTreeSet<Vec<u8>>,
+) -> Result<crate::Dictionary> {
     let mut new_dests = dests.clone();
     let keys: Vec<Vec<u8>> = dests.iter().map(|(k, _)| k.to_vec()).collect();
     for key in keys {
@@ -429,9 +454,7 @@ fn prune_legacy_dests<R: Read + Seek>(
             }
         }
     }
-
-    pdf.set_object(dests_ref, Object::Dictionary(new_dests));
-    Ok(())
+    Ok(new_dests)
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,5 +1820,43 @@ mod tests {
             Some(ObjectRef::new(20, 0)),
             "string-dest item to a conserved named dest must be kept"
         );
+    }
+
+    #[test]
+    fn legacy_dests_direct_dictionary_on_catalog_is_pruned() {
+        // Legacy /Dests is a *direct* dictionary on the catalog (not an
+        // indirect ref). get_ref() only matched references, so this form was
+        // skipped entirely — leaving a stale ref to a removed page.
+        let bytes = build_min_pdf(
+            &[
+                (
+                    1,
+                    "<< /Type /Catalog /Pages 2 0 R \
+                     /Dests << /d1 [3 0 R /Fit] /d2 [4 0 R /Fit] >> >>",
+                ),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        let Some(Object::Dictionary(dests)) = cat.get("Dests") else {
+            panic!("/Dests direct dict expected on catalog");
+        };
+        // d2 (page 2 removed) dropped; d1 (page 1 kept) remapped.
+        assert!(
+            dests.get("d2").is_none(),
+            "d2 -> removed page must be dropped"
+        );
+        let Some(Object::Array(arr)) = dests.get("d1") else {
+            panic!("d1 should survive as an array dest");
+        };
+        assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
     }
 }
