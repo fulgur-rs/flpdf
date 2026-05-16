@@ -46,6 +46,41 @@ pub enum CompressStreams {
     No,
 }
 
+/// Controls whether a newline is explicitly inserted immediately before the
+/// `endstream` keyword.
+///
+/// ISO 32000-1 §7.3.8.1 requires an end-of-line marker before `endstream`.
+/// qpdf exposes this as `--newline-before-endstream=y/n`.  The default is
+/// [`NewlineBeforeEndstream::Yes`], matching qpdf's default behaviour.
+///
+/// # Byte-level semantics
+///
+/// When `Yes`: exactly one `b'\n'` is written immediately before `endstream`,
+/// regardless of whether the stream payload already ends with a newline.  The
+/// `/Length` dictionary entry is **not** modified — it continues to reflect the
+/// raw payload length only, not the extra newline byte (matching qpdf parity).
+///
+/// When `No`: no newline is written before `endstream` unless the payload does
+/// not already end with a newline character (`\n` or `\r`), in which case a
+/// single `b'\n'` is appended to maintain ISO 32000-1 parseability.  The
+/// `/Length` value is likewise unmodified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NewlineBeforeEndstream {
+    /// Explicitly write exactly one `b'\n'` before `endstream` (default).
+    ///
+    /// This guarantees the invariant required by ISO 32000-1 §7.3.8.1 and
+    /// matches qpdf's `--newline-before-endstream=y` behaviour.
+    #[default]
+    Yes,
+    /// Do not add an extra newline before `endstream`.
+    ///
+    /// If the stream payload already ends with `\n` or `\r`, `endstream` is
+    /// written immediately after the payload (adjacency).  If the payload does
+    /// not end with a newline, a single `b'\n'` is inserted to preserve
+    /// parseability — matching qpdf's `--newline-before-endstream=n` behaviour.
+    No,
+}
+
 /// Options controlling [`write_pdf_with_options`].
 ///
 /// Constructed via `Default::default()` or struct literal. The struct is
@@ -109,6 +144,21 @@ pub struct WriteOptions {
     /// xref stream alike. The incremental-update path and `write_qdf`
     /// are unaffected.
     pub compress_streams: CompressStreams,
+
+    /// Whether to insert a newline immediately before each `endstream` keyword.
+    ///
+    /// ISO 32000-1 §7.3.8.1 requires an end-of-line marker before `endstream`.
+    /// [`NewlineBeforeEndstream::Yes`] (the default) always writes exactly one
+    /// `b'\n'` before `endstream`, matching qpdf's `--newline-before-endstream=y`
+    /// behaviour.  [`NewlineBeforeEndstream::No`] omits the extra newline when
+    /// the stream payload already ends with a newline character.
+    ///
+    /// The `/Length` value in the stream dictionary is **not** affected by this
+    /// setting — it always reflects the raw payload byte count only.
+    ///
+    /// Applied to every stream in the full-rewrite output.  The incremental-update
+    /// path emits streams verbatim from the input and is unaffected.
+    pub newline_before_endstream: NewlineBeforeEndstream,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
@@ -1213,7 +1263,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
         if let Object::Stream(stream) = object {
             let reencoded = apply_stream_compress_policy(&stream, options.compress_streams);
-            reencoded.write_pdf(&mut bytes);
+            if let Object::Stream(ref s) = reencoded {
+                write_stream_to_buf(&mut bytes, s, options.newline_before_endstream);
+            } else {
+                reencoded.write_pdf(&mut bytes);
+            }
         } else {
             object.write_pdf(&mut bytes);
         }
@@ -1230,7 +1284,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
-        Object::Stream(stream).write_pdf(&mut bytes);
+        write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
         bytes.extend_from_slice(b"\nendobj\n");
         offsets.insert(container_ref.number, (0, emit_offset));
     }
@@ -1423,9 +1477,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 apply_static_id(&mut xref_dict);
             }
 
-            let xref_stream = Object::Stream(crate::Stream::new(xref_dict, stream_data));
+            let xref_stream = crate::Stream::new(xref_dict, stream_data);
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
-            xref_stream.write_pdf(&mut bytes);
+            write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
             bytes.extend_from_slice(b"\nendobj\n");
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
         }
@@ -1533,6 +1587,59 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
             Object::Stream(crate::Stream::new(new_dict, decoded))
         }
     }
+}
+
+/// Write a PDF stream to `buf`, applying the [`NewlineBeforeEndstream`] policy.
+///
+/// This is the **single choke-point** through which all stream emission in the
+/// full-rewrite writer paths flows.  It mirrors the layout that
+/// [`Object::Stream::write_pdf`] produces, but gives the caller control over
+/// the newline before `endstream`.
+///
+/// # Layout
+///
+/// ```text
+/// <stream-dict>\nstream\n<payload><EOL>endstream
+/// ```
+///
+/// where `<EOL>` is:
+/// - `NewlineBeforeEndstream::Yes`: always `b'\n'` (one byte, unconditionally).
+/// - `NewlineBeforeEndstream::No`: empty when payload ends with `\n` or `\r`;
+///   otherwise `b'\n'` (one byte, for ISO 32000-1 parseability).
+///
+/// # /Length invariant
+///
+/// The helper **does not** modify the stream dictionary.  Callers are
+/// responsible for setting `/Length` to `stream.data.len()` before calling
+/// (i.e., the raw payload byte count, not including the EOL byte).
+pub fn write_stream_to_buf(
+    buf: &mut Vec<u8>,
+    stream: &crate::Stream,
+    policy: NewlineBeforeEndstream,
+) {
+    stream.dict.write_pdf(buf);
+    buf.extend_from_slice(b"\nstream\n");
+    buf.extend_from_slice(&stream.data);
+
+    match policy {
+        NewlineBeforeEndstream::Yes => {
+            // Always write exactly one newline before endstream.
+            buf.push(b'\n');
+        }
+        NewlineBeforeEndstream::No => {
+            // Only write a newline when the payload does not already end with one.
+            let ends_with_eol = stream
+                .data
+                .last()
+                .map(|&b| b == b'\n' || b == b'\r')
+                .unwrap_or(false);
+            if !ends_with_eol {
+                buf.push(b'\n');
+            }
+        }
+    }
+
+    buf.extend_from_slice(b"endstream");
 }
 
 #[cfg(test)]
