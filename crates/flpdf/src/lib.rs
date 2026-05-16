@@ -52,6 +52,7 @@ pub mod linearization;
 pub mod object;
 pub mod outline;
 pub mod page_range;
+pub mod page_rotate;
 pub mod pages;
 pub mod parser;
 pub mod reader;
@@ -73,6 +74,10 @@ pub use error::{EncryptedError, Error, Result};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
+pub use page_rotate::{
+    apply_rotate_to_pages, compose_rotate, normalize_rotate, resolve_inherited_rotate,
+    resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
+};
 pub use parser::parse_object;
 pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};
 pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
