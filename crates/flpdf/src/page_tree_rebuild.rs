@@ -249,9 +249,19 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             )));
         };
 
-        // Ensure /Type /Page (qpdf-equivalent: leaves are always /Page).
-        if leaf.get("Type").is_none() {
-            leaf.insert("Type", Object::Name(b"Page".to_vec()));
+        // Only leaf /Page dictionaries are valid inputs here. A /Pages tree
+        // node (or any non-/Page dict) would produce a broken page tree
+        // (e.g. a self-referential /Kids), so reject it explicitly.
+        match leaf.get("Type") {
+            Some(Object::Name(name)) if name == b"Page" => {}
+            None => {
+                leaf.insert("Type", Object::Name(b"Page".to_vec()));
+            }
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "selected object {src} is not a /Page dictionary"
+                )));
+            }
         }
 
         // Materialize each inherited attribute ONLY when the leaf lacks its
@@ -418,6 +428,18 @@ mod tests {
         let mut pdf = open(build_nested_pdf());
         let err = rebuild_page_tree(&mut pdf, &[]).unwrap_err();
         assert!(matches!(err, Error::Missing(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn selecting_a_pages_node_is_rejected() {
+        // 2 0 R is the root /Pages node, not a leaf /Page. Passing it must
+        // error rather than build a self-referential page tree.
+        let mut pdf = open(build_nested_pdf());
+        let err = rebuild_page_tree(&mut pdf, &[ObjectRef::new(2, 0)]).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported for /Pages node, got {err:?}"
+        );
     }
 
     #[test]
