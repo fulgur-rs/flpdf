@@ -45,6 +45,7 @@ pub mod check;
 pub mod content_stream;
 pub mod diagnostics;
 pub mod error;
+pub mod filespec_helper;
 pub mod filters;
 pub mod fonts;
 pub mod json;
@@ -86,6 +87,7 @@ pub use content_stream::{
 };
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use error::{EncryptedError, Error, Result};
+pub use filespec_helper::{EmbeddedFileStream, FileSpec};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
