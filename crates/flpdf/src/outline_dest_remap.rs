@@ -127,11 +127,25 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     if let Some(names_loc) = names_loc {
         let dests_empty = match names_dict.get("Dests").cloned() {
             Some(Object::Reference(dr)) => {
-                prune_name_tree(pdf, dr, &surviving, &mut surviving_names)?
+                let mut nt_visited: BTreeSet<ObjectRef> = BTreeSet::new();
+                prune_name_tree(
+                    pdf,
+                    dr,
+                    &surviving,
+                    &mut surviving_names,
+                    0,
+                    max_depth,
+                    &mut nt_visited,
+                )?
             }
             Some(Object::Dictionary(node)) => {
-                let (new_node, empty) =
-                    prune_name_tree_node_dict(pdf, node, &surviving, &mut surviving_names)?;
+                let (new_node, empty) = prune_name_tree_node_dict(
+                    pdf,
+                    node,
+                    &surviving,
+                    &mut surviving_names,
+                    max_depth,
+                )?;
                 if !empty {
                     names_dict.insert("Dests", Object::Dictionary(new_node));
                 }
@@ -258,7 +272,21 @@ fn prune_name_tree<R: Read + Seek>(
     node_ref: ObjectRef,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &mut BTreeSet<Vec<u8>>,
+    depth: usize,
+    max_depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<bool> {
+    // A hostile/broken name tree whose /Kids reference an ancestor or
+    // themselves must not recurse unbounded (stack overflow).
+    if depth >= max_depth {
+        return Err(Error::Unsupported(format!(
+            "outline_dest_remap: name-tree depth limit {max_depth} exceeded at {node_ref}"
+        )));
+    }
+    if !visited.insert(node_ref) {
+        // Cycle: this node was already processed — treat as empty.
+        return Ok(true);
+    }
     let node_obj = pdf.resolve(node_ref)?;
     let Object::Dictionary(node) = node_obj else {
         return Ok(true); // Malformed node — treat as empty.
@@ -309,7 +337,15 @@ fn prune_name_tree<R: Read + Seek>(
 
             let mut surviving_kids: Vec<ObjectRef> = Vec::new();
             for child_ref in child_refs {
-                let empty = prune_name_tree(pdf, child_ref, surviving, surviving_names)?;
+                let empty = prune_name_tree(
+                    pdf,
+                    child_ref,
+                    surviving,
+                    surviving_names,
+                    depth + 1,
+                    max_depth,
+                    visited,
+                )?;
                 if !empty {
                     surviving_kids.push(child_ref);
                 }
@@ -356,7 +392,9 @@ fn prune_name_tree_node_dict<R: Read + Seek>(
     node: crate::Dictionary,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &mut BTreeSet<Vec<u8>>,
+    max_depth: usize,
 ) -> Result<(crate::Dictionary, bool)> {
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
         let filtered = prune_name_pairs(pdf, pairs, surviving, surviving_names)?;
         if filtered.is_empty() {
@@ -382,7 +420,15 @@ fn prune_name_tree_node_dict<R: Read + Seek>(
             .collect();
         let mut surviving_kids: Vec<ObjectRef> = Vec::new();
         for child_ref in child_refs {
-            if !prune_name_tree(pdf, child_ref, surviving, surviving_names)? {
+            if !prune_name_tree(
+                pdf,
+                child_ref,
+                surviving,
+                surviving_names,
+                1,
+                max_depth,
+                &mut visited,
+            )? {
                 surviving_kids.push(child_ref);
             }
         }
@@ -755,14 +801,10 @@ fn item_survives<R: Read + Seek>(
     }
     // Then /A (action) — may itself be an indirect reference to the action dict.
     if let Some(action) = action_val {
-        let resolved;
-        let action = match action {
-            Object::Reference(r) => {
-                resolved = pdf.resolve(*r)?;
-                &resolved
-            }
-            other => other,
-        };
+        // /A may be a multi-level indirect chain (50 0 R → 51 0 R → dict);
+        // follow it to the terminal object before classifying.
+        let (resolved, _) = resolve_ref_chain(pdf, action)?;
+        let action = &resolved;
         if let Object::Dictionary(a) = action {
             // Only handle GoTo actions (/S /GoTo).
             let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
@@ -779,6 +821,29 @@ fn item_survives<R: Read + Seek>(
     Ok(true)
 }
 
+/// Follow a chain of `Object::Reference` indirections up to
+/// [`MAX_DEST_RESOLVE_DEPTH`], returning the terminal non-reference object and
+/// the last `ObjectRef` traversed (for in-place rewrite of an indirect
+/// target). A cyclic / over-deep chain terminates at the bound and yields the
+/// last resolved value, so a hostile `/A`/`/Dest` cannot loop forever.
+fn resolve_ref_chain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: &Object,
+) -> Result<(Object, Option<ObjectRef>)> {
+    let mut last_ref: Option<ObjectRef> = None;
+    let mut cur = start.clone();
+    for _ in 0..MAX_DEST_RESOLVE_DEPTH {
+        match cur {
+            Object::Reference(r) => {
+                last_ref = Some(r);
+                cur = pdf.resolve(r)?;
+            }
+            _ => break,
+        }
+    }
+    Ok((cur, last_ref))
+}
+
 /// `true` when `dest` resolves to a surviving page or is a surviving named dest.
 ///
 /// Resolves one level of `Object::Reference`: an outline `/Dest` or `/A /D`
@@ -789,17 +854,11 @@ fn dest_survives<R: Read + Seek>(
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &BTreeSet<Vec<u8>>,
 ) -> Result<bool> {
-    // String/name form is a *named* destination — resolve one indirection
-    // level for detection, then check the surviving-names set.
-    let concrete;
-    let head = match dest {
-        Object::Reference(r) => {
-            concrete = pdf.resolve(*r)?;
-            &concrete
-        }
-        other => other,
-    };
-    if let Object::String(name) | Object::Name(name) = head {
+    // String/name form is a *named* destination. Follow the full indirection
+    // chain (40 0 R → 41 0 R → (name)) before classifying, so a multi-level
+    // indirect named dest is not misclassified as an explicit dest.
+    let (concrete, _) = resolve_ref_chain(pdf, dest)?;
+    if let Object::String(name) | Object::Name(name) = &concrete {
         return Ok(surviving_names.contains(name.as_slice()));
     }
     // Otherwise it is (or resolves to) an explicit page destination. Resolve
@@ -838,14 +897,10 @@ fn remap_item_dest<R: Read + Seek>(
     // action dict; resolve one level so an indirect GoTo action's /D is
     // still pruned/remapped.
     if let Some(a_val) = d.get("A").cloned() {
-        let action_target = match &a_val {
-            Object::Reference(ar) => Some(*ar),
-            _ => None,
-        };
-        let action_obj = match &a_val {
-            Object::Reference(ar) => pdf.resolve(*ar)?,
-            other => other.clone(),
-        };
+        // /A may be a multi-level indirect chain; follow it to the terminal
+        // action object. action_target is the LAST ref in the chain so an
+        // in-place rewrite updates the object /A ultimately points at.
+        let (action_obj, action_target) = resolve_ref_chain(pdf, &a_val)?;
         if let Object::Dictionary(mut action) = action_obj {
             let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
             if is_goto {
