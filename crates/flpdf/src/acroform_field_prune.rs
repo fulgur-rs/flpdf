@@ -318,8 +318,12 @@ fn field_has_retained_widget<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<bool> {
     if depth > max_depth {
-        // Treat over-deep tree as "no retained widget" — conservative.
-        return Ok(false);
+        // Per the public contract, an over-deep field tree is an explicit
+        // error: silently treating it as "no retained widget" would drop
+        // valid /Fields. Propagate so the caller can decide.
+        return Err(crate::Error::Unsupported(format!(
+            "acroform_field_prune: field-tree depth limit {max_depth} exceeded at {field_ref}"
+        )));
     }
     if !visited.insert(field_ref) {
         // Cycle — treat as no retained widget to avoid infinite loop.
@@ -404,7 +408,9 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<()> {
     if depth > max_depth {
-        return Ok(());
+        return Err(crate::Error::Unsupported(format!(
+            "acroform_field_prune: field-tree depth limit {max_depth} exceeded at {field_ref}"
+        )));
     }
     if !visited.insert(field_ref) {
         return Ok(()); // Cycle guard.
