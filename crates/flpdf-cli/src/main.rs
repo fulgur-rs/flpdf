@@ -508,8 +508,10 @@ struct RewriteCommand {
     /// merge them into a single stream. Default: off (qpdf default: off).
     ///
     /// Requires a full rewrite of the document when enabled.
-    #[arg(long = "coalesce-contents",
-          help = "Merge per-page /Contents arrays into a single stream (qpdf default: off)")]
+    #[arg(
+        long = "coalesce-contents",
+        help = "Merge per-page /Contents arrays into a single stream (qpdf default: off)"
+    )]
     coalesce_contents: bool,
 
     /// Remove unreferenced /Resources entries from each page
@@ -705,8 +707,8 @@ fn main() {
             &args.password,
             true,
             args.remove_restrictions,
-            false, // normalize_content
-            false, // coalesce_contents
+            false,                              // normalize_content
+            false,                              // coalesce_contents
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             options,
         );
@@ -748,8 +750,8 @@ fn main() {
             &args.password,
             false,
             args.remove_restrictions,
-            false, // normalize_content
-            false, // coalesce_contents
+            false,                              // normalize_content
+            false,                              // coalesce_contents
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             options,
         )
@@ -1081,6 +1083,7 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rewrite(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
