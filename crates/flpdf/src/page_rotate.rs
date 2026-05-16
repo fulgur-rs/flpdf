@@ -75,13 +75,22 @@ pub struct RotateOp {
 /// - ` 45` → ` 90`  (rounded up — nearest boundary)
 /// - ` 44` → `  0`  (rounded down — nearest boundary)
 pub fn normalize_rotate(deg: i32) -> i32 {
+    normalize_rotate_i64(deg as i64)
+}
+
+/// Normalize an `i64` rotation to `{0, 90, 180, 270}`.
+///
+/// Internal helper so every entry point — public `i32` API, composed sums,
+/// and raw PDF `/Rotate` integers (which are `i64`) — normalizes *without*
+/// a narrowing cast that could truncate or overflow before normalization.
+fn normalize_rotate_i64(deg: i64) -> i32 {
     // Round `deg` to the nearest 90° boundary, then keep within [0, 360).
-    // Widen to i64 first: `deg + 45` would overflow i32 for inputs near
-    // `i32::MAX`/`i32::MIN` (and `RotateOp::degrees` accepts any i32).
+    // Widen to i128: `deg + 45` would overflow i64 for inputs near
+    // `i64::MAX`/`i64::MIN`.
     // `div_euclid` gives a non-negative quotient even for negative `deg`;
     // `rem_euclid` ensures the final result is non-negative even when
     // `(deg + 45).div_euclid(90) * 90` is negative (e.g. -45 → -1*90 = -90).
-    let snapped = (deg as i64 + 45).div_euclid(90) * 90;
+    let snapped = (deg as i128 + 45).div_euclid(90) * 90;
     snapped.rem_euclid(360) as i32
 }
 
@@ -90,11 +99,11 @@ pub fn normalize_rotate(deg: i32) -> i32 {
 ///
 /// The returned value is always normalized to `{0, 90, 180, 270}`.
 pub fn compose_rotate(existing: i32, op: &RotateOp) -> i32 {
-    let raw = match op.mode {
-        RotateMode::Assign => op.degrees,
-        RotateMode::Add => existing + op.degrees,
+    let raw: i64 = match op.mode {
+        RotateMode::Assign => op.degrees as i64,
+        RotateMode::Add => existing as i64 + op.degrees as i64,
     };
-    normalize_rotate(raw)
+    normalize_rotate_i64(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,12 +159,12 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
             match rotate_val {
                 // null → treat as absent; continue walking.
                 Object::Null => {}
-                Object::Integer(n) => return Ok(normalize_rotate(n as i32)),
+                Object::Integer(n) => return Ok(normalize_rotate_i64(n)),
                 Object::Reference(r) => {
                     let resolved = pdf.resolve(r)?;
                     match resolved {
                         Object::Null => {}
-                        Object::Integer(n) => return Ok(normalize_rotate(n as i32)),
+                        Object::Integer(n) => return Ok(normalize_rotate_i64(n)),
                         _ => {
                             return Err(Error::Unsupported(format!(
                                 "/Rotate reference {r} on node {current} does not resolve to an integer"
@@ -354,6 +363,22 @@ mod tests {
             degrees: 450,
         };
         assert_eq!(compose_rotate(0, &op), 90);
+    }
+
+    #[test]
+    fn compose_add_extreme_degrees_do_not_overflow() {
+        // `existing + op.degrees` is widened to i64 before normalization, so
+        // an i32::MAX additive angle no longer panics (debug) / wraps (release).
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: i32::MAX,
+        };
+        assert!(matches!(compose_rotate(270, &op), 0 | 90 | 180 | 270));
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: i32::MIN,
+        };
+        assert!(matches!(compose_rotate(90, &op), 0 | 90 | 180 | 270));
     }
 
     // -----------------------------------------------------------------------
