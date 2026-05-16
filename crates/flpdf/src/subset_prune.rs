@@ -77,8 +77,10 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// Propagates errors from [`Pdf::resolve`] and
-/// [`remove_unreferenced_resources`].
+/// Propagates errors from [`remove_unreferenced_resources`]. The GC
+/// reachability pass deliberately *swallows* [`Pdf::resolve`] errors
+/// (an unresolvable object is conservatively treated as reachable and
+/// kept), so a resolve failure there does not abort the prune.
 pub fn prune_after_subset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mode: RemoveUnreferencedResources,
@@ -161,6 +163,15 @@ fn collect_reachable<R: Read + Seek>(
         }
         if !visited.insert(current) {
             continue;
+        }
+
+        // If `current` lives inside an /ObjStm, that container object must
+        // survive the sweep too: walk_refs only follows Object::Reference and
+        // never sees the metadata-level compressed-parent link, so without
+        // this, delete_object would drop the /ObjStm and make every compressed
+        // member unrecoverable in the output.
+        if let Some((objstm_ref, _)) = pdf.compressed_parent(current) {
+            queue.push(objstm_ref);
         }
 
         // Resolve the object; skip on error (conservative — keeps the object).
