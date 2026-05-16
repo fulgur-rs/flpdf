@@ -213,9 +213,13 @@ fn compress_yes_does_not_double_compress_flate_stream() {
                 1,
                 "Yes mode must not produce a multi-element filter array; got {arr:?}"
             );
-            if let Object::Name(name) = &arr[0] {
-                assert_eq!(name.as_slice(), b"FlateDecode");
-            }
+            let Object::Name(name) = &arr[0] else {
+                panic!(
+                    "Yes mode single-element filter array must be a Name; got {:?}",
+                    arr[0]
+                );
+            };
+            assert_eq!(name.as_slice(), b"FlateDecode");
         }
         other => panic!("unexpected /Filter value: {other:?}"),
     }
