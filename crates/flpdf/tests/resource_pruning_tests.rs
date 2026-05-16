@@ -1248,3 +1248,202 @@ fn test_roborev3_indirect_xobject_category_form_recurse_font_kept() {
         "roborev3: /F2 must be pruned (unused): {keys:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// roborev medium 指摘1: is_builtin_color_space が広すぎる
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Test: /ColorSpace に "ICCBased" という名前のエントリ、content で `/ICCBased cs`
+// → ICCBased が残り、未使用の別エントリは剪定される。
+//
+// Before the fix, `ICCBased` was treated as a built-in and NOT recorded in
+// the used-set, causing `/ColorSpace/ICCBased` to be incorrectly pruned.
+// After the fix only Device*/Pattern are treated as built-ins for cs/CS ops.
+#[test]
+fn test_medium1_iccbased_named_entry_kept_via_cs_op() {
+    // Content uses /ICCBased as a /ColorSpace resource name (not a built-in),
+    // and /Unused is a color space resource that is not referenced.
+    let content = b"/ICCBased cs";
+    // /ColorSpace dict: "ICCBased" -> array CS, "Unused" -> array CS (should be pruned).
+    let res_body = "<< /ColorSpace << \
+        /ICCBased [ /ICCBased << >> ] \
+        /Unused [ /ICCBased << >> ] \
+    >> >>";
+
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, res_body))];
+    let page_body = "/Contents 4 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
+    let Object::Dictionary(res) = res_obj else {
+        panic!("resources not a dict");
+    };
+    let cs_entry = res.get("ColorSpace");
+    let Object::Dictionary(cs_dict) = cs_entry.expect("/ColorSpace must remain") else {
+        panic!("/ColorSpace is not a dict");
+    };
+    let cs_keys: Vec<String> = cs_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+
+    assert!(
+        cs_keys.contains(&"ICCBased".to_string()),
+        "medium1: /ColorSpace/ICCBased must be KEPT (referenced via `/ICCBased cs`): {cs_keys:?}"
+    );
+    assert!(
+        !cs_keys.contains(&"Unused".to_string()),
+        "medium1: /ColorSpace/Unused must be PRUNED (not referenced): {cs_keys:?}"
+    );
+}
+
+// Test: DeviceRGB used via cs op must NOT cause a /ColorSpace lookup.
+// Content: `/DeviceRGB cs` → DeviceRGB is a built-in for cs/CS, so no /ColorSpace
+// entry should be "used". A /ColorSpace entry named "DeviceRGB" is pruned.
+#[test]
+fn test_medium1_device_rgb_cs_op_is_builtin_not_a_resource_lookup() {
+    // /ColorSpace dict has an entry named "DeviceRGB" — but the cs op /DeviceRGB
+    // must NOT prevent it from being pruned (it is a built-in).
+    let content = b"/DeviceRGB cs";
+    let res_body = "<< /ColorSpace << /DeviceRGB [ /CalRGB << >> ] >> >>";
+
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, res_body))];
+    let page_body = "/Contents 4 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
+    let Object::Dictionary(res) = res_obj else {
+        panic!("resources not a dict");
+    };
+    // The /ColorSpace sub-dict should be entirely gone (the only entry was pruned).
+    assert!(
+        res.get("ColorSpace").is_none(),
+        "medium1: /ColorSpace/DeviceRGB must be PRUNED (DeviceRGB is a built-in for cs op): {:?}",
+        res.get("ColorSpace")
+    );
+}
+
+// Test: inline image BI /CS /RGB EI does NOT cause /ColorSpace/RGB to survive.
+// RGB is an inline-image built-in abbreviation; it must NOT be treated as a
+// /ColorSpace resource reference. If a /ColorSpace entry named "RGB" exists and
+// is not referenced by any cs/CS op, it must be pruned.
+#[test]
+fn test_medium1_inline_image_rgb_abbrev_does_not_prevent_pruning() {
+    // Inline image with /CS /RGB — should not add "RGB" to the ColorSpace used-set.
+    // /ColorSpace has an entry "RGB" that is never referenced by a cs/CS op.
+    // After pruning, /ColorSpace/RGB must be gone.
+    //
+    // The inline image body: BI /CS /RGB /W 1 /H 1 /BPC 8 ID \x00 EI
+    let content = b"BI /CS /RGB /W 1 /H 1 /BPC 8 ID \x00 EI";
+    let res_body = "<< /ColorSpace << /RGB [ /CalRGB << >> ] >> >>";
+
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, res_body))];
+    let page_body = "/Contents 4 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
+    let Object::Dictionary(res) = res_obj else {
+        panic!("resources not a dict");
+    };
+    // /ColorSpace/RGB must be pruned: the inline-image abbreviation is built-in.
+    assert!(
+        res.get("ColorSpace").is_none(),
+        "medium1: inline BI /CS /RGB must NOT prevent pruning of /ColorSpace/RGB: {:?}",
+        res.get("ColorSpace")
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// roborev medium 指摘2: 非UTF-8リソース名で lookup 失敗
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Test: Form XObject with a non-UTF-8 name (raw bytes \xff\xfeFm encoded as
+// `/#ff#feFm` in PDF syntax). The Form inherits the page scope and uses /F1.
+// After pruning, /F1 must remain (the Form used it).
+//
+// Before the fix, from_utf8(b"\xff\xfeFm").unwrap_or("") returned "" which
+// failed to look up the XObject → Form was not recursed → /F1 appeared unused.
+#[test]
+fn test_medium2_non_utf8_xobject_name_form_font_kept() {
+    // The XObject name in the resources dict and in the Do operand is the raw
+    // byte sequence [0xff, 0xfe, b'F', b'm'].  In PDF syntax this is written
+    // as `/#ff#feFm` (the parser decodes #xx hex escapes to raw bytes).
+
+    let form_content = b"BT /F1 10 Tf (non-utf8 name form) Tj ET";
+    let form_stream = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+
+    // Page content: invoke the Form via its non-UTF-8 name.
+    let page_content = b"/#ff#feFm Do";
+
+    // The /XObject sub-dict key must use the same #xx encoding so the parser
+    // stores the same raw bytes as the key.
+    let res_body = "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> \
+         /XObject << /#ff#feFm 6 0 R >> >>";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, page_content)),
+        (5, obj_bytes(5, res_body)),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open PDF with non-UTF-8 XObject name");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
+    let Object::Dictionary(res) = res_obj else {
+        panic!("resources not a dict");
+    };
+    let font_entry = res.get("Font").expect("/Font key must exist");
+    let Object::Dictionary(font_dict) = font_entry else {
+        panic!("/Font is not a dict");
+    };
+    let font_keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+        .collect();
+
+    assert!(
+        font_keys.contains(&"F1".to_string()),
+        "medium2: /F1 must be KEPT (non-UTF-8 Form uses it via inherited scope): {font_keys:?}"
+    );
+    assert!(
+        !font_keys.contains(&"F2".to_string()),
+        "medium2: /F2 must be PRUNED (unused): {font_keys:?}"
+    );
+}

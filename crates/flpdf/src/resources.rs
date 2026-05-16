@@ -79,21 +79,35 @@ const RESOURCE_CATEGORIES: &[&str] = &[
 
 // ── Device-colorspace names that are never looked up in /ColorSpace ───────────
 
-/// Names that appear as operands to `cs`/`CS`/`sc`/`SC` etc. but are **built-in**
-/// device colour spaces, not entries in the page's `/ColorSpace` dictionary.
-fn is_builtin_color_space(name: &[u8]) -> bool {
+/// Names that appear as operands to the page-content `cs`/`CS` operators but
+/// are **built-in** device colour spaces, not entries in the page's
+/// `/ColorSpace` dictionary.
+///
+/// ISO 32000-1 §8.6.8: only `/DeviceGray`, `/DeviceRGB`, `/DeviceCMYK`, and
+/// `/Pattern` may be selected by name directly in page content.  All other
+/// colour spaces (`/CalGray`, `/CalRGB`, `/Lab`, `/ICCBased`, `/Indexed`, …)
+/// are array-based and **must** be named via an entry in `/Resources/ColorSpace`.
+fn is_builtin_color_space_cs_op(name: &[u8]) -> bool {
     matches!(
         name,
+        b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern"
+    )
+}
+
+/// Names that are valid **inline-image** colour-space specifiers (ISO 32000-1
+/// Table 93) and do **not** correspond to entries in `/Resources/ColorSpace`.
+///
+/// This covers both the full Device names and the one-letter abbreviations
+/// permitted inside inline-image dictionaries (`BI … ID … EI`).
+fn is_builtin_inline_image_cs(name: &[u8]) -> bool {
+    matches!(
+        name,
+        // Full Device names are also valid in inline images.
         b"DeviceGray"
             | b"DeviceRGB"
             | b"DeviceCMYK"
             | b"Pattern"
-            | b"Indexed"
-            | b"CalGray"
-            | b"CalRGB"
-            | b"Lab"
-            | b"ICCBased"
-            // Inline-image abbreviations (ISO 32000-1 Table 93)
+            // Abbreviated names (Table 93).
             | b"G"
             | b"RGB"
             | b"CMYK"
@@ -472,7 +486,7 @@ fn collect_from_stream<R: Read + Seek>(
                 // Abbreviated key is /CS (ISO 32000-1 Table 93).
                 let cs_val = dict.get("CS").or_else(|| dict.get("ColorSpace")).cloned();
                 if let Some(Object::Name(name)) = cs_val {
-                    if !is_builtin_color_space(&name) {
+                    if !is_builtin_inline_image_cs(&name) {
                         used.entry(b"ColorSpace".to_vec()).or_default().insert(name);
                     }
                 }
@@ -528,7 +542,7 @@ fn process_operator<R: Read + Seek>(
         // /ColorSpace — `name cs` (non-stroking) / `name CS` (stroking)
         b"cs" | b"CS" => {
             if let Some(Object::Name(name)) = operands.first() {
-                if !is_builtin_color_space(name) {
+                if !is_builtin_color_space_cs_op(name) {
                     used.entry(b"ColorSpace".to_vec())
                         .or_default()
                         .insert(name.clone());
@@ -611,13 +625,9 @@ fn recurse_form_xobject<R: Read + Seek>(
     // same way `apply_pruning` already treats indirect category dicts.
     let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject").cloned())
     {
-        Some(Object::Dictionary(xobj_dict)) => xobj_dict
-            .get(std::str::from_utf8(xobject_name).unwrap_or(""))
-            .cloned(),
+        Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
         Some(Object::Reference(cat_ref)) => match pdf.resolve(cat_ref)? {
-            Object::Dictionary(xobj_dict) => xobj_dict
-                .get(std::str::from_utf8(xobject_name).unwrap_or(""))
-                .cloned(),
+            Object::Dictionary(xobj_dict) => xobj_dict.get(xobject_name).cloned(),
             _ => None,
         },
         _ => None,
