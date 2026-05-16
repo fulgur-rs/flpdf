@@ -37,6 +37,27 @@
 //! tolerated per the "qpdf 同等の最小限" requirement; all output files open
 //! correctly in PDF readers.
 //!
+//! ## Known limitation: inheritable attributes
+//!
+//! When reparenting page leaf nodes directly to the `/Pages` root, this
+//! module does **not** materialise inheritable attributes (`/Resources`,
+//! `/Rotate`, `/MediaBox`) that may have been stored on intermediate
+//! `/Pages` nodes in the original page tree.  Concretely:
+//!
+//! - If an intermediate `/Pages` node carried, say, a shared `/Resources`
+//!   dict, and a chunk's pages referenced that node but not the root, those
+//!   resources become inaccessible after the reparent.
+//! - In practice this is safe for **flat** page trees (where all pages are
+//!   direct children of the root `/Pages` node), which is the normal output
+//!   of qpdf-roundtripped PDFs.
+//! - Deep/branching page trees (e.g. large documents built by some InDesign
+//!   versions) may produce chunks with missing resources.
+//!
+//! Full resolution requires materialising inherited attributes before
+//! reparenting, which is deferred to the page-tree rebuild pass
+//! (flpdf-9hc.8.8).  Until then, prefer running `qpdf --linearize` (or
+//! equivalent) on the source to flatten the page tree before splitting.
+//!
 //! # Example
 //!
 //! ```no_run
