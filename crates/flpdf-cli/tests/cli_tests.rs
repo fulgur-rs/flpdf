@@ -1767,6 +1767,33 @@ fn pages_same_file_repeated_is_single_source() {
         .stdout(predicate::str::starts_with("2"));
 }
 
+#[test]
+fn pages_same_file_spelled_differently_is_single_source() {
+    // Primary input `../../tests/fixtures/compat/three-page.pdf` and a
+    // --pages segment referencing the *same* file via a different spelling
+    // (extra `./` and a redundant `dir/../`) must canonicalize to one source
+    // and be accepted — not rejected as a cross-document merge.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let alt_spelling = "../../tests/fixtures/compat/./three-page.pdf";
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", alt_spelling, "1", ".", "3", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("2"));
+}
+
 // ── Post-rebuild integration: outline/dest remap + resource prune via CLI ──
 
 #[test]

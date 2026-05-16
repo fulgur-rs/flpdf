@@ -1592,10 +1592,17 @@ fn run_page_extraction(
     let inputs = resolve_page_specs(&specs, primary_input)?;
 
     // ── Single-document scope enforcement ────────────────────────────────
-    let mut distinct: Vec<&std::path::Path> = Vec::new();
+    // Compare *canonicalized* source paths so the same file spelled
+    // differently (`tests/x.pdf` vs `./tests/x.pdf`, the `.` shorthand,
+    // relative/symlinked equivalents) is correctly treated as one document.
+    // The original path is preserved for opening/reporting.
+    let mut distinct: Vec<std::path::PathBuf> = Vec::new();
     for spec in &inputs {
-        if !distinct.contains(&spec.path.as_path()) {
-            distinct.push(spec.path.as_path());
+        // Source inputs must exist to be opened; if canonicalization fails
+        // fall back to the literal path (the open will surface a clear error).
+        let key = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
+        if !distinct.contains(&key) {
+            distinct.push(key);
         }
     }
     if distinct.len() > 1 {
