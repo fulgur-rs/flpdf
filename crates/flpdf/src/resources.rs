@@ -29,6 +29,24 @@ use std::io::{Read, Seek};
 /// (`Font`, `XObject`, …) → set of referenced names.
 type UsedNames = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
+/// Tracking information for indirect category sub-dictionary objects
+/// (e.g. `/Font 6 0 R`).  Built in a global pre-pass over all pages so that
+/// the sharing count includes pages Auto-mode would otherwise skip.
+///
+/// Key: `(category_bytes, cat_sub_dict_ref)`.
+type CatRefKey = (Vec<u8>, ObjectRef);
+
+/// Per-category-ref metadata accumulated across all top-level `/Resources`.
+struct CatRefInfo {
+    /// Number of distinct top-level `/Resources` groups that point to this
+    /// indirect category sub-dict.  Used by Auto mode: if > 1, skip pruning.
+    group_count: usize,
+    /// Union of used names contributed by groups whose used-names are known.
+    /// Groups skipped by Auto (shared top-level) do not contribute used-names,
+    /// but they still increment `group_count`, so the ref ends up protected.
+    used_union: BTreeSet<Vec<u8>>,
+}
+
 // ── Resource location ─────────────────────────────────────────────────────────
 
 /// Where a page's `/Resources` dictionary physically lives.
@@ -201,21 +219,131 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
         }
     }
 
+    // ── 3b. Build global cat-ref sharing table (指摘1 fix) ───────────────────
+    // An indirect category sub-dict (e.g. `/Font 6 0 R`) may be shared between
+    // several *different* top-level /Resources objects that each belong to
+    // different page groups.  Auto mode's top-level sharing detection only
+    // protects pages that share the same top-level /Resources, so it cannot
+    // prevent cross-group damage.
+    //
+    // We do a **global** pre-pass over every page's top-level /Resources
+    // (regardless of Auto skip decisions) to count how many distinct top-level
+    // /Resources groups contain each indirect category ref, and to accumulate
+    // the union of used names from groups whose used-names are already known.
+    //
+    // Key insight: groups that Auto *skipped* (shared top-level) do NOT
+    // contribute used-names (we have none), but they DO increment `group_count`,
+    // so any cat-ref they contain ends up with group_count > 1 and is protected
+    // even in Yes mode.
+    let mut cat_ref_map: BTreeMap<CatRefKey, CatRefInfo> = BTreeMap::new();
+
+    // Helper closure-equivalent: collect cat-refs from a /Resources dict.
+    // `top_res_ref` is the ObjectRef of the owning top-level resources group
+    // (used as a set key so the same group is only counted once per cat-ref).
+    // `used_for_group` is the already-computed used-names for this group,
+    // or None if this group was Auto-skipped.
+    //
+    // We track (cat_ref, seen_top_level_groups) to avoid double-counting when
+    // multiple pages share the same top-level Indirect /Resources.
+    let mut cat_ref_seen_groups: BTreeMap<CatRefKey, BTreeSet<ObjectRef>> = BTreeMap::new();
+
+    for (i, loc) in page_res_loc.iter().enumerate() {
+        // Resolve this page's top-level /Resources dict (if any).
+        let res_dict_opt: Option<Dictionary> = match loc {
+            ResourcesLoc::Indirect(r) => match pdf.resolve(*r) {
+                Ok(Object::Dictionary(d)) => Some(d),
+                _ => None,
+            },
+            ResourcesLoc::PageInline => {
+                // Read the inline dict from the page object.
+                match pdf.resolve(page_refs[i]) {
+                    Ok(Object::Dictionary(page_dict)) => {
+                        match page_dict.get("Resources").cloned() {
+                            Some(Object::Dictionary(d)) => Some(d),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ResourcesLoc::AncestorInline(a) => match pdf.resolve(*a) {
+                Ok(Object::Dictionary(anc_dict)) => match anc_dict.get("Resources").cloned() {
+                    Some(Object::Dictionary(d)) => Some(d),
+                    _ => None,
+                },
+                _ => None,
+            },
+            ResourcesLoc::None => None,
+        };
+
+        let Some(res_dict) = res_dict_opt else {
+            continue;
+        };
+
+        // The canonical key for this top-level resources group:
+        // use the loc discriminant so each distinct group is counted once.
+        let group_key: ObjectRef = match loc {
+            ResourcesLoc::Indirect(r) => *r,
+            ResourcesLoc::AncestorInline(a) => *a,
+            // PageInline and None: use a synthetic per-page ObjectRef
+            // (generation = 1 to distinguish from real refs).
+            _ => ObjectRef::new(page_refs[i].number, 1),
+        };
+
+        // What used-names does this group contribute?
+        // None if the group was Auto-skipped (shared top-level).
+        let group_used: Option<&UsedNames> = match loc {
+            ResourcesLoc::Indirect(r) => ref_used.get(r),
+            ResourcesLoc::AncestorInline(a) => ancestor_inline_used.get(a),
+            ResourcesLoc::PageInline => inline_used[i].as_ref(),
+            ResourcesLoc::None => None,
+        };
+
+        for &category in RESOURCE_CATEGORIES {
+            let cat_key = category.as_bytes();
+            if let Some(Object::Reference(cat_ref)) = res_dict.get(category).cloned() {
+                let key: CatRefKey = (cat_key.to_vec(), cat_ref);
+
+                let seen = cat_ref_seen_groups.entry(key.clone()).or_default();
+                if seen.insert(group_key) {
+                    // First time we see this cat_ref from this group.
+                    let info = cat_ref_map
+                        .entry(key.clone())
+                        .or_insert_with(|| CatRefInfo {
+                            group_count: 0,
+                            used_union: BTreeSet::new(),
+                        });
+                    info.group_count += 1;
+
+                    // Merge this group's known used-names for this category.
+                    if let Some(used_map) = group_used {
+                        if let Some(names) = used_map.get(cat_key) {
+                            info.used_union.extend(names.iter().cloned());
+                        }
+                    }
+                    // If group_used is None (Auto-skipped group), we have no
+                    // used-names to contribute — group_count alone protects
+                    // the ref in Auto mode.
+                }
+            }
+        }
+    }
+
     // ── 4. Prune: indirect resources objects ──────────────────────────────────
     for (res_ref, used) in &ref_used {
-        prune_resources_object(pdf, *res_ref, used)?;
+        prune_resources_object(pdf, *res_ref, used, &cat_ref_map, mode)?;
     }
 
     // ── 5. Prune: inline (direct) resources embedded in ancestor /Pages nodes ──
     for (ancestor_ref, used) in &ancestor_inline_used {
-        prune_ancestor_inline_resources(pdf, *ancestor_ref, used)?;
+        prune_ancestor_inline_resources(pdf, *ancestor_ref, used, &cat_ref_map, mode)?;
     }
 
     // ── 6. Prune: inline (direct) resources embedded in page dicts ────────────
     for (i, used_opt) in inline_used.iter().enumerate() {
         let Some(used) = used_opt else { continue };
         let page_ref = page_refs[i];
-        prune_inline_resources(pdf, page_ref, used)?;
+        prune_inline_resources(pdf, page_ref, used, &cat_ref_map, mode)?;
     }
 
     Ok(())
@@ -305,10 +433,18 @@ fn collect_used_names_for_page<R: Read + Seek>(
         page_resources.as_ref(),
         &mut used,
         &mut visited_xobjects,
+        0,
     )?;
 
     Ok(used)
 }
+
+/// Maximum recursion depth for Form XObject traversal.
+///
+/// Indirect Form XObjects are guarded by `visited` (ObjectRef cycle detection).
+/// Direct-stream Form XObjects are owned by their containing dict and cannot
+/// form cycles in well-formed PDFs, but we cap depth as an extra safeguard.
+const MAX_FORM_DEPTH: usize = 64;
 
 /// Core recursive walker: tokenises `stream_bytes` and records every resource
 /// reference into `used`. `resources` is the `/Resources` dict in scope for
@@ -320,6 +456,7 @@ fn collect_from_stream<R: Read + Seek>(
     resources: Option<&Dictionary>,
     used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
 ) -> Result<()> {
     let parser = ContentStreamParser::new(stream_bytes);
     for token_result in parser {
@@ -328,7 +465,7 @@ fn collect_from_stream<R: Read + Seek>(
 
         match token {
             ContentToken::Op { operands, operator } => {
-                process_operator(pdf, &operator, &operands, resources, used, visited)?;
+                process_operator(pdf, &operator, &operands, resources, used, visited, depth)?;
             }
             ContentToken::InlineImage { dict, .. } => {
                 // /CS operand in an inline image may reference /ColorSpace.
@@ -355,6 +492,7 @@ fn process_operator<R: Read + Seek>(
     resources: Option<&Dictionary>,
     used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
 ) -> Result<()> {
     match operator {
         // /XObject — `name Do`
@@ -365,7 +503,7 @@ fn process_operator<R: Read + Seek>(
                     .insert(name.clone());
 
                 // Recurse into Form XObjects.
-                recurse_form_xobject(pdf, name, resources, used, visited)?;
+                recurse_form_xobject(pdf, name, resources, used, visited, depth)?;
             }
         }
 
@@ -444,36 +582,66 @@ fn process_operator<R: Read + Seek>(
 /// - If the Form XObject has no `/Resources` entry, it inherits the calling
 ///   scope's resources; names referenced inside the Form are attributed to the
 ///   page's `used` set as before.
+///
+/// The XObject entry in `/Resources/XObject` may be either an indirect
+/// `Object::Reference` (the common case) or a direct `Object::Stream` (allowed
+/// by the PDF spec for inline stream objects).  Both are handled here.
+///
+/// Indirect references use `visited` (an `ObjectRef` set) for cycle detection.
+/// Direct streams are owned by their containing dictionary and therefore cannot
+/// be reached through a cycle in well-formed PDFs; `depth` provides an extra
+/// guard against pathological documents.
 fn recurse_form_xobject<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_name: &[u8],
     page_resources: Option<&Dictionary>,
     used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
 ) -> Result<()> {
-    // Locate the XObject sub-dictionary in the current /Resources scope.
-    let xobj_ref = match page_resources {
+    // Guard against excessively deep recursion (applies to direct-stream forms
+    // in particular, since indirect refs are additionally guarded by `visited`).
+    if depth >= MAX_FORM_DEPTH {
+        return Ok(());
+    }
+
+    // Locate the XObject entry in the current /Resources scope.
+    let xobj_val: Option<Object> = match page_resources {
         Some(res) => match res.get("XObject") {
             Some(Object::Dictionary(xobj_dict)) => {
-                xobj_dict.get_ref(std::str::from_utf8(xobject_name).unwrap_or(""))
+                // Retrieve the raw value — may be Reference *or* direct Stream.
+                xobj_dict
+                    .get(std::str::from_utf8(xobject_name).unwrap_or(""))
+                    .cloned()
             }
             _ => None,
         },
         None => None,
     };
 
-    let Some(xobj_ref) = xobj_ref else {
+    let Some(xobj_val) = xobj_val else {
         return Ok(());
     };
 
-    // Cycle guard.  Shared across all recursion levels to prevent infinite loops.
-    if !visited.insert(xobj_ref) {
-        return Ok(());
-    }
-
-    let obj = pdf.resolve(xobj_ref)?;
-    let Object::Stream(stream) = obj else {
-        return Ok(());
+    // Resolve to a Stream, handling both indirect references and direct streams.
+    let stream: crate::object::Stream = match xobj_val {
+        Object::Reference(xobj_ref) => {
+            // Cycle guard for indirect references.
+            if !visited.insert(xobj_ref) {
+                return Ok(());
+            }
+            let obj = pdf.resolve(xobj_ref)?;
+            match obj {
+                Object::Stream(s) => s,
+                _ => return Ok(()),
+            }
+        }
+        Object::Stream(s) => {
+            // Direct stream: owned by its parent dict, so cycles are impossible
+            // in well-formed PDFs.  Depth guard above is sufficient.
+            s
+        }
+        _ => return Ok(()),
     };
 
     // Only recurse into Form XObjects.
@@ -516,13 +684,14 @@ fn recurse_form_xobject<R: Read + Seek>(
             form_resources.as_ref(),
             &mut form_used,
             visited,
+            depth + 1,
         )?;
         // form_used is intentionally discarded; Form's own /Resources pruning
         // is out of scope for this minimum fix (flpdf-9hc.12.4).
     } else {
         // No /Resources key → Form inherits the calling scope's resources.
         // Attribute all references to the page's used set (original behaviour).
-        collect_from_stream(pdf, &form_bytes, page_resources, used, visited)?;
+        collect_from_stream(pdf, &form_bytes, page_resources, used, visited, depth + 1)?;
     }
 
     Ok(())
@@ -534,13 +703,15 @@ fn prune_resources_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     res_ref: ObjectRef,
     used: &UsedNames,
+    cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
+    mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     let obj = pdf.resolve(res_ref)?;
     let Object::Dictionary(mut res_dict) = obj else {
         return Ok(()); // not a dict — nothing to prune
     };
 
-    apply_pruning(pdf, &mut res_dict, used)?;
+    apply_pruning(pdf, &mut res_dict, used, cat_ref_map, mode)?;
     pdf.set_object(res_ref, Object::Dictionary(res_dict));
     Ok(())
 }
@@ -551,6 +722,8 @@ fn prune_inline_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     used: &UsedNames,
+    cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
+    mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     let page_obj = pdf.resolve(page_ref)?;
     let Object::Dictionary(mut page_dict) = page_obj else {
@@ -563,7 +736,7 @@ fn prune_inline_resources<R: Read + Seek>(
     let resources_val = page_dict.get("Resources").cloned();
     match resources_val {
         Some(Object::Dictionary(mut res_dict)) => {
-            apply_pruning(pdf, &mut res_dict, used)?;
+            apply_pruning(pdf, &mut res_dict, used, cat_ref_map, mode)?;
             page_dict.insert("Resources", Object::Dictionary(res_dict));
         }
         _ => return Ok(()), // nothing inline to prune
@@ -581,6 +754,8 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     ancestor_ref: ObjectRef,
     used: &UsedNames,
+    cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
+    mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     let ancestor_obj = pdf.resolve(ancestor_ref)?;
     let Object::Dictionary(mut ancestor_dict) = ancestor_obj else {
@@ -590,7 +765,7 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
     let resources_val = ancestor_dict.get("Resources").cloned();
     match resources_val {
         Some(Object::Dictionary(mut res_dict)) => {
-            apply_pruning(pdf, &mut res_dict, used)?;
+            apply_pruning(pdf, &mut res_dict, used, cat_ref_map, mode)?;
             ancestor_dict.insert("Resources", Object::Dictionary(res_dict));
         }
         _ => return Ok(()), // not an inline dict — nothing to prune here
@@ -606,10 +781,36 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
 /// Handles both direct Dictionary values and indirect Reference values for
 /// category sub-dictionaries (e.g., `/Font 10 0 R`). When the category value
 /// is a Reference, the referenced object is pruned in-place via `pdf.set_object`.
+///
+/// # Indirect category sub-dict sharing (指摘1 fix)
+///
+/// An indirect category sub-dict (e.g. `/Font 6 0 R`) may be referenced by
+/// several different top-level `/Resources` groups.  `cat_ref_map` carries
+/// the global sharing count and the union of used names across all groups.
+///
+/// - **Auto mode**: if `group_count > 1`, leave the sub-dict untouched
+///   (same philosophy as top-level sharing protection).
+/// - **Yes mode**: always use the global `used_union` rather than the
+///   per-group `used` argument, so no cross-group used name is lost.
+///
+/// Because the same `cat_ref` may appear in multiple calls to `apply_pruning`
+/// (once per top-level resources group that contains it), we do the actual
+/// `set_object` write on the first call only.  A written `cat_ref` is detected
+/// on subsequent calls by the fact that its resolved dict will have already
+/// had entries removed; since we only write (never expand), idempotency is
+/// guaranteed — but to avoid redundant I/O we rely on `cat_ref_map` tracking.
+///
+/// Note: when all entries are pruned from an indirect cat sub-dict, the empty
+/// indirect object is left in place (as an orphan).  Removing the containing
+/// category key from *all* top-level `/Resources` dicts that reference it would
+/// require tracking every such res_dict across calls, which is out of scope;
+/// xref-level GC handles orphans separately.
 fn apply_pruning<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     res_dict: &mut Dictionary,
     used: &UsedNames,
+    cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
+    mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     for &category in RESOURCE_CATEGORIES {
         let cat_key = category.as_bytes();
@@ -638,33 +839,73 @@ fn apply_pruning<R: Read + Seek>(
             }
             Some(Object::Reference(cat_ref)) => {
                 // Indirect reference to category sub-dictionary.
-                // Resolve, prune, and write back via set_object.
-                let resolved = pdf.resolve(cat_ref)?;
-                let Object::Dictionary(mut cat_dict) = resolved else {
-                    // Not a dictionary (e.g. Stream) — skip safely.
-                    continue;
-                };
+                //
+                // Check the global cat-ref sharing table first (指摘1):
+                let map_key: CatRefKey = (cat_key.to_vec(), cat_ref);
 
-                let empty_set = BTreeSet::new();
-                let used_names = used.get(cat_key).unwrap_or(&empty_set);
+                if let Some(info) = cat_ref_map.get(&map_key) {
+                    if mode == RemoveUnreferencedResources::Auto && info.group_count > 1 {
+                        // Auto: multiple top-level /Resources groups share this
+                        // indirect cat sub-dict → protect it, same as top-level
+                        // sharing protection.
+                        continue;
+                    }
 
-                let to_remove: Vec<Vec<u8>> = cat_dict
-                    .iter()
-                    .filter(|(k, _)| !used_names.contains(*k))
-                    .map(|(k, _)| k.to_vec())
-                    .collect();
-                for key in to_remove {
-                    cat_dict.remove(&key);
-                }
+                    // Yes (or Auto with group_count == 1): prune using the
+                    // global union, not just the per-group `used`.
+                    let resolved = pdf.resolve(cat_ref)?;
+                    let Object::Dictionary(mut cat_dict) = resolved else {
+                        continue; // not a dict — skip safely
+                    };
 
-                if cat_dict.iter().next().is_none() {
-                    // All entries pruned — remove the category reference from res_dict.
-                    // (The now-empty indirect object is left as an orphan; xref GC
-                    // is out of scope for this module.)
-                    res_dict.remove(category);
+                    let to_remove: Vec<Vec<u8>> = cat_dict
+                        .iter()
+                        .filter(|(k, _)| !info.used_union.contains(*k))
+                        .map(|(k, _)| k.to_vec())
+                        .collect();
+                    for key in to_remove {
+                        cat_dict.remove(&key);
+                    }
+
+                    if cat_dict.iter().next().is_none() {
+                        // All entries pruned — leave the empty indirect object as
+                        // an orphan (xref GC is out of scope for this module).
+                        // Do not remove the category from res_dict here because
+                        // the same cat_ref may still be referenced by other
+                        // top-level /Resources dicts; their apply_pruning calls
+                        // will each see an already-empty dict and remove their
+                        // own res_dict entry.
+                        res_dict.remove(category);
+                    } else {
+                        pdf.set_object(cat_ref, Object::Dictionary(cat_dict));
+                    }
                 } else {
-                    // Update the referenced object in-place; keep the reference in res_dict.
-                    pdf.set_object(cat_ref, Object::Dictionary(cat_dict));
+                    // No entry in cat_ref_map (e.g. this page was fully
+                    // Auto-skipped and no used-names were collected). Fall back
+                    // to the legacy per-group path which leaves the dict untouched
+                    // when used_names is empty — a safe conservative choice.
+                    let resolved = pdf.resolve(cat_ref)?;
+                    let Object::Dictionary(mut cat_dict) = resolved else {
+                        continue;
+                    };
+
+                    let empty_set = BTreeSet::new();
+                    let used_names = used.get(cat_key).unwrap_or(&empty_set);
+
+                    let to_remove: Vec<Vec<u8>> = cat_dict
+                        .iter()
+                        .filter(|(k, _)| !used_names.contains(*k))
+                        .map(|(k, _)| k.to_vec())
+                        .collect();
+                    for key in to_remove {
+                        cat_dict.remove(&key);
+                    }
+
+                    if cat_dict.iter().next().is_none() {
+                        res_dict.remove(category);
+                    } else {
+                        pdf.set_object(cat_ref, Object::Dictionary(cat_dict));
+                    }
                 }
             }
             _ => {

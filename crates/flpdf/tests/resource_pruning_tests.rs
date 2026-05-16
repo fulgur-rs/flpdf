@@ -900,3 +900,270 @@ fn test_other_categories_pruned() {
         "Prop2 pruned: {prop_keys:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// roborev 指摘1: 間接 category サブ辞書の共有が未考慮
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Setup: 2 pages each have a DIFFERENT top-level /Resources object (5 0 R and
+// 7 0 R), but BOTH point to the SAME indirect /Font sub-dict (6 0 R).
+//
+//   5 0 R  << /Font 6 0 R >>    ← page 1's /Resources
+//   7 0 R  << /Font 6 0 R >>    ← page 2's /Resources
+//   6 0 R  << /F1 << >> /F2 << >> /F3 << >> >>   ← shared Font sub-dict
+//
+//   Page 1 content: uses /F1
+//   Page 2 content: uses /F2
+//
+// Yes mode: union = {F1, F2}, F3 pruned.  6 0 R must contain F1 and F2.
+// Auto mode: 6 0 R is shared across two top-level groups → must NOT be pruned.
+
+#[test]
+fn test_roborev1_shared_indirect_font_subdict_yes_union() {
+    // Object layout:
+    //   1 0 R  Catalog
+    //   2 0 R  Pages  /Kids [3 0 R 4 0 R]
+    //   3 0 R  Page 1  /Resources 5 0 R  /Contents 8 0 R
+    //   4 0 R  Page 2  /Resources 7 0 R  /Contents 9 0 R
+    //   5 0 R  Resources for page 1: << /Font 6 0 R >>
+    //   6 0 R  Shared Font sub-dict: << /F1 << >> /F2 << >> /F3 << >> >>
+    //   7 0 R  Resources for page 2: << /Font 6 0 R >>
+    //   8 0 R  Content stream for page 1: uses /F1
+    //   9 0 R  Content stream for page 2: uses /F2
+
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            ),
+        ),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (
+            4,
+            obj_bytes(
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 9 0 R /Resources 7 0 R >>",
+            ),
+        ),
+        (5, obj_bytes(5, "<< /Font 6 0 R >>")),
+        (
+            6,
+            obj_bytes(
+                6,
+                "<< /F1 << /Type /Font >> /F2 << /Type /Font >> /F3 << /Type /Font >> >>",
+            ),
+        ),
+        (7, obj_bytes(7, "<< /Font 6 0 R >>")),
+        (8, stream_obj(8, content1)),
+        (9, stream_obj(9, content2)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    // The shared Font sub-dict (6 0 R) must contain F1 and F2 (union), and F3
+    // must have been pruned.
+    let font_obj = pdf
+        .resolve(ObjectRef::new(6, 0))
+        .expect("resolve shared font dict");
+    let Object::Dictionary(font_dict) = font_obj else {
+        panic!("6 0 R is not a dictionary");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "Yes: F1 must remain (page1 uses it): {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "Yes: F2 must remain (page2 uses it): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F3".to_string()),
+        "Yes: F3 must be pruned (neither page uses it): {keys:?}"
+    );
+}
+
+#[test]
+fn test_roborev1_shared_indirect_font_subdict_auto_protected() {
+    // Same layout as above.  Auto mode: the shared cat-ref (6 0 R) appears in
+    // two distinct top-level /Resources groups, so it must NOT be pruned even
+    // though each top-level group is individually "unshared" at page level.
+
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            ),
+        ),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (
+            4,
+            obj_bytes(
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 9 0 R /Resources 7 0 R >>",
+            ),
+        ),
+        (5, obj_bytes(5, "<< /Font 6 0 R >>")),
+        (
+            6,
+            obj_bytes(
+                6,
+                "<< /F1 << /Type /Font >> /F2 << /Type /Font >> /F3 << /Type /Font >> >>",
+            ),
+        ),
+        (7, obj_bytes(7, "<< /Font 6 0 R >>")),
+        (8, stream_obj(8, content1)),
+        (9, stream_obj(9, content2)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Auto).expect("prune");
+
+    // All three fonts must remain — Auto must not prune a shared cat-ref.
+    let font_obj = pdf
+        .resolve(ObjectRef::new(6, 0))
+        .expect("resolve shared font dict");
+    let Object::Dictionary(font_dict) = font_obj else {
+        panic!("6 0 R is not a dictionary");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "Auto: F1 must remain (shared cat-ref protected): {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "Auto: F2 must remain (shared cat-ref protected): {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F3".to_string()),
+        "Auto: F3 must remain (shared cat-ref protected): {keys:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// roborev 指摘2: 直接 Stream の Form XObject で再帰スキップ
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Setup: the /XObject sub-dict in the page /Resources contains a *direct*
+// Object::Stream Form XObject (not an indirect reference).  The Form has no
+// /Resources of its own, so it inherits the page's resources.  The Form
+// content uses /F1 via Tf.  Page content just invokes the Form via Do.
+//
+// Without the fix, get_ref() returns None for a direct Stream value, so the
+// Form is never recursed into and /F1 appears unused → incorrectly pruned.
+// After the fix, /F1 must be kept because the Form uses it.
+//
+// Building a raw PDF with a direct Stream inside a dict value requires writing
+// the stream inline.  We construct the bytes manually.
+
+#[test]
+fn test_roborev2_direct_stream_form_xobject_font_kept() {
+    // Form XObject content: uses /F1 via Tf.
+    // The Form has no /Resources — it inherits the page's scope.
+    let form_content = b"BT /F1 10 Tf (direct form) Tj ET";
+
+    // We build the PDF bytes manually so that the /XObject sub-dict entry for
+    // /Fm0 is a direct stream (not an indirect reference).
+    //
+    // Object layout:
+    //   1 0 R  Catalog
+    //   2 0 R  Pages  /Kids [3 0 R]
+    //   3 0 R  Page   /Resources 5 0 R  /Contents 4 0 R
+    //   4 0 R  Content stream: /Fm0 Do
+    //   5 0 R  /Resources dict with direct-stream XObject and /Font sub-dict
+    //
+    // The /Resources dict (5 0 R) looks like:
+    //   << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >>
+    //      /XObject << /Fm0 << /Subtype /Form /Length N >> stream … endstream >> >>
+    //
+    // Note: the outer object is a Dictionary (not a Stream), so pdf readers
+    // parse the inline stream inside the dict value as a direct Object::Stream.
+
+    let form_len = form_content.len();
+
+    // Build the raw resources dict object string.
+    // We embed the Form stream directly as a dict value.
+    let res_obj_body = format!(
+        "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> \
+         /XObject << /Fm0 << /Subtype /Form /Length {form_len} >> stream\n{}\nendstream >> >>",
+        std::str::from_utf8(form_content).unwrap()
+    );
+
+    let page_content = b"/Fm0 Do";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, page_content)),
+        (5, obj_bytes(5, &res_obj_body)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open PDF with direct-stream Form");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    // /F1 must remain — the direct-stream Form uses it via inherited scope.
+    // /F2 must be pruned — neither the page nor the Form references it.
+    let res_obj = pdf
+        .resolve(ObjectRef::new(5, 0))
+        .expect("resolve resources");
+    let Object::Dictionary(res_dict) = res_obj else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let font_entry = res_dict.get("Font").expect("/Font key must exist");
+    let Object::Dictionary(font_dict) = font_entry else {
+        panic!("/Font is not a dict");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "roborev2: /F1 must be kept (direct-stream Form uses it via inherited scope): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "roborev2: /F2 must be pruned (unused by page and Form): {keys:?}"
+    );
+}
