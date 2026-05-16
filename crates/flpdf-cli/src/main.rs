@@ -1156,6 +1156,19 @@ fn run_rewrite(
         //      decide which /Resources entries are reachable, then prune the rest.
         //   4. write (compress_streams / newline_before_endstream) — byte-emission
         //      policies applied by the writer, not the pre-processing step.
+        // INTENTIONAL DEFAULT (flpdf-9hc.12.7 acceptance: "defaults match
+        // qpdf documented behavior"). qpdf's defaults are
+        // `--remove-unreferenced-resources=auto` and `--compress-streams=y`,
+        // and qpdf always performs a full rewrite. flpdf mirrors this:
+        // because `remove_unref` defaults to `auto` (≠ `no`), a plain
+        // `flpdf rewrite IN OUT` takes the full-rewrite path and applies the
+        // safe `auto` pruning + default FlateDecode compression — exactly
+        // what plain `qpdf IN OUT` does. This is a deliberate, documented
+        // behavior (not an accidental regression); pass
+        // `--remove-unreferenced-resources=no` to opt out of pruning. The
+        // observable effect (qpdf-structural parity, smaller output) is
+        // captured by tests/golden/compat-matrix.md and asserted by the
+        // `rewrite_default_is_qpdf_equivalent_full_rewrite` CLI test.
         let needs_mutation = coalesce_contents
             || normalize_content
             || remove_unref != CliRemoveUnreferencedResources::No;
