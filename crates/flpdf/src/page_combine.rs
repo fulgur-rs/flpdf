@@ -591,9 +591,20 @@ mod tests {
     fn from_specs_two_files_concatenate_in_order() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir();
-        let path_a = dir.join("flpdf_test_combine_a.pdf");
-        let path_b = dir.join("flpdf_test_combine_b.pdf");
+        // Unique per-process/per-run directory so concurrent test processes
+        // (or repeated runs) cannot clobber each other's fixtures.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "flpdf_test_combine_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_a = dir.join("a.pdf");
+        let path_b = dir.join("b.pdf");
 
         // Write 3-page and 2-page PDFs to disk.
         std::fs::File::create(&path_a)
@@ -626,8 +637,7 @@ mod tests {
         assert_eq!(flat[3].source_index, 1);
         assert_eq!(flat[3].page.index_1based, 2);
 
-        // Clean up temp files.
-        let _ = std::fs::remove_file(&path_a);
-        let _ = std::fs::remove_file(&path_b);
+        // Clean up temp directory (and its files).
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
