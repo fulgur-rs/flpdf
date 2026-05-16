@@ -1167,3 +1167,68 @@ fn test_roborev2_direct_stream_form_xobject_font_kept() {
         "roborev2: /F2 must be pruned (unused by page and Form): {keys:?}"
     );
 }
+
+#[test]
+fn test_roborev3_indirect_xobject_category_form_recurse_font_kept() {
+    // The /XObject *resource category* is itself an indirect reference
+    // (`/XObject 7 0 R`). A Form invoked via `/Fm0 Do` inherits the page
+    // scope and uses /F1. recurse_form_xobject must resolve the indirect
+    // category dict, otherwise /F1 is wrongly pruned.
+    let form_content = b"BT /F1 10 Tf (form via indirect xobject cat) Tj ET";
+    let form_stream = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // /XObject category is an INDIRECT reference (7 0 R), not a direct dict.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> /XObject 7 0 R >>",
+            ),
+        ),
+        (6, form_stream),
+        (7, obj_bytes(7, "<< /Fm0 6 0 R >>")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R not a dict");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font missing");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "roborev3: /F1 must be kept (Form via indirect /XObject category uses it): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "roborev3: /F2 must be pruned (unused): {keys:?}"
+    );
+}

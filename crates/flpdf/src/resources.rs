@@ -605,18 +605,22 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(());
     }
 
-    // Locate the XObject entry in the current /Resources scope.
-    let xobj_val: Option<Object> = match page_resources {
-        Some(res) => match res.get("XObject") {
-            Some(Object::Dictionary(xobj_dict)) => {
-                // Retrieve the raw value — may be Reference *or* direct Stream.
-                xobj_dict
-                    .get(std::str::from_utf8(xobject_name).unwrap_or(""))
-                    .cloned()
-            }
+    // Locate the XObject entry in the current /Resources scope. The
+    // `/XObject` resource category itself may be a direct dictionary *or*
+    // an indirect reference (`/XObject 6 0 R`) — resolve the latter, the
+    // same way `apply_pruning` already treats indirect category dicts.
+    let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject").cloned())
+    {
+        Some(Object::Dictionary(xobj_dict)) => xobj_dict
+            .get(std::str::from_utf8(xobject_name).unwrap_or(""))
+            .cloned(),
+        Some(Object::Reference(cat_ref)) => match pdf.resolve(cat_ref)? {
+            Object::Dictionary(xobj_dict) => xobj_dict
+                .get(std::str::from_utf8(xobject_name).unwrap_or(""))
+                .cloned(),
             _ => None,
         },
-        None => None,
+        _ => None,
     };
 
     let Some(xobj_val) = xobj_val else {
