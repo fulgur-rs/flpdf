@@ -51,6 +51,7 @@ pub mod json_inspect;
 pub mod linearization;
 pub mod object;
 pub mod outline;
+pub mod page_combine;
 pub mod page_plan;
 pub mod page_range;
 pub mod page_rotate;
@@ -75,6 +76,7 @@ pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use error::{EncryptedError, Error, Result};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
+pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_rotate::{
