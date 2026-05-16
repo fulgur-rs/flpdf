@@ -185,11 +185,22 @@ impl<'a> ContentStreamParser<'a> {
     }
 
     /// Parse the inline-image dictionary (bare `/Key value` pairs) up to the
+    /// Consume whitespace and `%` comments unconditionally, never emitting
+    /// a comment. Used in contexts (inline-image header) where a comment is
+    /// not a standalone token: with `keep_comments == true`,
+    /// [`Self::skip_ws_collect_comment`] returns at the comment's line end
+    /// without consuming the newline, so a single call would leave the
+    /// parser stuck on whitespace. Looping drains every comment/whitespace
+    /// run regardless of the option.
+    fn skip_ws_and_comments(&mut self) {
+        while self.skip_ws_collect_comment().is_some() {}
+    }
+
     /// `ID` keyword, then collect raw data up to the `EI` keyword.
     fn parse_inline_image(&mut self) -> Result<ContentToken> {
         let mut dict = Dictionary::new();
         loop {
-            self.skip_ws_collect_comment();
+            self.skip_ws_and_comments();
             match self.peek() {
                 None => {
                     return Err(Error::parse(self.pos, "inline image missing ID"));
@@ -203,7 +214,7 @@ impl<'a> ContentStreamParser<'a> {
                     };
                     self.pos += parser.position();
                     // Value
-                    self.skip_ws_collect_comment();
+                    self.skip_ws_and_comments();
                     let value = self.parse_operand()?;
                     dict.insert(key, value);
                 }
