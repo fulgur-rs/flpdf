@@ -183,6 +183,24 @@ fn inline_image_with_binary_payload_and_crlf() {
 }
 
 #[test]
+fn inline_image_header_comment_with_keep_comments_does_not_break() {
+    // A comment inside the inline-image header must be consumed (not
+    // emitted, not fatal) even when keep_comments=true.
+    let toks = tokens_keep_comments(b"BI %hdr comment\n/W 1 /H 1 /BPC 8 /CS /G ID x EI");
+    assert_eq!(toks.len(), 1, "inline image must parse with header comment");
+    match &toks[0] {
+        ContentToken::InlineImage { dict, data } => {
+            assert_eq!(data, b"x");
+            assert_eq!(dict.get("W"), Some(&Object::Integer(1)));
+        }
+        other => panic!("expected inline image, got {other:?}"),
+    }
+    // Same input with default options must behave identically.
+    let toks = tokens(b"BI %hdr comment\n/W 1 /H 1 /BPC 8 /CS /G ID x EI");
+    assert_eq!(toks.len(), 1);
+}
+
+#[test]
 fn inline_image_data_with_delimiter_before_ei_not_truncated() {
     // Image data contains `}EI ` and `/EI ` — a delimiter immediately
     // before `EI` followed by whitespace. Per ISO 32000-1 §7.8.2 the real
