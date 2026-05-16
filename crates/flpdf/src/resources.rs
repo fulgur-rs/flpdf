@@ -433,8 +433,17 @@ fn process_operator<R: Read + Seek>(
 }
 
 /// If `xobject_name` resolves to a Form XObject, decode and recurse into its
-/// content stream. Uses the Form's own `/Resources` (falling back to `page_resources`)
-/// as the scope for the recursive scan.
+/// content stream.
+///
+/// Scoping rule (PDF spec §8.10.4):
+/// - If the Form XObject has its own `/Resources` entry, resource names used
+///   inside the Form resolve against the Form's own resources dict. Those names
+///   must NOT be added to the calling page's `used` set — doing so would cause
+///   page-level resources with the same name (but unused by the page itself) to
+///   be incorrectly retained when pruning.
+/// - If the Form XObject has no `/Resources` entry, it inherits the calling
+///   scope's resources; names referenced inside the Form are attributed to the
+///   page's `used` set as before.
 fn recurse_form_xobject<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_name: &[u8],
@@ -457,7 +466,7 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(());
     };
 
-    // Cycle guard.
+    // Cycle guard.  Shared across all recursion levels to prevent infinite loops.
     if !visited.insert(xobj_ref) {
         return Ok(());
     }
@@ -482,19 +491,40 @@ fn recurse_form_xobject<R: Read + Seek>(
         Err(_) => return Ok(()), // graceful degradation
     };
 
-    // The Form's /Resources (may be absent → falls back to page resources).
-    let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
-        Some(Object::Dictionary(d)) => Some(d),
-        Some(Object::Reference(r)) => {
-            match pdf.resolve(r)? {
-                Object::Dictionary(d) => Some(d),
-                _ => page_resources.cloned(),
-            }
-        }
-        _ => page_resources.cloned(),
-    };
+    // Determine whether the Form has its own /Resources entry.
+    // We check for key *presence* (not the resolved value) because an empty or
+    // indirect /Resources still means the Form owns its resource scope.
+    let form_has_own_resources = stream.dict.get("Resources").is_some();
 
-    collect_from_stream(pdf, &form_bytes, form_resources.as_ref(), used, visited)?;
+    if form_has_own_resources {
+        // Resolve the Form's own /Resources dict (may be direct or indirect).
+        let form_resources: Option<Dictionary> =
+            match stream.dict.get("Resources").cloned() {
+                Some(Object::Dictionary(d)) => Some(d),
+                Some(Object::Reference(r)) => match pdf.resolve(r)? {
+                    Object::Dictionary(d) => Some(d),
+                    _ => None, // broken ref → treat as empty own scope
+                },
+                _ => None,
+            };
+
+        // Use a throwaway accumulator so that resource names referenced inside
+        // the Form do NOT pollute the calling page's used set.
+        let mut form_used: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        collect_from_stream(
+            pdf,
+            &form_bytes,
+            form_resources.as_ref(),
+            &mut form_used,
+            visited,
+        )?;
+        // form_used is intentionally discarded; Form's own /Resources pruning
+        // is out of scope for this minimum fix (flpdf-9hc.12.4).
+    } else {
+        // No /Resources key → Form inherits the calling scope's resources.
+        // Attribute all references to the page's used set (original behaviour).
+        collect_from_stream(pdf, &form_bytes, page_resources, used, visited)?;
+    }
 
     Ok(())
 }
