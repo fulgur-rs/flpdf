@@ -325,6 +325,7 @@ dependencies = [
  "rc4",
  "sha2",
  "stringprep",
+ "tempfile",
  "thiserror",
 ]
 
