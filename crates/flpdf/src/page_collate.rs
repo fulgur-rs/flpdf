@@ -116,7 +116,10 @@ pub fn collate(plan: &CombinedPlan, n: usize) -> Result<Vec<CombinedPage>> {
                 continue;
             }
 
-            let end = (cursor + n).min(pages.len());
+            // saturating_add: `n` is a caller-supplied usize; a huge --collate=N
+            // must clamp to pages.len(), not overflow (panic in debug / wrap in
+            // release into an invalid slice range).
+            let end = cursor.saturating_add(n).min(pages.len());
             for page in &pages[cursor..end] {
                 result.push(CombinedPage {
                     source_index,
