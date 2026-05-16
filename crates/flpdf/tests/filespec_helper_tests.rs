@@ -471,3 +471,54 @@ fn params_indirect_reference_resolves() {
         Some(b"D:20260101000000Z".to_vec())
     );
 }
+
+#[test]
+fn embedded_file_skips_non_stream_higher_priority_key() {
+    // /EF << /UF 7 0 R /F 6 0 R >> where 7 0 R is a dictionary (not a
+    // stream) and 6 0 R is a valid /EmbeddedFile. /UF is higher priority
+    // but must be skipped so /F's stream is returned.
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ 4 0 R ] /Count 1 >>\nendobj\n");
+    offsets.insert(4, out.len() as u64);
+    out.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 612 792 ] >>\nendobj\n",
+    );
+    offsets.insert(5, out.len() as u64);
+    out.extend_from_slice(
+        b"5 0 obj\n<< /Type /Filespec /F (a.txt) /EF << /UF 7 0 R /F 6 0 R >> >>\nendobj\n",
+    );
+    let payload = b"from-F-stream";
+    offsets.insert(6, out.len() as u64);
+    out.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /EmbeddedFile /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.insert(7, out.len() as u64);
+    out.extend_from_slice(b"7 0 obj\n<< /NotAStream true >>\nendobj\n");
+    let xref_start = out.len() as u64;
+    let n = 8u32;
+    out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for i in 1..n {
+        let off = offsets.get(&i).copied().unwrap_or(0);
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+
+    let mut pdf = open(out);
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
+}
