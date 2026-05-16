@@ -340,7 +340,7 @@ fn coalesce_contents_merges_array_to_single_stream() {
 /// filter consistent with the original while comparing full operand values.
 fn collect_content_tokens(bytes: &[u8]) -> Vec<ContentToken> {
     ContentStreamParser::new(bytes)
-        .filter_map(|t| t.ok())
+        .map(|t| t.expect("content stream must parse successfully"))
         .filter(|t| matches!(t, ContentToken::Op { .. }))
         .collect()
 }
