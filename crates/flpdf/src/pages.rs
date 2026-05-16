@@ -258,10 +258,7 @@ fn collect_content_streams<R: Read + Seek>(
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn coalesce_page_contents<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<()> {
+pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<()> {
     // ── 1. Resolve the page dictionary ────────────────────────────────────────
     let page_obj = pdf.resolve(page_ref)?;
     let Object::Dictionary(page_dict) = page_obj else {

@@ -283,8 +283,7 @@ fn coalesce_newline_prevents_token_fusion() {
     // Verify the separator is b'\n'.
     let expected_sep_pos = seg1.len();
     assert_eq!(
-        s.data[expected_sep_pos],
-        b'\n',
+        s.data[expected_sep_pos], b'\n',
         "separator byte must be '\\n'"
     );
 
@@ -382,7 +381,10 @@ fn coalesce_noop_for_single_stream_reference() {
     let Object::Dictionary(before_dict) = before_obj else {
         panic!("page is not a dict");
     };
-    let before_contents = before_dict.get("Contents").cloned().expect("/Contents present");
+    let before_contents = before_dict
+        .get("Contents")
+        .cloned()
+        .expect("/Contents present");
 
     pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
 
@@ -391,7 +393,10 @@ fn coalesce_noop_for_single_stream_reference() {
     let Object::Dictionary(after_dict) = after_obj else {
         panic!("page is not a dict");
     };
-    let after_contents = after_dict.get("Contents").cloned().expect("/Contents present");
+    let after_contents = after_dict
+        .get("Contents")
+        .cloned()
+        .expect("/Contents present");
 
     assert_eq!(
         before_contents, after_contents,
@@ -434,7 +439,10 @@ fn coalesce_noop_for_single_element_array() {
     let Object::Dictionary(before_dict) = before_obj else {
         panic!();
     };
-    let before_contents = before_dict.get("Contents").cloned().expect("/Contents present");
+    let before_contents = before_dict
+        .get("Contents")
+        .cloned()
+        .expect("/Contents present");
 
     pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
 
@@ -442,7 +450,10 @@ fn coalesce_noop_for_single_element_array() {
     let Object::Dictionary(after_dict) = after_obj else {
         panic!();
     };
-    let after_contents = after_dict.get("Contents").cloned().expect("/Contents present");
+    let after_contents = after_dict
+        .get("Contents")
+        .cloned()
+        .expect("/Contents present");
 
     assert_eq!(
         before_contents, after_contents,
@@ -471,7 +482,10 @@ fn coalesce_noop_for_direct_stream_in_contents() {
     let Object::Dictionary(before_dict) = before_obj else {
         panic!();
     };
-    let before_contents = before_dict.get("Contents").cloned().expect("/Contents present");
+    let before_contents = before_dict
+        .get("Contents")
+        .cloned()
+        .expect("/Contents present");
 
     pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0))
         .expect("coalesce should succeed (noop)");
@@ -480,7 +494,10 @@ fn coalesce_noop_for_direct_stream_in_contents() {
     let Object::Dictionary(after_dict) = after_obj else {
         panic!();
     };
-    let after_contents = after_dict.get("Contents").cloned().expect("/Contents present");
+    let after_contents = after_dict
+        .get("Contents")
+        .cloned()
+        .expect("/Contents present");
 
     assert_eq!(before_contents, after_contents);
 }
