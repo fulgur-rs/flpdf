@@ -199,6 +199,12 @@ pub struct PdfOpenOptions {
     pub password_mode: PasswordMode,
     /// Permit deprecated RC4-backed handlers and revision 5 AES-256.
     pub allow_weak_crypto: bool,
+    /// Interpret [`password`](Self::password) as the precomputed file
+    /// encryption key in hex, NOT a user/owner password (qpdf
+    /// `--password-is-hex-key`). When set, all password→key derivation
+    /// (Algorithm 2 / 2.A / 2.B / 6 / 7) is skipped and `hex_decode(password)`
+    /// is used directly as the file key for stream/string decryption.
+    pub password_is_hex_key: bool,
 }
 
 impl<R: Read + Seek> Pdf<R> {
@@ -403,7 +409,17 @@ impl<R: Read + Seek> Pdf<R> {
         let revision = required_revision(&encrypt)?;
         let permissions = Permissions::new(required_permissions(&encrypt)?);
         let crypt_filters = crypt_filter_modes(&encrypt, revision)?;
-        let password = normalize_password(&options.password, options.password_mode, revision)?;
+        // Under `--password-is-hex-key` the --password value is a raw hex key,
+        // not a password, so password-encoding normalization (which can reject
+        // e.g. `--password-mode=unicode` on V<5) must not run and is unused by
+        // the hex-key branch. Skip it; the hex-key branch decodes the raw
+        // value itself. The `else` (layer-2) branches still see the normalized
+        // password unchanged.
+        let password = if options.password_is_hex_key {
+            Vec::new()
+        } else {
+            normalize_password(&options.password, options.password_mode, revision)?
+        };
         let (
             file_key,
             stream_mode,
@@ -412,7 +428,63 @@ impl<R: Read + Seek> Pdf<R> {
             weak_crypto,
             user_password_matched,
             owner_password_matched,
-        ) = if matches!(revision, 5 | 6) {
+        ) = if options.password_is_hex_key {
+            // qpdf `--password-is-hex-key`: the value passed via --password is
+            // the precomputed file encryption key as hex, NOT a user/owner
+            // password. We skip ALL password→key derivation (Algorithm 2 /
+            // 2.A / 2.B / 6 / 7) and the layer-2 user/owner attempt +
+            // bad-password ordering block entirely. This is a SEPARATE
+            // sibling branch: the `else` below preserves layer-2's reordered
+            // password/weak-crypto logic verbatim (flpdf-9hc.3.21).
+            //
+            // revision / crypt_filters / encrypt_ref / permissions are already
+            // determined above and do NOT depend on the password. Modes and
+            // /EncryptMetadata are likewise password-independent; compute them
+            // with the SAME revision-aware split layer-2 uses (the V<5/V=4
+            // helper returns RC4/RC4 unconditionally for V≠4, so it must not
+            // be applied to a V=5 document).
+            let file_key = decode_hex_file_key(&options.password)?;
+            let (stream_mode, string_mode, encrypt_metadata, weak_crypto) =
+                if matches!(revision, 5 | 6) {
+                    let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
+                    let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
+                    // Same weak-crypto classification as layer-2's R5/R6 branch.
+                    (stream_mode, string_mode, encrypt_metadata, revision == 5)
+                } else {
+                    let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
+                    let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
+                    let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
+                        || matches!(string_mode, EncryptionMode::Rc4)
+                        || crypt_filters
+                            .values()
+                            .any(|mode| matches!(mode, EncryptionMode::Rc4));
+                    (
+                        stream_mode,
+                        string_mode,
+                        inputs.encrypt_metadata,
+                        weak_crypto,
+                    )
+                };
+            // Honor the weak-crypto gate consistently with the password path:
+            // qpdf still requires --allow-weak-crypto for RC4 / R=5 even when a
+            // raw key is supplied. Keep the existing post-key gate behavior;
+            // do NOT special-case the explicit-key path.
+            if weak_crypto && !options.allow_weak_crypto {
+                return Err(EncryptedError::WeakCryptoNotAllowed.into());
+            }
+            // A raw key bypasses authentication, so neither the user nor the
+            // owner password was matched. qpdf likewise reports no password
+            // match for `--password-is-hex-key`; report both as false.
+            (
+                file_key,
+                stream_mode,
+                string_mode,
+                encrypt_metadata,
+                weak_crypto,
+                false,
+                false,
+            )
+        } else if matches!(revision, 5 | 6) {
             // Error-variant firing order (must match qpdf, see flpdf-9hc.3.21):
             //
             //   1. Password authentication runs FIRST.  If neither the user nor
@@ -1281,6 +1353,37 @@ fn map_uo_length_to_bad_password(err: Error) -> Error {
         }
         _ => err,
     }
+}
+
+/// Decode the `--password` value as a raw hex file encryption key for
+/// `--password-is-hex-key` (qpdf parity).
+///
+/// qpdf accepts upper- or lower-case hex and tolerates embedded whitespace;
+/// the decoded key must be at most 32 bytes (the longest Standard-handler key,
+/// AES-256). Invalid hex or an over-length key is reported as a clear
+/// [`EncryptedError::Malformed`] — never a panic. An empty input decodes to an
+/// empty key and is passed through unchanged (decryption then fails naturally
+/// downstream; no special-casing here).
+fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
+    let trimmed: Vec<u8> = raw
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let key = hex::decode(&trimmed).map_err(|err| EncryptedError::Malformed {
+        reason: format!("--password-is-hex-key: --password is not valid hex ({err})"),
+    })?;
+    if key.len() > 32 {
+        return Err(EncryptedError::Malformed {
+            reason: format!(
+                "--password-is-hex-key: decoded key is {} bytes; \
+                 the Standard security handler key is at most 32 bytes",
+                key.len()
+            ),
+        }
+        .into());
+    }
+    Ok(key)
 }
 
 fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5Inputs<'_>> {
