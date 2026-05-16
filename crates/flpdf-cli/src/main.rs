@@ -1,5 +1,11 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::{
+    acroform_field_prune::prune_acroform_after_subset, outline_dest_remap::remap_outline_and_dests,
+    page_collate::collate, page_combine::CombinedPlan, page_rotate::apply_rotate_to_pages,
+    page_split::split_pages, page_tree_rebuild::rebuild_page_tree,
+    subset_prune::prune_after_subset, InputSpec, PageRange, RotateSpec,
+};
+use flpdf::{
     check_reader_with_options, filters, fonts,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects, DecodeLevel,
@@ -254,8 +260,107 @@ struct Cli {
     #[arg(long = "linearize-pass1")]
     linearize_pass1: Option<PathBuf>,
 
+    // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
+    // These mirror qpdf's page-selection / page-transformation surface.
+    // Observed against /usr/bin/qpdf 11.9.0:
+    //   qpdf --help=--pages / --rotate / --split-pages / --collate
+    //   qpdf in.pdf --pages . a.pdf b.pdf 1-z:even -- out.pdf
+    #[command(flatten)]
+    page_ops: PageOpArgs,
+
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+}
+
+/// qpdf-compatible page-operation flags, shared by the top-level CLI and the
+/// `rewrite` subcommand.
+///
+/// `--pages SPEC... --` captures the raw multi-input page-selection segment
+/// verbatim (clap `value_terminator = "--"`, `allow_hyphen_values = true`) so
+/// the embedded `--password=` / `--file=` / `--range=` tokens reach the
+/// hand-written segment parser rather than being eaten as global flags. This
+/// was verified empirically: with this attribute set, the top-level
+/// `--password` field stays `None` while the segment vec captures
+/// `["--password=x", …]`.
+#[derive(Debug, Clone, Default, ClapArgs)]
+struct PageOpArgs {
+    /// Select pages from one or more input files (qpdf `--pages`).
+    ///
+    /// Syntax (qpdf 11.9.0 `--help=page-selection`):
+    ///   `--pages [--file=]file [--password=pw] [page-range] [...] -- out.pdf`
+    /// `.` is a shorthand for the primary input file. An omitted page-range
+    /// selects all pages of that file. The `--` terminator ends the segment;
+    /// the token after it is the OUTPUT positional.
+    ///
+    /// Cross-document merge (pages from more than one distinct source file) is
+    /// out of scope for this layer — see the SCOPE comment in
+    /// `run_page_extraction`.
+    #[arg(
+        long = "pages",
+        num_args = 0..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "SPEC",
+        help = "Select pages from input files: --pages [--file=]f [--password=p] \
+                [range] [...] -- (qpdf-compatible). '.' = primary input; omitted \
+                range = all pages."
+    )]
+    pages: Vec<String>,
+
+    /// Rotate pages by a multiple of 90 degrees (qpdf `--rotate`).
+    ///
+    /// Form: `[+|-]angle[:page-range]` where angle ∈ {0,90,180,270}.
+    /// Repeatable; specs are applied in argument order. In `--pages` mode the
+    /// page-range refers to OUTPUT page numbers (qpdf 11.9.0-observed:
+    /// `qpdf in --pages . 2-3 -- --rotate=+90:1 out` rotates the first
+    /// extracted page).
+    #[arg(
+        long = "rotate",
+        action = clap::ArgAction::Append,
+        value_name = "[+|-]angle[:range]",
+        help = "Rotate pages by 0/90/180/270 degrees (qpdf --rotate); repeatable"
+    )]
+    rotate: Vec<String>,
+
+    /// Write one output file per N-page group instead of a single file
+    /// (qpdf `--split-pages[=n]`, default n=1).
+    ///
+    /// File names are derived by `page_split::split_output_path` (8.7's
+    /// contract): a `-first-last` suffix is inserted before the `.pdf`
+    /// extension. Compatible with `--pages`.
+    #[arg(
+        long = "split-pages",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        require_equals = true,
+        value_name = "N",
+        help = "Split output into N-page files (qpdf --split-pages[=n], default 1)"
+    )]
+    split_pages: Option<String>,
+
+    /// Collate (interleave) pages selected with `--pages` instead of
+    /// concatenating (qpdf `--collate[=n[,m,...]]`, default n=1).
+    ///
+    /// Only meaningful together with `--pages`; qpdf 11.9.0 accepts it as a
+    /// no-op otherwise (exit 0), and flpdf matches that.
+    #[arg(
+        long = "collate",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        require_equals = true,
+        value_name = "N",
+        help = "Collate --pages selections in groups of N (qpdf --collate[=n], default 1)"
+    )]
+    collate: Option<String>,
+
+    /// `qpdf --empty` — start from an empty document. Parsed for qpdf-script
+    /// compatibility but NOT implemented at this layer (would silently
+    /// produce wrong output if ignored), so it errors actionably.
+    #[arg(
+        long = "empty",
+        help = "(qpdf --empty) start from an empty document — NOT yet implemented"
+    )]
+    empty: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -541,6 +646,11 @@ struct RewriteCommand {
     #[arg(long = "newline-before-endstream", value_enum, default_value_t = CliYesNo::Yes,
           help = "Insert newline before endstream keyword (qpdf default: y)")]
     newline_before_endstream: CliYesNo,
+
+    /// qpdf-compatible page-operation flags (--pages / --rotate /
+    /// --split-pages / --collate / --empty). See [`PageOpArgs`].
+    #[command(flatten)]
+    page_ops: PageOpArgs,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -686,6 +796,16 @@ fn main() {
     } else if args.check {
         run_check(args.input, args.repair, &args.password)
     } else if args.linearize {
+        // --linearize is incompatible with the page-extraction pipeline:
+        // extraction produces a normalized, non-linearized document. Without
+        // this guard the linearize branch would win the dispatch chain and
+        // silently ignore --pages/--rotate/--split-pages (wrong output, no
+        // diagnostic). Mirror the same rejection the `rewrite` subcommand
+        // performs.
+        if page_ops_active(&args.page_ops) {
+            eprintln!("flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages");
+            std::process::exit(1);
+        }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
@@ -728,6 +848,48 @@ fn main() {
             }
         }
         result
+    } else if page_ops_active(&args.page_ops) {
+        // Top-level page-operation path (qpdf-shaped invocation:
+        // `flpdf in.pdf --pages . 1-3 -- out.pdf`). Mirrors the `rewrite`
+        // subcommand's page-op dispatch below.
+        let mut options = WriteOptions::default();
+        options.static_id = args.static_id;
+        if let Some(ref cs) = args.compress_streams {
+            match cs.as_str() {
+                "y" => options.compress_streams = CompressStreams::Yes,
+                "n" => options.compress_streams = CompressStreams::No,
+                other => {
+                    eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
+                    std::process::exit(2);
+                }
+            }
+        }
+        let dispatch = |input: PathBuf, output: PathBuf| -> CliResult<()> {
+            if !args.page_ops.pages.is_empty() {
+                run_page_extraction(
+                    &input,
+                    &output,
+                    args.repair,
+                    &args.password,
+                    &args.page_ops,
+                    CliRemoveUnreferencedResources::Auto,
+                    options.clone(),
+                )
+            } else {
+                run_rewrite_with_page_ops(
+                    &input,
+                    &output,
+                    args.repair,
+                    &args.password,
+                    &args.page_ops,
+                    options.clone(),
+                )
+            }
+        };
+        match (args.input.clone(), args.output.clone()) {
+            (Some(i), Some(o)) => dispatch(i, o),
+            _ => Err("page operations require both an input and an output file".into()),
+        }
     } else {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
@@ -1016,6 +1178,41 @@ fn run_command(command: Commands) -> CliResult<()> {
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
+
+            // Page-operation dispatch (flpdf-9hc.8.12). When --pages is set
+            // the extraction pipeline owns the write; otherwise --rotate /
+            // --split-pages decorate a plain rewrite. --linearize with page
+            // ops is rejected (the extraction path produces a normalized,
+            // non-linearized document).
+            if page_ops_active(&cmd.page_ops) {
+                if cmd.linearize {
+                    eprintln!(
+                        "flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages"
+                    );
+                    std::process::exit(1);
+                }
+                return if !cmd.page_ops.pages.is_empty() {
+                    run_page_extraction(
+                        &cmd.input,
+                        &cmd.output,
+                        cmd.repair,
+                        &cmd.password,
+                        &cmd.page_ops,
+                        remove_unref,
+                        options,
+                    )
+                } else {
+                    run_rewrite_with_page_ops(
+                        &cmd.input,
+                        &cmd.output,
+                        cmd.repair,
+                        &cmd.password,
+                        &cmd.page_ops,
+                        options,
+                    )
+                };
+            }
+
             run_rewrite(
                 Some(cmd.input),
                 Some(cmd.output),
@@ -1213,6 +1410,369 @@ fn run_rewrite(
         // unencrypted files.
     }
     Ok(())
+}
+
+// ===========================================================================
+// Page operations (flpdf-9hc.8.12): --pages / --rotate / --split-pages /
+// --collate plumbing.
+//
+// qpdf observation basis (/usr/bin/qpdf 11.9.0):
+//   - `qpdf --help=page-selection` documents the
+//     `--pages [--file=]f [--password=p] [range] [...] -- out` segment, the
+//     `.` shorthand for the primary input, and `--collate=n`.
+//   - `qpdf in.pdf --pages . 2-3 -- --rotate=+90:1 out.pdf` rotates the FIRST
+//     EXTRACTED page (verified: source page 2's object got /Rotate 90, source
+//     page 3 stayed /Rotate 0) — so --rotate ranges index OUTPUT page numbers.
+//   - `qpdf --split-pages=2 in.pdf out.pdf` writes `out-1-2.pdf`,`out-3-3.pdf`.
+//   - `--collate` / `--rotate` / `--split-pages` without `--pages` exit 0 in
+//     qpdf; flpdf matches (rotate applies to the source doc, collate no-op,
+//     split operates on the rewritten bytes).
+// ===========================================================================
+
+/// One parsed entry from the `--pages` segment before file resolution.
+struct PageSegmentSpec {
+    /// File token as written (`.` = primary input, or a path).
+    file_token: String,
+    /// Per-input password (`--password=` immediately following the file).
+    password: Option<String>,
+    /// Page-range string (empty = all pages).
+    range: String,
+}
+
+/// Parse the raw `--pages` segment tokens into ordered specs.
+///
+/// Grammar (qpdf 11.9.0 `--help=page-selection`, both the modern
+/// `--file=`/`--range=` form and the legacy positional form):
+///
+/// ```text
+/// segment ::= ( file [ '--password=' pw ] [ range ] )+
+/// file    ::= '--file=' PATH | PATH | '.'
+/// range   ::= '--range=' R | R          (R = qpdf page-range syntax)
+/// ```
+///
+/// Bounded, non-recursive single pass over `tokens`; no panics.
+fn parse_pages_segment(tokens: &[String]) -> CliResult<Vec<PageSegmentSpec>> {
+    let mut specs: Vec<PageSegmentSpec> = Vec::new();
+
+    for tok in tokens {
+        if let Some(path) = tok.strip_prefix("--file=") {
+            specs.push(PageSegmentSpec {
+                file_token: path.to_string(),
+                password: None,
+                range: String::new(),
+            });
+            continue;
+        }
+        if let Some(pw) = tok.strip_prefix("--password=") {
+            let cur = specs
+                .last_mut()
+                .ok_or("--pages: --password= must follow a file in the --pages segment")?;
+            cur.password = Some(pw.to_string());
+            continue;
+        }
+        if let Some(r) = tok.strip_prefix("--range=") {
+            let cur = specs
+                .last_mut()
+                .ok_or("--pages: --range= must follow a file in the --pages segment")?;
+            if !cur.range.is_empty() {
+                return Err("--pages: duplicate page-range for one input file".into());
+            }
+            cur.range = r.to_string();
+            continue;
+        }
+        if tok.starts_with("--") {
+            return Err(format!(
+                "--pages: unsupported token {tok:?} in the page-selection segment"
+            )
+            .into());
+        }
+        // Positional token: either a NEW file, or the page-range for the
+        // current file. qpdf's heuristic: the token is a page-range iff a
+        // file is already open and that file has no range yet AND the token
+        // parses as a page-range. Otherwise it starts a new file.
+        match specs.last_mut() {
+            Some(cur) if cur.range.is_empty() && PageRange::parse(tok).is_ok() => {
+                cur.range = tok.clone();
+            }
+            _ => specs.push(PageSegmentSpec {
+                file_token: tok.clone(),
+                password: None,
+                range: String::new(),
+            }),
+        }
+    }
+
+    if specs.is_empty() {
+        return Err("--pages: no input files given in the page-selection segment".into());
+    }
+    Ok(specs)
+}
+
+/// Resolve `--pages` specs into [`InputSpec`]s, mapping the `.` shorthand to
+/// the primary input path. Also returns the set of distinct resolved paths so
+/// the caller can enforce the single-document scope boundary.
+fn resolve_page_specs(
+    specs: &[PageSegmentSpec],
+    primary_input: &std::path::Path,
+) -> CliResult<Vec<InputSpec>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for s in specs {
+        let path: PathBuf = if s.file_token == "." {
+            primary_input.to_path_buf()
+        } else {
+            PathBuf::from(&s.file_token)
+        };
+        let range = PageRange::parse(&s.range).map_err(|e| {
+            Box::<dyn std::error::Error>::from(format!(
+                "--pages: invalid page range {:?}: {e}",
+                s.range
+            ))
+        })?;
+        out.push(InputSpec::new(path, s.password.clone(), range));
+    }
+    Ok(out)
+}
+
+/// Parse `--collate` value: `n` or `i,j,k,...`. flpdf's [`collate`] supports a
+/// single chunk size `n`; the comma form is parsed but only the first value is
+/// honoured (a documented divergence — full per-input groups are out of scope
+/// for 8.12; see flpdf-9hc.8.13's matrix).
+fn parse_collate_n(raw: &str) -> CliResult<usize> {
+    let first = raw.split(',').next().unwrap_or(raw);
+    let n: usize = first
+        .parse()
+        .map_err(|_| format!("--collate: expected a positive integer, got {raw:?}"))?;
+    if n == 0 {
+        return Err("--collate: group size must be >= 1".into());
+    }
+    Ok(n)
+}
+
+/// Run the `--pages` extraction pipeline.
+///
+/// Pipeline order is fixed by the flpdf-9hc.8 DESIGN note (recorded on the bd
+/// issue):
+///   1. page_combine / page_collate → selected ObjectRef list
+///   2. page_tree_rebuild::rebuild_page_tree → RebuildResult
+///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)
+///   4. outline_dest_remap::remap_outline_and_dests          [8.10]
+///   5. subset_prune::prune_after_subset (Auto/Yes/No)       [8.9]
+///   6. acroform_field_prune::prune_acroform_after_subset    [8.11]
+///   7. write (or split_pages when --split-pages is set)
+///
+/// SCOPE BOUNDARY (single document only, flpdf-9hc.8.11 / .8.10):
+/// `rebuild_page_tree` and the post-rebuild passes operate on ONE [`Pdf`].
+/// Cross-document page merge (selecting pages from more than one distinct
+/// source file) — and the cross-doc AcroForm field-collision renaming it
+/// would require — is explicitly out of scope here. When the resolved
+/// `--pages` specs reference more than one distinct file we surface an
+/// actionable [`Error::Unsupported`] instead of silently producing wrong
+/// output or swallowing the limitation.
+#[allow(clippy::too_many_arguments)]
+fn run_page_extraction(
+    primary_input: &std::path::Path,
+    output: &std::path::Path,
+    repair: bool,
+    password: &PasswordArgs,
+    page_ops: &PageOpArgs,
+    remove_unref: CliRemoveUnreferencedResources,
+    options: WriteOptions,
+) -> CliResult<()> {
+    if page_ops.empty {
+        // qpdf accepts `--empty`; ignoring it would silently change which
+        // document supplies the catalog/outlines. Fail loudly instead.
+        return Err(
+            "--empty is accepted by qpdf but not implemented in flpdf at this layer \
+             (tracked separately); rerun without --empty"
+                .into(),
+        );
+    }
+
+    let specs = parse_pages_segment(&page_ops.pages)?;
+    let inputs = resolve_page_specs(&specs, primary_input)?;
+
+    // ── Single-document scope enforcement ────────────────────────────────
+    let mut distinct: Vec<&std::path::Path> = Vec::new();
+    for spec in &inputs {
+        if !distinct.contains(&spec.path.as_path()) {
+            distinct.push(spec.path.as_path());
+        }
+    }
+    if distinct.len() > 1 {
+        return Err(format!(
+            "--pages: cross-document page merge is not supported at this layer \
+             (got {} distinct source files: {}). Single-document extraction \
+             (repeats of the same file or '.') is supported; cross-doc merge \
+             and AcroForm field-collision handling are tracked in a separate issue.",
+            distinct.len(),
+            distinct
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into());
+    }
+
+    // CombinedPlan::from_specs opens each file itself; its per-input
+    // PagePlans carry source ObjectRefs that are stable across a re-open of
+    // identical bytes. We use it only for selection/collation planning, then
+    // open the (single) resolved source ourselves for the rebuild passes.
+    let plan = CombinedPlan::from_specs(inputs.clone())?;
+
+    let combined_pages = match page_ops.collate.as_deref() {
+        Some(raw) => {
+            let n = parse_collate_n(raw)?;
+            collate(&plan, n)?
+        }
+        None => plan.flat_pages().to_vec(),
+    };
+
+    // All combined pages belong to source_index files that all resolve to the
+    // same path (enforced above), so their page_refs are valid against a
+    // freshly-opened handle of that file.
+    let source_path = &inputs[0].path;
+    let source_password = inputs[0].password.clone();
+    let mut src_pw = password.clone();
+    if let Some(pw) = source_password {
+        src_pw.password = Some(pw);
+        src_pw.password_file = None;
+    }
+    let mut pdf = open_pdf(&source_path.to_path_buf(), repair, &src_pw)?;
+    reject_encrypted_write(&pdf)?;
+
+    let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
+    if selected.is_empty() {
+        return Err("--pages: page selection is empty".into());
+    }
+
+    // Step 2: rebuild the page tree from the selected leaves.
+    let result = rebuild_page_tree(&mut pdf, &selected)?;
+
+    // Step 3: --rotate, applied in argument order. In --pages mode the
+    // range indexes the OUTPUT page list (result.new_kids), matching the
+    // qpdf 11.9.0 observation documented at the top of this section.
+    // Ordering note: rotate runs after rebuild but before the remap/prune
+    // passes. This is order-independent w.r.t. those passes — rotate only
+    // mutates each leaf's /Rotate, never the /Outlines, /Names, /AcroForm,
+    // or orphaned-resource graph that steps 4–6 operate on.
+    apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
+
+    // Step 4: outline / named-destination remap-or-drop (8.10).
+    remap_outline_and_dests(&mut pdf, &result)?;
+
+    // Step 5: unreferenced-resource prune + xref GC (8.9).
+    prune_after_subset(&mut pdf, remove_unref.into())?;
+
+    // Step 6: AcroForm field/widget prune (8.11). The single-document API
+    // boundary makes the cross-doc field-collision case unreachable here;
+    // any Unsupported it returns is propagated, not swallowed.
+    prune_acroform_after_subset(&mut pdf, &result)?;
+
+    // Step 7: serialize. Extraction always implies a full document rewrite.
+    let mut options = options;
+    options.full_rewrite = true;
+    let mut bytes: Vec<u8> = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut bytes, &options)?;
+
+    if let Some(raw) = page_ops.split_pages.as_deref() {
+        let n = parse_split_n(raw)?;
+        split_pages(&bytes, n, output)?;
+    } else {
+        std::fs::write(output, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Apply each `--rotate` spec (in order) to `target_pages`, resolving each
+/// spec's page-range against the number of target pages.
+fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
+    pdf: &mut Pdf<R>,
+    rotate_args: &[String],
+    target_pages: &[ObjectRef],
+) -> CliResult<()> {
+    if rotate_args.is_empty() {
+        return Ok(());
+    }
+    let total = u32::try_from(target_pages.len())
+        .map_err(|_| "too many pages to apply --rotate".to_string())?;
+    for raw in rotate_args {
+        let spec =
+            RotateSpec::parse(raw).map_err(|e| format!("--rotate: invalid spec {raw:?}: {e}"))?;
+        let indices = spec
+            .range
+            .resolve(total)
+            .map_err(|e| format!("--rotate: page range out of bounds in {raw:?}: {e}"))?;
+        let pages: Vec<ObjectRef> = indices
+            .iter()
+            .filter_map(|&i| target_pages.get((i - 1) as usize).copied())
+            .collect();
+        apply_rotate_to_pages(pdf, &pages, &spec.op)?;
+    }
+    Ok(())
+}
+
+/// Parse `--split-pages[=n]` (default 1; qpdf-compatible).
+fn parse_split_n(raw: &str) -> CliResult<usize> {
+    let n: usize = raw
+        .parse()
+        .map_err(|_| format!("--split-pages: expected a positive integer, got {raw:?}"))?;
+    if n == 0 {
+        return Err("--split-pages: group size must be >= 1".into());
+    }
+    Ok(n)
+}
+
+/// Apply `--rotate` / `--split-pages` to a plain (no `--pages`) rewrite.
+///
+/// qpdf accepts these without `--pages` (exit 0). `--rotate` mutates the
+/// source document's pages directly (no page-tree rebuild); `--split-pages`
+/// chunks the rewritten output. `--collate` without `--pages` is a no-op,
+/// matching qpdf.
+fn run_rewrite_with_page_ops(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    repair: bool,
+    password: &PasswordArgs,
+    page_ops: &PageOpArgs,
+    options: WriteOptions,
+) -> CliResult<()> {
+    if page_ops.empty {
+        return Err(
+            "--empty is accepted by qpdf but not implemented in flpdf at this layer \
+             (tracked separately); rerun without --empty"
+                .into(),
+        );
+    }
+    let mut pdf = open_pdf(&input.to_path_buf(), repair, password)?;
+    reject_encrypted_write(&pdf)?;
+
+    if !page_ops.rotate.is_empty() {
+        let page_refs = pages::page_refs(&mut pdf)?;
+        apply_rotate_specs(&mut pdf, &page_ops.rotate, &page_refs)?;
+    }
+
+    // Force a full rewrite so the in-memory /Rotate mutations are emitted
+    // (the incremental write path copies source bytes verbatim).
+    let mut options = options;
+    options.full_rewrite = true;
+    let mut bytes: Vec<u8> = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut bytes, &options)?;
+
+    if let Some(raw) = page_ops.split_pages.as_deref() {
+        let n = parse_split_n(raw)?;
+        split_pages(&bytes, n, output)?;
+    } else {
+        std::fs::write(output, &bytes)?;
+    }
+    Ok(())
+}
+
+/// True when any page-operation flag that requires the page-op code paths is
+/// set. `--collate` alone (no `--pages`) is a documented no-op and does NOT
+/// trigger this on its own.
+fn page_ops_active(p: &PageOpArgs) -> bool {
+    !p.pages.is_empty() || !p.rotate.is_empty() || p.split_pages.is_some() || p.empty
 }
 
 /// Normalize the content stream(s) for a single page.

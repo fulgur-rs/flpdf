@@ -1429,6 +1429,512 @@ fn rewrite_normalize_and_remove_unreferenced_combination() {
         .success();
 }
 
+// ===========================================================================
+// Page operations: --pages / --rotate / --split-pages / --collate
+// (flpdf-9hc.8.12).
+//
+// qpdf observation basis (/usr/bin/qpdf 11.9.0): see the comment block at the
+// top of the page-ops section in main.rs. Key facts encoded in these tests:
+//   - `qpdf in --pages . 2-3 -- --rotate=+90:1 out` rotates the first
+//     EXTRACTED page (output page numbering).
+//   - `qpdf --split-pages=2 in out.pdf` → out-1-2.pdf, out-3-3.pdf.
+//   - `--collate`/`--rotate`/`--split-pages` without `--pages` exit 0.
+// ===========================================================================
+
+const THREE_PAGE: &str = "../../tests/fixtures/compat/three-page.pdf";
+const TWO_PAGE: &str = "../../tests/fixtures/compat/two-page.pdf";
+
+/// Build a 3-page PDF where:
+///   - each page carries its own `/Resources /Font` with a DISTINCT font
+///     entry (F1/F2/F3 → fonts 30/31/32),
+///   - an `/Outlines` tree has one item per page (Item1→p1, Item2→p2,
+///     Item3→p3),
+///   - a `/Names /Dests` name-tree maps "d1"/"d2"/"d3" to the three pages.
+///
+/// Used to assert, via the CLI, that after `--pages` extraction the
+/// post-rebuild passes actually run: dropped pages' outline items and named
+/// dests are gone, surviving ones repoint, and dropped pages' font resources
+/// are pruned out of the output.
+///
+/// Object layout (numbers are stable; ObjectRef gen 0):
+///   1  Catalog (/Pages 2 /Outlines 20 /Names 25)
+///   2  Pages root (/Kids [3 6 9])
+///   3  Page 1 (/Contents 4 /Resources << /Font 5 >>)
+///   4  content p1   5  /Font << /F1 30 >>
+///   6  Page 2 (/Contents 7 /Resources << /Font 8 >>)
+///   7  content p2   8  /Font << /F2 31 >>
+///   9  Page 3 (/Contents 10 /Resources << /Font 11 >>)
+///  10  content p3  11  /Font << /F3 32 >>
+///  20  Outlines root (/First 21 /Last 23 /Count 3)
+///  21  Item1 (/Dest [3 /Fit] /Next 22)
+///  22  Item2 (/Dest [6 /Fit] /Prev 21 /Next 23)
+///  23  Item3 (/Dest [9 /Fit] /Prev 22)
+///  25  Names (/Dests 26)
+///  26  Dests name-tree leaf (/Names [(d1) [3 /Fit] (d2) [6 /Fit] (d3) [9 /Fit]])
+///  30  Font F1   31  Font F2   32  Font F3
+fn outline_dests_three_page_pdf() -> Vec<u8> {
+    let c1 = b"BT /F1 12 Tf 1 1 Td (P1) Tj ET";
+    let c2 = b"BT /F2 12 Tf 1 1 Td (P2) Tj ET";
+    let c3 = b"BT /F3 12 Tf 1 1 Td (P3) Tj ET";
+
+    let mut out: Vec<u8> = b"%PDF-1.5\n".to_vec();
+    let mut offs: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+
+    let emit =
+        |out: &mut Vec<u8>, offs: &mut std::collections::BTreeMap<u32, u64>, n: u32, body: &str| {
+            offs.insert(n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+    let emit_stream = |out: &mut Vec<u8>,
+                       offs: &mut std::collections::BTreeMap<u32, u64>,
+                       n: u32,
+                       data: &[u8]| {
+        offs.insert(n, out.len() as u64);
+        out.extend_from_slice(
+            format!("{n} 0 obj\n<< /Length {} >>\nstream\n", data.len()).as_bytes(),
+        );
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    };
+
+    emit(
+        &mut out,
+        &mut offs,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 20 0 R /Names 25 0 R >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R] /Count 3 >>",
+    );
+    emit(&mut out, &mut offs, 3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font 5 0 R >> >>");
+    emit_stream(&mut out, &mut offs, 4, c1);
+    emit(&mut out, &mut offs, 5, "<< /F1 30 0 R >>");
+    emit(&mut out, &mut offs, 6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 7 0 R /Resources << /Font 8 0 R >> >>");
+    emit_stream(&mut out, &mut offs, 7, c2);
+    emit(&mut out, &mut offs, 8, "<< /F2 31 0 R >>");
+    emit(&mut out, &mut offs, 9, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 10 0 R /Resources << /Font 11 0 R >> >>");
+    emit_stream(&mut out, &mut offs, 10, c3);
+    emit(&mut out, &mut offs, 11, "<< /F3 32 0 R >>");
+    emit(
+        &mut out,
+        &mut offs,
+        20,
+        "<< /Type /Outlines /First 21 0 R /Last 23 0 R /Count 3 >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        21,
+        "<< /Title (Item1) /Parent 20 0 R /Dest [3 0 R /Fit] /Next 22 0 R >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        22,
+        "<< /Title (Item2) /Parent 20 0 R /Dest [6 0 R /Fit] /Prev 21 0 R /Next 23 0 R >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        23,
+        "<< /Title (Item3) /Parent 20 0 R /Dest [9 0 R /Fit] /Prev 22 0 R >>",
+    );
+    emit(&mut out, &mut offs, 25, "<< /Dests 26 0 R >>");
+    emit(
+        &mut out,
+        &mut offs,
+        26,
+        "<< /Names [(d1) [3 0 R /Fit] (d2) [6 0 R /Fit] (d3) [9 0 R /Fit]] >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        30,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        31,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+    );
+    emit(
+        &mut out,
+        &mut offs,
+        32,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>",
+    );
+
+    let max_obj = 32u32;
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_obj + 1).as_bytes());
+    for i in 1..=max_obj {
+        match offs.get(&i) {
+            Some(off) => out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 00000 f \n"),
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            max_obj + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+// ── Individual flags ──────────────────────────────────────────────────────
+
+#[test]
+fn pages_extracts_subset_top_level_syntax() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", ".", "2-3", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+}
+
+#[test]
+fn pages_dot_shorthand_resolves_to_primary_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("1"));
+}
+
+#[test]
+fn rotate_single_spec_rewrites_all_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .arg(&output)
+        .args(["--rotate=180"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-pages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rotate: 180"));
+}
+
+#[test]
+fn split_pages_produces_chunked_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .arg(&output)
+        .args(["--split-pages=2"])
+        .assert()
+        .success();
+
+    // qpdf 11.9.0 naming: out-1-2.pdf, out-3-3.pdf (width = digits of total).
+    assert!(temp.path().join("out-1-2.pdf").exists());
+    assert!(temp.path().join("out-3-3.pdf").exists());
+    assert!(!output.exists(), "unsplit single file must not be written");
+}
+
+#[test]
+fn collate_without_pages_is_accepted_noop() {
+    // qpdf 11.9.0 accepts --collate without --pages (exit 0); flpdf matches.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .arg(&output)
+        .args(["--collate=2"])
+        .assert()
+        .success();
+    assert!(output.exists());
+}
+
+// ── Combinations matching qpdf documented examples ────────────────────────
+
+#[test]
+fn pages_then_rotate_targets_output_page_numbering() {
+    // qpdf 11.9.0: `qpdf in --pages . 2-3 -- --rotate=+90:1 out` rotates the
+    // FIRST EXTRACTED page only (verified: src page 2 → /Rotate 90, src page
+    // 3 → /Rotate 0). The --rotate range indexes OUTPUT page numbers.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", ".", "2-3", "--"])
+        .arg("--rotate=+90:1")
+        .arg(&output)
+        .assert()
+        .success();
+
+    let show = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-pages", output.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
+    // Two output pages; first rotated 90, second 0.
+    let p1 = stdout.find("page 1:").unwrap();
+    let p2 = stdout.find("page 2:").unwrap();
+    assert!(
+        stdout[p1..p2].contains("rotate: 90"),
+        "page 1 should be rotated 90: {stdout}"
+    );
+    assert!(
+        stdout[p2..].contains("rotate: 0"),
+        "page 2 should stay 0: {stdout}"
+    );
+}
+
+#[test]
+fn pages_then_split_pages_combined() {
+    // qpdf documents --split-pages as compatible with --pages.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", ".", "1-3", "--"])
+        .arg("--split-pages=2")
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(temp.path().join("out-1-2.pdf").exists());
+    assert!(temp.path().join("out-3-3.pdf").exists());
+}
+
+#[test]
+fn pages_same_file_repeated_is_single_source() {
+    // `--pages . 1 . 3 --` repeats the primary input → single-document case,
+    // matching qpdf's "." shorthand semantics. 2 pages out.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", ".", "1", ".", "3", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("2"));
+}
+
+// ── Post-rebuild integration: outline/dest remap + resource prune via CLI ──
+
+#[test]
+fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, outline_dests_three_page_pdf()).unwrap();
+
+    // Extract only page 2 (the middle page). After the pipeline:
+    //  - outline Item1 (→ p1) and Item3 (→ p3) must be DROPPED; Item2 kept.
+    //  - named dests d1 and d3 must be DROPPED; d2 kept.
+    //  - fonts of dropped pages (Helvetica F1, Times-Roman F3) must be GC'd;
+    //    only Courier (F2, the kept page's font) survives.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "2", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("1"));
+
+    // Outline: only Item2 survives (Item1/Item3 dropped with their pages).
+    let outline = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-outline", output.to_str().unwrap()])
+        .assert()
+        .success();
+    let outline_txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();
+    assert!(
+        outline_txt.contains("Item2"),
+        "kept outline item missing: {outline_txt}"
+    );
+    assert!(
+        !outline_txt.contains("Item1"),
+        "dropped outline Item1 leaked: {outline_txt}"
+    );
+    assert!(
+        !outline_txt.contains("Item3"),
+        "dropped outline Item3 leaked: {outline_txt}"
+    );
+
+    // Resource prune + xref GC: dropped pages' fonts must not be in output.
+    let raw = std::fs::read(&output).unwrap();
+    let txt = String::from_utf8_lossy(&raw);
+    assert!(
+        txt.contains("Courier"),
+        "kept page's font missing from output"
+    );
+    assert!(
+        !txt.contains("Helvetica"),
+        "dropped page 1 font (Helvetica) was not pruned"
+    );
+    assert!(
+        !txt.contains("Times-Roman"),
+        "dropped page 3 font (Times-Roman) was not pruned"
+    );
+
+    // Output must be structurally valid.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn pages_extraction_keeps_all_when_full_range_selected() {
+    // Selecting every page keeps every outline item and every font.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, outline_dests_three_page_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "1-3", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    let outline = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-outline", output.to_str().unwrap()])
+        .assert()
+        .success();
+    let txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();
+    assert!(txt.contains("Item1") && txt.contains("Item2") && txt.contains("Item3"));
+}
+
+// ── Scope-boundary errors (actionable, not swallowed) ─────────────────────
+
+#[test]
+fn pages_cross_document_merge_is_rejected_actionably() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .args(["--pages", ".", "1", TWO_PAGE, "2", "--"])
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cross-document"))
+        .stderr(predicate::str::contains("not supported"));
+}
+
+#[test]
+fn empty_flag_is_rejected_actionably() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(THREE_PAGE)
+        .arg("--empty")
+        .args(["--pages", ".", "1", "--"])
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--empty"))
+        .stderr(predicate::str::contains("not implemented"));
+}
+
+#[test]
+fn rewrite_subcommand_supports_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(THREE_PAGE)
+        .arg(&output)
+        .args(["--pages", ".", "1-2", "--"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("2"));
+}
+
+#[test]
+fn pages_help_text_mirrors_qpdf_terms() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--pages"))
+        .stdout(predicate::str::contains("--rotate"))
+        .stdout(predicate::str::contains("--split-pages"))
+        .stdout(predicate::str::contains("--collate"));
+}
+
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
