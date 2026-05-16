@@ -29,15 +29,15 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 
 | fixture | flag | flpdf-sha | byte-equal | qpdf-json | structural |
 |---|---|---|---|---|---|
-| one-page.pdf | plain | 2e8bd79704e12f51 | diverge | diverge | diverge |
-| one-page.pdf | static-id | 8bbf34c257fe1141 | diverge | diverge | diverge |
+| one-page.pdf | plain | 0fc00b04084c40d2 | diverge | diverge | diverge |
+| one-page.pdf | static-id | fdb01346b94f8cc2 | diverge | diverge | match |
 | one-page.pdf | linearize | 8f13abe2a7e55c29 | diverge | diverge | diverge |
-| two-page.pdf | plain | 9e959dbb7ff2dea4 | diverge | diverge | diverge |
-| two-page.pdf | static-id | b0f21618b84b835f | diverge | diverge | diverge |
+| two-page.pdf | plain | 2030c93a2367609c | diverge | diverge | diverge |
+| two-page.pdf | static-id | 18fa4638a6243919 | diverge | diverge | match |
 | two-page.pdf | linearize | 0a19fc239f408b06 | diverge | diverge | diverge |
-| three-page.pdf | plain | cdacb767d761d8cd | diverge | diverge | diverge |
-| three-page.pdf | static-id | 5e6e94efa6d229b8 | diverge | diverge | diverge |
+| three-page.pdf | plain | 92e70403b9a04c12 | diverge | diverge | diverge |
+| three-page.pdf | static-id | 0b5000ccab151069 | diverge | diverge | match |
 | three-page.pdf | linearize | da6b7cdf60ce4cfe | diverge | diverge | diverge |
-| linearized-one-page.pdf | plain | b61b931c99624f9f | diverge | diverge | diverge |
-| attachment-two-page.pdf | plain | 8e9f438c4417c29e | diverge | diverge | diverge |
-| attachment-two-page.pdf | static-id | 8e9f438c4417c29e | diverge | diverge | diverge |
+| linearized-one-page.pdf | plain | e72ee1bf259d9d8c | diverge | diverge | diverge |
+| attachment-two-page.pdf | plain | 18017064c480ca19 | diverge | diverge | diverge |
+| attachment-two-page.pdf | static-id | 18017064c480ca19 | diverge | diverge | match |
