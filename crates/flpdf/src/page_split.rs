@@ -165,6 +165,13 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
 /// - Zero-pad `first` and `last` to `width` digits (width = digit count of
 ///   source page count, not chunk count).
 ///
+/// A leading-dot ("hidden file") template such as `.pdf` is intentionally
+/// treated the same as any other: the last `.` is at index 0, so the stem is
+/// empty and the result is `-1-2.pdf`. This is **not** a bug — it matches
+/// qpdf 11.9.0 exactly: `qpdf --split-pages=2 in.pdf /tmp/.pdf` writes
+/// `/tmp/-1-2.pdf` and `/tmp/-3-3.pdf`. Do not special-case `dot_pos == 0`
+/// to produce `.pdf-1-2`; that would diverge from qpdf.
+///
 /// ```
 /// # use std::path::{Path, PathBuf};
 /// # use flpdf::page_split::split_output_path;
@@ -187,6 +194,11 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
 /// assert_eq!(
 ///     split_output_path(Path::new("two.dots.pdf"), 1, 2, 1),
 ///     PathBuf::from("two.dots-1-2.pdf"),
+/// );
+/// // Leading-dot template: qpdf 11.9.0-verified — empty stem, ".pdf" ext
+/// assert_eq!(
+///     split_output_path(Path::new(".pdf"), 1, 2, 1),
+///     PathBuf::from("-1-2.pdf"),
 /// );
 /// ```
 pub fn split_output_path(
@@ -380,6 +392,21 @@ mod tests {
         assert_eq!(
             split_output_path(Path::new("two.dots.pdf"), 1, 2, 1),
             PathBuf::from("two.dots-1-2.pdf"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_leading_dot_template_matches_qpdf() {
+        // qpdf 11.9.0-verified: `qpdf --split-pages=2 in.pdf /tmp/.pdf`
+        // writes /tmp/-1-2.pdf (empty stem, ".pdf" treated as extension).
+        // Must NOT special-case dot_pos==0 into ".pdf-1-2".
+        assert_eq!(
+            split_output_path(Path::new(".pdf"), 1, 2, 1),
+            PathBuf::from("-1-2.pdf"),
+        );
+        assert_eq!(
+            split_output_path(Path::new("/tmp/.pdf"), 3, 3, 1),
+            PathBuf::from("/tmp/-3-3.pdf"),
         );
     }
 
