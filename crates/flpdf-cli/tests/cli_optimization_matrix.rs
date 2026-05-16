@@ -180,18 +180,30 @@ fn normalize_content_y_produces_canonical_form() {
         let in_content = page_content_bytes(&mut in_pdf, *in_pr).unwrap();
         let out_content = page_content_bytes(&mut out_pdf, *out_pr).unwrap();
 
-        // The output content should equal normalize(input content).
-        // Both sides should then normalize to the same bytes (idempotency).
+        // The expected bytes are the result of normalize(input content).
         let expected = normalize_content_stream(&in_content)
             .expect("normalize_content_stream must succeed on input");
-        let normalized_out = normalize_content_stream(&out_content)
-            .expect("normalize_content_stream must succeed on output");
 
+        // Primary assertion: the decoded output bytes must equal normalize(input)
+        // directly.  This catches any regression where the CLI emits semantically
+        // equivalent but non-normalized bytes (e.g. the flag was silently ignored).
         assert_eq!(
-            normalized_out, expected,
-            "normalize-content=y: output content stream does not match normalize(input);\n\
+            out_content, expected,
+            "normalize-content=y: decoded output content stream bytes do not equal \
+             normalize(input);\n\
              output content (first 200 bytes): {:?}",
             &out_content[..out_content.len().min(200)]
+        );
+
+        // Diagnostic: verify idempotency — normalize(output) == normalize(input).
+        // This should always hold after the primary assertion, but it catches any
+        // re-normalization divergence independently.
+        let normalized_out = normalize_content_stream(&out_content)
+            .expect("normalize_content_stream must succeed on output");
+        assert_eq!(
+            normalized_out, expected,
+            "normalize-content=y: output content stream is not idempotent under \
+             normalize_content_stream"
         );
     }
 
@@ -681,29 +693,89 @@ fn newline_before_endstream_y_always_inserts_newline() {
 // Cell 5b: newline-before-endstream=n
 //
 // With `n`, flpdf omits the extra newline when the payload already ends with
-// `\n` or `\r`. We just assert the output is valid (qpdf-checkable) and that
-// `endstream` appears at least once — the exact byte pattern depends on the
-// source payload's trailing byte, which may or may not end with a line ending.
+// `\n` or `\r`; it still inserts one `\n` for ISO 32000-1 parseability when
+// the payload is NOT EOL-terminated.
+//
+// To make this test discriminating — i.e., able to detect a regression where
+// `n` behaves identically to `y` — we use `--compress-streams=n` so that the
+// content-stream payload is written as raw decoded bytes.  The decoded payload
+// for `one-page.pdf` ends with `\n` (the last line of the content stream),
+// which means:
+//
+//   flag=n: no extra `\n` is inserted → byte before `endstream` is the
+//           payload's own trailing `\n` and the byte before THAT is the
+//           last non-newline content byte (NOT another `\n`).
+//   flag=y: exactly one extra `\n` is inserted unconditionally → byte before
+//           `endstream` is the inserted `\n` and the byte before THAT is the
+//           payload's own `\n` (two consecutive `\n` bytes).
+//
+// Assertions:
+//   (n-test) at least one `endstream` is found.
+//   (n-test) for every `endstream` preceded by `\n`, the byte two positions
+//            before `endstream` is NOT `\n` (no double-newline → extra `\n`
+//            was not inserted for a payload that already ends with `\n`).
+//   (y-contrast, in the y-test above) every `endstream` is preceded by `\n`.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn newline_before_endstream_n_produces_valid_output() {
+fn newline_before_endstream_n_omits_extra_newline_for_eol_terminated_payload() {
     let tmp = tempdir().unwrap();
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("newline-n.pdf");
 
+    // Use --compress-streams=n so the payload is written as raw decoded bytes.
+    // The decoded content stream for one-page.pdf ends with b'\n', so flag=n
+    // must NOT insert an additional newline before endstream.
     run_rewrite(
         &input,
         &output,
-        &["--full-rewrite", "--newline-before-endstream=n"],
+        &[
+            "--full-rewrite",
+            "--newline-before-endstream=n",
+            "--compress-streams=n",
+        ],
     );
 
     let output_bytes = std::fs::read(&output).unwrap();
     let keyword = b"endstream";
 
+    let occurrences = find_all_occurrences(&output_bytes, keyword);
     assert!(
-        !find_all_occurrences(&output_bytes, keyword).is_empty(),
+        !occurrences.is_empty(),
         "newline-before-endstream=n: no `endstream` keyword found in output"
+    );
+
+    // For every `endstream` occurrence, verify that an extra newline was NOT
+    // inserted when the payload already ends with `\n`.
+    //
+    // Concretely: if byte[idx-1] == '\n' (the payload's own trailing newline),
+    // then byte[idx-2] must NOT be '\n' (no double-newline injected by flag=n).
+    // If byte[idx-1] != '\n' (payload did not end with EOL), the check is not
+    // applicable for the "omit" direction (an extra '\n' is correctly inserted
+    // for parseability in that case).
+    let mut found_eol_terminated = false;
+    for &start in &occurrences {
+        if start >= 2 && output_bytes[start - 1] == b'\n' {
+            // The payload ends with '\n'.  With flag=n, no extra '\n' is added,
+            // so byte[start-2] must NOT be '\n'.
+            assert_ne!(
+                output_bytes[start - 2],
+                b'\n',
+                "newline-before-endstream=n: double \\n before `endstream` at offset {start}; \
+                 flag=n must not insert an extra newline when the payload already ends with \\n.\n\
+                 bytes[-4..0]: {:?}",
+                &output_bytes[start.saturating_sub(4)..start]
+            );
+            found_eol_terminated = true;
+        }
+    }
+
+    // Sanity-check: the fixture must have produced at least one stream whose
+    // payload ends with '\n' (so the above assertion was actually exercised).
+    assert!(
+        found_eol_terminated,
+        "newline-before-endstream=n: no `endstream` was preceded by '\\n' in the output; \
+         the fixture may no longer produce an EOL-terminated payload with --compress-streams=n"
     );
 
     if !skip_if_qpdf_missing() {
