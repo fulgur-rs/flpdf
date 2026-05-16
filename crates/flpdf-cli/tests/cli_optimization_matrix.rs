@@ -55,9 +55,9 @@
 use assert_cmd::Command as CargoCommand;
 use flpdf::{
     filters::decode_stream_data,
-    normalize_content_stream, ContentStreamParser, ContentToken,
+    normalize_content_stream,
     pages::{page_content_bytes, page_refs},
-    Object, Pdf,
+    ContentStreamParser, ContentToken, Object, Pdf,
 };
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -188,7 +188,8 @@ fn normalize_content_y_produces_canonical_form() {
         // directly.  This catches any regression where the CLI emits semantically
         // equivalent but non-normalized bytes (e.g. the flag was silently ignored).
         assert_eq!(
-            out_content, expected,
+            out_content,
+            expected,
             "normalize-content=y: decoded output content stream bytes do not equal \
              normalize(input);\n\
              output content (first 200 bytes): {:?}",
@@ -270,11 +271,7 @@ fn coalesce_contents_merges_array_to_single_stream() {
     let input = fixture_path("multi-contents-one-page.pdf");
     let output = tmp.path().join("coalesced.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--coalesce-contents"],
-    );
+    run_rewrite(&input, &output, &["--full-rewrite", "--coalesce-contents"]);
 
     let input_bytes = std::fs::read(&input).unwrap();
     let output_bytes = std::fs::read(&output).unwrap();
@@ -318,7 +315,8 @@ fn coalesce_contents_merges_array_to_single_stream() {
     let out_tokens = collect_content_tokens(&out_content);
 
     assert_eq!(
-        in_tokens, out_tokens,
+        in_tokens,
+        out_tokens,
         "coalesce-contents: merged stream operator sequence must match concatenated inputs;\n\
          input operators: {:?}\n\
          output operators: {:?}",
@@ -496,11 +494,7 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("compress-y.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--compress-streams=y"],
-    );
+    run_rewrite(&input, &output, &["--full-rewrite", "--compress-streams=y"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
     let mut out_pdf = Pdf::open(Cursor::new(&output_bytes)).unwrap();
@@ -531,7 +525,9 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
         let filter = content_stream.dict.get("Filter").cloned();
         let is_flatedecode = match &filter {
             Some(Object::Name(n)) => n.as_slice() == b"FlateDecode",
-            Some(Object::Array(arr)) => matches!(arr.as_slice(), [Object::Name(n)] if n.as_slice() == b"FlateDecode"),
+            Some(Object::Array(arr)) => {
+                matches!(arr.as_slice(), [Object::Name(n)] if n.as_slice() == b"FlateDecode")
+            }
             _ => false,
         };
         assert!(
@@ -580,11 +576,7 @@ fn compress_streams_n_omits_filter_and_roundtrips() {
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("compress-n.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--compress-streams=n"],
-    );
+    run_rewrite(&input, &output, &["--full-rewrite", "--compress-streams=n"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
     let mut out_pdf = Pdf::open(Cursor::new(&output_bytes)).unwrap();
@@ -820,10 +812,7 @@ fn combination_normalize_coalesce_compress_succeeds() {
         other => panic!("page must be a Dictionary, got {other:?}"),
     };
     assert!(
-        matches!(
-            page_dict.get("Contents"),
-            Some(Object::Reference(_))
-        ),
+        matches!(page_dict.get("Contents"), Some(Object::Reference(_))),
         "combination: /Contents must be a single reference after coalesce"
     );
 
@@ -847,7 +836,10 @@ fn combination_normalize_coalesce_compress_succeeds() {
 ///
 /// # Panics
 /// Panics if an anchor cannot be found (indicates a real fixture mismatch).
-fn real_endstream_offsets(output_bytes: &[u8], out_pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<usize> {
+fn real_endstream_offsets(
+    output_bytes: &[u8],
+    out_pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>,
+) -> Vec<usize> {
     let refs = out_pdf.live_object_refs();
     let mut offsets = Vec::new();
 
