@@ -364,25 +364,23 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         };
 
         // qpdf preference order: Unicode name first, then platform-specific.
-        let ef_ref: ObjectRef = match ["UF", "F", "Unix", "Mac", "DOS"]
+        // Try each key in order and skip any that does not resolve to an
+        // /EmbeddedFile stream, so a stray non-stream entry on a
+        // higher-priority key does not mask a valid lower-priority one.
+        let candidates: Vec<ObjectRef> = ["UF", "F", "Unix", "Mac", "DOS"]
             .iter()
-            .find_map(|k| match ef_dict.get(k) {
+            .filter_map(|k| match ef_dict.get(k) {
                 Some(Object::Reference(r)) => Some(*r),
                 _ => None,
-            }) {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+            })
+            .collect();
 
-        let stream: Stream = match self.pdf.resolve(ef_ref)? {
-            Object::Stream(s) => s,
-            _ => {
-                return Err(Error::Unsupported(format!(
-                    "/EF embedded-file key resolves to a non-stream object at {ef_ref}"
-                )))
+        for ef_ref in candidates {
+            if let Object::Stream(stream) = self.pdf.resolve(ef_ref)? {
+                return EmbeddedFileStream::new(stream, self.pdf).map(Some);
             }
-        };
+        }
 
-        EmbeddedFileStream::new(stream, self.pdf).map(Some)
+        Ok(None)
     }
 }
