@@ -478,6 +478,131 @@ fn test_f_indirect_category_subdict_pruned() {
     );
 }
 
+// ── Tests for roborev #803: Form XObject own-/Resources scoping (flpdf-9hc.12.4) ──
+
+// Test (h): Form has own /Resources/Font/F2; page /Resources/Font has F2 unused.
+//
+// Setup:
+//   - Page /Resources/Font = { F1 << >>, F2 << >> }
+//   - Page /Resources/XObject = { Fm0 → 7 0 R (Form) }
+//   - Form (7 0 R) has /Resources << /Font << /F2 << >> >> >>
+//   - Form content: BT /F2 10 Tf (inside) Tj ET  (only F2 inside Form)
+//   - Page content: /Fm0 Do  (page itself never uses F1 or F2 directly)
+//
+// Expected after Yes-mode prune:
+//   - Page /Font/F2 is PRUNED (Form's own /F2 must not bleed into page used-set)
+//   - Page /Font/F1 is also PRUNED (neither page nor Form references it at page scope)
+//   - Page /XObject/Fm0 is KEPT (page content invokes it via Do)
+#[test]
+fn test_h_form_own_resources_do_not_pollute_page_used() {
+    let form_content = b"BT /F2 10 Tf (inside form) Tj ET";
+    // Form XObject with its own /Resources containing /Font/F2.
+    let form_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        );
+        let mut b = header.into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+
+    // Page content only invokes the Form; no direct font usage.
+    let page_content = b"/Fm0 Do";
+    let extra: Vec<(u32, Vec<u8>)> = vec![
+        (4, stream_obj(4, page_content)),
+        // Page resources: Font with F1 and F2 (both should be pruned),
+        // XObject with Fm0 (should be kept because page uses Do).
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> \
+                   /XObject << /Fm0 7 0 R >> >>",
+            ),
+        ),
+        (7, form_stream),
+    ];
+    let page_body = "/Contents 4 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let font_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    // The Form's own /F2 must NOT have caused page-level /F2 to be retained.
+    assert!(
+        !font_keys.contains(&"F2".to_string()),
+        "test_h: page /Font/F2 must be pruned (Form's own /F2 must not pollute page used-set): {font_keys:?}"
+    );
+    // /F1 is also unreferenced at page scope.
+    assert!(
+        !font_keys.contains(&"F1".to_string()),
+        "test_h: page /Font/F1 must be pruned (unused at page scope): {font_keys:?}"
+    );
+
+    // /XObject/Fm0 must still exist (the page Do-invokes it).
+    let res_obj = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve resources");
+    let Object::Dictionary(res) = res_obj else { panic!("not a dict") };
+    let xobj_entry = res.get("XObject");
+    assert!(
+        xobj_entry.is_some(),
+        "test_h: /XObject sub-dict must remain: {res:?}"
+    );
+}
+
+// Test (i): Form without /Resources inherits page scope — existing behaviour preserved.
+//
+// Setup:
+//   - Page /Resources/Font = { F1 << >> }
+//   - Page /Resources/XObject = { Fm0 → 7 0 R (Form, NO /Resources key) }
+//   - Form content: BT /F1 10 Tf (text) Tj ET
+//   - Page content: /Fm0 Do
+//
+// Expected after Yes-mode prune:
+//   - Page /Font/F1 is KEPT (Form inherited page scope and used F1)
+//   - Page /XObject/Fm0 is KEPT
+#[test]
+fn test_i_form_no_resources_inherits_page_scope() {
+    let form_content = b"BT /F1 10 Tf (via inherited scope) Tj ET";
+    // Form XObject with NO /Resources key — inherits page resources.
+    let form_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            form_content.len()
+        );
+        let mut b = header.into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+
+    let page_content = b"/Fm0 Do";
+    let extra: Vec<(u32, Vec<u8>)> = vec![
+        (4, stream_obj(4, page_content)),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> >> /XObject << /Fm0 7 0 R >> >>",
+            ),
+        ),
+        (7, form_stream),
+    ];
+    let page_body = "/Contents 4 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let font_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        font_keys.contains(&"F1".to_string()),
+        "test_i: page /Font/F1 must be kept (Form inherits page scope and uses F1): {font_keys:?}"
+    );
+}
+
 // ── Test (g): single page inheriting ancestor inline /Resources — Yes prunes ──
 //
 // /Pages node has an inline /Resources << /Font << /F1 << >> /F2 << >> >> >>
