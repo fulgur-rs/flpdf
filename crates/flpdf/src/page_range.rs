@@ -15,6 +15,11 @@
 //!   `:odd` keeps positions 1, 3, 5, … (1-based); `:even` keeps positions 2, 4, 6, …
 //!   They operate on the entry's own expansion, not the whole expression.
 //!   Example: `2-8:even` → pages at positions 2, 4, 6 of `[2,3,4,5,6,7,8]` → `[3,5,7]`.
+//!   This is intentionally position-based, matching qpdf: its `--help=page-ranges`
+//!   states `:odd`/`:even` select "odd and even pages from the resulting set, not
+//!   based on the original page numbers" (verified against qpdf 11.9.0: `2-8:even`
+//!   yields 3 pages, not the 4 a page-number reading would give). Do not "fix"
+//!   this to filter by `p % 2` — that would diverge from qpdf.
 //! - An empty string means "all pages" and is resolved to `1..=page_count`.
 //! - Multiple entries are concatenated; the final resolved list is deduplicated
 //!   (first-occurrence wins) while preserving order.
