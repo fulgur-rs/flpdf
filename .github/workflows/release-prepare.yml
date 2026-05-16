@@ -106,7 +106,12 @@ jobs:
       - name: cargo publish --dry-run -p flpdf
         run: |
           rm -rf target/package
-          cargo publish --dry-run -p flpdf
+          # The version bump from the previous step is intentionally still
+          # uncommitted here (it is committed later in "Create release branch
+          # and PR"). Without --allow-dirty, cargo refuses to package a tree
+          # with uncommitted changes. This is a dry-run only, so allowing the
+          # dirty (expected) state is safe.
+          cargo publish --dry-run --allow-dirty -p flpdf
 
       - name: Verify packaged .crate contains README and LICENSE files
         shell: bash
