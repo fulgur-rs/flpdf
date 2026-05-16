@@ -47,6 +47,9 @@ pub enum ContentToken {
     /// names preserved (`/W`, `/H`, `/BPC`, `/CS`, …) — they are *not*
     /// expanded to their long forms. `data` is the raw, untouched payload
     /// between the single whitespace byte after `ID` and the `EI` keyword.
+    /// The one whitespace byte after `ID` **and** the single whitespace byte
+    /// immediately before `EI` (the separators) are excluded from `data`, so
+    /// a round-tripping consumer must re-insert a separator on each side.
     InlineImage { dict: Dictionary, data: Vec<u8> },
     /// A `%` comment up to (not including) the end-of-line.
     ///
