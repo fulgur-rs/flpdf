@@ -164,6 +164,61 @@ fn rewrite_fixture_creates_output() {
 }
 
 #[test]
+fn rewrite_default_is_qpdf_equivalent_full_rewrite() {
+    // flpdf-9hc.12.7 acceptance: a plain `flpdf rewrite IN OUT` (no flags)
+    // must match qpdf's documented defaults — qpdf full-rewrites and applies
+    // --compress-streams=y by default. This asserts that the deliberate
+    // default behavior (full rewrite + FlateDecode compression) holds, so a
+    // regression to a verbatim/incremental no-op default would be caught.
+    let temp = tempfile::tempdir().unwrap();
+    let default_out = temp.path().join("default.pdf");
+    let nocomp_out = temp.path().join("nocomp.pdf");
+    let input = "../../tests/fixtures/compat/one-page.pdf";
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", input, default_out.to_str().unwrap()])
+        .assert()
+        .success();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--compress-streams=n",
+            input,
+            nocomp_out.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let default_bytes = std::fs::read(&default_out).unwrap();
+    let nocomp_bytes = std::fs::read(&nocomp_out).unwrap();
+    let input_bytes = std::fs::read(input).unwrap();
+
+    // Default output is a real full rewrite (not a verbatim copy of input).
+    assert_ne!(
+        default_bytes, input_bytes,
+        "default rewrite must full-rewrite, not copy the source verbatim"
+    );
+    // Default applies FlateDecode compression (qpdf default = compress=y),
+    // whereas --compress-streams=n does not.
+    let has_flate = |b: &[u8]| b.windows(11).any(|w| w == b"FlateDecode");
+    assert!(
+        has_flate(&default_bytes),
+        "default rewrite must FlateDecode-compress streams (qpdf-equivalent default)"
+    );
+    // The default (compress=y) and explicit --compress-streams=n outputs
+    // must differ: this proves the qpdf-equivalent compression default is
+    // actually applied, not silently ignored. (A byte-size comparison is
+    // unreliable on tiny fixtures where the zlib/header overhead can exceed
+    // the savings, so we assert on behavior, not size.)
+    assert_ne!(
+        default_bytes, nocomp_bytes,
+        "default rewrite (compress=y) must differ from --compress-streams=n output"
+    );
+}
+
+#[test]
 fn rewrite_repaired_fixture_with_repair_flag() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("corrupt.pdf");
