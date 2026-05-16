@@ -656,7 +656,11 @@ mod tests {
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
-        assert_eq!(dict.get("Rotate"), None, "/Pages node must not gain /Rotate");
+        assert_eq!(
+            dict.get("Rotate"),
+            None,
+            "/Pages node must not gain /Rotate"
+        );
     }
 
     // -----------------------------------------------------------------------
