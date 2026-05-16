@@ -250,18 +250,14 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         };
 
         // Only leaf /Page dictionaries are valid inputs here. A /Pages tree
-        // node (or any non-/Page dict) would produce a broken page tree
-        // (e.g. a self-referential /Kids), so reject it explicitly.
-        match leaf.get("Type") {
-            Some(Object::Name(name)) if name == b"Page" => {}
-            None => {
-                leaf.insert("Type", Object::Name(b"Page".to_vec()));
-            }
-            _ => {
-                return Err(Error::Unsupported(format!(
-                    "selected object {src} is not a /Page dictionary"
-                )));
-            }
+        // node, a typeless dict, or any non-/Page dict would produce a broken
+        // page tree (e.g. a self-referential /Kids), so fail closed: require
+        // an explicit /Type /Page. Legitimate selections always carry it —
+        // `pages::page_refs` only enumerates nodes whose /Type is /Page.
+        if !matches!(leaf.get("Type"), Some(Object::Name(name)) if name == b"Page") {
+            return Err(Error::Unsupported(format!(
+                "selected object {src} is not a /Page dictionary"
+            )));
         }
 
         // Materialize each inherited attribute ONLY when the leaf lacks its
