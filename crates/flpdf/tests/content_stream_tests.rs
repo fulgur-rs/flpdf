@@ -203,6 +203,30 @@ fn inline_image_data_with_delimiter_before_ei_not_truncated() {
 }
 
 #[test]
+fn keyword_prefixed_operators_are_not_split_as_bool_null_operands() {
+    // Extension/unknown operators sharing a true/false/null prefix must
+    // tokenize as a single operator, not operand + shorter operator.
+    let toks = tokens(b"nullop trueColor falseStart");
+    assert_eq!(
+        toks,
+        vec![
+            op(vec![], b"nullop"),
+            op(vec![], b"trueColor"),
+            op(vec![], b"falseStart"),
+        ]
+    );
+    // Genuine keyword operands still parse (token-bounded).
+    let toks = tokens(b"true false null do");
+    assert_eq!(
+        toks,
+        vec![op(
+            vec![Object::Boolean(true), Object::Boolean(false), Object::Null,],
+            b"do"
+        )]
+    );
+}
+
+#[test]
 fn operands_before_bi_are_a_parse_error() {
     // `BI` takes no operands; stray operands before it mean the content
     // stream is malformed and must not be silently discarded.
