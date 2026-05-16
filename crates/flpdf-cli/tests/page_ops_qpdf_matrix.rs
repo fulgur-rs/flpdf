@@ -46,8 +46,22 @@ fn fixture_abs(rel: &str) -> PathBuf {
 /// `qpdf` binary path (the project's pinned truth source).
 const QPDF: &str = "/usr/bin/qpdf";
 
+/// The qpdf release this matrix's expected values were derived from. If the
+/// installed qpdf differs, the observable behaviour may differ too, so the
+/// affected cells skip rather than silently validate against a different
+/// truth source.
+const EXPECTED_QPDF_VERSION: &str = "11.9.0";
+
 fn qpdf_available() -> bool {
-    Path::new(QPDF).exists()
+    if !Path::new(QPDF).exists() {
+        return false;
+    }
+    // `qpdf --version` → e.g. "qpdf version 11.9.0\n...". Only treat the
+    // pinned version as a valid oracle for these cells.
+    match Shell::new(QPDF).arg("--version").output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(EXPECTED_QPDF_VERSION),
+        Err(_) => false,
+    }
 }
 
 /// Run qpdf with `args`; return (success, stdout) — stderr is folded into the
@@ -95,6 +109,64 @@ fn rotates_of(path: &Path) -> Vec<i64> {
         .filter_map(|l| l.trim().strip_prefix("rotate: "))
         .map(|n| n.trim().parse().expect("rotate integer"))
         .collect()
+}
+
+/// Per-page `/MediaBox` values read from `path` via flpdf's `--show-pages`
+/// (`  media-box: <arr>` lines), in page order. Used as a stable per-page
+/// identity marker so order-sensitive ops (reverse, collate) can assert the
+/// *sequence* matches qpdf, not merely the count.
+fn media_boxes_of(path: &Path) -> Vec<String> {
+    let out = flpdf_ok(&["--show-pages", path.to_str().unwrap()]);
+    out.lines()
+        .filter_map(|l| l.trim().strip_prefix("media-box: "))
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// Write a structurally valid `n`-page PDF whose pages have *distinct*
+/// MediaBox widths (page `i` → `[0 0 (i*100) 200]`). The width uniquely
+/// identifies each source page, so a reordering op's output page sequence
+/// can be compared element-by-element against qpdf's.
+fn distinct_pages_pdf(n: usize) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut buf: Vec<u8> = b"%PDF-1.5\n".to_vec();
+    let mut offsets: Vec<usize> = Vec::new();
+    let kids: String = (0..n)
+        .map(|i| format!("{} 0 R", 3 + i))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    offsets.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(buf.len());
+    buf.extend_from_slice(
+        format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n").as_bytes(),
+    );
+    for i in 0..n {
+        offsets.push(buf.len());
+        let w = (i + 1) * 100;
+        buf.extend_from_slice(
+            format!(
+                "{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 200] >>\nendobj\n",
+                3 + i
+            )
+            .as_bytes(),
+        );
+    }
+    let xref_pos = buf.len();
+    let total = n + 3; // objs 0..=(n+2)
+    buf.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for &off in &offsets {
+        buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n")
+            .as_bytes(),
+    );
+    let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+    f.write_all(&buf).unwrap();
+    f.flush().unwrap();
+    f
 }
 
 /// Sorted list of split output basenames matching `<stem>-*.pdf` in `dir`.
@@ -218,7 +290,10 @@ fn pages_reverse_range_matches_qpdf() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let src = fixture_abs(THREE_PAGE);
+    // Distinct MediaBox widths (100,200,300) make page identity observable,
+    // so we assert the *reversed order*, not just the count.
+    let src_file = distinct_pages_pdf(3);
+    let src = src_file.path();
     let q = tmp.path().join("q.pdf");
     let f = tmp.path().join("f.pdf");
 
@@ -241,6 +316,22 @@ fn pages_reverse_range_matches_qpdf() {
 
     assert_eq!(npages_of(&q), 3);
     assert_eq!(npages_of(&f), npages_of(&q));
+    // z-1 = last..first → widths reversed.
+    let q_boxes = media_boxes_of(&q);
+    assert_eq!(
+        q_boxes,
+        vec![
+            "[ 0 0 300 200 ]".to_string(),
+            "[ 0 0 200 200 ]".to_string(),
+            "[ 0 0 100 200 ]".to_string(),
+        ],
+        "qpdf z-1 should reverse page order"
+    );
+    assert_eq!(
+        media_boxes_of(&f),
+        q_boxes,
+        "flpdf z-1 page order must match qpdf"
+    );
 }
 
 #[test]
@@ -282,7 +373,9 @@ fn pages_multi_input_same_file_repeated_matches_qpdf() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let src = fixture_abs(THREE_PAGE);
+    // Distinct widths so `. 1 . 3` order (page1 then page3) is asserted.
+    let src_file = distinct_pages_pdf(3);
+    let src = src_file.path();
     let q = tmp.path().join("q.pdf");
     let f = tmp.path().join("f.pdf");
 
@@ -309,6 +402,18 @@ fn pages_multi_input_same_file_repeated_matches_qpdf() {
 
     assert_eq!(npages_of(&q), 2);
     assert_eq!(npages_of(&f), npages_of(&q));
+    // Selected pages 1 then 3 → widths 100 then 300, in that order.
+    let q_boxes = media_boxes_of(&q);
+    assert_eq!(
+        q_boxes,
+        vec!["[ 0 0 100 200 ]".to_string(), "[ 0 0 300 200 ]".to_string()],
+        "qpdf `. 1 . 3` should yield pages 1,3 in order"
+    );
+    assert_eq!(
+        media_boxes_of(&f),
+        q_boxes,
+        "flpdf repeated-same-file selection order must match qpdf"
+    );
 }
 
 #[test]
@@ -649,7 +754,9 @@ fn collate_default_matches_qpdf_count() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let src = fixture_abs(THREE_PAGE);
+    // Distinct widths so the *interleave order* is observable, not just count.
+    let src_file = distinct_pages_pdf(3);
+    let src = src_file.path();
     let q = tmp.path().join("q.pdf");
     let f = tmp.path().join("f.pdf");
 
@@ -678,6 +785,15 @@ fn collate_default_matches_qpdf_count() {
 
     assert_eq!(npages_of(&q), 3);
     assert_eq!(npages_of(&f), npages_of(&q));
+    // qpdf is the oracle for the interleave order; flpdf must match it
+    // page-for-page (collate ordering is the observable behaviour here).
+    let q_boxes = media_boxes_of(&q);
+    assert_eq!(q_boxes.len(), 3, "sanity: 3 collated pages");
+    assert_eq!(
+        media_boxes_of(&f),
+        q_boxes,
+        "flpdf --collate page order must match qpdf, not just the count"
+    );
 }
 
 #[test]
@@ -687,7 +803,8 @@ fn collate_n_gt_1_matches_qpdf_count() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let src = fixture_abs(THREE_PAGE);
+    let src_file = distinct_pages_pdf(3);
+    let src = src_file.path();
     let q = tmp.path().join("q.pdf");
     let f = tmp.path().join("f.pdf");
 
@@ -712,6 +829,13 @@ fn collate_n_gt_1_matches_qpdf_count() {
 
     assert_eq!(npages_of(&q), 3);
     assert_eq!(npages_of(&f), npages_of(&q));
+    let q_boxes = media_boxes_of(&q);
+    assert_eq!(q_boxes.len(), 3);
+    assert_eq!(
+        media_boxes_of(&f),
+        q_boxes,
+        "flpdf --collate=2 page order must match qpdf"
+    );
 }
 
 // ===========================================================================
