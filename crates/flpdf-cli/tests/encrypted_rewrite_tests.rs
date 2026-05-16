@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
@@ -106,6 +107,117 @@ fn qpdf_objects_json(path: &Path) -> Vec<u8> {
         String::from_utf8_lossy(&result.stderr)
     );
     result.stdout
+}
+
+// ---------------------------------------------------------------------------
+// flpdf-9hc.3.18: `rewrite --remove-restrictions`
+//
+// `--remove-restrictions` adds no new decryption logic: a plaintext rewrite of
+// an authenticated encrypted input already strips /Encrypt and the advisory
+// permission bits live only inside /Encrypt /P, so the output is inherently
+// unrestricted. These tests pin the acceptance criteria: the flag de-restricts
+// an encrypted+restricted fixture (one-line diagnostic, no /Encrypt,
+// `show-encryption` reports "File is not encrypted"), it does NOT bypass
+// authentication, and it is a no-op exit-0 rewrite on unencrypted input.
+// ---------------------------------------------------------------------------
+
+const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
+const REMOVE_RESTRICTIONS_DIAGNOSTIC: &str =
+    "flpdf: removed restrictions (encryption and advisory permissions stripped)";
+
+#[test]
+fn remove_restrictions_strips_encryption_and_emits_diagnostic() {
+    // v4-aes-128-r4 needs no --allow-weak-crypto, keeping the case clean.
+    let input = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("derestricted.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-restrictions", "--password=user-v4-aes"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC));
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "remove-restrictions output must not contain /Encrypt"
+    );
+
+    // Layer-4 show-encryption is qpdf-verbatim: must report unencrypted, exit 0.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("show-encryption")
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("File is not encrypted"));
+}
+
+#[test]
+fn remove_restrictions_does_not_bypass_authentication() {
+    // Auth-requiring input WITHOUT a password must be rejected exactly as a
+    // plain `rewrite` would: the flag must not bypass authentication.
+    let input = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+
+    let plain_out = tmp.path().join("plain.pdf");
+    let plain = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(&input)
+        .arg(&plain_out)
+        .assert()
+        .failure();
+    let plain_code = plain.get_output().status.code();
+
+    let flag_out = tmp.path().join("flag.pdf");
+    let flagged = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&flag_out)
+        .assert()
+        .failure();
+
+    assert_eq!(
+        flagged.get_output().status.code(),
+        plain_code,
+        "--remove-restrictions must reject auth-requiring input identically to plain rewrite"
+    );
+    assert!(
+        !flag_out.exists(),
+        "no output must be produced when authentication fails"
+    );
+}
+
+#[test]
+fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("noop.pdf");
+
+    // Exit 0, valid output, and no de-restriction diagnostic (nothing was
+    // restricted) — matching qpdf's lenient handling.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC).not());
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("check")
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("PDF check succeeded"));
 }
 
 fn ensure_qpdf_or_skip() -> bool {
