@@ -1,5 +1,9 @@
 //! E2E acceptance tests for the five optimization flags wired in flpdf-9hc.12.7.
 //!
+//! These exercise the CLI end-to-end (the `flpdf rewrite` binary), so they
+//! complement the per-crate unit tests by validating the wired-up flag
+//! behavior as a user would invoke it.
+//!
 //! Tests five matrix cells via `flpdf rewrite`:
 //!
 //! 1. **normalize-content=y/n** — re-parses the decoded page content stream and
