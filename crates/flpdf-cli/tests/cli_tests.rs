@@ -924,9 +924,7 @@ fn one_page_pdf_with_unused_resource() -> Vec<u8> {
         content_data.len(),
         String::from_utf8_lossy(content_data)
     );
-    let objects: Vec<&[u8]> = vec![
-        obj1, obj2, obj3_bytes, obj4, obj5, obj6.as_bytes(),
-    ];
+    let objects: Vec<&[u8]> = vec![obj1, obj2, obj3_bytes, obj4, obj5, obj6.as_bytes()];
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
     for obj in &objects {
@@ -956,17 +954,33 @@ fn two_page_pdf_with_multi_contents() -> Vec<u8> {
     // Page 1: two /Contents streams (4 0 R and 5 0 R).
     let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] >>\nendobj\n";
     let c1 = b"q Q";
-    let obj4 = format!("4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n", c1.len(), String::from_utf8_lossy(c1));
+    let obj4 = format!(
+        "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        c1.len(),
+        String::from_utf8_lossy(c1)
+    );
     let c2 = b"q Q";
-    let obj5 = format!("5 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n", c2.len(), String::from_utf8_lossy(c2));
+    let obj5 = format!(
+        "5 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        c2.len(),
+        String::from_utf8_lossy(c2)
+    );
     // Page 2: single /Contents.
     let obj7 = b"7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R >>\nendobj\n";
     let c3 = b"q Q";
-    let obj8 = format!("8 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n", c3.len(), String::from_utf8_lossy(c3));
+    let obj8 = format!(
+        "8 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        c3.len(),
+        String::from_utf8_lossy(c3)
+    );
     let objects: Vec<Vec<u8>> = vec![
-        obj1.to_vec(), obj2.to_vec(), obj3.to_vec(),
-        obj4.into_bytes(), obj5.into_bytes(),
-        obj7.to_vec(), obj8.into_bytes(),
+        obj1.to_vec(),
+        obj2.to_vec(),
+        obj3.to_vec(),
+        obj4.into_bytes(),
+        obj5.into_bytes(),
+        obj7.to_vec(),
+        obj8.into_bytes(),
     ];
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -1305,11 +1319,7 @@ fn rewrite_coalesce_and_normalize_content_combination() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "rewrite",
-            "--coalesce-contents",
-            "--normalize-content=y",
-        ])
+        .args(["rewrite", "--coalesce-contents", "--normalize-content=y"])
         .arg(&input)
         .arg(&output)
         .assert()
