@@ -24,6 +24,9 @@ sha2.workspace = true
 stringprep.workspace = true
 hex.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = []
 # Opt-in: link classic libz (zlib1g) via libz-sys so flate2's deflate output
