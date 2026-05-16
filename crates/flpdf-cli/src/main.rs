@@ -9,8 +9,13 @@ use flpdf::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
         RenumberMap,
     },
-    outline, pages, parse_pdf_version, write_pdf_with_options, write_qdf, Object, ObjectRef,
-    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, Severity, WriteOptions,
+    normalize_content_stream, outline, pages,
+    pages::coalesce_page_contents,
+    parse_pdf_version,
+    resources::remove_unreferenced_resources,
+    write_pdf_with_options, write_qdf, CompressStreams, Dictionary, NewlineBeforeEndstream, Object,
+    ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources,
+    Severity, Stream, WriteOptions,
 };
 use std::fs::File;
 use std::io::{BufReader, Write};
@@ -472,6 +477,68 @@ struct RewriteCommand {
     /// ignores this flag (tracked in flpdf-9hc.5.9).
     #[arg(long = "object-streams", value_enum, default_value_t = CliObjectStreamMode::Preserve)]
     object_streams: CliObjectStreamMode,
+
+    /// Apply FlateDecode compression to output streams (qpdf --compress-streams=y|n).
+    ///
+    /// `y` (default): decode each source stream and re-emit with a single /FlateDecode
+    /// filter, matching qpdf's default behaviour.
+    /// `n`: decode each source stream and emit raw bytes without any filter.
+    ///
+    /// Only affects the full-rewrite path.
+    #[arg(long = "compress-streams", value_enum, default_value_t = CliYesNo::Yes,
+          help = "Compress output streams with FlateDecode (qpdf default: y)")]
+    compress_streams: CliYesNo,
+
+    /// Normalize PDF content streams (qpdf --normalize-content=y|n).
+    ///
+    /// `y`: re-tokenize each page content stream and emit a canonical whitespace-
+    /// normalized form, matching qpdf's `--normalize-content=y`.
+    /// `n` (default): leave content streams untouched (qpdf default).
+    ///
+    /// When enabled, each page's content stream is updated in-place before writing,
+    /// which requires a full rewrite of the document.
+    #[arg(long = "normalize-content", value_enum, default_value_t = CliYesNo::No,
+          help = "Normalize page content streams (qpdf default: n)")]
+    normalize_content: CliYesNo,
+
+    /// Coalesce multiple /Contents streams into a single stream per page
+    /// (qpdf --coalesce-contents).
+    ///
+    /// When a page's /Contents is an array of two or more stream references,
+    /// merge them into a single stream. Default: off (qpdf default: off).
+    ///
+    /// Requires a full rewrite of the document when enabled.
+    #[arg(long = "coalesce-contents",
+          help = "Merge per-page /Contents arrays into a single stream (qpdf default: off)")]
+    coalesce_contents: bool,
+
+    /// Remove unreferenced /Resources entries from each page
+    /// (qpdf --remove-unreferenced-resources=auto|yes|no).
+    ///
+    /// - `auto` (default): prune only pages whose /Resources are not shared with
+    ///   another page — safe heuristic, qpdf-compatible.
+    /// - `yes`: prune on a per-page basis regardless of sharing (union of
+    ///   all referencing pages' used names is kept to avoid breakage).
+    /// - `no`: leave all /Resources entries untouched.
+    ///
+    /// Requires a full rewrite when set to `yes` or `auto`.
+    #[arg(long = "remove-unreferenced-resources", value_enum,
+          default_value_t = CliRemoveUnreferencedResources::Auto,
+          help = "Remove unreferenced /Resources entries (qpdf default: auto)")]
+    remove_unreferenced_resources: CliRemoveUnreferencedResources,
+
+    /// Insert a newline before each `endstream` keyword
+    /// (qpdf --newline-before-endstream=y|n).
+    ///
+    /// `y` (default): always write exactly one `\n` before `endstream`, matching
+    /// ISO 32000-1 §7.3.8.1 and qpdf's default behaviour.
+    /// `n`: omit the extra newline when the stream payload already ends with `\n`
+    /// or `\r`.
+    ///
+    /// Only affects the full-rewrite path.
+    #[arg(long = "newline-before-endstream", value_enum, default_value_t = CliYesNo::Yes,
+          help = "Insert newline before endstream keyword (qpdf default: y)")]
+    newline_before_endstream: CliYesNo,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -488,6 +555,35 @@ impl From<CliObjectStreamMode> for ObjectStreamMode {
             CliObjectStreamMode::Preserve => ObjectStreamMode::Preserve,
             CliObjectStreamMode::Disable => ObjectStreamMode::Disable,
             CliObjectStreamMode::Generate => ObjectStreamMode::Generate,
+        }
+    }
+}
+
+/// y|n toggle used by --compress-streams, --normalize-content, --newline-before-endstream.
+/// Clap variant names are `y` and `n` (lowercase single letter, qpdf-compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliYesNo {
+    #[clap(name = "y")]
+    Yes,
+    #[clap(name = "n")]
+    No,
+}
+
+/// `--remove-unreferenced-resources=auto|yes|no` (qpdf-compatible).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum CliRemoveUnreferencedResources {
+    #[default]
+    Auto,
+    Yes,
+    No,
+}
+
+impl From<CliRemoveUnreferencedResources> for RemoveUnreferencedResources {
+    fn from(v: CliRemoveUnreferencedResources) -> Self {
+        match v {
+            CliRemoveUnreferencedResources::Auto => RemoveUnreferencedResources::Auto,
+            CliRemoveUnreferencedResources::Yes => RemoveUnreferencedResources::Yes,
+            CliRemoveUnreferencedResources::No => RemoveUnreferencedResources::No,
         }
     }
 }
@@ -590,6 +686,18 @@ fn main() {
     } else if args.linearize {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
+        // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
+        if let Some(ref cs) = args.compress_streams {
+            match cs.as_str() {
+                "y" => options.compress_streams = CompressStreams::Yes,
+                "n" => options.compress_streams = CompressStreams::No,
+                other => {
+                    eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
+                    std::process::exit(2);
+                }
+            }
+        }
         let result = run_rewrite(
             args.input,
             args.output.clone(),
@@ -597,6 +705,9 @@ fn main() {
             &args.password,
             true,
             args.remove_restrictions,
+            false, // normalize_content
+            false, // coalesce_contents
+            CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             options,
         );
         if result.is_ok() {
@@ -618,6 +729,18 @@ fn main() {
     } else {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
+        // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
+        if let Some(ref cs) = args.compress_streams {
+            match cs.as_str() {
+                "y" => options.compress_streams = CompressStreams::Yes,
+                "n" => options.compress_streams = CompressStreams::No,
+                other => {
+                    eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
+                    std::process::exit(2);
+                }
+            }
+        }
         run_rewrite(
             args.input,
             args.output,
@@ -625,6 +748,9 @@ fn main() {
             &args.password,
             false,
             args.remove_restrictions,
+            false, // normalize_content
+            false, // coalesce_contents
+            CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             options,
         )
     };
@@ -877,6 +1003,17 @@ fn run_command(command: Commands) -> CliResult<()> {
             options.force_version = cmd.force_version;
             options.full_rewrite = cmd.full_rewrite;
             options.object_streams = cmd.object_streams.into();
+            options.compress_streams = match cmd.compress_streams {
+                CliYesNo::Yes => CompressStreams::Yes,
+                CliYesNo::No => CompressStreams::No,
+            };
+            options.newline_before_endstream = match cmd.newline_before_endstream {
+                CliYesNo::Yes => NewlineBeforeEndstream::Yes,
+                CliYesNo::No => NewlineBeforeEndstream::No,
+            };
+            let normalize_content = cmd.normalize_content == CliYesNo::Yes;
+            let coalesce_contents = cmd.coalesce_contents;
+            let remove_unref = cmd.remove_unreferenced_resources;
             run_rewrite(
                 Some(cmd.input),
                 Some(cmd.output),
@@ -884,6 +1021,9 @@ fn run_command(command: Commands) -> CliResult<()> {
                 &cmd.password,
                 cmd.linearize,
                 cmd.remove_restrictions,
+                normalize_content,
+                coalesce_contents,
+                remove_unref,
                 options,
             )
         }
@@ -948,6 +1088,9 @@ fn run_rewrite(
     password: &PasswordArgs,
     linearize: bool,
     remove_restrictions: bool,
+    normalize_content: bool,
+    coalesce_contents: bool,
+    remove_unref: CliRemoveUnreferencedResources,
     options: WriteOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
@@ -992,6 +1135,56 @@ fn run_rewrite(
         if was_encrypted {
             options.full_rewrite = true;
         }
+
+        // ── Content mutation pass ─────────────────────────────────────────────
+        //
+        // The mutations below operate on the in-memory Pdf model (via set_object).
+        // They are only visible in the output when the full-rewrite path is used
+        // (the incremental-update path copies source bytes verbatim and silently
+        // ignores in-memory mutations). Therefore we force full_rewrite = true
+        // whenever any content-mutating flag is active.
+        //
+        // Application order (semantically motivated):
+        //   1. coalesce_page_contents  — merge /Contents arrays so subsequent
+        //      passes always see a single stream per page.
+        //   2. normalize_content_stream — re-tokenize the (now-unified) stream
+        //      to canonical whitespace form.
+        //   3. remove_unreferenced_resources — scan the final content stream to
+        //      decide which /Resources entries are reachable, then prune the rest.
+        //   4. write (compress_streams / newline_before_endstream) — byte-emission
+        //      policies applied by the writer, not the pre-processing step.
+        let needs_mutation = coalesce_contents
+            || normalize_content
+            || remove_unref != CliRemoveUnreferencedResources::No;
+        if needs_mutation {
+            options.full_rewrite = true;
+        }
+
+        // Step 1: coalesce per-page /Contents arrays into a single stream.
+        if coalesce_contents {
+            let page_refs = pages::page_refs(&mut pdf)?;
+            for page_ref in page_refs {
+                coalesce_page_contents(&mut pdf, page_ref)?;
+            }
+        }
+
+        // Step 2: normalize each page's content stream(s).
+        // normalize_content_stream operates on raw decoded bytes → returns
+        // normalized bytes. We fetch each page's /Contents reference(s), decode
+        // the stored stream data, normalize, and write the result back via
+        // set_object (same pattern as coalesce_page_contents).
+        if normalize_content {
+            let page_refs = pages::page_refs(&mut pdf)?;
+            for page_ref in page_refs {
+                apply_normalize_content(&mut pdf, page_ref)?;
+            }
+        }
+
+        // Step 3: remove unreferenced /Resources entries.
+        if remove_unref != CliRemoveUnreferencedResources::No {
+            remove_unreferenced_resources(&mut pdf, remove_unref.into())?;
+        }
+
         let mut out = File::create(output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
 
@@ -1003,6 +1196,85 @@ fn run_rewrite(
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
     }
+    Ok(())
+}
+
+/// Normalize the content stream(s) for a single page.
+///
+/// Reads each `/Contents` stream referenced by the page, applies
+/// [`normalize_content_stream`] to the decoded bytes, and writes the result
+/// back into the in-memory [`Pdf`] model via [`Pdf::set_object`].
+///
+/// The `/Length` entry in each stream's dictionary is updated to the new
+/// (normalized) byte count. No filter is applied here — the write path
+/// (full-rewrite + compress_streams) handles re-encoding.
+fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> CliResult<()> {
+    // Resolve the page dictionary to find its /Contents value.
+    let page_obj = pdf.resolve(page_ref)?;
+    let Object::Dictionary(page_dict) = page_obj else {
+        return Ok(()); // Not a page dict — skip silently.
+    };
+
+    let contents = match page_dict.get("Contents").cloned() {
+        None => return Ok(()), // Empty page — nothing to normalize.
+        Some(c) => c,
+    };
+
+    match contents {
+        Object::Reference(stream_ref) => {
+            normalize_and_store_stream(pdf, stream_ref)?;
+        }
+        Object::Array(elems) => {
+            // Multiple content streams — normalize each one in-place.
+            // (If --coalesce-contents was also given, this is already a
+            // single stream; but we handle the array case for safety.)
+            for elem in elems {
+                if let Object::Reference(r) = elem {
+                    normalize_and_store_stream(pdf, r)?;
+                }
+                // Direct-stream elements are unusual in real PDFs; skip them
+                // (they have no separate object to patch).
+            }
+        }
+        Object::Stream(_) => {
+            // Direct (inline) stream on the page dict itself — no separate
+            // object ref to patch; skip silently.
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Normalize the raw decoded bytes of the indirect stream at `stream_ref`
+/// and write the result back into `pdf` via [`Pdf::set_object`].
+fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
+    pdf: &mut Pdf<R>,
+    stream_ref: ObjectRef,
+) -> CliResult<()> {
+    let resolved = pdf.resolve(stream_ref)?;
+    let Object::Stream(stream) = resolved else {
+        return Ok(()); // Not a stream — skip.
+    };
+
+    // Decode the stored bytes through the declared filter pipeline.
+    let decoded = filters::decode_stream_data(&stream.dict, &stream.data)?;
+
+    // Normalize the decoded content stream bytes.
+    let normalized = normalize_content_stream(&decoded)?;
+
+    // Build a new stream dict with the updated /Length.
+    let mut new_dict: Dictionary = stream.dict.clone();
+    // Remove filter / encode-form keys: the normalized bytes are raw (no filter).
+    for key in &["Filter", "DecodeParms", "DP", "DL"] {
+        new_dict.remove(key);
+    }
+    new_dict.insert("Length", Object::Integer(normalized.len() as i64));
+
+    let new_stream = Stream::new(new_dict, normalized);
+    pdf.set_object(stream_ref, Object::Stream(new_stream));
     Ok(())
 }
 

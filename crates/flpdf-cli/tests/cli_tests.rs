@@ -900,6 +900,456 @@ fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
     bytes
 }
 
+// ---------------------------------------------------------------------------
+// flpdf-9hc.12.7: CLI flags --compress-streams / --normalize-content /
+//                 --coalesce-contents / --remove-unreferenced-resources /
+//                 --newline-before-endstream
+// ---------------------------------------------------------------------------
+
+/// Minimal single-page PDF with a content stream and a font resource entry.
+/// The font resource is NOT referenced in the content stream, so
+/// --remove-unreferenced-resources should prune it.
+fn one_page_pdf_with_unused_resource() -> Vec<u8> {
+    let content_data = b"BT /F1 12 Tf (Hello) Tj ET";
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n";
+    // F1 is referenced, F2 is NOT referenced in the content stream.
+    let obj3_bytes = b"3 0 obj\n<< /Type /Page /Parent 2 0 R \
+        /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> \
+        /MediaBox [0 0 612 792] /Contents 6 0 R >>\nendobj\n";
+    let obj4 = b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n";
+    let obj5 = b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n";
+    let obj6 = format!(
+        "6 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        content_data.len(),
+        String::from_utf8_lossy(content_data)
+    );
+    let objects: Vec<&[u8]> = vec![
+        obj1, obj2, obj3_bytes, obj4, obj5, obj6.as_bytes(),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for obj in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(obj);
+    }
+    let xref_start = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for &off in &offsets {
+        bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// A two-page PDF where each page has multiple /Contents streams.
+fn two_page_pdf_with_multi_contents() -> Vec<u8> {
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 7 0 R] >>\nendobj\n";
+    // Page 1: two /Contents streams (4 0 R and 5 0 R).
+    let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] >>\nendobj\n";
+    let c1 = b"q Q";
+    let obj4 = format!("4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n", c1.len(), String::from_utf8_lossy(c1));
+    let c2 = b"q Q";
+    let obj5 = format!("5 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n", c2.len(), String::from_utf8_lossy(c2));
+    // Page 2: single /Contents.
+    let obj7 = b"7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R >>\nendobj\n";
+    let c3 = b"q Q";
+    let obj8 = format!("8 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n", c3.len(), String::from_utf8_lossy(c3));
+    let objects: Vec<Vec<u8>> = vec![
+        obj1.to_vec(), obj2.to_vec(), obj3.to_vec(),
+        obj4.into_bytes(), obj5.into_bytes(),
+        obj7.to_vec(), obj8.into_bytes(),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for obj in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(obj);
+    }
+    let xref_start = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for &off in &offsets {
+        bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+// ── compress-streams ──────────────────────────────────────────────────────────
+
+#[test]
+fn rewrite_compress_streams_y_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--compress-streams=y", "--full-rewrite"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_compress_streams_n_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--compress-streams=n", "--full-rewrite"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+// ── normalize-content ─────────────────────────────────────────────────────────
+
+#[test]
+fn rewrite_normalize_content_y_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_normalize_content_n_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
+// ── coalesce-contents ─────────────────────────────────────────────────────────
+
+#[test]
+fn rewrite_coalesce_contents_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--coalesce-contents"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+// ── remove-unreferenced-resources ─────────────────────────────────────────────
+
+#[test]
+fn rewrite_remove_unreferenced_resources_auto_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_unused_resource()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-unreferenced-resources=auto"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_remove_unreferenced_resources_yes_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_unused_resource()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-unreferenced-resources=yes"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_remove_unreferenced_resources_no_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-unreferenced-resources=no"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
+// ── newline-before-endstream ──────────────────────────────────────────────────
+
+#[test]
+fn rewrite_newline_before_endstream_y_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--newline-before-endstream=y", "--full-rewrite"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_newline_before_endstream_n_accepted_and_produces_valid_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--newline-before-endstream=n", "--full-rewrite"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+// ── help text contains qpdf-compatible defaults ───────────────────────────────
+
+#[test]
+fn rewrite_help_shows_compress_streams_default_y() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("compress-streams"))
+        .stdout(predicate::str::contains("default: y"));
+}
+
+#[test]
+fn rewrite_help_shows_normalize_content_default_n() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("normalize-content"))
+        .stdout(predicate::str::contains("default: n"));
+}
+
+#[test]
+fn rewrite_help_shows_remove_unreferenced_resources_default_auto() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remove-unreferenced-resources"))
+        .stdout(predicate::str::contains("default: auto"));
+}
+
+#[test]
+fn rewrite_help_shows_newline_before_endstream_default_y() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("newline-before-endstream"))
+        .stdout(predicate::str::contains("default: y"));
+}
+
+// ── combination tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn rewrite_full_rewrite_with_compress_n_and_newline_n() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_bytes()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--full-rewrite",
+            "--compress-streams=n",
+            "--newline-before-endstream=n",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_coalesce_and_normalize_content_combination() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--coalesce-contents",
+            "--normalize-content=y",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn rewrite_normalize_and_remove_unreferenced_combination() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_unused_resource()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--normalize-content=y",
+            "--remove-unreferenced-resources=yes",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
