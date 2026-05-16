@@ -203,6 +203,19 @@ fn inline_image_data_with_delimiter_before_ei_not_truncated() {
 }
 
 #[test]
+fn operands_before_bi_are_a_parse_error() {
+    // `BI` takes no operands; stray operands before it mean the content
+    // stream is malformed and must not be silently discarded.
+    let mut p = ContentStreamParser::new(b"1 2 BI /W 1 /H 1 ID x EI");
+    match p.next() {
+        Some(Err(_)) => {}
+        other => panic!("expected parse error for operands before BI, got {other:?}"),
+    }
+    // Iterator fuses after an error.
+    assert!(p.next().is_none(), "iterator must fuse after error");
+}
+
+#[test]
 fn inline_image_crlf_before_ei_strips_full_separator() {
     // `ID` separator is CRLF and the `EI` is also preceded by CRLF. Both
     // separators must be stripped wholly: a single-byte strip before `EI`

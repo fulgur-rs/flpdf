@@ -308,7 +308,15 @@ impl<'a> ContentStreamParser<'a> {
             }
 
             if keyword == b"BI" {
-                self.operands.clear();
+                // An inline image takes no operands. Operands sitting in
+                // the buffer before `BI` mean the stream is malformed;
+                // surface that rather than silently discarding them.
+                if !self.operands.is_empty() {
+                    return Some(Err(Error::parse(
+                        self.pos,
+                        "inline image operator BI cannot have operands",
+                    )));
+                }
                 return Some(self.parse_inline_image());
             }
 
