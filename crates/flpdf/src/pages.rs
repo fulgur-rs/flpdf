@@ -333,9 +333,11 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
         if i == 0 {
             let mut d = stream.dict.clone();
             // Stripped: encode-form keys (Filter/DecodeParms/DP/Length/DL)
-            // and external-data keys (F/FFilter/FDecodeParms) — the coalesced
-            // payload is embedded raw decoded bytes, so an external file
-            // specification or external-filter chain would be inconsistent.
+            // and external-data keys (F/FFilter/FDecodeParms) — see the
+            // stream-dictionary entries in ISO 32000-1 Table 5. The
+            // coalesced payload is embedded raw decoded bytes, so an
+            // external file specification or external-filter chain would
+            // be inconsistent with it.
             for key in [
                 "Filter",
                 "DecodeParms",
