@@ -221,7 +221,21 @@ struct Cli {
     /// Strip encryption and advisory permission restrictions from the output
     /// (top-level alias of `flpdf rewrite --remove-restrictions`; qpdf
     /// `--remove-restrictions` equivalent). Does NOT bypass authentication.
-    #[arg(long = "remove-restrictions")]
+    // This is a rewrite-path modifier. main()'s dispatch chain runs the
+    // inspection modes (--check / --dump-object / --show-*) before the
+    // rewrite branch, so without these conflicts `flpdf --check
+    // --remove-restrictions in out` would silently ignore the flag (and the
+    // OUTPUT positional). Listing the inspection modes as clap conflicts
+    // surfaces the mistake as a usage error instead. (--json already lists
+    // remove_restrictions in its own conflicts_with_all; rewrite/linearize/
+    // static_id/output are compatible rewrite modifiers and intentionally
+    // excluded here.)
+    #[arg(long = "remove-restrictions",
+          conflicts_with_all = [
+              "check", "dump_object", "show_info", "show_catalog",
+              "show_metadata", "show_outline", "show_fonts",
+              "show_npages", "show_pages",
+          ])]
     remove_restrictions: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
     /// currently a no-op: flpdf does not re-encode stream contents on
