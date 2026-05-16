@@ -116,11 +116,26 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         let names_dict_obj = pdf.resolve(names_dict_ref)?;
         if let Object::Dictionary(names_dict) = names_dict_obj {
             if let Some(dests_ref) = names_dict.get_ref("Dests") {
-                prune_name_tree(pdf, dests_ref, &surviving, &mut surviving_names)?;
-                // After pruning, rebuild the updated Names dict with the possibly-
-                // modified Dests subtree ref (it stays the same ref but inner nodes
-                // are mutated). No structural change to the Names dict itself needed
-                // unless the entire tree is empty — handled inside prune_name_tree.
+                let dests_empty =
+                    prune_name_tree(pdf, dests_ref, &surviving, &mut surviving_names)?;
+                if dests_empty {
+                    // All named dests were pruned — remove /Dests from /Names dict
+                    // so no dangling ref remains.
+                    let names_dict_obj2 = pdf.resolve(names_dict_ref)?;
+                    if let Object::Dictionary(mut nd) = names_dict_obj2 {
+                        nd.remove("Dests");
+                        if nd.iter().next().is_none() {
+                            // /Names dict is now completely empty — remove /Names from catalog.
+                            let catalog_obj3 = pdf.resolve(catalog_ref)?;
+                            if let Object::Dictionary(mut cat) = catalog_obj3 {
+                                cat.remove("Names");
+                                pdf.set_object(catalog_ref, Object::Dictionary(cat));
+                            }
+                        } else {
+                            pdf.set_object(names_dict_ref, Object::Dictionary(nd));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1298,6 +1313,38 @@ mod tests {
             report.valid,
             "rebuilt PDF should pass check_reader: {:?}",
             report.diagnostics
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: all named dests pruned → /Names /Dests removed from catalog (no dangling ref)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_named_dests_pruned_removes_names_dests_from_catalog() {
+        // Use an empty ref_map so all pages are considered removed.
+        // The name tree (30 0 R) has 4 entries all pointing at removed pages.
+        // After remap, /Dests should be gone from the /Names dict (11 0 R),
+        // and since /Names dict is now empty, /Names should be gone from catalog.
+        let mut pdf = open(build_outline_pdf());
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(3, 0)],
+            ref_map: BTreeMap::new(), // all pages removed
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+
+        // /Names should have been removed from catalog (since /Names dict is now empty).
+        assert!(
+            cat.get_ref("Names").is_none(),
+            "catalog /Names should be removed when all named dests are pruned"
+        );
+
+        // /Outlines should also be gone (all items drop with empty ref_map).
+        assert!(
+            cat.get_ref("Outlines").is_none(),
+            "catalog /Outlines should be removed when all outline items are dropped"
         );
     }
 
