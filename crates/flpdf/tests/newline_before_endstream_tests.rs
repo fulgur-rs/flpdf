@@ -294,7 +294,10 @@ fn e2e_yes_mode_endstream_preceded_by_exactly_one_newline_and_length_correct() {
     // Find all occurrences of `endstream` and check each one.
     let mut pos = 0;
     let mut found = false;
-    while let Some(rel) = output[pos..].windows(b"endstream".len()).position(|w| w == b"endstream") {
+    while let Some(rel) = output[pos..]
+        .windows(b"endstream".len())
+        .position(|w| w == b"endstream")
+    {
         let abs = pos + rel;
         if abs >= 1 {
             assert_eq!(
@@ -306,7 +309,10 @@ fn e2e_yes_mode_endstream_preceded_by_exactly_one_newline_and_length_correct() {
         }
         pos = abs + 1;
     }
-    assert!(found, "at least one endstream must be present in the output");
+    assert!(
+        found,
+        "at least one endstream must be present in the output"
+    );
 
     // Verify /Length in the stream dict via reader.
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
@@ -378,11 +384,11 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
     }
     let xref_offset = bytes.len();
     let mut xe: Vec<u8> = Vec::new();
-    append_entry(&mut xe, 0, 0, 0);          // 0: free
+    append_entry(&mut xe, 0, 0, 0); // 0: free
     append_entry(&mut xe, 1, cat_offset as u32, 0); // 1: Catalog
-    append_entry(&mut xe, 2, 3, 0);          // 2: Pages in ObjStm 3, idx 0
+    append_entry(&mut xe, 2, 3, 0); // 2: Pages in ObjStm 3, idx 0
     append_entry(&mut xe, 1, objstm_offset as u32, 0); // 3: ObjStm
-    append_entry(&mut xe, 1, xref_offset as u32, 0);   // 4: XRef (self)
+    append_entry(&mut xe, 1, xref_offset as u32, 0); // 4: XRef (self)
 
     bytes.extend_from_slice(
         format!(
@@ -408,12 +414,12 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
     // Verify every `endstream` is preceded by `\n`.
     let mut pos = 0;
     let mut count = 0;
-    while let Some(rel) = output[pos..].windows(b"endstream".len()).position(|w| w == b"endstream") {
+    while let Some(rel) = output[pos..]
+        .windows(b"endstream".len())
+        .position(|w| w == b"endstream")
+    {
         let abs = pos + rel;
-        assert!(
-            abs >= 1,
-            "endstream at offset {abs} has no preceding byte"
-        );
+        assert!(abs >= 1, "endstream at offset {abs} has no preceding byte");
         assert_eq!(
             output[abs - 1],
             b'\n',
@@ -422,5 +428,8 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
         count += 1;
         pos = abs + 1;
     }
-    assert!(count >= 2, "ObjStm output must have at least 2 endstream keywords (ObjStm + xref); got {count}");
+    assert!(
+        count >= 2,
+        "ObjStm output must have at least 2 endstream keywords (ObjStm + xref); got {count}"
+    );
 }
