@@ -878,12 +878,31 @@ fn remap_dest_value<R: Read + Seek>(
     dest: &Object,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<Option<Object>> {
+    remap_dest_value_depth(pdf, dest, surviving, MAX_DEST_RESOLVE_DEPTH)
+}
+
+/// Bound on indirection/`/D` nesting followed when resolving a destination.
+/// Real dests nest 1–2 levels; this only exists to make a malformed or
+/// hostile cyclic structure (e.g. `40 0 obj << /D 40 0 R >>`) terminate
+/// instead of overflowing the stack.
+const MAX_DEST_RESOLVE_DEPTH: usize = 64;
+
+fn remap_dest_value_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest: &Object,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Option<Object>> {
+    if depth == 0 {
+        // Cycle / pathological nesting — stop conservatively (no remap).
+        return Ok(None);
+    }
     match dest {
         // Indirect: resolve, recurse, and if the referenced object changed,
         // rewrite it in place. The caller keeps pointing at the same ref.
         Object::Reference(dr) => {
             let concrete = pdf.resolve(*dr)?;
-            if let Some(updated) = remap_dest_value(pdf, &concrete, surviving)? {
+            if let Some(updated) = remap_dest_value_depth(pdf, &concrete, surviving, depth - 1)? {
                 pdf.set_object(*dr, updated);
             }
             Ok(None)
@@ -903,7 +922,7 @@ fn remap_dest_value<R: Read + Seek>(
         // indirect reference; recurse so either is remapped.
         Object::Dictionary(d) => {
             if let Some(d_val) = d.get("D").cloned() {
-                if let Some(updated) = remap_dest_value(pdf, &d_val, surviving)? {
+                if let Some(updated) = remap_dest_value_depth(pdf, &d_val, surviving, depth - 1)? {
                     let mut nd = d.clone();
                     nd.insert("D", updated);
                     return Ok(Some(Object::Dictionary(nd)));
@@ -918,22 +937,36 @@ fn remap_dest_value<R: Read + Seek>(
 /// pdf-aware page-ref extraction. Resolves one level at each indirection
 /// (the dest value itself, or a dictionary's `/D`) so every indirection form
 /// — inline array, dict `/D`, indirect dest, dict whose `/D` is indirect — is
-/// classified uniformly. Returns `None` for named/string/external dests.
+/// classified uniformly. Returns `None` for named/string/external dests, or
+/// when a cyclic/over-deep structure is hit (handled conservatively).
 fn dest_page_ref_resolved<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest: &Object,
 ) -> Result<Option<ObjectRef>> {
+    dest_page_ref_resolved_depth(pdf, dest, MAX_DEST_RESOLVE_DEPTH)
+}
+
+fn dest_page_ref_resolved_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest: &Object,
+    depth: usize,
+) -> Result<Option<ObjectRef>> {
+    if depth == 0 {
+        // Cycle / pathological nesting — treat as no resolvable page ref so
+        // the entry is kept conservatively rather than overflowing the stack.
+        return Ok(None);
+    }
     match dest {
         Object::Reference(r) => {
             let c = pdf.resolve(*r)?;
-            dest_page_ref_resolved(pdf, &c)
+            dest_page_ref_resolved_depth(pdf, &c, depth - 1)
         }
         Object::Array(arr) => Ok(match arr.first() {
             Some(Object::Reference(r)) => Some(*r),
             _ => None,
         }),
         Object::Dictionary(d) => match d.get("D").cloned() {
-            Some(v) => dest_page_ref_resolved(pdf, &v),
+            Some(v) => dest_page_ref_resolved_depth(pdf, &v, depth - 1),
             None => Ok(None),
         },
         _ => Ok(None),
@@ -2017,5 +2050,35 @@ mod tests {
             panic!("d1 dest array expected");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
+    }
+
+    #[test]
+    fn cyclic_indirect_dest_terminates_without_overflow() {
+        // Hostile self-referential dest: 40 0 obj << /D 40 0 R >>. Resolution
+        // must terminate via the depth guard instead of overflowing the
+        // stack; the entry is kept conservatively (no resolvable page ref).
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (30, "<< /Limits [(c) (c)] /Names [(c) 40 0 R] >>"),
+                (40, "<< /D 40 0 R >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        // Must return (not hang / overflow).
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+        // Conserved: name (c) is still present (no resolvable page ref).
+        let leaf = dict_of(&mut pdf, ObjectRef::new(30, 0));
+        let Some(Object::Array(names)) = leaf.get("Names").cloned() else {
+            panic!("/Names array expected");
+        };
+        assert!(names
+            .iter()
+            .any(|o| matches!(o, Object::String(b) | Object::Name(b) if b == b"c")));
     }
 }
