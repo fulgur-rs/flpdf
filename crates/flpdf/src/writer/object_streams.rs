@@ -1115,6 +1115,31 @@ mod tests {
     }
 
     #[test]
+    fn wrap_objstm_body_no_compression_round_trips_without_filter() {
+        // CompressStreams::No must emit an uncompressed ObjStm (no /Filter)
+        // whose /N, /First and member offsets still let the reader resolve
+        // every member.
+        let ref1 = ObjectRef::new(11, 0);
+        let obj1 = Object::Integer(42);
+        let ref2 = ObjectRef::new(22, 0);
+        let obj2 = Object::Integer(99);
+
+        let body =
+            emit_objstm_body_from_resolved(&[(ref1, obj1.clone()), (ref2, obj2.clone())]).unwrap();
+        let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::No).unwrap();
+
+        assert!(
+            stream.dict.get("Filter").is_none(),
+            "CompressStreams::No ObjStm must have no /Filter"
+        );
+
+        let parsed0 = crate::reader::parse_object_stream_entry(&stream, 0).unwrap();
+        let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
+        assert_eq!(parsed0, obj1, "index 0 must parse to Integer(42)");
+        assert_eq!(parsed1, obj2, "index 1 must parse to Integer(99)");
+    }
+
+    #[test]
     fn wrap_objstm_body_empty_members_still_valid() {
         let body = ObjStmBody {
             bytes: vec![],
