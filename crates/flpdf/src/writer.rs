@@ -104,8 +104,10 @@ pub struct WriteOptions {
     /// emits the raw bytes without any filter; streams that cannot be decoded
     /// (e.g. `DCTDecode`/`JPXDecode` image data) are passed through verbatim.
     ///
-    /// Only consulted by the full-rewrite path (`full_rewrite = true`).
-    /// The incremental-update path and `write_qdf` are unaffected.
+    /// Only consulted by the full-rewrite path (`full_rewrite = true`);
+    /// it governs regular indirect streams, ObjStm containers, and the
+    /// xref stream alike. The incremental-update path and `write_qdf`
+    /// are unaffected.
     pub compress_streams: CompressStreams,
 }
 
