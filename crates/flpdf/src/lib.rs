@@ -56,6 +56,7 @@ pub mod page_plan;
 pub mod page_range;
 pub mod page_rotate;
 pub mod page_split;
+pub mod page_tree_rebuild;
 pub mod pages;
 pub mod parser;
 pub mod reader;
@@ -85,6 +86,7 @@ pub use page_rotate::{
     resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
 pub use page_split::{digit_width, split_output_path, split_pages};
+pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
 pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};
 pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
