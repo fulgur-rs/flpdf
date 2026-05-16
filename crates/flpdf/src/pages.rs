@@ -335,7 +335,20 @@ pub fn coalesce_page_contents<R: Read + Seek>(
 
         if i == 0 {
             let mut d = stream.dict.clone();
-            for key in ["Filter", "DecodeParms", "DP", "Length", "DL"] {
+            // Stripped: encode-form keys (Filter/DecodeParms/DP/Length/DL)
+            // and external-data keys (F/FFilter/FDecodeParms) — the coalesced
+            // payload is embedded raw decoded bytes, so an external file
+            // specification or external-filter chain would be inconsistent.
+            for key in [
+                "Filter",
+                "DecodeParms",
+                "DP",
+                "Length",
+                "DL",
+                "F",
+                "FFilter",
+                "FDecodeParms",
+            ] {
                 d.remove(key);
             }
             new_dict = Some(d);

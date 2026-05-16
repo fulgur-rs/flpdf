@@ -142,7 +142,7 @@ fn coalesce_preserves_first_stream_non_filter_dict_entries() {
     let seg1 = b"q Q";
     let seg2 = b"BT ET";
     let s1 = format!(
-        "4 0 obj\n<< /Length {} /Filter /ASCIIHexDecode /MyMeta (keepme) >>\nstream\n",
+        "4 0 obj\n<< /Length {} /Filter /ASCIIHexDecode /F (ext.dat) /FFilter /ASCIIHexDecode /MyMeta (keepme) >>\nstream\n",
         // ASCIIHex of seg1 so the declared filter is internally consistent.
         seg1.iter().map(|b| format!("{b:02x}")).collect::<String>().len() + 1
     );
@@ -184,6 +184,14 @@ fn coalesce_preserves_first_stream_non_filter_dict_entries() {
     assert!(
         s.dict.get("Length").is_none(),
         "/Length must be stripped (writer re-derives it)"
+    );
+    assert!(
+        s.dict.get("F").is_none(),
+        "/F (external file spec) must be stripped — payload is embedded"
+    );
+    assert!(
+        s.dict.get("FFilter").is_none(),
+        "/FFilter must be stripped — no external data after coalesce"
     );
 }
 
