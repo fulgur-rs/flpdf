@@ -389,31 +389,58 @@ pub(crate) fn emit_objstm_body<R: std::io::Read + std::io::Seek>(
 
 // ── ObjStm stream wrapper ────────────────────────────────────────────────────
 
-/// Wrap an [`ObjStmBody`] with FlateDecode compression and build the complete
-/// `/Type /ObjStm` stream dictionary (ISO 32000-1 §7.5.7).
+/// Wrap an [`ObjStmBody`] and build the complete `/Type /ObjStm` stream
+/// dictionary (ISO 32000-1 §7.5.7).
 ///
 /// The returned [`crate::Stream`] is ready to be written as an indirect object.
 /// Key order follows qpdf parity: `Type → N → First → Length → Filter`.
-pub(crate) fn wrap_objstm_body(body: &ObjStmBody) -> crate::Result<crate::Stream> {
-    // Build a temporary encode dict with /Filter /FlateDecode.
-    let mut encode_dict = Dictionary::new();
-    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+///
+/// The `compress` parameter controls whether the body bytes are compressed with
+/// FlateDecode (`CompressStreams::Yes`, the default) or emitted raw
+/// (`CompressStreams::No`).  Passing the same [`crate::writer::CompressStreams`]
+/// value that drives the surrounding full-rewrite loop ensures the ObjStm
+/// container uses the same policy as every other stream in the document.
+pub(crate) fn wrap_objstm_body(
+    body: &ObjStmBody,
+    compress: crate::writer::CompressStreams,
+) -> crate::Result<crate::Stream> {
+    match compress {
+        crate::writer::CompressStreams::Yes => {
+            // Build a temporary encode dict with /Filter /FlateDecode.
+            let mut encode_dict = Dictionary::new();
+            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
 
-    // Compress the body bytes via the existing helper.
-    let encoded = crate::filters::encode_stream_data(&encode_dict, &body.bytes)?;
+            // Compress the body bytes via the existing helper.
+            let encoded = crate::filters::encode_stream_data(&encode_dict, &body.bytes)?;
 
-    // Build the final stream dictionary in qpdf-compatible key order.
-    let mut dict = Dictionary::new();
-    dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
-    dict.insert("N", Object::Integer(body.n_members as i64));
-    dict.insert("First", Object::Integer(body.first_offset as i64));
-    dict.insert("Length", Object::Integer(encoded.len() as i64));
-    dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            // Build the final stream dictionary in qpdf-compatible key order.
+            let mut dict = Dictionary::new();
+            dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+            dict.insert("N", Object::Integer(body.n_members as i64));
+            dict.insert("First", Object::Integer(body.first_offset as i64));
+            dict.insert("Length", Object::Integer(encoded.len() as i64));
+            dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
 
-    Ok(crate::Stream {
-        dict,
-        data: encoded,
-    })
+            Ok(crate::Stream {
+                dict,
+                data: encoded,
+            })
+        }
+        crate::writer::CompressStreams::No => {
+            // Emit raw (uncompressed) body bytes without any /Filter.
+            let mut dict = Dictionary::new();
+            dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+            dict.insert("N", Object::Integer(body.n_members as i64));
+            dict.insert("First", Object::Integer(body.first_offset as i64));
+            dict.insert("Length", Object::Integer(body.bytes.len() as i64));
+            // No /Filter key — body is raw plaintext.
+
+            Ok(crate::Stream {
+                dict,
+                data: body.bytes.clone(),
+            })
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1022,7 +1049,8 @@ mod tests {
             first_offset: 4,
             n_members: 1,
         };
-        let stream = wrap_objstm_body(&body).unwrap();
+        let stream =
+            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         assert_eq!(
             stream.dict.get("Type"),
@@ -1060,7 +1088,8 @@ mod tests {
         let body = emit_objstm_body_from_resolved(&members).unwrap();
         let original_bytes = body.bytes.clone();
 
-        let stream = wrap_objstm_body(&body).unwrap();
+        let stream =
+            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         let decoded = crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
         assert_eq!(
@@ -1078,7 +1107,8 @@ mod tests {
 
         let body =
             emit_objstm_body_from_resolved(&[(ref1, obj1.clone()), (ref2, obj2.clone())]).unwrap();
-        let stream = wrap_objstm_body(&body).unwrap();
+        let stream =
+            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         let parsed0 = crate::reader::parse_object_stream_entry(&stream, 0).unwrap();
         let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
@@ -1094,7 +1124,8 @@ mod tests {
             first_offset: 0,
             n_members: 0,
         };
-        let stream = wrap_objstm_body(&body).unwrap();
+        let stream =
+            wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
         assert_eq!(
             stream.dict.get("N"),

@@ -2,7 +2,8 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_pdf_with_options,
-    write_qdf, Dictionary, Object, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset,
+    write_qdf, CompressStreams, Dictionary, Object, ObjectRef, Pdf, WriteOptions, XrefForm,
+    XrefOffset,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -2558,16 +2559,59 @@ fn build_minimal_pdf_with_flate_xref_stream() -> Vec<u8> {
 }
 
 #[test]
-fn full_rewrite_strips_filter_from_rebuilt_xref_stream_dict() {
-    // Regression test: when the source PDF's xref stream declared
-    // `/Filter /FlateDecode`, the rebuilt xref stream output used to inherit
-    // that key from `pdf.trailer().clone()` while emitting raw entry bytes,
-    // producing an unreadable PDF.  Verify the filter keys are stripped.
+fn full_rewrite_xref_stream_compress_yes_produces_valid_flate_xref() {
+    // Regression / policy test: when the source PDF's xref stream declares
+    // `/Filter /FlateDecode` the full-rewrite path used to inherit that key
+    // from `pdf.trailer().clone()` while emitting **raw** entry bytes,
+    // producing an unreadable PDF.  Now `CompressStreams::Yes` (the default)
+    // properly FlateDecode-compresses the rebuilt xref bytes and sets
+    // `/Filter /FlateDecode` deliberately.  Verify the output parses cleanly.
     let source = build_minimal_pdf_with_flate_xref_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    // compress_streams defaults to CompressStreams::Yes
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // The output must parse back cleanly (FlateDecode xref stream is valid).
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "full-rewrite output from filtered xref-stream input should be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // With CompressStreams::Yes the rebuilt xref stream carries /Filter
+    // /FlateDecode (set deliberately by the writer, not inherited stale).
+    let mut reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut reader).unwrap();
+    assert_eq!(
+        loaded.trailer.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec())),
+        "CompressStreams::Yes xref stream must declare /Filter /FlateDecode"
+    );
+    // Keys that must never appear (only stale external-file refs / decode parms).
+    for key in ["DecodeParms", "F", "FFilter", "FDecodeParms"] {
+        assert!(
+            loaded.trailer.get(key).is_none(),
+            "rebuilt xref stream must not carry /{key}"
+        );
+    }
+}
+
+#[test]
+fn full_rewrite_xref_stream_compress_no_strips_all_filter_keys() {
+    // With CompressStreams::No the rebuilt xref bytes are stored raw and no
+    // /Filter key should appear in the xref stream dictionary.
+    let source = build_minimal_pdf_with_flate_xref_stream();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.compress_streams = CompressStreams::No;
 
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
@@ -2576,17 +2620,17 @@ fn full_rewrite_strips_filter_from_rebuilt_xref_stream_dict() {
     let report = check_reader(Cursor::new(&output)).unwrap();
     assert!(
         report.valid,
-        "full-rewrite output from filtered xref-stream input should be valid; diagnostics: {:?}",
+        "CompressStreams::No full-rewrite should produce a valid PDF; diagnostics: {:?}",
         report.diagnostics.entries()
     );
 
-    // And the rebuilt xref stream must not carry any stream-filter keys.
+    // No filter keys in the xref stream dict.
     let mut reader = Cursor::new(&output);
     let loaded = load_xref_and_trailer(&mut reader).unwrap();
     for key in ["Filter", "DecodeParms", "F", "FFilter", "FDecodeParms"] {
         assert!(
             loaded.trailer.get(key).is_none(),
-            "rebuilt xref stream must not inherit /{key} from the source trailer"
+            "CompressStreams::No xref stream must not carry /{key}"
         );
     }
 }
