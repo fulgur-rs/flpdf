@@ -29,15 +29,41 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 pub(crate) struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
+    /// When `true`, `N G R` is *not* recognised as an indirect reference;
+    /// the first integer is returned and `G R` are left unconsumed. Content
+    /// streams never contain indirect references, so the tokenizer sets this
+    /// to avoid mis-parsing operands like `0 0 1 R` (rg/RG colour ops).
+    no_reference: bool,
 }
 
 impl<'a> Parser<'a> {
     pub(crate) fn new(input: &'a [u8]) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            no_reference: false,
+        }
+    }
+
+    /// Like [`new`](Self::new) but with indirect-reference recognition
+    /// disabled (see [`Parser::no_reference`]).
+    pub(crate) fn new_no_reference(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            pos: 0,
+            no_reference: true,
+        }
     }
 
     pub(crate) fn position(&self) -> usize {
         self.pos
+    }
+
+    /// Parse a single direct object at the current position (after leading
+    /// whitespace/comments). Re-exported for the content-stream tokenizer so it
+    /// can reuse the operand lexer without duplicating it.
+    pub(crate) fn parse_one_object(&mut self) -> Result<Object> {
+        self.object()
     }
 
     pub(crate) fn object(&mut self) -> Result<Object> {
@@ -177,6 +203,10 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
             return self.parse_real_exponent(start);
+        }
+        if self.no_reference {
+            self.pos = saved;
+            return Ok(Object::Integer(first));
         }
         self.skip_ws();
         if let Ok(second) = self.integer() {
@@ -450,11 +480,11 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn is_ws(byte: u8) -> bool {
+pub(crate) fn is_ws(byte: u8) -> bool {
     matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
 }
 
-fn is_delimiter(byte: u8) -> bool {
+pub(crate) fn is_delimiter(byte: u8) -> bool {
     matches!(
         byte,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
