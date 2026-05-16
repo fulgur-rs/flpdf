@@ -25,6 +25,23 @@ use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+// ── Resource location ─────────────────────────────────────────────────────────
+
+/// Where a page's `/Resources` dictionary physically lives.
+///
+/// Used to distinguish the three cases that need different pruning strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResourcesLoc {
+    /// The page has no `/Resources` entry anywhere in its parent chain.
+    None,
+    /// `/Resources` is an inline (direct) dictionary on the page dict itself.
+    PageInline,
+    /// `/Resources` is an inline (direct) dictionary on an ancestor `/Pages` node.
+    AncestorInline(ObjectRef),
+    /// `/Resources` is an indirect object reference (anywhere in the chain).
+    Indirect(ObjectRef),
+}
+
 // ── Resource category names we prune ─────────────────────────────────────────
 
 /// The seven resource sub-dictionary keys we inspect and prune.
@@ -106,24 +123,27 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     // ── 1. Collect all page refs ──────────────────────────────────────────────
     let page_refs = crate::pages::page_refs(pdf)?;
 
-    // ── 2. For each page, determine which /Resources object ref it uses ───────
+    // ── 2. For each page, determine where its /Resources physically lives ────────
     // This drives both the "shared" detection for Auto mode and the grouping
     // for Yes mode (union-over-sharing-pages).
-    //
-    // `page_res_ref[i]` = Some(ObjectRef) when the page or an ancestor has an
-    // indirect /Resources reference, None when /Resources is embedded directly
-    // in the page dict (inline dict → always unshared).
-    let mut page_res_ref: Vec<Option<ObjectRef>> = Vec::with_capacity(page_refs.len());
+    let mut page_res_loc: Vec<ResourcesLoc> = Vec::with_capacity(page_refs.len());
     for &pr in &page_refs {
-        page_res_ref.push(resources_indirect_ref(pdf, pr)?);
+        page_res_loc.push(resources_location(pdf, pr)?);
     }
 
-    // Count how many pages reference each resources ObjectRef.
-    // ref_count[r] > 1 means the resources dict is shared.
+    // Count how many pages reference each resources ObjectRef (Indirect or
+    // AncestorInline). ref_count[r] > 1 means the resources dict is shared.
     let mut ref_count: BTreeMap<ObjectRef, usize> = BTreeMap::new();
-    for opt in &page_res_ref {
-        if let Some(r) = opt {
-            *ref_count.entry(*r).or_insert(0) += 1;
+    let mut ancestor_count: BTreeMap<ObjectRef, usize> = BTreeMap::new();
+    for loc in &page_res_loc {
+        match loc {
+            ResourcesLoc::Indirect(r) => {
+                *ref_count.entry(*r).or_insert(0) += 1;
+            }
+            ResourcesLoc::AncestorInline(a) => {
+                *ancestor_count.entry(*a).or_insert(0) += 1;
+            }
+            _ => {}
         }
     }
 
@@ -131,18 +151,21 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     // For Auto mode we only need per-page used-names for unshared pages.
     // For Yes mode we need the union grouped by resources-ref.
 
-    // Map from resources ObjectRef → union of used names per category.
+    // Map from indirect resources ObjectRef → union of used names per category.
     let mut ref_used: BTreeMap<ObjectRef, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>> = BTreeMap::new();
-    // For pages with inline /Resources (no indirect ref), store inline
-    // per-page used names keyed by page index.
+    // Map from ancestor /Pages ObjectRef → union of used names (AncestorInline case).
+    let mut ancestor_inline_used: BTreeMap<ObjectRef, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>> =
+        BTreeMap::new();
+    // For pages with PageInline /Resources, store per-page used names keyed by index.
     let mut inline_used: Vec<Option<BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>>> =
         vec![None; page_refs.len()];
 
     for (i, &page_ref) in page_refs.iter().enumerate() {
         // Determine if this page's resources are shared (for Auto mode skip).
-        let is_shared = match &page_res_ref[i] {
-            Some(r) => ref_count.get(r).copied().unwrap_or(0) > 1,
-            None => false, // inline dict: always unshared
+        let is_shared = match &page_res_loc[i] {
+            ResourcesLoc::Indirect(r) => ref_count.get(r).copied().unwrap_or(0) > 1,
+            ResourcesLoc::AncestorInline(a) => ancestor_count.get(a).copied().unwrap_or(0) > 1,
+            _ => false, // PageInline and None: always unshared
         };
 
         if mode == RemoveUnreferencedResources::Auto && is_shared {
@@ -153,18 +176,26 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
         // Collect the used names for this page.
         let used = collect_used_names_for_page(pdf, page_ref)?;
 
-        match &page_res_ref[i] {
-            Some(r) => {
+        match &page_res_loc[i] {
+            ResourcesLoc::Indirect(r) => {
                 // Merge into the union for this resources ref.
                 let entry = ref_used.entry(*r).or_default();
                 for (cat, names) in used {
                     entry.entry(cat).or_default().extend(names);
                 }
             }
-            None => {
-                // Inline resources: store per-page.
+            ResourcesLoc::AncestorInline(a) => {
+                // Merge into the union for this ancestor /Pages node.
+                let entry = ancestor_inline_used.entry(*a).or_default();
+                for (cat, names) in used {
+                    entry.entry(cat).or_default().extend(names);
+                }
+            }
+            ResourcesLoc::PageInline => {
+                // Inline resources on page itself: store per-page.
                 inline_used[i] = Some(used);
             }
+            ResourcesLoc::None => {}
         }
     }
 
@@ -173,7 +204,12 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
         prune_resources_object(pdf, *res_ref, used)?;
     }
 
-    // ── 5. Prune: inline (direct) resources embedded in page dicts ────────────
+    // ── 5. Prune: inline (direct) resources embedded in ancestor /Pages nodes ──
+    for (ancestor_ref, used) in &ancestor_inline_used {
+        prune_ancestor_inline_resources(pdf, *ancestor_ref, used)?;
+    }
+
+    // ── 6. Prune: inline (direct) resources embedded in page dicts ────────────
     for (i, used_opt) in inline_used.iter().enumerate() {
         let Some(used) = used_opt else { continue };
         let page_ref = page_refs[i];
@@ -185,17 +221,18 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Return the indirect `ObjectRef` that a page's `/Resources` resolves to, if
-/// any. Returns `None` when:
-/// - the page has an inline (direct dictionary) `/Resources`, or
-/// - no `/Resources` is found at all.
+/// Determine where a page's `/Resources` dictionary physically lives.
 ///
-/// When a page inherits `/Resources` from a parent `/Pages` node, the ref is
-/// the one stored on that parent node (not the page's own ref).
-fn resources_indirect_ref<R: Read + Seek>(
+/// Walks the parent chain looking for the first `/Resources` entry and
+/// returns a [`ResourcesLoc`] discriminating among:
+/// - [`ResourcesLoc::Indirect`] – indirect object reference (anywhere in chain)
+/// - [`ResourcesLoc::PageInline`] – inline dict on the page dict itself
+/// - [`ResourcesLoc::AncestorInline`] – inline dict on a `/Pages` ancestor
+/// - [`ResourcesLoc::None`] – no `/Resources` found at all
+fn resources_location<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> Result<Option<ObjectRef>> {
+) -> Result<ResourcesLoc> {
     // Walk the parent chain looking for the first /Resources entry.
     let mut current = page_ref;
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -204,31 +241,38 @@ fn resources_indirect_ref<R: Read + Seek>(
 
     loop {
         if depth >= MAX_DEPTH {
-            return Ok(None);
+            return Ok(ResourcesLoc::None);
         }
         if !seen.insert(current) {
-            return Ok(None); // cycle
+            return Ok(ResourcesLoc::None); // cycle
         }
         depth += 1;
 
         let node_obj = pdf.resolve(current)?;
         let Object::Dictionary(dict) = node_obj else {
-            return Ok(None);
+            return Ok(ResourcesLoc::None);
         };
 
         match dict.get("Resources").cloned() {
-            Some(Object::Reference(r)) => return Ok(Some(r)),
-            Some(Object::Dictionary(_)) => return Ok(None), // inline
+            Some(Object::Reference(r)) => return Ok(ResourcesLoc::Indirect(r)),
+            Some(Object::Dictionary(_)) => {
+                // Inline dict: distinguish page-level vs ancestor.
+                if current == page_ref {
+                    return Ok(ResourcesLoc::PageInline);
+                } else {
+                    return Ok(ResourcesLoc::AncestorInline(current));
+                }
+            }
             Some(Object::Null) | None => {
                 // Fall through to parent.
                 match dict.get("Parent").cloned() {
                     Some(Object::Reference(parent)) => {
                         current = parent;
                     }
-                    _ => return Ok(None),
+                    _ => return Ok(ResourcesLoc::None),
                 }
             }
-            _ => return Ok(None),
+            _ => return Ok(ResourcesLoc::None),
         }
     }
 }
@@ -467,7 +511,7 @@ fn prune_resources_object<R: Read + Seek>(
         return Ok(()); // not a dict — nothing to prune
     };
 
-    apply_pruning(&mut res_dict, used);
+    apply_pruning(pdf, &mut res_dict, used)?;
     pdf.set_object(res_ref, Object::Dictionary(res_dict));
     Ok(())
 }
@@ -490,7 +534,7 @@ fn prune_inline_resources<R: Read + Seek>(
     let resources_val = page_dict.get("Resources").cloned();
     match resources_val {
         Some(Object::Dictionary(mut res_dict)) => {
-            apply_pruning(&mut res_dict, used);
+            apply_pruning(pdf, &mut res_dict, used)?;
             page_dict.insert("Resources", Object::Dictionary(res_dict));
         }
         _ => return Ok(()), // nothing inline to prune
@@ -500,38 +544,105 @@ fn prune_inline_resources<R: Read + Seek>(
     Ok(())
 }
 
+/// Prune the /Resources that is embedded directly in an ancestor /Pages node.
+/// The union of used names across all pages that inherit from this ancestor is
+/// given by `used`. We resolve the ancestor node, mutate its inline /Resources,
+/// and write it back via `set_object`.
+fn prune_ancestor_inline_resources<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    ancestor_ref: ObjectRef,
+    used: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+) -> Result<()> {
+    let ancestor_obj = pdf.resolve(ancestor_ref)?;
+    let Object::Dictionary(mut ancestor_dict) = ancestor_obj else {
+        return Ok(()); // not a dict — nothing to prune
+    };
+
+    let resources_val = ancestor_dict.get("Resources").cloned();
+    match resources_val {
+        Some(Object::Dictionary(mut res_dict)) => {
+            apply_pruning(pdf, &mut res_dict, used)?;
+            ancestor_dict.insert("Resources", Object::Dictionary(res_dict));
+        }
+        _ => return Ok(()), // not an inline dict — nothing to prune here
+    }
+
+    pdf.set_object(ancestor_ref, Object::Dictionary(ancestor_dict));
+    Ok(())
+}
+
 /// Mutate `res_dict` by removing every entry from each resource sub-category
 /// that is not listed in `used`. Empty sub-category dicts are removed entirely.
-fn apply_pruning(
+///
+/// Handles both direct Dictionary values and indirect Reference values for
+/// category sub-dictionaries (e.g., `/Font 10 0 R`). When the category value
+/// is a Reference, the referenced object is pruned in-place via `pdf.set_object`.
+fn apply_pruning<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     res_dict: &mut Dictionary,
     used: &BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
-) {
+) -> Result<()> {
     for &category in RESOURCE_CATEGORIES {
         let cat_key = category.as_bytes();
         let cat_val = res_dict.get(category).cloned();
 
-        let Some(Object::Dictionary(mut cat_dict)) = cat_val else {
-            continue;
-        };
+        match cat_val {
+            Some(Object::Dictionary(mut cat_dict)) => {
+                // Direct dictionary — prune in place and write back.
+                let empty_set = BTreeSet::new();
+                let used_names = used.get(cat_key).unwrap_or(&empty_set);
 
-        let empty_set = BTreeSet::new();
-        let used_names = used.get(cat_key).unwrap_or(&empty_set);
+                let to_remove: Vec<Vec<u8>> = cat_dict
+                    .iter()
+                    .filter(|(k, _)| !used_names.contains(*k))
+                    .map(|(k, _)| k.to_vec())
+                    .collect();
+                for key in to_remove {
+                    cat_dict.remove(&key);
+                }
 
-        // Collect keys to remove (can't mutate while iterating).
-        let to_remove: Vec<Vec<u8>> = cat_dict
-            .iter()
-            .filter(|(k, _)| !used_names.contains(*k))
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in to_remove {
-            cat_dict.remove(&key);
-        }
+                if cat_dict.iter().next().is_none() {
+                    res_dict.remove(category);
+                } else {
+                    res_dict.insert(category, Object::Dictionary(cat_dict));
+                }
+            }
+            Some(Object::Reference(cat_ref)) => {
+                // Indirect reference to category sub-dictionary.
+                // Resolve, prune, and write back via set_object.
+                let resolved = pdf.resolve(cat_ref)?;
+                let Object::Dictionary(mut cat_dict) = resolved else {
+                    // Not a dictionary (e.g. Stream) — skip safely.
+                    continue;
+                };
 
-        if cat_dict.iter().next().is_none() {
-            // Remove the whole sub-dictionary when nothing remains.
-            res_dict.remove(category);
-        } else {
-            res_dict.insert(category, Object::Dictionary(cat_dict));
+                let empty_set = BTreeSet::new();
+                let used_names = used.get(cat_key).unwrap_or(&empty_set);
+
+                let to_remove: Vec<Vec<u8>> = cat_dict
+                    .iter()
+                    .filter(|(k, _)| !used_names.contains(*k))
+                    .map(|(k, _)| k.to_vec())
+                    .collect();
+                for key in to_remove {
+                    cat_dict.remove(&key);
+                }
+
+                if cat_dict.iter().next().is_none() {
+                    // All entries pruned — remove the category reference from res_dict.
+                    // (The now-empty indirect object is left as an orphan; xref GC
+                    // is out of scope for this module.)
+                    res_dict.remove(category);
+                } else {
+                    // Update the referenced object in-place; keep the reference in res_dict.
+                    pdf.set_object(cat_ref, Object::Dictionary(cat_dict));
+                }
+            }
+            _ => {
+                // Absent or non-dictionary/non-reference value — skip.
+                continue;
+            }
         }
     }
+    Ok(())
 }
