@@ -640,12 +640,10 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
 // ===========================================================================
 
 #[test]
-#[ignore = "flpdf-s5e: --split-pages=1 emits range-form -1-1.pdf; qpdf 11.9.0 emits single-number -1.pdf. Real divergence in layer flpdf-9hc.8.7 (page_split::split_output_path). Tracked as bug flpdf-s5e (P2, child of epic flpdf-9hc.8); un-ignore once fixed in the 8.7 layer."]
 fn split_pages_one_filename_matches_qpdf() {
     // qpdf 11.9.0: `3p --split-pages=1` → q-1.pdf, q-2.pdf, q-3.pdf.
-    // flpdf produces f-1-1.pdf, f-2-2.pdf, f-3-3.pdf (range form for every
-    // chunk regardless of chunk_size==1). Verified divergence; tracked for a
-    // fix at layer 8.7 (do NOT fix in this test-only subtask).
+    // flpdf now matches: chunk_size==1 uses the single-number suffix
+    // (page_split::split_output_path). Regression guard for flpdf-s5e.
     let qdir = tempfile::tempdir().unwrap();
     let fdir = tempfile::tempdir().unwrap();
     let src = fixture_abs(THREE_PAGE);
@@ -664,7 +662,6 @@ fn split_pages_one_filename_matches_qpdf() {
     let q = split_outputs(qdir.path());
     let f = split_outputs(fdir.path());
     assert_eq!(q, vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"]);
-    // This is the assertion that currently fails (range vs single number):
     assert_eq!(f, q, "flpdf split-pages=1 naming must match qpdf");
 }
 
