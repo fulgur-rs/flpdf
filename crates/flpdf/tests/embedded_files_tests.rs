@@ -57,9 +57,7 @@ fn build_single_level_pdf() -> Vec<u8> {
     out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
 
     off.insert(3, out.len() as u64);
-    out.extend_from_slice(
-        b"3 0 obj\n<< /Names [ (alpha) 4 0 R (beta) 5 0 R ] >>\nendobj\n",
-    );
+    out.extend_from_slice(b"3 0 obj\n<< /Names [ (alpha) 4 0 R (beta) 5 0 R ] >>\nendobj\n");
 
     off.insert(4, out.len() as u64);
     out.extend_from_slice(b"4 0 obj\n<< /Type /Filespec /F (alpha.txt) >>\nendobj\n");
@@ -149,9 +147,7 @@ fn build_multi_level_with_limits_pdf() -> Vec<u8> {
     out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
 
     off.insert(3, out.len() as u64);
-    out.extend_from_slice(
-        b"3 0 obj\n<< /Limits [(aaa) (zzz)] /Kids [ 4 0 R 5 0 R ] >>\nendobj\n",
-    );
+    out.extend_from_slice(b"3 0 obj\n<< /Limits [(aaa) (zzz)] /Kids [ 4 0 R 5 0 R ] >>\nendobj\n");
 
     off.insert(4, out.len() as u64);
     out.extend_from_slice(
@@ -159,9 +155,7 @@ fn build_multi_level_with_limits_pdf() -> Vec<u8> {
     );
 
     off.insert(5, out.len() as u64);
-    out.extend_from_slice(
-        b"5 0 obj\n<< /Limits [(zzz) (zzz)] /Names [ (zzz) 8 0 R ] >>\nendobj\n",
-    );
+    out.extend_from_slice(b"5 0 obj\n<< /Limits [(zzz) (zzz)] /Names [ (zzz) 8 0 R ] >>\nendobj\n");
 
     off.insert(6, out.len() as u64);
     out.extend_from_slice(b"6 0 obj\n<< /Type /Filespec /F (aaa.txt) >>\nendobj\n");
