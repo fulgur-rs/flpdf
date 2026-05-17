@@ -472,23 +472,9 @@ pub fn format_pdf_date(year: u16, month: u8, day: u8, hour: u8, minute: u8, seco
 /// assert_eq!(escape_pdf_name(b"image/png"), b"image#2Fpng".to_vec());
 /// ```
 pub fn escape_pdf_name(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len() + 4);
-    for &b in raw {
-        // Escape: non-printable, DEL, space, or any PDF delimiter character.
-        // PDF delimiters: ( ) < > [ ] { } / %  — and also # itself (since we
-        // use it as our own escape prefix).
-        let needs_escape = !(0x21..=0x7E).contains(&b)
-            || matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#');
-        if needs_escape {
-            out.push(b'#');
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            out.push(HEX[(b >> 4) as usize]);
-            out.push(HEX[(b & 0x0F) as usize]);
-        } else {
-            out.push(b);
-        }
-    }
-    out
+    // Delegate to the canonical name escaper used by the serializer
+    // (`Object::write_pdf`) so the two never drift apart.
+    crate::object::escape_name_bytes(raw)
 }
 
 /// Compute the MD5 checksum of `data` and return it as a 16-byte `Vec<u8>`.
