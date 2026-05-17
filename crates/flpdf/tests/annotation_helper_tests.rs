@@ -58,25 +58,16 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
 //   4 0 R  Annotation  (the object under test)
 fn build_annotation_pdf(annot_extras: &str) -> Vec<u8> {
     build_pdf(vec![
-        (
-            1,
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        ),
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
         (
             2,
             b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
         ),
         (
             3,
-            format!(
-                "<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>"
-            )
-            .into_bytes(),
+            format!("<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>").into_bytes(),
         ),
-        (
-            4,
-            format!("<< /Type /Annot {annot_extras} >>").into_bytes(),
-        ),
+        (4, format!("<< /Type /Annot {annot_extras} >>").into_bytes()),
     ])
 }
 
@@ -141,7 +132,10 @@ fn annotation_appearance_inline_dict() {
     let bytes = build_annotation_pdf("/Subtype /Widget /Rect [0 0 10 10] /AP << /N 5 0 R >>");
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    let ap = annot.appearance().expect("appearance()").expect("should have AP");
+    let ap = annot
+        .appearance()
+        .expect("appearance()")
+        .expect("should have AP");
     // /N should be present as a reference to object 5.
     assert!(ap.get("N").is_some());
 }
@@ -207,7 +201,10 @@ fn field_type_direct_on_widget() {
     let bytes = build_leaf_field_pdf("/FT /Tx /V (Hello) /DV () /Ff 0");
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    assert_eq!(field.field_type().expect("field_type()"), Some(b"Tx".to_vec()));
+    assert_eq!(
+        field.field_type().expect("field_type()"),
+        Some(b"Tx".to_vec())
+    );
 }
 
 #[test]
@@ -248,7 +245,10 @@ fn field_absent_returns_none() {
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(field.field_type().expect("field_type()"), None);
     assert_eq!(field.field_value().expect("field_value()"), None);
-    assert_eq!(field.field_default_value().expect("field_default_value()"), None);
+    assert_eq!(
+        field.field_default_value().expect("field_default_value()"),
+        None
+    );
     assert_eq!(field.field_flags().expect("field_flags()"), None);
 }
 
@@ -263,10 +263,7 @@ fn field_absent_returns_none() {
 //
 // The child helper must resolve all four values from the parent.
 
-fn build_parent_child_field_pdf(
-    parent_field_extras: &str,
-    child_widget_extras: &str,
-) -> Vec<u8> {
+fn build_parent_child_field_pdf(parent_field_extras: &str, child_widget_extras: &str) -> Vec<u8> {
     build_pdf(vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
         (
@@ -298,7 +295,10 @@ fn field_type_inherited_from_parent() {
 
     // The child (5 0 R) has no /FT, so it must be read from parent (4 0 R).
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    assert_eq!(child.field_type().expect("field_type()"), Some(b"Tx".to_vec()));
+    assert_eq!(
+        child.field_type().expect("field_type()"),
+        Some(b"Tx".to_vec())
+    );
 }
 
 #[test]
@@ -350,7 +350,10 @@ fn field_type_child_overrides_parent() {
     let bytes = build_parent_child_field_pdf("/FT /Tx", "/FT /Btn");
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    assert_eq!(child.field_type().expect("field_type()"), Some(b"Btn".to_vec()));
+    assert_eq!(
+        child.field_type().expect("field_type()"),
+        Some(b"Btn".to_vec())
+    );
 }
 
 // ── Cycle guard ───────────────────────────────────────────────────────────────
