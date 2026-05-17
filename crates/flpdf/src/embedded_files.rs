@@ -22,8 +22,10 @@
 //! # Missing keys
 //!
 //! Any of `/Root`, `/Names`, `/EmbeddedFiles`, or the name-tree root being absent
-//! results in an empty list (`Ok(vec![])`) rather than an error.  Only I/O
-//! errors from [`Pdf::resolve`] are propagated.
+//! results in an empty list (`Ok(vec![])`) rather than an error.  Two error
+//! kinds can be returned: I/O errors propagated from [`Pdf::resolve`], and
+//! [`crate::Error::Unsupported`] when a `/Kids` chain exceeds the configured depth
+//! limit (guards against cyclic or maliciously deep trees).
 //!
 //! # Value types
 //!
@@ -68,7 +70,9 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`].
+/// Propagates any error from [`Pdf::resolve`], and returns
+/// [`crate::Error::Unsupported`] if a `/Kids` chain exceeds
+/// [`DEFAULT_MAX_EMBEDDED_FILES_DEPTH`] (cyclic or maliciously deep tree).
 pub fn list_embedded_files<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<(Vec<u8>, ObjectRef)>> {
     list_embedded_files_with_max_depth(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
 }
@@ -77,6 +81,11 @@ pub fn list_embedded_files<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<(Vec<
 ///
 /// The depth limit guards against maliciously or accidentally cyclic `/Kids`
 /// references.  Exceeding the limit returns an error rather than panicking.
+///
+/// # Errors
+///
+/// Propagates any error from [`Pdf::resolve`], and returns
+/// [`crate::Error::Unsupported`] if a `/Kids` chain depth reaches `max_depth`.
 pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
