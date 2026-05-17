@@ -733,8 +733,9 @@ impl FileSpecBuilder {
 /// # Errors
 ///
 /// - [`Error::Io`] if the file cannot be read.
-/// - [`Error::Unsupported`] if the path has no basename or the basename is not
-///   valid UTF-8.
+/// - [`Error::Unsupported`] if the path has no basename, the basename is not
+///   valid UTF-8, or the basename is not ASCII (independent `/F` ASCII-fallback
+///   + `/UF` Unicode handling is not yet supported).
 /// - Any error from [`FileSpecBuilder::build`] or
 ///   [`crate::embedded_files::insert_embedded_file`].
 ///
@@ -778,6 +779,20 @@ where
                 path.display()
             ))
         })?;
+
+    // `FileSpecBuilder::new` uses the same string for both `/F`
+    // (PDFDocEncoding/ASCII) and `/UF` (UTF-16BE).  A non-ASCII basename would
+    // place non-PDFDocEncoding bytes into `/F`, corrupting the attachment name
+    // in viewers that only read `/F`.  Reject it loudly until this helper can
+    // set `/F` (ASCII-safe fallback) and `/UF` (full Unicode) independently
+    // (tracked as a followup).
+    if !basename.is_ascii() {
+        return Err(Error::Unsupported(format!(
+            "add_attachment_from_path: basename must be ASCII (independent /F \
+             ASCII-fallback + /UF Unicode not yet supported): {}",
+            path.display()
+        )));
+    }
 
     // Read the raw file bytes.
     let raw = std::fs::read(path)?;
