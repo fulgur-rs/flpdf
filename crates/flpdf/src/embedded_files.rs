@@ -259,9 +259,23 @@ fn clear_af_reference<R: Read + Seek>(pdf: &mut Pdf<R>, target_ref: ObjectRef) -
 }
 
 /// Remove `target_ref` from the `/AF` array of the dictionary at `dict_ref`.
-/// Patches the dictionary back via [`Pdf::set_object`].  If `/AF` becomes
-/// empty after removal, the key is deleted.  If `/AF` is absent or contains no
-/// reference to `target_ref`, this is a no-op.
+///
+/// `/AF` may be a *direct* array or an *indirect reference* to an array
+/// object.  In the indirect case the referenced array object — not just the
+/// parent dictionary — must be updated, otherwise it lingers in
+/// [`Pdf::live_object_refs`] still holding a stale reference to `target_ref`,
+/// which would block the conservative GC in [`remove_attachment`] and leave
+/// the removed attachment's data as unreachable objects (roborev #948).
+///
+/// Behaviour:
+/// - direct array → filter in place; if it becomes empty the `/AF` key is
+///   removed from the parent;
+/// - indirect array → the *referenced* array object is rewritten with the
+///   filtered contents; if it becomes empty the `/AF` key is removed from the
+///   parent and the now-orphan array object is `delete_object`-ed.
+///
+/// If `/AF` is absent or contains no reference to `target_ref`, this is a
+/// no-op.
 fn remove_ref_from_af_in_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict_ref: ObjectRef,
@@ -278,10 +292,12 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
         None => return Ok(()), // No /AF — nothing to do.
     };
 
-    let af_array: Vec<Object> = match af_value {
-        Object::Array(arr) => arr,
+    // `array_ref` is `Some(r)` when /AF is an indirect reference to the array
+    // object `r` (which must be patched/deleted, not just the parent dict).
+    let (array_ref, af_array): (Option<ObjectRef>, Vec<Object>) = match af_value {
+        Object::Array(arr) => (None, arr),
         Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => arr,
+            Object::Array(arr) => (Some(r), arr),
             _ => return Ok(()),
         },
         _ => return Ok(()),
@@ -292,12 +308,29 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
         .filter(|o| !matches!(o, Object::Reference(r) if *r == target_ref))
         .collect();
 
-    if filtered.is_empty() {
-        dict.remove("AF");
-    } else {
-        dict.insert("AF", Object::Array(filtered));
+    match array_ref {
+        // Indirect /AF: patch (or drop) the referenced array object itself so
+        // it no longer holds a stale reference to `target_ref`.
+        Some(r) => {
+            if filtered.is_empty() {
+                dict.remove("AF");
+                pdf.set_object(dict_ref, Object::Dictionary(dict));
+                pdf.delete_object(r);
+            } else {
+                pdf.set_object(r, Object::Array(filtered));
+                // Parent keeps `/AF -> r`; nothing else to change there.
+            }
+        }
+        // Direct /AF array lives inside the parent dictionary.
+        None => {
+            if filtered.is_empty() {
+                dict.remove("AF");
+            } else {
+                dict.insert("AF", Object::Array(filtered));
+            }
+            pdf.set_object(dict_ref, Object::Dictionary(dict));
+        }
     }
-    pdf.set_object(dict_ref, Object::Dictionary(dict));
     Ok(())
 }
 
@@ -1054,6 +1087,73 @@ mod tests {
         assert!(
             !live.contains(&stream_ref),
             "stream ref must not be in live_object_refs after GC"
+        );
+    }
+
+    // ── Test: indirect /AF array is patched so GC still frees the filespec ───
+    //
+    // Regression for roborev #948: when /AF is an *indirect* array reference,
+    // remove_ref_from_af_in_dict used to rewrite only the parent dict, leaving
+    // the referenced array object holding a stale reference to the filespec —
+    // which blocked the conservative GC and left the removed attachment's data
+    // as unreachable objects.
+    #[test]
+    fn remove_attachment_with_indirect_af_array_gcs_filespec_and_stream() {
+        let mut pdf = open_minimal();
+
+        let fs_ref = FileSpecBuilder::new("idx.txt", b"indirect-af payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"idx.txt", fs_ref).expect("insert");
+
+        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+            .expect("resolve stream ref")
+            .expect("stream ref must exist");
+
+        // Allocate a standalone array object [fs_ref] and point catalog /AF at
+        // it *indirectly* (the only reference to this array object).
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let af_array_ref = ObjectRef::new(next + 1, 0);
+        pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
+
+        let catalog_ref = pdf.root_ref().expect("root");
+        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        else {
+            panic!("expected catalog dict");
+        };
+        catalog.insert("AF", Object::Reference(af_array_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let removed = remove_attachment(&mut pdf, b"idx.txt").expect("remove");
+        assert!(removed);
+
+        let live = pdf.live_object_refs();
+        assert!(
+            !live.contains(&fs_ref),
+            "filespec must be GC-deleted even when only an indirect /AF array referenced it"
+        );
+        assert!(
+            !live.contains(&stream_ref),
+            "embedded stream must be GC-deleted alongside the filespec"
+        );
+        assert!(
+            !live.contains(&af_array_ref),
+            "emptied indirect /AF array object must not linger as a ghost"
+        );
+
+        // Catalog /AF must be gone (its only entry was the removed filespec).
+        let Object::Dictionary(catalog2) = pdf.resolve(catalog_ref).expect("resolve catalog after")
+        else {
+            panic!("expected catalog dict");
+        };
+        assert!(
+            catalog2.get("AF").is_none(),
+            "catalog /AF must be removed once empty"
         );
     }
 
