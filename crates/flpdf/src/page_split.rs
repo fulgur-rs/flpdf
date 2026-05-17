@@ -140,7 +140,8 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
         let last_page = chunk_end as u32;
 
         // Build the output path.
-        let out_path = split_output_path(output_template, first_page, last_page, width);
+        let out_path =
+            split_output_path(output_template, first_page, last_page, width, chunk_size);
 
         // Extract page refs for this chunk.
         let chunk_refs: Vec<ObjectRef> = all_page_refs[chunk_start..chunk_end].to_vec();
@@ -161,9 +162,14 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
 /// # Naming rule (observed with qpdf 11.9.0)
 ///
 /// - Split at the *last* `.` in the filename component.
-/// - If no `.` exists, append the page range suffix directly (no extension).
-/// - Zero-pad `first` and `last` to `width` digits (width = digit count of
-///   source page count, not chunk count).
+/// - If no `.` exists, append the page suffix directly (no extension).
+/// - Zero-pad page numbers to `width` digits (width = digit count of source
+///   page count, not chunk count).
+/// - When `chunk_size == 1` every chunk is a single page and qpdf emits a
+///   single-number suffix `-N` (e.g. `out-1.pdf`), **not** the range form
+///   `-N-N`. For `chunk_size >= 2` the range form `-lo-hi` is always used,
+///   including a trailing single-page chunk (e.g. 3 pages `--split-pages=2`
+///   → `out-1-2.pdf`, `out-3-3.pdf`). This mirrors qpdf 11.9.0 exactly.
 ///
 /// A leading-dot ("hidden file") template such as `.pdf` is intentionally
 /// treated the same as any other: the last `.` is at index 0, so the stem is
@@ -175,29 +181,34 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
 /// ```
 /// # use std::path::{Path, PathBuf};
 /// # use flpdf::page_split::split_output_path;
-/// // 5-page source → width=1
+/// // --split-pages=1: single-number suffix (qpdf 11.9.0)
 /// assert_eq!(
-///     split_output_path(Path::new("out.pdf"), 1, 2, 1),
+///     split_output_path(Path::new("out.pdf"), 1, 1, 1, 1),
+///     PathBuf::from("out-1.pdf"),
+/// );
+/// // --split-pages=2, first chunk 1-2 → range form
+/// assert_eq!(
+///     split_output_path(Path::new("out.pdf"), 1, 2, 1, 2),
 ///     PathBuf::from("out-1-2.pdf"),
 /// );
-/// // 11-page source → width=2
+/// // --split-pages=2, trailing single-page chunk still keeps lo-hi
 /// assert_eq!(
-///     split_output_path(Path::new("out.pdf"), 11, 11, 2),
+///     split_output_path(Path::new("out.pdf"), 11, 11, 2, 2),
 ///     PathBuf::from("out-11-11.pdf"),
 /// );
 /// // No extension
 /// assert_eq!(
-///     split_output_path(Path::new("out"), 1, 2, 1),
+///     split_output_path(Path::new("out"), 1, 2, 1, 2),
 ///     PathBuf::from("out-1-2"),
 /// );
 /// // Multiple dots: split at last dot
 /// assert_eq!(
-///     split_output_path(Path::new("two.dots.pdf"), 1, 2, 1),
+///     split_output_path(Path::new("two.dots.pdf"), 1, 2, 1, 2),
 ///     PathBuf::from("two.dots-1-2.pdf"),
 /// );
 /// // Leading-dot template: qpdf 11.9.0-verified — empty stem, ".pdf" ext
 /// assert_eq!(
-///     split_output_path(Path::new(".pdf"), 1, 2, 1),
+///     split_output_path(Path::new(".pdf"), 1, 2, 1, 2),
 ///     PathBuf::from("-1-2.pdf"),
 /// );
 /// ```
@@ -206,6 +217,7 @@ pub fn split_output_path(
     first_page: u32,
     last_page: u32,
     width: usize,
+    chunk_size: usize,
 ) -> PathBuf {
     // Work with the filename only (file_name() returns an OsStr).
     let parent = template.parent().unwrap_or(Path::new(""));
@@ -223,12 +235,19 @@ pub fn split_output_path(
         None => (filename.clone(), String::new()),
     };
 
-    let new_filename = format!(
-        "{stem}-{:0>width$}-{:0>width$}{ext}",
-        first_page,
-        last_page,
-        width = width
-    );
+    // qpdf 11.9.0: --split-pages=1 produces a single-number suffix (`-N`);
+    // chunk_size >= 2 always uses the range form (`-lo-hi`), even for a
+    // trailing single-page chunk.
+    let new_filename = if chunk_size == 1 {
+        format!("{stem}-{first_page:0>width$}{ext}", width = width)
+    } else {
+        format!(
+            "{stem}-{:0>width$}-{:0>width$}{ext}",
+            first_page,
+            last_page,
+            width = width
+        )
+    };
 
     if parent == Path::new("") {
         PathBuf::from(new_filename)
@@ -333,46 +352,78 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn split_output_path_basic_pdf_extension() {
-        // 5-page source (width=1): out-1-2.pdf
+    fn split_output_path_chunk_size_1_single_number() {
+        // --split-pages=1: qpdf 11.9.0 names each single-page chunk with a
+        // single page number (out-1.pdf), NOT the range form (out-1-1.pdf).
         assert_eq!(
-            split_output_path(Path::new("out.pdf"), 1, 2, 1),
+            split_output_path(Path::new("out.pdf"), 1, 1, 1, 1),
+            PathBuf::from("out-1.pdf"),
+        );
+        assert_eq!(
+            split_output_path(Path::new("out.pdf"), 3, 3, 1, 1),
+            PathBuf::from("out-3.pdf"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_chunk_size_1_single_number_zero_padded() {
+        // Single-number form is still zero-padded to `width`.
+        assert_eq!(
+            split_output_path(Path::new("out.pdf"), 7, 7, 2, 1),
+            PathBuf::from("out-07.pdf"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_chunk_size_1_single_number_no_extension() {
+        assert_eq!(
+            split_output_path(Path::new("out"), 2, 2, 1, 1),
+            PathBuf::from("out-2"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_basic_pdf_extension() {
+        // --split-pages=2, 5-page source (width=1): out-1-2.pdf
+        assert_eq!(
+            split_output_path(Path::new("out.pdf"), 1, 2, 1, 2),
             PathBuf::from("out-1-2.pdf"),
         );
     }
 
     #[test]
     fn split_output_path_last_chunk_same_page() {
-        // Final chunk where first == last
+        // --split-pages>=2 trailing chunk where first == last: qpdf keeps the
+        // range form (out-5-5.pdf), it does NOT collapse to a single number.
         assert_eq!(
-            split_output_path(Path::new("out.pdf"), 5, 5, 1),
+            split_output_path(Path::new("out.pdf"), 5, 5, 1, 2),
             PathBuf::from("out-5-5.pdf"),
         );
     }
 
     #[test]
     fn split_output_path_zero_padded_width2() {
-        // 11-page source (width=2): first chunk 1-2 → 01-02
+        // --split-pages=2, 11-page source (width=2): first chunk 1-2 → 01-02
         assert_eq!(
-            split_output_path(Path::new("out.pdf"), 1, 2, 2),
+            split_output_path(Path::new("out.pdf"), 1, 2, 2, 2),
             PathBuf::from("out-01-02.pdf"),
         );
-        // Last chunk 11-11
+        // Last chunk 11-11 (range form retained for chunk_size >= 2)
         assert_eq!(
-            split_output_path(Path::new("out.pdf"), 11, 11, 2),
+            split_output_path(Path::new("out.pdf"), 11, 11, 2, 2),
             PathBuf::from("out-11-11.pdf"),
         );
     }
 
     #[test]
     fn split_output_path_zero_padded_width3() {
-        // 100-page source (width=3): first chunk 1-10 → 001-010
+        // --split-pages=10, 100-page source (width=3): first chunk 1-10 → 001-010
         assert_eq!(
-            split_output_path(Path::new("out.pdf"), 1, 10, 3),
+            split_output_path(Path::new("out.pdf"), 1, 10, 3, 10),
             PathBuf::from("out-001-010.pdf"),
         );
         assert_eq!(
-            split_output_path(Path::new("out.pdf"), 91, 100, 3),
+            split_output_path(Path::new("out.pdf"), 91, 100, 3, 10),
             PathBuf::from("out-091-100.pdf"),
         );
     }
@@ -381,7 +432,7 @@ mod tests {
     fn split_output_path_no_extension() {
         // No `.` in filename → suffix appended without extension
         assert_eq!(
-            split_output_path(Path::new("out"), 1, 2, 1),
+            split_output_path(Path::new("out"), 1, 2, 1, 2),
             PathBuf::from("out-1-2"),
         );
     }
@@ -390,7 +441,7 @@ mod tests {
     fn split_output_path_multiple_dots_splits_at_last() {
         // "two.dots.pdf" → split at last `.` → "two.dots-1-2.pdf"
         assert_eq!(
-            split_output_path(Path::new("two.dots.pdf"), 1, 2, 1),
+            split_output_path(Path::new("two.dots.pdf"), 1, 2, 1, 2),
             PathBuf::from("two.dots-1-2.pdf"),
         );
     }
@@ -401,11 +452,11 @@ mod tests {
         // writes /tmp/-1-2.pdf (empty stem, ".pdf" treated as extension).
         // Must NOT special-case dot_pos==0 into ".pdf-1-2".
         assert_eq!(
-            split_output_path(Path::new(".pdf"), 1, 2, 1),
+            split_output_path(Path::new(".pdf"), 1, 2, 1, 2),
             PathBuf::from("-1-2.pdf"),
         );
         assert_eq!(
-            split_output_path(Path::new("/tmp/.pdf"), 3, 3, 1),
+            split_output_path(Path::new("/tmp/.pdf"), 3, 3, 1, 2),
             PathBuf::from("/tmp/-3-3.pdf"),
         );
     }
@@ -413,7 +464,7 @@ mod tests {
     #[test]
     fn split_output_path_preserves_parent_directory() {
         assert_eq!(
-            split_output_path(Path::new("/tmp/out.pdf"), 3, 4, 1),
+            split_output_path(Path::new("/tmp/out.pdf"), 3, 4, 1, 2),
             PathBuf::from("/tmp/out-3-4.pdf"),
         );
     }
@@ -516,9 +567,11 @@ mod tests {
 
         split_pages(&src, 1, &template).expect("split should succeed");
 
-        let out1 = tmpdir.path().join("out-1-1.pdf");
-        let out2 = tmpdir.path().join("out-2-2.pdf");
-        let out3 = tmpdir.path().join("out-3-3.pdf");
+        // qpdf 11.9.0: --split-pages=1 → single-number suffix (out-N.pdf),
+        // not the range form out-N-N.pdf (flpdf-s5e).
+        let out1 = tmpdir.path().join("out-1.pdf");
+        let out2 = tmpdir.path().join("out-2.pdf");
+        let out3 = tmpdir.path().join("out-3.pdf");
 
         assert!(out1.exists(), "chunk 1 should exist");
         assert!(out2.exists(), "chunk 2 should exist");
