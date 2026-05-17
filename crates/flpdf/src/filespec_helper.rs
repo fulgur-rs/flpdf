@@ -1171,4 +1171,23 @@ mod tests {
             "expected Io error, got: {err:?}"
         );
     }
+
+    #[test]
+    fn add_attachment_from_path_rejects_non_ascii_basename() {
+        // A non-ASCII basename would put non-PDFDocEncoding bytes into `/F`,
+        // corrupting the attachment name in viewers that ignore `/UF`.  The
+        // helper must reject it loudly rather than silently corrupt `/F`.
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("é.txt");
+        std::fs::write(&file_path, b"payload").expect("write temp file");
+
+        let result = add_attachment_from_path(&mut pdf, b"e.txt", &file_path);
+        assert!(result.is_err(), "must reject non-ASCII basename");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "expected Unsupported error, got: {err:?}"
+        );
+    }
 }
