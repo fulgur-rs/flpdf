@@ -503,8 +503,10 @@ pub struct FileParamDates {
 ///     .expect("insert into name tree");
 /// ```
 pub struct FileSpecBuilder {
-    /// ASCII filename (used for `/F` and as the basis for `/UF`).
+    /// ASCII filename used for `/F`.
     filename: Vec<u8>,
+    /// Unicode filename used for `/UF`; defaults to `filename` interpreted as UTF-8.
+    uf_filename: Option<String>,
     /// Raw payload bytes for the `/EmbeddedFile` stream (uncompressed).
     payload: Vec<u8>,
     /// MIME type stored in `/EmbeddedFile /Subtype` (raw, e.g. `b"application/pdf"`).
@@ -540,6 +542,7 @@ impl FileSpecBuilder {
     pub fn new(filename: impl AsRef<[u8]>, payload: impl Into<Vec<u8>>) -> Self {
         Self {
             filename: filename.as_ref().to_vec(),
+            uf_filename: None,
             payload: payload.into(),
             mimetype: None,
             description: None,
@@ -562,6 +565,15 @@ impl FileSpecBuilder {
     /// to qpdf's `compress2()` at level 6).
     pub fn compress(mut self, compress: bool) -> Self {
         self.compress = compress;
+        self
+    }
+
+    /// Set the Unicode filename stored in `/UF`, independently from `/F`.
+    ///
+    /// Use this when `/F` must be an ASCII-safe fallback but `/UF` should
+    /// preserve the original Unicode filename.
+    pub fn uf_filename(mut self, filename: impl AsRef<str>) -> Self {
+        self.uf_filename = Some(filename.as_ref().to_string());
         self
     }
 
@@ -680,11 +692,18 @@ impl FileSpecBuilder {
         ef_sub.insert("UF", Object::Reference(stream_ref));
 
         // ── Build /Filespec dictionary ────────────────────────────────────────
-        let uf_bytes = encode_utf16be(std::str::from_utf8(&self.filename).map_err(|_| {
-            Error::Unsupported(
-                "FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF".to_string(),
-            )
-        })?);
+        let uf_filename = match self.uf_filename {
+            Some(filename) => filename,
+            None => std::str::from_utf8(&self.filename)
+                .map_err(|_| {
+                    Error::Unsupported(
+                        "FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF"
+                            .to_string(),
+                    )
+                })?
+                .to_string(),
+        };
+        let uf_bytes = encode_utf16be(&uf_filename);
 
         let mut fs_dict = Dictionary::new();
         fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
@@ -780,30 +799,37 @@ where
             ))
         })?;
 
-    // `FileSpecBuilder::new` uses the same string for both `/F`
-    // (PDFDocEncoding/ASCII) and `/UF` (UTF-16BE).  A non-ASCII basename would
-    // place non-PDFDocEncoding bytes into `/F`, corrupting the attachment name
-    // in viewers that only read `/F`.  Reject it loudly until this helper can
-    // set `/F` (ASCII-safe fallback) and `/UF` (full Unicode) independently
-    // (tracked as a followup).
-    if !basename.is_ascii() {
-        return Err(Error::Unsupported(format!(
-            "add_attachment_from_path: basename must be ASCII (independent /F \
-             ASCII-fallback + /UF Unicode not yet supported): {}",
-            path.display()
-        )));
-    }
-
     // Read the raw file bytes.
     let raw = std::fs::read(path)?;
 
     // Build the /Filespec + /EmbeddedFile and insert into the name tree.
-    let filespec_ref = FileSpecBuilder::new(basename, raw)
+    let filespec_ref = FileSpecBuilder::new(ascii_filename_fallback(basename), raw)
+        .uf_filename(basename)
         .compress(true)
         .build(pdf)?;
     crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
 
     Ok(filespec_ref)
+}
+
+/// Return an ASCII-safe `/F` fallback while preserving readable ASCII filename parts.
+pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
+    let fallback: String = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if fallback.is_empty() || fallback.bytes().all(|b| b == b'.' || b == b'_') {
+        b"attachment".to_vec()
+    } else {
+        fallback.into_bytes()
+    }
 }
 
 // ── Attachment extraction API ─────────────────────────────────────────────────
@@ -1479,6 +1505,36 @@ mod tests {
         assert_eq!(uf, expected_uf, "/UF must be UTF-16BE encoded filename");
     }
 
+    #[test]
+    fn builder_allows_distinct_ascii_f_and_unicode_uf() {
+        let mut pdf = open_minimal();
+        let raw = b"payload";
+        let fs_ref = FileSpecBuilder::new("____.pdf", raw.as_ref())
+            .uf_filename("レポート.pdf")
+            .build(&mut pdf)
+            .expect("build");
+
+        let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
+        let Object::Dictionary(fs_dict) = fs_obj else {
+            panic!("expected dictionary");
+        };
+        let f = match fs_dict.get("F") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /F"),
+        };
+        let uf = match fs_dict.get("UF") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /UF"),
+        };
+
+        assert_eq!(f, b"____.pdf", "/F must be ASCII fallback");
+        assert_eq!(
+            uf,
+            encode_utf16be("レポート.pdf"),
+            "/UF must preserve the Unicode filename"
+        );
+    }
+
     // ── Tests: FileSpecBuilder → insert_embedded_file → list ─────────────────
 
     #[test]
@@ -1643,21 +1699,33 @@ mod tests {
     }
 
     #[test]
-    fn add_attachment_from_path_rejects_non_ascii_basename() {
-        // A non-ASCII basename would put non-PDFDocEncoding bytes into `/F`,
-        // corrupting the attachment name in viewers that ignore `/UF`.  The
-        // helper must reject it loudly rather than silently corrupt `/F`.
+    fn add_attachment_from_path_accepts_non_ascii_basename() {
         let mut pdf = open_minimal();
         let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("é.txt");
+        let file_path = dir.path().join("レポート.pdf");
         std::fs::write(&file_path, b"payload").expect("write temp file");
 
-        let result = add_attachment_from_path(&mut pdf, b"e.txt", &file_path);
-        assert!(result.is_err(), "must reject non-ASCII basename");
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(_)),
-            "expected Unsupported error, got: {err:?}"
+        let fs_ref = add_attachment_from_path(&mut pdf, "レポート.pdf".as_bytes(), &file_path)
+            .expect("attach non-ASCII basename");
+
+        let fs_obj = pdf.resolve(fs_ref).expect("resolve");
+        let Object::Dictionary(fs_dict) = fs_obj else {
+            panic!("expected dict");
+        };
+        let f = match fs_dict.get("F") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /F"),
+        };
+        let uf = match fs_dict.get("UF") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /UF"),
+        };
+
+        assert_eq!(f, b"____.pdf", "/F must be ASCII-safe fallback");
+        assert_eq!(
+            uf,
+            encode_utf16be("レポート.pdf"),
+            "/UF must preserve the Unicode basename"
         );
     }
 
