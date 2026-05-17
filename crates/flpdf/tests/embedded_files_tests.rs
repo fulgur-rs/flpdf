@@ -454,6 +454,8 @@ fn writer_delete_last_entry_cleans_up() {
 
 #[test]
 fn writer_large_insert_produces_kids() {
+    use flpdf::Object;
+
     let mut pdf = open(build_empty_pdf());
     let count = LEAF_MAX + 5; // One chunk over the threshold.
 
@@ -464,6 +466,7 @@ fn writer_large_insert_produces_kids() {
         insert_embedded_file(&mut pdf, key.as_bytes(), fs_ref).expect("insert");
     }
 
+    // ── Reader round-trip ────────────────────────────────────────────────────
     let entries = list_embedded_files(&mut pdf).expect("list");
     assert_eq!(entries.len(), count, "all entries must be readable back");
 
@@ -471,6 +474,68 @@ fn writer_large_insert_produces_kids() {
     for window in entries.windows(2) {
         assert!(window[0].0 <= window[1].0, "entries must be sorted");
     }
+
+    // ── Structural check: tree root must carry /Kids, not /Names ─────────────
+    // Walk: catalog → /Names ref → /EmbeddedFiles ref → tree root dict.
+    let catalog_ref = pdf.root_ref().expect("root");
+    let catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+        Object::Dictionary(d) => d,
+        other => panic!("catalog not a dict: {other:?}"),
+    };
+    let names_ref = catalog.get_ref("Names").expect("catalog /Names");
+    let names_dict = match pdf.resolve(names_ref).expect("resolve /Names") {
+        Object::Dictionary(d) => d,
+        other => panic!("/Names not a dict: {other:?}"),
+    };
+    let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
+    let ef_root = match pdf.resolve(ef_root_ref).expect("resolve EF root") {
+        Object::Dictionary(d) => d,
+        other => panic!("EF root not a dict: {other:?}"),
+    };
+
+    // The root must have /Kids (not a flat /Names leaf) because count > LEAF_MAX.
+    assert!(
+        ef_root.get("Kids").is_some(),
+        "tree root with {count} entries must have /Kids, got: {ef_root:?}"
+    );
+    assert!(
+        ef_root.get("Names").is_none(),
+        "tree root with /Kids must not also have /Names"
+    );
+
+    // Verify /Limits on a leaf child.
+    let Object::Array(kids) = ef_root.get("Kids").cloned().unwrap() else {
+        panic!("/Kids is not an array");
+    };
+    let first_leaf_ref = match &kids[0] {
+        Object::Reference(r) => *r,
+        other => panic!("first kid not a reference: {other:?}"),
+    };
+    let first_leaf = match pdf.resolve(first_leaf_ref).expect("resolve leaf") {
+        Object::Dictionary(d) => d,
+        other => panic!("leaf not a dict: {other:?}"),
+    };
+    assert!(
+        first_leaf.get("Limits").is_some(),
+        "leaf node must have /Limits"
+    );
+    // /Limits must be a two-element array of strings.
+    let Object::Array(limits) = first_leaf.get("Limits").cloned().unwrap() else {
+        panic!("/Limits is not an array");
+    };
+    assert_eq!(limits.len(), 2, "/Limits must have exactly 2 elements");
+    assert!(
+        matches!(&limits[0], Object::String(_)),
+        "/Limits[0] must be a string"
+    );
+    assert!(
+        matches!(&limits[1], Object::String(_)),
+        "/Limits[1] must be a string"
+    );
+    // First limit ≤ last limit within the leaf.
+    let Object::String(first_lim) = &limits[0] else { unreachable!() };
+    let Object::String(last_lim) = &limits[1] else { unreachable!() };
+    assert!(first_lim <= last_lim, "leaf /Limits[0] must be ≤ /Limits[1]");
 }
 
 // ── W8: round-trip: insert → list returns same keys ──────────────────────────
