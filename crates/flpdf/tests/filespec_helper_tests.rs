@@ -853,3 +853,51 @@ fn builder_params_date_format_is_pdf_date() {
     // Year must be 4 digits at position 2..6
     assert_eq!(&cdate[2..6], b"2026");
 }
+
+/// End-to-end: build a /Filespec whose MIME type contains a `/`
+/// (`application/pdf`), serialize the whole document to PDF bytes via
+/// `write_pdf`, reopen the serialized bytes, and verify `/Subtype`
+/// round-trips back to `application/pdf`.
+///
+/// This guards the serializer's name-escaping: `Object::Name` holds
+/// decoded bytes, so `application/pdf` must be written as
+/// `/application#2Fpdf` and decoded back on read. Without escaping the
+/// `/` would split the name token and corrupt `/Subtype`.
+#[test]
+fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
+    let mut pdf = build_minimal_pdf();
+    let payload = b"%PDF-1.4 fake nested pdf";
+
+    let filespec_ref = FileSpecBuilder::new("nested.pdf", payload.as_slice())
+        .mimetype(b"application/pdf")
+        .build(&mut pdf)
+        .expect("build()");
+
+    // Serialize the whole document to PDF bytes.
+    let mut serialized: Vec<u8> = Vec::new();
+    flpdf::writer::write_pdf(&mut pdf, &mut serialized).expect("write_pdf()");
+
+    // The escaped name must appear literally in the byte stream, and the
+    // unescaped form must NOT (which would mean the `/` split the token).
+    let needle = b"/application#2Fpdf";
+    assert!(
+        serialized
+            .windows(needle.len())
+            .any(|w| w == needle),
+        "serialized PDF must contain escaped /Subtype name /application#2Fpdf"
+    );
+
+    // Reopen the serialized bytes and read /Subtype back.
+    let mut pdf2 = open(serialized);
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf2);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some(EmbeddedFileStream)");
+    let mime = ef.mimetype().expect("mimetype()");
+    assert_eq!(
+        mime,
+        Some(b"application/pdf".to_vec()),
+        "/Subtype must round-trip back to application/pdf after serialization"
+    );
+}
