@@ -85,7 +85,7 @@ use crate::filters::{decode_stream_data, encode_stream_data};
 use crate::object::{Dictionary, Object, Stream};
 use crate::{Error, ObjectRef, Pdf, Result};
 use md5::{Digest, Md5};
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
@@ -806,6 +806,154 @@ where
     Ok(filespec_ref)
 }
 
+// ── Attachment extraction API ─────────────────────────────────────────────────
+
+/// Extract the decoded payload of an attachment identified by `key`.
+///
+/// Looks up `key` in the catalog's `/Names /EmbeddedFiles` name tree, resolves
+/// the associated `/Filespec` dictionary, and decodes the `/EmbeddedFile` stream
+/// (applying the filter chain, e.g. FlateDecode) to return the original file
+/// contents.
+///
+/// # Note on direct-dict filespecs
+///
+/// Name-tree entries whose value is a direct `/Filespec` dictionary (rather than
+/// an indirect reference) are not surfaced by the underlying
+/// [`crate::embedded_files::list_embedded_files`] enumeration; they are
+/// skipped with the same limitation documented there (see also the TODO comment
+/// for flpdf-9hc.10.6). Only attachments with indirect-reference values are
+/// extractable by this function.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] when `key` is not present in the name tree.  The
+///   error message includes the missing key name and a sorted list of available
+///   keys so the caller can emit an actionable diagnostic.
+/// - [`Error::Unsupported`] when the filespec at `key` has no resolvable
+///   `/EmbeddedFile` stream (e.g. the `/EF` sub-dictionary is absent or
+///   malformed).
+/// - Any error from [`Pdf::resolve`] or the filter decoder.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{filespec_helper, Pdf};
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
+/// let bytes = filespec_helper::extract_attachment(&mut pdf, b"report.pdf")?;
+/// println!("extracted {} bytes", bytes.len());
+/// # Ok(())
+/// # }
+/// ```
+pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<Vec<u8>> {
+    // Look up all entries in the name tree.
+    let entries = crate::embedded_files::list_embedded_files(pdf)?;
+
+    // Find the target key.
+    let filespec_ref = match entries.iter().find(|(k, _)| k.as_slice() == key) {
+        Some((_, r)) => *r,
+        None => {
+            // Collect available keys for an actionable error message.
+            let available: Vec<String> = entries
+                .iter()
+                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                .collect();
+            let hint = if available.is_empty() {
+                " (no attachments present)".to_string()
+            } else {
+                format!(" (available keys: {})", available.join(", "))
+            };
+            return Err(Error::Unsupported(format!(
+                "extract_attachment: key {:?} not found{}",
+                String::from_utf8_lossy(key),
+                hint,
+            )));
+        }
+    };
+
+    // Resolve the filespec and decode its embedded file stream.
+    let mut fs = FileSpec::new(filespec_ref, pdf);
+    let ef = fs.embedded_file()?.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "extract_attachment: key {:?} has no resolvable /EmbeddedFile stream \
+             (the /EF sub-dictionary may be absent or malformed)",
+            String::from_utf8_lossy(key),
+        ))
+    })?;
+    ef.payload()
+}
+
+/// Write the decoded payload of attachment `key` to `out`.
+///
+/// Decodes the embedded file stream via [`extract_attachment`] and writes all
+/// bytes to `out` in a single [`Write::write_all`] call.
+///
+/// # Errors
+///
+/// Propagates all errors from [`extract_attachment`] and from `out.write_all`.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{filespec_helper, Pdf};
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
+/// let mut buf = Vec::new();
+/// filespec_helper::write_attachment(&mut pdf, b"report.pdf", &mut buf)?;
+/// println!("wrote {} bytes", buf.len());
+/// # Ok(())
+/// # }
+/// ```
+pub fn write_attachment<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    key: &[u8],
+    out: &mut W,
+) -> Result<()> {
+    let bytes = extract_attachment(pdf, key)?;
+    out.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Write the decoded payload of attachment `key` to a file at `path`.
+///
+/// Creates (or truncates) the file at `path` and writes the decoded stream
+/// bytes.  This is the library-side counterpart of the CLI `-o` option
+/// (wiring of the `-o` flag is handled by the CLI layer, not here).
+///
+/// # Errors
+///
+/// - Any error from [`extract_attachment`].
+/// - [`Error::Io`] if the file cannot be created or written.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{filespec_helper, Pdf};
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
+/// filespec_helper::extract_attachment_to_path(&mut pdf, b"report.pdf", "/tmp/out.pdf")?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn extract_attachment_to_path<R, P>(pdf: &mut Pdf<R>, key: &[u8], path: P) -> Result<()>
+where
+    R: Read + Seek,
+    P: AsRef<Path>,
+{
+    let bytes = extract_attachment(pdf, key)?;
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1188,6 +1336,152 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported(_)),
             "expected Unsupported error, got: {err:?}"
+        );
+    }
+
+    // ── Tests: extract_attachment / write_attachment / extract_attachment_to_path ─
+
+    #[test]
+    fn extract_attachment_small_round_trip() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.txt");
+        let raw = b"Hello, world!";
+        std::fs::write(&path, raw).expect("write");
+        add_attachment_from_path(&mut pdf, b"small.txt", &path).expect("attach");
+
+        let extracted = extract_attachment(&mut pdf, b"small.txt").expect("extract");
+        assert_eq!(
+            extracted.as_slice(),
+            raw.as_ref(),
+            "small file round-trip must match"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_large_round_trip() {
+        // 128 KiB of repeating pseudo-random-ish bytes — exercises compressor splits.
+        let raw: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("large.bin");
+        std::fs::write(&path, &raw).expect("write");
+        add_attachment_from_path(&mut pdf, b"large.bin", &path).expect("attach");
+
+        let extracted = extract_attachment(&mut pdf, b"large.bin").expect("extract");
+        assert_eq!(extracted, raw, "large file round-trip must match");
+    }
+
+    #[test]
+    fn extract_attachment_binary_with_nuls_round_trip() {
+        // 4096 bytes including NUL bytes, exercises binary safety.
+        let raw: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("binary.bin");
+        std::fs::write(&path, &raw).expect("write");
+        add_attachment_from_path(&mut pdf, b"binary.bin", &path).expect("attach");
+
+        let extracted = extract_attachment(&mut pdf, b"binary.bin").expect("extract");
+        assert_eq!(extracted, raw, "binary file round-trip must match");
+    }
+
+    #[test]
+    fn write_attachment_to_vec_matches_extract() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vec-test.txt");
+        let raw = b"write_attachment test payload";
+        std::fs::write(&path, raw).expect("write");
+        add_attachment_from_path(&mut pdf, b"vec-test.txt", &path).expect("attach");
+
+        let mut buf = Vec::new();
+        write_attachment(&mut pdf, b"vec-test.txt", &mut buf).expect("write_attachment");
+        assert_eq!(
+            buf.as_slice(),
+            raw.as_ref(),
+            "write_attachment output must match raw"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_to_path_round_trip() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let src_path = dir.path().join("source.bin");
+        let raw: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        std::fs::write(&src_path, &raw).expect("write source");
+        add_attachment_from_path(&mut pdf, b"source.bin", &src_path).expect("attach");
+
+        let out_path = dir.path().join("extracted.bin");
+        extract_attachment_to_path(&mut pdf, b"source.bin", &out_path)
+            .expect("extract_attachment_to_path");
+
+        let read_back = std::fs::read(&out_path).expect("read back");
+        assert_eq!(read_back, raw, "extract_to_path round-trip must match");
+    }
+
+    #[test]
+    fn extract_attachment_missing_key_is_actionable_error() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("real.txt");
+        std::fs::write(&path, b"real content").expect("write");
+        add_attachment_from_path(&mut pdf, b"real.txt", &path).expect("attach");
+
+        let err =
+            extract_attachment(&mut pdf, b"missing-key").expect_err("must error for absent key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing-key"),
+            "error message must contain the missing key name, got: {msg}"
+        );
+        // Available keys hint must be present
+        assert!(
+            msg.contains("real.txt"),
+            "error message must list available keys, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_from_compat_fixture() {
+        // attachment-two-page.pdf contains an attachment under the key "attachment.txt"
+        // with an uncompressed size of 95 bytes (from /Params /Size).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/compat/attachment-two-page.pdf"
+        );
+        let file = std::fs::File::open(path);
+        let file = match file {
+            Ok(f) => f,
+            Err(_) => return, // Skip if fixture is unavailable.
+        };
+        let mut pdf = crate::Pdf::open(std::io::BufReader::new(file)).expect("open compat fixture");
+
+        let entries = crate::embedded_files::list_embedded_files(&mut pdf).expect("list");
+        assert!(
+            !entries.is_empty(),
+            "fixture must have at least one attachment"
+        );
+
+        // Use the first available key.
+        let key = entries[0].0.clone();
+        let extracted = extract_attachment(&mut pdf, &key).expect("extract from compat fixture");
+        assert!(!extracted.is_empty(), "extracted bytes must be non-empty");
+
+        // The fixture reports /Params /Size 95 — the extracted bytes must match.
+        let mut fs = FileSpec::new(entries[0].1, &mut pdf);
+        let ef = fs
+            .embedded_file()
+            .expect("embedded_file")
+            .expect("must have embedded file");
+        let reported_size = ef.size().expect("size").expect("size must be present");
+        assert_eq!(
+            extracted.len() as i64,
+            reported_size,
+            "extracted length must equal /Params /Size"
         );
     }
 }
