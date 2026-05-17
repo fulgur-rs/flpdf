@@ -857,10 +857,13 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
         Some((_, r)) => *r,
         None => {
             // Collect available keys for an actionable error message.
-            let available: Vec<String> = entries
+            // Sorted so the diagnostic is deterministic / reproducible,
+            // independent of name-tree iteration order (CodeRabbit nitpick).
+            let mut available: Vec<String> = entries
                 .iter()
                 .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
                 .collect();
+            available.sort_unstable();
             let hint = if available.is_empty() {
                 " (no attachments present)".to_string()
             } else {
@@ -1453,11 +1456,11 @@ mod tests {
             "/../..",
             "/tests/fixtures/compat/attachment-two-page.pdf"
         );
-        let file = std::fs::File::open(path);
-        let file = match file {
-            Ok(f) => f,
-            Err(_) => return, // Skip if fixture is unavailable.
-        };
+        // The compat fixture is committed to the repo, so a missing file is a
+        // real regression — fail loudly instead of silently skipping, which
+        // could turn this into a false-positive pass (CodeRabbit).
+        let file = std::fs::File::open(path)
+            .expect("compat fixture missing: tests/fixtures/compat/attachment-two-page.pdf");
         let mut pdf = crate::Pdf::open(std::io::BufReader::new(file)).expect("open compat fixture");
 
         let entries = crate::embedded_files::list_embedded_files(&mut pdf).expect("list");
