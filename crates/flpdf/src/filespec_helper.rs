@@ -450,32 +450,12 @@ pub fn format_pdf_date(year: u16, month: u8, day: u8, hour: u8, minute: u8, seco
     .into_bytes()
 }
 
-/// Escape a raw MIME-type byte string (e.g. `b"application/pdf"`) so that it
-/// can be stored safely as a PDF name token.
-///
-/// PDF name tokens terminate at delimiter and whitespace bytes.  The `/`
-/// character (`0x2F`) is itself a PDF delimiter, so it must be escaped as
-/// `#2F`.  Any byte outside the printable ASCII range (`0x21`–`0x7E`) or any
-/// other PDF delimiter is also `#XX`-escaped.
-///
-/// The returned bytes are suitable for `Object::Name(...)`.  When the parser
-/// re-reads the name, `#2F` is decoded back to `/`, restoring the original
-/// MIME type.
-///
-/// # Examples
-///
-/// ```
-/// use flpdf::filespec_helper::escape_pdf_name;
-///
-/// assert_eq!(escape_pdf_name(b"application/pdf"), b"application#2Fpdf".to_vec());
-/// assert_eq!(escape_pdf_name(b"text/plain"), b"text#2Fplain".to_vec());
-/// assert_eq!(escape_pdf_name(b"image/png"), b"image#2Fpng".to_vec());
-/// ```
-pub fn escape_pdf_name(raw: &[u8]) -> Vec<u8> {
-    // Delegate to the canonical name escaper used by the serializer
-    // (`Object::write_pdf`) so the two never drift apart.
-    crate::object::escape_name_bytes(raw)
-}
+// NOTE: a public `escape_pdf_name` helper used to live here. It was removed
+// (roborev #920): `Object::Name` holds *decoded* logical bytes and the
+// serializer escapes delimiters on write (#919), so escaping before
+// constructing `Object::Name` would double-escape (`#` → `#23`). Callers must
+// pass raw logical bytes straight to `Object::Name`. The canonical escaper now
+// lives at `crate::object::escape_name_bytes` and is serializer-internal.
 
 /// Compute the MD5 checksum of `data` and return it as a 16-byte `Vec<u8>`.
 ///
@@ -638,12 +618,11 @@ impl FileSpecBuilder {
         let mut ef_dict = Dictionary::new();
         ef_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
         if let Some(ref mime) = self.mimetype {
-            // Store the raw MIME type bytes in the in-memory Name object.
-            // When the document is written to a file via write_pdf the Name
-            // serialiser emits `/` characters verbatim; callers that need
-            // byte-identical PDF output should apply escape_pdf_name before
-            // constructing the Name.  For in-memory round-trips (set_object →
-            // resolve → mimetype()) the raw bytes are correct.
+            // `Object::Name` holds raw (logical) bytes. The serializer escapes
+            // delimiters as `#XX` on write and the parser decodes them on read,
+            // so a MIME type like `application/pdf` round-trips correctly
+            // through both in-memory access and write_pdf → reopen. Do NOT
+            // pre-escape here — that would double-escape on serialization.
             ef_dict.insert("Subtype", Object::Name(mime.clone()));
         }
         ef_dict.insert("Length", Object::Integer(size));
@@ -659,13 +638,11 @@ impl FileSpecBuilder {
         ef_sub.insert("UF", Object::Reference(stream_ref));
 
         // ── Build /Filespec dictionary ────────────────────────────────────────
-        let uf_bytes = encode_utf16be(
-            std::str::from_utf8(&self.filename).map_err(|_| {
-                Error::Unsupported(
-                    "FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF".to_string(),
-                )
-            })?,
-        );
+        let uf_bytes = encode_utf16be(std::str::from_utf8(&self.filename).map_err(|_| {
+            Error::Unsupported(
+                "FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF".to_string(),
+            )
+        })?);
 
         let mut fs_dict = Dictionary::new();
         fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));

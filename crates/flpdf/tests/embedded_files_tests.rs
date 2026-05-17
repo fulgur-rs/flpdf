@@ -591,3 +591,120 @@ fn writer_round_trip_key_order() {
         assert_eq!(entries[i].1, *exp_ref);
     }
 }
+
+// ── W9: rebuild preserves pre-existing direct-dict /Filespec entries ──────────
+
+/// A name-tree leaf may store a value as a *direct* `/Filespec` dictionary
+/// rather than an indirect reference. The public reader filters those out,
+/// but the writer must not: inserting an unrelated key must not silently drop
+/// the direct-dict entry from the rebuilt tree.
+fn build_direct_dict_entry_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 4 0 R /Names 2 0 R >>\nendobj\n");
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
+
+    // Tree-root leaf whose only entry's value is a DIRECT /Filespec dict.
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Limits [ (direct.txt) (direct.txt) ] \
+          /Names [ (direct.txt) << /Type /Filespec /F (direct.txt) >> ] >>\nendobj\n",
+    );
+
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Type /Pages /Kids [ ] /Count 0 >>\nendobj\n");
+
+    // Pre-allocated slot for the inserted filespec reference.
+    off.insert(5, out.len() as u64);
+    out.extend_from_slice(b"5 0 obj\n<< /Type /Filespec /F (added.txt) >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 5, 1);
+    out
+}
+
+#[test]
+fn writer_preserves_direct_dict_filespec_on_insert() {
+    use flpdf::Object;
+
+    let mut pdf = open(build_direct_dict_entry_pdf());
+
+    // Sanity: the public reader skips the direct-dict entry (documented).
+    let visible = list_embedded_files(&mut pdf).expect("list");
+    assert!(
+        visible.is_empty(),
+        "public reader must skip direct-dict values; got {visible:?}"
+    );
+
+    // Insert an unrelated, reference-valued entry — triggers a full rebuild.
+    insert_embedded_file(&mut pdf, b"added.txt", ObjectRef::new(5, 0)).expect("insert");
+
+    // Walk the rebuilt tree by hand and collect the raw /Names pairs across
+    // all leaves (the rebuilt root may be a single leaf or carry /Kids).
+    let catalog_ref = pdf.root_ref().expect("root");
+    let catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+        Object::Dictionary(d) => d,
+        other => panic!("catalog not a dict: {other:?}"),
+    };
+    let names_ref = catalog.get_ref("Names").expect("catalog /Names");
+    let names_dict = match pdf.resolve(names_ref).expect("resolve /Names") {
+        Object::Dictionary(d) => d,
+        other => panic!("/Names not a dict: {other:?}"),
+    };
+    let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
+
+    // Gather (key, value) pairs from every leaf reachable from the root.
+    let mut pairs: Vec<(Vec<u8>, Object)> = Vec::new();
+    let mut stack = vec![ef_root_ref];
+    while let Some(node_ref) = stack.pop() {
+        let node = match pdf.resolve(node_ref).expect("resolve node") {
+            Object::Dictionary(d) => d,
+            other => panic!("node not a dict: {other:?}"),
+        };
+        if let Some(Object::Array(arr)) = node.get("Names").cloned() {
+            let mut it = arr.into_iter();
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                if let Object::String(key) = k {
+                    pairs.push((key, v));
+                }
+            }
+        }
+        if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
+            for kid in kids {
+                if let Object::Reference(r) = kid {
+                    stack.push(r);
+                }
+            }
+        }
+    }
+
+    // Both entries must survive: the inserted reference AND the original
+    // direct-dict /Filespec, preserved verbatim.
+    let added = pairs
+        .iter()
+        .find(|(k, _)| k == b"added.txt")
+        .expect("inserted key must be present");
+    assert_eq!(
+        added.1,
+        Object::Reference(ObjectRef::new(5, 0)),
+        "inserted value must be the reference passed to insert_embedded_file"
+    );
+
+    let direct = pairs
+        .iter()
+        .find(|(k, _)| k == b"direct.txt")
+        .expect("pre-existing direct-dict entry must NOT be dropped on rebuild");
+    match &direct.1 {
+        Object::Dictionary(d) => {
+            assert_eq!(
+                d.get("F").cloned(),
+                Some(Object::String(b"direct.txt".to_vec())),
+                "direct-dict /Filespec must be preserved verbatim"
+            );
+        }
+        other => panic!("direct-dict value must stay a dictionary, got: {other:?}"),
+    }
+}

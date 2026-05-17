@@ -264,12 +264,6 @@ impl Object {
 /// `/application#2Fpdf` and round-trips back to `application/pdf`.
 /// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no
 /// escapable bytes, so their output is byte-identical to before.
-pub(crate) fn escape_name_bytes(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
-    write_name_escaped(&mut out, raw);
-    out
-}
-
 fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in raw {
