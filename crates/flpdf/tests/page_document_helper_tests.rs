@@ -4,9 +4,7 @@
 //! `PageDocumentHelper` for all page-list access rather than calling
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
-use flpdf::{
-    write_pdf, Object, ObjectRef, PageDocumentHelper, PageRange, Pdf, RotateMode,
-};
+use flpdf::{write_pdf, Object, ObjectRef, PageDocumentHelper, PageRange, Pdf, RotateMode};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -39,9 +37,7 @@ fn build_n_page_pdf(n: u32) -> Vec<u8> {
         .join(" ");
     // Pages (2 0 R)
     offs.insert(2, out.len() as u64);
-    let pages_str = format!(
-        "2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n"
-    );
+    let pages_str = format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n");
     out.extend_from_slice(pages_str.as_bytes());
 
     // Individual pages (3 0 R … (2+n) 0 R)
@@ -57,17 +53,12 @@ fn build_n_page_pdf(n: u32) -> Vec<u8> {
     let max_num = 2 + n;
     let total = max_num + 1; // 0 .. max_num inclusive
     let xref_start = out.len() as u64;
-    out.extend_from_slice(
-        format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes(),
-    );
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
     for i in 1..=max_num {
-        out.extend_from_slice(
-            format!("{:010} 00000 n \n", offs[&i]).as_bytes(),
-        );
+        out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
     }
-    let trailer = format!(
-        "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-    );
+    let trailer =
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     out.extend_from_slice(trailer.as_bytes());
     out
 }
@@ -144,7 +135,9 @@ fn rotate_partial_range_only_affects_selected_pages() {
     }
     // Page 1 (3 0 R) should have /Rotate 180.
     let obj1 = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
-    let Object::Dictionary(d1) = obj1 else { panic!() };
+    let Object::Dictionary(d1) = obj1 else {
+        panic!()
+    };
     assert_eq!(d1.get("Rotate"), Some(&Object::Integer(180)));
 
     // Pages 2 and 3 (4, 5) must not have been touched (no /Rotate key added).
@@ -181,7 +174,9 @@ fn rotate_round_trip_persists_after_write_reopen() {
     drop(helper2);
 
     let obj = pdf2.resolve(pages[0]).unwrap();
-    let Object::Dictionary(dict) = obj else { panic!() };
+    let Object::Dictionary(dict) = obj else {
+        panic!()
+    };
     assert_eq!(
         dict.get("Rotate"),
         Some(&Object::Integer(270)),
