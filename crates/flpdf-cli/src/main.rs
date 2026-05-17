@@ -23,6 +23,10 @@ use flpdf::{
     ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources,
     Severity, Stream, WriteOptions,
 };
+use flpdf::{
+    copy_attachments_from, extract_attachment, format_attachment_list, insert_embedded_file,
+    list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
+};
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
@@ -151,6 +155,8 @@ struct Cli {
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
+              "add_attachment", "remove_attachment", "list_attachments",
+              "show_attachment", "copy_attachments_from",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -267,6 +273,96 @@ struct Cli {
     //   qpdf in.pdf --pages . a.pdf b.pdf 1-z:even -- out.pdf
     #[command(flatten)]
     page_ops: PageOpArgs,
+
+    // ── Attachment flags (flpdf-9hc.10.9) ────────────────────────────────
+    // Five qpdf-compatible attachment operations.  Each is a top-level flag
+    // dispatched before the default rewrite branch.
+    //
+    // --add-attachment and --copy-attachments-from use value_terminator="--"
+    // and allow_hyphen_values=true so that their sub-flags (--key, --filename,
+    // --prefix, --password, …) are captured verbatim in the token Vec rather
+    // than being parsed as global clap flags.
+    /// Add an attachment to the input PDF (qpdf --add-attachment compatible).
+    ///
+    /// Syntax: `--add-attachment FILE [--key=K] [--filename=F] [--mimetype=M]
+    ///           [--description=D] [--creationdate=D] [--moddate=D]
+    ///           [--afrelationship=R] [--replace] --`
+    ///
+    /// The `--` terminator ends the sub-flag segment. The token after `--` is
+    /// the OUTPUT positional.
+    #[arg(
+        long = "add-attachment",
+        num_args = 1..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "FILE [sub-flags]",
+        help = "Add a file attachment (qpdf --add-attachment compatible); \
+                terminate segment with --"
+    )]
+    add_attachment: Vec<String>,
+
+    /// Remove an attachment by key (qpdf --remove-attachment compatible).
+    ///
+    /// KEY is the name-tree key used when the attachment was added.
+    #[arg(
+        long = "remove-attachment",
+        value_name = "KEY",
+        help = "Remove the embedded file with the given key (qpdf --remove-attachment)"
+    )]
+    remove_attachment: Option<String>,
+
+    /// List all embedded-file attachments (qpdf --list-attachments compatible).
+    #[arg(
+        long = "list-attachments",
+        help = "List all embedded-file attachments (qpdf --list-attachments)"
+    )]
+    list_attachments: bool,
+
+    /// Print verbose listing for --list-attachments (mirrors qpdf --verbose).
+    #[arg(
+        long = "verbose",
+        requires = "list_attachments",
+        help = "Print verbose listing when used with --list-attachments"
+    )]
+    verbose: bool,
+
+    /// Extract an attachment by key (qpdf --show-attachment compatible).
+    ///
+    /// KEY is the name-tree key used when the attachment was added.  Without
+    /// `-o` the raw bytes are written to stdout.
+    #[arg(
+        long = "show-attachment",
+        value_name = "KEY",
+        help = "Extract the embedded file with the given key to stdout or -o PATH \
+                (qpdf --show-attachment)"
+    )]
+    show_attachment: Option<String>,
+
+    /// Write --show-attachment output to this file instead of stdout.
+    #[arg(
+        short = 'o',
+        long = "show-attachment-to",
+        value_name = "PATH",
+        requires = "show_attachment",
+        help = "Write --show-attachment output to PATH instead of stdout"
+    )]
+    show_attachment_to: Option<PathBuf>,
+
+    /// Copy attachments from another PDF (qpdf --copy-attachments-from compatible).
+    ///
+    /// Syntax: `--copy-attachments-from FILE [--password=P] [--prefix=X] --`
+    ///
+    /// The `--` terminator ends the sub-flag segment.
+    #[arg(
+        long = "copy-attachments-from",
+        num_args = 1..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "FILE [sub-flags]",
+        help = "Copy attachments from another PDF (qpdf --copy-attachments-from compatible); \
+                terminate segment with --"
+    )]
+    copy_attachments_from: Vec<String>,
 
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -795,6 +891,34 @@ fn main() {
         run_show_pages(args.input, args.repair, &args.password)
     } else if args.check {
         run_check(args.input, args.repair, &args.password)
+    } else if args.list_attachments {
+        run_list_attachments(args.input, args.repair, &args.password, args.verbose)
+    } else if let Some(key) = args.show_attachment {
+        run_show_attachment(
+            args.input,
+            args.repair,
+            &args.password,
+            &key,
+            args.show_attachment_to,
+        )
+    } else if let Some(key) = args.remove_attachment {
+        run_remove_attachment(args.input, args.output, args.repair, &args.password, &key)
+    } else if !args.add_attachment.is_empty() {
+        run_add_attachment(
+            args.input,
+            args.output,
+            args.repair,
+            &args.password,
+            args.add_attachment,
+        )
+    } else if !args.copy_attachments_from.is_empty() {
+        run_copy_attachments_from(
+            args.input,
+            args.output,
+            args.repair,
+            &args.password,
+            args.copy_attachments_from,
+        )
     } else if args.linearize {
         // --linearize is incompatible with the page-extraction pipeline:
         // extraction produces a normalized, non-linearized document. Without
@@ -2490,4 +2614,343 @@ fn object_to_pdf(object: &Object) -> String {
     let mut out = Vec::new();
     object.write_pdf(&mut out);
     String::from_utf8_lossy(&out).to_string()
+}
+
+// ── Attachment helpers (flpdf-9hc.10.9) ──────────────────────────────────────
+
+/// Parse a PDF date string of the form `D:YYYYMMDDHHmmSS` (with optional
+/// trailing timezone) into `(year, month, day, hour, minute, second)`.
+///
+/// Only the local-time components are extracted; timezone info is ignored.
+/// The `D:` prefix is required.
+fn parse_pdf_date_arg(s: &str) -> CliResult<(u16, u8, u8, u8, u8, u8)> {
+    let s = s
+        .strip_prefix("D:")
+        .ok_or_else(|| format!("invalid PDF date {s:?}: must start with D:"))?;
+    if s.len() < 14 {
+        return Err(
+            format!("invalid PDF date D:{s:?}: need at least 14 digits (YYYYMMDDHHmmSS)").into(),
+        );
+    }
+    let year: u16 = s[0..4]
+        .parse()
+        .map_err(|_| format!("invalid year in PDF date D:{s}"))?;
+    let month: u8 = s[4..6]
+        .parse()
+        .map_err(|_| format!("invalid month in PDF date D:{s}"))?;
+    let day: u8 = s[6..8]
+        .parse()
+        .map_err(|_| format!("invalid day in PDF date D:{s}"))?;
+    let hour: u8 = s[8..10]
+        .parse()
+        .map_err(|_| format!("invalid hour in PDF date D:{s}"))?;
+    let minute: u8 = s[10..12]
+        .parse()
+        .map_err(|_| format!("invalid minute in PDF date D:{s}"))?;
+    let second: u8 = s[12..14]
+        .parse()
+        .map_err(|_| format!("invalid second in PDF date D:{s}"))?;
+    Ok((year, month, day, hour, minute, second))
+}
+
+/// Parsed sub-flags for the `--add-attachment FILE [sub-flags] --` segment.
+struct AddAttachmentArgs {
+    /// Path to the file whose bytes will be embedded.
+    file: PathBuf,
+    /// Name-tree key (default: basename of `file`).
+    key: Option<Vec<u8>>,
+    /// `/F` and `/UF` filename stored in the filespec (default: basename of `file`).
+    filename: Option<Vec<u8>>,
+    /// MIME type for `/EmbeddedFile /Subtype`.
+    mimetype: Option<Vec<u8>>,
+    /// Human-readable description for `/Filespec /Desc`.
+    description: Option<Vec<u8>>,
+    /// `/AFRelationship` name.
+    af_relationship: Option<Vec<u8>>,
+    /// `/Params /CreationDate` as `(year, month, day, hour, minute, second)`.
+    creation_date: Option<(u16, u8, u8, u8, u8, u8)>,
+    /// `/Params /ModDate` as `(year, month, day, hour, minute, second)`.
+    mod_date: Option<(u16, u8, u8, u8, u8, u8)>,
+    /// When true, replace an existing attachment with the same key.
+    replace: bool,
+}
+
+/// Parse the raw token Vec captured by `--add-attachment … --` into
+/// [`AddAttachmentArgs`].
+///
+/// Expected token order: FILE [--key=K] [--filename=F] [--mimetype=M]
+/// [--description=D] [--creationdate=D] [--moddate=D] [--afrelationship=R]
+/// [--replace]
+fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentArgs> {
+    let mut iter = tokens.into_iter();
+    let file: PathBuf = iter
+        .next()
+        .ok_or("--add-attachment: missing FILE argument")?
+        .into();
+
+    let mut key: Option<Vec<u8>> = None;
+    let mut filename: Option<Vec<u8>> = None;
+    let mut mimetype: Option<Vec<u8>> = None;
+    let mut description: Option<Vec<u8>> = None;
+    let mut af_relationship: Option<Vec<u8>> = None;
+    let mut creation_date: Option<(u16, u8, u8, u8, u8, u8)> = None;
+    let mut mod_date: Option<(u16, u8, u8, u8, u8, u8)> = None;
+    let mut replace = false;
+
+    for token in iter {
+        if let Some(v) = token.strip_prefix("--key=") {
+            key = Some(v.as_bytes().to_vec());
+        } else if let Some(v) = token.strip_prefix("--filename=") {
+            filename = Some(v.as_bytes().to_vec());
+        } else if let Some(v) = token.strip_prefix("--mimetype=") {
+            mimetype = Some(v.as_bytes().to_vec());
+        } else if let Some(v) = token.strip_prefix("--description=") {
+            description = Some(v.as_bytes().to_vec());
+        } else if let Some(v) = token.strip_prefix("--afrelationship=") {
+            af_relationship = Some(v.as_bytes().to_vec());
+        } else if let Some(v) = token.strip_prefix("--creationdate=") {
+            creation_date = Some(parse_pdf_date_arg(v)?);
+        } else if let Some(v) = token.strip_prefix("--moddate=") {
+            mod_date = Some(parse_pdf_date_arg(v)?);
+        } else if token == "--replace" {
+            replace = true;
+        } else {
+            return Err(format!(
+                "--add-attachment: unknown sub-flag or unexpected token {token:?}"
+            )
+            .into());
+        }
+    }
+
+    Ok(AddAttachmentArgs {
+        file,
+        key,
+        filename,
+        mimetype,
+        description,
+        af_relationship,
+        creation_date,
+        mod_date,
+        replace,
+    })
+}
+
+/// Parsed sub-flags for the `--copy-attachments-from FILE [sub-flags] --` segment.
+struct CopyAttachmentsArgs {
+    /// Source PDF path.
+    file: PathBuf,
+    /// Password for the source PDF (empty = no password).
+    password: Vec<u8>,
+    /// Prefix prepended to each copied key.
+    prefix: Option<Vec<u8>>,
+}
+
+/// Parse the raw token Vec captured by `--copy-attachments-from … --` into
+/// [`CopyAttachmentsArgs`].
+///
+/// Expected token order: FILE [--password=P] [--prefix=X]
+fn parse_copy_attachments_segment(tokens: Vec<String>) -> CliResult<CopyAttachmentsArgs> {
+    let mut iter = tokens.into_iter();
+    let file: PathBuf = iter
+        .next()
+        .ok_or("--copy-attachments-from: missing FILE argument")?
+        .into();
+
+    let mut password: Vec<u8> = Vec::new();
+    let mut prefix: Option<Vec<u8>> = None;
+
+    for token in iter {
+        if let Some(v) = token.strip_prefix("--password=") {
+            password = v.as_bytes().to_vec();
+        } else if let Some(v) = token.strip_prefix("--prefix=") {
+            prefix = Some(v.as_bytes().to_vec());
+        } else {
+            return Err(format!(
+                "--copy-attachments-from: unknown sub-flag or unexpected token {token:?}"
+            )
+            .into());
+        }
+    }
+
+    Ok(CopyAttachmentsArgs {
+        file,
+        password,
+        prefix,
+    })
+}
+
+/// Return the basename of `path` as raw bytes, or error if the path has no
+/// valid file name component.
+fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
+    path.file_name()
+        .ok_or_else(|| format!("cannot determine filename from path {:?}", path).into())
+        .map(|n| n.to_string_lossy().into_owned().into_bytes())
+}
+
+/// `--add-attachment FILE [sub-flags] -- output.pdf`
+fn run_add_attachment(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    tokens: Vec<String>,
+) -> CliResult<()> {
+    let input = input.ok_or("--add-attachment: missing input PDF")?;
+    let output = output.ok_or("--add-attachment: missing output PDF")?;
+    let args = parse_add_attachment_segment(tokens)?;
+
+    let payload = std::fs::read(&args.file)
+        .map_err(|e| format!("--add-attachment: cannot read {:?}: {e}", args.file))?;
+
+    let basename = path_basename(&args.file)?;
+    let key = args.key.unwrap_or_else(|| basename.clone());
+    let filename = args.filename.unwrap_or_else(|| basename.clone());
+
+    let mut pdf = open_pdf(&input, repair, password)?;
+    reject_encrypted_write(&pdf)?;
+
+    // Duplicate-key handling.
+    if !args.replace {
+        let existing = list_attachment_info(&mut pdf)?;
+        if existing.iter().any(|a| a.key == key) {
+            return Err(format!(
+                "--add-attachment: key {:?} already exists; use --replace to overwrite",
+                String::from_utf8_lossy(&key)
+            )
+            .into());
+        }
+    } else {
+        // Remove the existing entry so insert_embedded_file can start clean.
+        remove_attachment(&mut pdf, &key)?;
+    }
+
+    let dates = FileParamDates {
+        creation: args.creation_date,
+        modification: args.mod_date,
+    };
+
+    let mut builder = FileSpecBuilder::new(&filename, payload)
+        .compress(true)
+        .dates(dates);
+    if let Some(mime) = args.mimetype {
+        builder = builder.mimetype(mime);
+    }
+    if let Some(desc) = args.description {
+        builder = builder.description(desc);
+    }
+    if let Some(rel) = args.af_relationship {
+        builder = builder.af_relationship(rel);
+    }
+    let filespec_ref = builder.build(&mut pdf)?;
+    insert_embedded_file(&mut pdf, &key, filespec_ref)?;
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    let mut out = File::create(&output)?;
+    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    Ok(())
+}
+
+/// `--remove-attachment KEY [input] [output]`
+fn run_remove_attachment(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    key: &str,
+) -> CliResult<()> {
+    let input = input.ok_or("--remove-attachment: missing input PDF")?;
+    let output = output.ok_or("--remove-attachment: missing output PDF")?;
+
+    let mut pdf = open_pdf(&input, repair, password)?;
+    reject_encrypted_write(&pdf)?;
+
+    let found = remove_attachment(&mut pdf, key.as_bytes())?;
+    if !found {
+        return Err(format!("--remove-attachment: key {:?} not found in document", key).into());
+    }
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    let mut out = File::create(&output)?;
+    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    Ok(())
+}
+
+/// `--list-attachments [--verbose] input`
+fn run_list_attachments(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    verbose: bool,
+) -> CliResult<()> {
+    let input = input.ok_or("--list-attachments: missing input PDF")?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    let entries = list_attachment_info(&mut pdf)?;
+    let listing = format_attachment_list(&entries, verbose);
+    print!("{listing}");
+    Ok(())
+}
+
+/// `--show-attachment KEY [-o PATH] input`
+fn run_show_attachment(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    key: &str,
+    out_path: Option<PathBuf>,
+) -> CliResult<()> {
+    let input = input.ok_or("--show-attachment: missing input PDF")?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    let bytes = extract_attachment(&mut pdf, key.as_bytes()).map_err(|e| {
+        format!(
+            "--show-attachment: key {:?} not found or unreadable: {e}",
+            key
+        )
+    })?;
+    if let Some(path) = out_path {
+        std::fs::write(&path, &bytes)
+            .map_err(|e| format!("--show-attachment: cannot write to {:?}: {e}", path))?;
+    } else {
+        std::io::stdout().write_all(&bytes)?;
+        std::io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+/// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- input output`
+fn run_copy_attachments_from(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    tokens: Vec<String>,
+) -> CliResult<()> {
+    let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
+    let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
+    let args = parse_copy_attachments_segment(tokens)?;
+
+    // Open the source with its own password (independent of the target's).
+    let src_options = PdfOpenOptions {
+        repair,
+        password: args.password.clone(),
+        ..PdfOpenOptions::default()
+    };
+    let src_file = File::open(&args.file)
+        .map_err(|e| format!("--copy-attachments-from: cannot open {:?}: {e}", args.file))?;
+    let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
+        .map_err(|e| format!("--copy-attachments-from: failed to open source PDF: {e}"))?;
+
+    let mut target = open_pdf(&input, repair, password)?;
+    reject_encrypted_write(&target)?;
+
+    let prefix = args.prefix.as_deref();
+    let count = copy_attachments_from(&mut target, &mut src, prefix)?;
+    eprintln!("copied {count} attachment(s)");
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    let mut out = File::create(&output)?;
+    write_pdf_with_options(&mut target, &mut out, &options)?;
+    Ok(())
 }
