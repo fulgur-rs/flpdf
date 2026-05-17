@@ -86,6 +86,313 @@ use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
+// ── remove_attachment ─────────────────────────────────────────────────────────
+
+/// Remove an attachment by name-tree key, including garbage collection of the
+/// now-unreferenced `/Filespec` and `/EmbeddedFile` stream objects.
+///
+/// # Behaviour
+///
+/// 1. Looks up `key` in the catalog's `/Names /EmbeddedFiles` name tree.
+///    Returns `Ok(false)` — without error — if the key is absent.
+/// 2. Before any mutation, captures the `filespec_ref` (if the value is an
+///    indirect reference) and the `/EmbeddedFile` stream ref reachable via
+///    `/EF /UF` › `/EF /F` › other standard keys.
+/// 3. Calls [`delete_embedded_file`] to remove the name-tree entry.
+/// 4. Clears any references to `filespec_ref` from the `/AF` array in the
+///    document catalog and in every page dictionary.  If the `/AF` array
+///    becomes empty after removal, the `/AF` key itself is deleted.
+/// 5. **Conservative GC:** if `filespec_ref` or `stream_ref` now appear in
+///    zero live objects (other than themselves), [`Pdf::delete_object`] is
+///    called to physically remove them.  If another object still references
+///    them they are left intact.
+///
+/// # Limitation
+///
+/// When the name-tree value is a *direct* `/Filespec` dictionary (not an
+/// indirect reference), there is no `ObjectRef` to GC.  The name-tree entry
+/// is removed and `/AF` is cleared for indirect refs that happen to match
+/// nothing; only the tree entry itself is gone.  This case is exceedingly rare
+/// in practice (ISO 32000-1 §7.11 expects indirect refs), but is handled
+/// gracefully — no panic, no spurious error.
+///
+/// # GC conservatism
+///
+/// The reachability scan walks every live object in the document and checks
+/// whether its serialised object graph contains a reference to the target
+/// `ObjectRef`.  If any live object (other than the target itself) still holds
+/// a reference, the target is preserved.  This avoids breaking documents that
+/// — unusually — share a single `/EmbeddedFile` stream between two filespecs.
+///
+/// # Errors
+///
+/// Propagates any error from [`Pdf::resolve`] or [`delete_embedded_file`].
+pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
+    // ── Step 1: locate the entry and capture refs (before any mutation) ───────
+    // We need both the filespec_ref and the stream_ref before we mutate the tree.
+    let entries = collect_embedded_file_pairs_raw(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)?;
+    let target_value = match entries.iter().find(|(k, _)| k.as_slice() == key) {
+        Some((_, v)) => v.clone(),
+        None => return Ok(false),
+    };
+
+    // Extract indirect filespec ref (if the value is an indirect reference).
+    let filespec_ref_opt: Option<ObjectRef> = match &target_value {
+        Object::Reference(r) => Some(*r),
+        _ => None, // direct-dict filespec — no ref to GC
+    };
+
+    // Resolve the /EmbeddedFile stream ref via /EF of the filespec (if any).
+    let stream_ref_opt: Option<ObjectRef> = if let Some(fs_ref) = filespec_ref_opt {
+        resolve_embedded_file_stream_ref(pdf, fs_ref)?
+    } else {
+        None
+    };
+
+    // ── Step 1b: collect name-tree node refs (before mutation) ────────────────
+    // After `delete_embedded_file` rebuilds the tree, old leaf/intermediate nodes
+    // are NOT `delete_object`-ed — they remain as live "ghosts" that still contain
+    // references to the old filespec/stream.  We collect ALL currently-live name-
+    // tree node refs before the rebuild so we can exclude both:
+    //   (a) the nodes that survive in the rebuilt tree, and
+    //   (b) the ghost nodes from earlier rebuilds (e.g. from successive inserts).
+    // We take the union of ALL live objects that look like name-tree nodes
+    // (i.e. contain a /Names flat array or a /Kids array but not a /Type key that
+    // would identify them as something else).  This is a heuristic, but safe: a
+    // false positive just means we're more conservative (skip a non-tree object
+    // from the scan), which cannot cause incorrect deletion.
+    let name_tree_node_refs = collect_all_live_name_tree_node_refs(pdf)?;
+
+    // ── Step 2: remove the name-tree entry ────────────────────────────────────
+    delete_embedded_file(pdf, key)?;
+
+    // ── Step 3: clear /AF references on catalog and all pages ─────────────────
+    if let Some(fs_ref) = filespec_ref_opt {
+        clear_af_reference(pdf, fs_ref)?;
+    }
+
+    // ── Step 4: conservative GC ───────────────────────────────────────────────
+    // Check whether the filespec is referenced by any live object OTHER than:
+    //   - itself
+    //   - name-tree nodes (which we just rebuilt and may be stale live ghosts)
+    //   - the stream ref (whose edge to the stream we separately check)
+    //
+    // Note: `rebuild_embedded_files_tree` (called by `delete_embedded_file`)
+    // does not call `delete_object` on old name-tree leaf/intermediate nodes;
+    // they remain in live_object_refs() as unreachable ghosts.  We exclude them
+    // from the scan so their stale references do not incorrectly preserve the
+    // filespec/stream objects.
+    let mut gc_exclude: BTreeSet<ObjectRef> = name_tree_node_refs;
+
+    if let Some(fs_ref) = filespec_ref_opt {
+        // Also exclude the stream ref from "things that reference the filespec"
+        // scan — the filespec itself points to the stream, but we're about to
+        // delete both; don't let that edge count.
+        if let Some(st_ref) = stream_ref_opt {
+            gc_exclude.insert(st_ref);
+        }
+        let self_refs = [fs_ref];
+        if !is_referenced_by_live_objects_excluding(pdf, fs_ref, &self_refs, &gc_exclude)? {
+            pdf.delete_object(fs_ref);
+        }
+    }
+    if let Some(st_ref) = stream_ref_opt {
+        let self_refs = [st_ref];
+        // Use the same name-tree exclusion set (without the stream itself).
+        let mut exclude2 = gc_exclude.clone();
+        exclude2.remove(&st_ref); // stream is in self_refs already
+        if !is_referenced_by_live_objects_excluding(pdf, st_ref, &self_refs, &exclude2)? {
+            pdf.delete_object(st_ref);
+        }
+    }
+
+    Ok(true)
+}
+
+// ── helpers for remove_attachment ─────────────────────────────────────────────
+
+/// Walk a `/Filespec` dict and return the first `/EmbeddedFile` stream `ObjectRef`
+/// reachable via `/EF /UF`, `/EF /F`, `/EF /Unix`, `/EF /Mac`, `/EF /DOS` (in
+/// that priority order).  Returns `None` if not found or on any soft error.
+fn resolve_embedded_file_stream_ref<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filespec_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    let fs_obj = pdf.resolve(filespec_ref)?;
+    let Object::Dictionary(fs_dict) = fs_obj else {
+        return Ok(None);
+    };
+    let ef_dict: Dictionary = match fs_dict.get("EF") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => {
+            let r = *r;
+            match pdf.resolve(r)? {
+                Object::Dictionary(d) => d,
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    for key in &["UF", "F", "Unix", "Mac", "DOS"] {
+        if let Some(Object::Reference(r)) = ef_dict.get(key) {
+            return Ok(Some(*r));
+        }
+    }
+    Ok(None)
+}
+
+/// Remove all occurrences of `target_ref` from `/AF` arrays on the catalog and
+/// every page dictionary.  After removal, if a `/AF` array becomes empty, the
+/// `/AF` key is deleted from that dictionary.
+fn clear_af_reference<R: Read + Seek>(pdf: &mut Pdf<R>, target_ref: ObjectRef) -> Result<()> {
+    // ── Catalog /AF ───────────────────────────────────────────────────────────
+    let catalog_ref = match pdf.root_ref() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    remove_ref_from_af_in_dict(pdf, catalog_ref, target_ref)?;
+
+    // ── Page /AF ──────────────────────────────────────────────────────────────
+    // Collect page refs first; page_refs performs I/O so we cannot interleave
+    // it with set_object mutations.
+    let page_refs = match crate::pages::page_refs(pdf) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // Best-effort: skip if tree is broken.
+    };
+    for page_ref in page_refs {
+        remove_ref_from_af_in_dict(pdf, page_ref, target_ref)?;
+    }
+    Ok(())
+}
+
+/// Remove `target_ref` from the `/AF` array of the dictionary at `dict_ref`.
+/// Patches the dictionary back via [`Pdf::set_object`].  If `/AF` becomes
+/// empty after removal, the key is deleted.  If `/AF` is absent or contains no
+/// reference to `target_ref`, this is a no-op.
+fn remove_ref_from_af_in_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict_ref: ObjectRef,
+    target_ref: ObjectRef,
+) -> Result<()> {
+    let obj = pdf.resolve(dict_ref)?;
+    let Object::Dictionary(mut dict) = obj else {
+        return Ok(());
+    };
+
+    // /AF may be a direct array or an indirect reference to an array.
+    let af_value = match dict.get("AF").cloned() {
+        Some(v) => v,
+        None => return Ok(()), // No /AF — nothing to do.
+    };
+
+    let af_array: Vec<Object> = match af_value {
+        Object::Array(arr) => arr,
+        Object::Reference(r) => match pdf.resolve(r)? {
+            Object::Array(arr) => arr,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+
+    let filtered: Vec<Object> = af_array
+        .into_iter()
+        .filter(|o| !matches!(o, Object::Reference(r) if *r == target_ref))
+        .collect();
+
+    if filtered.is_empty() {
+        dict.remove("AF");
+    } else {
+        dict.insert("AF", Object::Array(filtered));
+    }
+    pdf.set_object(dict_ref, Object::Dictionary(dict));
+    Ok(())
+}
+
+/// Collect all live objects that look like name-tree nodes.
+///
+/// A name-tree node is a dictionary with a `/Names` flat array or a `/Kids`
+/// array and no `/Type` key that would identify it as a page, catalog, etc.
+/// This heuristic may occasionally include non-tree objects (false positives)
+/// but that only makes the GC more conservative — it never causes incorrect
+/// deletion.
+///
+/// Used by [`remove_attachment`] to exclude all ghost name-tree nodes (from
+/// prior `rebuild_embedded_files_tree` calls that did not `delete_object` old
+/// nodes) from the reachability scan.
+fn collect_all_live_name_tree_node_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<BTreeSet<ObjectRef>> {
+    let mut out = BTreeSet::new();
+    let live = pdf.live_object_refs();
+    for obj_ref in live {
+        let obj = pdf.resolve(obj_ref)?;
+        let Object::Dictionary(dict) = obj else {
+            continue;
+        };
+        // Skip objects with a /Type name that marks them as non-tree (Page,
+        // Catalog, Pages, EmbeddedFile, Filespec, etc.).
+        if dict.get("Type").is_some() {
+            continue;
+        }
+        // Heuristic: a /Names flat array or a /Kids array without /Type → tree node.
+        let has_names = matches!(dict.get("Names"), Some(Object::Array(_)));
+        let has_kids = matches!(dict.get("Kids"), Some(Object::Array(_)));
+        if has_names || has_kids {
+            out.insert(obj_ref);
+        }
+    }
+    Ok(out)
+}
+
+/// Return `true` if any **live** object — other than the objects listed in
+/// `self_refs` and other than any object in `exclude_set` — contains a
+/// `Reference` to `target_ref` anywhere in its object graph.
+///
+/// `exclude_set` is a set of `ObjectRef`s that are skipped entirely during the
+/// scan.  Used to exclude name-tree nodes (which may be stale live ghosts after
+/// a rebuild) and other objects whose edges to `target_ref` should not count.
+///
+/// The scan resolves every live object and walks its nested structure.  Nested
+/// indirect references are checked by value (i.e. whether they equal
+/// `target_ref`), not followed recursively.  This is sufficient: the question
+/// is "who holds a direct reference to this object", not "who can transitively
+/// reach it".
+fn is_referenced_by_live_objects_excluding<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    target_ref: ObjectRef,
+    self_refs: &[ObjectRef],
+    exclude_set: &BTreeSet<ObjectRef>,
+) -> Result<bool> {
+    let live = pdf.live_object_refs();
+    for obj_ref in live {
+        // Skip the object itself.
+        if self_refs.contains(&obj_ref) {
+            continue;
+        }
+        // Skip excluded objects (e.g. stale name-tree ghost nodes).
+        if exclude_set.contains(&obj_ref) {
+            continue;
+        }
+        let obj = pdf.resolve(obj_ref)?;
+        if object_contains_ref(&obj, target_ref) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Recursively check whether `obj` contains `Object::Reference(target)` anywhere
+/// in its nested structure (dict values, array elements, stream dict).
+fn object_contains_ref(obj: &Object, target: ObjectRef) -> bool {
+    match obj {
+        Object::Reference(r) => *r == target,
+        Object::Array(arr) => arr.iter().any(|o| object_contains_ref(o, target)),
+        Object::Dictionary(dict) => dict.iter().any(|(_, v)| object_contains_ref(v, target)),
+        Object::Stream(s) => s.dict.iter().any(|(_, v)| object_contains_ref(v, target)),
+        _ => false,
+    }
+}
+
 // ── Writer constants ──────────────────────────────────────────────────────────
 
 /// Maximum number of entries in a single leaf `/Names` node before the writer
@@ -611,4 +918,251 @@ fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
     );
     dict.insert("Names", Object::Array(pairs));
     dict
+}
+
+// ── Tests for remove_attachment ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filespec_helper::{add_attachment_from_path, FileSpecBuilder};
+
+    // ── Minimal PDF fixture (same as filespec_helper tests) ───────────────────
+
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    fn open_minimal() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        Pdf::open(std::io::Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
+    }
+
+    // ── Test: add 2, remove 1, check list has 1 ──────────────────────────────
+
+    #[test]
+    fn remove_one_of_two_leaves_other_intact() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let file_a = dir.path().join("a.txt");
+        let file_b = dir.path().join("b.txt");
+        std::fs::write(&file_a, b"content A").unwrap();
+        std::fs::write(&file_b, b"content B").unwrap();
+
+        add_attachment_from_path(&mut pdf, b"a.txt", &file_a).expect("add a");
+        let fs_b = add_attachment_from_path(&mut pdf, b"b.txt", &file_b).expect("add b");
+
+        let removed = remove_attachment(&mut pdf, b"a.txt").expect("remove a");
+        assert!(
+            removed,
+            "remove_attachment must return true for existing key"
+        );
+
+        let entries = list_embedded_files(&mut pdf).expect("list");
+        assert_eq!(entries.len(), 1, "exactly one attachment must remain");
+        assert_eq!(entries[0].0, b"b.txt", "b.txt must survive");
+        assert_eq!(entries[0].1, fs_b, "surviving filespec ref must match");
+
+        // Deleted key must not appear
+        let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+        assert!(!keys.contains(&b"a.txt".as_ref()), "a.txt must be gone");
+    }
+
+    // ── Test: removed filespec and stream are no longer live ─────────────────
+
+    #[test]
+    fn remove_attachment_gc_deletes_filespec_and_stream() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("gc.txt");
+        std::fs::write(&file, b"gc test").unwrap();
+
+        let fs_ref = add_attachment_from_path(&mut pdf, b"gc.txt", &file).expect("add");
+
+        // Resolve the stream ref before removal.
+        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+            .expect("resolve_stream_ref")
+            .expect("stream ref must exist");
+
+        remove_attachment(&mut pdf, b"gc.txt").expect("remove");
+
+        // Both filespec and stream must be absent from live objects.
+        let live = pdf.live_object_refs();
+        assert!(
+            !live.contains(&fs_ref),
+            "filespec ref must not be in live_object_refs after GC"
+        );
+        assert!(
+            !live.contains(&stream_ref),
+            "stream ref must not be in live_object_refs after GC"
+        );
+    }
+
+    // ── Test: missing key returns false, document unchanged ──────────────────
+
+    #[test]
+    fn remove_nonexistent_key_returns_false() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("keep.txt");
+        std::fs::write(&file, b"keep me").unwrap();
+        add_attachment_from_path(&mut pdf, b"keep.txt", &file).expect("add");
+
+        let result = remove_attachment(&mut pdf, b"no-such-key.txt").expect("no error");
+        assert!(!result, "must return false for absent key");
+
+        // Document must still contain the original attachment.
+        let entries = list_embedded_files(&mut pdf).expect("list");
+        assert_eq!(entries.len(), 1, "document must be unchanged");
+        assert_eq!(entries[0].0, b"keep.txt");
+    }
+
+    // ── Test: /AF on catalog and page is cleared after remove ─────────────────
+
+    #[test]
+    fn remove_attachment_clears_af_on_catalog_and_page() {
+        let mut pdf = open_minimal();
+
+        // Build a filespec manually so we control the ref.
+        let fs_ref = FileSpecBuilder::new("af-test.txt", b"payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"af-test.txt", fs_ref).expect("insert");
+
+        // Add /AF to catalog pointing at fs_ref.
+        let catalog_ref = pdf.root_ref().expect("root");
+        let catalog_obj = pdf.resolve(catalog_ref).expect("resolve catalog");
+        let Object::Dictionary(mut catalog) = catalog_obj else {
+            panic!("expected catalog dict");
+        };
+        catalog.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        // Add /AF to the single page as well.
+        let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
+        assert_eq!(page_refs.len(), 1, "fixture has one page");
+        let page_ref = page_refs[0];
+        let page_obj = pdf.resolve(page_ref).expect("resolve page");
+        let Object::Dictionary(mut page_dict) = page_obj else {
+            panic!("expected page dict");
+        };
+        page_dict.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+
+        // Remove the attachment.
+        let removed = remove_attachment(&mut pdf, b"af-test.txt").expect("remove");
+        assert!(removed);
+
+        // /AF on catalog must be gone.
+        let catalog_obj2 = pdf.resolve(catalog_ref).expect("resolve catalog after");
+        let Object::Dictionary(catalog2) = catalog_obj2 else {
+            panic!("expected catalog dict");
+        };
+        assert!(
+            catalog2.get("AF").is_none(),
+            "catalog /AF must be removed after attachment removal"
+        );
+
+        // /AF on page must be gone.
+        let page_obj2 = pdf.resolve(page_ref).expect("resolve page after");
+        let Object::Dictionary(page_dict2) = page_obj2 else {
+            panic!("expected page dict");
+        };
+        assert!(
+            page_dict2.get("AF").is_none(),
+            "page /AF must be removed after attachment removal"
+        );
+    }
+
+    // ── Test: shared stream is preserved under conservative GC ───────────────
+
+    #[test]
+    fn conservative_gc_preserves_shared_stream() {
+        // Build two /Filespec dicts that share the same /EmbeddedFile stream.
+        // When one filespec is removed, the shared stream must NOT be GC'd.
+        let mut pdf = open_minimal();
+
+        // Allocate the shared EmbeddedFile stream object.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let stream_ref = ObjectRef::new(next + 1, 0);
+        let fs_ref1 = ObjectRef::new(next + 2, 0);
+        let fs_ref2 = ObjectRef::new(next + 3, 0);
+
+        // Shared EmbeddedFile stream.
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        ef_dict.insert("Length", Object::Integer(7));
+        let ef_stream = crate::object::Stream::new(ef_dict, b"payload".to_vec());
+        pdf.set_object(stream_ref, Object::Stream(ef_stream));
+
+        // /EF sub-dict pointing both filespecs at the same stream.
+        let mut ef_sub = Dictionary::new();
+        ef_sub.insert("F", Object::Reference(stream_ref));
+        ef_sub.insert("UF", Object::Reference(stream_ref));
+
+        // Filespec 1.
+        let mut fs1 = Dictionary::new();
+        fs1.insert("Type", Object::Name(b"Filespec".to_vec()));
+        fs1.insert("F", Object::String(b"shared1.txt".to_vec()));
+        fs1.insert("EF", Object::Dictionary(ef_sub.clone()));
+        pdf.set_object(fs_ref1, Object::Dictionary(fs1));
+
+        // Filespec 2.
+        let mut fs2 = Dictionary::new();
+        fs2.insert("Type", Object::Name(b"Filespec".to_vec()));
+        fs2.insert("F", Object::String(b"shared2.txt".to_vec()));
+        fs2.insert("EF", Object::Dictionary(ef_sub));
+        pdf.set_object(fs_ref2, Object::Dictionary(fs2));
+
+        // Insert both into the name tree.
+        insert_embedded_file(&mut pdf, b"shared1.txt", fs_ref1).expect("insert 1");
+        insert_embedded_file(&mut pdf, b"shared2.txt", fs_ref2).expect("insert 2");
+
+        // Remove only the first attachment.
+        let removed = remove_attachment(&mut pdf, b"shared1.txt").expect("remove");
+        assert!(removed);
+
+        // The shared stream must still be alive (fs_ref2 still references it).
+        let live = pdf.live_object_refs();
+        assert!(
+            live.contains(&stream_ref),
+            "shared stream must NOT be GC'd while fs_ref2 still references it"
+        );
+
+        // fs_ref1 itself should be gone (it is no longer referenced).
+        assert!(
+            !live.contains(&fs_ref1),
+            "removed filespec ref must be GC'd"
+        );
+
+        // fs_ref2 must still be alive.
+        assert!(
+            live.contains(&fs_ref2),
+            "surviving filespec ref must remain alive"
+        );
+    }
 }
