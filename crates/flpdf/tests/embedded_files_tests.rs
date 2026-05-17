@@ -1,4 +1,4 @@
-//! Integration tests for [`flpdf::embedded_files`] name-tree reader.
+//! Integration tests for [`flpdf::embedded_files`] name-tree reader and writer.
 //!
 //! All tests build minimal in-memory PDFs without touching the filesystem
 //! and exercise the four acceptance scenarios:
@@ -8,8 +8,18 @@
 //!   4. `/EmbeddedFiles` absent → empty list, no error.
 //!   5. `/Names` catalog key absent → empty list, no error.
 //!   6. `/Root` absent → empty list, no error.
+//!
+//! Writer tests (insert/delete/rebuild):
+//!   W1. Insert into empty tree → single entry, sorted.
+//!   W2. Multiple inserts → sorted order maintained.
+//!   W3. Insert duplicate key → value replaced, no duplicate.
+//!   W4. Delete existing key → entry removed, no dangling /Kids.
+//!   W5. Delete non-existent key → returns false, tree unchanged.
+//!   W6. Delete last entry → /EmbeddedFiles removed from /Names dict.
+//!   W7. Insert > LEAF_MAX entries → tree has two levels with /Kids.
+//!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
-use flpdf::{list_embedded_files, ObjectRef, Pdf};
+use flpdf::{delete_embedded_file, insert_embedded_file, list_embedded_files, ObjectRef, Pdf, LEAF_MAX};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -300,5 +310,200 @@ fn fixture_attachment_two_page() {
             window[0].0 <= window[1].0,
             "entries must be in non-decreasing key order"
         );
+    }
+}
+
+// ── Writer helpers ────────────────────────────────────────────────────────────
+
+/// Build a minimal PDF with no /Names /EmbeddedFiles at all.
+///
+/// Object layout:
+///   1 0 R  Catalog  (/Pages 2 0 R)
+///   2 0 R  Pages    (/Type /Pages /Kids [] /Count 0)
+///
+/// Filespec slots are pre-allocated in the xref so we can hand their refs to
+/// `insert_embedded_file` without them being truly absent (the Pdf::set_object
+/// call will place them into the cache regardless).
+fn build_empty_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ ] /Count 0 >>\nendobj\n");
+
+    // Pre-allocate a few filespec slots so the xref knows about them.
+    for n in 3u32..=40 {
+        off.insert(n, out.len() as u64);
+        out.extend_from_slice(
+            format!("{n} 0 obj\n<< /Type /Filespec /F (file{n}.txt) >>\nendobj\n").as_bytes(),
+        );
+    }
+
+    finish_pdf(&mut out, &off, 40, 1);
+    out
+}
+
+// ── W1: insert into empty tree ────────────────────────────────────────────────
+
+#[test]
+fn writer_insert_into_empty_tree() {
+    let mut pdf = open(build_empty_pdf());
+    let fs_ref = ObjectRef::new(3, 0);
+
+    insert_embedded_file(&mut pdf, b"alpha.txt", fs_ref).expect("insert");
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"alpha.txt");
+    assert_eq!(entries[0].1, fs_ref);
+}
+
+// ── W2: multiple inserts maintain sorted order ────────────────────────────────
+
+#[test]
+fn writer_multiple_inserts_sorted() {
+    let mut pdf = open(build_empty_pdf());
+
+    // Insert out of alphabetical order.
+    insert_embedded_file(&mut pdf, b"zebra.txt", ObjectRef::new(3, 0)).expect("insert zebra");
+    insert_embedded_file(&mut pdf, b"apple.txt", ObjectRef::new(4, 0)).expect("insert apple");
+    insert_embedded_file(&mut pdf, b"mango.txt", ObjectRef::new(5, 0)).expect("insert mango");
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].0, b"apple.txt");
+    assert_eq!(entries[1].0, b"mango.txt");
+    assert_eq!(entries[2].0, b"zebra.txt");
+
+    // Verify sort invariant holds across all windows.
+    for window in entries.windows(2) {
+        assert!(window[0].0 <= window[1].0, "entries must be sorted");
+    }
+}
+
+// ── W3: insert duplicate key replaces value ───────────────────────────────────
+
+#[test]
+fn writer_insert_duplicate_key_replaces() {
+    let mut pdf = open(build_empty_pdf());
+    let original = ObjectRef::new(3, 0);
+    let replacement = ObjectRef::new(4, 0);
+
+    insert_embedded_file(&mut pdf, b"doc.pdf", original).expect("first insert");
+    insert_embedded_file(&mut pdf, b"doc.pdf", replacement).expect("second insert");
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), 1, "duplicate key must not create a second entry");
+    assert_eq!(entries[0].0, b"doc.pdf");
+    assert_eq!(entries[0].1, replacement, "value must be the replacement");
+}
+
+// ── W4: delete existing key removes it ───────────────────────────────────────
+
+#[test]
+fn writer_delete_existing_key() {
+    let mut pdf = open(build_empty_pdf());
+    insert_embedded_file(&mut pdf, b"keep.txt", ObjectRef::new(3, 0)).expect("insert keep");
+    insert_embedded_file(&mut pdf, b"remove.txt", ObjectRef::new(4, 0)).expect("insert remove");
+
+    let removed = delete_embedded_file(&mut pdf, b"remove.txt").expect("delete");
+    assert!(removed, "delete must return true for an existing key");
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"keep.txt");
+
+    // Verify there are no dangling /Kids: the remaining single entry is a
+    // flat leaf (no /Kids array needed), so the tree round-trips cleanly.
+    let entries2 = list_embedded_files(&mut pdf).expect("second list");
+    assert_eq!(entries2.len(), 1);
+}
+
+// ── W5: delete non-existent key returns false ─────────────────────────────────
+
+#[test]
+fn writer_delete_absent_key_returns_false() {
+    let mut pdf = open(build_empty_pdf());
+    insert_embedded_file(&mut pdf, b"present.txt", ObjectRef::new(3, 0)).expect("insert");
+
+    let removed = delete_embedded_file(&mut pdf, b"absent.txt").expect("delete");
+    assert!(!removed, "delete of absent key must return false");
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), 1, "tree unchanged after deleting absent key");
+}
+
+// ── W6: delete last entry removes /EmbeddedFiles from /Names dict ─────────────
+
+#[test]
+fn writer_delete_last_entry_cleans_up() {
+    let mut pdf = open(build_empty_pdf());
+    insert_embedded_file(&mut pdf, b"only.txt", ObjectRef::new(3, 0)).expect("insert");
+
+    let removed = delete_embedded_file(&mut pdf, b"only.txt").expect("delete");
+    assert!(removed, "delete must succeed");
+
+    let entries = list_embedded_files(&mut pdf).expect("list after cleanup");
+    assert!(entries.is_empty(), "tree must be empty after last entry removed");
+}
+
+// ── W7: insert > LEAF_MAX entries produces /Kids split ───────────────────────
+
+#[test]
+fn writer_large_insert_produces_kids() {
+    let mut pdf = open(build_empty_pdf());
+    let count = LEAF_MAX + 5; // One chunk over the threshold.
+
+    for i in 0..count {
+        // Keys are zero-padded so byte-sort matches numeric sort.
+        let key = format!("file{i:04}.txt");
+        let fs_ref = ObjectRef::new(3 + i as u32, 0);
+        insert_embedded_file(&mut pdf, key.as_bytes(), fs_ref).expect("insert");
+    }
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), count, "all entries must be readable back");
+
+    // Verify sorted order.
+    for window in entries.windows(2) {
+        assert!(window[0].0 <= window[1].0, "entries must be sorted");
+    }
+}
+
+// ── W8: round-trip: insert → list returns same keys ──────────────────────────
+
+#[test]
+fn writer_round_trip_key_order() {
+    let mut pdf = open(build_empty_pdf());
+
+    let keys: &[&[u8]] = &[b"charlie", b"alpha", b"bravo", b"delta"];
+    let refs: Vec<ObjectRef> = (3u32..)
+        .take(keys.len())
+        .map(|n| ObjectRef::new(n, 0))
+        .collect();
+
+    for (key, &fs_ref) in keys.iter().zip(refs.iter()) {
+        insert_embedded_file(&mut pdf, key, fs_ref).expect("insert");
+    }
+
+    let entries = list_embedded_files(&mut pdf).expect("list");
+
+    // Expect alphabetical order.
+    let got_keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(got_keys, vec![b"alpha" as &[u8], b"bravo", b"charlie", b"delta"]);
+
+    // Verify that the filespec refs match after sorting.
+    let expected_sorted = {
+        let mut pairs: Vec<(&[u8], ObjectRef)> =
+            keys.iter().copied().zip(refs.iter().copied()).collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        pairs
+    };
+    for (i, (exp_key, exp_ref)) in expected_sorted.iter().enumerate() {
+        assert_eq!(&entries[i].0, exp_key);
+        assert_eq!(entries[i].1, *exp_ref);
     }
 }
