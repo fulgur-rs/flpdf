@@ -359,9 +359,8 @@ fn build_pdf_with_ef_keys(pairs: &[(&str, &[u8])]) -> Vec<u8> {
         ef_entries.push_str(&format!("/{key} {obj} 0 R "));
     }
     offsets.insert(5, out.len() as u64);
-    let filespec = format!(
-        "5 0 obj\n<< /Type /Filespec /F (a.txt) /EF << {ef_entries}>> >>\nendobj\n"
-    );
+    let filespec =
+        format!("5 0 obj\n<< /Type /Filespec /F (a.txt) /EF << {ef_entries}>> >>\nendobj\n");
     out.extend_from_slice(filespec.as_bytes());
 
     for (i, (_, payload)) in pairs.iter().enumerate() {
