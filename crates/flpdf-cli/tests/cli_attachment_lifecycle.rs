@@ -135,7 +135,10 @@ fn qpdf_add_attachment(
     if !support::is_qpdf_available() {
         return false;
     }
-    let status = ShellCommand::new("qpdf")
+    // qpdf is available — a failure here is a real regression, not a skip.
+    // Fail loud with stderr + exit code, consistent with the other qpdf
+    // cross-check helpers (CodeRabbit).
+    let out = ShellCommand::new("qpdf")
         .arg("--add-attachment")
         .arg(file)
         .arg(format!("--key={key}"))
@@ -143,9 +146,15 @@ fn qpdf_add_attachment(
         .arg("--")
         .arg(in_pdf)
         .arg(out_pdf)
-        .status()
-        .unwrap();
-    status.success()
+        .output()
+        .expect("qpdf is available but `qpdf --add-attachment` failed to spawn");
+    assert!(
+        out.status.success(),
+        "qpdf --add-attachment --key={key} {in_pdf:?} -> {out_pdf:?} exited {:?}; stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
