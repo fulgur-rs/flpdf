@@ -87,29 +87,20 @@ pub struct AttachmentInfo {
 
 // ── UTF-16BE decoder ──────────────────────────────────────────────────────────
 
-/// Decode a PDF text string to a UTF-8 `String`.
+/// Decode a PDF text string (ISO 32000-1 §7.9.2) to a UTF-8 `String` for
+/// display.
 ///
-/// If the bytes start with the UTF-16BE BOM (`0xFE 0xFF`), the remainder is
-/// decoded as big-endian UTF-16 code units.  Otherwise the bytes are treated
-/// as PDFDocEncoding, which for ASCII-range content is losslessly identical to
-/// UTF-8; non-ASCII bytes are replaced by the Unicode replacement character
-/// (`\u{FFFD}`).
+/// Delegates to the single canonical decoder
+/// [`crate::json_inspect::decode_pdf_text_string`], which handles UTF-16BE /
+/// UTF-16LE BOM-prefixed strings **and** the full PDFDocEncoding table
+/// (ISO 32000-1 Annex D.3) — so non-ASCII `/F`, `/UF`, and `/Desc` values are
+/// decoded correctly instead of being mangled by a lossy UTF-8 fallback
+/// (roborev #953).  If the bytes cannot be interpreted as a PDF text string,
+/// fall back to lossy UTF-8 so the listing still shows *something* rather than
+/// failing.
 fn decode_pdf_text_string(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        // UTF-16BE with BOM
-        let units: Vec<u16> = bytes[2..]
-            .chunks(2)
-            .map(|c| {
-                let hi = *c.first().unwrap_or(&0) as u16;
-                let lo = *c.get(1).unwrap_or(&0) as u16;
-                (hi << 8) | lo
-            })
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        // PDFDocEncoding fallback — lossy UTF-8 for non-ASCII.
-        String::from_utf8_lossy(bytes).into_owned()
-    }
+    crate::json_inspect::decode_pdf_text_string(bytes)
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
 // ── list_attachment_info ──────────────────────────────────────────────────────
@@ -271,11 +262,13 @@ pub fn format_attachment_list(entries: &[AttachmentInfo], verbose: bool) -> Stri
         out.push_str(&format!("  modification date: {mdate_s}\n"));
 
         if verbose {
-            // Description
+            // Description — `/Filespec /Desc` is a PDF text string, so decode
+            // it through the canonical PDFDocEncoding/UTF-16 decoder rather
+            // than a lossy UTF-8 cast (roborev #953).
             let desc_s = info
                 .description
                 .as_deref()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .map(decode_pdf_text_string)
                 .unwrap_or_else(|| "(none)".to_owned());
             out.push_str(&format!("  description:     {desc_s}\n"));
 
@@ -648,5 +641,41 @@ mod tests {
     fn decode_ascii_fallback() {
         let bytes = b"plain ascii".to_vec();
         assert_eq!(decode_pdf_text_string(&bytes), "plain ascii");
+    }
+
+    // Regression for roborev #953: non-ASCII PDFDocEncoding must decode via
+    // the canonical ISO 32000-1 Annex D.3 table, not a lossy UTF-8 cast.
+    #[test]
+    fn decode_non_ascii_pdfdocencoding() {
+        // 0x18 → U+02D8 BREVE (a PDF-specific PDFDocEncoding code point).
+        assert_eq!(decode_pdf_text_string(&[0x18]), "\u{02D8}");
+        // 0xE9 → U+00E9 'é' (PDFDocEncoding follows ISO-8859-1 in 0xA0..=0xFF).
+        assert_eq!(decode_pdf_text_string(&[0xE9]), "é");
+        // Mixed ASCII + non-ASCII PDFDocEncoding round-trips correctly rather
+        // than emitting U+FFFD replacement characters.
+        assert_eq!(decode_pdf_text_string(b"caf\xE9"), "café");
+    }
+
+    // Regression for roborev #953: /Desc verbose output must decode PDF text
+    // strings (here UTF-16BE) instead of showing mojibake.
+    #[test]
+    fn verbose_description_decodes_utf16be() {
+        let info = AttachmentInfo {
+            key: b"k.txt".to_vec(),
+            filespec_ref: crate::ObjectRef::new(1, 0),
+            display_name: Some("k.txt".to_owned()),
+            size: None,
+            mimetype: None,
+            creation_date: None,
+            modification_date: None,
+            description: Some(encode_utf16be("dé")),
+            af_relationship: None,
+            checksum: None,
+        };
+        let formatted = format_attachment_list(std::slice::from_ref(&info), true);
+        assert!(
+            formatted.contains("description:     dé"),
+            "UTF-16BE /Desc must be decoded: {formatted:?}"
+        );
     }
 }

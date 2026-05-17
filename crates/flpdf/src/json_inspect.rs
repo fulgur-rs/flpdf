@@ -125,7 +125,10 @@ const fn build_pdfdoc_table() -> [Option<char>; 256] {
 /// (UTF-16BE/UTF-16LE BOM-prefixed UTF-16, or PDFDocEncoding-mapped bytes).
 /// Returns `None` when the byte sequence cannot be safely interpreted as
 /// text — at which point the caller falls back to the `b:` hex representation.
-fn decode_pdf_text_string(bytes: &[u8]) -> Option<String> {
+///
+/// `pub(crate)` so other modules (e.g. `attachment_list`) reuse this single
+/// canonical PDFDocEncoding/UTF-16 decoder instead of duplicating it.
+pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> Option<String> {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         if rest.len() % 2 != 0 {
             return None;
