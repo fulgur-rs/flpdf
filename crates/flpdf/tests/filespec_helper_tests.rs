@@ -396,7 +396,7 @@ fn embedded_file_prefers_uf_over_f() {
     let bytes = build_pdf_with_ef_keys(&[("F", b"from-F"), ("UF", b"from-UF")]);
     let mut pdf = open(bytes);
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
-    let mut ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), b"from-UF".to_vec());
 }
 
@@ -406,7 +406,7 @@ fn embedded_file_falls_back_to_platform_keys() {
     let bytes = build_pdf_with_ef_keys(&[("Unix", b"unix-payload")]);
     let mut pdf = open(bytes);
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
-    let mut ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), b"unix-payload".to_vec());
 }
 
@@ -518,6 +518,6 @@ fn embedded_file_skips_non_stream_higher_priority_key() {
 
     let mut pdf = open(out);
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
-    let mut ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
 }
