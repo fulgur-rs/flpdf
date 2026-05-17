@@ -215,8 +215,12 @@ fn collect_one<R: Read + Seek>(
 pub fn format_attachment_list(entries: &[AttachmentInfo], verbose: bool) -> String {
     let mut out = String::new();
     for info in entries {
-        // Header line: key -> num,gen  (mirrors qpdf)
-        let key_str = String::from_utf8_lossy(&info.key);
+        // Header line: key -> num,gen  (mirrors qpdf).  The name-tree key is a
+        // PDF string; decode it the same way as display name / description so
+        // non-ASCII PDFDocEncoding / UTF-16BE keys are not mojibake (roborev
+        // #954).  Only the displayed text is decoded — `info.key` keeps its
+        // raw bytes for lookups elsewhere.
+        let key_str = decode_pdf_text_string(&info.key);
         out.push_str(&format!(
             "{} -> {},{}\n",
             key_str, info.filespec_ref.number, info.filespec_ref.generation
@@ -654,6 +658,33 @@ mod tests {
         // Mixed ASCII + non-ASCII PDFDocEncoding round-trips correctly rather
         // than emitting U+FFFD replacement characters.
         assert_eq!(decode_pdf_text_string(b"caf\xE9"), "café");
+    }
+
+    // Regression for roborev #954: the header line key must be decoded as a
+    // PDF text string, not lossy UTF-8, so non-ASCII keys are not mojibake.
+    #[test]
+    fn header_key_decodes_pdfdocencoding() {
+        let info = AttachmentInfo {
+            key: b"caf\xE9.txt".to_vec(),
+            filespec_ref: crate::ObjectRef::new(7, 0),
+            display_name: Some("café.txt".to_owned()),
+            size: None,
+            mimetype: None,
+            creation_date: None,
+            modification_date: None,
+            description: None,
+            af_relationship: None,
+            checksum: None,
+        };
+        let formatted = format_attachment_list(std::slice::from_ref(&info), false);
+        assert!(
+            formatted.contains("café.txt -> 7,0"),
+            "non-ASCII PDFDocEncoding key must decode in the header: {formatted:?}"
+        );
+        assert!(
+            !formatted.contains('\u{FFFD}'),
+            "header must not contain replacement chars: {formatted:?}"
+        );
     }
 
     // Regression for roborev #953: /Desc verbose output must decode PDF text
