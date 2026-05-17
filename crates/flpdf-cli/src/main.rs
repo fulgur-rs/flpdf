@@ -1,4 +1,4 @@
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset, outline_dest_remap::remap_outline_and_dests,
     page_collate::collate, page_combine::CombinedPlan, page_rotate::apply_rotate_to_pages,
@@ -106,6 +106,24 @@ impl std::error::Error for CliExitError {}
 // never reaching the JSON branch. Conflicting instead surfaces the
 // ambiguity as a clean usage error.
 #[command(args_conflicts_with_subcommands = true)]
+// The five attachment operations are dispatched by an ordered `else if`
+// chain in `main`, so supplying two at once would silently run only the
+// first. Make them mutually exclusive at the parser level: clap rejects
+// e.g. `--add-attachment … -- --copy-attachments-from …` with a usage
+// error instead of discarding the second operation. (`--verbose` and
+// `-o/--show-attachment-to` are sub-modifiers, not operations, so they are
+// intentionally NOT members of this group.)
+#[command(group(
+    ArgGroup::new("attachment_op")
+        .multiple(false)
+        .args([
+            "add_attachment",
+            "remove_attachment",
+            "list_attachments",
+            "show_attachment",
+            "copy_attachments_from",
+        ])
+))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -2627,10 +2645,14 @@ fn parse_pdf_date_arg(s: &str) -> CliResult<(u16, u8, u8, u8, u8, u8)> {
     let s = s
         .strip_prefix("D:")
         .ok_or_else(|| format!("invalid PDF date {s:?}: must start with D:"))?;
-    if s.len() < 14 {
-        return Err(
-            format!("invalid PDF date D:{s:?}: need at least 14 digits (YYYYMMDDHHmmSS)").into(),
-        );
+    // Validate the required 14-character body is ASCII digits BEFORE slicing
+    // by byte offsets: a multibyte value (e.g. fullwidth digits
+    // `D:２０２４…`) would otherwise panic on a non-char-boundary slice.
+    if s.len() < 14 || !s.as_bytes()[..14].iter().all(u8::is_ascii_digit) {
+        return Err(format!(
+            "invalid PDF date D:{s:?}: need at least 14 ASCII digits (YYYYMMDDHHmmSS)"
+        )
+        .into());
     }
     let year: u16 = s[0..4]
         .parse()

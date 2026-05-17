@@ -2630,6 +2630,64 @@ fn attachment_help_text_contains_expected_flags() {
         .stdout(predicate::str::contains("--copy-attachments-from"));
 }
 
+/// Two attachment operations in one invocation must be a clean clap usage
+/// error (mutually-exclusive ArgGroup), not silently running only the first.
+#[test]
+fn attachment_ops_are_mutually_exclusive() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("a.txt");
+    std::fs::write(&attachment, b"a").unwrap();
+    let src = minimal_pdf_temp();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=a",
+            "--",
+            "--copy-attachments-from",
+            src.path().to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+/// A non-ASCII (e.g. fullwidth-digit) date must yield a clean CLI error,
+/// never a byte-slice panic.
+#[test]
+fn add_attachment_non_ascii_date_is_clean_error_not_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("d.txt");
+    std::fs::write(&attachment, b"d").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=d",
+            // Fullwidth digits: multibyte UTF-8, would panic a byte slice.
+            "--creationdate=D:２０２４０１０１１２００００",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid PDF date"))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
