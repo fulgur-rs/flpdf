@@ -26,6 +26,152 @@ fn rewrites_minimal_pdf_to_valid_pdf() {
     );
 }
 
+/// flpdf-9hc.13.2: default (no-flag) /ID strategy, full-rewrite path.
+///
+/// First save of a source with no /ID emits a fresh two-element random /ID;
+/// re-saving the result preserves element 1 (permanent identifier) verbatim
+/// while element 2 (changing identifier) rotates — and the overall /ID differs
+/// on every save (matching qpdf's default observable behaviour, ISO 32000-1
+/// §14.4).
+#[test]
+fn default_id_random_first_save_then_preserves_element1_on_resave() {
+    fn id_pair(trailer: &Dictionary) -> (Vec<u8>, Vec<u8>) {
+        match trailer.get("ID") {
+            Some(Object::Array(v)) if v.len() == 2 => {
+                let s = |o: &Object| match o {
+                    Object::String(b) => b.clone(),
+                    other => panic!("expected /ID string, got {other:?}"),
+                };
+                (s(&v[0]), s(&v[1]))
+            }
+            other => panic!("expected 2-element /ID array, got {other:?}"),
+        }
+    }
+
+    // Minimal source PDF with NO /ID in the trailer.
+    let mut src = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+    offsets.push(src.len());
+    src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(src.len());
+    src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let startxref = src.len();
+    src.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    src.extend_from_slice(b"0000000000 65535 f \n");
+    for o in &offsets {
+        src.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    src.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+
+    // First save.
+    let mut pdf1 = Pdf::open(Cursor::new(src.clone())).unwrap();
+    let mut out1 = Vec::new();
+    write_pdf_with_options(&mut pdf1, &mut out1, &opts).unwrap();
+    let t1 = load_xref_and_trailer(&mut Cursor::new(&out1))
+        .unwrap()
+        .trailer;
+    let (a1, b1) = id_pair(&t1);
+
+    assert_eq!(a1.len(), 16, "first-save /ID[0] must be 16 bytes");
+    assert_eq!(b1.len(), 16, "first-save /ID[1] must be 16 bytes");
+    let pi: [u8; 16] = [
+        0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27,
+        0x95,
+    ];
+    assert_ne!(a1.as_slice(), &pi[..], "/ID[0] must not be the π constant");
+    assert_ne!(b1.as_slice(), &pi[..], "/ID[1] must not be the π constant");
+    assert!(a1.iter().any(|&c| c != 0), "/ID[0] must not be all-zero");
+    assert!(b1.iter().any(|&c| c != 0), "/ID[1] must not be all-zero");
+
+    // Re-save the first output.
+    let mut pdf2 = Pdf::open(Cursor::new(out1.clone())).unwrap();
+    let mut out2 = Vec::new();
+    write_pdf_with_options(&mut pdf2, &mut out2, &opts).unwrap();
+    let t2 = load_xref_and_trailer(&mut Cursor::new(&out2))
+        .unwrap()
+        .trailer;
+    let (a2, b2) = id_pair(&t2);
+
+    assert_eq!(
+        a2, a1,
+        "element 1 (permanent id) must be preserved on re-save"
+    );
+    assert_ne!(b2, b1, "element 2 (changing id) must rotate on re-save");
+    assert_ne!((a1, b1), (a2, b2), "/ID must vary between saves");
+}
+
+/// flpdf-9hc.13.2: default /ID strategy on the **incremental** write path
+/// (`write_pdf`, the most common entry point).  Same contract as the
+/// full-rewrite variant: first save emits a fresh random /ID, re-save
+/// preserves element 1 and rotates element 2.
+#[test]
+fn default_id_random_on_incremental_path_first_save_and_resave() {
+    fn id_pair(trailer: &Dictionary) -> (Vec<u8>, Vec<u8>) {
+        match trailer.get("ID") {
+            Some(Object::Array(v)) if v.len() == 2 => {
+                let s = |o: &Object| match o {
+                    Object::String(b) => b.clone(),
+                    other => panic!("expected /ID string, got {other:?}"),
+                };
+                (s(&v[0]), s(&v[1]))
+            }
+            other => panic!("expected 2-element /ID array, got {other:?}"),
+        }
+    }
+
+    // Minimal source PDF with NO /ID in the trailer.
+    let mut src = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+    offsets.push(src.len());
+    src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(src.len());
+    src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let startxref = src.len();
+    src.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    src.extend_from_slice(b"0000000000 65535 f \n");
+    for o in &offsets {
+        src.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    src.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes(),
+    );
+
+    // First save via the default incremental path (no options).
+    let mut pdf1 = Pdf::open(Cursor::new(src.clone())).unwrap();
+    let mut out1 = Vec::new();
+    write_pdf(&mut pdf1, &mut out1).unwrap();
+    let t1 = load_xref_and_trailer(&mut Cursor::new(&out1))
+        .unwrap()
+        .trailer;
+    let (a1, b1) = id_pair(&t1);
+    assert_eq!(a1.len(), 16);
+    assert_eq!(b1.len(), 16);
+    assert!(a1.iter().any(|&c| c != 0), "/ID[0] must not be all-zero");
+    assert!(b1.iter().any(|&c| c != 0), "/ID[1] must not be all-zero");
+
+    // Re-save the first output: element 1 preserved, element 2 rotated.
+    let mut pdf2 = Pdf::open(Cursor::new(out1.clone())).unwrap();
+    let mut out2 = Vec::new();
+    write_pdf(&mut pdf2, &mut out2).unwrap();
+    let t2 = load_xref_and_trailer(&mut Cursor::new(&out2))
+        .unwrap()
+        .trailer;
+    let (a2, b2) = id_pair(&t2);
+    assert_eq!(
+        a2, a1,
+        "element 1 (permanent id) must be preserved on incremental re-save"
+    );
+    assert_ne!(
+        b2, b1,
+        "element 2 (changing id) must rotate on incremental re-save"
+    );
+}
+
 #[test]
 fn write_pdf_preserves_source_bytes() {
     let mut bytes = b"%PDF-1.7\n".to_vec();

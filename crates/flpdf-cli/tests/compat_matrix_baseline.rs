@@ -179,6 +179,44 @@ fn fnv1a_64_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+/// Elide every `/ID [<..><..>]` array from `bytes`, replacing it with a
+/// stable placeholder so byte-level comparisons and fingerprints ignore the
+/// trailer file identifier.
+///
+/// The default (no-flag) `/ID` strategy emits a fresh random identifier on
+/// every save (ISO 32000-1 §14.4), which would otherwise make the `byte-equal`
+/// verdict and the `flpdf-sha` fingerprint non-deterministic for the `Plain`
+/// and `Linearize` rows.  Eliding `/ID` keeps the matrix tracking every other
+/// byte of flpdf's output.  The `StaticId` rows are unaffected because their
+/// `/ID` is the fixed π constant on both sides; eliding it on both sides
+/// preserves the byte-equal verdict.
+fn elide_id_arrays(bytes: &[u8]) -> Vec<u8> {
+    const KEY: &[u8] = b"/ID";
+    const PLACEHOLDER: &[u8] = b"/ID <ELIDED>";
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(KEY) {
+            // Skip optional whitespace, then require an opening '['.
+            let mut j = i + KEY.len();
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\r' | b'\n') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'[' {
+                // Consume up to and including the matching ']'.
+                if let Some(close) = bytes[j..].iter().position(|&b| b == b']') {
+                    out.extend_from_slice(PLACEHOLDER);
+                    i = j + close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Markdown renderer
 // ---------------------------------------------------------------------------
@@ -197,9 +235,12 @@ fn render_markdown(rows: &[MatrixRow]) -> String {
     out.push_str("- **structural**: flpdf-parsed object graphs match (encoding-only stream\n");
     out.push_str("  dict keys excluded when decoded content matches)\n\n");
     out.push_str("The **flpdf-sha** column is a stable 64-bit FNV-1a fingerprint of flpdf's\n");
-    out.push_str("output bytes. It changes whenever flpdf's output changes, so the baseline\n");
-    out.push_str("detects byte-level drift even when every comparator verdict stays at\n");
-    out.push_str("`diverge`.\n\n");
+    out.push_str("output bytes with the trailer `/ID` array elided (the default `/ID` is\n");
+    out.push_str("randomized per ISO 32000-1 §14.4, so fingerprinting it verbatim would be\n");
+    out.push_str("non-deterministic). It changes whenever flpdf's non-`/ID` output changes,\n");
+    out.push_str("so the baseline detects byte-level drift even when every comparator\n");
+    out.push_str("verdict stays at `diverge`. The `byte-equal` column likewise compares\n");
+    out.push_str("with `/ID` elided.\n\n");
     out.push_str("## Review cadence\n\n");
     out.push_str("Re-bless this file when:\n");
     out.push_str("- qpdf binary is upgraded (qpdf-json comparator may shift)\n");
@@ -333,12 +374,37 @@ fn compat_matrix_baseline() {
             },
         };
 
-        let byte_result = byte_cmp.compare(&run_outputs);
+        // The default /ID is randomized per ISO 32000-1 §14.4, so byte-level
+        // comparison and the fingerprint must elide it on both sides.  The
+        // qpdf-json and structural comparators parse the raw PDF, so they keep
+        // the original (un-elided) bytes.
+        let id_normalized = RunOutputs {
+            qpdf: ToolOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: vec![],
+                stderr: vec![],
+                output_bytes: Some(elide_id_arrays(
+                    run_outputs.qpdf.output_bytes.as_ref().unwrap(),
+                )),
+            },
+            flpdf: ToolOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: vec![],
+                stderr: vec![],
+                output_bytes: Some(elide_id_arrays(
+                    run_outputs.flpdf.output_bytes.as_ref().unwrap(),
+                )),
+            },
+        };
+
+        let byte_result = byte_cmp.compare(&id_normalized);
         let qpdf_result = qpdf_cmp.compare(&run_outputs);
         let struct_result = struct_cmp.compare(&run_outputs);
 
         let flpdf_sha = fnv1a_64_hex(
-            run_outputs
+            id_normalized
                 .flpdf
                 .output_bytes
                 .as_ref()

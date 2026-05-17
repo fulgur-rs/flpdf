@@ -12,9 +12,12 @@ test.
   dict keys excluded when decoded content matches)
 
 The **flpdf-sha** column is a stable 64-bit FNV-1a fingerprint of flpdf's
-output bytes. It changes whenever flpdf's output changes, so the baseline
-detects byte-level drift even when every comparator verdict stays at
-`diverge`.
+output bytes with the trailer `/ID` array elided (the default `/ID` is
+randomized per ISO 32000-1 §14.4, so fingerprinting it verbatim would be
+non-deterministic). It changes whenever flpdf's non-`/ID` output changes,
+so the baseline detects byte-level drift even when every comparator
+verdict stays at `diverge`. The `byte-equal` column likewise compares
+with `/ID` elided.
 
 ## Review cadence
 
@@ -29,15 +32,15 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 
 | fixture | flag | flpdf-sha | byte-equal | qpdf-json | structural |
 |---|---|---|---|---|---|
-| one-page.pdf | plain | 0fc00b04084c40d2 | diverge | diverge | diverge |
-| one-page.pdf | static-id | fdb01346b94f8cc2 | diverge | diverge | match |
-| one-page.pdf | linearize | 8f13abe2a7e55c29 | diverge | diverge | diverge |
-| two-page.pdf | plain | 2030c93a2367609c | diverge | diverge | diverge |
-| two-page.pdf | static-id | 18fa4638a6243919 | diverge | diverge | match |
-| two-page.pdf | linearize | 0a19fc239f408b06 | diverge | diverge | diverge |
-| three-page.pdf | plain | 92e70403b9a04c12 | diverge | diverge | diverge |
-| three-page.pdf | static-id | 0b5000ccab151069 | diverge | diverge | match |
-| three-page.pdf | linearize | da6b7cdf60ce4cfe | diverge | diverge | diverge |
-| linearized-one-page.pdf | plain | e72ee1bf259d9d8c | diverge | diverge | diverge |
-| attachment-two-page.pdf | plain | 18017064c480ca19 | diverge | diverge | diverge |
-| attachment-two-page.pdf | static-id | 18017064c480ca19 | diverge | diverge | match |
+| one-page.pdf | plain | de1930f4a42047f3 | diverge | diverge | diverge |
+| one-page.pdf | static-id | de1930f4a42047f3 | diverge | diverge | match |
+| one-page.pdf | linearize | 3949bf1d6f5e7834 | diverge | diverge | diverge |
+| two-page.pdf | plain | 595b45e80feb4965 | diverge | diverge | diverge |
+| two-page.pdf | static-id | 595b45e80feb4965 | diverge | diverge | match |
+| two-page.pdf | linearize | e8937b4e0b16972b | diverge | diverge | diverge |
+| three-page.pdf | plain | 5a2ef4291e5808af | diverge | diverge | diverge |
+| three-page.pdf | static-id | 5a2ef4291e5808af | diverge | diverge | match |
+| three-page.pdf | linearize | 814c196eb9598155 | diverge | diverge | diverge |
+| linearized-one-page.pdf | plain | 91e82ebd65c611d4 | diverge | diverge | diverge |
+| attachment-two-page.pdf | plain | 18d7b3e57b78e069 | diverge | diverge | diverge |
+| attachment-two-page.pdf | static-id | 18d7b3e57b78e069 | diverge | diverge | match |

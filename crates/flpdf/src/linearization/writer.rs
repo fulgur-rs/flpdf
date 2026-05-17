@@ -482,16 +482,16 @@ fn write_part1_xref_and_trailer(
     bytes.extend_from_slice(placeholder.as_bytes());
     let prev_value_end = bytes.len();
 
-    // /ID — emit only when meaningful.
+    // /ID — emit per the active identifier strategy.
     //
-    // Three cases:
-    //   1. --static-id: emit the fixed [source_id0, π_const] array (or [π_const, π_const]
-    //      when the source has no /ID).
-    //   2. source trailer has /ID: inherit it verbatim.
-    //   3. Neither: omit the /ID key entirely.  The PDF spec (ISO 32000) marks
-    //      /ID as optional in the trailer; emitting an empty array `[]` is not a
-    //      valid two-element byte-string array and may cause conforming readers to
-    //      reject the file as malformed.
+    // Two cases:
+    //   1. --static-id: emit the fixed [source_id0, π_const] array (or
+    //      [π_const, π_const] when the source has no /ID).
+    //   2. Default (no flag): emit a fresh random two-element /ID.  Element 1
+    //      (permanent identifier) is preserved from a well-formed source /ID on
+    //      a re-save and freshly generated on a first save; element 2 (changing
+    //      identifier) is always fresh.  This matches qpdf's default observable
+    //      behaviour (random /IDs differ between runs, ISO 32000-1 §14.4).
     let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
     if options.static_id {
         // static-id: [π_const, π_const] — both elements set to qpdf constant.
@@ -508,16 +508,11 @@ fn write_part1_xref_and_trailer(
         bytes.extend_from_slice(b" /ID ");
         id_array.write_pdf(bytes);
     } else {
-        // Dynamic ID: inherit from source trailer, or omit entirely.
-        match source_trailer.get("ID") {
-            Some(id_obj) => {
-                bytes.extend_from_slice(b" /ID ");
-                id_obj.write_pdf(bytes);
-            }
-            None => {
-                // Source has no /ID and --static-id is not set — omit the key.
-            }
-        }
+        // Default strategy: emit a fresh random /ID (element 1 preserved on
+        // re-save, both fresh on first save; element 2 always fresh).
+        let id_obj = crate::writer::random_id_array(source_trailer.get("ID"));
+        bytes.extend_from_slice(b" /ID ");
+        id_obj.write_pdf(bytes);
     }
 
     bytes.extend_from_slice(b" >>");
@@ -647,7 +642,11 @@ fn split_xref_common_id(options: &WriteOptions, source_trailer: &Dictionary) -> 
         };
         Some(Object::Array(vec![first_id, pi_bytes]))
     } else {
-        source_trailer.get("ID").cloned()
+        // Default (no-flag) strategy: emit a fresh random /ID — element 1
+        // preserved from a well-formed source /ID (re-save), both fresh
+        // otherwise (first save).  Matches qpdf's default observable
+        // behaviour (ISO 32000-1 §14.4).
+        Some(crate::writer::random_id_array(source_trailer.get("ID")))
     }
 }
 

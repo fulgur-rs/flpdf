@@ -991,6 +991,8 @@ fn write_incremental_trailer<R: Read + Seek>(
     );
     if options.static_id {
         apply_static_id(&mut trailer);
+    } else {
+        apply_random_id(&mut trailer);
     }
 
     bytes.extend_from_slice(b"trailer\n");
@@ -1017,6 +1019,67 @@ pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
         _ => pi_id.clone(),
     };
     trailer.insert("ID", Object::Array(vec![first_id, pi_id]));
+}
+
+/// Generate a fresh 16-byte file identifier.
+///
+/// Mirrors qpdf's default-`/ID` algorithm in spirit: an MD5 digest seeded from
+/// volatile per-invocation entropy (wall-clock nanoseconds, the process id, and
+/// a strictly-monotonic process-global counter).  MD5 is already a direct
+/// dependency, so no new crate is introduced.  The counter guarantees two calls
+/// within the same nanosecond tick still produce distinct identifiers, which is
+/// what makes "every save emits a different `/ID`" hold even for back-to-back
+/// writes in a tight loop.
+fn fresh_id_bytes() -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = md5::Md5::new();
+    use md5::Digest as _;
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(pid.to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Replace `trailer`'s `/ID` following the default (no-flag) identifier
+/// strategy of ISO 32000-1 §14.4.
+///
+/// The permanent identifier (element 1) is preserved from the existing `/ID`
+/// when its shape matches a 2-element array of strings — i.e. on a re-save of a
+/// file that already carries a well-formed `/ID`.  In every other case
+/// (missing, wrong arity, wrong element types — i.e. the first save by flpdf)
+/// element 1 is freshly generated.  The changing identifier (element 2) is
+/// **always** freshly generated, so the `/ID` varies on every save while the
+/// permanent identifier remains stable across re-saves.  This matches qpdf's
+/// default observable behaviour (random `/ID`s differ between runs).
+pub(crate) fn random_id_array(source_id: Option<&Object>) -> Object {
+    let first_id = match source_id {
+        Some(Object::Array(values))
+            if values.len() == 2
+                && matches!(values[0], Object::String(_))
+                && matches!(values[1], Object::String(_)) =>
+        {
+            values[0].clone()
+        }
+        _ => Object::String(fresh_id_bytes().to_vec()),
+    };
+    let second_id = Object::String(fresh_id_bytes().to_vec());
+    Object::Array(vec![first_id, second_id])
+}
+
+/// Apply [`random_id_array`] to a trailer dictionary in place, reading the
+/// existing `/ID` (if any) as the permanent-identifier source.
+pub(crate) fn apply_random_id(trailer: &mut Dictionary) {
+    let id = random_id_array(trailer.get("ID"));
+    trailer.insert("ID", id);
 }
 
 fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
@@ -1345,6 +1408,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             trailer.insert("Root", Object::Reference(root_ref));
             if options.static_id {
                 apply_static_id(&mut trailer);
+            } else {
+                apply_random_id(&mut trailer);
             }
 
             bytes.extend_from_slice(b"trailer\n");
@@ -1492,6 +1557,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             );
             if options.static_id {
                 apply_static_id(&mut xref_dict);
+            } else {
+                apply_random_id(&mut xref_dict);
             }
 
             let xref_stream = crate::Stream::new(xref_dict, stream_data);
@@ -1720,5 +1787,103 @@ mod tests {
         let v = id_array(&t);
         assert_eq!(v[0], Object::String(QPDF_STATIC_ID.to_vec()));
         assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
+    }
+
+    // --- Default (no-flag) /ID generation strategy (flpdf-9hc.13.2) ---------
+
+    fn str_bytes(o: &Object) -> &[u8] {
+        match o {
+            Object::String(s) => s.as_slice(),
+            other => panic!("expected /ID element to be a string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_random_id_first_save_generates_both_elements_fresh() {
+        // No source /ID: both elements must be fresh 16-byte randoms — never
+        // the π constant and never all-zero.
+        let mut t = Dictionary::new();
+        apply_random_id(&mut t);
+        let v = id_array(&t);
+        assert_eq!(v.len(), 2);
+        let (e0, e1) = (str_bytes(&v[0]), str_bytes(&v[1]));
+        assert_eq!(e0.len(), 16, "element 1 must be 16 bytes");
+        assert_eq!(e1.len(), 16, "element 2 must be 16 bytes");
+        assert_ne!(
+            e0,
+            &QPDF_STATIC_ID[..],
+            "element 1 must not be the π constant"
+        );
+        assert_ne!(
+            e1,
+            &QPDF_STATIC_ID[..],
+            "element 2 must not be the π constant"
+        );
+        assert!(e0.iter().any(|&b| b != 0), "element 1 must not be all-zero");
+        assert!(e1.iter().any(|&b| b != 0), "element 2 must not be all-zero");
+        // First save: the two elements are independently random.
+        assert_ne!(
+            e0, e1,
+            "first-save elements must be independently generated"
+        );
+    }
+
+    #[test]
+    fn apply_random_id_varies_per_save() {
+        // Two saves of the same (no-/ID) input yield different /ID arrays —
+        // even back-to-back, thanks to the process-global counter.
+        let mut a = Dictionary::new();
+        let mut b = Dictionary::new();
+        apply_random_id(&mut a);
+        apply_random_id(&mut b);
+        assert_ne!(id_array(&a), id_array(&b), "/ID must change on every save");
+    }
+
+    #[test]
+    fn apply_random_id_re_save_preserves_element1_rotates_element2() {
+        // First save (no source /ID): both fresh.
+        let mut first = Dictionary::new();
+        apply_random_id(&mut first);
+        let v1 = id_array(&first);
+        let perm = v1[0].clone();
+
+        // Re-save: feed the well-formed 2-string /ID back in.  Element 1 must
+        // be preserved verbatim (ISO 32000-1 §14.4); element 2 must rotate.
+        let mut second = Dictionary::new();
+        second.insert("ID", Object::Array(v1.clone()));
+        apply_random_id(&mut second);
+        let v2 = id_array(&second);
+
+        assert_eq!(
+            v2[0], perm,
+            "element 1 (permanent id) must be preserved on re-save"
+        );
+        assert_ne!(
+            v2[1], v1[1],
+            "element 2 (changing id) must rotate on re-save"
+        );
+    }
+
+    #[test]
+    fn apply_random_id_regenerates_element1_when_source_id_is_malformed() {
+        // Arity-2 array but element 2 is not a string → not a usable /ID, so
+        // element 1 is treated as a first save and regenerated.
+        let mut t = Dictionary::new();
+        t.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(b"would-be-permanent".to_vec()),
+                Object::Integer(123),
+            ]),
+        );
+        apply_random_id(&mut t);
+        let v = id_array(&t);
+        assert_ne!(
+            v[0],
+            Object::String(b"would-be-permanent".to_vec()),
+            "malformed source /ID must not be trusted as permanent id"
+        );
+        assert_eq!(str_bytes(&v[0]).len(), 16);
+        assert_eq!(str_bytes(&v[1]).len(), 16);
     }
 }
