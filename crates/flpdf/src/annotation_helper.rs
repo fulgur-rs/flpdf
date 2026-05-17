@@ -490,7 +490,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
             let node_obj = self.pdf.resolve(current)?;
             let Object::Dictionary(dict) = node_obj else {
-                return Ok(None);
+                return Err(Error::Unsupported(format!(
+                    "field tree node {current} is not a dictionary"
+                )));
             };
 
             if let Some(val) = dict.get(key).cloned() {
@@ -535,7 +537,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
             let node_obj = self.pdf.resolve(current)?;
             let Object::Dictionary(dict) = node_obj else {
-                return Ok(None);
+                return Err(Error::Unsupported(format!(
+                    "field tree node {current} is not a dictionary"
+                )));
             };
 
             if let Some(val) = dict.get(key).cloned() {
@@ -578,7 +582,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
             let node_obj = self.pdf.resolve(current)?;
             let Object::Dictionary(dict) = node_obj else {
-                return Ok(None);
+                return Err(Error::Unsupported(format!(
+                    "field tree node {current} is not a dictionary"
+                )));
             };
 
             if let Some(val) = dict.get(key).cloned() {
@@ -655,7 +661,7 @@ fn resolve_optional_dict<R: Read + Seek>(
 /// Mirrors `page_object_helper::parse_rect_array` — kept private here to
 /// avoid coupling across modules.
 fn parse_rect_array(arr: &[Object], key: &[u8]) -> Result<PageBox> {
-    if arr.len() < 4 {
+    if arr.len() != 4 {
         return Err(Error::Unsupported(format!(
             "/{} rectangle array has {} elements, expected 4",
             String::from_utf8_lossy(key),

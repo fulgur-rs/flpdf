@@ -33,8 +33,12 @@ fn build_pdf(objects: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
     out.extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
     out.extend_from_slice(b"0000000000 65535 f \n");
     for i in 1..count {
-        let offset = offsets.get(&i).copied().unwrap_or(0);
-        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        match offsets.get(&i) {
+            Some(offset) => {
+                out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
     }
     let root_num = objects.first().map(|(n, _)| *n).unwrap_or(1);
     let trailer = format!(
@@ -127,17 +131,35 @@ fn annotation_rect_absent_returns_none() {
 // ── AnnotationObjectHelper::appearance ───────────────────────────────────────
 
 #[test]
-fn annotation_appearance_inline_dict() {
-    // AP is a direct dictionary (N stream reference not needed for this test).
-    let bytes = build_annotation_pdf("/Subtype /Widget /Rect [0 0 10 10] /AP << /N 5 0 R >>");
+fn annotation_appearance_indirect_dict() {
+    // /AP is an indirect reference (6 0 R) so appearance() must resolve it.
+    // Object 6 is the appearance dict; object 5 is its /N appearance stream.
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>".to_vec(),
+        ),
+        (
+            4,
+            b"<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /AP 6 0 R >>".to_vec(),
+        ),
+        (5, b"<< /Type /XObject /Subtype /Form >>".to_vec()),
+        (6, b"<< /N 5 0 R >>".to_vec()),
+    ]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     let ap = annot
         .appearance()
         .expect("appearance()")
         .expect("should have AP");
-    // /N should be present as a reference to object 5.
-    assert!(ap.get("N").is_some());
+    // The indirect /AP reference was resolved to its dictionary, which
+    // carries /N pointing at object 5.
+    assert_eq!(ap.get("N"), Some(&Object::Reference(ObjectRef::new(5, 0))));
 }
 
 #[test]
