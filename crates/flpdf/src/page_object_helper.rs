@@ -180,6 +180,24 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Self { page_ref, pdf }
     }
 
+    /// Verify `page_ref` resolves to a leaf `/Type /Page` dictionary.
+    ///
+    /// Guards the public accessors so a `/Pages` tree node (or any other
+    /// dictionary) cannot be misread as a page and return plausible but
+    /// incorrect inherited/default metadata.
+    fn ensure_leaf_page(&mut self) -> Result<()> {
+        let obj = self.pdf.resolve(self.page_ref)?;
+        match obj {
+            Object::Dictionary(ref d) if matches!(d.get("Type"), Some(Object::Name(n)) if n == b"Page") => {
+                Ok(())
+            }
+            _ => Err(Error::Unsupported(format!(
+                "object {} is not a /Type /Page dictionary",
+                self.page_ref
+            ))),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // content_streams
     // -----------------------------------------------------------------------
@@ -217,6 +235,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn content_streams(&mut self) -> Result<Vec<ContentToken>> {
+        self.ensure_leaf_page()?;
         let raw = crate::pages::page_content_bytes(self.pdf, self.page_ref)?;
         if raw.is_empty() {
             return Ok(Vec::new());
@@ -259,6 +278,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn resources(&mut self) -> Result<Option<Dictionary>> {
+        self.ensure_leaf_page()?;
         resolve_inherited_resources(self.pdf, self.page_ref)
     }
 
@@ -299,6 +319,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn rotate(&mut self) -> Result<i32> {
+        self.ensure_leaf_page()?;
         resolve_inherited_rotate(self.pdf, self.page_ref)
     }
 
@@ -340,6 +361,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
+        self.ensure_leaf_page()?;
         let page_obj = self.pdf.resolve(self.page_ref)?;
         let Object::Dictionary(page_dict) = page_obj else {
             return Err(Error::Unsupported(format!(
@@ -428,6 +450,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn media_box(&mut self) -> Result<Option<PageBox>> {
+        self.ensure_leaf_page()?;
         self.inherited_box(b"MediaBox")
     }
 
@@ -459,6 +482,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn crop_box(&mut self) -> Result<Option<PageBox>> {
+        self.ensure_leaf_page()?;
         match self.inherited_box(b"CropBox")? {
             Some(b) => Ok(Some(b)),
             None => self.media_box(),
@@ -492,6 +516,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn bleed_box(&mut self) -> Result<Option<PageBox>> {
+        self.ensure_leaf_page()?;
         match self.leaf_box(b"BleedBox")? {
             Some(b) => Ok(Some(b)),
             None => self.crop_box(),
@@ -525,6 +550,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn trim_box(&mut self) -> Result<Option<PageBox>> {
+        self.ensure_leaf_page()?;
         match self.leaf_box(b"TrimBox")? {
             Some(b) => Ok(Some(b)),
             None => self.crop_box(),
@@ -558,6 +584,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn art_box(&mut self) -> Result<Option<PageBox>> {
+        self.ensure_leaf_page()?;
         match self.leaf_box(b"ArtBox")? {
             Some(b) => Ok(Some(b)),
             None => self.crop_box(),
