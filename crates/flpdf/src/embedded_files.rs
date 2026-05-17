@@ -345,7 +345,15 @@ fn clear_af_reference<R: Read + Seek>(pdf: &mut Pdf<R>, target_ref: ObjectRef) -
 ///   removed from the parent;
 /// - indirect array → the *referenced* array object is rewritten with the
 ///   filtered contents; if it becomes empty the `/AF` key is removed from the
-///   parent and the now-orphan array object is `delete_object`-ed.
+///   parent.  The array object itself is **never** `delete_object`-ed: the
+///   same indirect array may be shared by the catalog and one or more page
+///   dictionaries, and [`clear_af_reference`] invokes this helper once per
+///   parent — deleting it on the first parent would dangle the rest (roborev
+///   #951).  Filtering its contents already removes the stale reference that
+///   would otherwise block conservative GC (the original #948 motivation), so
+///   the deletion was unnecessary.  An emptied, now-unreferenced array object
+///   is harmless dead weight, exactly like the name-tree ghosts the existing
+///   GC already tolerates.
 ///
 /// If `/AF` is absent or contains no reference to `target_ref`, this is a
 /// no-op.
@@ -366,7 +374,7 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     };
 
     // `array_ref` is `Some(r)` when /AF is an indirect reference to the array
-    // object `r` (which must be patched/deleted, not just the parent dict).
+    // object `r` (which must be patched, not just the parent dict).
     let (array_ref, af_array): (Option<ObjectRef>, Vec<Object>) = match af_value {
         Object::Array(arr) => (None, arr),
         Object::Reference(r) => match pdf.resolve(r)? {
@@ -393,17 +401,20 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
         .collect();
 
     match array_ref {
-        // Indirect /AF: patch (or drop) the referenced array object itself so
-        // it no longer holds a stale reference to `target_ref`.
+        // Indirect /AF: patch the referenced array object so it no longer
+        // holds a stale reference to `target_ref`.  Never delete it — it may
+        // be shared by the catalog and page dicts; deleting on the first
+        // parent would dangle the rest (roborev #951).
         Some(r) => {
-            if filtered.is_empty() {
+            let is_empty = filtered.is_empty();
+            pdf.set_object(r, Object::Array(filtered));
+            if is_empty {
+                // Drop the now-empty /AF key from this parent; the array
+                // object stays (a harmless orphan once nothing points at it).
                 dict.remove("AF");
                 pdf.set_object(dict_ref, Object::Dictionary(dict));
-                pdf.delete_object(r);
-            } else {
-                pdf.set_object(r, Object::Array(filtered));
-                // Parent keeps `/AF -> r`; nothing else to change there.
             }
+            // non-empty: parent already points at `r` via /AF; leave it.
         }
         // Direct /AF array lives inside the parent dictionary.
         None => {
@@ -1225,9 +1236,17 @@ mod tests {
             !live.contains(&stream_ref),
             "embedded stream must be GC-deleted alongside the filespec"
         );
+        // The indirect /AF array object is intentionally NOT deleted (it may
+        // be shared across parents; roborev #951).  It must, however, be
+        // emptied so it no longer references the filespec — that is what
+        // unblocks the filespec/stream GC asserted above.
+        let Object::Array(af_after) = pdf.resolve(af_array_ref).expect("resolve af array after")
+        else {
+            panic!("indirect /AF array object must still resolve (not deleted)");
+        };
         assert!(
-            !live.contains(&af_array_ref),
-            "emptied indirect /AF array object must not linger as a ghost"
+            af_after.is_empty(),
+            "indirect /AF array must be emptied of the removed filespec"
         );
 
         // Catalog /AF must be gone (its only entry was the removed filespec).
@@ -1239,6 +1258,92 @@ mod tests {
             catalog2.get("AF").is_none(),
             "catalog /AF must be removed once empty"
         );
+    }
+
+    // ── Test: indirect /AF shared by catalog + page is not dangled ───────────
+    //
+    // Regression for roborev #951: the same indirect /AF array object was
+    // `delete_object`-ed by the first parent (catalog) while a later parent
+    // (page) still referenced it → dangling ref / resolve failure.  The array
+    // must survive (emptied) and stay resolvable for every parent.
+    #[test]
+    fn remove_attachment_shared_indirect_af_across_catalog_and_page_not_dangled() {
+        let mut pdf = open_minimal();
+
+        let fs_ref = FileSpecBuilder::new("sh.txt", b"shared-af payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"sh.txt", fs_ref).expect("insert");
+
+        // One indirect /AF array object [fs_ref], referenced by BOTH the
+        // catalog and the page.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let af_array_ref = ObjectRef::new(next + 1, 0);
+        pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
+
+        let catalog_ref = pdf.root_ref().expect("root");
+        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        else {
+            panic!("expected catalog dict");
+        };
+        catalog.insert("AF", Object::Reference(af_array_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
+        assert_eq!(page_refs.len(), 1, "fixture has one page");
+        let page_ref = page_refs[0];
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("expected page dict");
+        };
+        page_dict.insert("AF", Object::Reference(af_array_ref));
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+
+        // Removal walks catalog then every page, calling the helper once per
+        // parent against the SAME shared array object.
+        let removed = remove_attachment(&mut pdf, b"sh.txt").expect("remove");
+        assert!(removed);
+
+        // The shared array object must still resolve for every parent (not
+        // deleted on the first), and be emptied of the removed filespec.
+        let Object::Array(af_after) = pdf
+            .resolve(af_array_ref)
+            .expect("shared indirect /AF array must still resolve (not deleted)")
+        else {
+            panic!("expected /AF array object");
+        };
+        assert!(
+            af_after.is_empty(),
+            "shared /AF array must be emptied of the removed filespec"
+        );
+
+        // The filespec is still GC-deleted (array no longer references it).
+        let live = pdf.live_object_refs();
+        assert!(
+            !live.contains(&fs_ref),
+            "filespec must be GC-deleted once the shared /AF array no longer references it"
+        );
+
+        // Catalog /AF dropped (emptied); page /AF may remain but, if present,
+        // must point at the still-resolvable array (no dangling ref).
+        let Object::Dictionary(page_after) = pdf.resolve(page_ref).expect("resolve page after")
+        else {
+            panic!("expected page dict");
+        };
+        if let Some(Object::Reference(r)) = page_after.get("AF") {
+            assert_eq!(
+                *r, af_array_ref,
+                "page /AF must still point at the surviving shared array"
+            );
+            assert!(
+                pdf.resolve(*r).is_ok(),
+                "page /AF reference must resolve (not dangling)"
+            );
+        }
     }
 
     // ── Test: filespec referenced by another live name tree is preserved ─────
