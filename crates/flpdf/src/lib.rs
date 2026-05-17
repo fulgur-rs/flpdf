@@ -42,7 +42,6 @@ pub(crate) mod ascii85;
 pub(crate) mod ascii_hex;
 pub mod cache;
 pub mod check;
-pub mod page_document_helper;
 pub mod content_stream;
 pub mod diagnostics;
 pub mod error;
@@ -56,6 +55,7 @@ pub mod outline;
 pub mod outline_dest_remap;
 pub mod page_collate;
 pub mod page_combine;
+pub mod page_document_helper;
 pub mod page_plan;
 pub mod page_range;
 pub mod page_rotate;
@@ -90,13 +90,13 @@ pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
+pub use page_document_helper::PageDocumentHelper;
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_rotate::{
     apply_rotate_to_pages, compose_rotate, normalize_rotate, resolve_inherited_rotate,
     resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
-pub use page_document_helper::PageDocumentHelper;
 pub use page_split::{digit_width, split_output_path, split_pages};
 pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
