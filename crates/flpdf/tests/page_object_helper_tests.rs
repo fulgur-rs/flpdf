@@ -496,3 +496,36 @@ fn page_box_fields_are_accessible() {
     assert_eq!(b.urx, 3.0);
     assert_eq!(b.ury, 4.0);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: accessors must reject a non-leaf /Type /Pages node
+// ---------------------------------------------------------------------------
+
+#[test]
+fn accessors_reject_pages_tree_node() {
+    // Object 2 0 R is the `/Type /Pages` node (not a leaf `/Page`).
+    let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "");
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(2, 0), &mut pdf);
+
+    assert!(
+        helper.media_box().is_err(),
+        "media_box() must reject a /Pages node"
+    );
+    assert!(
+        helper.rotate().is_err(),
+        "rotate() must reject a /Pages node"
+    );
+    assert!(
+        helper.resources().is_err(),
+        "resources() must reject a /Pages node"
+    );
+    assert!(
+        helper.get_annotations().is_err(),
+        "get_annotations() must reject a /Pages node"
+    );
+    assert!(
+        helper.content_streams().is_err(),
+        "content_streams() must reject a /Pages node"
+    );
+}
