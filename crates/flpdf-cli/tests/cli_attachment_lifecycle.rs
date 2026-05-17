@@ -493,6 +493,18 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         !verbose.contains("checksum:        (none)"),
         "copy: /CheckSum must not be dropped to (none); got: {verbose}"
     );
+
+    // /Desc and /AFRelationship were set on the source attachment; the copy
+    // must preserve them too (roborev #936 follow-up — the test set these
+    // flags but never asserted their survival).
+    assert!(
+        verbose.contains("Copy test image"),
+        "copy: verbose listing must preserve /Desc 'Copy test image'; got: {verbose}"
+    );
+    assert!(
+        verbose.contains("Data"),
+        "copy: verbose listing must preserve /AFRelationship 'Data'; got: {verbose}"
+    );
 }
 
 #[test]
