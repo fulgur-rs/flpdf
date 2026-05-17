@@ -171,7 +171,6 @@ fn rotate_round_trip_persists_after_write_reopen() {
     let mut helper2 = PageDocumentHelper::new(&mut pdf2);
     let pages = helper2.pages().unwrap();
     assert_eq!(pages.len(), 1);
-    drop(helper2);
 
     let obj = pdf2.resolve(pages[0]).unwrap();
     let Object::Dictionary(dict) = obj else {
