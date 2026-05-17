@@ -65,7 +65,7 @@ fn build_annotation_pdf(annot_extras: &str) -> Vec<u8> {
         ),
         (
             3,
-            format!("<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>").into_bytes(),
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>".to_vec(),
         ),
         (4, format!("<< /Type /Annot {annot_extras} >>").into_bytes()),
     ])
