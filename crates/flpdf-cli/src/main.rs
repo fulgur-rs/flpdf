@@ -1543,6 +1543,19 @@ fn run_rewrite(
             options.full_rewrite = true;
         }
 
+        // --min-version / --force-version rewrite the `%PDF-x.y` header line,
+        // which only the new-generation write paths emit. The incremental-update
+        // path (`write_pdf`) copies the source header verbatim and would
+        // silently drop the requested version. qpdf always full-rewrites, so
+        // every `qpdf --force-version`/`--min-version` invocation honors the
+        // flag; mirror that by promoting to full_rewrite whenever a version
+        // setter is active and we would otherwise take the incremental path
+        // (e.g. `rewrite --remove-unreferenced-resources=no --force-version=1.4`
+        // on unencrypted input). flpdf-9hc.13.1.
+        if options.min_version.is_some() || options.force_version.is_some() {
+            options.full_rewrite = true;
+        }
+
         // Step 1: coalesce per-page /Contents arrays into a single stream.
         if coalesce_contents {
             let page_refs = pages::page_refs(&mut pdf)?;

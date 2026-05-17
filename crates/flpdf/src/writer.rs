@@ -184,6 +184,23 @@ pub fn parse_pdf_version(v: &str) -> Option<(u8, u8)> {
 /// If the version strings cannot be parsed the function falls back to the
 /// `source` string unchanged (rather than panicking) so callers do not need to
 /// validate before calling.
+///
+/// # `/Catalog /Version` reconciliation (qpdf semantics)
+///
+/// ISO 32000-1 §7.5.2 lets a `/Catalog /Version` entry override the header
+/// when it is *higher*; readers compute the effective version as
+/// `max(header, catalog)`. Empirically (verified against qpdf 11.x with
+/// `qpdf --force-version` / `--min-version` on fixtures carrying a
+/// `/Catalog /Version`), qpdf rewrites **only** the `%PDF-x.y` header line and
+/// never strips, lowers, or otherwise touches `/Catalog /Version` — even when
+/// it is higher than the chosen header. It also does **not** fold
+/// `/Catalog /Version` into the source floor: the `--min-version` baseline is
+/// the header version alone, not `max(header, catalog)`.
+///
+/// "Reconciled per qpdf semantics" therefore means *leave `/Catalog /Version`
+/// alone* — `source` here is the header version and this function deliberately
+/// does not read the Catalog. This keeps the implementation minimal and
+/// byte-faithful to qpdf rather than guessing at a broader reconciliation.
 pub fn effective_pdf_version<'a>(
     source: &'a str,
     options: &'a WriteOptions,
