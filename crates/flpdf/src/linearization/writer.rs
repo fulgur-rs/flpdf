@@ -439,7 +439,6 @@ fn write_part1_xref_and_trailer(
     total_object_count: u32,
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
-    options: &WriteOptions,
     source_trailer: &Dictionary,
 ) -> (usize, std::ops::Range<usize>) {
     let xref_offset = bytes.len();
@@ -482,35 +481,15 @@ fn write_part1_xref_and_trailer(
     bytes.extend_from_slice(placeholder.as_bytes());
     let prev_value_end = bytes.len();
 
-    // /ID — emit per the active identifier strategy.
+    // /ID — emit the file identifier verbatim.
     //
-    // Two cases:
-    //   1. --static-id: emit the fixed [source_id0, π_const] array (or
-    //      [π_const, π_const] when the source has no /ID).
-    //   2. Default (no flag): emit a fresh random two-element /ID.  Element 1
-    //      (permanent identifier) is preserved from a well-formed source /ID on
-    //      a re-save and freshly generated on a first save; element 2 (changing
-    //      identifier) is always fresh.  This matches qpdf's default observable
-    //      behaviour (random /IDs differ between runs, ISO 32000-1 §14.4).
-    let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
-    if options.static_id {
-        // static-id: [π_const, π_const] — both elements set to qpdf constant.
-        // (first element preserved from source if available, like apply_static_id)
-        let first_id = match source_trailer.get("ID") {
-            Some(Object::Array(values))
-                if values.len() == 2 && matches!(values[0], Object::String(_)) =>
-            {
-                values[0].clone()
-            }
-            _ => pi_bytes.clone(),
-        };
-        let id_array = Object::Array(vec![first_id, pi_bytes]);
-        bytes.extend_from_slice(b" /ID ");
-        id_array.write_pdf(bytes);
-    } else {
-        // Default strategy: emit a fresh random /ID (element 1 preserved on
-        // re-save, both fresh on first save; element 2 always fresh).
-        let id_obj = crate::writer::random_id_array(source_trailer.get("ID"));
+    // `write_linearized` finalizes the /ID exactly once per save (via
+    // `finalize_linearized_id`) and stores it on `source_trailer["ID"]`, so
+    // the Part-1 trailer and every split xref/trailer in the same output all
+    // emit the *same* identifier.  A PDF file identifier is file-scoped, so
+    // regenerating a fresh random /ID here (as before) produced inconsistent
+    // identifiers across trailers within one linearized file.
+    if let Some(id_obj) = source_trailer.get("ID") {
         bytes.extend_from_slice(b" /ID ");
         id_obj.write_pdf(bytes);
     }
@@ -627,9 +606,21 @@ fn encode_split_xref_slice(
     data
 }
 
-/// `/ID` array for the split xref stream dicts — same policy as the classic
-/// Part-6 / Part-1 trailers.
-fn split_xref_common_id(options: &WriteOptions, source_trailer: &Dictionary) -> Option<Object> {
+/// Compute the linearized output's `/ID` **once per save**.
+///
+/// A PDF file identifier is file-scoped: every trailer / xref-stream dict in
+/// one linearized output must carry the *same* `/ID`.  `write_linearized`
+/// calls this exactly once and stores the result on the working
+/// `source_trailer` so the Part-1 trailer and all split xref/trailers emit an
+/// identical identifier (previously each site regenerated a fresh random /ID,
+/// producing inconsistent identifiers within a single file).
+///
+/// Policy mirrors `crate::writer`:
+///   - `--static-id`: `[source_id0_or_π, π_const]`
+///   - default: a fresh random two-element /ID — element 1 preserved from a
+///     well-formed source /ID on re-save, both fresh on first save
+///     (ISO 32000-1 §14.4).
+fn finalize_linearized_id(options: &WriteOptions, source_trailer: &Dictionary) -> Object {
     let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
     if options.static_id {
         let first_id = match source_trailer.get("ID") {
@@ -640,14 +631,18 @@ fn split_xref_common_id(options: &WriteOptions, source_trailer: &Dictionary) -> 
             }
             _ => pi_bytes.clone(),
         };
-        Some(Object::Array(vec![first_id, pi_bytes]))
+        Object::Array(vec![first_id, pi_bytes])
     } else {
-        // Default (no-flag) strategy: emit a fresh random /ID — element 1
-        // preserved from a well-formed source /ID (re-save), both fresh
-        // otherwise (first save).  Matches qpdf's default observable
-        // behaviour (ISO 32000-1 §14.4).
-        Some(crate::writer::random_id_array(source_trailer.get("ID")))
+        crate::writer::random_id_array(source_trailer.get("ID"))
     }
+}
+
+/// `/ID` array for the split xref stream dicts.  Reads the file-scoped
+/// identifier that `write_linearized` already finalized onto `source_trailer`
+/// (see [`finalize_linearized_id`]) so it stays consistent with the Part-1
+/// trailer.
+fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
+    source_trailer.get("ID").cloned()
 }
 
 /// Emit the **first-page (Part-1) cross-reference stream** at its proper
@@ -696,7 +691,6 @@ fn write_first_page_xref_stream(
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
-    options: &WriteOptions,
 ) -> Result<FirstPageXrefPatch> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -733,7 +727,7 @@ fn write_first_page_xref_stream(
     if let Some(info_ref) = info_new_ref {
         d1.insert("Info", Object::Reference(info_ref));
     }
-    if let Some(id) = split_xref_common_id(options, source_trailer) {
+    if let Some(id) = split_xref_common_id(source_trailer) {
         d1.insert("ID", id);
     }
     // The payload is stored uncompressed so /Length is the constant
@@ -837,7 +831,6 @@ fn write_main_xref_stream_and_trailer(
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
-    options: &WriteOptions,
     first_page_obj_offset: usize,
 ) -> Result<(usize, usize)> {
     let final_size = total_count;
@@ -879,7 +872,7 @@ fn write_main_xref_stream_and_trailer(
     if let Some(info_ref) = info_new_ref {
         d2.insert("Info", Object::Reference(info_ref));
     }
-    if let Some(id) = split_xref_common_id(options, source_trailer) {
+    if let Some(id) = split_xref_common_id(source_trailer) {
         d2.insert("ID", id);
     }
     // /Prev → first-page xref stream object offset (qpdf chains main → first).
@@ -939,7 +932,6 @@ fn do_write_pass<R: Read + Seek>(
     _first_page_object_new_num: u32,
     hint_compressed: &[u8],
     hint_shared_section_offset: usize,
-    options: &WriteOptions,
     source_trailer: &Dictionary,
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
@@ -992,7 +984,6 @@ fn do_write_pass<R: Read + Seek>(
             total_count,
             catalog_new_ref,
             info_new_ref,
-            options,
             source_trailer,
         );
         range
@@ -1004,7 +995,6 @@ fn do_write_pass<R: Read + Seek>(
             catalog_new_ref,
             info_new_ref,
             source_trailer,
-            options,
         )?;
         first_page_xref_patch = Some(patch);
         0..0
@@ -1148,7 +1138,6 @@ fn do_write_pass<R: Read + Seek>(
             catalog_new_ref,
             info_new_ref,
             source_trailer,
-            options,
             first_page_obj_offset,
         )?;
 
@@ -1371,7 +1360,16 @@ pub fn write_linearized<R: Read + Seek>(
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
 
     // Capture the source trailer once; it does not change across iterations.
-    let source_trailer = pdf.trailer().clone();
+    //
+    // Finalize the file identifier exactly once here (before the convergence
+    // loop) and store it back on the working trailer.  The Part-1 trailer and
+    // every split xref/trailer then read this single value, so one linearized
+    // output carries one consistent /ID — and it also stays stable across the
+    // up-to-3 convergence iterations.
+    let mut source_trailer = pdf.trailer().clone();
+    let finalized_id = finalize_linearized_id(options, &source_trailer);
+    source_trailer.insert("ID", finalized_id);
+    let source_trailer = source_trailer;
 
     // ------------------------------------------------------------------
     // Convergence loop (max 3 iterations).
@@ -1408,7 +1406,6 @@ pub fn write_linearized<R: Read + Seek>(
             first_page_object_new_num,
             &current_hint_compressed,
             current_hint_shared_s,
-            options,
             &source_trailer,
             &objstm_layout,
             &relocation,
@@ -1738,7 +1735,6 @@ pub fn write_linearized<R: Read + Seek>(
                 first_page_object_new_num,
                 &current_hint_compressed,
                 current_hint_shared_s,
-                options,
                 &source_trailer,
                 &objstm_layout,
                 &relocation,
