@@ -957,6 +957,220 @@ where
     Ok(())
 }
 
+// ── Cross-document attachment copy ───────────────────────────────────────────
+
+/// Copy all attachments from `source` into `target`, optionally prefixing each
+/// name-tree key with `prefix`.
+///
+/// For each attachment in `source`'s `/Names /EmbeddedFiles` tree:
+///
+/// 1. The `/Filespec` dictionary is resolved (handles both indirect-reference
+///    and direct-dictionary tree values).
+/// 2. The `/EF` sub-dictionary is inspected with the qpdf key-priority order
+///    `[UF, F, Unix, Mac, DOS]`; the first key whose value is an indirect
+///    reference that resolves to a `/EmbeddedFile` stream is selected.
+/// 3. The stream `data` bytes **and** the entire stream dictionary (including
+///    `/Filter`, `/DecodeParms`, `/Type`, etc.) are copied verbatim into
+///    `target` as a new indirect object — no decode/re-encode is performed.
+///    Any indirect sub-references inside the stream dictionary (e.g. a foreign
+///    `/Params` reference) are inlined before the copy so no dangling reference
+///    is introduced into `target`.
+/// 4. A fresh `/Filespec` dictionary is built in `target`, copying `/Type`,
+///    `/F`, `/UF`, `/Desc`, and `/AFRelationship` from the source filespec.
+///    A new `/EF` sub-dictionary is created with `/F` and `/UF` both pointing
+///    to the newly allocated stream reference.
+/// 5. The entry is inserted under the key `prefix + original_key` (or the
+///    original key when `prefix` is `None`) via
+///    [`crate::embedded_files::insert_embedded_file`], which replaces any
+///    existing entry with the same key.
+///
+/// # Skip policy
+///
+/// Attachments whose `/EmbeddedFile` stream cannot be reached (e.g. the `/EF`
+/// sub-dictionary is absent, none of the standard keys hold an indirect stream
+/// reference, or the target object is not a stream) are **silently skipped**
+/// and do not contribute to the returned count.  This keeps the operation
+/// best-effort so a single malformed attachment in `source` does not abort the
+/// entire copy.
+///
+/// # Return value
+///
+/// Returns the number of attachments successfully copied.  Returns `0` without
+/// error when `source` has no attachments.
+///
+/// # Object numbering
+///
+/// Two new object numbers are allocated per copied attachment (one for the
+/// `/EmbeddedFile` stream, one for the `/Filespec` dictionary).  The numbers
+/// are derived from `max(target.object_refs().number) + 1`, snapshotted once
+/// before the loop and incremented locally to avoid collisions across
+/// attachments within the same call.
+///
+/// # Password-protected sources
+///
+/// `source` must already be opened (and authenticated) before being passed to
+/// this function.  Use [`Pdf::open_with_options`] with a
+/// [`PdfOpenOptions`](crate::PdfOpenOptions) carrying the password to open
+/// an encrypted source document before calling `copy_attachments_from`.
+///
+/// # Errors
+///
+/// Propagates any error from [`Pdf::resolve`] (for both `source` and
+/// `target`), from object allocation, or from
+/// [`crate::embedded_files::insert_embedded_file`].  Individual attachment
+/// failures that prevent stream resolution are skipped rather than propagated
+/// (see the skip policy above).
+pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
+    target: &mut Pdf<R1>,
+    source: &mut Pdf<R2>,
+    prefix: Option<&[u8]>,
+) -> Result<usize> {
+    use crate::embedded_files::{
+        collect_embedded_file_pairs_raw, insert_embedded_file, DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
+    };
+
+    // Collect all (key, value) pairs from source — preserves both indirect
+    // reference and direct-dict filespec values.
+    let entries = collect_embedded_file_pairs_raw(source, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let mut count = 0usize;
+
+    for (key, value) in entries {
+        // ── Step 1: resolve filespec dictionary ───────────────────────────────
+        let fs_dict: Dictionary = match value {
+            Object::Reference(r) => match source.resolve(r) {
+                Ok(Object::Dictionary(d)) => d,
+                _ => continue, // skip: cannot resolve filespec
+            },
+            Object::Dictionary(d) => d,
+            _ => continue, // skip: unexpected value type
+        };
+
+        // ── Step 2: resolve /EF sub-dictionary ───────────────────────────────
+        let ef_dict: Dictionary = match fs_dict.get("EF") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            Some(Object::Reference(r)) => {
+                let r = *r;
+                match source.resolve(r) {
+                    Ok(Object::Dictionary(d)) => d,
+                    _ => continue, // skip: cannot resolve /EF
+                }
+            }
+            _ => continue, // skip: no /EF
+        };
+
+        // ── Step 3 + 4: find the /EmbeddedFile stream in /EF and capture it ────
+        // Use qpdf priority order: UF, F, Unix, Mac, DOS.
+        // Capture the stream directly when found to avoid a second resolve call.
+        let mut ef_stream: Stream = {
+            let mut found = None;
+            for k in &["UF", "F", "Unix", "Mac", "DOS"] {
+                if let Some(Object::Reference(r)) = ef_dict.get(k) {
+                    let r = *r;
+                    if let Ok(Object::Stream(s)) = source.resolve(r) {
+                        found = Some(s);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(s) => s,
+                None => continue, // skip: no resolvable /EmbeddedFile stream
+            }
+        };
+
+        // Inline any indirect /Params reference so target does not inherit a
+        // dangling foreign object reference inside the stream dictionary.
+        if let Some(Object::Reference(params_ref)) = ef_stream.dict.get("Params").cloned() {
+            match source.resolve(params_ref) {
+                Ok(Object::Dictionary(params_dict)) => {
+                    ef_stream
+                        .dict
+                        .insert("Params", Object::Dictionary(params_dict));
+                }
+                _ => {
+                    // Cannot inline — remove the dangling reference to keep
+                    // the target consistent.
+                    ef_stream.dict.remove("Params");
+                }
+            }
+        }
+
+        // Inline any indirect /DecodeParms reference similarly.
+        if let Some(Object::Reference(dp_ref)) = ef_stream.dict.get("DecodeParms").cloned() {
+            match source.resolve(dp_ref) {
+                Ok(resolved) => {
+                    ef_stream.dict.insert("DecodeParms", resolved);
+                }
+                _ => {
+                    ef_stream.dict.remove("DecodeParms");
+                }
+            }
+        }
+
+        // Allocate two fresh object numbers in target for this attachment.
+        // Re-snapshot the max after every `insert_embedded_file` call so that
+        // object numbers allocated by the name-tree rebuild inside that call are
+        // accounted for and do not collide with our next pair.
+        let base: u32 = target
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let new_stream_ref = ObjectRef::new(base + 1, 0);
+        let new_fs_ref = ObjectRef::new(base + 2, 0);
+
+        // Write the copied stream into target (bytes + dict, verbatim).
+        target.set_object(new_stream_ref, Object::Stream(ef_stream));
+
+        // ── Step 5: build a new /Filespec dictionary in target ─────────────────
+        let mut new_fs = Dictionary::new();
+        // Copy /Type from source filespec (usually "Filespec").
+        if let Some(t) = fs_dict.get("Type") {
+            new_fs.insert("Type", t.clone());
+        }
+        // Copy filename fields.
+        if let Some(f) = fs_dict.get("F") {
+            new_fs.insert("F", f.clone());
+        }
+        if let Some(uf) = fs_dict.get("UF") {
+            new_fs.insert("UF", uf.clone());
+        }
+        // Copy optional metadata.
+        if let Some(desc) = fs_dict.get("Desc") {
+            new_fs.insert("Desc", desc.clone());
+        }
+        if let Some(rel) = fs_dict.get("AFRelationship") {
+            new_fs.insert("AFRelationship", rel.clone());
+        }
+
+        // /EF sub-dict: both /F and /UF point to the new stream ref.
+        let mut new_ef_sub = Dictionary::new();
+        new_ef_sub.insert("F", Object::Reference(new_stream_ref));
+        new_ef_sub.insert("UF", Object::Reference(new_stream_ref));
+        new_fs.insert("EF", Object::Dictionary(new_ef_sub));
+
+        target.set_object(new_fs_ref, Object::Dictionary(new_fs));
+
+        // ── Step 6: build the name-tree key (with optional prefix) ──────────
+        let new_key: Vec<u8> = match prefix {
+            Some(p) => p.iter().chain(key.iter()).copied().collect(),
+            None => key,
+        };
+
+        // Insert into target's name tree.
+        insert_embedded_file(target, &new_key, new_fs_ref)?;
+
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1485,6 +1699,205 @@ mod tests {
             extracted.len() as i64,
             reported_size,
             "extracted length must equal /Params /Size"
+        );
+    }
+
+    // ── Tests: copy_attachments_from ──────────────────────────────────────────
+
+    /// Build a two-attachment source PDF and copy all into an empty target;
+    /// verify both payloads round-trip via extract_attachment.
+    #[test]
+    fn copy_attachments_two_files_round_trip() {
+        // Build source PDF with two attachments.
+        let mut source = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_a = dir.path().join("alpha.txt");
+        let path_b = dir.path().join("beta.txt");
+        let raw_a = b"attachment alpha payload";
+        let raw_b = b"attachment beta payload";
+        std::fs::write(&path_a, raw_a).unwrap();
+        std::fs::write(&path_b, raw_b).unwrap();
+        add_attachment_from_path(&mut source, b"alpha.txt", &path_a).expect("add alpha");
+        add_attachment_from_path(&mut source, b"beta.txt", &path_b).expect("add beta");
+
+        // Copy into empty target.
+        let mut target = open_minimal();
+        let count = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(count, 2, "must copy 2 attachments");
+
+        // Both must be extractable with correct bytes.
+        let got_a = extract_attachment(&mut target, b"alpha.txt").expect("extract alpha");
+        let got_b = extract_attachment(&mut target, b"beta.txt").expect("extract beta");
+        assert_eq!(got_a, raw_a, "alpha payload must match");
+        assert_eq!(got_b, raw_b, "beta payload must match");
+    }
+
+    /// Verify that the /Filter chain is preserved verbatim (no recompression).
+    #[test]
+    fn copy_attachments_filter_and_bytes_preserved() {
+        let mut source = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("compressed.txt");
+        let raw = b"some data for compression test";
+        std::fs::write(&path, raw).unwrap();
+        add_attachment_from_path(&mut source, b"compressed.txt", &path).expect("add");
+
+        // Capture the source stream's raw bytes and Filter before copying.
+        let src_entries =
+            crate::embedded_files::list_embedded_files(&mut source).expect("list source");
+        let src_fs_ref = src_entries[0].1;
+        let src_stream = resolve_ef_stream(&mut source, src_fs_ref);
+        let src_filter = src_stream.dict.get("Filter").cloned();
+        let src_data = src_stream.data.clone();
+
+        // Copy to target.
+        let mut target = open_minimal();
+        copy_attachments_from(&mut target, &mut source, None).expect("copy");
+
+        // Retrieve target stream.
+        let tgt_entries =
+            crate::embedded_files::list_embedded_files(&mut target).expect("list target");
+        assert_eq!(tgt_entries.len(), 1);
+        let tgt_fs_ref = tgt_entries[0].1;
+        let tgt_stream = resolve_ef_stream(&mut target, tgt_fs_ref);
+
+        // /Filter must be identical.
+        assert_eq!(
+            tgt_stream.dict.get("Filter").cloned(),
+            src_filter,
+            "target /Filter must equal source /Filter"
+        );
+        // Raw bytes must be identical (no re-encode).
+        assert_eq!(
+            tgt_stream.data, src_data,
+            "target stream data must be byte-identical to source"
+        );
+
+        // Decoded payload must also match the original file content.
+        let decoded =
+            crate::filters::decode_stream_data(&tgt_stream.dict, &tgt_stream.data).expect("decode");
+        assert_eq!(
+            decoded.as_slice(),
+            raw.as_ref(),
+            "decoded payload must match original"
+        );
+    }
+
+    /// Verify prefix avoids key collision with a pre-existing target attachment.
+    #[test]
+    fn copy_attachments_prefix_avoids_collision() {
+        let mut source = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Source has "data.txt".
+        let src_path = dir.path().join("data.txt");
+        std::fs::write(&src_path, b"source data").unwrap();
+        add_attachment_from_path(&mut source, b"data.txt", &src_path).expect("add source");
+
+        // Target also has "data.txt" (different content).
+        let mut target = open_minimal();
+        let tgt_path = dir.path().join("target_data.txt");
+        let original_target_content = b"target original data";
+        std::fs::write(&tgt_path, original_target_content).unwrap();
+        add_attachment_from_path(&mut target, b"data.txt", &tgt_path).expect("add target pre");
+
+        // Copy with prefix "src-".
+        let count = copy_attachments_from(&mut target, &mut source, Some(b"src-")).expect("copy");
+        assert_eq!(count, 1);
+
+        // Both keys must coexist.
+        let entries = crate::embedded_files::list_embedded_files(&mut target).expect("list");
+        assert_eq!(entries.len(), 2, "both keys must exist");
+
+        let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+        assert!(
+            keys.contains(&b"data.txt".as_ref()),
+            "original key must survive"
+        );
+        assert!(
+            keys.contains(&b"src-data.txt".as_ref()),
+            "prefixed key must be present"
+        );
+
+        // Original content must be unchanged.
+        let original = extract_attachment(&mut target, b"data.txt").expect("extract original");
+        assert_eq!(
+            original, original_target_content,
+            "original content must be intact"
+        );
+
+        // Prefixed entry has the source content.
+        let prefixed = extract_attachment(&mut target, b"src-data.txt").expect("extract prefixed");
+        assert_eq!(
+            prefixed, b"source data",
+            "prefixed entry must contain source content"
+        );
+    }
+
+    /// Return value equals the number of copied attachments.
+    #[test]
+    fn copy_attachments_return_value_is_count() {
+        let mut source = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in &["one.txt", "two.txt", "three.txt"] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, name.as_bytes()).unwrap();
+            add_attachment_from_path(&mut source, name.as_bytes(), &p).expect("add");
+        }
+
+        let mut target = open_minimal();
+        let count = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(
+            count, 3,
+            "return value must equal number of attachments copied"
+        );
+    }
+
+    /// An empty source returns 0 without modifying the target.
+    #[test]
+    fn copy_attachments_empty_source_returns_zero() {
+        let mut source = open_minimal(); // no attachments
+        let mut target = open_minimal();
+
+        let count = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(count, 0, "empty source must return 0");
+
+        let entries = crate::embedded_files::list_embedded_files(&mut target).expect("list");
+        assert_eq!(entries.len(), 0, "target must remain empty");
+    }
+
+    /// Opening an encrypted source with password then copying returns 0 (the
+    /// encrypted fixture has no attachments) without error. This validates that
+    /// the password-open → copy pipeline works correctly; a count-based bytes
+    /// test is not possible with these fixtures since they carry no attachments.
+    ///
+    /// Fixture: `tests/fixtures/encrypted/v4-aes-128-r4.pdf`
+    /// User password: `user-v4-aes` (AES-128, no weak-crypto flag required for V4/AES).
+    #[test]
+    fn copy_attachments_encrypted_source_password_open() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+        );
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return, // Skip if fixture is unavailable.
+        };
+        let opts = crate::PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..crate::PdfOpenOptions::default()
+        };
+        let mut source = crate::Pdf::open_with_options(std::io::BufReader::new(file), opts)
+            .expect("open encrypted source");
+
+        let mut target = open_minimal();
+        // The fixture has no attachments; expect 0, no error.
+        let count =
+            copy_attachments_from(&mut target, &mut source, None).expect("copy from encrypted");
+        assert_eq!(
+            count, 0,
+            "encrypted fixture has no attachments; copy must return 0"
         );
     }
 }
