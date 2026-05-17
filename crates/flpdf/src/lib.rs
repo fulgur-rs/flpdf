@@ -95,8 +95,8 @@ pub use embedded_files::{
 };
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{
-    encode_utf16be, escape_pdf_name, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates,
-    FileSpec, FileSpecBuilder,
+    encode_utf16be, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates, FileSpec,
+    FileSpecBuilder,
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
