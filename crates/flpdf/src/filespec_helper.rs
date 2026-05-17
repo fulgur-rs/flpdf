@@ -6,8 +6,13 @@
 //! stream reachable via the `/EF` sub-dictionary and exposes its payload and
 //! metadata (MIME type, dates, checksum, size).
 //!
-//! Both types are **read-only** thin borrowing wrappers — they hold no copied
-//! state and re-derive every value from the live document on each call.
+//! Both types are **read-only**. [`FileSpec`] is a thin borrowing wrapper that
+//! holds only the `/Filespec` `ObjectRef` and re-resolves the dictionary from
+//! the live document on each accessor call. [`EmbeddedFileStream`] is
+//! constructed once from an already-resolved `/EmbeddedFile` stream: it owns
+//! that [`Stream`] and the `/Params` sub-dictionary resolved at construction
+//! time (an indirect `/Params` is dereferenced once), so its metadata
+//! accessors read this retained state rather than re-resolving.
 //!
 //! # Design
 //!
@@ -326,11 +331,15 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// or when none of the standard keys (`/UF`, `/F`, `/Unix`, `/Mac`,
     /// `/DOS`) resolve to an `/EmbeddedFile` stream.
     ///
+    /// A candidate key whose value is not an indirect reference, or that
+    /// resolves to a non-stream object, is skipped and the search continues
+    /// with the next key; if no key yields an `/EmbeddedFile` stream the
+    /// method returns `Ok(None)` (it does not error on a non-stream entry).
+    ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when the `/Filespec` object is not a
-    ///   dictionary, or when `/EF /F` (or `/EF /UF`) resolves to a
-    ///   non-stream object.
+    /// - [`Error::Unsupported`] when the `/Filespec` object itself is not a
+    ///   dictionary.
     /// - Any error from [`Pdf::resolve`].
     ///
     /// # Examples
