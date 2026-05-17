@@ -146,8 +146,7 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
         let last_page = chunk_end as u32;
 
         // Build the output path (single-number form for --split-pages=1).
-        let out_path =
-            chunk_output_path(output_template, first_page, last_page, width, chunk_size);
+        let out_path = chunk_output_path(output_template, first_page, last_page, width, chunk_size);
 
         // Extract page refs for this chunk.
         let chunk_refs: Vec<ObjectRef> = all_page_refs[chunk_start..chunk_end].to_vec();
