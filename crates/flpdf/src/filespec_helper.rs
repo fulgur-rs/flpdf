@@ -959,6 +959,97 @@ where
 
 // ── Cross-document attachment copy ───────────────────────────────────────────
 
+/// Recursively replace every `Object::Reference` inside `value` (and its
+/// nested `Dictionary`/`Array` structure) with its **inlined** resolution
+/// from `source`.
+///
+/// A copied `/EmbeddedFile` stream dictionary (or `/Filespec` dictionary) may
+/// contain indirect references that only make sense in `source`'s object
+/// table. Writing them verbatim into `target` would create dangling or
+/// wrong-object references. Rather than deep-importing the whole subgraph
+/// (and re-numbering objects), this inlines every resolvable reference to a
+/// *value* and drops anything that cannot be inlined safely.
+///
+/// Returns `Ok(true)` if `value` is still valid in place, or `Ok(false)` if
+/// the caller should drop the slot holding it (unresolvable reference,
+/// non-inlineable target such as a nested `Stream`, cycle, or depth limit).
+fn sanitize_imported_object<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    value: &mut Object,
+    visited: &mut std::collections::BTreeSet<ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<bool> {
+    if depth >= max_depth {
+        return Ok(false);
+    }
+    match value {
+        Object::Reference(r) => {
+            let r = *r;
+            if !visited.insert(r) {
+                // Cycle / repeated reference — cannot safely inline again.
+                return Ok(false);
+            }
+            let resolved = match source.resolve(r) {
+                Ok(o) => o,
+                Err(_) => {
+                    visited.remove(&r);
+                    return Ok(false);
+                }
+            };
+            let keep = match resolved {
+                // Non-inlineable: a stream or a chained reference.
+                Object::Stream(_) | Object::Reference(_) => false,
+                mut inner => {
+                    let ok = sanitize_imported_object(
+                        source,
+                        &mut inner,
+                        visited,
+                        depth + 1,
+                        max_depth,
+                    )?;
+                    if ok {
+                        *value = inner;
+                    }
+                    ok
+                }
+            };
+            visited.remove(&r);
+            Ok(keep)
+        }
+        Object::Dictionary(dict) => {
+            let keys: Vec<Vec<u8>> = dict.iter().map(|(k, _)| k.to_vec()).collect();
+            for k in keys {
+                let Some(slot) = dict.get(k.as_slice()).cloned() else {
+                    continue;
+                };
+                let mut v = slot;
+                if sanitize_imported_object(source, &mut v, visited, depth + 1, max_depth)? {
+                    dict.insert(k.as_slice(), v);
+                } else {
+                    dict.remove(k.as_slice());
+                }
+            }
+            Ok(true)
+        }
+        Object::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for elem in arr.iter() {
+                let mut v = elem.clone();
+                if sanitize_imported_object(source, &mut v, visited, depth + 1, max_depth)? {
+                    out.push(v);
+                }
+            }
+            *arr = out;
+            Ok(true)
+        }
+        // Primitives are already self-contained.
+        _ => Ok(true),
+    }
+}
+
+// ── Cross-document attachment copy (continued) ───────────────────────────────
+
 /// Copy all attachments from `source` into `target`, optionally prefixing each
 /// name-tree key with `prefix`.
 ///
@@ -969,16 +1060,18 @@ where
 /// 2. The `/EF` sub-dictionary is inspected with the qpdf key-priority order
 ///    `[UF, F, Unix, Mac, DOS]`; the first key whose value is an indirect
 ///    reference that resolves to a `/EmbeddedFile` stream is selected.
-/// 3. The stream `data` bytes **and** the entire stream dictionary (including
-///    `/Filter`, `/DecodeParms`, `/Type`, etc.) are copied verbatim into
-///    `target` as a new indirect object — no decode/re-encode is performed.
-///    Any indirect sub-references inside the stream dictionary (e.g. a foreign
-///    `/Params` reference) are inlined before the copy so no dangling reference
-///    is introduced into `target`.
+/// 3. The stream `data` bytes are copied verbatim (no decode/re-encode), and
+///    the stream dictionary is **sanitized** ([`sanitize_imported_object`]):
+///    every indirect reference it carries — at any nesting depth, including
+///    `/Filter`, `/DecodeParms`, `/Params`, or refs nested inside an inlined
+///    `/Params` — is inlined to its resolved value, and anything that cannot
+///    be safely inlined (unresolvable, a nested stream, a cycle) is dropped,
+///    so `target` never inherits a dangling or wrong-object foreign reference.
 /// 4. A fresh `/Filespec` dictionary is built in `target`, copying `/Type`,
-///    `/F`, `/UF`, `/Desc`, and `/AFRelationship` from the source filespec.
-///    A new `/EF` sub-dictionary is created with `/F` and `/UF` both pointing
-///    to the newly allocated stream reference.
+///    `/F`, `/UF`, `/Desc`, and `/AFRelationship` from the source filespec;
+///    these source-derived fields are sanitized the same way. A new `/EF`
+///    sub-dictionary is then created with `/F` and `/UF` both pointing to the
+///    newly allocated (target) stream reference.
 /// 5. The entry is inserted under the key `prefix + original_key` (or the
 ///    original key when `prefix` is `None`) via
 ///    [`crate::embedded_files::insert_embedded_file`], which replaces any
@@ -1082,32 +1175,24 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
             }
         };
 
-        // Inline any indirect /Params reference so target does not inherit a
-        // dangling foreign object reference inside the stream dictionary.
-        if let Some(Object::Reference(params_ref)) = ef_stream.dict.get("Params").cloned() {
-            match source.resolve(params_ref) {
-                Ok(Object::Dictionary(params_dict)) => {
-                    ef_stream
-                        .dict
-                        .insert("Params", Object::Dictionary(params_dict));
-                }
-                _ => {
-                    // Cannot inline — remove the dangling reference to keep
-                    // the target consistent.
-                    ef_stream.dict.remove("Params");
-                }
-            }
-        }
-
-        // Inline any indirect /DecodeParms reference similarly.
-        if let Some(Object::Reference(dp_ref)) = ef_stream.dict.get("DecodeParms").cloned() {
-            match source.resolve(dp_ref) {
-                Ok(resolved) => {
-                    ef_stream.dict.insert("DecodeParms", resolved);
-                }
-                _ => {
-                    ef_stream.dict.remove("DecodeParms");
-                }
+        // Sanitize the copied stream dictionary: every indirect reference it
+        // carries (e.g. `/Params`, `/DecodeParms`, `/Filter`, or anything
+        // nested inside an inlined `/Params`) only makes sense in `source`'s
+        // object table. Inline every resolvable reference to a value and drop
+        // anything that cannot be safely inlined, so the target never inherits
+        // a dangling or wrong-object foreign reference.
+        {
+            let mut dict_obj = Object::Dictionary(std::mem::take(&mut ef_stream.dict));
+            let mut visited = std::collections::BTreeSet::new();
+            sanitize_imported_object(
+                source,
+                &mut dict_obj,
+                &mut visited,
+                0,
+                DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
+            )?;
+            if let Object::Dictionary(d) = dict_obj {
+                ef_stream.dict = d;
             }
         }
 
@@ -1148,7 +1233,27 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
             new_fs.insert("AFRelationship", rel.clone());
         }
 
-        // /EF sub-dict: both /F and /UF point to the new stream ref.
+        // Sanitize the source-derived filespec fields BEFORE attaching the
+        // target `/EF` reference: these values were cloned from `source`'s
+        // filespec and may carry foreign indirect references. The `/EF`
+        // sub-dict is inserted afterwards so the (valid) target stream ref is
+        // never run through `source.resolve`.
+        {
+            let mut fs_obj = Object::Dictionary(std::mem::take(&mut new_fs));
+            let mut visited = std::collections::BTreeSet::new();
+            sanitize_imported_object(
+                source,
+                &mut fs_obj,
+                &mut visited,
+                0,
+                DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
+            )?;
+            if let Object::Dictionary(d) = fs_obj {
+                new_fs = d;
+            }
+        }
+
+        // /EF sub-dict: both /F and /UF point to the new (target) stream ref.
         let mut new_ef_sub = Dictionary::new();
         new_ef_sub.insert("F", Object::Reference(new_stream_ref));
         new_ef_sub.insert("UF", Object::Reference(new_stream_ref));
@@ -1899,5 +2004,131 @@ mod tests {
             count, 0,
             "encrypted fixture has no attachments; copy must return 0"
         );
+    }
+
+    // ── sanitize_imported_object: foreign indirect references ────────────────
+
+    /// Recursively assert an object graph contains no `Object::Reference`.
+    fn assert_no_refs(o: &Object, ctx: &str) {
+        match o {
+            Object::Reference(r) => panic!("unexpected indirect reference {r} in {ctx}"),
+            Object::Array(a) => a.iter().for_each(|e| assert_no_refs(e, ctx)),
+            Object::Dictionary(d) => d.iter().for_each(|(_, v)| assert_no_refs(v, ctx)),
+            Object::Stream(s) => s.dict.iter().for_each(|(_, v)| assert_no_refs(v, ctx)),
+            _ => {}
+        }
+    }
+
+    /// Build a `source` whose `/EmbeddedFile` stream dict carries foreign
+    /// indirect references: an indirect `/Params` dict that *itself* holds an
+    /// indirect `/CreationDate`, an indirect `/Filter`, and a dangling ref to
+    /// a non-existent object. After `copy_attachments_from` the target copy
+    /// must contain zero `Object::Reference`s, the dangling key must be gone,
+    /// and the payload must still decode.
+    #[test]
+    fn copy_attachments_sanitizes_foreign_and_dangling_refs() {
+        let mut source = open_minimal();
+
+        let base = source
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let date_ref = ObjectRef::new(base + 1, 0);
+        let params_ref = ObjectRef::new(base + 2, 0);
+        let filter_ref = ObjectRef::new(base + 3, 0);
+        let stream_ref = ObjectRef::new(base + 4, 0);
+        let fs_ref = ObjectRef::new(base + 5, 0);
+        let dangling = ObjectRef::new(base + 999, 0); // never set
+
+        source.set_object(date_ref, Object::String(b"D:20260101000000Z".to_vec()));
+        let mut params = Dictionary::new();
+        params.insert("Size", Object::Integer(5));
+        params.insert("CreationDate", Object::Reference(date_ref)); // nested foreign ref
+        source.set_object(params_ref, Object::Dictionary(params));
+        source.set_object(filter_ref, Object::Name(b"FlateDecode".to_vec()));
+
+        // FlateDecode-compress the payload so /Filter must be inlined for decode.
+        let raw = b"hello sanitize";
+        let mut enc_dict = Dictionary::new();
+        enc_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = encode_stream_data(&enc_dict, raw).expect("encode");
+
+        let mut sdict = Dictionary::new();
+        sdict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        sdict.insert("Filter", Object::Reference(filter_ref)); // foreign /Filter ref
+        sdict.insert("Params", Object::Reference(params_ref)); // foreign /Params ref
+        sdict.insert("Length", Object::Integer(encoded.len() as i64));
+        sdict.insert("DanglingKey", Object::Reference(dangling)); // unresolvable
+        source.set_object(stream_ref, Object::Stream(Stream::new(sdict, encoded)));
+
+        let mut efsub = Dictionary::new();
+        efsub.insert("F", Object::Reference(stream_ref));
+        efsub.insert("UF", Object::Reference(stream_ref));
+        let mut fs = Dictionary::new();
+        fs.insert("Type", Object::Name(b"Filespec".to_vec()));
+        fs.insert("F", Object::String(b"s.bin".to_vec()));
+        fs.insert("UF", Object::String(b"s.bin".to_vec()));
+        fs.insert("EF", Object::Dictionary(efsub));
+        source.set_object(fs_ref, Object::Dictionary(fs));
+        insert_embedded_file(&mut source, b"s.bin", fs_ref).expect("insert source");
+
+        let mut target = open_minimal();
+        let n = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(n, 1);
+
+        let tgt_entries = list_embedded_files(&mut target).expect("list target");
+        assert_eq!(tgt_entries.len(), 1);
+        let tgt_fs_ref = tgt_entries[0].1;
+
+        // The target filespec dict must hold no foreign refs except the /EF
+        // entries (which point at the freshly-allocated target stream).
+        let Object::Dictionary(tgt_fs) = target.resolve(tgt_fs_ref).expect("resolve tgt fs") else {
+            panic!("filespec not a dict");
+        };
+        for (k, v) in tgt_fs.iter() {
+            if k == b"EF" {
+                continue; // /EF intentionally references the target stream
+            }
+            assert_no_refs(v, "target filespec (non-/EF)");
+        }
+
+        let tgt_stream = resolve_ef_stream(&mut target, tgt_fs_ref);
+        // Every foreign ref in the stream dict must be inlined or dropped.
+        assert_no_refs(
+            &Object::Dictionary(tgt_stream.dict.clone()),
+            "target stream dict",
+        );
+        // /Params inlined as a dict, with the nested date inlined as a String.
+        match tgt_stream.dict.get("Params") {
+            Some(Object::Dictionary(p)) => {
+                assert_eq!(
+                    p.get("CreationDate").cloned(),
+                    Some(Object::String(b"D:20260101000000Z".to_vec())),
+                    "nested /CreationDate must be inlined"
+                );
+            }
+            other => panic!("/Params must be an inlined dict, got {other:?}"),
+        }
+        // /Filter inlined as a Name so the payload still decodes.
+        assert_eq!(
+            tgt_stream.dict.get("Filter").cloned(),
+            Some(Object::Name(b"FlateDecode".to_vec())),
+            "/Filter must be inlined as a Name"
+        );
+        // The unresolvable /DanglingKey must no longer be an indirect
+        // reference. Per ISO 32000-1, a reference to a non-existent object IS
+        // null, so `source.resolve` yields `Null`; inlining that null (or
+        // dropping the key) is correct — what matters is that no foreign
+        // `Object::Reference` survives into the target.
+        match tgt_stream.dict.get("DanglingKey") {
+            None | Some(Object::Null) => {}
+            other => panic!("unresolvable ref must become null/absent, got {other:?}"),
+        }
+        // Payload still decodes to the original bytes.
+        let decoded =
+            crate::filters::decode_stream_data(&tgt_stream.dict, &tgt_stream.data).expect("decode");
+        assert_eq!(decoded.as_slice(), raw.as_ref());
     }
 }
