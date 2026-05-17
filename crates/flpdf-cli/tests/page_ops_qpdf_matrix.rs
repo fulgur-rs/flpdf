@@ -648,21 +648,31 @@ fn split_pages_one_filename_matches_qpdf() {
     let fdir = tempfile::tempdir().unwrap();
     let src = fixture_abs(THREE_PAGE);
 
-    run_qpdf(&[
-        src.to_str().unwrap(),
-        "--split-pages=1",
-        qdir.path().join("o.pdf").to_str().unwrap(),
-    ]);
+    // Cross-check the qpdf baseline only where qpdf is present (skipped on
+    // Windows CI / hosts without /usr/bin/qpdf); the flpdf assertion below
+    // always runs against the qpdf-11.9.0-observed expected names.
+    if qpdf_available() {
+        run_qpdf(&[
+            src.to_str().unwrap(),
+            "--split-pages=1",
+            qdir.path().join("o.pdf").to_str().unwrap(),
+        ]);
+        assert_eq!(
+            split_outputs(qdir.path()),
+            vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"],
+            "qpdf observed baseline"
+        );
+    }
     flpdf_ok(&[
         src.to_str().unwrap(),
         fdir.path().join("o.pdf").to_str().unwrap(),
         "--split-pages=1",
     ]);
-
-    let q = split_outputs(qdir.path());
-    let f = split_outputs(fdir.path());
-    assert_eq!(q, vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"]);
-    assert_eq!(f, q, "flpdf split-pages=1 naming must match qpdf");
+    assert_eq!(
+        split_outputs(fdir.path()),
+        vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"],
+        "flpdf split-pages=1 naming must match qpdf"
+    );
 }
 
 #[test]
