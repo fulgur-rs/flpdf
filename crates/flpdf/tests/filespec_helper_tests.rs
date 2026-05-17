@@ -7,8 +7,8 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, escape_pdf_name, format_pdf_date, md5_checksum, FileParamDates, FileSpec,
-    FileSpecBuilder, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, FileParamDates, FileSpec, FileSpecBuilder,
+    ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -610,20 +610,10 @@ fn format_pdf_date_nonzero_time() {
     );
 }
 
-// ── helper: escape_pdf_name ───────────────────────────────────────────────────
-
-#[test]
-fn escape_pdf_name_escapes_slash() {
-    assert_eq!(
-        escape_pdf_name(b"application/pdf"),
-        b"application#2Fpdf".to_vec()
-    );
-}
-
-#[test]
-fn escape_pdf_name_plain_text_unchanged() {
-    assert_eq!(escape_pdf_name(b"text"), b"text".to_vec());
-}
+// (the public `escape_pdf_name` helper was removed in roborev #920; name
+// escaping is now serializer-internal — see
+// `builder_mimetype_with_slash_round_trips_through_pdf_serialization` for the
+// end-to-end guarantee.)
 
 // ── helper: md5_checksum ──────────────────────────────────────────────────────
 
@@ -671,7 +661,10 @@ fn builder_round_trip_all_fields() {
     // ── /UF (UTF-16BE with BOM) ───────────────────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
     let uf = fs.uf().expect("uf()").expect("/UF should be present");
-    assert!(uf.starts_with(&[0xFE, 0xFF]), "/UF must start with BOM FE FF");
+    assert!(
+        uf.starts_with(&[0xFE, 0xFF]),
+        "/UF must start with BOM FE FF"
+    );
     // Decode UF back: skip BOM, read u16 pairs
     let units: Vec<u16> = uf[2..]
         .chunks_exact(2)
@@ -705,10 +698,7 @@ fn builder_round_trip_all_fields() {
 
     // ── MIME type (round-trips through name escape) ───────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let mime = ef.mimetype().expect("mimetype()");
     assert_eq!(
         mime,
@@ -718,29 +708,24 @@ fn builder_round_trip_all_fields() {
 
     // ── /Params /Size ─────────────────────────────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let sz = ef.size().expect("size()");
     assert_eq!(sz, Some(payload.len() as i64), "/Params /Size mismatch");
 
     // ── /Params /CheckSum (MD5 of payload) ───────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let cs = ef.checksum().expect("checksum()").expect("Some checksum");
     assert_eq!(cs.len(), 16, "checksum must be 16 bytes");
-    assert_eq!(cs, md5_checksum(payload), "checksum must match MD5 of payload");
+    assert_eq!(
+        cs,
+        md5_checksum(payload),
+        "checksum must match MD5 of payload"
+    );
 
     // ── /Params /CreationDate ─────────────────────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let cdate = ef.creation_date().expect("creation_date()");
     assert_eq!(
         cdate,
@@ -750,10 +735,7 @@ fn builder_round_trip_all_fields() {
 
     // ── /Params /ModDate ──────────────────────────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let mdate = ef.modification_date().expect("modification_date()");
     assert_eq!(
         mdate,
@@ -789,10 +771,7 @@ fn builder_round_trip_minimal() {
     assert_eq!(fs.af_relationship().expect("af_relationship()"), None);
 
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
     assert_eq!(ef.mimetype().expect("mimetype()"), None);
     assert_eq!(ef.creation_date().expect("creation_date()"), None);
@@ -841,10 +820,7 @@ fn builder_params_date_format_is_pdf_date() {
         .expect("build()");
 
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
-    let ef = fs
-        .embedded_file()
-        .expect("embedded_file()")
-        .expect("Some");
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let cdate = ef.creation_date().expect("creation_date()").expect("Some");
     // D:YYYYMMDDHHmmSSZ
     assert_eq!(cdate, b"D:20260615123045Z".to_vec());
@@ -881,9 +857,7 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
     // unescaped form must NOT (which would mean the `/` split the token).
     let needle = b"/application#2Fpdf";
     assert!(
-        serialized
-            .windows(needle.len())
-            .any(|w| w == needle),
+        serialized.windows(needle.len()).any(|w| w == needle),
         "serialized PDF must contain escaped /Subtype name /application#2Fpdf"
     );
 
