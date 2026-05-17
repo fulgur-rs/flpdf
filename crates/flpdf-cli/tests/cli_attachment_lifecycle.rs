@@ -475,6 +475,24 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         verbose.contains(&expected_size),
         "copy: verbose listing must preserve /Size={expected_size}; got: {verbose}"
     );
+
+    // /CheckSum must survive the copy (roborev #936 — the test claimed to
+    // verify /CheckSum preservation but never asserted it). The verbose
+    // listing prints the MD5 of the payload as lowercase hex; assert the
+    // exact expected value so a dropped/rewritten /CheckSum during
+    // --copy-attachments-from is caught.
+    let expected_checksum_hex: String = flpdf::md5_checksum(&png)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(
+        verbose.contains(&expected_checksum_hex),
+        "copy: verbose listing must preserve /CheckSum={expected_checksum_hex}; got: {verbose}"
+    );
+    assert!(
+        !verbose.contains("checksum:        (none)"),
+        "copy: /CheckSum must not be dropped to (none); got: {verbose}"
+    );
 }
 
 #[test]
