@@ -149,20 +149,6 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
         None
     };
 
-    // ── Step 1b: collect name-tree node refs (before mutation) ────────────────
-    // After `delete_embedded_file` rebuilds the tree, old leaf/intermediate nodes
-    // are NOT `delete_object`-ed — they remain as live "ghosts" that still contain
-    // references to the old filespec/stream.  We collect ALL currently-live name-
-    // tree node refs before the rebuild so we can exclude both:
-    //   (a) the nodes that survive in the rebuilt tree, and
-    //   (b) the ghost nodes from earlier rebuilds (e.g. from successive inserts).
-    // We take the union of ALL live objects that look like name-tree nodes
-    // (i.e. contain a /Names flat array or a /Kids array but not a /Type key that
-    // would identify them as something else).  This is a heuristic, but safe: a
-    // false positive just means we're more conservative (skip a non-tree object
-    // from the scan), which cannot cause incorrect deletion.
-    let name_tree_node_refs = collect_all_live_name_tree_node_refs(pdf)?;
-
     // ── Step 2: remove the name-tree entry ────────────────────────────────────
     delete_embedded_file(pdf, key)?;
 
@@ -174,15 +160,22 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
     // ── Step 4: conservative GC ───────────────────────────────────────────────
     // Check whether the filespec is referenced by any live object OTHER than:
     //   - itself
-    //   - name-tree nodes (which we just rebuilt and may be stale live ghosts)
+    //   - dead name-tree ghost nodes (see below)
     //   - the stream ref (whose edge to the stream we separately check)
     //
-    // Note: `rebuild_embedded_files_tree` (called by `delete_embedded_file`)
-    // does not call `delete_object` on old name-tree leaf/intermediate nodes;
-    // they remain in live_object_refs() as unreachable ghosts.  We exclude them
-    // from the scan so their stale references do not incorrectly preserve the
-    // filespec/stream objects.
-    let mut gc_exclude: BTreeSet<ObjectRef> = name_tree_node_refs;
+    // `rebuild_embedded_files_tree` (called by `delete_embedded_file`) does not
+    // `delete_object` superseded name-tree leaf/intermediate nodes; they linger
+    // in `live_object_refs()` as ghosts that still reference the old
+    // filespec/stream.  We must exclude those ghosts from the scan, otherwise
+    // their stale references would falsely preserve the objects.
+    //
+    // Collecting the exclude set *after* the rebuild is essential: only then are
+    // the superseded nodes unreachable from the catalog and thus identifiable as
+    // ghosts.  We exclude name-tree-shaped objects that are NOT reachable from
+    // the catalog — never a live, catalog-reachable name tree (`/Dests`,
+    // `/JavaScript`, a custom tree, …), which may legitimately reference the
+    // same filespec/stream and must keep counting (roborev #947).
+    let mut gc_exclude: BTreeSet<ObjectRef> = collect_dead_name_tree_node_refs(pdf)?;
 
     if let Some(fs_ref) = filespec_ref_opt {
         // Also exclude the stream ref from "things that reference the filespec"
@@ -308,23 +301,70 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     Ok(())
 }
 
-/// Collect all live objects that look like name-tree nodes.
+/// Collect every object reachable from the document catalog (`/Root`),
+/// following indirect references through dictionaries, arrays, and stream
+/// dicts.  A visited set makes the walk terminate on the cycles that pervade
+/// PDF object graphs (`/Parent` back-references, catalog ↔ name-tree, …).
+///
+/// Returns an empty set if the document has no `/Root`; callers then treat
+/// nothing as a dead ghost, i.e. GC stays maximally conservative.
+fn reachable_from_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<BTreeSet<ObjectRef>> {
+    let mut reachable = BTreeSet::new();
+    let Some(root) = pdf.root_ref() else {
+        return Ok(reachable);
+    };
+    let mut stack = vec![root];
+    while let Some(obj_ref) = stack.pop() {
+        if !reachable.insert(obj_ref) {
+            continue; // already visited — breaks /Parent / catalog cycles
+        }
+        let obj = pdf.resolve(obj_ref)?;
+        collect_refs(&obj, &mut stack);
+    }
+    Ok(reachable)
+}
+
+/// Append every `ObjectRef` directly contained in `obj` (recursing through
+/// nested arrays, dicts, and stream dicts) onto `out`.
+fn collect_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
+    match obj {
+        Object::Reference(r) => out.push(*r),
+        Object::Array(arr) => arr.iter().for_each(|o| collect_refs(o, out)),
+        Object::Dictionary(dict) => dict.iter().for_each(|(_, v)| collect_refs(v, out)),
+        Object::Stream(s) => s.dict.iter().for_each(|(_, v)| collect_refs(v, out)),
+        _ => {}
+    }
+}
+
+/// Collect **dead** (catalog-unreachable) live objects that look like
+/// name-tree nodes.
 ///
 /// A name-tree node is a dictionary with a `/Names` flat array or a `/Kids`
 /// array and no `/Type` key that would identify it as a page, catalog, etc.
-/// This heuristic may occasionally include non-tree objects (false positives)
-/// but that only makes the GC more conservative — it never causes incorrect
-/// deletion.
 ///
-/// Used by [`remove_attachment`] to exclude all ghost name-tree nodes (from
-/// prior `rebuild_embedded_files_tree` calls that did not `delete_object` old
-/// nodes) from the reachability scan.
-fn collect_all_live_name_tree_node_refs<R: Read + Seek>(
+/// `rebuild_embedded_files_tree` does not `delete_object` superseded leaf /
+/// intermediate nodes, so after a rebuild they linger in
+/// [`Pdf::live_object_refs`] as ghosts whose stale references would otherwise
+/// keep a removed filespec/stream artificially "referenced".  [`remove_attachment`]
+/// excludes those ghosts from the conservative-GC reachability scan.
+///
+/// Crucially we exclude **only** name-tree nodes that are *not reachable from
+/// the catalog*.  A type-less `/Names`/`/Kids` dictionary that IS reachable —
+/// e.g. a live `/Dests`, `/JavaScript`, or custom name tree — may legitimately
+/// reference the same filespec/stream; excluding it would make
+/// `remove_attachment` delete an object that is still in use (roborev #947).
+fn collect_dead_name_tree_node_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> Result<BTreeSet<ObjectRef>> {
+    let reachable = reachable_from_catalog(pdf)?;
     let mut out = BTreeSet::new();
     let live = pdf.live_object_refs();
     for obj_ref in live {
+        // A catalog-reachable name tree is live and may legitimately hold the
+        // reference we are GC-checking — never exclude it.
+        if reachable.contains(&obj_ref) {
+            continue;
+        }
         let obj = pdf.resolve(obj_ref)?;
         let Object::Dictionary(dict) = obj else {
             continue;
@@ -1014,6 +1054,73 @@ mod tests {
         assert!(
             !live.contains(&stream_ref),
             "stream ref must not be in live_object_refs after GC"
+        );
+    }
+
+    // ── Test: filespec referenced by another live name tree is preserved ─────
+    //
+    // Regression for roborev #947: the GC ghost-exclusion heuristic used to
+    // skip *every* type-less /Names|/Kids dictionary, so a live `/Dests` (or
+    // /JavaScript / custom) name tree referencing the same filespec was also
+    // excluded — letting `remove_attachment` delete a still-referenced object.
+    #[test]
+    fn remove_attachment_preserves_filespec_referenced_by_other_name_tree() {
+        let mut pdf = open_minimal();
+
+        // Register a filespec under /Names /EmbeddedFiles.
+        let fs_ref = FileSpecBuilder::new("shared.txt", b"shared payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"shared.txt", fs_ref).expect("insert");
+
+        // A separate, type-less name-tree leaf (models a /Dests name tree) that
+        // legitimately references the SAME filespec.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let dests_leaf_ref = ObjectRef::new(next + 1, 0);
+        let mut dests_leaf = Dictionary::new();
+        dests_leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"shared-dest".to_vec()),
+                Object::Reference(fs_ref),
+            ]),
+        );
+        pdf.set_object(dests_leaf_ref, Object::Dictionary(dests_leaf));
+
+        // Hang it off the catalog's /Dests so it is reachable from the catalog
+        // (a legitimate live name tree, not a dead ghost).
+        let catalog_ref = pdf.root_ref().expect("root");
+        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        else {
+            panic!("expected catalog dict");
+        };
+        catalog.insert("Dests", Object::Reference(dests_leaf_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        // Remove the embedded-files attachment.  The filespec is still
+        // referenced by the /Dests name tree → conservative GC must keep it.
+        let removed = remove_attachment(&mut pdf, b"shared.txt").expect("remove");
+        assert!(removed, "existing key must report removed");
+
+        let live = pdf.live_object_refs();
+        assert!(
+            live.contains(&fs_ref),
+            "filespec referenced by another live name tree (/Dests) must NOT be GC-deleted"
+        );
+
+        // The /Dests reference itself must remain intact.
+        let Object::Dictionary(leaf) = pdf.resolve(dests_leaf_ref).expect("resolve dests leaf")
+        else {
+            panic!("expected dests leaf dict");
+        };
+        assert!(
+            matches!(leaf.get("Names"), Some(Object::Array(a)) if a.iter().any(|o| matches!(o, Object::Reference(r) if *r == fs_ref))),
+            "/Dests leaf must still reference the filespec"
         );
     }
 
