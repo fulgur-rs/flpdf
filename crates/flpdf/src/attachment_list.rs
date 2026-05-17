@@ -105,7 +105,7 @@ fn decode_pdf_text_string(bytes: &[u8]) -> String {
                 (hi << 8) | lo
             })
             .collect();
-        String::from_utf16_lossy(&units).to_owned()
+        String::from_utf16_lossy(&units)
     } else {
         // PDFDocEncoding fallback — lossy UTF-8 for non-ASCII.
         String::from_utf8_lossy(bytes).into_owned()
@@ -212,6 +212,14 @@ fn collect_one<R: Read + Seek>(
 ///
 /// All absent/missing fields are rendered as the literal string `(none)`.
 /// Dates are printed as-is (raw PDF date string).
+///
+/// # Note on qpdf wording
+///
+/// The field labels (`display name:`, `mime type:`, etc.) are modelled on
+/// `qpdf --list-attachments --verbose` output.  The per-field multi-line layout
+/// differs from qpdf's non-verbose single-line `key -> num,gen` format: the
+/// header line is shared but plain mode adds per-field lines, which qpdf omits.
+/// CLI task .10.9 may adjust final output wording further.
 /// The checksum is formatted as lowercase hexadecimal, matching qpdf output.
 pub fn format_attachment_list(entries: &[AttachmentInfo], verbose: bool) -> String {
     let mut out = String::new();
