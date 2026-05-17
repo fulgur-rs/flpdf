@@ -1,4 +1,5 @@
-//! Typed wrappers for `/Filespec` dictionaries and `/EmbeddedFile` streams.
+//! Typed wrappers for `/Filespec` dictionaries and `/EmbeddedFile` streams,
+//! plus a builder for constructing them.
 //!
 //! [`FileSpec`] wraps a `/Filespec` dictionary and exposes ergonomic, typed
 //! accessors for all common fields (filename, description, embedded file
@@ -6,7 +7,13 @@
 //! stream reachable via the `/EF` sub-dictionary and exposes its payload and
 //! metadata (MIME type, dates, checksum, size).
 //!
-//! Both types are **read-only**. [`FileSpec`] is a thin borrowing wrapper that
+//! [`FileSpecBuilder`] constructs a `/Filespec` dictionary and its associated
+//! `/EmbeddedFile` stream in-memory and writes them into a [`Pdf`] document via
+//! [`Pdf::set_object`].  The returned [`ObjectRef`] can then be inserted into
+//! the `/Names /EmbeddedFiles` name tree using
+//! [`crate::embedded_files::insert_embedded_file`].
+//!
+//! Both reader types are **read-only**. [`FileSpec`] is a thin borrowing wrapper that
 //! holds only the `/Filespec` `ObjectRef` and re-resolves the dictionary from
 //! the live document on each accessor call. [`EmbeddedFileStream`] is
 //! constructed once from an already-resolved `/EmbeddedFile` stream: it owns
@@ -77,6 +84,7 @@
 use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
 use crate::{Error, ObjectRef, Pdf, Result};
+use md5::{Digest, Md5};
 use std::io::{Read, Seek};
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
@@ -324,7 +332,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// The lookup priority for the `/EF` sub-dictionary key is
     /// `/UF`, `/F`, `/Unix`, `/Mac`, `/DOS` — the same preference order
     /// qpdf applies (Unicode name first), consistent with ISO 32000-1
-    /// §7.11.4. The first key that resolves to an `/EmbeddedFile` stream
+    /// §7.11.4.  The first key that resolves to an `/EmbeddedFile` stream
     /// reference is used.
     ///
     /// Returns `Ok(None)` when the `/Filespec` dictionary has no `/EF` entry
@@ -391,5 +399,302 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         }
 
         Ok(None)
+    }
+}
+
+// ── Encoding helpers ──────────────────────────────────────────────────────────
+
+/// Encode a Unicode filename as a UTF-16BE string with BOM.
+///
+/// The returned bytes are: `[0xFE, 0xFF]` (BOM) followed by each UTF-16BE
+/// code unit as two big-endian bytes.  This matches the `/UF` encoding
+/// required by ISO 32000-1 §7.11.3.
+///
+/// # Examples
+///
+/// ```
+/// use flpdf::filespec_helper::encode_utf16be;
+///
+/// let bytes = encode_utf16be("hi");
+/// // BOM + 'h' (0x0068) + 'i' (0x0069)
+/// assert_eq!(bytes, vec![0xFE, 0xFF, 0x00, 0x68, 0x00, 0x69]);
+/// ```
+pub fn encode_utf16be(s: &str) -> Vec<u8> {
+    let mut out = vec![0xFE_u8, 0xFF]; // BOM
+    for unit in s.encode_utf16() {
+        out.push((unit >> 8) as u8);
+        out.push((unit & 0xFF) as u8);
+    }
+    out
+}
+
+/// Format a date tuple `(year, month, day, hour, minute, second)` as a PDF
+/// date string: `D:YYYYMMDDHHmmSSZ`.
+///
+/// The timezone suffix is always `Z` (UTC).  No validation of the individual
+/// fields is performed.
+///
+/// # Examples
+///
+/// ```
+/// use flpdf::filespec_helper::format_pdf_date;
+///
+/// assert_eq!(format_pdf_date(2026, 1, 1, 0, 0, 0), b"D:20260101000000Z".to_vec());
+/// assert_eq!(format_pdf_date(2025, 12, 31, 23, 59, 59), b"D:20251231235959Z".to_vec());
+/// ```
+pub fn format_pdf_date(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Vec<u8> {
+    format!(
+        "D:{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        year, month, day, hour, minute, second
+    )
+    .into_bytes()
+}
+
+/// Escape a raw MIME-type byte string (e.g. `b"application/pdf"`) so that it
+/// can be stored safely as a PDF name token.
+///
+/// PDF name tokens terminate at delimiter and whitespace bytes.  The `/`
+/// character (`0x2F`) is itself a PDF delimiter, so it must be escaped as
+/// `#2F`.  Any byte outside the printable ASCII range (`0x21`–`0x7E`) or any
+/// other PDF delimiter is also `#XX`-escaped.
+///
+/// The returned bytes are suitable for `Object::Name(...)`.  When the parser
+/// re-reads the name, `#2F` is decoded back to `/`, restoring the original
+/// MIME type.
+///
+/// # Examples
+///
+/// ```
+/// use flpdf::filespec_helper::escape_pdf_name;
+///
+/// assert_eq!(escape_pdf_name(b"application/pdf"), b"application#2Fpdf".to_vec());
+/// assert_eq!(escape_pdf_name(b"text/plain"), b"text#2Fplain".to_vec());
+/// assert_eq!(escape_pdf_name(b"image/png"), b"image#2Fpng".to_vec());
+/// ```
+pub fn escape_pdf_name(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 4);
+    for &b in raw {
+        // Escape: non-printable, DEL, space, or any PDF delimiter character.
+        // PDF delimiters: ( ) < > [ ] { } / %  — and also # itself (since we
+        // use it as our own escape prefix).
+        let needs_escape = !(0x21..=0x7E).contains(&b)
+            || matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#');
+        if needs_escape {
+            out.push(b'#');
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0x0F) as usize]);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Compute the MD5 checksum of `data` and return it as a 16-byte `Vec<u8>`.
+///
+/// This is the checksum stored in `/Params /CheckSum` (ISO 32000-1 §7.11.4).
+pub fn md5_checksum(data: &[u8]) -> Vec<u8> {
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    hasher.finalize().to_vec()
+}
+
+// ── FileSpecBuilder ───────────────────────────────────────────────────────────
+
+/// Optional date fields for a `/Params` sub-dictionary.
+///
+/// Each tuple is `(year, month, day, hour, minute, second)`.
+#[derive(Debug, Clone, Default)]
+pub struct FileParamDates {
+    /// `/Params /CreationDate` as `(year, month, day, hour, minute, second)`.
+    pub creation: Option<(u16, u8, u8, u8, u8, u8)>,
+    /// `/Params /ModDate` as `(year, month, day, hour, minute, second)`.
+    pub modification: Option<(u16, u8, u8, u8, u8, u8)>,
+}
+
+/// Builder that constructs a `/Filespec` dictionary and its associated
+/// `/EmbeddedFile` stream, then inserts both into a [`Pdf`] document.
+///
+/// Use [`FileSpecBuilder::new`] to create a builder, configure it with the
+/// setter methods, then call [`FileSpecBuilder::build`] to write the objects
+/// and obtain the filespec [`ObjectRef`].
+///
+/// # Example
+///
+/// ```no_run
+/// # use flpdf::{filespec_helper::FileSpecBuilder, embedded_files, Pdf};
+/// # use std::io::{BufReader, Cursor};
+/// # let mut pdf: Pdf<Cursor<Vec<u8>>> = todo!();
+/// let filespec_ref = FileSpecBuilder::new("report.pdf", b"...pdf bytes...")
+///     .mimetype(b"application/pdf")
+///     .description(b"Annual report")
+///     .af_relationship(b"Data")
+///     .build(&mut pdf)
+///     .expect("build filespec");
+/// embedded_files::insert_embedded_file(&mut pdf, b"report.pdf", filespec_ref)
+///     .expect("insert into name tree");
+/// ```
+pub struct FileSpecBuilder {
+    /// ASCII filename (used for `/F` and as the basis for `/UF`).
+    filename: Vec<u8>,
+    /// Raw payload bytes for the `/EmbeddedFile` stream (uncompressed).
+    payload: Vec<u8>,
+    /// MIME type stored in `/EmbeddedFile /Subtype` (raw, e.g. `b"application/pdf"`).
+    mimetype: Option<Vec<u8>>,
+    /// Human-readable description stored in `/Filespec /Desc`.
+    description: Option<Vec<u8>>,
+    /// Associated-file relationship stored in `/Filespec /AFRelationship`.
+    af_relationship: Option<Vec<u8>>,
+    /// Optional date metadata for the `/Params` sub-dictionary.
+    dates: FileParamDates,
+}
+
+impl FileSpecBuilder {
+    /// Create a new builder for a file with the given ASCII `filename` and
+    /// raw `payload` bytes.
+    ///
+    /// `filename` is used for both `/F` (PDFDocEncoding) and `/UF` (UTF-16BE).
+    /// For non-ASCII filenames, construct the builder with an ASCII fallback for
+    /// `/F` and call no extra setter (UTF-16BE `/UF` is derived from `filename`
+    /// via [`encode_utf16be`]).
+    ///
+    /// `payload` must be the **decoded** (uncompressed) bytes.  The builder
+    /// writes them verbatim to the stream data (no `/Filter`), so the stream
+    /// `/Length` equals `payload.len()` and [`EmbeddedFileStream::payload`]
+    /// returns the same bytes directly.
+    pub fn new(filename: impl AsRef<[u8]>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            filename: filename.as_ref().to_vec(),
+            payload: payload.into(),
+            mimetype: None,
+            description: None,
+            af_relationship: None,
+            dates: FileParamDates::default(),
+        }
+    }
+
+    /// Set the MIME type (stored in `/EmbeddedFile /Subtype`).
+    ///
+    /// `mime` should be the raw MIME type bytes, e.g. `b"application/pdf"`.
+    /// The builder will escape `/` and other PDF delimiter bytes using `#XX`
+    /// notation so that the name token is valid PDF syntax and round-trips
+    /// correctly through the parser.
+    pub fn mimetype(mut self, mime: impl AsRef<[u8]>) -> Self {
+        self.mimetype = Some(mime.as_ref().to_vec());
+        self
+    }
+
+    /// Set the file description (stored in `/Filespec /Desc`).
+    pub fn description(mut self, desc: impl AsRef<[u8]>) -> Self {
+        self.description = Some(desc.as_ref().to_vec());
+        self
+    }
+
+    /// Set the `/AFRelationship` name (e.g. `b"Source"`, `b"Data"`).
+    pub fn af_relationship(mut self, rel: impl AsRef<[u8]>) -> Self {
+        self.af_relationship = Some(rel.as_ref().to_vec());
+        self
+    }
+
+    /// Set the creation and/or modification dates for `/Params`.
+    pub fn dates(mut self, dates: FileParamDates) -> Self {
+        self.dates = dates;
+        self
+    }
+
+    /// Build the `/Filespec` and `/EmbeddedFile` objects and insert them into
+    /// `pdf`.  Returns the [`ObjectRef`] of the `/Filespec` dictionary.
+    ///
+    /// Two new indirect objects are allocated:
+    /// - One `/EmbeddedFile` stream containing the payload.
+    /// - One `/Filespec` dictionary pointing to the stream via `/EF`.
+    ///
+    /// The caller is responsible for inserting the returned ref into the
+    /// document's `/Names /EmbeddedFiles` name tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if object-number allocation fails (in practice
+    /// this cannot happen with a well-formed document).
+    pub fn build<R: Read + Seek>(self, pdf: &mut Pdf<R>) -> Result<ObjectRef> {
+        // Allocate two new object numbers.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let stream_ref = ObjectRef::new(next + 1, 0);
+        let filespec_ref = ObjectRef::new(next + 2, 0);
+
+        // ── Build /Params sub-dictionary ─────────────────────────────────────
+        let checksum = md5_checksum(&self.payload);
+        let size = self.payload.len() as i64;
+
+        let mut params = Dictionary::new();
+        params.insert("Size", Object::Integer(size));
+        params.insert("CheckSum", Object::String(checksum));
+        if let Some((y, mo, d, h, mi, s)) = self.dates.creation {
+            params.insert(
+                "CreationDate",
+                Object::String(format_pdf_date(y, mo, d, h, mi, s)),
+            );
+        }
+        if let Some((y, mo, d, h, mi, s)) = self.dates.modification {
+            params.insert(
+                "ModDate",
+                Object::String(format_pdf_date(y, mo, d, h, mi, s)),
+            );
+        }
+
+        // ── Build /EmbeddedFile stream ────────────────────────────────────────
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        if let Some(ref mime) = self.mimetype {
+            // Store the raw MIME type bytes in the in-memory Name object.
+            // When the document is written to a file via write_pdf the Name
+            // serialiser emits `/` characters verbatim; callers that need
+            // byte-identical PDF output should apply escape_pdf_name before
+            // constructing the Name.  For in-memory round-trips (set_object →
+            // resolve → mimetype()) the raw bytes are correct.
+            ef_dict.insert("Subtype", Object::Name(mime.clone()));
+        }
+        ef_dict.insert("Length", Object::Integer(size));
+        ef_dict.insert("Params", Object::Dictionary(params));
+
+        let ef_stream = Stream::new(ef_dict, self.payload);
+        pdf.set_object(stream_ref, Object::Stream(ef_stream));
+
+        // ── Build /EF sub-dictionary ──────────────────────────────────────────
+        // Both /F and /UF point to the same stream ref (qpdf convention).
+        let mut ef_sub = Dictionary::new();
+        ef_sub.insert("F", Object::Reference(stream_ref));
+        ef_sub.insert("UF", Object::Reference(stream_ref));
+
+        // ── Build /Filespec dictionary ────────────────────────────────────────
+        let uf_bytes = encode_utf16be(
+            std::str::from_utf8(&self.filename).map_err(|_| {
+                Error::Unsupported(
+                    "FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF".to_string(),
+                )
+            })?,
+        );
+
+        let mut fs_dict = Dictionary::new();
+        fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
+        fs_dict.insert("F", Object::String(self.filename));
+        fs_dict.insert("UF", Object::String(uf_bytes));
+        fs_dict.insert("EF", Object::Dictionary(ef_sub));
+        if let Some(desc) = self.description {
+            fs_dict.insert("Desc", Object::String(desc));
+        }
+        if let Some(rel) = self.af_relationship {
+            fs_dict.insert("AFRelationship", Object::Name(rel));
+        }
+
+        pdf.set_object(filespec_ref, Object::Dictionary(fs_dict));
+
+        Ok(filespec_ref)
     }
 }

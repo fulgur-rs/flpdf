@@ -94,7 +94,10 @@ pub use embedded_files::{
     list_embedded_files_with_max_depth, DEFAULT_MAX_EMBEDDED_FILES_DEPTH, LEAF_MAX,
 };
 pub use error::{EncryptedError, Error, Result};
-pub use filespec_helper::{EmbeddedFileStream, FileSpec};
+pub use filespec_helper::{
+    encode_utf16be, escape_pdf_name, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates,
+    FileSpec, FileSpecBuilder,
+};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
