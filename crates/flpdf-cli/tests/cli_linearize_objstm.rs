@@ -208,6 +208,12 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
 // ---------------------------------------------------------------------------
 // 2. Regression: linearize + object-streams=disable is byte-identical to the
 //    default path, contains no ObjStm, and keeps a classic xref table.
+//
+//    Both invocations pass --static-id so the comparison is deterministic:
+//    the default /ID strategy (flpdf-9hc.13.2) is now random, so two separate
+//    runs would otherwise differ only in the trailer /ID bytes.  The /ID
+//    randomness itself is covered by dedicated tests; this test isolates the
+//    structural disable-vs-default equivalence.
 // ---------------------------------------------------------------------------
 #[test]
 fn linearize_disable_is_unchanged_and_no_objstm() {
@@ -221,6 +227,7 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
             "rewrite",
             "--linearize",
             "--object-streams=disable",
+            "--static-id",
             FIXTURE,
             out_disable.to_str().unwrap(),
         ])
@@ -232,6 +239,7 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
         .args([
             "rewrite",
             "--linearize",
+            "--static-id",
             FIXTURE,
             out_default.to_str().unwrap(),
         ])

@@ -313,35 +313,90 @@ fn linearize_force_version_overrides_linearize_floor() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. /ID omission: when source has no /ID and --static-id is not set,
-//     the linearized output must not contain a /ID key.
+// 10. Default /ID strategy (flpdf-9hc.13.2): when source has no /ID and
+//     --static-id is not set, the linearized output must still emit a fresh
+//     random two-element /ID that differs between runs and is not the qpdf
+//     static-id (π) constant.  Matches qpdf's default observable behaviour
+//     (ISO 32000-1 §14.4).
 // ---------------------------------------------------------------------------
 
+/// Extract the two hex byte-strings of the *first* `/ID [<..><..>]` array.
+fn first_id_pair(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let pos = bytes
+        .windows(3)
+        .position(|w| w == b"/ID")
+        .expect("/ID key present");
+    let lb = bytes[pos..]
+        .iter()
+        .position(|&b| b == b'[')
+        .map(|i| pos + i)
+        .expect("/ID array open bracket");
+    let rb = bytes[lb..]
+        .iter()
+        .position(|&b| b == b']')
+        .map(|i| lb + i)
+        .expect("/ID array close bracket");
+    let slice = &bytes[lb + 1..rb];
+    let mut hexes = slice
+        .split(|&b| b == b'<' || b == b'>')
+        .filter(|s| !s.is_empty() && s.iter().all(|&c| c.is_ascii_hexdigit()))
+        .map(|s| s.to_vec());
+    let a = hexes.next().expect("/ID element 1");
+    let b = hexes.next().expect("/ID element 2");
+    (a, b)
+}
+
 #[test]
-fn linearize_no_source_id_omits_id_key() {
+fn linearize_no_source_id_emits_fresh_random_id() {
     // minimal_pdf_bytes() builds a trailer with no /ID entry.
     let input = write_temp(&minimal_pdf_bytes());
-    let outdir = tempfile::tempdir().unwrap();
-    let output = outdir.path().join("linearized.pdf");
 
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "rewrite",
-            "--linearize",
-            input.path().to_str().unwrap(),
-            output.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let run = || {
+        let outdir = tempfile::tempdir().unwrap();
+        let output = outdir.path().join("linearized.pdf");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "rewrite",
+                "--linearize",
+                input.path().to_str().unwrap(),
+                output.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        std::fs::read(&output).unwrap()
+    };
 
-    let bytes = std::fs::read(&output).unwrap();
+    let bytes1 = run();
+    let bytes2 = run();
 
-    // The trailer must not contain the /ID key at all.
+    // /ID must be present despite the source having none.
     let id_needle = b"/ID";
     assert!(
-        !bytes.windows(id_needle.len()).any(|w| w == id_needle),
-        "linearized output must not contain /ID when source has none and --static-id is off"
+        bytes1.windows(id_needle.len()).any(|w| w == id_needle),
+        "default strategy must emit /ID even when source has none"
+    );
+
+    let (a1, b1) = first_id_pair(&bytes1);
+    let (a2, b2) = first_id_pair(&bytes2);
+
+    // Each element is a 16-byte (32 hex digit) string.
+    assert_eq!(a1.len(), 32, "/ID element 1 must be 16 bytes (32 hex)");
+    assert_eq!(b1.len(), 32, "/ID element 2 must be 16 bytes (32 hex)");
+
+    // Not the qpdf static-id (π) constant.
+    let pi = b"31415926535897932384626433832795";
+    assert_ne!(a1.as_slice(), pi, "/ID[0] must not be the π constant");
+    assert_ne!(b1.as_slice(), pi, "/ID[1] must not be the π constant");
+
+    // Not all zeros.
+    assert!(a1.iter().any(|&c| c != b'0'), "/ID[0] must not be all-zero");
+    assert!(b1.iter().any(|&c| c != b'0'), "/ID[1] must not be all-zero");
+
+    // Random: two independent runs of a no-/ID source produce different IDs.
+    assert!(
+        (a1, b1) != (a2, b2),
+        "default /ID must differ between independent runs"
     );
 }
 
