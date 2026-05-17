@@ -165,9 +165,12 @@ fn mimetype_returns_subtype_name() {
     let mut pdf = open(bytes);
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
-    // /Subtype is stored as raw name bytes (no leading /)
-    let mime = ef.mimetype().expect("mimetype()");
-    assert!(mime.is_some(), "expected Some mime");
+    // /Subtype is stored as raw name bytes (no leading /); the `#2f`
+    // name escape decodes to `/`.
+    assert_eq!(
+        ef.mimetype().expect("mimetype()"),
+        Some(b"application/plain".to_vec())
+    );
 }
 
 #[test]
@@ -214,10 +217,13 @@ fn checksum_returns_raw_bytes() {
     let mut pdf = open(bytes);
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
-    let cs = ef.checksum().expect("checksum()");
-    assert!(cs.is_some(), "expected Some checksum");
-    let cs = cs.unwrap();
-    assert_eq!(cs.len(), 16, "MD5 should be 16 bytes, got {}", cs.len());
+    assert_eq!(
+        ef.checksum().expect("checksum()"),
+        Some(vec![
+            0x54, 0x22, 0x66, 0xa1, 0xf5, 0x65, 0xc3, 0xe5, 0xd8, 0xcf, 0xbd, 0x55, 0xeb, 0x7d,
+            0xfa, 0x40,
+        ])
+    );
 }
 
 #[test]
@@ -380,8 +386,12 @@ fn build_pdf_with_ef_keys(pairs: &[(&str, &[u8])]) -> Vec<u8> {
     out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
     out.extend_from_slice(b"0000000000 65535 f \n");
     for i in 1..n {
-        let off = offsets.get(&i).copied().unwrap_or(0);
-        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        match offsets.get(&i) {
+            Some(off) => {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
     }
     out.extend_from_slice(
         format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
@@ -449,8 +459,12 @@ fn params_indirect_reference_resolves() {
     out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
     out.extend_from_slice(b"0000000000 65535 f \n");
     for i in 1..n {
-        let off = offsets.get(&i).copied().unwrap_or(0);
-        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        match offsets.get(&i) {
+            Some(off) => {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
     }
     out.extend_from_slice(
         format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
@@ -508,8 +522,12 @@ fn embedded_file_skips_non_stream_higher_priority_key() {
     out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
     out.extend_from_slice(b"0000000000 65535 f \n");
     for i in 1..n {
-        let off = offsets.get(&i).copied().unwrap_or(0);
-        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        match offsets.get(&i) {
+            Some(off) => {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
     }
     out.extend_from_slice(
         format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
