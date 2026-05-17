@@ -99,8 +99,11 @@ fn skip_if_qpdf_missing() -> bool {
         return false;
     }
     let on_ci = std::env::var_os("CI").is_some();
-    let on_windows = cfg!(target_os = "windows");
-    if on_ci && !on_windows {
+    // Windows (choco) and macOS (Homebrew) both hit the separately-tracked
+    // qpdf vector::_M_range_check defect (flpdf-d4k), so CI deliberately does
+    // not install qpdf there — treat both as skip-allowed, not a hard-fail.
+    let qpdf_install_skipped = cfg!(any(target_os = "windows", target_os = "macos"));
+    if on_ci && !qpdf_install_skipped {
         panic!(
             "qpdf is required for cli_optimization_matrix tests on CI (Linux); \
              install qpdf in the workflow before running this test suite"
