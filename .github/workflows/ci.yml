@@ -90,21 +90,19 @@ jobs:
 
       # qpdf is required by crates/flpdf-cli/tests/cli_linearize_qpdf.rs as
       # an external oracle.  Install it on Linux (apt — covers both amd64 and
-      # the ubuntu-24.04-arm runner) and macOS (brew) so the oracle suite
-      # hard-fails on missing qpdf (skip_if_qpdf_missing).
+      # the ubuntu-24.04-arm runner) so the oracle suite hard-fails on missing
+      # qpdf (skip_if_qpdf_missing).
       #
-      # On Windows we deliberately do NOT install qpdf at the moment: the
-      # choco package surfaces an unrelated qpdf runtime error on existing
-      # writer_tests output (vector::_M_range_check) that is tracked
-      # separately.  The qpdf-dependent tests therefore skip silently on
-      # Windows runners and CI panic only fires on Linux/macOS.
+      # On Windows AND macOS we deliberately do NOT install qpdf: both the
+      # choco (Windows) and Homebrew (macOS) packages surface the same
+      # unrelated qpdf runtime error on existing writer_tests output
+      # (vector::_M_range_check) — empirically reproduced on macos-latest via
+      # brew — tracked separately in flpdf-d4k.  The qpdf-dependent tests
+      # therefore skip silently on Windows/macOS runners (is_qpdf_available()
+      # == false) and the qpdf oracle gate only fires on Linux.
       - name: Install qpdf (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y qpdf
-
-      - name: Install qpdf (macOS)
-        if: runner.os == 'macOS'
-        run: brew install qpdf
 
       - name: Run tests in required order
         if: ${{ !matrix.coverage }}
