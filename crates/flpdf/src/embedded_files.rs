@@ -1,10 +1,35 @@
-//! Read-only enumeration of `/Names /EmbeddedFiles` name-tree entries.
+//! Read/write access to the `/Names /EmbeddedFiles` name-tree.
+//!
+//! # Reader
 //!
 //! Walks the catalog's `/Names /EmbeddedFiles` name tree (ISO 32000-1 §7.9.6
 //! + §7.11) and returns an ordered list of `(name_key, filespec_ref)` pairs.
 //!
 //! The result is in depth-first, key-ascending order as mandated by the spec
 //! requirement that name trees be sorted by key.
+//!
+//! # Writer
+//!
+//! [`insert_embedded_file`] and [`delete_embedded_file`] mutate the tree
+//! using a **collect → modify → rebuild** strategy that mirrors qpdf's
+//! aggressive rebuild policy: all entries are gathered in one pass, the entry
+//! list is changed, sorted, and the entire tree is reconstructed from scratch.
+//!
+//! The reconstruction uses at most two levels:
+//! - ≤ [`LEAF_MAX`] entries → a single leaf node (no `/Kids`).
+//! - > [`LEAF_MAX`] entries → a root node with `/Kids` pointing to leaf chunks.
+//!
+//! Every node carries a `/Limits [first, last]` array as required by validators
+//! such as qpdf.
+//!
+//! The writer normalises the catalog path: after any mutation `/Names` is
+//! stored as an indirect object and `/EmbeddedFiles` within it is an indirect
+//! reference to the tree root.  Other keys in the `/Names` dictionary (e.g.
+//! `/Dests`, `/JavaScript`) are preserved unchanged.
+//!
+//! When deletion reduces the entry list to zero the `/EmbeddedFiles` key is
+//! removed from the `/Names` dictionary; if that makes the dictionary empty
+//! the `/Names` key is removed from the catalog.
 //!
 //! # Name-tree structure (ISO 32000-1 §7.9.6)
 //!
@@ -38,19 +63,36 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{embedded_files, Pdf};
+//! use flpdf::{embedded_files, Pdf, ObjectRef};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("with-attachments.pdf")?))?;
 //! let entries = embedded_files::list_embedded_files(&mut pdf)?;
 //! for (name, filespec_ref) in &entries {
 //!     println!("{}: {}", String::from_utf8_lossy(name), filespec_ref);
 //! }
+//!
+//! // Insert a new attachment key (the filespec object must already exist in pdf)
+//! let filespec_ref = ObjectRef::new(42, 0);
+//! embedded_files::insert_embedded_file(&mut pdf, b"report.pdf", filespec_ref)?;
+//!
+//! // Remove an entry
+//! embedded_files::delete_embedded_file(&mut pdf, b"old-attachment.txt")?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
+
+// ── Writer constants ──────────────────────────────────────────────────────────
+
+/// Maximum number of entries in a single leaf `/Names` node before the writer
+/// splits into multiple leaves under a `/Kids` root.
+///
+/// This mirrors the threshold used by qpdf's aggressive rebuild policy.  Any
+/// tree with more than this many entries will have two levels (root + leaves);
+/// three levels are never emitted.
+pub const LEAF_MAX: usize = 32;
 
 /// Default maximum depth when descending `/Kids` chains.
 ///
@@ -208,4 +250,241 @@ fn collect_leaf_pairs(pairs: Vec<Object>, out: &mut Vec<(Vec<u8>, ObjectRef)>) {
 
         out.push((key, filespec_ref));
     }
+}
+
+// ── Writer ────────────────────────────────────────────────────────────────────
+
+/// Insert or replace a `(key, filespec_ref)` entry in the catalog's
+/// `/Names /EmbeddedFiles` name tree.
+///
+/// If `key` already exists its value is replaced with `filespec_ref`.
+/// If the `/Names /EmbeddedFiles` path does not yet exist it is created.
+///
+/// The entire tree is rebuilt from scratch after the insertion (qpdf-style
+/// aggressive rebuild): all existing entries are read, the new entry is merged
+/// in sorted order, and a fresh tree is written back via [`Pdf::set_object`].
+///
+/// # Errors
+///
+/// Propagates any error from [`Pdf::resolve`].
+pub fn insert_embedded_file<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    key: &[u8],
+    filespec_ref: ObjectRef,
+) -> Result<()> {
+    // Collect existing entries.
+    let mut entries = list_embedded_files(pdf)?;
+
+    // Insert or replace.
+    if let Some(existing) = entries.iter_mut().find(|(k, _)| k == key) {
+        existing.1 = filespec_ref;
+    } else {
+        entries.push((key.to_vec(), filespec_ref));
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    }
+
+    rebuild_embedded_files_tree(pdf, entries)
+}
+
+/// Remove the entry with `key` from the catalog's `/Names /EmbeddedFiles`
+/// name tree.
+///
+/// Returns `true` if the key was found and removed, `false` if it was absent.
+///
+/// When the last entry is removed the `/EmbeddedFiles` key is deleted from the
+/// `/Names` dictionary.  If that leaves the `/Names` dictionary empty the
+/// `/Names` key is removed from the catalog as well — no dangling references
+/// remain.
+///
+/// # Errors
+///
+/// Propagates any error from [`Pdf::resolve`].
+pub fn delete_embedded_file<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    key: &[u8],
+) -> Result<bool> {
+    let mut entries = list_embedded_files(pdf)?;
+    let before = entries.len();
+    entries.retain(|(k, _)| k != key);
+    if entries.len() == before {
+        return Ok(false); // Key was not present.
+    }
+
+    rebuild_embedded_files_tree(pdf, entries)?;
+    Ok(true)
+}
+
+// ── Internal rebuild ──────────────────────────────────────────────────────────
+
+/// Rebuild the `/Names /EmbeddedFiles` name tree from a sorted entry list and
+/// patch it back into the document via [`Pdf::set_object`].
+///
+/// When `entries` is empty the function removes `/EmbeddedFiles` from the
+/// `/Names` dictionary (and removes `/Names` from the catalog if it then
+/// becomes empty), leaving no dangling references.
+///
+/// Otherwise it constructs a tree with at most two levels:
+/// - ≤ [`LEAF_MAX`] entries → single-leaf root (just `/Names` + `/Limits`).
+/// - > [`LEAF_MAX`] entries → root with `/Kids` pointing to leaf chunks.
+///
+/// All emitted nodes carry `/Limits [first, last]` as required by PDF
+/// validators.  The catalog `/Names` reference is stored as an indirect object;
+/// `/EmbeddedFiles` within it points indirectly to the tree root.
+fn rebuild_embedded_files_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    entries: Vec<(Vec<u8>, ObjectRef)>,
+) -> Result<()> {
+    // Resolve the catalog.
+    let catalog_ref = match pdf.root_ref() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let catalog_obj = pdf.resolve(catalog_ref)?;
+    let Object::Dictionary(mut catalog) = catalog_obj else {
+        return Ok(());
+    };
+
+    // ── Allocate a block of fresh object numbers ──────────────────────────────
+    // Snapshot the current maximum to avoid re-querying inside the loop.
+    let mut next_num: u32 = pdf
+        .object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0);
+    let mut alloc = move || -> ObjectRef {
+        next_num += 1;
+        ObjectRef::new(next_num, 0)
+    };
+
+    // ── Empty case: remove /EmbeddedFiles ────────────────────────────────────
+    if entries.is_empty() {
+        // Retrieve (or create empty) /Names dict and drop /EmbeddedFiles from it.
+        let names_dict_opt = match catalog.get("Names").cloned() {
+            Some(Object::Reference(r)) => match pdf.resolve(r)? {
+                Object::Dictionary(d) => Some((Some(r), d)),
+                _ => None,
+            },
+            Some(Object::Dictionary(d)) => Some((None, d)),
+            _ => None,
+        };
+        if let Some((names_ref_opt, mut names_dict)) = names_dict_opt {
+            names_dict.remove("EmbeddedFiles");
+            if names_dict.iter().next().is_none() {
+                // /Names dict is now empty — remove from catalog.
+                catalog.remove("Names");
+                pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+                if let Some(r) = names_ref_opt {
+                    pdf.delete_object(r);
+                }
+            } else {
+                match names_ref_opt {
+                    Some(r) => {
+                        pdf.set_object(r, Object::Dictionary(names_dict));
+                    }
+                    None => {
+                        catalog.insert("Names", Object::Dictionary(names_dict));
+                        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // ── Build the name-tree nodes ─────────────────────────────────────────────
+    let tree_root_ref = if entries.len() <= LEAF_MAX {
+        // Single-leaf root.
+        let leaf = build_leaf_dict(&entries);
+        let leaf_ref = alloc();
+        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+        leaf_ref
+    } else {
+        // Multi-leaf: chunk entries evenly, each chunk ≤ LEAF_MAX.
+        let n_leaves = entries.len().div_ceil(LEAF_MAX);
+        let chunk_size = entries.len().div_ceil(n_leaves);
+
+        let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
+        for chunk in entries.chunks(chunk_size) {
+            let leaf = build_leaf_dict(chunk);
+            let leaf_ref = alloc();
+            pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+            kids.push(Object::Reference(leaf_ref));
+        }
+
+        // Root node: /Kids + /Limits
+        let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
+        let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(first),
+                Object::String(last),
+            ]),
+        );
+        root.insert("Kids", Object::Array(kids));
+        let root_ref = alloc();
+        pdf.set_object(root_ref, Object::Dictionary(root));
+        root_ref
+    };
+
+    // ── Patch the catalog /Names dictionary ───────────────────────────────────
+    // Resolve or create the /Names dict.  We always store it as an indirect
+    // object and point /EmbeddedFiles to the tree root indirectly.
+    let (names_ref, mut names_dict) = match catalog.get("Names").cloned() {
+        Some(Object::Reference(r)) => match pdf.resolve(r)? {
+            Object::Dictionary(d) => (r, d),
+            _ => {
+                let r2 = alloc();
+                (r2, Dictionary::new())
+            }
+        },
+        Some(Object::Dictionary(d)) => {
+            let r = alloc();
+            (r, d)
+        }
+        _ => {
+            let r = alloc();
+            (r, Dictionary::new())
+        }
+    };
+
+    names_dict.insert("EmbeddedFiles", Object::Reference(tree_root_ref));
+    pdf.set_object(names_ref, Object::Dictionary(names_dict));
+
+    // Point catalog /Names to the (possibly new) indirect names dict.
+    catalog.insert("Names", Object::Reference(names_ref));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    Ok(())
+}
+
+/// Build a leaf name-tree node dictionary from an ordered slice of entries.
+///
+/// The returned dictionary has:
+/// - `/Limits [first_key, last_key]`
+/// - `/Names [key₁, ref₁, key₂, ref₂, …]`
+fn build_leaf_dict(entries: &[(Vec<u8>, ObjectRef)]) -> Dictionary {
+    debug_assert!(!entries.is_empty(), "build_leaf_dict called with empty slice");
+
+    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
+
+    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
+    for (key, val_ref) in entries {
+        pairs.push(Object::String(key.clone()));
+        pairs.push(Object::Reference(*val_ref));
+    }
+
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "Limits",
+        Object::Array(vec![
+            Object::String(first),
+            Object::String(last),
+        ]),
+    );
+    dict.insert("Names", Object::Array(pairs));
+    dict
 }
