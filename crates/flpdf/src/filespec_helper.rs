@@ -1985,10 +1985,11 @@ mod tests {
             "/../..",
             "/tests/fixtures/encrypted/v4-aes-128-r4.pdf"
         );
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => return, // Skip if fixture is unavailable.
-        };
+        // The encrypted fixture is committed to the repo, so a missing file is
+        // a real regression — fail loudly instead of silently skipping, which
+        // could turn this into a false-positive pass (CodeRabbit).
+        let file = std::fs::File::open(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v4-aes-128-r4.pdf");
         let opts = crate::PdfOpenOptions {
             password: b"user-v4-aes".to_vec(),
             ..crate::PdfOpenOptions::default()
