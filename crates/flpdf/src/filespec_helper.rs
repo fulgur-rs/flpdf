@@ -81,11 +81,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::filters::decode_stream_data;
+use crate::filters::{decode_stream_data, encode_stream_data};
 use crate::object::{Dictionary, Object, Stream};
 use crate::{Error, ObjectRef, Pdf, Result};
 use md5::{Digest, Md5};
 use std::io::{Read, Seek};
+use std::path::Path;
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
 
@@ -514,6 +515,13 @@ pub struct FileSpecBuilder {
     af_relationship: Option<Vec<u8>>,
     /// Optional date metadata for the `/Params` sub-dictionary.
     dates: FileParamDates,
+    /// Whether to compress the stream payload with FlateDecode.
+    ///
+    /// When `true`, the `/EmbeddedFile` stream is compressed via
+    /// `FlateDecode` using [`encode_stream_data`].  `/Params /Size` and
+    /// `/Params /CheckSum` always reflect the **raw (uncompressed)** bytes
+    /// regardless of this flag (ISO 32000-1 §7.11.4).
+    compress: bool,
 }
 
 impl FileSpecBuilder {
@@ -525,10 +533,10 @@ impl FileSpecBuilder {
     /// `/F` and call no extra setter (UTF-16BE `/UF` is derived from `filename`
     /// via [`encode_utf16be`]).
     ///
-    /// `payload` must be the **decoded** (uncompressed) bytes.  The builder
-    /// writes them verbatim to the stream data (no `/Filter`), so the stream
-    /// `/Length` equals `payload.len()` and [`EmbeddedFileStream::payload`]
-    /// returns the same bytes directly.
+    /// `payload` must be the **decoded** (uncompressed) bytes.  By default the
+    /// builder writes them verbatim to the stream (no `/Filter`).  Call
+    /// [`.compress(true)`](FileSpecBuilder::compress) to enable FlateDecode
+    /// compression.
     pub fn new(filename: impl AsRef<[u8]>, payload: impl Into<Vec<u8>>) -> Self {
         Self {
             filename: filename.as_ref().to_vec(),
@@ -537,7 +545,24 @@ impl FileSpecBuilder {
             description: None,
             af_relationship: None,
             dates: FileParamDates::default(),
+            compress: false,
         }
+    }
+
+    /// Enable or disable FlateDecode compression of the `/EmbeddedFile` stream
+    /// payload (default: `false`).
+    ///
+    /// When `true`, the stream data is compressed via
+    /// `crate::filters::encode_stream_data` with `/Filter /FlateDecode` before
+    /// being stored.  `/Params /Size` and `/Params /CheckSum` always reflect the
+    /// **raw (uncompressed)** bytes regardless of this setting.
+    ///
+    /// Compression is applied through `encode_stream_data`, which automatically
+    /// inherits the `qpdf-zlib-compat` feature when enabled (byte-identical output
+    /// to qpdf's `compress2()` at level 6).
+    pub fn compress(mut self, compress: bool) -> Self {
+        self.compress = compress;
+        self
     }
 
     /// Set the MIME type (stored in `/EmbeddedFile /Subtype`).
@@ -625,10 +650,27 @@ impl FileSpecBuilder {
             // pre-escape here — that would double-escape on serialization.
             ef_dict.insert("Subtype", Object::Name(mime.clone()));
         }
-        ef_dict.insert("Length", Object::Integer(size));
+
+        // Compress if requested. /Params /Size and /Params /CheckSum are
+        // always based on the raw (uncompressed) bytes — determined above —
+        // regardless of compression.
+        let (stream_payload, stored_length) = if self.compress {
+            let mut enc_dict = Dictionary::new();
+            enc_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            let encoded = encode_stream_data(&enc_dict, &self.payload)?;
+            // Add /Filter to the EmbeddedFile stream dictionary so the decoder
+            // knows how to decompress the payload.
+            ef_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            let encoded_len = encoded.len() as i64;
+            (encoded, encoded_len)
+        } else {
+            (self.payload, size)
+        };
+
+        ef_dict.insert("Length", Object::Integer(stored_length));
         ef_dict.insert("Params", Object::Dictionary(params));
 
-        let ef_stream = Stream::new(ef_dict, self.payload);
+        let ef_stream = Stream::new(ef_dict, stream_payload);
         pdf.set_object(stream_ref, Object::Stream(ef_stream));
 
         // ── Build /EF sub-dictionary ──────────────────────────────────────────
@@ -659,5 +701,459 @@ impl FileSpecBuilder {
         pdf.set_object(filespec_ref, Object::Dictionary(fs_dict));
 
         Ok(filespec_ref)
+    }
+}
+
+// ── High-level attachment helper ──────────────────────────────────────────────
+
+/// Load a file from disk and attach it to `pdf`, compressed with FlateDecode.
+///
+/// This is a convenience wrapper around [`FileSpecBuilder`] +
+/// [`crate::embedded_files::insert_embedded_file`] that:
+///
+/// 1. Reads the file at `path` into memory.
+/// 2. Derives the name-tree key and `/F`/`/UF` filename from the path's
+///    **basename** (the last component of the path).
+/// 3. Builds a `/Filespec` + `/EmbeddedFile` pair with FlateDecode compression.
+///    `/Params /Size` and `/Params /CheckSum` reflect the **raw (uncompressed)**
+///    bytes, as required by ISO 32000-1 §7.11.4.
+/// 4. Inserts the pair into the catalog's `/Names /EmbeddedFiles` name tree
+///    under the UTF-8 `key` (which may differ from the basename if the caller
+///    wants an explicit tree key).
+///
+/// Returns the [`ObjectRef`] of the newly created `/Filespec` dictionary.
+///
+/// # Parameters
+///
+/// - `pdf` — the target document (must be mutable).
+/// - `key` — the name-tree key used to look up the attachment later (e.g. the
+///   basename encoded as bytes, or any other agreed-upon string).
+/// - `path` — path to the file on disk; its basename is used for `/F`/`/UF`.
+///
+/// # Errors
+///
+/// - [`Error::Io`] if the file cannot be read.
+/// - [`Error::Unsupported`] if the path has no basename or the basename is not
+///   valid UTF-8.
+/// - Any error from [`FileSpecBuilder::build`] or
+///   [`crate::embedded_files::insert_embedded_file`].
+///
+/// # Example
+///
+/// ```no_run
+/// use std::io::Cursor;
+/// use flpdf::{filespec_helper, Pdf};
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf: Pdf<Cursor<Vec<u8>>> = todo!();
+/// let fs_ref = filespec_helper::add_attachment_from_path(
+///     &mut pdf,
+///     b"README.txt",
+///     "/tmp/README.txt",
+/// )?;
+/// println!("inserted filespec at {fs_ref}");
+/// # Ok(())
+/// # }
+/// ```
+pub fn add_attachment_from_path<R, P>(pdf: &mut Pdf<R>, key: &[u8], path: P) -> Result<ObjectRef>
+where
+    R: Read + Seek,
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+
+    // Derive the basename for /F and /UF.
+    let basename = path
+        .file_name()
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "add_attachment_from_path: path has no basename: {}",
+                path.display()
+            ))
+        })?
+        .to_str()
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "add_attachment_from_path: basename is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+
+    // Read the raw file bytes.
+    let raw = std::fs::read(path)?;
+
+    // Build the /Filespec + /EmbeddedFile and insert into the name tree.
+    let filespec_ref = FileSpecBuilder::new(basename, raw)
+        .compress(true)
+        .build(pdf)?;
+    crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
+
+    Ok(filespec_ref)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedded_files::{insert_embedded_file, list_embedded_files};
+    use crate::filters::decode_stream_data;
+    use crate::{Object, ObjectRef, Pdf};
+    use std::io::Cursor;
+
+    // ── Minimal PDF fixture ───────────────────────────────────────────────────
+
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    fn open_minimal() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Resolve the /EmbeddedFile stream dict for a filespec ref.
+    fn resolve_ef_stream(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        fs_ref: ObjectRef,
+    ) -> crate::object::Stream {
+        let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
+        let Object::Dictionary(fs_dict) = fs_obj else {
+            panic!("expected dictionary");
+        };
+        let ef_sub = match fs_dict.get("EF") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("missing /EF"),
+        };
+        let stream_ref = match ef_sub.get("F") {
+            Some(Object::Reference(r)) => *r,
+            _ => panic!("missing /EF /F ref"),
+        };
+        match pdf.resolve(stream_ref).expect("resolve stream") {
+            Object::Stream(s) => s,
+            _ => panic!("expected stream"),
+        }
+    }
+
+    // ── Tests: FileSpecBuilder with compress(false) — existing behaviour ───────
+
+    #[test]
+    fn builder_uncompressed_round_trip() {
+        let mut pdf = open_minimal();
+        let raw = b"hello world";
+        let fs_ref = FileSpecBuilder::new("test.txt", raw.as_ref())
+            .build(&mut pdf)
+            .expect("build");
+
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        // No /Filter in uncompressed stream
+        assert!(
+            stream.dict.get("Filter").is_none(),
+            "uncompressed stream must have no /Filter"
+        );
+        let decoded = decode_stream_data(&stream.dict, &stream.data).expect("decode");
+        assert_eq!(decoded, raw);
+    }
+
+    // ── Tests: FileSpecBuilder with compress(true) ────────────────────────────
+
+    #[test]
+    fn builder_compressed_has_flatedecode_filter() {
+        let mut pdf = open_minimal();
+        let raw = b"compressed payload data";
+        let fs_ref = FileSpecBuilder::new("data.bin", raw.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build");
+
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            "/Filter must be /FlateDecode"
+        );
+    }
+
+    #[test]
+    fn builder_compressed_round_trip() {
+        let mut pdf = open_minimal();
+        let raw = b"The quick brown fox jumps over the lazy dog.";
+        let fs_ref = FileSpecBuilder::new("fox.txt", raw.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build");
+
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        let decoded = decode_stream_data(&stream.dict, &stream.data).expect("decode");
+        assert_eq!(
+            decoded.as_slice(),
+            raw.as_ref(),
+            "round-trip must restore original bytes"
+        );
+    }
+
+    #[test]
+    fn builder_compressed_params_size_is_raw_length() {
+        let mut pdf = open_minimal();
+        let raw = b"some raw bytes for size check";
+        let fs_ref = FileSpecBuilder::new("size.bin", raw.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build");
+
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        let params = match stream.dict.get("Params") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("missing /Params"),
+        };
+        let stored_size = match params.get("Size") {
+            Some(Object::Integer(n)) => *n,
+            _ => panic!("missing /Params /Size"),
+        };
+        assert_eq!(
+            stored_size,
+            raw.len() as i64,
+            "/Params /Size must equal raw byte length, not compressed length"
+        );
+        // Compressed payload should differ from raw (sanity check)
+        assert_ne!(
+            stream.data.len(),
+            raw.len(),
+            "compressed data length should differ from raw (sanity)"
+        );
+    }
+
+    #[test]
+    fn builder_compressed_params_checksum_is_md5_of_raw() {
+        let mut pdf = open_minimal();
+        let raw = b"checksum test data 12345";
+        let fs_ref = FileSpecBuilder::new("chk.bin", raw.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build");
+
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        let params = match stream.dict.get("Params") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("missing /Params"),
+        };
+        let stored_checksum = match params.get("CheckSum") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /Params /CheckSum"),
+        };
+        let expected = md5_checksum(raw);
+        assert_eq!(
+            stored_checksum, expected,
+            "/Params /CheckSum must be MD5 of raw bytes"
+        );
+    }
+
+    #[test]
+    fn builder_compressed_f_and_uf_are_basename() {
+        let mut pdf = open_minimal();
+        let raw = b"payload";
+        let fs_ref = FileSpecBuilder::new("myfile.txt", raw.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build");
+
+        let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
+        let Object::Dictionary(fs_dict) = fs_obj else {
+            panic!("expected dictionary");
+        };
+        let f = match fs_dict.get("F") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /F"),
+        };
+        let uf = match fs_dict.get("UF") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /UF"),
+        };
+        assert_eq!(f, b"myfile.txt", "/F must be the filename");
+        let expected_uf = encode_utf16be("myfile.txt");
+        assert_eq!(uf, expected_uf, "/UF must be UTF-16BE encoded filename");
+    }
+
+    // ── Tests: FileSpecBuilder → insert_embedded_file → list ─────────────────
+
+    #[test]
+    fn compressed_filespec_retrievable_via_list() {
+        let mut pdf = open_minimal();
+        let raw = b"retrievable payload";
+        let fs_ref = FileSpecBuilder::new("list-test.txt", raw.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build");
+        insert_embedded_file(&mut pdf, b"list-test.txt", fs_ref).expect("insert");
+
+        let entries = list_embedded_files(&mut pdf).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"list-test.txt");
+        assert_eq!(entries[0].1, fs_ref);
+    }
+
+    #[test]
+    fn existing_attachment_survives_second_insertion() {
+        let mut pdf = open_minimal();
+
+        // Insert first attachment (uncompressed for variety)
+        let raw1 = b"first attachment";
+        let fs1 = FileSpecBuilder::new("first.txt", raw1.as_ref())
+            .build(&mut pdf)
+            .expect("build first");
+        insert_embedded_file(&mut pdf, b"first.txt", fs1).expect("insert first");
+
+        // Insert second attachment (compressed)
+        let raw2 = b"second attachment with more data";
+        let fs2 = FileSpecBuilder::new("second.txt", raw2.as_ref())
+            .compress(true)
+            .build(&mut pdf)
+            .expect("build second");
+        insert_embedded_file(&mut pdf, b"second.txt", fs2).expect("insert second");
+
+        let entries = list_embedded_files(&mut pdf).expect("list");
+        assert_eq!(entries.len(), 2, "both attachments must survive");
+        let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+        assert!(
+            keys.contains(&b"first.txt".as_ref()),
+            "first.txt must be present"
+        );
+        assert!(
+            keys.contains(&b"second.txt".as_ref()),
+            "second.txt must be present"
+        );
+    }
+
+    // ── Tests: add_attachment_from_path ───────────────────────────────────────
+
+    #[test]
+    fn add_attachment_from_path_round_trip() {
+        let mut pdf = open_minimal();
+
+        // Write a temp file to attach.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("hello.txt");
+        let raw = b"Hello from disk!";
+        std::fs::write(&file_path, raw).expect("write temp file");
+
+        let fs_ref = add_attachment_from_path(&mut pdf, b"hello.txt", &file_path).expect("attach");
+
+        // Verify retrievable via list_embedded_files
+        let entries = list_embedded_files(&mut pdf).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"hello.txt");
+        assert_eq!(entries[0].1, fs_ref);
+
+        // Verify round-trip decompression
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            "must use FlateDecode"
+        );
+        let decoded = decode_stream_data(&stream.dict, &stream.data).expect("decode");
+        assert_eq!(
+            decoded.as_slice(),
+            raw.as_ref(),
+            "round-trip must restore original bytes"
+        );
+    }
+
+    #[test]
+    fn add_attachment_from_path_checksum_and_size() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("data.bin");
+        let raw = b"deterministic checksum test data";
+        std::fs::write(&file_path, raw).expect("write");
+
+        let fs_ref = add_attachment_from_path(&mut pdf, b"data.bin", &file_path).expect("attach");
+
+        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        let params = match stream.dict.get("Params") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("missing /Params"),
+        };
+        let size = match params.get("Size") {
+            Some(Object::Integer(n)) => *n,
+            _ => panic!("missing /Params /Size"),
+        };
+        let checksum = match params.get("CheckSum") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /Params /CheckSum"),
+        };
+        assert_eq!(
+            size,
+            raw.len() as i64,
+            "/Params /Size must match raw length"
+        );
+        assert_eq!(
+            checksum,
+            md5_checksum(raw),
+            "/Params /CheckSum must match MD5 of raw bytes"
+        );
+    }
+
+    #[test]
+    fn add_attachment_from_path_f_and_uf_are_basename() {
+        let mut pdf = open_minimal();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("report.pdf");
+        std::fs::write(&file_path, b"fake pdf content").expect("write");
+
+        let fs_ref = add_attachment_from_path(&mut pdf, b"report.pdf", &file_path).expect("attach");
+
+        let fs_obj = pdf.resolve(fs_ref).expect("resolve");
+        let Object::Dictionary(fs_dict) = fs_obj else {
+            panic!("expected dict");
+        };
+        let f = match fs_dict.get("F") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /F"),
+        };
+        let uf = match fs_dict.get("UF") {
+            Some(Object::String(b)) => b.clone(),
+            _ => panic!("missing /UF"),
+        };
+        assert_eq!(f, b"report.pdf", "/F must be basename");
+        assert_eq!(
+            uf,
+            encode_utf16be("report.pdf"),
+            "/UF must be UTF-16BE basename"
+        );
+    }
+
+    #[test]
+    fn add_attachment_from_path_errors_on_missing_file() {
+        let mut pdf = open_minimal();
+        let result =
+            add_attachment_from_path(&mut pdf, b"missing.txt", "/this/does/not/exist/missing.txt");
+        assert!(result.is_err(), "must error when file does not exist");
+        // Should be an Io error
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Io(_)),
+            "expected Io error, got: {err:?}"
+        );
     }
 }
