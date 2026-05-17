@@ -91,7 +91,8 @@ pub use content_stream::{
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use embedded_files::{
     delete_embedded_file, insert_embedded_file, list_embedded_files,
-    list_embedded_files_with_max_depth, DEFAULT_MAX_EMBEDDED_FILES_DEPTH, LEAF_MAX,
+    list_embedded_files_with_max_depth, remove_attachment, DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
+    LEAF_MAX,
 };
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{
