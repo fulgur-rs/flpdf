@@ -1962,6 +1962,674 @@ fn pages_help_text_mirrors_qpdf_terms() {
         .stdout(predicate::str::contains("--collate"));
 }
 
+// ── Attachment tests (flpdf-9hc.10.9) ────────────────────────────────────────
+
+/// Write a minimal valid PDF to a tempfile and return the path.
+fn minimal_pdf_temp() -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(include_bytes!("../../../tests/fixtures/minimal.pdf"))
+        .unwrap();
+    f
+}
+
+#[test]
+fn add_attachment_default_key_is_basename() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("hello.txt");
+    std::fs::write(&attachment, b"hello world").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // The key should default to "hello.txt".
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt"));
+}
+
+#[test]
+fn add_attachment_explicit_key_and_filename() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("data.bin");
+    std::fs::write(&attachment, b"binary data").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=mykey",
+            "--filename=renamed.bin",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mykey"));
+}
+
+#[test]
+fn add_attachment_subflag_mimetype_description_afrelationship() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("report.pdf");
+    std::fs::write(&attachment, b"%PDF-1.4 report").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=report",
+            "--mimetype=application/pdf",
+            "--description=Annual Report",
+            "--afrelationship=Data",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("report"));
+}
+
+#[test]
+fn add_attachment_subflag_creationdate_and_moddate() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("dated.txt");
+    std::fs::write(&attachment, b"dated content").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=dated",
+            "--creationdate=D:20240101120000",
+            "--moddate=D:20240201130000",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dated"));
+}
+
+#[test]
+fn add_attachment_replace_flag_overwrites_existing() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("file.txt");
+    std::fs::write(&attachment, b"first content").unwrap();
+    let out1 = temp.path().join("out1.pdf");
+
+    // Add first version.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=myfile",
+            "--",
+            out1.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Update content and add with --replace.
+    std::fs::write(&attachment, b"second content").unwrap();
+    let out2 = temp.path().join("out2.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            out1.to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=myfile",
+            "--replace",
+            "--",
+            out2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Should still have exactly one entry.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", out2.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("myfile"));
+}
+
+#[test]
+fn add_attachment_without_replace_fails_on_duplicate_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("file.txt");
+    std::fs::write(&attachment, b"content").unwrap();
+    let out1 = temp.path().join("out1.pdf");
+
+    // Add first version.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=dupkey",
+            "--",
+            out1.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Add again without --replace → should fail.
+    let out2 = temp.path().join("out2.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            out1.to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=dupkey",
+            "--",
+            out2.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dupkey"))
+        .stderr(predicate::str::contains("--replace"));
+}
+
+#[test]
+fn remove_attachment_removes_existing_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("removeme.txt");
+    std::fs::write(&attachment, b"to be removed").unwrap();
+    let out1 = temp.path().join("out1.pdf");
+
+    // Add the attachment.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=removeme",
+            "--",
+            out1.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Verify it's there.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", out1.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removeme"));
+
+    // Remove it.
+    let out2 = temp.path().join("out2.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            out1.to_str().unwrap(),
+            "--remove-attachment=removeme",
+            out2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Verify it's gone.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", out2.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn remove_attachment_errors_on_missing_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--remove-attachment=nosuchkey",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nosuchkey"));
+}
+
+#[test]
+fn list_attachments_empty_document() {
+    let input = minimal_pdf_temp();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", input.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn list_attachments_shows_one_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("listed.txt");
+    std::fs::write(&attachment, b"listed content").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=listed",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("listed"));
+}
+
+#[test]
+fn list_attachments_verbose_shows_extra_info() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("verbose.txt");
+    std::fs::write(&attachment, b"verbose content").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=verbose",
+            "--mimetype=text/plain",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // --verbose should produce more output than plain --list-attachments.
+    let plain_out = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .stdout;
+
+    let verbose_out = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose", output.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .stdout;
+
+    // verbose output should be longer
+    assert!(
+        verbose_out.len() >= plain_out.len(),
+        "verbose output should be at least as long as plain output"
+    );
+    // verbose output should mention the key
+    assert!(
+        String::from_utf8_lossy(&verbose_out).contains("verbose"),
+        "verbose output should contain the key"
+    );
+}
+
+#[test]
+fn show_attachment_writes_to_stdout() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let payload = b"payload bytes for stdout test";
+    let attachment = temp.path().join("stdout.txt");
+    std::fs::write(&attachment, payload).unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=showme",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let stdout_bytes = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-attachment=showme", output.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .stdout;
+
+    assert_eq!(stdout_bytes, payload);
+}
+
+#[test]
+fn show_attachment_writes_to_file_with_o_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let payload = b"payload bytes for file test";
+    let attachment = temp.path().join("tofile.txt");
+    std::fs::write(&attachment, payload).unwrap();
+    let out_pdf = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=tofile",
+            "--",
+            out_pdf.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let extracted = temp.path().join("extracted.txt");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-attachment=tofile",
+            "--show-attachment-to",
+            extracted.to_str().unwrap(),
+            out_pdf.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let read_back = std::fs::read(&extracted).unwrap();
+    assert_eq!(read_back, payload);
+}
+
+#[test]
+fn show_attachment_errors_on_missing_key() {
+    let input = minimal_pdf_temp();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-attachment=nosuchkey",
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nosuchkey"));
+}
+
+#[test]
+fn copy_attachments_from_copies_all_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let source_input = minimal_pdf_temp();
+
+    // Build a source PDF with two attachments.
+    let att1 = temp.path().join("att1.txt");
+    std::fs::write(&att1, b"attachment one").unwrap();
+    let source_with_one = temp.path().join("src1.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            source_input.path().to_str().unwrap(),
+            "--add-attachment",
+            att1.to_str().unwrap(),
+            "--key=att1",
+            "--",
+            source_with_one.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let att2 = temp.path().join("att2.txt");
+    std::fs::write(&att2, b"attachment two").unwrap();
+    let source_with_two = temp.path().join("src2.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            source_with_one.to_str().unwrap(),
+            "--add-attachment",
+            att2.to_str().unwrap(),
+            "--key=att2",
+            "--",
+            source_with_two.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Copy attachments from the source into a fresh target.
+    let output = temp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--copy-attachments-from",
+            source_with_two.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("att1"))
+        .stdout(predicate::str::contains("att2"));
+}
+
+#[test]
+fn copy_attachments_from_with_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let source_input = minimal_pdf_temp();
+
+    let att = temp.path().join("original.txt");
+    std::fs::write(&att, b"original content").unwrap();
+    let source = temp.path().join("source.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            source_input.path().to_str().unwrap(),
+            "--add-attachment",
+            att.to_str().unwrap(),
+            "--key=original",
+            "--",
+            source.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = temp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--copy-attachments-from",
+            source.to_str().unwrap(),
+            "--prefix=pfx-",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pfx-original"));
+}
+
+#[test]
+fn attachment_round_trip_add_list_show_remove_copy() {
+    // Full end-to-end round-trip as described in the subtask acceptance criteria.
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let payload = b"round-trip payload bytes \x00\x01\x02";
+    let att = temp.path().join("rtrip.bin");
+    std::fs::write(&att, payload).unwrap();
+
+    // 1. add
+    let after_add = temp.path().join("after_add.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            att.to_str().unwrap(),
+            "--key=rtrip",
+            "--",
+            after_add.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // 2. list → contains "rtrip"
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", after_add.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rtrip"));
+
+    // 3. show → bytes match payload exactly
+    let stdout_bytes = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-attachment=rtrip", after_add.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(stdout_bytes, payload.to_vec());
+
+    // 4. remove
+    let after_remove = temp.path().join("after_remove.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            after_add.to_str().unwrap(),
+            "--remove-attachment=rtrip",
+            after_remove.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // 5. list → empty
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", after_remove.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    // 6. copy from original (has "rtrip") into the now-empty PDF
+    let after_copy = temp.path().join("after_copy.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            after_remove.to_str().unwrap(),
+            "--copy-attachments-from",
+            after_add.to_str().unwrap(),
+            "--",
+            after_copy.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // 7. list → "rtrip" reappears
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", after_copy.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rtrip"));
+}
+
+#[test]
+fn attachment_help_text_contains_expected_flags() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--add-attachment"))
+        .stdout(predicate::str::contains("--remove-attachment"))
+        .stdout(predicate::str::contains("--list-attachments"))
+        .stdout(predicate::str::contains("--show-attachment"))
+        .stdout(predicate::str::contains("--copy-attachments-from"));
+}
+
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
