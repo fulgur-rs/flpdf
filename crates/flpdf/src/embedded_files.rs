@@ -69,9 +69,7 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 /// # Errors
 ///
 /// Propagates any error from [`Pdf::resolve`].
-pub fn list_embedded_files<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<Vec<(Vec<u8>, ObjectRef)>> {
+pub fn list_embedded_files<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<(Vec<u8>, ObjectRef)>> {
     list_embedded_files_with_max_depth(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
 }
 
