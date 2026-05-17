@@ -10,19 +10,24 @@
 //! running `qpdf --split-pages=2 <in>.pdf <out>.pdf` with various page counts:
 //!
 //! ```text
+//! # 3-page source, split=1 → 3 chunks (observed: out-1.pdf, out-2.pdf, out-3.pdf)
 //! # 5-page source, split=2 → 3 chunks (observed: _out-1-2.pdf, _out-3-4.pdf, _out-5-5.pdf)
 //! # 11-page source, split=2 → 6 chunks (observed: _out11-01-02.pdf, ..., _out11-11-11.pdf)
 //! # 100-page source, split=10 → 10 chunks (observed: _out100-001-010.pdf, ...)
 //! ```
 //!
-//! The pattern is: `{stem}-{first}-{last}{ext}` where:
-//! - The separator between stem and page range is `-`.
-//! - `first` and `last` are 1-based page numbers of the **source document**.
-//! - Both numbers are zero-padded to the digit-width of the **source page
+//! The pattern is `{stem}-{first}-{last}{ext}` for `--split-pages >= 2`, and
+//! `{stem}-{page}{ext}` for `--split-pages=1` (qpdf 11.9.0 emits a single
+//! page number per chunk when every chunk is one page; the range form is
+//! retained for `>= 2`, including a trailing single-page chunk). In both
+//! forms:
+//! - The separator between stem and page number(s) is `-`.
+//! - Page numbers are 1-based positions in the **source document**.
+//! - Each number is zero-padded to the digit-width of the **source page
 //!   count** (NOT the chunk count).  For 1–9 pages: no padding (width=1);
 //!   for 10–99 pages: width=2; for 100–999 pages: width=3, etc.
-//! - The extension (including the `.`) comes after `last`. If the template
-//!   has no extension, no `.` is added.
+//! - The extension (including the `.`) comes after the page number(s). If
+//!   the template has no extension, no `.` is added.
 //! - The split is at the **last** `.` in the filename portion of the path
 //!   (confirmed with `two.dots.pdf` → `two.dots-1-2.pdf`).
 //!
@@ -90,10 +95,11 @@ use std::path::{Path, PathBuf};
 /// - `src_bytes`: Raw bytes of the source PDF (read once, reused per chunk).
 /// - `chunk_size`: Number of pages per chunk (`N` in `--split-pages=N`). Must
 ///   be ≥ 1. Values ≥ total page count emit a single file containing all pages.
-/// - `output_template`: Output path template. The output filenames are derived
-///   by inserting `-{first}-{last}` immediately before the last `.` in the
-///   filename (or at the end if there is no `.`). Example: `output.pdf` →
-///   `output-1-2.pdf`.
+/// - `output_template`: Output path template. The page suffix is inserted
+///   immediately before the last `.` in the filename (or at the end if there
+///   is no `.`): `-{first}-{last}` for `chunk_size >= 2` (e.g. `output.pdf`
+///   → `output-1-2.pdf`), or `-{page}` for `chunk_size == 1` (e.g.
+///   `output.pdf` → `output-1.pdf`), matching qpdf 11.9.0.
 ///
 /// # Errors
 ///
