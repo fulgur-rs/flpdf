@@ -142,11 +142,13 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
         _ => None, // direct-dict filespec — no ref to GC
     };
 
-    // Resolve the /EmbeddedFile stream ref via /EF of the filespec (if any).
-    let stream_ref_opt: Option<ObjectRef> = if let Some(fs_ref) = filespec_ref_opt {
-        resolve_embedded_file_stream_ref(pdf, fs_ref)?
+    // Collect *all* /EmbeddedFile stream refs reachable via the filespec's
+    // `/EF` (a filespec may carry distinct streams under /UF, /F, /Unix,
+    // /Mac, /DOS — not just the first one).
+    let stream_refs: Vec<ObjectRef> = if let Some(fs_ref) = filespec_ref_opt {
+        collect_embedded_file_stream_refs(pdf, fs_ref)?
     } else {
-        None
+        Vec::new()
     };
 
     // ── Step 2: remove the name-tree entry ────────────────────────────────────
@@ -177,61 +179,53 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
     // same filespec/stream and must keep counting (roborev #947).
     let gc_exclude: BTreeSet<ObjectRef> = collect_dead_name_tree_node_refs(pdf)?;
 
-    match (filespec_ref_opt, stream_ref_opt) {
-        // Filespec + embedded stream: a mutually-referencing pair.  The
-        // filespec points at the stream via `/EF`; pathological documents may
-        // also have the stream dictionary point back at the filespec.  Decide
-        // both together so we never delete one while a *live* (preserved)
-        // peer keeps a dangling reference to it (roborev #949).
+    if let Some(fs_ref) = filespec_ref_opt {
+        // The filespec and its `/EmbeddedFile` stream(s) form a
+        // mutually-referencing group: the filespec points at each stream via
+        // `/EF`, and pathological documents may also have a stream dictionary
+        // point back at the filespec.  Decide the whole group together so we
+        // never delete one member while a *live* (preserved) peer keeps a
+        // dangling reference to it (roborev #949, #950-1).
         //
-        // Pass 1 — external references, with the whole pair excluded so their
-        // mutual `/EF` (and any back-) edges do not self-preserve the pair.
-        // Pass 2 — propagate "keep": `keep_fs ⇒ keep_st` (the `/EF` edge always
-        // exists), and `keep_st ⇒ keep_fs` iff the stream really back-refs the
-        // filespec.  The pair has ≤2 nodes and ≤2 edges with monotone updates,
-        // so this two-pass propagation reaches the fixpoint in one iteration.
-        (Some(fs_ref), Some(st_ref)) => {
-            let pair_self = [fs_ref, st_ref];
-            let fs_ext =
-                is_referenced_by_live_objects_excluding(pdf, fs_ref, &pair_self, &gc_exclude)?;
+        // Pass 1 — external references, with the entire group excluded so the
+        // group's internal `/EF` (and any back-) edges do not self-preserve it.
+        // Pass 2 — propagate "keep": keeping the filespec keeps every stream
+        // (the `/EF` edges always exist); keeping a stream keeps the filespec
+        // iff that stream genuinely back-refs it.  The group is finite with
+        // monotone updates, so this reaches the fixpoint in one pass.
+        let mut group_self: Vec<ObjectRef> = Vec::with_capacity(stream_refs.len() + 1);
+        group_self.push(fs_ref);
+        group_self.extend_from_slice(&stream_refs);
+
+        let fs_ext =
+            is_referenced_by_live_objects_excluding(pdf, fs_ref, &group_self, &gc_exclude)?;
+        let mut keep_fs = fs_ext;
+
+        // Per-stream external reference, plus whether it back-refs the filespec.
+        let mut stream_state: Vec<(ObjectRef, bool, bool)> = Vec::with_capacity(stream_refs.len());
+        for &st_ref in &stream_refs {
             let st_ext =
-                is_referenced_by_live_objects_excluding(pdf, st_ref, &pair_self, &gc_exclude)?;
-
-            let mut keep_fs = fs_ext;
-            let mut keep_st = st_ext;
-
-            // The filespec always references the stream via `/EF`, so keeping
-            // the filespec means the stream must survive too.
-            if keep_fs {
-                keep_st = true;
+                is_referenced_by_live_objects_excluding(pdf, st_ref, &group_self, &gc_exclude)?;
+            let st_obj = pdf.resolve(st_ref)?;
+            let back_refs_fs = object_contains_ref(&st_obj, fs_ref);
+            if st_ext && back_refs_fs {
+                keep_fs = true;
             }
-            // The stream only references the filespec in pathological docs —
-            // verify by inspecting the resolved stream object.
-            if keep_st && !keep_fs {
-                let st_obj = pdf.resolve(st_ref)?;
-                if object_contains_ref(&st_obj, fs_ref) {
-                    keep_fs = true;
-                }
-            }
+            stream_state.push((st_ref, st_ext, back_refs_fs));
+        }
 
-            if !keep_fs {
-                pdf.delete_object(fs_ref);
-            }
+        // Keeping the filespec keeps every stream it references via `/EF`.
+        for (st_ref, st_ext, _back) in &stream_state {
+            let keep_st = *st_ext || keep_fs;
             if !keep_st {
-                pdf.delete_object(st_ref);
+                pdf.delete_object(*st_ref);
             }
         }
-        // Filespec without a resolvable embedded stream (no `/EF`): GC the
-        // filespec alone if nothing live still references it.
-        (Some(fs_ref), None) => {
-            let self_refs = [fs_ref];
-            if !is_referenced_by_live_objects_excluding(pdf, fs_ref, &self_refs, &gc_exclude)? {
-                pdf.delete_object(fs_ref);
-            }
+        if !keep_fs {
+            pdf.delete_object(fs_ref);
         }
-        // Direct-dict filespec (no indirect ref to GC) — nothing to delete.
-        (None, _) => {}
     }
+    // Direct-dict filespec (`filespec_ref_opt == None`): no indirect ref to GC.
 
     Ok(true)
 }
@@ -241,6 +235,10 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
 /// Walk a `/Filespec` dict and return the first `/EmbeddedFile` stream `ObjectRef`
 /// reachable via `/EF /UF`, `/EF /F`, `/EF /Unix`, `/EF /Mac`, `/EF /DOS` (in
 /// that priority order).  Returns `None` if not found or on any soft error.
+///
+/// Retained for single-stream test fixtures; production code uses
+/// [`collect_embedded_file_stream_refs`] to handle multi-stream filespecs.
+#[cfg(test)]
 fn resolve_embedded_file_stream_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filespec_ref: ObjectRef,
@@ -266,6 +264,47 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
         }
     }
     Ok(None)
+}
+
+/// Walk a `/Filespec` dict and return **every distinct** `/EmbeddedFile`
+/// stream `ObjectRef` reachable via `/EF /UF`, `/EF /F`, `/EF /Unix`,
+/// `/EF /Mac`, `/EF /DOS`.
+///
+/// A filespec usually points all `/EF` keys at one stream, but the keys may
+/// reference *distinct* stream objects; `remove_attachment` must GC each of
+/// them, not just the highest-priority one (roborev #950-1).  Returns an
+/// empty vector if the filespec has no resolvable `/EF` stream.  Order is
+/// deterministic (`/UF` → `/F` → `/Unix` → `/Mac` → `/DOS`) with duplicates
+/// removed.
+fn collect_embedded_file_stream_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filespec_ref: ObjectRef,
+) -> Result<Vec<ObjectRef>> {
+    let fs_obj = pdf.resolve(filespec_ref)?;
+    let Object::Dictionary(fs_dict) = fs_obj else {
+        return Ok(Vec::new());
+    };
+    let ef_dict: Dictionary = match fs_dict.get("EF") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => {
+            let r = *r;
+            match pdf.resolve(r)? {
+                Object::Dictionary(d) => d,
+                _ => return Ok(Vec::new()),
+            }
+        }
+        _ => return Ok(Vec::new()),
+    };
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut out: Vec<ObjectRef> = Vec::new();
+    for key in &["UF", "F", "Unix", "Mac", "DOS"] {
+        if let Some(Object::Reference(r)) = ef_dict.get(key) {
+            if seen.insert(*r) {
+                out.push(*r);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Remove all occurrences of `target_ref` from `/AF` arrays on the catalog and
@@ -336,6 +375,17 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
         },
         _ => return Ok(()),
     };
+
+    // Early no-op: if `target_ref` is not actually present, do NOT mutate the
+    // parent dict or delete the indirect array object — an unrelated empty (or
+    // target-absent) indirect /AF array may be shared and must be left intact
+    // (roborev #950-2).
+    if !af_array
+        .iter()
+        .any(|o| matches!(o, Object::Reference(r) if *r == target_ref))
+    {
+        return Ok(());
+    }
 
     let filtered: Vec<Object> = af_array
         .into_iter()
@@ -1376,6 +1426,132 @@ mod tests {
         assert!(
             live.contains(&fs_b),
             "the other filespec sharing the stream must remain intact"
+        );
+    }
+
+    // ── Test: filespec with distinct /EF streams GCs all of them ─────────────
+    //
+    // Regression for roborev #950-1: only the first /EF stream was resolved,
+    // so sibling streams under other /EF keys were orphaned (left live) once
+    // the filespec was GC-deleted.
+    #[test]
+    fn remove_attachment_gcs_all_distinct_ef_streams() {
+        let mut pdf = open_minimal();
+
+        let fs_ref = FileSpecBuilder::new("multi.txt", b"primary stream")
+            .build(&mut pdf)
+            .expect("build filespec");
+
+        // The builder points /EF /F and /EF /UF at one stream; capture it.
+        let Object::Dictionary(fs_dict) = pdf.resolve(fs_ref).expect("resolve fs") else {
+            panic!("expected filespec dict");
+        };
+        let Some(Object::Dictionary(mut ef)) = fs_dict.get("EF").cloned() else {
+            panic!("expected inline /EF dict");
+        };
+        let stream_f = match ef.get("F") {
+            Some(Object::Reference(r)) => *r,
+            _ => panic!("expected /EF /F indirect stream"),
+        };
+
+        // Add a *distinct* second stream object under /EF /UF.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let stream_uf = ObjectRef::new(next + 1, 0);
+        let mut s2 = Dictionary::new();
+        s2.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        pdf.set_object(
+            stream_uf,
+            Object::Stream(crate::object::Stream {
+                dict: s2,
+                data: b"sibling stream".to_vec(),
+            }),
+        );
+        ef.insert("UF", Object::Reference(stream_uf));
+        let Object::Dictionary(mut fs_dict_mut) = pdf.resolve(fs_ref).expect("resolve fs") else {
+            panic!("expected filespec dict");
+        };
+        fs_dict_mut.insert("EF", Object::Dictionary(ef));
+        pdf.set_object(fs_ref, Object::Dictionary(fs_dict_mut));
+
+        insert_embedded_file(&mut pdf, b"multi.txt", fs_ref).expect("insert");
+
+        let removed = remove_attachment(&mut pdf, b"multi.txt").expect("remove");
+        assert!(removed);
+
+        let live = pdf.live_object_refs();
+        assert!(!live.contains(&fs_ref), "filespec must be GC-deleted");
+        assert!(
+            !live.contains(&stream_f),
+            "primary /EF /F stream must be GC-deleted"
+        );
+        assert!(
+            !live.contains(&stream_uf),
+            "distinct /EF /UF sibling stream must also be GC-deleted (not orphaned)"
+        );
+    }
+
+    // ── Test: empty/target-absent indirect /AF array is left untouched ───────
+    //
+    // Regression for roborev #950-2: an *empty* (or target-absent) indirect
+    // /AF array used to be deleted and its parent /AF key removed even though
+    // the target ref was never present — dangling the array if it is shared.
+    #[test]
+    fn remove_attachment_leaves_empty_indirect_af_array_intact() {
+        let mut pdf = open_minimal();
+
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+
+        // An empty indirect /AF array object, shared by the catalog *and* a
+        // second dictionary so wrongly deleting it would dangle a live ref.
+        let af_array_ref = ObjectRef::new(next + 1, 0);
+        pdf.set_object(af_array_ref, Object::Array(vec![]));
+
+        let sharer_ref = ObjectRef::new(next + 2, 0);
+        let mut sharer = Dictionary::new();
+        sharer.insert("AF", Object::Reference(af_array_ref));
+        pdf.set_object(sharer_ref, Object::Dictionary(sharer));
+
+        let catalog_ref = pdf.root_ref().expect("root");
+        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        else {
+            panic!("expected catalog dict");
+        };
+        catalog.insert("AF", Object::Reference(af_array_ref));
+        catalog.insert("Sharer", Object::Reference(sharer_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        // Add and remove an unrelated attachment.  Its filespec is NOT in the
+        // empty indirect /AF array, so the array and parent key must survive.
+        let fs_ref = FileSpecBuilder::new("x.txt", b"x")
+            .build(&mut pdf)
+            .expect("build");
+        insert_embedded_file(&mut pdf, b"x.txt", fs_ref).expect("insert");
+
+        let removed = remove_attachment(&mut pdf, b"x.txt").expect("remove");
+        assert!(removed);
+
+        let live = pdf.live_object_refs();
+        assert!(
+            live.contains(&af_array_ref),
+            "empty indirect /AF array (target absent) must NOT be deleted"
+        );
+        let Object::Dictionary(catalog2) = pdf.resolve(catalog_ref).expect("resolve catalog after")
+        else {
+            panic!("expected catalog dict");
+        };
+        assert!(
+            matches!(catalog2.get("AF"), Some(Object::Reference(r)) if *r == af_array_ref),
+            "catalog /AF must still point at the untouched indirect array"
         );
     }
 
