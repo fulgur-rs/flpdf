@@ -201,7 +201,7 @@ impl Object {
             Object::Real(value) => out.extend_from_slice(value.to_string().as_bytes()),
             Object::Name(name) => {
                 out.push(b'/');
-                out.extend_from_slice(name);
+                write_name_escaped(out, name);
             }
             Object::String(value) => {
                 if is_printable_string(value) {
@@ -248,6 +248,42 @@ impl Object {
             Object::Reference(object_ref) => {
                 out.extend_from_slice(object_ref.to_string().as_bytes())
             }
+        }
+    }
+}
+
+/// Escape a name's raw (logical) bytes into PDF name-token syntax per
+/// ISO 32000-1 §7.3.5: any byte outside the printable ASCII range
+/// `0x21..=0x7E`, any PDF delimiter (`( ) < > [ ] { } / %`), and `#`
+/// itself are written as `#XX` (two uppercase hex digits). All other
+/// bytes pass through unchanged.
+///
+/// `Object::Name` always holds *decoded* bytes (the parser unescapes
+/// `#XX` on read — see `Parser::name`), so escaping on write keeps the
+/// read/write pair symmetric: `Name(b"application/pdf")` serializes to
+/// `/application#2Fpdf` and round-trips back to `application/pdf`.
+/// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no
+/// escapable bytes, so their output is byte-identical to before.
+pub(crate) fn escape_name_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    write_name_escaped(&mut out, raw);
+    out
+}
+
+fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in raw {
+        let needs_escape = !(0x21..=0x7E).contains(&b)
+            || matches!(
+                b,
+                b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
+            );
+        if needs_escape {
+            out.push(b'#');
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 0x0F) as usize]);
+        } else {
+            out.push(b);
         }
     }
 }
