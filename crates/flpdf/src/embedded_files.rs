@@ -88,144 +88,86 @@ use std::io::{Read, Seek};
 
 // ── remove_attachment ─────────────────────────────────────────────────────────
 
-/// Remove an attachment by name-tree key, including garbage collection of the
-/// now-unreferenced `/Filespec` and `/EmbeddedFile` stream objects.
+/// Remove an attachment by name-tree key, then garbage-collect via a
+/// mark-and-sweep from `/Root` (the qpdf rewrite model).
 ///
 /// # Behaviour
 ///
 /// 1. Looks up `key` in the catalog's `/Names /EmbeddedFiles` name tree.
 ///    Returns `Ok(false)` — without error — if the key is absent.
-/// 2. Before any mutation, captures the `filespec_ref` (if the value is an
-///    indirect reference) and the `/EmbeddedFile` stream ref reachable via
-///    `/EF /UF` › `/EF /F` › other standard keys.
-/// 3. Calls [`delete_embedded_file`] to remove the name-tree entry.
-/// 4. Clears any references to `filespec_ref` from the `/AF` array in the
-///    document catalog and in every page dictionary.  If the `/AF` array
-///    becomes empty after removal, the `/AF` key itself is deleted.
-/// 5. **Conservative GC:** if `filespec_ref` or `stream_ref` now appear in
-///    zero live objects (other than themselves), [`Pdf::delete_object`] is
-///    called to physically remove them.  If another object still references
-///    them they are left intact.
+/// 2. Calls [`delete_embedded_file`] to remove the name-tree entry (rebuilds
+///    the tree; superseded leaf/intermediate nodes become orphans).
+/// 3. Clears references to the filespec from the `/AF` array in the document
+///    catalog and in every page dictionary.  If a `/AF` array becomes empty
+///    the `/AF` key itself is deleted; a shared indirect `/AF` array object
+///    is patched in place, never deleted here (see
+///    [`remove_ref_from_af_in_dict`]).
+/// 4. **Mark-and-sweep GC** ([`crate::subset_prune::sweep_unreachable_objects`]):
+///    every indirect object no longer reachable from `/Root` or the trailer
+///    is physically deleted. This drops the removed `/Filespec`, *all* its
+///    `/EF` streams (including a filespec carrying distinct streams under
+///    several `/EF` keys), any sub-objects reachable only through it, and the
+///    orphan ghost name-tree nodes left by the rebuild — in one pass, with no
+///    per-feature reachability heuristics.
+///
+/// The conservative-share semantics are automatic: an `/EmbeddedFile` stream
+/// still reachable from another live object (e.g. shared between two
+/// filespecs, or a filespec still referenced by a live `/Dests` /
+/// `/JavaScript` name tree) stays reachable and therefore survives the sweep.
+///
+/// # Blast radius
+///
+/// The sweep is **document-wide**, not scoped to the removed attachment: any
+/// *pre-existing* object that was already unreachable from `/Root` is also
+/// collected. This matches qpdf's complete-rewrite behaviour (its writer only
+/// emits reachable objects) and flpdf's own page-subset pruning, so the
+/// observable output is qpdf-aligned rather than a targeted in-place edit.
 ///
 /// # Limitation
 ///
 /// When the name-tree value is a *direct* `/Filespec` dictionary (not an
-/// indirect reference), there is no `ObjectRef` to GC.  The name-tree entry
-/// is removed and `/AF` is cleared for indirect refs that happen to match
-/// nothing; only the tree entry itself is gone.  This case is exceedingly rare
-/// in practice (ISO 32000-1 §7.11 expects indirect refs), but is handled
-/// gracefully — no panic, no spurious error.
-///
-/// # GC conservatism
-///
-/// The reachability scan walks every live object in the document and checks
-/// whether its serialised object graph contains a reference to the target
-/// `ObjectRef`.  If any live object (other than the target itself) still holds
-/// a reference, the target is preserved.  This avoids breaking documents that
-/// — unusually — share a single `/EmbeddedFile` stream between two filespecs.
+/// indirect reference) there is no `ObjectRef` to clear from `/AF`; the
+/// name-tree entry is removed and the sweep still runs. This case is
+/// exceedingly rare in practice (ISO 32000-1 §7.11 expects indirect refs)
+/// and is handled gracefully — no panic, no spurious error.
 ///
 /// # Errors
 ///
 /// Propagates any error from [`Pdf::resolve`] or [`delete_embedded_file`].
 pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
-    // ── Step 1: locate the entry and capture refs (before any mutation) ───────
-    // We need both the filespec_ref and the stream_ref before we mutate the tree.
+    // ── Step 1: locate the entry ──────────────────────────────────────────────
     let entries = collect_embedded_file_pairs_raw(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)?;
     let target_value = match entries.iter().find(|(k, _)| k.as_slice() == key) {
         Some((_, v)) => v.clone(),
         None => return Ok(false),
     };
 
-    // Extract indirect filespec ref (if the value is an indirect reference).
+    // The filespec ref is only needed to clear it from `/AF` (so that path
+    // stops keeping it reachable). Direct-dict filespecs have no ref.
     let filespec_ref_opt: Option<ObjectRef> = match &target_value {
         Object::Reference(r) => Some(*r),
-        _ => None, // direct-dict filespec — no ref to GC
+        _ => None,
     };
 
-    // Collect *all* /EmbeddedFile stream refs reachable via the filespec's
-    // `/EF` (a filespec may carry distinct streams under /UF, /F, /Unix,
-    // /Mac, /DOS — not just the first one).
-    let stream_refs: Vec<ObjectRef> = if let Some(fs_ref) = filespec_ref_opt {
-        collect_embedded_file_stream_refs(pdf, fs_ref)?
-    } else {
-        Vec::new()
-    };
-
-    // ── Step 2: remove the name-tree entry ────────────────────────────────────
+    // ── Step 2: detach the name-tree entry ────────────────────────────────────
     delete_embedded_file(pdf, key)?;
 
     // ── Step 3: clear /AF references on catalog and all pages ─────────────────
+    // Done before the sweep so a stale `/AF` edge cannot keep the filespec
+    // artificially reachable.
     if let Some(fs_ref) = filespec_ref_opt {
         clear_af_reference(pdf, fs_ref)?;
     }
 
-    // ── Step 4: conservative GC ───────────────────────────────────────────────
-    // Check whether the filespec is referenced by any live object OTHER than:
-    //   - itself
-    //   - dead name-tree ghost nodes (see below)
-    //   - the stream ref (whose edge to the stream we separately check)
-    //
-    // `rebuild_embedded_files_tree` (called by `delete_embedded_file`) does not
-    // `delete_object` superseded name-tree leaf/intermediate nodes; they linger
-    // in `live_object_refs()` as ghosts that still reference the old
-    // filespec/stream.  We must exclude those ghosts from the scan, otherwise
-    // their stale references would falsely preserve the objects.
-    //
-    // Collecting the exclude set *after* the rebuild is essential: only then are
-    // the superseded nodes unreachable from the catalog and thus identifiable as
-    // ghosts.  We exclude name-tree-shaped objects that are NOT reachable from
-    // the catalog — never a live, catalog-reachable name tree (`/Dests`,
-    // `/JavaScript`, a custom tree, …), which may legitimately reference the
-    // same filespec/stream and must keep counting (roborev #947).
-    let gc_exclude: BTreeSet<ObjectRef> = collect_dead_name_tree_node_refs(pdf)?;
-
-    if let Some(fs_ref) = filespec_ref_opt {
-        // The filespec and its `/EmbeddedFile` stream(s) form a
-        // mutually-referencing group: the filespec points at each stream via
-        // `/EF`, and pathological documents may also have a stream dictionary
-        // point back at the filespec.  Decide the whole group together so we
-        // never delete one member while a *live* (preserved) peer keeps a
-        // dangling reference to it (roborev #949, #950-1).
-        //
-        // Pass 1 — external references, with the entire group excluded so the
-        // group's internal `/EF` (and any back-) edges do not self-preserve it.
-        // Pass 2 — propagate "keep": keeping the filespec keeps every stream
-        // (the `/EF` edges always exist); keeping a stream keeps the filespec
-        // iff that stream genuinely back-refs it.  The group is finite with
-        // monotone updates, so this reaches the fixpoint in one pass.
-        let mut group_self: Vec<ObjectRef> = Vec::with_capacity(stream_refs.len() + 1);
-        group_self.push(fs_ref);
-        group_self.extend_from_slice(&stream_refs);
-
-        let fs_ext =
-            is_referenced_by_live_objects_excluding(pdf, fs_ref, &group_self, &gc_exclude)?;
-        let mut keep_fs = fs_ext;
-
-        // Per-stream external reference, plus whether it back-refs the filespec.
-        let mut stream_state: Vec<(ObjectRef, bool, bool)> = Vec::with_capacity(stream_refs.len());
-        for &st_ref in &stream_refs {
-            let st_ext =
-                is_referenced_by_live_objects_excluding(pdf, st_ref, &group_self, &gc_exclude)?;
-            let st_obj = pdf.resolve(st_ref)?;
-            let back_refs_fs = object_contains_ref(&st_obj, fs_ref);
-            if st_ext && back_refs_fs {
-                keep_fs = true;
-            }
-            stream_state.push((st_ref, st_ext, back_refs_fs));
-        }
-
-        // Keeping the filespec keeps every stream it references via `/EF`.
-        for (st_ref, st_ext, _back) in &stream_state {
-            let keep_st = *st_ext || keep_fs;
-            if !keep_st {
-                pdf.delete_object(*st_ref);
-            }
-        }
-        if !keep_fs {
-            pdf.delete_object(fs_ref);
-        }
-    }
-    // Direct-dict filespec (`filespec_ref_opt == None`): no indirect ref to GC.
+    // ── Step 4: mark-and-sweep GC (qpdf model) ────────────────────────────────
+    // Once the entry is detached and `/AF` cleared, the removed filespec, its
+    // `/EF` stream(s), any objects reachable only through it, and the orphan
+    // ghost name-tree nodes left by the rebuild are all unreachable from
+    // `/Root`/trailer and are physically dropped here. A filespec/stream still
+    // reachable from another live object (shared stream, live `/Dests`, …)
+    // stays reachable and therefore survives — conservative semantics for
+    // free, no ad-hoc exclusion heuristics.
+    crate::subset_prune::sweep_unreachable_objects(pdf)?;
 
     Ok(true)
 }
@@ -236,8 +178,10 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
 /// reachable via `/EF /UF`, `/EF /F`, `/EF /Unix`, `/EF /Mac`, `/EF /DOS` (in
 /// that priority order).  Returns `None` if not found or on any soft error.
 ///
-/// Retained for single-stream test fixtures; production code uses
-/// [`collect_embedded_file_stream_refs`] to handle multi-stream filespecs.
+/// Test-only helper for single-stream fixtures. Production code no longer
+/// resolves `/EF` streams explicitly: [`remove_attachment`] relies on the
+/// `/Root` mark-and-sweep, which drops every `/EF` stream of a removed
+/// filespec transitively.
 #[cfg(test)]
 fn resolve_embedded_file_stream_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -264,47 +208,6 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
         }
     }
     Ok(None)
-}
-
-/// Walk a `/Filespec` dict and return **every distinct** `/EmbeddedFile`
-/// stream `ObjectRef` reachable via `/EF /UF`, `/EF /F`, `/EF /Unix`,
-/// `/EF /Mac`, `/EF /DOS`.
-///
-/// A filespec usually points all `/EF` keys at one stream, but the keys may
-/// reference *distinct* stream objects; `remove_attachment` must GC each of
-/// them, not just the highest-priority one (roborev #950-1).  Returns an
-/// empty vector if the filespec has no resolvable `/EF` stream.  Order is
-/// deterministic (`/UF` → `/F` → `/Unix` → `/Mac` → `/DOS`) with duplicates
-/// removed.
-fn collect_embedded_file_stream_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    filespec_ref: ObjectRef,
-) -> Result<Vec<ObjectRef>> {
-    let fs_obj = pdf.resolve(filespec_ref)?;
-    let Object::Dictionary(fs_dict) = fs_obj else {
-        return Ok(Vec::new());
-    };
-    let ef_dict: Dictionary = match fs_dict.get("EF") {
-        Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => {
-            let r = *r;
-            match pdf.resolve(r)? {
-                Object::Dictionary(d) => d,
-                _ => return Ok(Vec::new()),
-            }
-        }
-        _ => return Ok(Vec::new()),
-    };
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut out: Vec<ObjectRef> = Vec::new();
-    for key in &["UF", "F", "Unix", "Mac", "DOS"] {
-        if let Some(Object::Reference(r)) = ef_dict.get(key) {
-            if seen.insert(*r) {
-                out.push(*r);
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Remove all occurrences of `target_ref` from `/AF` arrays on the catalog and
@@ -427,138 +330,6 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
         }
     }
     Ok(())
-}
-
-/// Collect every object reachable from the document catalog (`/Root`),
-/// following indirect references through dictionaries, arrays, and stream
-/// dicts.  A visited set makes the walk terminate on the cycles that pervade
-/// PDF object graphs (`/Parent` back-references, catalog ↔ name-tree, …).
-///
-/// Returns an empty set if the document has no `/Root`; callers then treat
-/// nothing as a dead ghost, i.e. GC stays maximally conservative.
-fn reachable_from_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<BTreeSet<ObjectRef>> {
-    let mut reachable = BTreeSet::new();
-    let Some(root) = pdf.root_ref() else {
-        return Ok(reachable);
-    };
-    let mut stack = vec![root];
-    while let Some(obj_ref) = stack.pop() {
-        if !reachable.insert(obj_ref) {
-            continue; // already visited — breaks /Parent / catalog cycles
-        }
-        let obj = pdf.resolve(obj_ref)?;
-        collect_refs(&obj, &mut stack);
-    }
-    Ok(reachable)
-}
-
-/// Append every `ObjectRef` directly contained in `obj` (recursing through
-/// nested arrays, dicts, and stream dicts) onto `out`.
-fn collect_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
-    match obj {
-        Object::Reference(r) => out.push(*r),
-        Object::Array(arr) => arr.iter().for_each(|o| collect_refs(o, out)),
-        Object::Dictionary(dict) => dict.iter().for_each(|(_, v)| collect_refs(v, out)),
-        Object::Stream(s) => s.dict.iter().for_each(|(_, v)| collect_refs(v, out)),
-        _ => {}
-    }
-}
-
-/// Collect **dead** (catalog-unreachable) live objects that look like
-/// name-tree nodes.
-///
-/// A name-tree node is a dictionary with a `/Names` flat array or a `/Kids`
-/// array and no `/Type` key that would identify it as a page, catalog, etc.
-///
-/// `rebuild_embedded_files_tree` does not `delete_object` superseded leaf /
-/// intermediate nodes, so after a rebuild they linger in
-/// [`Pdf::live_object_refs`] as ghosts whose stale references would otherwise
-/// keep a removed filespec/stream artificially "referenced".  [`remove_attachment`]
-/// excludes those ghosts from the conservative-GC reachability scan.
-///
-/// Crucially we exclude **only** name-tree nodes that are *not reachable from
-/// the catalog*.  A type-less `/Names`/`/Kids` dictionary that IS reachable —
-/// e.g. a live `/Dests`, `/JavaScript`, or custom name tree — may legitimately
-/// reference the same filespec/stream; excluding it would make
-/// `remove_attachment` delete an object that is still in use (roborev #947).
-fn collect_dead_name_tree_node_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<BTreeSet<ObjectRef>> {
-    let reachable = reachable_from_catalog(pdf)?;
-    let mut out = BTreeSet::new();
-    let live = pdf.live_object_refs();
-    for obj_ref in live {
-        // A catalog-reachable name tree is live and may legitimately hold the
-        // reference we are GC-checking — never exclude it.
-        if reachable.contains(&obj_ref) {
-            continue;
-        }
-        let obj = pdf.resolve(obj_ref)?;
-        let Object::Dictionary(dict) = obj else {
-            continue;
-        };
-        // Skip objects with a /Type name that marks them as non-tree (Page,
-        // Catalog, Pages, EmbeddedFile, Filespec, etc.).
-        if dict.get("Type").is_some() {
-            continue;
-        }
-        // Heuristic: a /Names flat array or a /Kids array without /Type → tree node.
-        let has_names = matches!(dict.get("Names"), Some(Object::Array(_)));
-        let has_kids = matches!(dict.get("Kids"), Some(Object::Array(_)));
-        if has_names || has_kids {
-            out.insert(obj_ref);
-        }
-    }
-    Ok(out)
-}
-
-/// Return `true` if any **live** object — other than the objects listed in
-/// `self_refs` and other than any object in `exclude_set` — contains a
-/// `Reference` to `target_ref` anywhere in its object graph.
-///
-/// `exclude_set` is a set of `ObjectRef`s that are skipped entirely during the
-/// scan.  Used to exclude name-tree nodes (which may be stale live ghosts after
-/// a rebuild) and other objects whose edges to `target_ref` should not count.
-///
-/// The scan resolves every live object and walks its nested structure.  Nested
-/// indirect references are checked by value (i.e. whether they equal
-/// `target_ref`), not followed recursively.  This is sufficient: the question
-/// is "who holds a direct reference to this object", not "who can transitively
-/// reach it".
-fn is_referenced_by_live_objects_excluding<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    target_ref: ObjectRef,
-    self_refs: &[ObjectRef],
-    exclude_set: &BTreeSet<ObjectRef>,
-) -> Result<bool> {
-    let live = pdf.live_object_refs();
-    for obj_ref in live {
-        // Skip the object itself.
-        if self_refs.contains(&obj_ref) {
-            continue;
-        }
-        // Skip excluded objects (e.g. stale name-tree ghost nodes).
-        if exclude_set.contains(&obj_ref) {
-            continue;
-        }
-        let obj = pdf.resolve(obj_ref)?;
-        if object_contains_ref(&obj, target_ref) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Recursively check whether `obj` contains `Object::Reference(target)` anywhere
-/// in its nested structure (dict values, array elements, stream dict).
-fn object_contains_ref(obj: &Object, target: ObjectRef) -> bool {
-    match obj {
-        Object::Reference(r) => *r == target,
-        Object::Array(arr) => arr.iter().any(|o| object_contains_ref(o, target)),
-        Object::Dictionary(dict) => dict.iter().any(|(_, v)| object_contains_ref(v, target)),
-        Object::Stream(s) => s.dict.iter().any(|(_, v)| object_contains_ref(v, target)),
-        _ => false,
-    }
 }
 
 // ── Writer constants ──────────────────────────────────────────────────────────
@@ -1155,6 +926,55 @@ mod tests {
         assert!(!keys.contains(&b"a.txt".as_ref()), "a.txt must be gone");
     }
 
+    // ── Test: transitively-unreachable subgraph is swept (flpdf-eg3) ─────────
+    //
+    // The old ad-hoc GC only ever considered the filespec ref and its `/EF`
+    // streams, so an object reachable *only* through the filespec dictionary
+    // (e.g. an indirect `/CI` collection-item stream) was left behind as an
+    // orphan after removal. A proper mark-and-sweep from `/Root` + trailer —
+    // the qpdf rewrite model — drops the whole now-unreachable subgraph.
+    #[test]
+    fn remove_attachment_sweeps_transitively_unreachable_subgraph() {
+        let mut pdf = open_minimal();
+
+        // A side-car stream that will be reachable ONLY via the filespec dict.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let sidecar_ref = ObjectRef::new(next + 1, 0);
+        pdf.set_object(
+            sidecar_ref,
+            Object::Stream(crate::object::Stream {
+                dict: Dictionary::new(),
+                data: b"sidecar".to_vec(),
+            }),
+        );
+
+        // Build a filespec, then point an indirect key at the side-car so the
+        // side-car is reachable exclusively through the filespec.
+        let fs_ref = FileSpecBuilder::new("trans.txt", b"payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        let Object::Dictionary(mut fs_dict) = pdf.resolve(fs_ref).expect("resolve filespec") else {
+            panic!("expected filespec dict");
+        };
+        fs_dict.insert("CI", Object::Reference(sidecar_ref));
+        pdf.set_object(fs_ref, Object::Dictionary(fs_dict));
+        insert_embedded_file(&mut pdf, b"trans.txt", fs_ref).expect("insert");
+
+        remove_attachment(&mut pdf, b"trans.txt").expect("remove");
+
+        let live = pdf.live_object_refs();
+        assert!(!live.contains(&fs_ref), "filespec must be swept");
+        assert!(
+            !live.contains(&sidecar_ref),
+            "object reachable only via the filespec must be transitively swept (mark-and-sweep)"
+        );
+    }
+
     // ── Test: removed filespec and stream are no longer live ─────────────────
 
     #[test]
@@ -1185,13 +1005,15 @@ mod tests {
         );
     }
 
-    // ── Test: indirect /AF array is patched so GC still frees the filespec ───
+    // ── Test: indirect /AF array no longer blocks GC of the filespec ─────────
     //
-    // Regression for roborev #948: when /AF is an *indirect* array reference,
-    // remove_ref_from_af_in_dict used to rewrite only the parent dict, leaving
-    // the referenced array object holding a stale reference to the filespec —
-    // which blocked the conservative GC and left the removed attachment's data
-    // as unreachable objects.
+    // Regression for roborev #948 (semantics updated by flpdf-eg3): when /AF
+    // is an *indirect* array reference whose only referrer is the catalog,
+    // removing the attachment clears the catalog /AF key, leaving the array
+    // object unreachable — the mark-and-sweep then drops the array, the
+    // filespec, and the stream together (no orphan left behind; qpdf model).
+    // The shared-indirect-/AF case (catalog + page) is covered separately by
+    // `remove_attachment_shared_indirect_af_across_catalog_and_page_not_dangled`.
     #[test]
     fn remove_attachment_with_indirect_af_array_gcs_filespec_and_stream() {
         let mut pdf = open_minimal();
@@ -1236,17 +1058,12 @@ mod tests {
             !live.contains(&stream_ref),
             "embedded stream must be GC-deleted alongside the filespec"
         );
-        // The indirect /AF array object is intentionally NOT deleted (it may
-        // be shared across parents; roborev #951).  It must, however, be
-        // emptied so it no longer references the filespec — that is what
-        // unblocks the filespec/stream GC asserted above.
-        let Object::Array(af_after) = pdf.resolve(af_array_ref).expect("resolve af array after")
-        else {
-            panic!("indirect /AF array object must still resolve (not deleted)");
-        };
+        // The indirect /AF array was reachable ONLY via the catalog /AF key;
+        // once that key is cleared the array is unreachable and the
+        // mark-and-sweep drops it too (no orphan left behind — qpdf model).
         assert!(
-            af_after.is_empty(),
-            "indirect /AF array must be emptied of the removed filespec"
+            !live.contains(&af_array_ref),
+            "indirect /AF array reachable only via the cleared catalog /AF must be swept"
         );
 
         // Catalog /AF must be gone (its only entry was the removed filespec).

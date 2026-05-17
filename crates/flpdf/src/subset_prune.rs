@@ -97,22 +97,42 @@ pub fn prune_after_subset<R: Read + Seek>(
     remove_unreferenced_resources(pdf, mode)?;
 
     // ── Pass 2: xref-level GC ─────────────────────────────────────────────────
-    // Walk every ObjectRef reachable from /Root and collect them.
+    sweep_unreachable_objects(pdf)?;
+
+    Ok(())
+}
+
+/// Mark-and-sweep every indirect object that is **not** reachable from the
+/// document `/Root` or the PDF trailer, mirroring qpdf's complete-rewrite
+/// model (the writer only emits reachable objects; everything else is
+/// implicitly dropped — `truth source /usr/bin/qpdf`).
+///
+/// The trailer is seeded in addition to `/Root` because it can reference
+/// objects that are not reachable through `/Root`, most notably `/Info`
+/// (document information dictionary) and `/Encrypt` (encryption dictionary).
+///
+/// Returns the number of objects deleted (useful for diagnostics/logging;
+/// callers may ignore it). Returns `Ok(0)` when the document has no `/Root`
+/// (nothing can be proven unreachable, so the GC stays maximally
+/// conservative).
+///
+/// Used by [`prune_after_subset`] (after page-subset rebuild) and by
+/// [`crate::embedded_files::remove_attachment`] (after detaching an
+/// attachment): in both cases the mutation makes some objects unreachable and
+/// this single, well-tested sweep is the one place that physically removes
+/// them — no per-feature ad-hoc reachability heuristics.
+pub(crate) fn sweep_unreachable_objects<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<usize> {
     let root_ref = match pdf.root_ref() {
         Some(r) => r,
-        None => return Ok(()), // no /Root → nothing to GC
+        None => return Ok(0), // no /Root → nothing can be proven unreachable
     };
 
-    // Collect all live object refs before the walk so we can compute the
-    // "unreachable" set after.
+    // Snapshot live refs before the walk so we can compute the unreachable
+    // set after marking.
     let all_live = pdf.live_object_refs();
 
-    // Mark: traverse the object graph from /Root AND from the trailer.
-    //
-    // The PDF trailer can reference objects that are NOT reachable from /Root,
-    // most notably /Info (document information dictionary) and /Encrypt
-    // (encryption dictionary for encrypted PDFs).  We must protect these from
-    // the sweep pass by seeding the reachability walk with them too.
+    // Mark: traverse from /Root AND from the trailer (protects /Info,
+    // /Encrypt and any other trailer-only references from the sweep).
     let trailer_refs = {
         let trailer_clone = Object::Dictionary(pdf.trailer().clone());
         let mut refs: Vec<ObjectRef> = Vec::new();
@@ -122,13 +142,14 @@ pub fn prune_after_subset<R: Read + Seek>(
     let reachable = collect_reachable(pdf, root_ref, trailer_refs)?;
 
     // Sweep: delete every live object that was not reached.
+    let mut deleted = 0usize;
     for obj_ref in all_live {
         if !reachable.contains(&obj_ref) {
             pdf.delete_object(obj_ref);
+            deleted += 1;
         }
     }
-
-    Ok(())
+    Ok(deleted)
 }
 
 // ── Reachability walker ───────────────────────────────────────────────────────
