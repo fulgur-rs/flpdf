@@ -2705,3 +2705,146 @@ fn full_rewrite_strips_external_file_ref_from_reencoded_stream() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PDF header version setters (--min-version / --force-version) — flpdf-9hc.13.1
+//
+// These tests pin the full-rewrite write path (the path a plain `flpdf
+// rewrite` takes). They assert the *header bytes*, not merely that the write
+// succeeds, and they assert that `/Catalog /Version` is preserved verbatim
+// (qpdf's observed semantics: `qpdf --force-version`/`--min-version` rewrites
+// only the `%PDF-x.y` line and never touches the Catalog's `/Version` entry).
+// ---------------------------------------------------------------------------
+
+/// Build a tiny classic-xref-table PDF with the given header version string
+/// and an optional `/Catalog /Version` name entry (e.g. `Some("1.7")`).
+fn build_pdf_with_optional_catalog_version(header: &str, catalog_version: Option<&str>) -> Vec<u8> {
+    let mut bytes = format!("%PDF-{header}\n").into_bytes();
+    let mut offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    let catalog = match catalog_version {
+        Some(v) => format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Version /{v} >>\nendobj\n"),
+        None => "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+    };
+    add_object(catalog.as_bytes(), &mut bytes, &mut offsets);
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn full_rewrite_force_version_sets_header_exactly() {
+    let source = build_pdf_with_optional_catalog_version("1.7", None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.force_version = Some("1.4".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.4\n"),
+        "force_version must set header to 1.4 even when source is higher; got {:?}",
+        std::str::from_utf8(&output[..9]).unwrap_or("<bad>")
+    );
+}
+
+#[test]
+fn full_rewrite_min_version_raises_header_when_source_lower() {
+    let source = build_pdf_with_optional_catalog_version("1.3", None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.min_version = Some("1.7".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.7\n"),
+        "min_version must raise header 1.3 -> 1.7; got {:?}",
+        std::str::from_utf8(&output[..9]).unwrap_or("<bad>")
+    );
+}
+
+#[test]
+fn full_rewrite_min_version_is_noop_when_source_already_higher() {
+    let source = build_pdf_with_optional_catalog_version("1.7", None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.min_version = Some("1.3".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.7\n"),
+        "min_version below source must be a no-op (header stays 1.7); got {:?}",
+        std::str::from_utf8(&output[..9]).unwrap_or("<bad>")
+    );
+}
+
+#[test]
+fn full_rewrite_preserves_catalog_version_verbatim_under_force_version() {
+    // qpdf semantics (verified empirically against qpdf 11.x):
+    // `qpdf --force-version=1.4` rewrites only the `%PDF-x.y` line and leaves
+    // the Catalog's `/Version` entry untouched, even when it is *higher* than
+    // the chosen header. "Reconciled per qpdf semantics" therefore means
+    // "leave /Catalog /Version alone" — readers compute the effective version
+    // as max(header, catalog), but the writer must not strip or lower it.
+    let source = build_pdf_with_optional_catalog_version("1.3", Some("1.7"));
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.force_version = Some("1.4".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.4\n"),
+        "header must be forced to 1.4; got {:?}",
+        std::str::from_utf8(&output[..9]).unwrap_or("<bad>")
+    );
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let Object::Dictionary(catalog) = reopened.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("object 1 should be the Catalog dictionary");
+    };
+    match catalog.get("Version") {
+        Some(Object::Name(name)) => assert_eq!(
+            name.as_slice(),
+            b"1.7",
+            "/Catalog /Version must be preserved verbatim (qpdf does not touch it)"
+        ),
+        other => panic!("expected /Catalog /Version /1.7 to be preserved, got {other:?}"),
+    }
+}

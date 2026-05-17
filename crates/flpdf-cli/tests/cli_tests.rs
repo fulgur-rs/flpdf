@@ -494,7 +494,15 @@ fn rewrite_valid_force_version_succeeds() {
     .success();
 
     assert!(output.exists());
-    assert!(std::fs::metadata(output).unwrap().len() > 0);
+    // minimal.pdf has header 1.7; --force-version=1.4 must rewrite the header
+    // line down to exactly 1.4 (acceptance: "Output header line matches the
+    // chosen version"). flpdf-9hc.13.1.
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.4\n"),
+        "expected forced header %PDF-1.4; got {:?}",
+        std::str::from_utf8(&bytes[..bytes.len().min(9)]).unwrap_or("<bad>")
+    );
 }
 
 #[test]
@@ -513,7 +521,83 @@ fn rewrite_valid_min_version_succeeds() {
     .success();
 
     assert!(output.exists());
-    assert!(std::fs::metadata(output).unwrap().len() > 0);
+    // minimal.pdf is already 1.7; --min-version=1.3 is below the source, so
+    // it must be a no-op (header stays 1.7). flpdf-9hc.13.1.
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.7\n"),
+        "min-version below source must be a no-op (header stays 1.7); got {:?}",
+        std::str::from_utf8(&bytes[..bytes.len().min(9)]).unwrap_or("<bad>")
+    );
+}
+
+#[test]
+fn rewrite_min_version_raises_header_on_low_source() {
+    // Build a header-1.3 PDF and request --min-version=1.7: the header line
+    // must be raised to exactly 1.7. flpdf-9hc.13.1.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("v13.pdf");
+    let output = temp.path().join("out.pdf");
+
+    let mut pdf = b"%PDF-1.3\n".to_vec();
+    let o1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let o2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let startxref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    pdf.extend_from_slice(format!("{o1:010} 00000 n \n{o2:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes(),
+    );
+    std::fs::write(&input, &pdf).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--min-version=1.7",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.7\n"),
+        "min-version 1.7 must raise header 1.3 -> 1.7; got {:?}",
+        std::str::from_utf8(&bytes[..bytes.len().min(9)]).unwrap_or("<bad>")
+    );
+}
+
+#[test]
+fn rewrite_force_version_honored_on_incremental_path() {
+    // Regression for flpdf-9hc.13.1: `--remove-unreferenced-resources=no`
+    // with no other mutation flag would otherwise take the incremental-update
+    // write path, which copies the source header verbatim and silently drops
+    // --force-version. The CLI must promote to full_rewrite so the version
+    // setter is honored (qpdf always full-rewrites and always honors it).
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--remove-unreferenced-resources=no",
+        "--force-version=1.4",
+        "../../tests/fixtures/minimal.pdf",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.4\n"),
+        "force-version must be honored even on the would-be incremental path; \
+         got {:?}",
+        std::str::from_utf8(&bytes[..bytes.len().min(9)]).unwrap_or("<bad>")
+    );
 }
 
 #[test]
