@@ -308,10 +308,7 @@ pub fn insert_embedded_file<R: Read + Seek>(
 /// # Errors
 ///
 /// Propagates any error from [`Pdf::resolve`].
-pub fn delete_embedded_file<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    key: &[u8],
-) -> Result<bool> {
+pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
     let mut entries = list_embedded_files(pdf)?;
     let before = entries.len();
     entries.retain(|(k, _)| k != key);
@@ -427,10 +424,7 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
         let mut root = Dictionary::new();
         root.insert(
             "Limits",
-            Object::Array(vec![
-                Object::String(first),
-                Object::String(last),
-            ]),
+            Object::Array(vec![Object::String(first), Object::String(last)]),
         );
         root.insert("Kids", Object::Array(kids));
         let root_ref = alloc();
@@ -475,7 +469,10 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
 /// - `/Limits [first_key, last_key]`
 /// - `/Names [key₁, ref₁, key₂, ref₂, …]`
 fn build_leaf_dict(entries: &[(Vec<u8>, ObjectRef)]) -> Dictionary {
-    debug_assert!(!entries.is_empty(), "build_leaf_dict called with empty slice");
+    debug_assert!(
+        !entries.is_empty(),
+        "build_leaf_dict called with empty slice"
+    );
 
     let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
     let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
@@ -489,10 +486,7 @@ fn build_leaf_dict(entries: &[(Vec<u8>, ObjectRef)]) -> Dictionary {
     let mut dict = Dictionary::new();
     dict.insert(
         "Limits",
-        Object::Array(vec![
-            Object::String(first),
-            Object::String(last),
-        ]),
+        Object::Array(vec![Object::String(first), Object::String(last)]),
     );
     dict.insert("Names", Object::Array(pairs));
     dict

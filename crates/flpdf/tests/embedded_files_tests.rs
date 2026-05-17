@@ -19,7 +19,9 @@
 //!   W7. Insert > LEAF_MAX entries → tree has two levels with /Kids.
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
-use flpdf::{delete_embedded_file, insert_embedded_file, list_embedded_files, ObjectRef, Pdf, LEAF_MAX};
+use flpdf::{
+    delete_embedded_file, insert_embedded_file, list_embedded_files, ObjectRef, Pdf, LEAF_MAX,
+};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -396,7 +398,11 @@ fn writer_insert_duplicate_key_replaces() {
     insert_embedded_file(&mut pdf, b"doc.pdf", replacement).expect("second insert");
 
     let entries = list_embedded_files(&mut pdf).expect("list");
-    assert_eq!(entries.len(), 1, "duplicate key must not create a second entry");
+    assert_eq!(
+        entries.len(),
+        1,
+        "duplicate key must not create a second entry"
+    );
     assert_eq!(entries[0].0, b"doc.pdf");
     assert_eq!(entries[0].1, replacement, "value must be the replacement");
 }
@@ -447,7 +453,10 @@ fn writer_delete_last_entry_cleans_up() {
     assert!(removed, "delete must succeed");
 
     let entries = list_embedded_files(&mut pdf).expect("list after cleanup");
-    assert!(entries.is_empty(), "tree must be empty after last entry removed");
+    assert!(
+        entries.is_empty(),
+        "tree must be empty after last entry removed"
+    );
 }
 
 // ── W7: insert > LEAF_MAX entries produces /Kids split ───────────────────────
@@ -533,9 +542,16 @@ fn writer_large_insert_produces_kids() {
         "/Limits[1] must be a string"
     );
     // First limit ≤ last limit within the leaf.
-    let Object::String(first_lim) = &limits[0] else { unreachable!() };
-    let Object::String(last_lim) = &limits[1] else { unreachable!() };
-    assert!(first_lim <= last_lim, "leaf /Limits[0] must be ≤ /Limits[1]");
+    let Object::String(first_lim) = &limits[0] else {
+        unreachable!()
+    };
+    let Object::String(last_lim) = &limits[1] else {
+        unreachable!()
+    };
+    assert!(
+        first_lim <= last_lim,
+        "leaf /Limits[0] must be ≤ /Limits[1]"
+    );
 }
 
 // ── W8: round-trip: insert → list returns same keys ──────────────────────────
@@ -558,7 +574,10 @@ fn writer_round_trip_key_order() {
 
     // Expect alphabetical order.
     let got_keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
-    assert_eq!(got_keys, vec![b"alpha" as &[u8], b"bravo", b"charlie", b"delta"]);
+    assert_eq!(
+        got_keys,
+        vec![b"alpha" as &[u8], b"bravo", b"charlie", b"delta"]
+    );
 
     // Verify that the filespec refs match after sorting.
     let expected_sorted = {
