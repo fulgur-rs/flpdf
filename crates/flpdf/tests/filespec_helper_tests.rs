@@ -6,7 +6,10 @@
 //! `tests/fixtures/compat/attachment-two-page.pdf` to validate against a
 //! production-generated document.
 
-use flpdf::{FileSpec, ObjectRef, Pdf};
+use flpdf::{
+    encode_utf16be, escape_pdf_name, format_pdf_date, md5_checksum, FileParamDates, FileSpec,
+    FileSpecBuilder, ObjectRef, Pdf,
+};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
@@ -538,4 +541,315 @@ fn embedded_file_skips_non_stream_higher_priority_key() {
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
+}
+
+// ── FileSpecBuilder ───────────────────────────────────────────────────────────
+
+/// Build a minimal one-page PDF in memory and return it as a `Pdf`.
+///
+/// Object layout:
+///   1 0 R  Catalog  (/Pages 2 0 R)
+///   2 0 R  Pages    (/Kids [3 0 R])
+///   3 0 R  Page
+fn build_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    offsets.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>\nendobj\n");
+
+    offsets.insert(3, out.len() as u64);
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 612 792 ] >>\nendobj\n",
+    );
+
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for i in 1u32..4 {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&i]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+
+    open(out)
+}
+
+// ── helper: encode_utf16be ────────────────────────────────────────────────────
+
+#[test]
+fn encode_utf16be_bom_and_codepoints() {
+    let bytes = encode_utf16be("hi");
+    // BOM (FE FF) + 'h' (00 68) + 'i' (00 69)
+    assert_eq!(bytes, vec![0xFE, 0xFF, 0x00, 0x68, 0x00, 0x69]);
+}
+
+#[test]
+fn encode_utf16be_empty_string_is_bom_only() {
+    assert_eq!(encode_utf16be(""), vec![0xFE, 0xFF]);
+}
+
+// ── helper: format_pdf_date ───────────────────────────────────────────────────
+
+#[test]
+fn format_pdf_date_utc() {
+    assert_eq!(
+        format_pdf_date(2026, 1, 1, 0, 0, 0),
+        b"D:20260101000000Z".to_vec()
+    );
+}
+
+#[test]
+fn format_pdf_date_nonzero_time() {
+    assert_eq!(
+        format_pdf_date(2025, 12, 31, 23, 59, 59),
+        b"D:20251231235959Z".to_vec()
+    );
+}
+
+// ── helper: escape_pdf_name ───────────────────────────────────────────────────
+
+#[test]
+fn escape_pdf_name_escapes_slash() {
+    assert_eq!(
+        escape_pdf_name(b"application/pdf"),
+        b"application#2Fpdf".to_vec()
+    );
+}
+
+#[test]
+fn escape_pdf_name_plain_text_unchanged() {
+    assert_eq!(escape_pdf_name(b"text"), b"text".to_vec());
+}
+
+// ── helper: md5_checksum ──────────────────────────────────────────────────────
+
+#[test]
+fn md5_checksum_length_and_known_value() {
+    // MD5 of empty string is d41d8cd98f00b204e9800998ecf8427e
+    let cs = md5_checksum(b"");
+    assert_eq!(cs.len(), 16);
+    assert_eq!(
+        cs,
+        vec![
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e
+        ]
+    );
+}
+
+// ── FileSpecBuilder: round-trip via FileSpec reader ───────────────────────────
+
+/// Round-trip: build a /Filespec with all optional fields set, then read it
+/// back through `FileSpec` and `EmbeddedFileStream` and verify every field.
+#[test]
+fn builder_round_trip_all_fields() {
+    let mut pdf = build_minimal_pdf();
+
+    let payload = b"Hello, PDF attachment!\n";
+    let dates = FileParamDates {
+        creation: Some((2026, 1, 15, 9, 30, 0)),
+        modification: Some((2026, 2, 20, 14, 0, 0)),
+    };
+
+    let filespec_ref = FileSpecBuilder::new("report.txt", payload.as_slice())
+        .mimetype(b"text/plain")
+        .description(b"Annual report attachment")
+        .af_relationship(b"Data")
+        .dates(dates)
+        .build(&mut pdf)
+        .expect("build()");
+
+    // ── /F (filename) ────────────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let fname = fs.filename().expect("filename()");
+    assert_eq!(fname, Some(b"report.txt".to_vec()), "/F mismatch");
+
+    // ── /UF (UTF-16BE with BOM) ───────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let uf = fs.uf().expect("uf()").expect("/UF should be present");
+    assert!(uf.starts_with(&[0xFE, 0xFF]), "/UF must start with BOM FE FF");
+    // Decode UF back: skip BOM, read u16 pairs
+    let units: Vec<u16> = uf[2..]
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    let decoded = String::from_utf16(&units).expect("UTF-16BE decode");
+    assert_eq!(decoded, "report.txt", "/UF decoded filename mismatch");
+
+    // ── /Desc ────────────────────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let desc = fs.description().expect("description()");
+    assert_eq!(
+        desc,
+        Some(b"Annual report attachment".to_vec()),
+        "/Desc mismatch"
+    );
+
+    // ── /AFRelationship ───────────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let rel = fs.af_relationship().expect("af_relationship()");
+    assert_eq!(rel, Some(b"Data".to_vec()), "/AFRelationship mismatch");
+
+    // ── /EmbeddedFile payload ─────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some(EmbeddedFileStream)");
+    let got_payload = ef.payload().expect("payload()");
+    assert_eq!(got_payload, payload.to_vec(), "payload mismatch");
+
+    // ── MIME type (round-trips through name escape) ───────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    let mime = ef.mimetype().expect("mimetype()");
+    assert_eq!(
+        mime,
+        Some(b"text/plain".to_vec()),
+        "/Subtype (MIME) mismatch"
+    );
+
+    // ── /Params /Size ─────────────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    let sz = ef.size().expect("size()");
+    assert_eq!(sz, Some(payload.len() as i64), "/Params /Size mismatch");
+
+    // ── /Params /CheckSum (MD5 of payload) ───────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    let cs = ef.checksum().expect("checksum()").expect("Some checksum");
+    assert_eq!(cs.len(), 16, "checksum must be 16 bytes");
+    assert_eq!(cs, md5_checksum(payload), "checksum must match MD5 of payload");
+
+    // ── /Params /CreationDate ─────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    let cdate = ef.creation_date().expect("creation_date()");
+    assert_eq!(
+        cdate,
+        Some(b"D:20260115093000Z".to_vec()),
+        "/Params /CreationDate mismatch"
+    );
+
+    // ── /Params /ModDate ──────────────────────────────────────────────────────
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    let mdate = ef.modification_date().expect("modification_date()");
+    assert_eq!(
+        mdate,
+        Some(b"D:20260220140000Z".to_vec()),
+        "/Params /ModDate mismatch"
+    );
+}
+
+/// Round-trip with minimal fields (no optional fields set).
+#[test]
+fn builder_round_trip_minimal() {
+    let mut pdf = build_minimal_pdf();
+    let payload = b"tiny";
+
+    let filespec_ref = FileSpecBuilder::new("tiny.bin", payload.as_slice())
+        .build(&mut pdf)
+        .expect("build()");
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    assert_eq!(
+        fs.filename().expect("filename()"),
+        Some(b"tiny.bin".to_vec())
+    );
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let uf = fs.uf().expect("uf()").expect("/UF present");
+    assert!(uf.starts_with(&[0xFE, 0xFF]), "/UF BOM missing");
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    assert_eq!(fs.description().expect("description()"), None);
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    assert_eq!(fs.af_relationship().expect("af_relationship()"), None);
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
+    assert_eq!(ef.mimetype().expect("mimetype()"), None);
+    assert_eq!(ef.creation_date().expect("creation_date()"), None);
+    assert_eq!(ef.modification_date().expect("modification_date()"), None);
+    assert_eq!(ef.size().expect("size()"), Some(4));
+    assert_eq!(
+        ef.checksum().expect("checksum()"),
+        Some(md5_checksum(payload))
+    );
+}
+
+/// /UF is UTF-16BE encoded with BOM for a Unicode filename.
+#[test]
+fn builder_uf_is_utf16be_with_bom() {
+    let mut pdf = build_minimal_pdf();
+    let payload = b"data";
+    let filespec_ref = FileSpecBuilder::new("ascii.txt", payload.as_slice())
+        .build(&mut pdf)
+        .expect("build()");
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let uf = fs.uf().expect("uf()").expect("/UF present");
+
+    // BOM must be first two bytes.
+    assert_eq!(&uf[..2], &[0xFE, 0xFF], "BOM missing");
+
+    // Decode and verify filename.
+    let units: Vec<u16> = uf[2..]
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(String::from_utf16(&units).expect("utf16"), "ascii.txt");
+}
+
+/// /Params date format must follow D:YYYYMMDDHHmmSSZ.
+#[test]
+fn builder_params_date_format_is_pdf_date() {
+    let mut pdf = build_minimal_pdf();
+    let payload = b"content";
+    let filespec_ref = FileSpecBuilder::new("f.txt", payload.as_slice())
+        .dates(FileParamDates {
+            creation: Some((2026, 6, 15, 12, 30, 45)),
+            modification: None,
+        })
+        .build(&mut pdf)
+        .expect("build()");
+
+    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let ef = fs
+        .embedded_file()
+        .expect("embedded_file()")
+        .expect("Some");
+    let cdate = ef.creation_date().expect("creation_date()").expect("Some");
+    // D:YYYYMMDDHHmmSSZ
+    assert_eq!(cdate, b"D:20260615123045Z".to_vec());
+    // Must start with "D:"
+    assert!(cdate.starts_with(b"D:"), "PDF date must start with D:");
+    // Year must be 4 digits at position 2..6
+    assert_eq!(&cdate[2..6], b"2026");
 }
