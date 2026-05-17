@@ -175,28 +175,62 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
     // the catalog — never a live, catalog-reachable name tree (`/Dests`,
     // `/JavaScript`, a custom tree, …), which may legitimately reference the
     // same filespec/stream and must keep counting (roborev #947).
-    let mut gc_exclude: BTreeSet<ObjectRef> = collect_dead_name_tree_node_refs(pdf)?;
+    let gc_exclude: BTreeSet<ObjectRef> = collect_dead_name_tree_node_refs(pdf)?;
 
-    if let Some(fs_ref) = filespec_ref_opt {
-        // Also exclude the stream ref from "things that reference the filespec"
-        // scan — the filespec itself points to the stream, but we're about to
-        // delete both; don't let that edge count.
-        if let Some(st_ref) = stream_ref_opt {
-            gc_exclude.insert(st_ref);
+    match (filespec_ref_opt, stream_ref_opt) {
+        // Filespec + embedded stream: a mutually-referencing pair.  The
+        // filespec points at the stream via `/EF`; pathological documents may
+        // also have the stream dictionary point back at the filespec.  Decide
+        // both together so we never delete one while a *live* (preserved)
+        // peer keeps a dangling reference to it (roborev #949).
+        //
+        // Pass 1 — external references, with the whole pair excluded so their
+        // mutual `/EF` (and any back-) edges do not self-preserve the pair.
+        // Pass 2 — propagate "keep": `keep_fs ⇒ keep_st` (the `/EF` edge always
+        // exists), and `keep_st ⇒ keep_fs` iff the stream really back-refs the
+        // filespec.  The pair has ≤2 nodes and ≤2 edges with monotone updates,
+        // so this two-pass propagation reaches the fixpoint in one iteration.
+        (Some(fs_ref), Some(st_ref)) => {
+            let pair_self = [fs_ref, st_ref];
+            let fs_ext =
+                is_referenced_by_live_objects_excluding(pdf, fs_ref, &pair_self, &gc_exclude)?;
+            let st_ext =
+                is_referenced_by_live_objects_excluding(pdf, st_ref, &pair_self, &gc_exclude)?;
+
+            let mut keep_fs = fs_ext;
+            let mut keep_st = st_ext;
+
+            // The filespec always references the stream via `/EF`, so keeping
+            // the filespec means the stream must survive too.
+            if keep_fs {
+                keep_st = true;
+            }
+            // The stream only references the filespec in pathological docs —
+            // verify by inspecting the resolved stream object.
+            if keep_st && !keep_fs {
+                let st_obj = pdf.resolve(st_ref)?;
+                if object_contains_ref(&st_obj, fs_ref) {
+                    keep_fs = true;
+                }
+            }
+
+            if !keep_fs {
+                pdf.delete_object(fs_ref);
+            }
+            if !keep_st {
+                pdf.delete_object(st_ref);
+            }
         }
-        let self_refs = [fs_ref];
-        if !is_referenced_by_live_objects_excluding(pdf, fs_ref, &self_refs, &gc_exclude)? {
-            pdf.delete_object(fs_ref);
+        // Filespec without a resolvable embedded stream (no `/EF`): GC the
+        // filespec alone if nothing live still references it.
+        (Some(fs_ref), None) => {
+            let self_refs = [fs_ref];
+            if !is_referenced_by_live_objects_excluding(pdf, fs_ref, &self_refs, &gc_exclude)? {
+                pdf.delete_object(fs_ref);
+            }
         }
-    }
-    if let Some(st_ref) = stream_ref_opt {
-        let self_refs = [st_ref];
-        // Use the same name-tree exclusion set (without the stream itself).
-        let mut exclude2 = gc_exclude.clone();
-        exclude2.remove(&st_ref); // stream is in self_refs already
-        if !is_referenced_by_live_objects_excluding(pdf, st_ref, &self_refs, &exclude2)? {
-            pdf.delete_object(st_ref);
-        }
+        // Direct-dict filespec (no indirect ref to GC) — nothing to delete.
+        (None, _) => {}
     }
 
     Ok(true)
@@ -1173,6 +1207,10 @@ mod tests {
             .expect("build filespec");
         insert_embedded_file(&mut pdf, b"shared.txt", fs_ref).expect("insert");
 
+        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+            .expect("resolve stream ref")
+            .expect("stream ref must exist");
+
         // A separate, type-less name-tree leaf (models a /Dests name tree) that
         // legitimately references the SAME filespec.
         let next = pdf
@@ -1221,6 +1259,123 @@ mod tests {
         assert!(
             matches!(leaf.get("Names"), Some(Object::Array(a)) if a.iter().any(|o| matches!(o, Object::Reference(r) if *r == fs_ref))),
             "/Dests leaf must still reference the filespec"
+        );
+
+        // Symmetric inverse (roborev #949): the preserved filespec still
+        // references its embedded stream via `/EF`, so the stream must also
+        // survive — otherwise the kept filespec would dangle.
+        assert!(
+            live.contains(&stream_ref),
+            "embedded stream of a preserved filespec must NOT be GC-deleted"
+        );
+    }
+
+    // ── Test: live object referencing the stream (with stream back-ref) ──────
+    //
+    // Regression for roborev #949: the stream ref used to be unconditionally
+    // excluded from the filespec-reference scan.  If the stream is preserved
+    // (externally referenced) and its dictionary back-references the filespec,
+    // the filespec would be deleted leaving the live stream dangling.  The
+    // mutual-ref pair must be kept together.
+    #[test]
+    fn remove_attachment_keeps_pair_when_stream_externally_referenced_and_back_refs() {
+        let mut pdf = open_minimal();
+
+        let fs_ref = FileSpecBuilder::new("paired.txt", b"paired payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"paired.txt", fs_ref).expect("insert");
+
+        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+            .expect("resolve stream ref")
+            .expect("stream ref must exist");
+
+        // Make the stream dictionary back-reference the filespec (pathological
+        // but legal) and have a live, catalog-reachable object reference the
+        // stream so conservative GC must preserve it.
+        let Object::Stream(mut stream) = pdf.resolve(stream_ref).expect("resolve stream") else {
+            panic!("expected stream object");
+        };
+        stream.dict.insert("RelatedFS", Object::Reference(fs_ref));
+        pdf.set_object(stream_ref, Object::Stream(stream));
+
+        let catalog_ref = pdf.root_ref().expect("root");
+        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        else {
+            panic!("expected catalog dict");
+        };
+        catalog.insert("ExtraStreamRef", Object::Reference(stream_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let removed = remove_attachment(&mut pdf, b"paired.txt").expect("remove");
+        assert!(removed);
+
+        let live = pdf.live_object_refs();
+        assert!(
+            live.contains(&stream_ref),
+            "externally-referenced stream must be preserved"
+        );
+        assert!(
+            live.contains(&fs_ref),
+            "filespec must be preserved because the live stream back-references it"
+        );
+    }
+
+    // ── Test: shared embedded stream is preserved, removed filespec GC'd ──────
+    //
+    // Two filespecs share one /EmbeddedFile stream.  Removing one attachment
+    // must GC its (otherwise-unreferenced) filespec but keep the shared stream
+    // and the other filespec intact.  Guards against an over-conservative
+    // "pair-or-nothing" regression of the roborev #949 fix.
+    #[test]
+    fn remove_attachment_with_shared_stream_keeps_stream_and_other_filespec() {
+        let mut pdf = open_minimal();
+
+        let fs_a = FileSpecBuilder::new("a.txt", b"shared body")
+            .build(&mut pdf)
+            .expect("build a");
+        insert_embedded_file(&mut pdf, b"a.txt", fs_a).expect("insert a");
+        let shared_stream = resolve_embedded_file_stream_ref(&mut pdf, fs_a)
+            .expect("resolve stream a")
+            .expect("stream a exists");
+
+        // Build a second filespec whose /EF points at the SAME stream object.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let fs_b = ObjectRef::new(next + 1, 0);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(shared_stream));
+        ef.insert("UF", Object::Reference(shared_stream));
+        let mut fs_b_dict = Dictionary::new();
+        fs_b_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
+        fs_b_dict.insert("F", Object::String(b"b.txt".to_vec()));
+        fs_b_dict.insert("UF", Object::String(b"b.txt".to_vec()));
+        fs_b_dict.insert("EF", Object::Dictionary(ef));
+        pdf.set_object(fs_b, Object::Dictionary(fs_b_dict));
+        insert_embedded_file(&mut pdf, b"b.txt", fs_b).expect("insert b");
+
+        // Remove attachment "a": its filespec is otherwise unreferenced and
+        // must be GC'd; the stream is still used by fs_b and must survive,
+        // and fs_b itself must remain intact.
+        let removed = remove_attachment(&mut pdf, b"a.txt").expect("remove a");
+        assert!(removed);
+
+        let live = pdf.live_object_refs();
+        assert!(
+            !live.contains(&fs_a),
+            "removed attachment's filespec must be GC-deleted"
+        );
+        assert!(
+            live.contains(&shared_stream),
+            "stream shared with another filespec must be preserved"
+        );
+        assert!(
+            live.contains(&fs_b),
+            "the other filespec sharing the stream must remain intact"
         );
     }
 
