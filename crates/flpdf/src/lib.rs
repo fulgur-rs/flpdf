@@ -45,6 +45,7 @@ pub mod cache;
 pub mod check;
 pub mod content_stream;
 pub mod diagnostics;
+pub mod embedded_files;
 pub mod error;
 pub mod filespec_helper;
 pub mod filters;
@@ -88,6 +89,9 @@ pub use content_stream::{
     normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,
 };
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
+pub use embedded_files::{
+    list_embedded_files, list_embedded_files_with_max_depth, DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
+};
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{EmbeddedFileStream, FileSpec};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
