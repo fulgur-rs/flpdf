@@ -75,7 +75,11 @@ fn zip_like_payload() -> Vec<u8> {
 }
 
 /// Run `qpdf --list-attachments <path>` and return stdout as a String.
-/// Returns `None` if qpdf is not available.
+///
+/// `None` means **only** "qpdf is not installed" (the test should skip the
+/// cross-check). When qpdf *is* available, a spawn failure, non-zero exit, or
+/// non-UTF-8 output is a genuine cross-check regression and panics with
+/// stderr — never a silent skip.
 fn qpdf_list_attachments(pdf_path: &Path) -> Option<String> {
     if !support::is_qpdf_available() {
         return None;
@@ -84,12 +88,22 @@ fn qpdf_list_attachments(pdf_path: &Path) -> Option<String> {
         .arg("--list-attachments")
         .arg(pdf_path)
         .output()
-        .ok()?;
-    String::from_utf8(out.stdout).ok()
+        .expect("qpdf is available but `qpdf --list-attachments` failed to spawn");
+    assert!(
+        out.status.success(),
+        "qpdf --list-attachments {pdf_path:?} exited {:?}; stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    Some(String::from_utf8(out.stdout).expect("qpdf --list-attachments output is not UTF-8"))
 }
 
 /// Run `qpdf --show-attachment=KEY <path>` and return raw stdout bytes.
-/// Returns `None` if qpdf is not available.
+///
+/// `None` means **only** "qpdf is not installed". When qpdf *is* available a
+/// spawn failure or non-zero exit (e.g. the flpdf-generated PDF is unreadable
+/// by qpdf, or the key is missing) is a real cross-check regression and
+/// panics with stderr — it must never be swallowed as a skip.
 fn qpdf_show_attachment(pdf_path: &Path, key: &str) -> Option<Vec<u8>> {
     if !support::is_qpdf_available() {
         return None;
@@ -98,12 +112,15 @@ fn qpdf_show_attachment(pdf_path: &Path, key: &str) -> Option<Vec<u8>> {
         .arg(format!("--show-attachment={key}"))
         .arg(pdf_path)
         .output()
-        .ok()?;
-    if out.status.success() {
-        Some(out.stdout)
-    } else {
-        None
-    }
+        .expect("qpdf is available but `qpdf --show-attachment` failed to spawn");
+    assert!(
+        out.status.success(),
+        "qpdf --show-attachment={key} {pdf_path:?} exited {:?} \
+         (flpdf-generated PDF unreadable by qpdf?); stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    Some(out.stdout)
 }
 
 /// Run `qpdf --add-attachment FILE --key=KEY -- in.pdf out.pdf`.
