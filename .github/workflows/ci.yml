@@ -36,40 +36,29 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
-    name: Test (${{ matrix.os }}${{ matrix.coverage && ' cov' || '' }})
+    name: Test (${{ matrix.os }})
     needs: quality
-    # id-token: write is required by the coverage cell's Codecov OIDC upload.
-    # Job-level permissions fully replace the workflow-level set (they do not
-    # merge), so contents: read must be restated here.
-    permissions:
-      contents: read
-      id-token: write
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       # Platform parity with fulgur's `test` matrix so flpdf surfaces the
       # same cross-arch / cross-OS behaviour ahead of fulgur integration.
+      # Coverage lives in its own `coverage` job (below) so the elevated
+      # id-token: write permission Codecov OIDC needs stays off these
+      # cross-platform cells (the job inherits workflow contents: read only).
       matrix:
         include:
           - os: ubuntu-latest
             arch: amd64
-            coverage: false
             cache-key: ubuntu-latest-flpdf
-          - os: ubuntu-latest
-            arch: amd64
-            coverage: true
-            cache-key: ubuntu-latest-flpdf-cov
           - os: ubuntu-24.04-arm
             arch: arm64
-            coverage: false
             cache-key: ubuntu-24.04-arm-flpdf
           - os: macos-latest
             arch: arm64
-            coverage: false
             cache-key: macos-latest-flpdf
           - os: windows-latest
             arch: amd64
-            coverage: false
             cache-key: windows-latest-flpdf
 
     steps:
@@ -83,10 +72,6 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           shared-key: ${{ matrix.cache-key }}
-
-      - name: Install cargo-llvm-cov
-        if: matrix.coverage
-        uses: taiki-e/install-action@88ada01c46e65c47040a0ae865537cc76fcd0e1c # cargo-llvm-cov
 
       # qpdf is required by crates/flpdf-cli/tests/cli_linearize_qpdf.rs as
       # an external oracle.  Install it on Linux (apt — covers both amd64 and
@@ -105,7 +90,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qpdf
 
       - name: Run tests in required order
-        if: ${{ !matrix.coverage }}
         shell: bash
         run: |
           set -euo pipefail
@@ -134,16 +118,60 @@ jobs:
           echo "[ci] cargo test"
           cargo test
 
-      # The coverage cell measures coverage instead of running the strict
-      # ordered script (the ordering is for log readability + oracle hard-
-      # fail surfacing, not inter-test state); the amd64 non-coverage Linux
-      # cell remains the authoritative correctness gate.
+      # amd64-Linux-only: the captured reference bytes match the amd64 Ubuntu
+      # base image's zlib1g version; Windows (libz-sys vendored zlib),
+      # ubuntu-24.04-arm (different arch base image) and macOS would produce
+      # spurious diffs.
+      - name: bytes-identical zlib compat (Linux amd64)
+        if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
+        run: cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
+
+      - name: Compat matrix baselines (Linux amd64)
+        if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[ci] Running compat matrix baselines — drift surfaces here as an explicit step"
+          cargo test -p flpdf-cli --test compat_baseline_static_id -- --nocapture
+          cargo test -p flpdf-cli --test compat_matrix_baseline -- --nocapture
+
+  coverage:
+    name: Coverage
+    needs: quality
+    runs-on: ubuntu-latest
+    # Codecov OIDC upload needs id-token: write.  Isolating coverage in its
+    # own single-runner job keeps that elevated permission off the cross-
+    # platform `test` matrix cells (least privilege).  Job-level permissions
+    # fully replace the workflow-level set, so contents: read is restated.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          shared-key: ubuntu-latest-flpdf-cov
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@88ada01c46e65c47040a0ae865537cc76fcd0e1c # cargo-llvm-cov
+
+      # qpdf oracle hard-fails on Linux CI when missing (skip_if_qpdf_missing),
+      # and cargo llvm-cov --workspace exercises those suites — install it.
+      - name: Install qpdf
+        run: sudo apt-get update && sudo apt-get install -y qpdf
+
+      # Coverage measures the workspace once; the strict ordered script in the
+      # `test` job remains the authoritative correctness gate.
       - name: Run tests with coverage
-        if: matrix.coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
-        if: matrix.coverage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lcov
@@ -151,27 +179,8 @@ jobs:
           if-no-files-found: error
 
       - name: Upload coverage to Codecov
-        if: matrix.coverage
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
           files: lcov.info
           use_oidc: true
           fail_ci_if_error: false
-
-      # amd64-Linux-only: the captured reference bytes match the amd64 Ubuntu
-      # base image's zlib1g version; Windows (libz-sys vendored zlib),
-      # ubuntu-24.04-arm (different arch base image) and macOS would produce
-      # spurious diffs.  Skipped on the coverage cell to avoid a duplicate
-      # amd64-Linux run.
-      - name: bytes-identical zlib compat (Linux amd64)
-        if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' && !matrix.coverage }}
-        run: cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
-
-      - name: Compat matrix baselines (Linux amd64)
-        if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' && !matrix.coverage }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "[ci] Running compat matrix baselines — drift surfaces here as an explicit step"
-          cargo test -p flpdf-cli --test compat_baseline_static_id -- --nocapture
-          cargo test -p flpdf-cli --test compat_matrix_baseline -- --nocapture
