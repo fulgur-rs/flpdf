@@ -1,4 +1,5 @@
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset, outline_dest_remap::remap_outline_and_dests,
     page_collate::collate, page_combine::CombinedPlan, page_rotate::apply_rotate_to_pages,
@@ -2681,7 +2682,7 @@ struct AddAttachmentArgs {
     file: PathBuf,
     /// Name-tree key (default: basename of `file`).
     key: Option<Vec<u8>>,
-    /// `/F` and `/UF` filename stored in the filespec (default: basename of `file`).
+    /// Filename stored in `/UF`; `/F` uses an ASCII-safe fallback.
     filename: Option<Vec<u8>>,
     /// MIME type for `/EmbeddedFile /Subtype`.
     mimetype: Option<Vec<u8>>,
@@ -2827,6 +2828,9 @@ fn run_add_attachment(
     let basename = path_basename(&args.file)?;
     let key = args.key.unwrap_or_else(|| basename.clone());
     let filename = args.filename.unwrap_or_else(|| basename.clone());
+    let filename = String::from_utf8(filename).map_err(|_| {
+        "--add-attachment: filename must be valid UTF-8 so it can be encoded as /UF"
+    })?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
     reject_encrypted_write(&pdf)?;
@@ -2851,7 +2855,8 @@ fn run_add_attachment(
         modification: args.mod_date,
     };
 
-    let mut builder = FileSpecBuilder::new(&filename, payload)
+    let mut builder = FileSpecBuilder::new(ascii_filename_fallback(&filename), payload)
+        .uf_filename(&filename)
         .compress(true)
         .dates(dates);
     if let Some(mime) = args.mimetype {

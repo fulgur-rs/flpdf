@@ -1,5 +1,8 @@
 use assert_cmd::Command;
+use flpdf::{filespec_helper::encode_utf16be, Object, Pdf};
 use predicates::prelude::*;
+use std::fs::File;
+use std::io::BufReader;
 use std::io::Write;
 
 #[test]
@@ -2029,6 +2032,58 @@ fn add_attachment_explicit_key_and_filename() {
         .assert()
         .success()
         .stdout(predicate::str::contains("mykey"));
+}
+
+#[test]
+fn add_attachment_non_ascii_basename_uses_ascii_fallback_and_unicode_uf() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("レポート.pdf");
+    std::fs::write(&attachment, b"unicode filename payload").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=unicode-key",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-attachment=unicode-key", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::eq(b"unicode filename payload" as &[u8]));
+
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let entries = flpdf::embedded_files::list_embedded_files(&mut pdf).unwrap();
+    let (_, filespec_ref) = entries
+        .iter()
+        .find(|(key, _)| key == b"unicode-key")
+        .expect("unicode attachment must be present");
+    let fs_obj = pdf.resolve(*filespec_ref).unwrap();
+    let Object::Dictionary(fs_dict) = fs_obj else {
+        panic!("expected filespec dictionary");
+    };
+
+    assert_eq!(
+        fs_dict.get("F"),
+        Some(&Object::String(b"____.pdf".to_vec())),
+        "/F must be ASCII-safe fallback"
+    );
+    assert_eq!(
+        fs_dict.get("UF"),
+        Some(&Object::String(encode_utf16be("レポート.pdf"))),
+        "/UF must preserve the Unicode basename"
+    );
 }
 
 #[test]
