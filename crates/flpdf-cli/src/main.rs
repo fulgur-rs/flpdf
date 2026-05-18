@@ -20,13 +20,13 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version,
     resources::remove_unreferenced_resources,
-    write_pdf_with_options, write_qdf, CompressStreams, Dictionary, NewlineBeforeEndstream, Object,
-    ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources,
-    Severity, Stream, WriteOptions,
+    write_pdf_with_options, CompressStreams, Dictionary, NewlineBeforeEndstream, Object, ObjectRef,
+    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources, Severity,
+    Stream, WriteOptions,
 };
 use flpdf::{
-    copy_attachments_from, extract_attachment, format_attachment_list, insert_embedded_file,
-    list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
+    copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
+    insert_embedded_file, list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
 };
 use std::fs::File;
 use std::io::{BufReader, Write};
@@ -176,7 +176,7 @@ struct Cli {
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
-              "no_original_object_ids",
+              "no_original_object_ids", "qdf",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -294,6 +294,14 @@ struct Cli {
     /// does not conflict with the rewrite-mode positionals.
     #[arg(long = "no-original-object-ids")]
     no_original_object_ids: bool,
+    /// Create a PDF in QDF form: uncompressed, normalized,
+    /// human-readable/editable; pair with the qdf-fix subcommand after manual
+    /// edits (qpdf --qdf equivalent). Top-level alias of `flpdf rewrite
+    /// --qdf`. Like `--static-id`/`--no-original-object-ids` it is a
+    /// compatible rewrite/QDF modifier and does not conflict with the
+    /// rewrite-mode positionals.
+    #[arg(long = "qdf")]
+    qdf: bool,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -501,8 +509,13 @@ enum Commands {
     DumpObject(DumpObjectCommand),
     #[command(about = "Show page structure summary or detail")]
     Pages(PagesCommand),
-    #[command(about = "Write a qdf-style raw dump into a file")]
+    #[command(about = "Create a PDF in QDF form (alias of `rewrite --qdf`)")]
     Qdf(QdfCommand),
+    #[command(
+        name = "qdf-fix",
+        about = "Repair stream /Length, xref offsets, /Size and startxref in a hand-edited QDF file (qpdf fix-qdf equivalent)"
+    )]
+    QdfFix(QdfFixCommand),
     #[command(about = "Rewrite the input PDF to a normalized output")]
     Rewrite(RewriteCommand),
     #[command(
@@ -648,6 +661,15 @@ struct QdfCommand {
     password: PasswordArgs,
 }
 
+/// Args for `qdf-fix` (qpdf `fix-qdf` equivalent). No password / no Pdf
+/// open: fix_qdf operates byte-for-byte on a (possibly hand-edited) QDF file
+/// and must not reparse or reformat it.
+#[derive(Debug, ClapArgs)]
+struct QdfFixCommand {
+    input: PathBuf,
+    output: PathBuf,
+}
+
 #[derive(Debug, ClapArgs)]
 struct RewriteCommand {
     input: PathBuf,
@@ -707,6 +729,15 @@ struct RewriteCommand {
     /// contains no /Prev chain.  Cannot be combined with --linearize.
     #[arg(long = "full-rewrite")]
     full_rewrite: bool,
+    /// Create a PDF in QDF form: uncompressed, normalized,
+    /// human-readable/editable; pair with the qdf-fix subcommand after manual
+    /// edits (qpdf --qdf equivalent).
+    ///
+    /// Implies --full-rewrite (the QDF code path lives in the full-rewrite
+    /// writer) and forces object streams off. Cannot be combined with
+    /// --linearize (QDF is inherently non-linearized).
+    #[arg(long = "qdf")]
+    qdf: bool,
     /// Object stream behaviour for the output. Mirrors qpdf
     /// `--object-streams=preserve|disable|generate`. Default: `preserve`.
     ///
@@ -950,6 +981,18 @@ fn main() {
     // warning never precedes a usage error yet is always visible.
     warn_if_static_id(&args);
 
+    // Top-level `--qdf --linearize` is rejected here, before the dispatch
+    // chain. The `else if args.linearize` branch (below) wins over the
+    // default rewrite branch, so deferring this check into the rewrite branch
+    // would let the linearize path run while silently dropping --qdf. QDF is
+    // inherently non-linearized; mirror the `rewrite --full-rewrite
+    // --linearize` rejection. (The `Commands::Rewrite` arm performs the
+    // equivalent check for the subcommand form.)
+    if args.qdf && args.linearize {
+        eprintln!("flpdf: --qdf and --linearize cannot be used together");
+        std::process::exit(1);
+    }
+
     // JSON mode takes the first branch, but this is unambiguous: clap's
     // conflicts_with_all on --json (plus args_conflicts_with_subcommands on
     // Cli) guarantees no other top-level mode or subcommand can be set at
@@ -1106,6 +1149,16 @@ fn main() {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
         options.no_original_object_ids = args.no_original_object_ids;
+        // Top-level `--qdf` is an alias of `rewrite --qdf`. The QDF code path
+        // lives in the full-rewrite writer, so --qdf must imply
+        // full_rewrite=true regardless of any --full-rewrite flag (the
+        // top-level surface has none). The library forces ObjStm off under
+        // qdf; --object-streams is not accepted on the top-level surface, so
+        // no conflict diagnostic is needed here.
+        options.qdf = args.qdf;
+        if args.qdf {
+            options.full_rewrite = true;
+        }
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
@@ -1348,6 +1401,7 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
         }
         Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair, &cmd.password),
+        Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => run_show_encryption(&cmd.input, cmd.repair, &cmd.password),
         Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair),
@@ -1374,12 +1428,49 @@ fn run_command(command: Commands) -> CliResult<()> {
                 eprintln!("flpdf: --full-rewrite and --linearize cannot be used together");
                 std::process::exit(1);
             }
+            // QDF is inherently non-linearized; reject the combination with a
+            // fatal diagnostic, mirroring the --full-rewrite/--linearize
+            // rejection above. (The top-level `--qdf --linearize` form is
+            // rejected earlier in main(), before the linearize branch wins
+            // the dispatch chain.)
+            if cmd.qdf && cmd.linearize {
+                eprintln!("flpdf: --qdf and --linearize cannot be used together");
+                std::process::exit(1);
+            }
+            // Non-fatal conflict diagnostic deferred from flpdf-9hc.6.6:
+            // --qdf forces object streams off (the library disables ObjStm
+            // under qdf via 6.2). `preserve` is the clap default and is
+            // indistinguishable from "not passed", so only an explicit
+            // `disable`/`generate` is diagnosable; `disable` already agrees
+            // with QDF so only `generate` is surprising, but report both
+            // explicit non-default values for clarity. Proceed with QDF.
+            if cmd.qdf {
+                match cmd.object_streams {
+                    CliObjectStreamMode::Generate => {
+                        eprintln!(
+                            "flpdf: --qdf forces object streams off; ignoring \
+                             --object-streams=generate"
+                        );
+                    }
+                    CliObjectStreamMode::Disable => {
+                        eprintln!(
+                            "flpdf: --qdf forces object streams off; ignoring \
+                             --object-streams=disable"
+                        );
+                    }
+                    CliObjectStreamMode::Preserve => {}
+                }
+            }
             let mut options = WriteOptions::default();
             options.static_id = cmd.static_id;
             options.min_version = cmd.min_version;
             options.force_version = cmd.force_version;
             options.no_original_object_ids = cmd.no_original_object_ids;
-            options.full_rewrite = cmd.full_rewrite;
+            // `--qdf` enables QDF and, because the QDF code path lives in the
+            // full-rewrite writer, forces full_rewrite=true regardless of
+            // whether --full-rewrite was passed.
+            options.qdf = cmd.qdf;
+            options.full_rewrite = cmd.full_rewrite || cmd.qdf;
             options.object_streams = cmd.object_streams.into();
             options.compress_streams = match cmd.compress_streams {
                 CliYesNo::Yes => CompressStreams::Yes,
@@ -2147,8 +2238,29 @@ fn run_qdf(
     let mut pdf = open_pdf(&input, repair, password)?;
     reject_encrypted_write(&pdf)?;
 
+    // The `qdf` subcommand is an alias of `rewrite --qdf` (epic flpdf-9hc.6
+    // architecture decision): produce canonical QDF via the full-rewrite
+    // path rather than the old standalone `write_qdf` raw dump. The QDF code
+    // path lives in write_pdf_full_rewrite, so full_rewrite must be true.
+    let mut options = WriteOptions::default();
+    options.qdf = true;
+    options.full_rewrite = true;
     let mut out = File::create(output)?;
-    write_qdf(&mut pdf, &mut out)?;
+    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    Ok(())
+}
+
+/// `qdf-fix` (qpdf `fix-qdf` equivalent): repair stream `/Length`, xref
+/// offsets, `/Size` and `startxref` in a hand-edited QDF file.
+///
+/// fix_qdf is byte-level: it must operate on the raw file bytes and must
+/// NOT reparse/reformat the document, so this reads with `std::fs::read`
+/// (not `open_pdf`) and writes the repaired bytes verbatim. No password /
+/// no `Pdf` open.
+fn run_qdf_fix(input: &std::path::Path, output: &std::path::Path) -> CliResult<()> {
+    let bytes = std::fs::read(input)?;
+    let fixed = fix_qdf(&bytes)?;
+    std::fs::write(output, fixed)?;
     Ok(())
 }
 

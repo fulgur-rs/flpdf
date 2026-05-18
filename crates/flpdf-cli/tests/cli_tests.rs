@@ -284,6 +284,9 @@ fn dump_object_subcommand_accepts_ref() {
 
 #[test]
 fn qdf_subcommand_rewrites_output() {
+    // The `qdf` subcommand is now an alias of `rewrite --qdf` (epic
+    // flpdf-9hc.6 architecture decision): it must emit canonical QDF, not the
+    // old standalone `write_qdf` raw dump.
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -297,7 +300,18 @@ fn qdf_subcommand_rewrites_output() {
     .success();
 
     assert!(output.exists());
-    assert!(std::fs::metadata(output).unwrap().len() > 0);
+    assert!(std::fs::metadata(&output).unwrap().len() > 0);
+
+    let rendered = std::fs::read(&output).unwrap();
+    let has = |needle: &[u8]| rendered.windows(needle.len()).any(|w| w == needle);
+    assert!(has(b"%QDF-1.0"), "expected %QDF-1.0 header marker");
+    assert!(
+        has(b"%% Original object ID:"),
+        "expected %% Original object ID: comments"
+    );
+    assert!(has(b"\nxref\n"), "expected a classic `xref` table");
+    assert!(!has(b"/Type /XRef"), "QDF must not use an xref stream");
+    assert!(!has(b"/Type /ObjStm"), "QDF must not use object streams");
 }
 
 #[test]
@@ -315,13 +329,23 @@ fn qdf_subcommand_dumps_all_objects() {
     .assert()
     .success();
 
-    // The qdf output contains a binary header marker (non-UTF-8 bytes), so we
-    // read raw bytes and search for the target substring as bytes.
+    // The QDF output contains a binary header marker (non-UTF-8 bytes), so we
+    // read raw bytes and search for target substrings as bytes. Canonical QDF
+    // (the new `qdf` == `rewrite --qdf` behavior) preserves every object,
+    // including the unreferenced `5 0 obj` (/Type /Orphan), and carries the
+    // QDF markers.
     let rendered = std::fs::read(&output).unwrap();
+    let has = |needle: &[u8]| rendered.windows(needle.len()).any(|w| w == needle);
+    assert!(has(b"5 0 obj"), "expected '5 0 obj' in QDF output");
+    assert!(has(b"/Type /Orphan"), "expected the orphan object body");
+    assert!(has(b"%QDF-1.0"), "expected %QDF-1.0 header marker");
     assert!(
-        rendered.windows(b"5 0 obj".len()).any(|w| w == b"5 0 obj"),
-        "expected '5 0 obj' in qdf output"
+        has(b"%% Original object ID:"),
+        "expected %% Original object ID: comments"
     );
+    assert!(has(b"\nxref\n"), "expected a classic `xref` table");
+    assert!(!has(b"/Type /XRef"), "QDF must not use an xref stream");
+    assert!(!has(b"/Type /ObjStm"), "QDF must not use object streams");
 }
 
 #[test]
