@@ -49,8 +49,8 @@
 //! Running [`fix_qdf`] on an already-valid QDF file is a no-op, and the
 //! function is idempotent: `fix_qdf(fix_qdf(x)) == fix_qdf(x)`.
 
-use crate::{Error, Result};
 use crate::parser::{is_delimiter, is_ws};
+use crate::{Error, Result};
 
 /// One parsed `N G obj ... endobj` body in the input.
 #[derive(Debug, Clone)]
@@ -137,7 +137,6 @@ fn rfind_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
     found
 }
 
-
 /// Scan a stream dictionary slice for `/Length M G R` (indirect) or
 /// `/Length <int>` (direct). Returns `Indirect(M)` or `Direct`.
 enum LengthKind {
@@ -147,30 +146,66 @@ enum LengthKind {
 }
 
 fn classify_length(dict: &[u8]) -> LengthKind {
-    // Search for the PDF *name token* `/Length` — not just a byte substring.
-    // `/Length` must be followed immediately by a PDF whitespace or delimiter
-    // (ISO 32000-1 §7.2) or by end-of-slice, so that `/Length1`, `/LengthX`,
-    // etc. are not mistaken for the real `/Length` key.
-    let mut search_from = 0;
+    // Find the PDF *name token* `/Length` in object syntax — not just a byte
+    // substring. We walk the dictionary bytes skipping literal strings
+    // `(...)`, hex strings `<...>`, and `%` comments, so a `/Length` appearing
+    // inside e.g. `/Note (/Length 999)` or a comment is ignored. `/Length`
+    // must also be followed immediately by a PDF whitespace/delimiter
+    // (ISO 32000-1 §7.2) or end-of-slice, so `/Length1`, `/LengthX`, etc. are
+    // not mistaken for the real key.
     let needle = b"/Length";
-    let p = loop {
-        let offset = match find_subslice(&dict[search_from..], needle) {
-            Some(o) => o,
-            None => return LengthKind::None,
-        };
-        let abs = search_from + offset;
-        let after_pos = abs + needle.len();
-        match dict.get(after_pos) {
-            // End of slice: this is a bare `/Length` token — accept it.
-            None => break abs,
-            // Delimiter or whitespace after `Length`: valid token boundary.
-            Some(&b) if is_ws(b) || is_delimiter(b) => break abs,
-            // Anything else (e.g. `1` in `/Length1`): not a match — skip past
-            // this occurrence and keep scanning.
-            _ => {
-                search_from = abs + 1;
-                continue;
+    let p = {
+        let mut i = 0usize;
+        let found = loop {
+            if i >= dict.len() {
+                break None;
             }
+            match dict[i] {
+                // `%` comment runs to end of line (PDF §7.2.4).
+                b'%' => {
+                    while i < dict.len() && dict[i] != b'\n' && dict[i] != b'\r' {
+                        i += 1;
+                    }
+                }
+                // `<<` / `>>` are dict delimiters, not hex strings.
+                b'<' if dict.get(i + 1) == Some(&b'<') => i += 2,
+                b'>' if dict.get(i + 1) == Some(&b'>') => i += 2,
+                // Hex string `<...>` — skip to the closing `>`.
+                b'<' => {
+                    i += 1;
+                    while i < dict.len() && dict[i] != b'>' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // Literal string `(...)` — balanced parens, `\` escapes.
+                b'(' => {
+                    i += 1;
+                    let mut depth = 1usize;
+                    while i < dict.len() && depth > 0 {
+                        match dict[i] {
+                            b'\\' => i += 1, // skip escaped byte
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                // Candidate name token in normal object context.
+                b'/' if dict[i..].starts_with(needle) => {
+                    let after = dict.get(i + needle.len());
+                    if after.is_none_or(|&b| is_ws(b) || is_delimiter(b)) {
+                        break Some(i);
+                    }
+                    i += 1; // `/Length1` etc. — keep scanning.
+                }
+                _ => i += 1,
+            }
+        };
+        match found {
+            Some(p) => p,
+            None => return LengthKind::None,
         }
     };
     let rest = &dict[p + needle.len()..];
@@ -258,7 +293,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                     content_start += 1;
                 }
                 // Search for `endstream` starting from content_start.
-                if let Some(endstream_kw) = find_line_keyword_from(body_region, b"endstream", content_start) {
+                if let Some(endstream_kw) =
+                    find_line_keyword_from(body_region, b"endstream", content_start)
+                {
                     stream_info = Some((stream_kw, content_start, endstream_kw));
                 }
             }
