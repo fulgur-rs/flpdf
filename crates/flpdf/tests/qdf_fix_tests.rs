@@ -611,3 +611,36 @@ fn objstm_as_plain_name_value_not_rejected() {
     assert!(find(&fixed, b"/SomeKey /ObjStm").is_some());
     assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
 }
+
+/// Regression for roborev job 996: `>>` inside a trailer string/comment must
+/// not be taken as the dict close, so the real /Size is still rewritten.
+#[test]
+fn trailer_close_ignores_brackets_in_string() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    // Decoy `>>` inside a literal string AND a comment, before the real
+    // closing `>>`; the real /Size sits after the decoys.
+    pdf.extend_from_slice(
+        b"trailer <<\n  /Note (closing >> here)\n  %% another >> in a comment\n  /Root 1 0 R\n  /Size 4242\n>>\nstartxref\n0\n%%EOF\n",
+    );
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+    assert!(
+        find(&fixed, b"/Size 2\n").is_some(),
+        "real /Size must be rewritten despite >> in string/comment:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert!(
+        find(&fixed, b"/Size 4242").is_none(),
+        "stale /Size must be gone"
+    );
+    assert!(
+        find(&fixed, b"/Note (closing >> here)").is_some(),
+        "string decoy verbatim"
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
