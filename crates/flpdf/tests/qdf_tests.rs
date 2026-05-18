@@ -12,8 +12,10 @@
 //!       full-rewrite recovers byte-identical decoded content.
 //!   (h) qdf=true full-rewrite: LZWDecode stream decoded and /Filter absent.
 
-use flpdf::{filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef, Pdf,
-    Stream, WriteOptions};
+use flpdf::{
+    filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef, Pdf, Stream,
+    WriteOptions,
+};
 use std::io::Cursor;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,8 +90,9 @@ fn flate_encode(raw: &[u8]) -> Vec<u8> {
 
 /// Known LZW-encoded vector for "ABABABABABABAB" with EarlyChange=1 (PDF default).
 /// Generated and verified by an independent Python implementation.
-const LZW_ABABABABABABAB_EC1: &[u8] =
-    &[0x80, 0x10, 0x48, 0x50, 0x28, 0x24, 0x0e, 0x0d, 0x02, 0x80, 0x80];
+const LZW_ABABABABABABAB_EC1: &[u8] = &[
+    0x80, 0x10, 0x48, 0x50, 0x28, 0x24, 0x0e, 0x0d, 0x02, 0x80, 0x80,
+];
 
 /// Known LZW-encoded vector for "A" with EarlyChange=1.
 const LZW_A_EC1: &[u8] = &[0x80, 0x10, 0x60, 0x20];
@@ -104,8 +107,7 @@ const LZW_ABABABABAB_EC0: &[u8] = &[0x80, 0x10, 0x48, 0x50, 0x28, 0x24, 0x0e, 0x
 fn lzw_decode_abab_early_change_default() {
     let decoded = lzw_decode_raw(LZW_ABABABABABABAB_EC1, /*early_change=*/ true);
     assert_eq!(
-        decoded,
-        b"ABABABABABABAB",
+        decoded, b"ABABABABABABAB",
         "LZWDecode (EarlyChange=1): decoded bytes must match known plaintext"
     );
 }
@@ -114,8 +116,7 @@ fn lzw_decode_abab_early_change_default() {
 fn lzw_decode_single_byte_a() {
     let decoded = lzw_decode_raw(LZW_A_EC1, true);
     assert_eq!(
-        decoded,
-        b"A",
+        decoded, b"A",
         "LZWDecode: single-byte input must decode correctly"
     );
 }
@@ -128,8 +129,7 @@ fn lzw_decode_single_byte_a() {
 fn lzw_decode_early_change_zero() {
     let decoded = lzw_decode_raw(LZW_ABABABABAB_EC0, /*early_change=*/ false);
     assert_eq!(
-        decoded,
-        b"ABABABABABAB",
+        decoded, b"ABABABABABAB",
         "LZWDecode (EarlyChange=0): decoded bytes must match known plaintext"
     );
 }
@@ -142,8 +142,7 @@ fn lzw_decode_early_change_zero() {
 fn lzw_decode_empty_input() {
     let decoded = lzw_decode_raw(LZW_EMPTY_EC1, true);
     assert_eq!(
-        decoded,
-        b"",
+        decoded, b"",
         "LZWDecode: ClearCode+EOD stream must decode to empty output"
     );
 }
@@ -372,10 +371,7 @@ fn apply_stream_compress_no_decodes_lzw() {
     let lzw_data = LZW_ABABABABABABAB_EC1.to_vec();
     let mut dict = Dictionary::new();
     dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
-    dict.insert(
-        "Length",
-        Object::Integer(lzw_data.len() as i64),
-    );
+    dict.insert("Length", Object::Integer(lzw_data.len() as i64));
     let stream = Stream::new(dict, lzw_data);
 
     let result = apply_stream_compress_policy(&stream, CompressStreams::No);
