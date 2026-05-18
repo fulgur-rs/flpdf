@@ -259,9 +259,18 @@ fn detect_objstm(body: &[u8]) -> bool {
     let mut from = 0;
     while let Some(tp) = find_name_token_from(body, b"/Type", from) {
         let mut j = tp + b"/Type".len();
-        // Skip PDF whitespace between the key and its value.
-        while body.get(j).is_some_and(|&b| is_ws(b)) {
-            j += 1;
+        // Skip PDF whitespace AND `%...EOL` comments between the key and its
+        // value (comments are token separators too — `/Type %c\n /ObjStm`).
+        loop {
+            match body.get(j) {
+                Some(&b) if is_ws(b) => j += 1,
+                Some(&b'%') => {
+                    while body.get(j).is_some_and(|&c| c != b'\n' && c != b'\r') {
+                        j += 1;
+                    }
+                }
+                _ => break,
+            }
         }
         if body[j..].starts_with(b"/ObjStm")
             && body
@@ -306,7 +315,21 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         // searched for `endobj` naively. The real `endobj` always follows the
         // `endstream` keyword, so for stream objects we anchor the search there.
         let mut stream_info: Option<(usize, usize, usize)> = None; // (stream_kw, content_start, endstream_kw)
-        if let Some(stream_kw) = find_line_keyword_from(body_region, b"stream", kw_end) {
+                                                                   // A real stream's `stream` keyword follows this object's dictionary
+                                                                   // close `>>`. `find_matching_dict_close` skips literal strings, hex
+                                                                   // strings, and `%` comments, so a `stream`/`endstream` byte sequence
+                                                                   // inside a NON-stream object's string value (which lives *inside*
+                                                                   // `<<...>>`, before the close) is never mistaken for a real stream.
+                                                                   // For dict-less objects (e.g. bare-integer length holders) the first
+                                                                   // `<<` belongs to a later object; the `stream_is_ours` endobj-
+                                                                   // precedence check below then correctly rejects it.
+        let after_dict = find_subslice(&body_region[kw_end..], b"<<")
+            .map(|o| kw_end + o)
+            .and_then(|d| find_matching_dict_close(body_region, d))
+            .map(|c| c + 2);
+        if let Some(stream_kw) =
+            after_dict.and_then(|sf| find_line_keyword_from(body_region, b"stream", sf))
+        {
             // Only treat it as this object's stream if there is no `endobj`
             // before the `stream` keyword (otherwise the stream belongs to a
             // later object).
