@@ -161,11 +161,13 @@ fn default_id_random_xref_stream_full_rewrite_resave_preserves_element1() {
     let mut pdf2 = Pdf::open(Cursor::new(out1.clone())).unwrap();
     let mut out2 = Vec::new();
     write_pdf_with_options(&mut pdf2, &mut out2, &opts).unwrap();
-    let (a2, b2) = id_pair(
-        &load_xref_and_trailer(&mut Cursor::new(&out2))
-            .unwrap()
-            .trailer,
+    let t2 = load_xref_and_trailer(&mut Cursor::new(&out2)).unwrap();
+    assert_eq!(
+        t2.last_xref_form,
+        XrefForm::Stream,
+        "re-save output must also be xref-stream form, else the re-save no longer exercises the xref_dict path this test pins"
     );
+    let (a2, b2) = id_pair(&t2.trailer);
 
     assert_eq!(
         a2, a1,
