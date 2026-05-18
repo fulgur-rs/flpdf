@@ -2983,5 +2983,8 @@ fn no_original_object_ids_conflicts_with_json() {
             "../../tests/fixtures/minimal.pdf",
         ])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"))
+        .stderr(predicate::str::contains("--json"))
+        .stderr(predicate::str::contains("--no-original-object-ids"));
 }
