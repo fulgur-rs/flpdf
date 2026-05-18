@@ -1037,21 +1037,24 @@ fn non_qdf_never_emits_original_object_id_comments() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// flpdf-9hc.6.3 — QDF output formatting normalization
+// flpdf-9hc.6.3 + flpdf-9hc.6.10 — QDF byte-parity with the qpdf --qdf golden
 //
-// (o) Golden normalized-diff: flpdf qdf full-rewrite of minimal.pdf matches the
-//     committed qpdf 11.9.0 --qdf reference byte-for-byte, modulo three KNOWN
-//     pre-existing divergences (all outside 6.3's body/trailer-serialization
-//     scope, confirmed by stashing the 6.3 diff):
-//       - object 0 (`%% Original object ID: 0 65535` / `0 65535 obj` / `null`
-//         / `endobj`) is emitted by flpdf but not by qpdf (object-loop /
-//         framing concern — tracked as a 6.4/6.5 follow-up),
-//       - the blank line qpdf inserts BETWEEN indirect objects (framing),
-//       - the random `/ID` hex (qpdf emits a fresh id; flpdf static-id is the
-//         pi constant — id strategy is 6.8/6.9 scope).
-//     After normalizing those, the dict multi-line layout, alphabetical key
-//     sort, one-element-per-line arrays, empty-container shape, and the
-//     `trailer <<` block (with /ID last and inline) are byte-identical.
+// (o) Golden byte-diff: flpdf qdf full-rewrite of minimal.pdf is now
+//     byte-IDENTICAL to the committed qpdf 11.9.0 `--qdf --deterministic-id`
+//     reference EXCEPT for the single `/ID [<hex><hex>]` line in the trailer.
+//
+//     flpdf-9hc.6.10 closed the two framing gaps that 6.3 documented as
+//     pre-existing (object-0 body suppression + the inter-object blank line),
+//     so the ONLY remaining divergence is the trailer /ID hex: qpdf's golden
+//     uses `--deterministic-id` (a content hash, `63a4ae…`) while flpdf's
+//     `--static-id` is the fixed pi-digit constant (`31415…`). These are two
+//     intentionally different deterministic-ID strategies, NOT a defect — the
+//     /ID line is the documented, irreducible residual. Everything else (the
+//     %PDF/%QDF header + binary marker, every `%% Original object ID:` /
+//     `N G obj` / body / `endobj` / inter-object blank line, the `xref` table
+//     with exact offsets, the `trailer <<` block layout with /ID last and
+//     inline, `startxref`, and the `startxref` byte offset itself) matches
+//     qpdf byte-for-byte.
 // (p) Property assertions on the qdf body region.
 // (q) Idempotence: qdf output re-fed through qdf full-rewrite is byte-identical.
 // (r) Non-qdf regression guard: qdf=false output keeps the compact
@@ -1187,82 +1190,71 @@ fn trailer_size(bytes: &[u8]) -> i64 {
     panic!("/Size not found in trailer");
 }
 
-/// Drop the pre-existing framing/id divergences so the comparison isolates
-/// what flpdf-9hc.6.3 actually owns (body + trailer serialization). The
-/// removed shapes are tracked by a separate bd follow-up (object-0 body +
-/// inter-object blank line) and by 6.8/6.9 (/ID strategy).
-fn normalize_known_divergences(bytes: &[u8]) -> Vec<String> {
+/// Normalize ONLY the trailer `/ID [<hex><hex>]` line — the single,
+/// documented, irreducible divergence between flpdf `--static-id` (fixed
+/// pi-digit constant) and the qpdf `--qdf --deterministic-id` golden (content
+/// hash). flpdf-9hc.6.10 closed the object-0 and inter-object-blank-line
+/// framing gaps, so EVERY other byte (header, binary marker, object bodies,
+/// `endobj`/blank-line framing, xref table + offsets, trailer layout,
+/// `startxref` + its byte offset) must now match qpdf exactly. Nothing else is
+/// normalized: any other diff is a real regression and must fail the test.
+fn normalize_id_line_only(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        // Strip the pre-existing object-0 null body block.
-        if line == "%% Original object ID: 0 65535" {
-            // skip: comment, "0 65535 obj", "null", "endobj"
-            i += 4;
-            continue;
-        }
-        // Drop blank separator lines (qpdf has them between objects, flpdf
-        // does not — framing follow-up).
-        if line.is_empty() {
-            i += 1;
-            continue;
-        }
-        // Normalize the random /ID array (id strategy is 6.8/6.9 scope).
-        if let Some(idx) = line.find("/ID [<") {
-            out.push(format!("{}/ID <NORM>", &line[..idx]));
-            i += 1;
-            continue;
-        }
-        // xref in-use/free entry: "0000000052 00000 n " — the OFFSET value
-        // differs only because flpdf still emits the object-0 block (framing
-        // follow-up), which shifts every byte position. 6.3 owns the body
-        // serialization, not the offsets, so collapse the whole entry to a
-        // single marker; the body bytes themselves are compared above.
-        // Form: 10 digits, space, 5 digits, space, 'n'|'f', trailing space
-        // ("0000000052 00000 n ").
-        let bytes_line = line.as_bytes();
-        if bytes_line.len() == 19
-            && bytes_line[10] == b' '
-            && bytes_line[16] == b' '
-            && matches!(bytes_line[17], b'n' | b'f')
-            && bytes_line[18] == b' '
-            && line[..10].bytes().all(|b| b.is_ascii_digit())
-            && line[11..16].bytes().all(|b| b.is_ascii_digit())
-        {
-            out.push("<XREF-ENTRY>".to_string());
-            i += 1;
-            continue;
-        }
-        if out.last().map(String::as_str) == Some("startxref") {
-            out.push("<OFFSET>".to_string());
-            i += 1;
-            continue;
-        }
-        out.push(line.to_string());
-        i += 1;
-    }
-    out
+    text.lines()
+        .map(|line| {
+            if let Some(idx) = line.find("/ID [<") {
+                format!("{}/ID <NORM>", &line[..idx])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
 }
 
 #[test]
-fn qdf_golden_minimal_matches_qpdf_modulo_known_divergences() {
+fn qdf_golden_minimal_is_byte_identical_to_qpdf_modulo_id() {
     let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
     let golden = std::fs::read("../../tests/fixtures/qdf-golden/minimal.qdf").unwrap();
 
     let produced = qdf_rewrite(&source);
 
-    let want = normalize_known_divergences(&golden);
-    let got = normalize_known_divergences(&produced);
-
+    // Exactly one line — the trailer /ID — may differ (flpdf --static-id vs
+    // qpdf --deterministic-id). Confirm that is the ONLY raw-byte difference,
+    // then assert byte parity on every other line.
+    let golden_text = String::from_utf8_lossy(&golden);
+    let produced_text = String::from_utf8_lossy(&produced);
+    let raw_diffs: Vec<(&str, &str)> = golden_text
+        .lines()
+        .zip(produced_text.lines())
+        .filter(|(g, p)| g != p)
+        .collect();
     assert_eq!(
-        got,
-        want,
+        golden_text.lines().count(),
+        produced_text.lines().count(),
+        "flpdf qdf output has a different line count than the qpdf --qdf \
+         golden — framing regression.\n--- produced ---\n{produced_text}\n"
+    );
+    assert_eq!(
+        raw_diffs.len(),
+        1,
+        "exactly one line (the trailer /ID) may differ from the qpdf --qdf \
+         golden; found {} differing lines: {:?}\n--- produced ---\n{}\n",
+        raw_diffs.len(),
+        raw_diffs,
+        produced_text
+    );
+    assert!(
+        raw_diffs[0].0.contains("/ID [<") && raw_diffs[0].1.contains("/ID [<"),
+        "the sole permitted divergence must be the trailer /ID line, got {:?}",
+        raw_diffs[0]
+    );
+
+    // And, with only the /ID hex normalized, the files are byte-identical.
+    assert_eq!(
+        normalize_id_line_only(&produced),
+        normalize_id_line_only(&golden),
         "flpdf qdf output diverges from the qpdf --qdf golden beyond the \
-         documented pre-existing framing/id gaps.\n--- produced ---\n{}\n",
-        String::from_utf8_lossy(&produced)
+         trailer /ID line.\n--- produced ---\n{produced_text}\n"
     );
 }
 
