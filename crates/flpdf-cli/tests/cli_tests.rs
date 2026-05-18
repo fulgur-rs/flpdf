@@ -2872,3 +2872,116 @@ fn corrupt_xref_with_info_pdf() -> Vec<u8> {
 
     corrupted
 }
+
+// ── --no-original-object-ids (flpdf-9hc.13.5) ────────────────────────────────
+//
+// qpdf `--no-original-object-ids` omits the `%% Original object ID: N M`
+// comments QDF output carries. Observed against qpdf 11.9.0: the flag changes
+// ONLY QDF output (`qpdf --qdf` vs `qpdf --qdf --no-original-object-ids`);
+// qpdf JSON v1/v2 is byte-identical with or without it. fulgur-qtest fails 52
+// cases purely because the flag was "unrecognized"; the load-bearing fix is
+// clap acceptance on both the top-level and `rewrite` surfaces.
+//
+// flpdf's QDF writer does not yet emit those comments (the comment body is
+// epic flpdf-9hc.6), so today the flag is a byte-level no-op: default output
+// and `--no-original-object-ids` output must be byte-identical.
+
+#[test]
+fn top_level_no_original_object_ids_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let assert = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--no-original-object-ids",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    // The whole point of .13.5: clap must NOT reject the flag as unknown.
+    assert.stderr(predicate::str::contains("unrecognized").not());
+    assert!(output.exists());
+}
+
+#[test]
+fn rewrite_no_original_object_ids_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    let assert = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--no-original-object-ids",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert.stderr(predicate::str::contains("unrecognized").not());
+    assert!(output.exists());
+}
+
+#[test]
+fn no_original_object_ids_default_behavior_unchanged() {
+    // presence/absence parity: with no QDF-comment emission point yet, the
+    // flag must not perturb any output byte. Compared same-surface (flag vs
+    // no-flag on the SAME `rewrite` path) and made deterministic with
+    // --static-id so the random trailer /ID does not cause a spurious diff.
+    // This guards the "default behavior unchanged" acceptance criterion and
+    // will keep holding once flpdf-9hc.6 adds the comment body (the comment
+    // is absent by default; the flag only suppresses an opt-in QDF annotation).
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.pdf");
+    let with_flag = temp.path().join("with_flag.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--static-id",
+            "../../tests/fixtures/minimal.pdf",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--static-id",
+            "--no-original-object-ids",
+            "../../tests/fixtures/minimal.pdf",
+            with_flag.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let baseline_bytes = std::fs::read(&baseline).unwrap();
+    let with_flag_bytes = std::fs::read(&with_flag).unwrap();
+    assert_eq!(
+        baseline_bytes, with_flag_bytes,
+        "rewrite --no-original-object-ids must not change output bytes \
+         (no QDF-comment emission point exists yet; flpdf-9hc.6)"
+    );
+}
+
+#[test]
+fn no_original_object_ids_conflicts_with_json() {
+    // Mirrors how `--static-id` conflicts with `--json`: combining a QDF/rewrite
+    // modifier with --json is a usage error, not a silently-ignored flag.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--no-original-object-ids",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .assert()
+        .failure();
+}

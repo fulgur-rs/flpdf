@@ -1703,6 +1703,42 @@ fn writes_qdf_with_object_generations() {
     assert!(rendered.contains(" 00003 n"));
 }
 
+#[test]
+fn write_options_no_original_object_ids_defaults_false_and_qdf_has_no_such_comment() {
+    // flpdf-9hc.13.5: `WriteOptions::no_original_object_ids` exists and
+    // defaults to false (qpdf --no-original-object-ids is plumbed for
+    // acceptance + forward-compat). flpdf's write_qdf does NOT yet emit the
+    // `%% Original object ID` comment (epic flpdf-9hc.6 owns that body), so
+    // the default QDF output must not contain it regardless of the flag.
+    let opts = WriteOptions::default();
+    assert!(
+        !opts.no_original_object_ids,
+        "no_original_object_ids must default to false (default behavior unchanged)"
+    );
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(
+        !rendered.contains("%% Original object ID"),
+        "write_qdf does not emit %% Original object ID comments yet \
+         (flpdf-9hc.6); there is no suppression point for the flag to act on"
+    );
+}
+
 fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() {
         return 0;
