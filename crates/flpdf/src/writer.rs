@@ -1383,8 +1383,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     }
 
     // Holders to emit after the last original object, ascending by number:
-    // (holder_object_number, decoded_length_value). Filled in the main loop.
-    let mut length_holders: Vec<(u32, i64)> = Vec::new();
+    // holder_object_number -> decoded_length_value. A BTreeMap keeps them
+    // unique and key-sorted; a reused holder number with a *conflicting*
+    // length is an explicit error (a plain Vec + dedup_by_key would silently
+    // drop the conflict and emit a wrong `/Length H 0 R`).
+    let mut length_holders: BTreeMap<u32, i64> = BTreeMap::new();
     // Running counter for freshly allocated holder numbers (above existing_max
     // and above any ObjStm container numbers). Mirrors the `existing_max + i`
     // container-allocation pattern at the top of this function.
@@ -1523,7 +1526,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                                 })?
                         }
                     };
-                    length_holders.push((holder, len_value));
+                    if let Some(prev) = length_holders.insert(holder, len_value) {
+                        if prev != len_value {
+                            return Err(crate::Error::Unsupported(format!(
+                                "full-rewrite: QDF length-holder {holder} reused with conflicting lengths ({prev} vs {len_value})"
+                            )));
+                        }
+                    }
 
                     let mut holder_stream = s.clone();
                     holder_stream
@@ -1575,8 +1584,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // line with no zero padding — identical framing to qpdf and to what
     // flpdf::fix_qdf (qdf_fix.rs) rewrites. The same `endobj` framing the
     // main loop uses keeps offsets and xref consistent.
-    length_holders.sort_by_key(|&(h, _)| h);
-    length_holders.dedup_by_key(|&mut (h, _)| h);
+    // `length_holders` is a BTreeMap: already unique and ascending by holder
+    // number, with conflicting-length reuse rejected at insert time above.
     for (holder, len_value) in &length_holders {
         if offsets.contains_key(holder) {
             return Err(crate::Error::Unsupported(format!(
