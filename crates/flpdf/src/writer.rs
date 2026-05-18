@@ -1430,10 +1430,18 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             };
             let reencoded = apply_stream_compress_policy(&stream, compress_policy);
             if let Object::Stream(ref s) = reencoded {
-                write_stream_to_buf(&mut bytes, s, options.newline_before_endstream);
+                if options.qdf {
+                    write_stream_to_buf_qdf(&mut bytes, s, options.newline_before_endstream);
+                } else {
+                    write_stream_to_buf(&mut bytes, s, options.newline_before_endstream);
+                }
+            } else if options.qdf {
+                reencoded.write_pdf_qdf(&mut bytes, 0);
             } else {
                 reencoded.write_pdf(&mut bytes);
             }
+        } else if options.qdf {
+            object.write_pdf_qdf(&mut bytes, 0);
         } else {
             object.write_pdf(&mut bytes);
         }
@@ -1498,9 +1506,26 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 apply_random_id(&mut trailer);
             }
 
-            bytes.extend_from_slice(b"trailer\n");
-            trailer.write_pdf(&mut bytes);
-            bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+            if options.qdf {
+                // qpdf --qdf trailer: "trailer <<" on one line, then one
+                // "  /Key value" entry per line with the keys alphabetically
+                // sorted but /ID forced LAST (verified empirically against
+                // qpdf 11.9.0: minimal => /Root /Size /ID; three-page =>
+                // /Info /Root /Size /ID). Values use the EXISTING compact
+                // serializer, which keeps the /ID array inline
+                // ("[<hex><hex>]") — do NOT route the trailer through the qdf
+                // dict serializer. Closing ">>" then startxref directly (no
+                // extra leading newline) to match the qpdf reference.
+                write_qdf_trailer(&mut bytes, &trailer);
+                bytes
+                    .extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+            } else {
+                bytes.extend_from_slice(b"trailer\n");
+                trailer.write_pdf(&mut bytes);
+                bytes.extend_from_slice(
+                    format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+                );
+            }
         }
 
         XrefForm::Stream => {
@@ -1810,6 +1835,82 @@ pub fn write_stream_to_buf(
     }
 
     buf.extend_from_slice(b"endstream");
+}
+
+/// QDF variant of [`write_stream_to_buf`]: identical stream/endstream framing
+/// and newline-before-endstream behaviour, but the stream dictionary is
+/// serialized with the qpdf `--qdf` multi-line / sorted-key layout
+/// ([`Dictionary::write_pdf_qdf`]) instead of the compact form. Used only on
+/// the qdf full-rewrite path; preserves the 6.1-era stream invariants
+/// (raw `data`, `/Length` already correct in `dict`).
+fn write_stream_to_buf_qdf(
+    buf: &mut Vec<u8>,
+    stream: &crate::Stream,
+    policy: NewlineBeforeEndstream,
+) {
+    stream.dict.write_pdf_qdf(buf, 0);
+    buf.extend_from_slice(b"\nstream\n");
+    buf.extend_from_slice(&stream.data);
+
+    match policy {
+        NewlineBeforeEndstream::Yes => {
+            buf.push(b'\n');
+        }
+        NewlineBeforeEndstream::No => {
+            let ends_with_eol = stream
+                .data
+                .last()
+                .map(|&b| b == b'\n' || b == b'\r')
+                .unwrap_or(false);
+            if !ends_with_eol {
+                buf.push(b'\n');
+            }
+        }
+    }
+
+    buf.extend_from_slice(b"endstream");
+}
+
+/// Emit the rebuilt full-rewrite trailer in qpdf `--qdf` formatting:
+///
+/// ```text
+/// trailer <<
+///   /Key value
+///   ...
+/// >>
+/// ```
+///
+/// Keys are emitted alphabetically by raw name, **except `/ID` which is forced
+/// last** — this matches qpdf 11.9.0 exactly (minimal.pdf: `/Root /Size /ID`;
+/// three-page.pdf: `/Info /Root /Size /ID`). Each value is written with the
+/// EXISTING compact [`Object::write_pdf`] serializer, so array values such as
+/// `/ID [<hex><hex>]` stay inline (qpdf formats the trailer specially). The
+/// closing `>>` is followed by a newline; the caller appends `startxref`
+/// directly afterwards.
+fn write_qdf_trailer(bytes: &mut Vec<u8>, trailer: &Dictionary) {
+    bytes.extend_from_slice(b"trailer <<\n");
+
+    // `Dictionary::iter()` already yields keys in lexicographic (BTreeMap)
+    // order; split out /ID so it can be appended last.
+    let mut id_value: Option<&Object> = None;
+    for (key, value) in trailer.iter() {
+        if key == b"ID" {
+            id_value = Some(value);
+            continue;
+        }
+        bytes.extend_from_slice(b"  /");
+        bytes.extend_from_slice(key);
+        bytes.push(b' ');
+        value.write_pdf(bytes);
+        bytes.push(b'\n');
+    }
+    if let Some(value) = id_value {
+        bytes.extend_from_slice(b"  /ID ");
+        value.write_pdf(bytes);
+        bytes.push(b'\n');
+    }
+
+    bytes.extend_from_slice(b">>\n");
 }
 
 #[cfg(test)]
