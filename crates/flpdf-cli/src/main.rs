@@ -993,6 +993,18 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Top-level `--qdf` combined with a page operation is rejected here, before
+    // the dispatch chain, for the same reason: the `else if
+    // page_ops_active(...)` branch (below) wins over the default rewrite
+    // branch and does not thread `--qdf` into its `WriteOptions`, so the
+    // combination would silently emit a non-QDF document. The page-extraction
+    // pipeline produces a normalized (non-QDF) doc by design; reject the
+    // combination explicitly rather than ignoring the flag.
+    if args.qdf && page_ops_active(&args.page_ops) {
+        eprintln!("flpdf: --qdf cannot be combined with --pages/--rotate/--split-pages");
+        std::process::exit(1);
+    }
+
     // JSON mode takes the first branch, but this is unambiguous: clap's
     // conflicts_with_all on --json (plus args_conflicts_with_subcommands on
     // Cli) guarantees no other top-level mode or subcommand can be set at
