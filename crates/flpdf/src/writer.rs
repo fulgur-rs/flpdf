@@ -122,13 +122,13 @@ pub struct WriteOptions {
     /// v1 and v2 output are byte-identical with or without it, so this field is
     /// intentionally **not** wired into any JSON path.
     ///
-    /// `flpdf`'s current [`write_qdf`] does not yet emit the `%% Original
-    /// object ID` comments at all (the QDF-comment body is tracked under epic
-    /// `flpdf-9hc.6`). This flag is therefore plumbed through `WriteOptions`
-    /// for acceptance and forward-compatibility; the eventual QDF-comment
-    /// emitter will read this bool to decide whether to skip the annotation.
-    /// With no emission point today, the default (`false`) and the flag both
-    /// produce byte-identical QDF output.
+    /// `flpdf`'s full-rewrite path (`write_pdf_full_rewrite`, reached when
+    /// `full_rewrite = true`) emits `%% Original object ID: N G` immediately
+    /// before each indirect object's `N G obj` line when `qdf = true` and this
+    /// flag is `false`.  Setting this flag to `true` suppresses those comments
+    /// while leaving the `N G obj` lines intact — matching qpdf's
+    /// `--no-original-object-ids` behaviour exactly (implemented in epic layer
+    /// `flpdf-9hc.6.5`).
     pub no_original_object_ids: bool,
 
     /// When `true`, decode every stream through its filter pipeline and re-emit
@@ -1389,6 +1389,22 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 "duplicate object number {} in xref table",
                 object_ref.number
             )));
+        }
+
+        // QDF per-object comment: "%% Original object ID: N G"
+        // Emitted immediately before the "N G obj" line so human readers can
+        // locate objects without consulting the xref table.  Mirrors qpdf
+        // 11.9.0 --qdf output.  Suppressed when no_original_object_ids=true.
+        // The xref offset below is recorded AFTER the comment so it still
+        // points at the "N G obj" line, not at the comment.
+        if options.qdf && !options.no_original_object_ids {
+            bytes.extend_from_slice(
+                format!(
+                    "%% Original object ID: {} {}\n",
+                    object_ref.number, object_ref.generation
+                )
+                .as_bytes(),
+            );
         }
 
         let emit_offset = bytes.len();
