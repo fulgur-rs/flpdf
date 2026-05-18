@@ -1517,14 +1517,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 // dict serializer. Closing ">>" then startxref directly (no
                 // extra leading newline) to match the qpdf reference.
                 write_qdf_trailer(&mut bytes, &trailer);
-                bytes
-                    .extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+                bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
             } else {
                 bytes.extend_from_slice(b"trailer\n");
                 trailer.write_pdf(&mut bytes);
-                bytes.extend_from_slice(
-                    format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
-                );
+                bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
             }
         }
 
