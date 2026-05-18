@@ -89,7 +89,10 @@ fn find_next_obj(input: &[u8], from: usize) -> Option<(u32, u32, usize, usize)> 
 
 /// Index of the next `\n` at or after `from`.
 fn memchr_nl(buf: &[u8], from: usize) -> Option<usize> {
-    buf[from..].iter().position(|&b| b == b'\n').map(|i| from + i)
+    buf[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| from + i)
 }
 
 /// Parse a line that should be `N G obj` (with optional trailing content after
@@ -117,17 +120,20 @@ fn parse_obj_header(line: &[u8]) -> Option<(u32, u32, usize)> {
     Some((num, gen, kw_end))
 }
 
-/// Locate `needle` as a standalone keyword (preceded by start-of-buffer or an
-/// ASCII delimiter/whitespace) at or after `from`.
-fn find_keyword(input: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + needle.len() <= input.len() {
-        if &input[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
+/// Locate the **last** line-anchored `kw` keyword in `input`.
+///
+/// The genuine cross-reference table always follows every object, at the tail
+/// of the file. A QDF stream body (streams are decompressed in QDF) can itself
+/// contain a line that begins with `xref`, so scanning from the top would match
+/// stream content. Taking the last line-anchored match selects the real table.
+fn rfind_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(pos) = find_line_keyword_from(input, kw, from) {
+        found = Some(pos);
+        from = pos + 1;
     }
-    None
+    found
 }
 
 /// Compute the verbatim stream length for an object whose body starts a stream.
@@ -135,8 +141,10 @@ fn find_keyword(input: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// `body` is the bytes from just after the `N G obj` line to the object's
 /// `endobj`. Returns `Some(len)` if a `stream` keyword is found.
 fn compute_stream_len(body: &[u8]) -> Option<usize> {
-    // Find the `stream` keyword. It appears on its own line after the dict.
-    let kw = find_keyword(body, b"stream", 0)?;
+    // Find the `stream` keyword. It appears on its own line after the dict;
+    // match it line-anchored so a `stream` byte sequence inside a dictionary
+    // string/name value cannot be mistaken for the keyword.
+    let kw = find_line_keyword_from(body, b"stream", 0)?;
     // Skip the keyword and its end-of-line marker (CRLF, LF, or lone CR), as
     // per the PDF stream convention. Content begins immediately after.
     let mut content_start = kw + b"stream".len();
@@ -213,9 +221,10 @@ fn detect_objstm(body: &[u8]) -> bool {
 ///   missing).
 pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ---- 1. Locate the xref / trailer / startxref region. ---------------
-    // We rebuild everything from the first `xref` keyword that starts a line
+    // We rebuild everything from the real `xref` table (the LAST line-anchored
+    // `xref`, since a decompressed stream body may contain an `xref` line)
     // through end of file.
-    let xref_pos = find_line_keyword(input, b"xref")
+    let xref_pos = rfind_line_keyword(input, b"xref")
         .ok_or_else(|| Error::parse(0, "fix_qdf: no classic `xref` table found"))?;
 
     let body_region = &input[..xref_pos];
@@ -225,9 +234,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     let mut cursor = 0usize;
     while let Some((num, gen, line_start, kw_end)) = find_next_obj(body_region, cursor) {
         // Object body runs until the matching `endobj` keyword.
-        let endobj = find_line_keyword_from(body_region, b"endobj", kw_end).ok_or_else(|| {
-            Error::parse(line_start, "fix_qdf: object without matching `endobj`")
-        })?;
+        let endobj = find_line_keyword_from(body_region, b"endobj", kw_end)
+            .ok_or_else(|| Error::parse(line_start, "fix_qdf: object without matching `endobj`"))?;
         let end = endobj + b"endobj".len();
         let body = &body_region[kw_end..endobj];
 
@@ -241,9 +249,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         // whether this object has a stream and how its /Length is stored.
         let mut stream_len = None;
         let mut length_holder = None;
-        if let Some(stream_kw) = find_keyword(body, b"stream", 0) {
+        if let Some(stream_kw) = find_line_keyword_from(body, b"stream", 0) {
             // `endstream` must follow; if not this `stream` is incidental text.
-            if find_keyword(body, b"endstream", stream_kw).is_some() {
+            if find_line_keyword_from(body, b"endstream", stream_kw).is_some() {
                 stream_len = compute_stream_len(body);
                 // The dictionary is everything before the `stream` keyword.
                 let dict = &body[..stream_kw];
@@ -364,8 +372,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
 
     // Copy `trailer` ... up to and including the dict, with /Size rewritten.
     let trailer_prefix = &input[xref_pos..trailer_kw]; // usually empty
-    // (the xref body we already emitted ourselves; trailer_prefix is bytes
-    // between old xref keyword and `trailer`, which we *replaced*, so ignore).
+                                                       // (the xref body we already emitted ourselves; trailer_prefix is bytes
+                                                       // between old xref keyword and `trailer`, which we *replaced*, so ignore).
     let _ = trailer_prefix;
     let trailer_dict = &input[trailer_kw..dict_close + 2];
     let rewritten_trailer = rewrite_size(trailer_dict, size);
@@ -392,11 +400,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Find a keyword that begins a line (preceded by start-of-buffer or `\n`).
-fn find_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
-    find_line_keyword_from(input, kw, 0)
-}
-
+/// Find a keyword that begins a line (preceded by start-of-buffer or `\n`),
+/// at or after `from`.
 fn find_line_keyword_from(input: &[u8], kw: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + kw.len() <= input.len() {
@@ -436,7 +441,10 @@ fn rewrite_length_holder(out: &mut Vec<u8>, obj_bytes: &[u8], new_len: usize) ->
     let body = &obj_bytes[nl + 1..endobj_rel];
 
     // Split body into leading whitespace, the integer token, trailing bytes.
-    let lead = body.iter().take_while(|&&b| b.is_ascii_whitespace()).count();
+    let lead = body
+        .iter()
+        .take_while(|&&b| b.is_ascii_whitespace())
+        .count();
     let after_int = body[lead..]
         .iter()
         .position(|&b| !b.is_ascii_digit())
@@ -491,11 +499,11 @@ fn rewrite_size(trailer: &[u8], size: u32) -> Vec<u8> {
     out.extend_from_slice(&trailer[..p + b"/Size".len()]);
     let rest = &trailer[p + b"/Size".len()..];
     // Skip whitespace, then the old integer.
-    let ws = rest.iter().take_while(|&&b| b.is_ascii_whitespace()).count();
-    let digits = rest[ws..]
+    let ws = rest
         .iter()
-        .take_while(|b| b.is_ascii_digit())
+        .take_while(|&&b| b.is_ascii_whitespace())
         .count();
+    let digits = rest[ws..].iter().take_while(|b| b.is_ascii_digit()).count();
     out.extend_from_slice(&rest[..ws]);
     out.extend_from_slice(size.to_string().as_bytes());
     out.extend_from_slice(&rest[ws + digits..]);
