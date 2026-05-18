@@ -591,8 +591,7 @@ fn qdf_header_contains_qdf_marker() {
     );
     let line2 = lines.next().expect("line 2 (binary marker)");
     assert_eq!(
-        line2,
-        b"%\xbf\xf7\xa2\xfe",
+        line2, b"%\xbf\xf7\xa2\xfe",
         "line 2 must be the binary marker %BF F7 A2 FE (without the newline)"
     );
     let line3 = lines.next().expect("line 3 (%QDF-1.0)");
