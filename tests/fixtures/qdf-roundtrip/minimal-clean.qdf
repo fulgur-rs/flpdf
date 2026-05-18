@@ -2,10 +2,6 @@
 %¿÷¢þ
 %QDF-1.0
 
-%% Original object ID: 0 65535
-0 65535 obj
-null
-endobj
 %% Original object ID: 1 0
 1 0 obj
 <<
@@ -13,6 +9,7 @@ endobj
   /Type /Catalog
 >>
 endobj
+
 %% Original object ID: 2 0
 2 0 obj
 <<
@@ -22,16 +19,17 @@ endobj
   /Type /Pages
 >>
 endobj
+
 xref
 0 3
 0000000000 65535 f 
-0000000107 00000 n 
-0000000187 00000 n 
+0000000052 00000 n 
+0000000133 00000 n 
 trailer <<
   /Root 1 0 R
   /Size 3
   /ID [<31415926535897932384626433832795><31415926535897932384626433832795>]
 >>
 startxref
-248
+195
 %%EOF
