@@ -1403,8 +1403,27 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 
+    // QDF framing (flpdf-9hc.6.10): qpdf `--qdf` never emits a body object for
+    // object 0 (the xref free-list head) or for any free/deleted entry — those
+    // exist only as `f` rows in the regenerated xref table. flpdf's
+    // `object_refs()` includes the free head (0 65535) and any deleted refs, so
+    // on the qdf path we suppress them here. The non-qdf path is unaffected and
+    // its byte output is unchanged.
+    let qdf_skip_refs: std::collections::HashSet<ObjectRef> = if options.qdf {
+        pdf.deleted_object_refs().into_iter().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for object_ref in &object_refs {
         if Some(*object_ref) == pdf.encryption_ref() {
+            continue;
+        }
+
+        // QDF: never emit object 0 or any free/deleted entry as a body object
+        // (qpdf --qdf parity, flpdf-9hc.6.10). The xref free-list head and any
+        // free rows are still written into the regenerated `xref` table below.
+        if options.qdf && (object_ref.number == 0 || qdf_skip_refs.contains(object_ref)) {
             continue;
         }
 
@@ -1558,6 +1577,15 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         }
 
         bytes.extend_from_slice(b"\nendobj\n");
+        // QDF framing (flpdf-9hc.6.10): qpdf `--qdf` separates every indirect
+        // object with one blank line (`endobj\n\n%% Original object ID:` …, and
+        // `endobj\n\nxref` before the xref table). The trailing blank line is
+        // also emitted before the next holder/ObjStm object and, because
+        // `xref_offset` is captured immediately after the loops, before the
+        // `xref` keyword for the final object — matching qpdf byte-for-byte.
+        if options.qdf {
+            bytes.push(b'\n');
+        }
         offsets.insert(object_ref.number, (object_ref.generation, emit_offset));
     }
 
@@ -1571,6 +1599,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
         write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
         bytes.extend_from_slice(b"\nendobj\n");
+        // QDF inter-object blank-line separator (flpdf-9hc.6.10). qdf mode
+        // emits no ObjStm containers (6.2), so this is a consistency guard.
+        if options.qdf {
+            bytes.push(b'\n');
+        }
         offsets.insert(container_ref.number, (0, emit_offset));
     }
 
@@ -1594,6 +1627,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         }
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{holder} 0 obj\n{len_value}\nendobj\n").as_bytes());
+        // QDF inter-object blank-line separator (flpdf-9hc.6.10): a blank line
+        // between holders and before the `xref` keyword, matching qpdf which
+        // separates every object. length_holders is only populated on the qdf
+        // path, but gate explicitly for clarity.
+        if options.qdf {
+            bytes.push(b'\n');
+        }
         offsets.insert(*holder, (0, emit_offset));
     }
 
