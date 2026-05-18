@@ -454,9 +454,7 @@ fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, S
                 table.push(new_entry);
 
                 // Bump code width when the table reaches the trigger threshold.
-                if code_bits < MAX_BITS
-                    && table.len() == (1usize << code_bits) - early_offset
-                {
+                if code_bits < MAX_BITS && table.len() == (1usize << code_bits) - early_offset {
                     code_bits += 1;
                 }
             }
