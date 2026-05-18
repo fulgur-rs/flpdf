@@ -410,10 +410,31 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     }
 
     // ---- 3. Compute the new length-holder integer bodies. ---------------
-    // Map object number -> its index in `objects`.
+    // Validate every indirect `/Length M G R` holder (flpdf-9hc.25):
+    //   * the holder object `M` must actually exist in the parsed set —
+    //     otherwise the "repaired" file still carries a dangling indirect
+    //     length and is invalid for downstream readers; and
+    //   * a holder reused by two streams with *conflicting* lengths is an
+    //     explicit error rather than silent last-writer-wins (which would
+    //     leave the earlier stream's /Length wrong).
+    let object_numbers: std::collections::HashSet<u32> = objects.iter().map(|o| o.num).collect();
     let mut new_len_body: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for obj in &objects {
         if let (Some(len), Some(holder)) = (obj.stream_len, obj.length_holder) {
+            if !object_numbers.contains(&holder) {
+                return Err(Error::parse(
+                    obj.obj_line_start,
+                    "fix_qdf: stream's indirect /Length holder object is missing",
+                ));
+            }
+            if let Some(&prev) = new_len_body.get(&holder) {
+                if prev != len {
+                    return Err(Error::parse(
+                        obj.obj_line_start,
+                        "fix_qdf: indirect /Length holder reused with conflicting lengths",
+                    ));
+                }
+            }
             new_len_body.insert(holder, len);
         }
     }

@@ -704,3 +704,73 @@ fn stream_keywords_inside_dict_string_not_mistaken_for_stream() {
     );
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
+
+// ── flpdf-9hc.25: indirect /Length holder validation ──────────────────────
+
+/// A stream whose indirect `/Length M G R` points at a NON-existent object
+/// `M` must be rejected, not silently "repaired" with a dangling /Length.
+#[test]
+fn missing_indirect_length_holder_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(b"<<\n  /Length 9 0 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    // No object 9 (the declared /Length holder) anywhere.
+    pdf.extend_from_slice(
+        b"xref\n0 3\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n",
+    );
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("holder object is missing"),
+        "dangling indirect /Length holder must be an error, got: {err}"
+    );
+}
+
+/// Two streams sharing one indirect /Length holder with DIFFERENT lengths is
+/// an explicit error (not silent last-writer-wins).
+#[test]
+fn conflicting_indirect_length_holder_reuse_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nABC\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nABCDEFGHI\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 3 0\n3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"4 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("conflicting lengths"),
+        "conflicting holder reuse must be an error, got: {err}"
+    );
+}
+
+/// Two streams sharing one holder with the SAME length is legitimate and
+/// must still succeed (no false conflict).
+#[test]
+fn same_length_indirect_holder_reuse_is_ok() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nABC\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Length 4 0 R\n>>\nstream\nXYZ\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 3 0\n3 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"4 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 3 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+    let fixed = flpdf::fix_qdf(&pdf).expect("same-length holder reuse must succeed");
+    // Holder 4 recomputed to the (shared) on-disk length of "ABC\n" / "XYZ\n".
+    assert!(
+        find(&fixed, b"\n4 0 obj\n4\nendobj").is_some(),
+        "holder 4 must be recomputed to the shared length 4:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
