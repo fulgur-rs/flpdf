@@ -251,7 +251,9 @@ struct Cli {
     #[arg(long)]
     linearize: bool,
     /// Use a fixed value for the trailer /ID's changing identifier
-    /// (top-level alias of `flpdf rewrite --static-id`). Testing only.
+    /// (top-level alias of `flpdf rewrite --static-id`). Testing only;
+    /// never for production output. Emits a stderr warning when used
+    /// (suppress with the FLPDF_STATIC_ID_QUIET env var).
     #[arg(long = "static-id")]
     static_id: bool,
     /// Strip encryption and advisory permission restrictions from the output
@@ -651,6 +653,8 @@ struct RewriteCommand {
     linearize: bool,
     /// Use a fixed value for the trailer /ID's changing identifier (qpdf
     /// --static-id equivalent). Testing only; not for production output.
+    /// Emits a stderr warning when used (suppress with the
+    /// FLPDF_STATIC_ID_QUIET env var).
     #[arg(long = "static-id")]
     static_id: bool,
     /// Strip encryption and advisory permission restrictions from the output
@@ -880,8 +884,52 @@ impl From<CliPasswordMode> for PasswordMode {
     }
 }
 
+/// Env var that suppresses the `--static-id` "testing only" warning.
+///
+/// `--static-id` exists purely so test/parity harnesses can produce a
+/// byte-stable trailer `/ID`; it must never be used for production output.
+/// `main` therefore emits a stderr warning whenever the flag is requested
+/// (flpdf-9hc.13.4). Test harnesses that legitimately need the deterministic
+/// ID — and that assert on a clean stderr to mirror qpdf's qtest "no output"
+/// condition — set this variable to opt out of the diagnostic. It is
+/// deliberately *not* a CLI flag: the top-level `--static-id` alias mirrors
+/// qpdf's command surface, which has no such switch.
+const STATIC_ID_QUIET_ENV: &str = "FLPDF_STATIC_ID_QUIET";
+
+/// Returns true when `--static-id` was requested on either the top-level
+/// qpdf-shaped alias or the `rewrite` subcommand.
+fn static_id_requested(args: &Cli) -> bool {
+    if args.static_id {
+        return true;
+    }
+    matches!(&args.command, Some(Commands::Rewrite(cmd)) if cmd.static_id)
+}
+
+/// Emit the test-only warning for `--static-id` exactly once, unless
+/// suppressed via [`STATIC_ID_QUIET_ENV`]. Writes to stderr only and never
+/// changes the process exit code.
+fn warn_if_static_id(args: &Cli) {
+    if !static_id_requested(args) {
+        return;
+    }
+    if std::env::var_os(STATIC_ID_QUIET_ENV).is_some() {
+        return;
+    }
+    eprintln!(
+        "flpdf: warning: --static-id is for testing only and must not be \
+         used for production output"
+    );
+}
+
 fn main() {
     let args = Cli::parse();
+
+    // --static-id produces a fixed, non-unique trailer /ID. It exists only
+    // for deterministic test/parity output; warn loudly (stderr only, exit
+    // code unchanged) so it is never mistaken for a production option. Done
+    // here, after clap parsing succeeds and before any rewrite work, so the
+    // warning never precedes a usage error yet is always visible.
+    warn_if_static_id(&args);
 
     // JSON mode takes the first branch, but this is unambiguous: clap's
     // conflicts_with_all on --json (plus args_conflicts_with_subcommands on
