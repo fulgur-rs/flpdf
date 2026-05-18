@@ -1300,11 +1300,19 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // classic xref table.  An empty plan respects the source form, so a
     // Disable-mode rewrite of a Table-form input still produces a classic
     // xref table.
-    let effective_xref_form = if plan.batches.is_empty() {
+    let mut effective_xref_form = if plan.batches.is_empty() {
         pdf.last_xref_form()
     } else {
         XrefForm::Stream
     };
+
+    // QDF mode always uses the classic xref table for human readability —
+    // override whatever the planner or source form selected.
+    // user-facing diagnostic for explicit --object-streams + --qdf is emitted
+    // by the CLI layer (flpdf-9hc.6.8)
+    if options.qdf {
+        effective_xref_form = XrefForm::Table;
+    }
 
     // PDF 1.5 introduced xref streams.  Bump the header floor to 1.5 whenever
     // the chosen xref form is `Stream`, overriding even an explicit
