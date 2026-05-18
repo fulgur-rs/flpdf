@@ -105,6 +105,78 @@ fn default_id_random_first_save_then_preserves_element1_on_resave() {
     assert_ne!((a1, b1), (a2, b2), "/ID must vary between saves");
 }
 
+/// flpdf-9hc.13.2 regression (coverage gap surfaced by roborev during the
+/// stacked merge of #183): the **xref-stream** full-rewrite output branch
+/// (`writer.rs` xref_dict path) must honour the same default-/ID contract as
+/// the classic-xref branch — first save fresh random /ID, re-save preserves
+/// element 1 and rotates element 2.  The pre-existing re-save test only
+/// exercised the classic-xref path; this pins the xref-stream path so the
+/// "permanent identifier preserved on re-save" guarantee can't silently
+/// regress for xref-stream output (the path roborev flagged).
+#[test]
+fn default_id_random_xref_stream_full_rewrite_resave_preserves_element1() {
+    fn id_pair(trailer: &Dictionary) -> (Vec<u8>, Vec<u8>) {
+        match trailer.get("ID") {
+            Some(Object::Array(v)) if v.len() == 2 => {
+                let s = |o: &Object| match o {
+                    Object::String(b) => b.clone(),
+                    other => panic!("expected /ID string, got {other:?}"),
+                };
+                (s(&v[0]), s(&v[1]))
+            }
+            other => panic!("expected 2-element /ID array, got {other:?}"),
+        }
+    }
+
+    // Source uses xref-stream form, so full_rewrite takes the xref_dict
+    // (xref-stream output) branch — the exact path under review.
+    let source = build_minimal_pdf_with_xref_stream();
+    {
+        let mut r = Cursor::new(&source);
+        assert_eq!(
+            load_xref_and_trailer(&mut r).unwrap().last_xref_form,
+            XrefForm::Stream,
+            "fixture must use xref stream form"
+        );
+    }
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true; // compress_streams defaults to Yes ⇒ xref-stream output
+
+    // First save: fresh random two-element /ID.
+    let mut pdf1 = Pdf::open(Cursor::new(source)).unwrap();
+    let mut out1 = Vec::new();
+    write_pdf_with_options(&mut pdf1, &mut out1, &opts).unwrap();
+    let t1 = load_xref_and_trailer(&mut Cursor::new(&out1)).unwrap();
+    assert_eq!(
+        t1.last_xref_form,
+        XrefForm::Stream,
+        "first-save output must itself be xref-stream form (re-save also hits the xref_dict path)"
+    );
+    let (a1, b1) = id_pair(&t1.trailer);
+    assert_eq!(a1.len(), 16, "first-save /ID[0] must be 16 bytes");
+    assert_eq!(b1.len(), 16, "first-save /ID[1] must be 16 bytes");
+
+    // Re-save the xref-stream output.
+    let mut pdf2 = Pdf::open(Cursor::new(out1.clone())).unwrap();
+    let mut out2 = Vec::new();
+    write_pdf_with_options(&mut pdf2, &mut out2, &opts).unwrap();
+    let (a2, b2) = id_pair(
+        &load_xref_and_trailer(&mut Cursor::new(&out2))
+            .unwrap()
+            .trailer,
+    );
+
+    assert_eq!(
+        a2, a1,
+        "xref-stream path: element 1 (permanent id) must be preserved on re-save"
+    );
+    assert_ne!(
+        b2, b1,
+        "xref-stream path: element 2 (changing id) must rotate on re-save"
+    );
+}
+
 /// flpdf-9hc.13.2: default /ID strategy on the **incremental** write path
 /// (`write_pdf`, the most common entry point).  Same contract as the
 /// full-rewrite variant: first save emits a fresh random /ID, re-save
