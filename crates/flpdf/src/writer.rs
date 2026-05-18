@@ -1899,7 +1899,7 @@ fn write_qdf_trailer(bytes: &mut Vec<u8>, trailer: &Dictionary) {
             continue;
         }
         bytes.extend_from_slice(b"  /");
-        bytes.extend_from_slice(key);
+        crate::object::write_name_escaped(bytes, key);
         bytes.push(b' ');
         value.write_pdf(bytes);
         bytes.push(b'\n');

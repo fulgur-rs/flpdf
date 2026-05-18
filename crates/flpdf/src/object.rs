@@ -311,7 +311,7 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 /// `/application#2Fpdf` and round-trips back to `application/pdf`.
 /// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no
 /// escapable bytes, so their output is byte-identical to before.
-fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
+pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in raw {
         let needs_escape = !(0x21..=0x7E).contains(&b)
@@ -473,7 +473,7 @@ impl Dictionary {
         for (key, value) in self.iter() {
             push_spaces(out, indent + 2);
             out.push(b'/');
-            out.extend_from_slice(key);
+            write_name_escaped(out, key);
             out.push(b' ');
             value.write_pdf_qdf(out, indent + 2);
             out.push(b'\n');
@@ -498,5 +498,40 @@ impl Stream {
     /// Build a stream from its dictionary and its encoded payload.
     pub fn new(dict: Dictionary, data: Vec<u8>) -> Self {
         Self { dict, data }
+    }
+}
+
+#[cfg(test)]
+mod qdf_key_escape_tests {
+    use super::*;
+
+    /// A QDF dict key containing PDF delimiter / whitespace / non-ASCII bytes
+    /// must be `#`-escaped exactly like the compact name serializer does, so the
+    /// emitted `/Key` is a single valid PDF name token (regression: the QDF
+    /// serializer previously wrote raw key bytes).
+    #[test]
+    fn qdf_dict_key_is_name_escaped() {
+        let mut d = Dictionary::new();
+        // space, '#', '/', and a non-ASCII byte all require escaping.
+        d.insert(b"A B#C/D\x80E".to_vec(), Object::Integer(1));
+        let mut out = Vec::new();
+        d.write_pdf_qdf(&mut out, 0);
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("/A#20B#23C#2FD#80E 1"),
+            "key not escaped in QDF output: {s:?}"
+        );
+        // No raw delimiter/space leaked into the name token.
+        assert!(!s.contains("/A B"), "raw space leaked: {s:?}");
+    }
+
+    /// Keys that need no escaping are emitted verbatim (parity with qpdf).
+    #[test]
+    fn qdf_dict_plain_key_unescaped() {
+        let mut d = Dictionary::new();
+        d.insert(b"Type".to_vec(), Object::Name(b"Catalog".to_vec()));
+        let mut out = Vec::new();
+        d.write_pdf_qdf(&mut out, 0);
+        assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
     }
 }
