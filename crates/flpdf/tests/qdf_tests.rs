@@ -810,7 +810,7 @@ fn qdf_original_object_id_comments_suppressed_when_flag_true() {
 /// QDF mode must force a classic xref table even when the source PDF used an
 /// xref stream.  The output must:
 ///   - contain "\nxref\n" (classic table marker)
-///   - contain "\ntrailer\n" (classic trailer keyword)
+///   - contain "\ntrailer <<\n" (classic trailer keyword; qdf format since 6.3)
 ///   - NOT contain "/Type /XRef" (no xref stream)
 #[test]
 fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
@@ -840,7 +840,10 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
         "qdf=true must emit a classic xref table (\\nxref\\n) even for an xref-stream source"
     );
 
-    // Classic trailer keyword — present only in table-form output.
+    // Classic (table-form) trailer keyword. Since flpdf-9hc.6.3 the qdf path
+    // formats it as "trailer <<\n" (qpdf --qdf convention) rather than the
+    // compact "trailer\n<<"; either way it is a classic trailer, NOT an xref
+    // stream, which is what this 6.6 test asserts.
     assert!(
         output
             .windows(b"\ntrailer\n".len())
@@ -1010,4 +1013,250 @@ fn non_qdf_never_emits_original_object_id_comments() {
             "qdf=false must emit zero '%% Original object ID:' lines (no_original_object_ids={flag})"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// flpdf-9hc.6.3 — QDF output formatting normalization
+//
+// (o) Golden normalized-diff: flpdf qdf full-rewrite of minimal.pdf matches the
+//     committed qpdf 11.9.0 --qdf reference byte-for-byte, modulo three KNOWN
+//     pre-existing divergences (all outside 6.3's body/trailer-serialization
+//     scope, confirmed by stashing the 6.3 diff):
+//       - object 0 (`%% Original object ID: 0 65535` / `0 65535 obj` / `null`
+//         / `endobj`) is emitted by flpdf but not by qpdf (object-loop /
+//         framing concern — tracked as a 6.4/6.5 follow-up),
+//       - the blank line qpdf inserts BETWEEN indirect objects (framing),
+//       - the random `/ID` hex (qpdf emits a fresh id; flpdf static-id is the
+//         pi constant — id strategy is 6.8/6.9 scope).
+//     After normalizing those, the dict multi-line layout, alphabetical key
+//     sort, one-element-per-line arrays, empty-container shape, and the
+//     `trailer <<` block (with /ID last and inline) are byte-identical.
+// (p) Property assertions on the qdf body region.
+// (q) Idempotence: qdf output re-fed through qdf full-rewrite is byte-identical.
+// (r) Non-qdf regression guard: qdf=false output keeps the compact
+//     `<< /K v >>` single-line form (this layer changes nothing off the qdf
+//     path).
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn qdf_rewrite(source: &[u8]) -> Vec<u8> {
+    let mut pdf = Pdf::open(Cursor::new(source.to_vec())).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.static_id = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    output
+}
+
+/// Drop the pre-existing framing/id divergences so the comparison isolates
+/// what flpdf-9hc.6.3 actually owns (body + trailer serialization). The
+/// removed shapes are tracked by a separate bd follow-up (object-0 body +
+/// inter-object blank line) and by 6.8/6.9 (/ID strategy).
+fn normalize_known_divergences(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Strip the pre-existing object-0 null body block.
+        if line == "%% Original object ID: 0 65535" {
+            // skip: comment, "0 65535 obj", "null", "endobj"
+            i += 4;
+            continue;
+        }
+        // Drop blank separator lines (qpdf has them between objects, flpdf
+        // does not — framing follow-up).
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Normalize the random /ID array (id strategy is 6.8/6.9 scope).
+        if let Some(idx) = line.find("/ID [<") {
+            out.push(format!("{}/ID <NORM>", &line[..idx]));
+            i += 1;
+            continue;
+        }
+        // xref in-use/free entry: "0000000052 00000 n " — the OFFSET value
+        // differs only because flpdf still emits the object-0 block (framing
+        // follow-up), which shifts every byte position. 6.3 owns the body
+        // serialization, not the offsets, so collapse the whole entry to a
+        // single marker; the body bytes themselves are compared above.
+        // Form: 10 digits, space, 5 digits, space, 'n'|'f', trailing space
+        // ("0000000052 00000 n ").
+        let bytes_line = line.as_bytes();
+        if bytes_line.len() == 19
+            && bytes_line[10] == b' '
+            && bytes_line[16] == b' '
+            && matches!(bytes_line[17], b'n' | b'f')
+            && bytes_line[18] == b' '
+            && line[..10].bytes().all(|b| b.is_ascii_digit())
+            && line[11..16].bytes().all(|b| b.is_ascii_digit())
+        {
+            out.push("<XREF-ENTRY>".to_string());
+            i += 1;
+            continue;
+        }
+        if out.last().map(String::as_str) == Some("startxref") {
+            out.push("<OFFSET>".to_string());
+            i += 1;
+            continue;
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    out
+}
+
+#[test]
+fn qdf_golden_minimal_matches_qpdf_modulo_known_divergences() {
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let golden = std::fs::read("../../tests/fixtures/qdf-golden/minimal.qdf").unwrap();
+
+    let produced = qdf_rewrite(&source);
+
+    let want = normalize_known_divergences(&golden);
+    let got = normalize_known_divergences(&produced);
+
+    assert_eq!(
+        got,
+        want,
+        "flpdf qdf output diverges from the qpdf --qdf golden beyond the \
+         documented pre-existing framing/id gaps.\n--- produced ---\n{}\n",
+        String::from_utf8_lossy(&produced)
+    );
+}
+
+// NOTE: there is intentionally no full-byte golden test for three-page.pdf.
+// qpdf --qdf RENUMBERS objects sequentially; flpdf preserves the source
+// object numbers (renumbering is not in flpdf-9hc.6.3's body/trailer
+// serialization scope). minimal.pdf's numbering happens to align with qpdf's,
+// so it is the byte-parity golden; three-page is exercised only via the
+// structural property + idempotence tests below.
+
+#[test]
+fn qdf_body_formatting_properties() {
+    let source = std::fs::read("../../tests/fixtures/compat/three-page.pdf").unwrap();
+    let out = qdf_rewrite(&source);
+    let text = String::from_utf8_lossy(&out);
+
+    // Every dictionary opens multi-line ("<<\n", never the compact "<< /").
+    assert!(
+        text.contains("<<\n"),
+        "qdf output must contain multi-line dictionaries"
+    );
+    assert!(
+        !text.contains("<< /"),
+        "qdf output must not contain the compact '<< /' single-line dict form"
+    );
+    assert!(
+        !text.contains("[ "),
+        "qdf output must not contain the compact '[ ' inline-array form"
+    );
+
+    // Locate the Catalog by content signature (the Catalog dict contains
+    // "/Type /Catalog"), independent of which object number it received.
+    // Walk back from that marker to the enclosing "<<\n", then collect the
+    // entry lines up to the matching ">>".
+    let type_pos = text.find("/Type /Catalog").expect("a Catalog object");
+    let open = text[..type_pos].rfind("<<\n").expect("catalog dict open") + "<<\n".len();
+    let close_rel = text[open..].find("\n>>").expect("catalog dict close");
+    let cat_body = &text[open..open + close_rel];
+    let mut keys: Vec<&str> = Vec::new();
+    for line in cat_body.lines() {
+        assert!(
+            line.starts_with("  /"),
+            "catalog entry line must be '  /'-indented, got {line:?}"
+        );
+        let key = line[3..].split(' ').next().unwrap();
+        keys.push(key);
+    }
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(
+        keys, sorted,
+        "catalog dict keys must be alphabetically sorted"
+    );
+    assert_eq!(keys, vec!["PageMode", "Pages", "Type"]);
+
+    // Array element on its own line: every /Kids indirect-ref array must put
+    // each element on its own +2-indented line and close at the dict indent.
+    let kids = text.find("/Kids [\n").expect("a /Kids array");
+    let kids_close = text[kids..].find("  ]\n").expect("/Kids array close") + kids;
+    let kids_body = &text[kids + "/Kids [\n".len()..kids_close];
+    let mut elem_lines = 0;
+    for line in kids_body.lines() {
+        assert!(
+            line.starts_with("    ") && line.trim().ends_with(" R"),
+            "each /Kids element must be a '    N G R' line, got {line:?}"
+        );
+        elem_lines += 1;
+    }
+    assert_eq!(elem_lines, 3, "three-page /Pages has three /Kids entries");
+
+    // Trailer: "trailer <<" on one line, /ID last and INLINE.
+    let tr = text.find("trailer <<\n").expect("trailer block");
+    let tr_rel_end = text[tr..].find("\n>>\n").unwrap();
+    let tr_block = &text[tr..tr + tr_rel_end];
+    assert!(
+        tr_block.contains("\n  /ID [<") && tr_block.contains(">]"),
+        "trailer /ID must stay inline ([<hex><hex>]), got: {tr_block:?}"
+    );
+    let id_pos = tr_block.find("/ID").unwrap();
+    assert!(
+        tr_block[..id_pos].contains("/Root") && tr_block[..id_pos].contains("/Size"),
+        "trailer /ID must be emitted last (after the sorted keys)"
+    );
+}
+
+#[test]
+fn qdf_empty_container_shape() {
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let out = qdf_rewrite(&source);
+    let text = String::from_utf8_lossy(&out);
+    // minimal.pdf's /Pages has an empty /Kids array.
+    assert!(
+        text.contains("/Kids [\n  ]\n"),
+        "empty array must render as '[\\n<indent>]' (got: {text})"
+    );
+}
+
+#[test]
+fn qdf_output_is_idempotent() {
+    let source = std::fs::read("../../tests/fixtures/compat/three-page.pdf").unwrap();
+    let once = qdf_rewrite(&source);
+    let twice = qdf_rewrite(&once);
+    assert_eq!(
+        once, twice,
+        "feeding qdf full-rewrite output back through qdf full-rewrite must \
+         be byte-identical"
+    );
+}
+
+#[test]
+fn non_qdf_output_keeps_compact_dict_form() {
+    // Regression guard: this layer must not change any non-qdf serialization.
+    let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = false;
+    options.static_id = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(
+        text.contains("<< /Pages 2 0 R /Type /Catalog >>"),
+        "non-qdf full-rewrite must keep the compact single-line dict form"
+    );
+    assert!(
+        text.contains("<< /Count 0 /Kids [ ] /Type /Pages >>"),
+        "non-qdf full-rewrite must keep compact dicts and inline empty arrays"
+    );
+    assert!(
+        text.contains("trailer\n<<"),
+        "non-qdf trailer must keep the 'trailer\\n<<' compact form"
+    );
 }

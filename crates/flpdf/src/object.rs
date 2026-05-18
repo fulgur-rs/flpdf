@@ -250,6 +250,53 @@ impl Object {
             }
         }
     }
+
+    /// Serialize this object into qpdf `--qdf` formatting conventions, appending
+    /// to `out`. `indent` is the column (number of leading spaces) at which the
+    /// *opening* delimiter of a container sits; children are indented by
+    /// `indent + 2`, and a container's closing delimiter (`>>` / `]`) is emitted
+    /// on its own line at column `indent`.
+    ///
+    /// Only container layout (dictionaries, arrays) and stream framing differ
+    /// from [`Object::write_pdf`]; every scalar / name / string / number /
+    /// reference delegates to the existing compact serializer so number
+    /// formatting, string escaping, name encoding, and `N G R` references are
+    /// byte-identical to the non-qdf path. Dictionary keys are emitted in the
+    /// `Dictionary`'s natural (`BTreeMap`, lexicographic-by-raw-name) order,
+    /// which is exactly qpdf's alphabetical key sort.
+    ///
+    /// This is used **only** on the qdf full-rewrite path; the non-qdf path is
+    /// untouched.
+    pub(crate) fn write_pdf_qdf(&self, out: &mut Vec<u8>, indent: usize) {
+        match self {
+            Object::Array(values) => {
+                out.push(b'[');
+                out.push(b'\n');
+                for value in values.iter() {
+                    push_spaces(out, indent + 2);
+                    value.write_pdf_qdf(out, indent + 2);
+                    out.push(b'\n');
+                }
+                push_spaces(out, indent);
+                out.push(b']');
+            }
+            Object::Dictionary(dict) => dict.write_pdf_qdf(out, indent),
+            Object::Stream(stream) => {
+                stream.dict.write_pdf_qdf(out, indent);
+                out.extend_from_slice(b"\nstream\n");
+                out.extend_from_slice(&stream.data);
+                out.extend_from_slice(b"\nendstream");
+            }
+            // Scalars, names, strings, numbers, references, null, booleans:
+            // reuse the existing compact serialization verbatim.
+            _ => self.write_pdf(out),
+        }
+    }
+}
+
+/// Append `n` ASCII space bytes to `out`.
+fn push_spaces(out: &mut Vec<u8>, n: usize) {
+    out.resize(out.len() + n, b' ');
 }
 
 /// Escape a name's raw (logical) bytes into PDF name-token syntax per
@@ -264,7 +311,7 @@ impl Object {
 /// `/application#2Fpdf` and round-trips back to `application/pdf`.
 /// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no
 /// escapable bytes, so their output is byte-identical to before.
-fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
+pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in raw {
         let needs_escape = !(0x21..=0x7E).contains(&b)
@@ -409,6 +456,31 @@ impl Dictionary {
         }
         out.extend_from_slice(b" >>");
     }
+
+    /// Serialize this dictionary in qpdf `--qdf` formatting: `<<` then one
+    /// `  /Key value` entry per line (keys in lexicographic-by-raw-name order,
+    /// which is qpdf's alphabetical sort, with exactly one ASCII space between
+    /// key and value), then `>>` on its own line at column `indent`. Values are
+    /// serialized with [`Object::write_pdf_qdf`] so nested containers add
+    /// another `+2` indent level. An empty dictionary renders as
+    /// `<<\n<indent>>>`.
+    ///
+    /// `/Length` (and every other key) is emitted verbatim — this serializer
+    /// never recomputes or special-cases `/Length`; the stream-write path has
+    /// already stored the correct value before serialization.
+    pub(crate) fn write_pdf_qdf(&self, out: &mut Vec<u8>, indent: usize) {
+        out.extend_from_slice(b"<<\n");
+        for (key, value) in self.iter() {
+            push_spaces(out, indent + 2);
+            out.push(b'/');
+            write_name_escaped(out, key);
+            out.push(b' ');
+            value.write_pdf_qdf(out, indent + 2);
+            out.push(b'\n');
+        }
+        push_spaces(out, indent);
+        out.extend_from_slice(b">>");
+    }
 }
 
 /// PDF content stream: a dictionary plus an opaque byte payload.
@@ -426,5 +498,40 @@ impl Stream {
     /// Build a stream from its dictionary and its encoded payload.
     pub fn new(dict: Dictionary, data: Vec<u8>) -> Self {
         Self { dict, data }
+    }
+}
+
+#[cfg(test)]
+mod qdf_key_escape_tests {
+    use super::*;
+
+    /// A QDF dict key containing PDF delimiter / whitespace / non-ASCII bytes
+    /// must be `#`-escaped exactly like the compact name serializer does, so the
+    /// emitted `/Key` is a single valid PDF name token (regression: the QDF
+    /// serializer previously wrote raw key bytes).
+    #[test]
+    fn qdf_dict_key_is_name_escaped() {
+        let mut d = Dictionary::new();
+        // space, '#', '/', and a non-ASCII byte all require escaping.
+        d.insert(b"A B#C/D\x80E", Object::Integer(1));
+        let mut out = Vec::new();
+        d.write_pdf_qdf(&mut out, 0);
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("/A#20B#23C#2FD#80E 1"),
+            "key not escaped in QDF output: {s:?}"
+        );
+        // No raw delimiter/space leaked into the name token.
+        assert!(!s.contains("/A B"), "raw space leaked: {s:?}");
+    }
+
+    /// Keys that need no escaping are emitted verbatim (parity with qpdf).
+    #[test]
+    fn qdf_dict_plain_key_unescaped() {
+        let mut d = Dictionary::new();
+        d.insert(b"Type", Object::Name(b"Catalog".to_vec()));
+        let mut out = Vec::new();
+        d.write_pdf_qdf(&mut out, 0);
+        assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
     }
 }
