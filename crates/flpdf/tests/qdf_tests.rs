@@ -1120,7 +1120,8 @@ fn qdf_golden_minimal_matches_qpdf_modulo_known_divergences() {
     let got = normalize_known_divergences(&produced);
 
     assert_eq!(
-        got, want,
+        got,
+        want,
         "flpdf qdf output diverges from the qpdf --qdf golden beyond the \
          documented pre-existing framing/id gaps.\n--- produced ---\n{}\n",
         String::from_utf8_lossy(&produced)
@@ -1173,7 +1174,10 @@ fn qdf_body_formatting_properties() {
     }
     let mut sorted = keys.clone();
     sorted.sort();
-    assert_eq!(keys, sorted, "catalog dict keys must be alphabetically sorted");
+    assert_eq!(
+        keys, sorted,
+        "catalog dict keys must be alphabetically sorted"
+    );
     assert_eq!(keys, vec!["PageMode", "Pages", "Type"]);
 
     // Array element on its own line: every /Kids indirect-ref array must put
