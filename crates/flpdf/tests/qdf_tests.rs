@@ -846,9 +846,9 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
     // stream, which is what this 6.6 test asserts.
     assert!(
         output
-            .windows(b"\ntrailer\n".len())
-            .any(|w| w == b"\ntrailer\n"),
-        "qdf=true must emit a classic trailer dict (\\ntrailer\\n) even for an xref-stream source"
+            .windows(b"\ntrailer <<\n".len())
+            .any(|w| w == b"\ntrailer <<\n"),
+        "qdf=true must emit a classic trailer dict (\\ntrailer <<\\n) even for an xref-stream source"
     );
 
     // No xref stream must remain.
@@ -906,8 +906,8 @@ fn qdf_mode_keeps_xref_table_when_source_has_classic_table() {
     );
     assert!(
         output
-            .windows(b"\ntrailer\n".len())
-            .any(|w| w == b"\ntrailer\n"),
+            .windows(b"\ntrailer <<\n".len())
+            .any(|w| w == b"\ntrailer <<\n"),
         "qdf=true on a classic-table source must still emit a classic trailer"
     );
     assert!(
@@ -945,8 +945,8 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
     );
     assert!(
         output
-            .windows(b"\ntrailer\n".len())
-            .any(|w| w == b"\ntrailer\n"),
+            .windows(b"\ntrailer <<\n".len())
+            .any(|w| w == b"\ntrailer <<\n"),
         "qdf=true + Generate must still emit a classic trailer"
     );
 
