@@ -593,3 +593,21 @@ fn sizeextra_not_mistaken_for_size() {
         "stale real /Size must be gone"
     );
 }
+
+/// Regression for roborev job 995: `/ObjStm` as a non-/Type name value (or
+/// after a custom key) must NOT trigger the Unsupported(ObjStm) rejection —
+/// only a real `/Type /ObjStm` object stream is unsupported.
+#[test]
+fn objstm_as_plain_name_value_not_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(b"<<\n  /SomeKey /ObjStm\n  /Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed =
+        flpdf::fix_qdf(&pdf).expect("fix_qdf must accept /ObjStm as a non-/Type name value");
+    assert!(find(&fixed, b"/SomeKey /ObjStm").is_some());
+    assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
+}
