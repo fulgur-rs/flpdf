@@ -227,3 +227,105 @@ fn ignores_xref_and_stream_inside_object_body() {
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
+
+/// Closed loop for flpdf-9hc.6.12: the flpdf QDF writer and flpdf::fix_qdf
+/// must mesh. Produce a real QDF via the writer (it now emits indirect
+/// `/Length H 0 R` + a bare-integer holder), hand-edit a stream's decoded
+/// payload (the canonical "human edits the QDF" use case), run flpdf::fix_qdf,
+/// and verify it repairs the indirect length-holder body — then `qpdf --check`
+/// accepts the result. This is the lighter version; the full round-trip
+/// matrix is flpdf-9hc.6.9.
+#[test]
+fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
+    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+    use std::io::Cursor;
+
+    let source = read("../compat/three-page.pdf");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.qdf = true;
+    opts.static_id = true;
+    let mut qdf = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut qdf, &opts).unwrap();
+
+    // Sanity: writer produced an indirect-length stream + holder.
+    let lp = find(&qdf, b"/Length ").expect("indirect /Length entry");
+    let tail = std::str::from_utf8(&qdf[lp + b"/Length ".len()..lp + b"/Length ".len() + 16])
+        .expect("ascii");
+    let mut it = tail.split_whitespace();
+    let holder: u32 = it.next().unwrap().parse().unwrap();
+    assert_eq!(it.next(), Some("0"));
+    assert_eq!(it.next(), Some("R"), "writer must emit indirect /Length");
+
+    // Hand-edit: inject extra bytes into the first stream's decoded payload,
+    // simulating a human editing the QDF content. The indirect holder body
+    // is now STALE — exactly the failure flpdf::fix_qdf exists to repair.
+    let s_kw = find(&qdf, b"\nstream\n").expect("stream kw");
+    let payload_start = s_kw + b"\nstream\n".len();
+    let inject = b"% injected by a human editor\n";
+    let mut edited = qdf.clone();
+    edited.splice(payload_start..payload_start, inject.iter().copied());
+
+    // The clean writer holder body — read it from the unedited QDF so the
+    // test does not hardcode the fixture's content length. It is the on-disk
+    // byte count (payload + the single EOL the Yes framing adds), which is
+    // exactly what flpdf::fix_qdf recomputes — so on the UNEDITED file
+    // fix_qdf must be a perfect no-op (writer↔fix_qdf mesh).
+    assert_eq!(
+        flpdf::fix_qdf(&qdf).expect("fix_qdf on clean writer QDF"),
+        qdf,
+        "fix_qdf must be a no-op on unedited flpdf QDF (writer/fix_qdf mesh)"
+    );
+    let clean_holder_hdr = format!("\n{holder} 0 obj\n");
+    let chp = find(&qdf, clean_holder_hdr.as_bytes()).expect("clean holder");
+    let crest = &qdf[chp + clean_holder_hdr.len()..];
+    let cend = find(crest, b"\nendobj").expect("clean holder endobj");
+    let clean_len: usize = std::str::from_utf8(&crest[..cend])
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("clean holder body integer");
+
+    // fix_qdf must repair the indirect holder, xref, /Size, startxref.
+    let fixed = flpdf::fix_qdf(&edited).expect("fix_qdf on edited writer QDF");
+
+    // The holder body for `holder` must now reflect the LENGTHENED payload.
+    let stale_holder = format!("\n{holder} 0 obj\n{clean_len}\nendobj");
+    assert!(
+        find(&fixed, stale_holder.as_bytes()).is_none(),
+        "stale holder value {clean_len} must have been recomputed"
+    );
+    let new_len = clean_len + inject.len();
+    let fixed_holder = format!("\n{holder} 0 obj\n{new_len}\nendobj");
+    assert!(
+        find(&fixed, fixed_holder.as_bytes()).is_some(),
+        "indirect length-holder {holder} must be repaired to {new_len}"
+    );
+
+    // qpdf must accept the closed-loop result.
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let tmp = std::env::temp_dir().join("flpdf_qdf_closed_loop.pdf");
+        fs::write(&tmp, &fixed).unwrap();
+        let out = Command::new("qpdf")
+            .arg("--check")
+            .arg(&tmp)
+            .output()
+            .expect("run qpdf --check");
+        assert!(
+            out.status.success(),
+            "qpdf --check failed on closed-loop output:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let _ = fs::remove_file(&tmp);
+    } else {
+        eprintln!("qpdf not available; skipping qpdf --check in closed-loop test");
+    }
+
+    // fix_qdf must be idempotent on its own output.
+    let again = flpdf::fix_qdf(&fixed).expect("fix_qdf idempotent");
+    assert_eq!(
+        again, fixed,
+        "fix_qdf must be idempotent on repaired writer QDF"
+    );
+}
