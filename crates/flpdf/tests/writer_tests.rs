@@ -1704,12 +1704,13 @@ fn writes_qdf_with_object_generations() {
 }
 
 #[test]
-fn write_options_no_original_object_ids_defaults_false_and_qdf_has_no_such_comment() {
-    // flpdf-9hc.13.5: `WriteOptions::no_original_object_ids` exists and
-    // defaults to false (qpdf --no-original-object-ids is plumbed for
-    // acceptance + forward-compat). flpdf's write_qdf does NOT yet emit the
-    // `%% Original object ID` comment (epic flpdf-9hc.6 owns that body), so
-    // the default QDF output must not contain it regardless of the flag.
+fn write_qdf_goes_through_canonical_qdf_serializers() {
+    // flpdf-9hc.24: write_qdf() is now a thin wrapper over the canonical QDF
+    // path (write_pdf_with_options { qdf: true, full_rewrite: true }), so its
+    // output must carry the canonical QDF markers built by epic flpdf-9hc.6
+    // — NOT the old compact dump. (`WriteOptions::no_original_object_ids`
+    // still defaults to false; the canonical path emits the comment unless
+    // that flag is set.)
     let opts = WriteOptions::default();
     assert!(
         !opts.no_original_object_ids,
@@ -1732,10 +1733,30 @@ fn write_options_no_original_object_ids_defaults_false_and_qdf_has_no_such_comme
     let mut output = Vec::new();
     write_qdf(&mut pdf, &mut output).unwrap();
     let rendered = String::from_utf8_lossy(&output);
+
     assert!(
-        !rendered.contains("%% Original object ID"),
-        "write_qdf does not emit %% Original object ID comments yet \
-         (flpdf-9hc.6); there is no suppression point for the flag to act on"
+        rendered.contains("%QDF-1.0"),
+        "canonical write_qdf must emit the %QDF-1.0 header marker"
+    );
+    assert!(
+        rendered.contains("%% Original object ID:"),
+        "canonical write_qdf must emit %% Original object ID: comments"
+    );
+    assert!(
+        rendered.contains("\ntrailer <<"),
+        "canonical write_qdf must use the `trailer <<` dict layout"
+    );
+    assert!(
+        rendered.contains("\nxref\n"),
+        "canonical write_qdf must use a classic xref table"
+    );
+    assert!(
+        !rendered.contains("/Type /XRef"),
+        "canonical write_qdf must not emit a cross-reference stream"
+    );
+    assert!(
+        !rendered.contains("/Type /ObjStm"),
+        "canonical write_qdf must not emit object streams"
     );
 }
 
