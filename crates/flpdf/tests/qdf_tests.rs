@@ -819,7 +819,9 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
 
     // Verify the source really has an xref stream (sanity guard for this test).
     assert!(
-        source.windows(b"/Type /XRef".len()).any(|w| w == b"/Type /XRef"),
+        source
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
         "test setup error: source fixture must use an xref stream"
     );
 
@@ -840,13 +842,17 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
 
     // Classic trailer keyword — present only in table-form output.
     assert!(
-        output.windows(b"\ntrailer\n".len()).any(|w| w == b"\ntrailer\n"),
+        output
+            .windows(b"\ntrailer\n".len())
+            .any(|w| w == b"\ntrailer\n"),
         "qdf=true must emit a classic trailer dict (\\ntrailer\\n) even for an xref-stream source"
     );
 
     // No xref stream must remain.
     assert!(
-        !output.windows(b"/Type /XRef".len()).any(|w| w == b"/Type /XRef"),
+        !output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
         "qdf=true must not emit any /Type /XRef stream"
     );
 
@@ -876,7 +882,9 @@ fn qdf_mode_keeps_xref_table_when_source_has_classic_table() {
 
     // Sanity: source must not have an xref stream.
     assert!(
-        !source.windows(b"/Type /XRef".len()).any(|w| w == b"/Type /XRef"),
+        !source
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
         "test setup error: source fixture must use a classic xref table"
     );
 
@@ -894,11 +902,15 @@ fn qdf_mode_keeps_xref_table_when_source_has_classic_table() {
         "qdf=true on a classic-table source must still emit a classic xref table"
     );
     assert!(
-        output.windows(b"\ntrailer\n".len()).any(|w| w == b"\ntrailer\n"),
+        output
+            .windows(b"\ntrailer\n".len())
+            .any(|w| w == b"\ntrailer\n"),
         "qdf=true on a classic-table source must still emit a classic trailer"
     );
     assert!(
-        !output.windows(b"/Type /XRef".len()).any(|w| w == b"/Type /XRef"),
+        !output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
         "qdf=true on a classic-table source must not emit /Type /XRef"
     );
 }
@@ -929,13 +941,17 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
         "qdf=true + Generate must still emit a classic xref table"
     );
     assert!(
-        output.windows(b"\ntrailer\n".len()).any(|w| w == b"\ntrailer\n"),
+        output
+            .windows(b"\ntrailer\n".len())
+            .any(|w| w == b"\ntrailer\n"),
         "qdf=true + Generate must still emit a classic trailer"
     );
 
     // No xref stream.
     assert!(
-        !output.windows(b"/Type /XRef".len()).any(|w| w == b"/Type /XRef"),
+        !output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
         "qdf=true + Generate must not emit /Type /XRef"
     );
 
