@@ -25,8 +25,7 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn read(name: &str) -> Vec<u8> {
-    fs::read(fixtures_dir().join(name))
-        .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+    fs::read(fixtures_dir().join(name)).unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
 }
 
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
@@ -50,9 +49,7 @@ fn matches_oracle_golden_byte_for_byte() {
              got {} bytes, golden {} bytes\nfirst diff at {:?}",
             got.len(),
             golden.len(),
-            got.iter()
-                .zip(golden.iter())
-                .position(|(a, b)| a != b)
+            got.iter().zip(golden.iter()).position(|(a, b)| a != b)
         );
     }
 }
@@ -166,4 +163,67 @@ fn objstm_input_is_unsupported() {
         matches!(err, flpdf::Error::Unsupported(_)),
         "expected Unsupported for ObjStm input, got {err:?}"
     );
+}
+
+/// Regression for roborev job 989 (qdf_fix.rs robustness):
+///   1. A decompressed stream body that contains a line-anchored `xref` must
+///      NOT be mistaken for the cross-reference table (use the LAST one).
+///   2. A `stream` byte sequence inside a dictionary string value must NOT be
+///      mistaken for the `stream` keyword (match it line-anchored).
+#[test]
+fn ignores_xref_and_stream_inside_object_body() {
+    // obj 1: stream whose dict has a string containing the word "stream" and
+    // whose decompressed content contains a line `xref`. /Length is indirect
+    // (held by obj 4). Initial xref offsets are intentionally bogus zeros —
+    // fix_qdf must regenerate them and still pick the real table at the tail.
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(b"<<\n  /Length 4 0 R\n  /Note (the word stream appears here)\n>>\n");
+    pdf.extend_from_slice(b"stream\nline one\nxref\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"%% Original object ID: 4 0\n4 0 obj\n0\nendobj\n\n");
+    // Real (tail) xref table with deliberately wrong offsets.
+    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+    let s = &fixed;
+
+    // The `xref` line inside obj 1's stream body is preserved verbatim.
+    assert!(
+        find(s, b"stream\nline one\nxref\nendstream").is_some(),
+        "stream body (incl. its inner `xref` line) must be preserved verbatim"
+    );
+
+    // Exactly ONE regenerated cross-reference table: a line-anchored `xref`
+    // immediately followed by the `0 5` subsection header.
+    assert!(
+        find(s, b"\nxref\n0 5\n").is_some(),
+        "real xref table must be regenerated at the tail"
+    );
+
+    // /Length holder (obj 4) recomputed to the verbatim content byte count:
+    // "line one\nxref\n" == 14 bytes (after `stream`+EOL, up to line `endstream`).
+    assert!(
+        find(s, b"4 0 obj\n14\nendobj").is_some(),
+        "indirect /Length holder must be recomputed to 14, got:\n{}",
+        String::from_utf8_lossy(s)
+    );
+
+    // Idempotent.
+    let again = flpdf::fix_qdf(&fixed).expect("fix_qdf idempotent");
+    assert_eq!(again, fixed, "fix_qdf must be idempotent");
+}
+
+/// Tiny substring search helper (tests only).
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
