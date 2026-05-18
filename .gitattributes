@@ -5,3 +5,10 @@
 # the snapshot tests (`compat_baseline_static_id`, `compat_matrix_baseline`)
 # read CRLF but compare against LF-rendered markdown.
 tests/golden/*.md text eol=lf
+
+# QDF fixtures are byte-exact golden artifacts (fix_qdf recomputes
+# xref offsets/lengths from raw bytes). Git autocrlf on Windows must NOT
+# rewrite their line endings or the byte-for-byte golden comparisons
+# (qdf_fix_tests: matches_oracle_golden_byte_for_byte, no_op_on_clean_qdf)
+# fail. Treat as binary, same as *.pdf.
+*.qdf -text
