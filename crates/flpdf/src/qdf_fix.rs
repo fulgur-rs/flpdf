@@ -434,14 +434,22 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     //   * a holder reused by two streams with *conflicting* lengths is an
     //     explicit error rather than silent last-writer-wins (which would
     //     leave the earlier stream's /Length wrong).
-    let object_numbers: std::collections::HashSet<u32> = objects.iter().map(|o| o.num).collect();
+    // A canonical QDF indirect /Length is always `M 0 R` (generation 0;
+    // non-zero generations are rejected above). The holder must therefore be
+    // an object whose number is M AND whose generation is 0 — matching on the
+    // number alone would wrongly accept/rewrite an `M G` object with G != 0.
+    let gen0_object_numbers: std::collections::HashSet<u32> = objects
+        .iter()
+        .filter(|o| o.gen == 0)
+        .map(|o| o.num)
+        .collect();
     let mut new_len_body: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for obj in &objects {
         if let (Some(len), Some(holder)) = (obj.stream_len, obj.length_holder) {
-            if !object_numbers.contains(&holder) {
+            if !gen0_object_numbers.contains(&holder) {
                 return Err(Error::parse(
                     obj.obj_line_start,
-                    "fix_qdf: stream's indirect /Length holder object is missing",
+                    "fix_qdf: stream's indirect /Length holder object (M 0) is missing",
                 ));
             }
             if let Some(&prev) = new_len_body.get(&holder) {
@@ -480,7 +488,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         // This object's offset = current output length (start of `N G obj`).
         new_offsets.push((obj.num, obj.gen, out.len()));
 
-        if let Some(&new_len) = new_len_body.get(&obj.num) {
+        // Only a generation-0 object can be the holder a canonical `M 0 R`
+        // /Length points at — never rewrite an `M G` object with G != 0.
+        if let Some(&new_len) = new_len_body.get(&obj.num).filter(|_| obj.gen == 0) {
             // Rewrite this length-holder object: keep the `N G obj` line and
             // `endobj`, replace the integer body with the recomputed value.
             rewrite_length_holder(&mut out, &body_region[obj.obj_line_start..obj.end], new_len)?;

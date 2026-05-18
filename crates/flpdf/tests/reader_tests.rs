@@ -1607,3 +1607,36 @@ fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
     }
     assert!(stream_seen, "fixture must contain at least one stream");
 }
+
+/// flpdf-9hc.27 (roborev #199): a cyclic indirect-/Length holder chain
+/// (obj 1's /Length -> obj 2 -> obj 1) must NOT recurse forever. The
+/// in-progress `Reserved` guard breaks the cycle; resolution terminates and
+/// the stream falls back to the endstream-scan length.
+#[test]
+fn cyclic_indirect_length_holder_terminates() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Length 2 0 R >>\nstream\nAAA\nendstream\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Length 1 0 R >>\nstream\nBBBB\nendstream\nendobj\n");
+    let off3 = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Type /Catalog /Pages 4 0 R >>\nendobj\n");
+    let off4 = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 3 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+    // Must terminate (no stack overflow / hang) and yield a stream.
+    let obj = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    assert!(
+        matches!(obj, Object::Stream(_)),
+        "cyclic /Length holder must still resolve to a stream (endstream-scan fallback)"
+    );
+}
