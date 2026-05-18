@@ -725,7 +725,7 @@ fn missing_indirect_length_holder_is_rejected() {
     pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
     let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
-        format!("{err}").contains("holder object is missing"),
+        format!("{err}").contains("holder object (M 0) is missing"),
         "dangling indirect /Length holder must be an error, got: {err}"
     );
 }
@@ -794,5 +794,28 @@ fn nonzero_generation_indirect_length_holder_is_rejected() {
     assert!(
         format!("{err}").contains("non-zero generation"),
         "non-zero-generation indirect /Length holder must be rejected, got: {err}"
+    );
+}
+
+/// flpdf-9hc.25 (roborev #199 follow-up): an indirect `/Length 7 0 R` whose
+/// only object numbered 7 is `7 1 obj` (generation 1, NOT the gen-0 holder
+/// the reference points at) must be rejected — number-only matching would
+/// wrongly accept it and rewrite the wrong-generation object.
+#[test]
+fn indirect_length_holder_generation_must_match() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 7 0 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    // Only `7 1 obj` exists — the `7 0` holder the /Length points at is absent.
+    pdf.extend_from_slice(b"7 1 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 f \n0000000000 00000 f \n0000000000 00000 f \n0000000000 00000 f \n0000000000 00001 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 8\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("holder object (M 0) is missing"),
+        "a /Length 7 0 R with only 7 1 obj must be rejected, got: {err}"
     );
 }

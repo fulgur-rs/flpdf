@@ -814,7 +814,17 @@ impl<R: Read + Seek> Pdf<R> {
                 // `decrypt_resolved_object` decrypts in place afterwards.
                 if let Some(isl) = indirect_len {
                     if isl.holder != object_ref {
-                        if let Object::Integer(n) = self.resolve(isl.holder)? {
+                        // Mark this object resolution in-progress before
+                        // recursing into the holder: a cyclic length-holder
+                        // chain (A's /Length -> B -> ... -> A) would otherwise
+                        // recurse forever (resolve() does not otherwise mark
+                        // in-progress). The cyclic re-entry now hits the
+                        // `Reserved => Null` arm and the holder simply reads
+                        // as non-Integer -> endstream-scan fallback. A holder
+                        // resolution error is likewise non-fatal: fall back
+                        // rather than failing the whole stream.
+                        self.cache.set_reserved(object_ref);
+                        if let Ok(Object::Integer(n)) = self.resolve(isl.holder) {
                             if let (Ok(n), Object::Stream(stream)) =
                                 (usize::try_from(n), &mut object)
                             {
