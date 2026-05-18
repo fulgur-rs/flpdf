@@ -15,6 +15,7 @@
 //! and on Windows.
 
 use assert_cmd::Command as CargoCommand;
+use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 use tempfile::tempdir;
@@ -169,6 +170,81 @@ fn static_id_trailer_id_matches_qpdf_oracle() {
             "/ID[1] is not the qpdf static-id constant"
         );
     }
+}
+
+#[test]
+fn static_id_emits_test_only_warning_on_stderr() {
+    // --static-id is a test/parity-only flag; using it must surface a
+    // stderr warning (flpdf-9hc.13.4) without changing the exit code.
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("one-page.pdf");
+    let output = tmp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("rewrite")
+        .arg("--static-id")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--static-id"))
+        .stderr(predicate::str::contains("testing only"));
+}
+
+#[test]
+fn static_id_top_level_alias_emits_warning() {
+    // The qpdf-shaped top-level alias (`flpdf --static-id in out`) must warn
+    // identically to the `rewrite` subcommand.
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("one-page.pdf");
+    let output = tmp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("--static-id")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("testing only"));
+}
+
+#[test]
+fn static_id_warning_suppressed_by_env_var() {
+    // FLPDF_STATIC_ID_QUIET opts test/parity harnesses out of the warning
+    // (still exit 0, still produces output).
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("one-page.pdf");
+    let output = tmp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .arg("rewrite")
+        .arg("--static-id")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn no_static_id_emits_no_static_id_warning() {
+    // Plain rewrite (no --static-id) must not emit the warning.
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("one-page.pdf");
+    let output = tmp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("rewrite")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("testing only").not());
 }
 
 #[test]

@@ -410,7 +410,12 @@ fn top_level_linearize_accepts_compress_streams_and_pass1() {
     std::fs::write(&input, one_page_pdf_bytes()).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--linearize", "--static-id", "--compress-streams=n"])
+    // --static-id normally emits a "testing only" stderr warning
+    // (flpdf-9hc.13.4). This test mirrors qpdf qtest's "no stdout/stderr"
+    // condition, so suppress the diagnostic via the documented opt-out env
+    // var; the empty-stderr assertion below still pins the parity guarantee.
+    cmd.env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--linearize", "--static-id", "--compress-streams=n"])
         .arg(format!("--linearize-pass1={}", pass1.display()))
         .arg(&input)
         .arg(&output)
