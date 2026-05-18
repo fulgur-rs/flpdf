@@ -148,7 +148,15 @@ fn rfind_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
 /// end-of-slice, so `/Length1`, `/SizeExtra`, etc. are not mistaken for
 /// `/Length` / `/Size`. Returns the start offset of the match.
 fn find_name_token(hay: &[u8], name: &[u8]) -> Option<usize> {
-    let mut i = 0usize;
+    find_name_token_from(hay, name, 0)
+}
+
+/// Like [`find_name_token`] but starts scanning at `from`. `from` must be a
+/// position in normal object context (not inside a string/hex/comment) — all
+/// internal callers pass either `0` or a position just past a previously
+/// matched name token, which satisfies this.
+fn find_name_token_from(hay: &[u8], name: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
     while i < hay.len() {
         match hay[i] {
             // `%` comment runs to end of line (PDF §7.2.4).
@@ -244,9 +252,27 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// The recomputed value to be written into a length-holder object.
 fn detect_objstm(body: &[u8]) -> bool {
-    // `/ObjStm` as a real name token only — ignore copies inside strings,
-    // hex strings, or comments (e.g. `/Note (mentions /ObjStm)`).
-    find_name_token(body, b"/ObjStm").is_some()
+    // An object stream is `<< ... /Type /ObjStm ... >>`. Only reject when a
+    // `/Type` *name token* has the *value* name token `/ObjStm` — not merely
+    // any `/ObjStm` (it could be an unrelated name value like
+    // `/SomeKey /ObjStm`, and copies in strings/comments are skipped anyway).
+    let mut from = 0;
+    while let Some(tp) = find_name_token_from(body, b"/Type", from) {
+        let mut j = tp + b"/Type".len();
+        // Skip PDF whitespace between the key and its value.
+        while body.get(j).is_some_and(|&b| is_ws(b)) {
+            j += 1;
+        }
+        if body[j..].starts_with(b"/ObjStm")
+            && body
+                .get(j + b"/ObjStm".len())
+                .is_none_or(|&b| is_ws(b) || is_delimiter(b))
+        {
+            return true;
+        }
+        from = tp + b"/Type".len();
+    }
+    false
 }
 
 /// Read and recompute a hand-edited QDF file.
