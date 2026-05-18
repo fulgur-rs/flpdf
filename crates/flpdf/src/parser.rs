@@ -113,17 +113,14 @@ impl<'a> Parser<'a> {
     }
 
     fn stream_from_dict(&mut self, dict: Dictionary) -> Result<Object> {
-        let Some(length) = dict.get("Length") else {
-            return Err(Error::parse(self.pos, "missing stream length"));
-        };
         // A usable DIRECT /Length is a non-negative Integer; everything else
-        // (an indirect `M G R` reference — the form flpdf's own QDF writer now
-        // emits and a common real-world shape, valid per ISO 32000-1 §7.3.8.2 —
-        // or any otherwise-unusable value) falls through to the spec-sanctioned
-        // `endstream`-scan recovery path. The DIRECT fast path must stay
-        // byte-identical so no currently-parsing PDF regresses.
-        let direct_length = match length {
-            Object::Integer(value) if *value >= 0 => u64::try_from(*value).ok(),
+        // — an indirect `M G R` reference (the form flpdf's own QDF writer now
+        // emits; a common real-world shape, valid per ISO 32000-1 §7.3.8.2), an
+        // ABSENT /Length, or any otherwise-unusable value — falls through to
+        // the spec-sanctioned `endstream`-scan recovery path. The DIRECT fast
+        // path must stay byte-identical so no currently-parsing PDF regresses.
+        let direct_length = match dict.get("Length") {
+            Some(Object::Integer(value)) if *value >= 0 => u64::try_from(*value).ok(),
             _ => None,
         };
 
@@ -138,8 +135,8 @@ impl<'a> Parser<'a> {
         }
 
         let data_start = self.pos;
-        let length = match direct_length {
-            Some(length) if data_start + (length as usize) <= self.input.len() => length as usize,
+        let length = match direct_length.and_then(|n| usize::try_from(n).ok()) {
+            Some(length) if data_start + length <= self.input.len() => length,
             // Indirect / missing / invalid / out-of-range /Length: recover the
             // payload boundary by locating the line-anchored `endstream`
             // keyword (what qpdf and conformant readers do). The indirect
