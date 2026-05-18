@@ -1,6 +1,6 @@
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
-use crate::parser::{parse_indirect_object, Parser};
+use crate::parser::{parse_indirect_object, parse_indirect_object_detailed, Parser};
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -801,9 +801,49 @@ impl<R: Read + Seek> Pdf<R> {
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut bytes = Vec::new();
                 self.reader.read_to_end(&mut bytes)?;
-                let (parsed_ref, object) = parse_indirect_object(&bytes)?;
+                let (parsed_ref, mut object, indirect_len) =
+                    parse_indirect_object_detailed(&bytes)?;
                 if parsed_ref != object_ref {
                     return Ok(Object::Null);
+                }
+                // flpdf-9hc.27: when the stream's /Length is an indirect
+                // reference, the parser fell back to endstream-scan (it has no
+                // xref). Resolve the holder via the xref and re-slice to the
+                // authoritative length. This MUST happen before decryption:
+                // `object`/`bytes` are still ciphertext here, and
+                // `decrypt_resolved_object` decrypts in place afterwards.
+                if let Some(isl) = indirect_len {
+                    if isl.holder != object_ref {
+                        if let Object::Integer(n) = self.resolve(isl.holder)? {
+                            if let (Ok(n), Object::Stream(stream)) =
+                                (usize::try_from(n), &mut object)
+                            {
+                                let auth_end = isl.data_start.saturating_add(n);
+                                // Only override with the authoritative length
+                                // when it lands STRICTLY inside the payload
+                                // window — i.e. the resolved /Length is the
+                                // spec content length and `endstream` (plus
+                                // its mandatory preceding EOL) still follows.
+                                // Then the exact `n` content bytes are used
+                                // verbatim (no EOL trim), fixing non-QDF
+                                // streams whose data legitimately ends with a
+                                // newline (flpdf-9hc.27).
+                                //
+                                // When `auth_end >= endstream_pos` the holder
+                                // counts the whole window including the
+                                // framing EOL — flpdf's own QDF convention.
+                                // There the parser's endstream-scan (which
+                                // strips exactly one framing EOL) already
+                                // yields the correct logical content and keeps
+                                // QDF round-trip / idempotence byte-stable, so
+                                // leave it untouched. A too-large/garbage
+                                // holder also falls here → safe fallback.
+                                if auth_end < isl.endstream_pos && auth_end <= bytes.len() {
+                                    stream.data = bytes[isl.data_start..auth_end].to_vec();
+                                }
+                            }
+                        }
+                    }
                 }
                 let object = self.decrypt_resolved_object(object_ref, object)?;
                 self.cache.set_resolved(object_ref, object.clone());

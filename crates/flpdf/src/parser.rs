@@ -10,7 +10,36 @@ pub fn parse_object(input: &[u8]) -> Result<Object> {
     Ok(object)
 }
 
+/// A stream object whose `/Length` is an indirect reference `M G R`. The
+/// parser cannot resolve `M` (it has no xref); it locates the payload window
+/// via the spec `endstream`-scan recovery and records these bounds so the
+/// reader — which *does* have the xref — can re-slice to the authoritative
+/// length (flpdf-9hc.27).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IndirectStreamLength {
+    /// The `/Length M G R` holder object reference.
+    pub holder: ObjectRef,
+    /// Byte offset of the first stream payload byte (just past the `stream`
+    /// keyword's EOL), relative to the `parse_indirect_object` input slice.
+    pub data_start: usize,
+    /// Byte offset of the `endstream` keyword (the syntactic upper bound;
+    /// the authoritative length is clamped to not exceed this).
+    pub endstream_pos: usize,
+}
+
 pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)> {
+    let (object_ref, object, _) = parse_indirect_object_detailed(input)?;
+    Ok((object_ref, object))
+}
+
+/// Like [`parse_indirect_object`] but also returns
+/// [`IndirectStreamLength`] bounds when the parsed object is a stream whose
+/// `/Length` is an indirect reference. Used by the reader to resolve the
+/// authoritative length via the xref (flpdf-9hc.27); all other callers use
+/// the plain [`parse_indirect_object`] wrapper.
+pub(crate) fn parse_indirect_object_detailed(
+    input: &[u8],
+) -> Result<(ObjectRef, Object, Option<IndirectStreamLength>)> {
     let mut parser = Parser::new(input);
     let number = parser.integer_for_indirect()?;
     let generation = parser.integer_for_indirect()?;
@@ -23,6 +52,7 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
                 .map_err(|_| Error::parse(0, "invalid indirect generation"))?,
         ),
         object,
+        parser.last_indirect_stream_len,
     ))
 }
 
@@ -34,6 +64,10 @@ pub(crate) struct Parser<'a> {
     /// streams never contain indirect references, so the tokenizer sets this
     /// to avoid mis-parsing operands like `0 0 1 R` (rg/RG colour ops).
     no_reference: bool,
+    /// Set by [`stream_from_dict`](Self::stream_from_dict) when a stream's
+    /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
+    /// can surface the payload window for xref-based resolution (flpdf-9hc.27).
+    last_indirect_stream_len: Option<IndirectStreamLength>,
 }
 
 impl<'a> Parser<'a> {
@@ -42,6 +76,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             no_reference: false,
+            last_indirect_stream_len: None,
         }
     }
 
@@ -52,6 +87,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             no_reference: true,
+            last_indirect_stream_len: None,
         }
     }
 
@@ -123,6 +159,13 @@ impl<'a> Parser<'a> {
             Some(Object::Integer(value)) if *value >= 0 => u64::try_from(*value).ok(),
             _ => None,
         };
+        // An indirect `/Length M G R`: the parser cannot resolve M, but the
+        // reader can (flpdf-9hc.27). Record the holder so the recovery branch
+        // below can surface the payload window for xref-based resolution.
+        let length_ref = match dict.get("Length") {
+            Some(Object::Reference(r)) => Some(*r),
+            _ => None,
+        };
 
         self.expect_keyword_for_indirect(b"stream")?;
         if self.peek() == Some(b'\r') {
@@ -151,13 +194,25 @@ impl<'a> Parser<'a> {
             // keyword (what qpdf and conformant readers do). The indirect
             // holder value is advisory; `endstream` is authoritative.
             _ => {
-                let end = find_line_anchored_keyword(self.input, b"endstream", data_start)
-                    .ok_or_else(|| Error::parse(self.pos, "stream data exceeds input"))?;
+                let endstream_pos =
+                    find_line_anchored_keyword(self.input, b"endstream", data_start)
+                        .ok_or_else(|| Error::parse(self.pos, "stream data exceeds input"))?;
+                // For an indirect /Length, surface the payload window so the
+                // reader can re-slice to the xref-resolved authoritative length
+                // (flpdf-9hc.27). The endstream-scan result here is only the
+                // last-resort fallback when the holder is unresolvable.
+                if let Some(holder) = length_ref {
+                    self.last_indirect_stream_len = Some(IndirectStreamLength {
+                        holder,
+                        data_start,
+                        endstream_pos,
+                    });
+                }
                 // Exclude exactly ONE framing EOL marker that the writer placed
                 // between the payload and `endstream`, so `stream.data` is the
                 // logical content. The writer then re-adds exactly one EOL,
                 // keeping QDF round-trip / idempotence byte-stable.
-                let mut end = end;
+                let mut end = endstream_pos;
                 if end > data_start && self.input[end - 1] == b'\n' {
                     end -= 1;
                     if end > data_start && self.input[end - 1] == b'\r' {
