@@ -1354,6 +1354,42 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         }
     }
 
+    // ── QDF length-holder pre-pass (flpdf-9hc.6.12) ──────────────────────────
+    // In qdf mode every real stream's /Length is emitted as an INDIRECT
+    // reference `/Length H 0 R` plus a separate bare-integer holder object,
+    // matching qpdf 11.9.0 --qdf and the flpdf::fix_qdf oracle (qdf_fix.rs).
+    // A direct `/Length <n>` in a stream dict is something flpdf::fix_qdf
+    // never rewrites, so without this the "edit then fix" use case breaks.
+    //
+    // Idempotence: a qdf output fed back through this path already carries
+    // `/Length H 0 R` plus a leaf-integer holder object H. We detect those
+    // holders here so we (a) skip re-emitting them as ordinary objects in
+    // the main loop and (b) REUSE their number H rather than allocating a
+    // fresh one — making `flpdf --qdf` of its own qdf output byte-stable.
+    use std::collections::HashSet;
+    let mut existing_holders: HashSet<u32> = HashSet::new();
+    if options.qdf {
+        for object_ref in &object_refs {
+            if Some(*object_ref) == pdf.encryption_ref() || member_to_batch.contains_key(object_ref)
+            {
+                continue;
+            }
+            if let Ok(Object::Stream(s)) = pdf.resolve(*object_ref) {
+                if let Some(Object::Reference(r)) = s.dict.get("Length") {
+                    existing_holders.insert(r.number);
+                }
+            }
+        }
+    }
+
+    // Holders to emit after the last original object, ascending by number:
+    // (holder_object_number, decoded_length_value). Filled in the main loop.
+    let mut length_holders: Vec<(u32, i64)> = Vec::new();
+    // Running counter for freshly allocated holder numbers (above existing_max
+    // and above any ObjStm container numbers). Mirrors the `existing_max + i`
+    // container-allocation pattern at the top of this function.
+    let mut next_holder_offset: u32 = plan.batches.len() as u32;
+
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
     bytes.extend_from_slice(QPDF_BINARY_MARKER);
@@ -1371,6 +1407,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
         // ── Step 4: skip members that will be routed into an ObjStm batch ───
         if member_to_batch.contains_key(object_ref) {
+            continue;
+        }
+
+        // QDF length-holder objects from a prior qdf pass are reconstructed
+        // (with the recomputed length) below; do not re-emit them here as
+        // ordinary integer objects, or idempotence breaks.
+        if options.qdf && existing_holders.contains(&object_ref.number) {
             continue;
         }
 
@@ -1428,10 +1471,69 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             } else {
                 options.compress_streams
             };
+            // Capture the pre-policy /Length form so an existing indirect
+            // holder (from a prior qdf pass) can be reused for byte-stable
+            // idempotence instead of allocating a new number.
+            let prior_holder = match stream.dict.get("Length") {
+                Some(Object::Reference(r)) if existing_holders.contains(&r.number) => {
+                    Some(r.number)
+                }
+                _ => None,
+            };
             let reencoded = apply_stream_compress_policy(&stream, compress_policy);
             if let Object::Stream(ref s) = reencoded {
                 if options.qdf {
-                    write_stream_to_buf_qdf(&mut bytes, s, options.newline_before_endstream);
+                    // QDF: split the stream's /Length into a separate
+                    // indirect length-holder object so flpdf::fix_qdf
+                    // (qdf_fix.rs) — which only ever rewrites an INDIRECT
+                    // `/Length M G R`, never a direct one — can repair the
+                    // length after a hand edit, then replace the dict entry
+                    // with `H 0 R`.
+                    //
+                    // The holder body is the ON-DISK byte count (raw `data`
+                    // plus the single EOL the framing inserts before
+                    // `endstream`), NOT `apply_stream_compress_policy`'s raw
+                    // decoded length. fix_qdf counts the emitted bytes between
+                    // `stream`+EOL and the `endstream` line; the holder must
+                    // equal that, or the writer and fix_qdf disagree by the
+                    // newline-before-endstream byte and the "edit then fix"
+                    // loop is broken (flpdf-9hc.6.12).
+                    let len_value = i64::try_from(on_disk_stream_len(
+                        &s.data,
+                        options.newline_before_endstream,
+                    ))
+                    .unwrap_or(i64::MAX);
+                    let holder = match prior_holder {
+                        Some(h) => h,
+                        None => {
+                            next_holder_offset =
+                                next_holder_offset.checked_add(1).ok_or_else(|| {
+                                    crate::Error::Unsupported(
+                                        "full-rewrite: QDF length-holder number overflows u32"
+                                            .to_string(),
+                                    )
+                                })?;
+                            existing_max
+                                .checked_add(next_holder_offset)
+                                .ok_or_else(|| {
+                                    crate::Error::Unsupported(
+                                        "full-rewrite: QDF length-holder number overflows u32"
+                                            .to_string(),
+                                    )
+                                })?
+                        }
+                    };
+                    length_holders.push((holder, len_value));
+
+                    let mut holder_stream = s.clone();
+                    holder_stream
+                        .dict
+                        .insert("Length", Object::Reference(ObjectRef::new(holder, 0)));
+                    write_stream_to_buf_qdf(
+                        &mut bytes,
+                        &holder_stream,
+                        options.newline_before_endstream,
+                    );
                 } else {
                     write_stream_to_buf(&mut bytes, s, options.newline_before_endstream);
                 }
@@ -1461,6 +1563,29 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
         bytes.extend_from_slice(b"\nendobj\n");
         offsets.insert(container_ref.number, (0, emit_offset));
+    }
+
+    // ── Step 5b: emit QDF length-holder objects (flpdf-9hc.6.12) ─────────────
+    // Each real stream's /Length was rewritten to `/Length H 0 R` above.
+    // Emit the holders here, AFTER the last original object (and any ObjStm
+    // container — empty in qdf mode per 6.2), ascending by object number,
+    // with NO `%% Original object ID:` comment (they are synthetic; qpdf
+    // 11.9.0 --qdf only emits that comment for source objects). The holder
+    // body is the decoded byte count as a bare decimal integer on its own
+    // line with no zero padding — identical framing to qpdf and to what
+    // flpdf::fix_qdf (qdf_fix.rs) rewrites. The same `endobj` framing the
+    // main loop uses keeps offsets and xref consistent.
+    length_holders.sort_by_key(|&(h, _)| h);
+    length_holders.dedup_by_key(|&mut (h, _)| h);
+    for (holder, len_value) in &length_holders {
+        if offsets.contains_key(holder) {
+            return Err(crate::Error::Unsupported(format!(
+                "full-rewrite: QDF length-holder number {holder} collides with an existing object"
+            )));
+        }
+        let emit_offset = bytes.len();
+        bytes.extend_from_slice(format!("{holder} 0 obj\n{len_value}\nendobj\n").as_bytes());
+        offsets.insert(*holder, (0, emit_offset));
     }
 
     // Build xref / trailer matching the input's xref form.
@@ -1832,6 +1957,34 @@ pub fn write_stream_to_buf(
     }
 
     buf.extend_from_slice(b"endstream");
+}
+
+/// On-disk byte count of a stream payload as written by
+/// [`write_stream_to_buf`] / [`write_stream_to_buf_qdf`] for the given
+/// [`NewlineBeforeEndstream`] policy: the raw `data` length plus the single
+/// EOL byte the writer inserts before `endstream` (if any).
+///
+/// This is the value ISO 32000-1 §7.3.8.1 mandates for `/Length` (bytes
+/// between the `stream` EOL and the `endstream` keyword) and is exactly the
+/// count [`crate::fix_qdf`] (qdf_fix.rs) recomputes from the emitted bytes.
+/// In QDF mode the indirect length-holder body MUST equal this — not the
+/// raw decoded length — so the writer and `fix_qdf` mesh (flpdf-9hc.6.12).
+fn on_disk_stream_len(data: &[u8], policy: NewlineBeforeEndstream) -> usize {
+    let n = data.len();
+    match policy {
+        NewlineBeforeEndstream::Yes => n + 1,
+        NewlineBeforeEndstream::No => {
+            let ends_with_eol = data
+                .last()
+                .map(|&b| b == b'\n' || b == b'\r')
+                .unwrap_or(false);
+            if ends_with_eol {
+                n
+            } else {
+                n + 1
+            }
+        }
+    }
 }
 
 /// QDF variant of [`write_stream_to_buf`]: identical stream/endstream framing
