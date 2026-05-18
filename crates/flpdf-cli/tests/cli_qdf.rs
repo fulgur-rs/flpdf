@@ -423,3 +423,28 @@ fn qdf_linearize_is_rejected_top_level() {
             "--qdf and --linearize cannot be used together",
         ));
 }
+
+/// Regression for roborev #194: top-level `--qdf` combined with a page
+/// operation must be rejected (exit 1) rather than silently emitting a
+/// non-QDF document.
+#[test]
+fn qdf_page_ops_is_rejected_top_level() {
+    let input = fixture_with_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--rotate=+90",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--qdf cannot be combined with --pages/--rotate/--split-pages",
+        ));
+}
