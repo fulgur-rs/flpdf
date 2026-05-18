@@ -537,3 +537,59 @@ fn length_inside_string_or_comment_not_mistaken_for_key() {
         "fix_qdf must be idempotent"
     );
 }
+
+/// Regression for roborev job 994 #1: `/ObjStm` inside a string/comment must
+/// NOT trigger the Unsupported(ObjStm) rejection. A valid QDF with no real
+/// object stream but text mentioning /ObjStm must repair normally.
+#[test]
+fn objstm_substring_in_string_not_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(
+        b"<<\n  /Type /Catalog\n  /Note (this mentions /ObjStm but is not one)\n",
+    );
+    pdf.extend_from_slice(b"  %% /ObjStm in a comment too\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must not reject string-only /ObjStm");
+    assert!(find(&fixed, b"/Note (this mentions /ObjStm but is not one)").is_some());
+    assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
+}
+
+/// Regression for roborev job 994 #2: a trailer key like `/SizeExtra` before
+/// the real `/Size` must not absorb the recomputed size.
+#[test]
+fn sizeextra_not_mistaken_for_size() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    // /SizeExtra (decoy) and a /Note string containing /Size, before real /Size.
+    pdf.extend_from_slice(
+        b"trailer <<\n  /SizeExtra 7\n  /Note (/Size 999)\n  /Root 1 0 R\n  /Size 4242\n>>\nstartxref\n0\n%%EOF\n",
+    );
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+    // Real /Size recomputed to 2 (max obj number 1 + 1); decoys untouched.
+    assert!(
+        find(&fixed, b"/Size 2\n").is_some(),
+        "real /Size must be rewritten to 2:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert!(
+        find(&fixed, b"/SizeExtra 7\n").is_some(),
+        "/SizeExtra must be untouched"
+    );
+    assert!(
+        find(&fixed, b"/Note (/Size 999)").is_some(),
+        "string decoy must be verbatim"
+    );
+    assert!(
+        find(&fixed, b"/Size 4242").is_none(),
+        "stale real /Size must be gone"
+    );
+}

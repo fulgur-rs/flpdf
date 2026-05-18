@@ -137,6 +137,65 @@ fn rfind_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
     found
 }
 
+/// Find the PDF name token `name` (e.g. `b"/Length"`, `b"/Size"`,
+/// `b"/ObjStm"`) inside `hay`, in object syntax only.
+///
+/// Walks the bytes skipping literal strings `(...)` (balanced parens, `\`
+/// escapes), hex strings `<...>` (while treating `<<`/`>>` as dictionary
+/// delimiters, not strings), and `%` comments, so a copy of `name` appearing
+/// inside a string/comment is ignored. `name` matches only when the byte
+/// immediately after it is a PDF whitespace/delimiter (ISO 32000-1 §7.2) or
+/// end-of-slice, so `/Length1`, `/SizeExtra`, etc. are not mistaken for
+/// `/Length` / `/Size`. Returns the start offset of the match.
+fn find_name_token(hay: &[u8], name: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while i < hay.len() {
+        match hay[i] {
+            // `%` comment runs to end of line (PDF §7.2.4).
+            b'%' => {
+                while i < hay.len() && hay[i] != b'\n' && hay[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            // `<<` / `>>` are dict delimiters, not hex strings.
+            b'<' if hay.get(i + 1) == Some(&b'<') => i += 2,
+            b'>' if hay.get(i + 1) == Some(&b'>') => i += 2,
+            // Hex string `<...>` — skip to the closing `>`.
+            b'<' => {
+                i += 1;
+                while i < hay.len() && hay[i] != b'>' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Literal string `(...)` — balanced parens, `\` escapes.
+            b'(' => {
+                i += 1;
+                let mut depth = 1usize;
+                while i < hay.len() && depth > 0 {
+                    match hay[i] {
+                        b'\\' => i += 1, // skip escaped byte
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            // Candidate name token in normal object context.
+            b'/' if hay[i..].starts_with(name) => {
+                let after = hay.get(i + name.len());
+                if after.is_none_or(|&b| is_ws(b) || is_delimiter(b)) {
+                    return Some(i);
+                }
+                i += 1; // longer name (`/Length1` etc.) — keep scanning.
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Scan a stream dictionary slice for `/Length M G R` (indirect) or
 /// `/Length <int>` (direct). Returns `Indirect(M)` or `Direct`.
 enum LengthKind {
@@ -146,67 +205,12 @@ enum LengthKind {
 }
 
 fn classify_length(dict: &[u8]) -> LengthKind {
-    // Find the PDF *name token* `/Length` in object syntax — not just a byte
-    // substring. We walk the dictionary bytes skipping literal strings
-    // `(...)`, hex strings `<...>`, and `%` comments, so a `/Length` appearing
-    // inside e.g. `/Note (/Length 999)` or a comment is ignored. `/Length`
-    // must also be followed immediately by a PDF whitespace/delimiter
-    // (ISO 32000-1 §7.2) or end-of-slice, so `/Length1`, `/LengthX`, etc. are
-    // not mistaken for the real key.
+    // Find the PDF *name token* `/Length` in object syntax (skipping strings,
+    // hex strings, and comments; requiring a trailing token boundary so
+    // `/Length1` etc. do not match).
     let needle = b"/Length";
-    let p = {
-        let mut i = 0usize;
-        let found = loop {
-            if i >= dict.len() {
-                break None;
-            }
-            match dict[i] {
-                // `%` comment runs to end of line (PDF §7.2.4).
-                b'%' => {
-                    while i < dict.len() && dict[i] != b'\n' && dict[i] != b'\r' {
-                        i += 1;
-                    }
-                }
-                // `<<` / `>>` are dict delimiters, not hex strings.
-                b'<' if dict.get(i + 1) == Some(&b'<') => i += 2,
-                b'>' if dict.get(i + 1) == Some(&b'>') => i += 2,
-                // Hex string `<...>` — skip to the closing `>`.
-                b'<' => {
-                    i += 1;
-                    while i < dict.len() && dict[i] != b'>' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                // Literal string `(...)` — balanced parens, `\` escapes.
-                b'(' => {
-                    i += 1;
-                    let mut depth = 1usize;
-                    while i < dict.len() && depth > 0 {
-                        match dict[i] {
-                            b'\\' => i += 1, // skip escaped byte
-                            b'(' => depth += 1,
-                            b')' => depth -= 1,
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-                }
-                // Candidate name token in normal object context.
-                b'/' if dict[i..].starts_with(needle) => {
-                    let after = dict.get(i + needle.len());
-                    if after.is_none_or(|&b| is_ws(b) || is_delimiter(b)) {
-                        break Some(i);
-                    }
-                    i += 1; // `/Length1` etc. — keep scanning.
-                }
-                _ => i += 1,
-            }
-        };
-        match found {
-            Some(p) => p,
-            None => return LengthKind::None,
-        }
+    let Some(p) = find_name_token(dict, needle) else {
+        return LengthKind::None;
     };
     let rest = &dict[p + needle.len()..];
     let s = match std::str::from_utf8(rest) {
@@ -240,7 +244,9 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// The recomputed value to be written into a length-holder object.
 fn detect_objstm(body: &[u8]) -> bool {
-    find_subslice(body, b"/ObjStm").is_some()
+    // `/ObjStm` as a real name token only — ignore copies inside strings,
+    // hex strings, or comments (e.g. `/Note (mentions /ObjStm)`).
+    find_name_token(body, b"/ObjStm").is_some()
 }
 
 /// Read and recompute a hand-edited QDF file.
@@ -565,7 +571,9 @@ fn find_matching_dict_close(input: &[u8], open: usize) -> Option<usize> {
 
 /// Rewrite the `/Size <n>` entry inside a trailer dictionary slice.
 fn rewrite_size(trailer: &[u8], size: u32) -> Vec<u8> {
-    let Some(p) = find_subslice(trailer, b"/Size") else {
+    // `/Size` as a real name token only — skip strings/hex/comments and
+    // reject `/SizeExtra` etc. via the trailing token-boundary check.
+    let Some(p) = find_name_token(trailer, b"/Size") else {
         return trailer.to_vec();
     };
     let mut out = Vec::with_capacity(trailer.len() + 4);
