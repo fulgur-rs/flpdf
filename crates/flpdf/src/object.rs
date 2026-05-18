@@ -513,7 +513,7 @@ mod qdf_key_escape_tests {
     fn qdf_dict_key_is_name_escaped() {
         let mut d = Dictionary::new();
         // space, '#', '/', and a non-ASCII byte all require escaping.
-        d.insert(b"A B#C/D\x80E".to_vec(), Object::Integer(1));
+        d.insert(b"A B#C/D\x80E", Object::Integer(1));
         let mut out = Vec::new();
         d.write_pdf_qdf(&mut out, 0);
         let s = String::from_utf8(out).unwrap();
@@ -529,7 +529,7 @@ mod qdf_key_escape_tests {
     #[test]
     fn qdf_dict_plain_key_unescaped() {
         let mut d = Dictionary::new();
-        d.insert(b"Type".to_vec(), Object::Name(b"Catalog".to_vec()));
+        d.insert(b"Type", Object::Name(b"Catalog".to_vec()));
         let mut out = Vec::new();
         d.write_pdf_qdf(&mut out, 0);
         assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
