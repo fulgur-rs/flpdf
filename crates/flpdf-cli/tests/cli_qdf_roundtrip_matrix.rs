@@ -97,7 +97,20 @@ fn qpdf_recanonicalize_code(path: &Path) -> i32 {
 /// Acceptable outcomes: a clean result (0), or exactly the same code as the
 /// baseline (e.g. an intentionally-warning fixture staying at 3).
 fn qpdf_no_worse_than(actual: i32, baseline: i32) -> bool {
-    actual == 0 || actual == baseline
+    // qpdf exit codes: 0 = clean, 3 = warnings only, 2 = errors. The
+    // "badness" order is 0 < 3 < 2 (NOT numeric): `actual` is acceptable iff
+    // it is no worse than `baseline`. This correctly allows improvements such
+    // as errors(2) -> warnings(3) and warnings(3) -> clean(0), and rejects
+    // regressions such as warnings(3) -> errors(2).
+    fn rank(code: i32) -> u8 {
+        match code {
+            0 => 0, // clean
+            3 => 1, // warnings only
+            2 => 2, // errors
+            _ => 3, // anything else: treat as worst
+        }
+    }
+    rank(actual) <= rank(baseline)
 }
 
 // ---------------------------------------------------------------------------
