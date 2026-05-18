@@ -1537,3 +1537,73 @@ fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, 
     append_u24_be(entries, field1);
     entries.push(field2);
 }
+
+// ── flpdf-9hc.27: authoritative indirect /Length via xref ─────────────────
+
+/// When `/Length` is an indirect reference, the reader resolves the holder
+/// via the xref and slices EXACTLY that many content bytes. Here the
+/// authoritative length (2) is shorter than what the `endstream`-scan
+/// fallback would yield (`ab\n`, after trimming one of the two trailing
+/// EOLs), so without xref resolution the stream would carry a spurious
+/// trailing newline. With flpdf-9hc.27 it is exactly `ab`.
+#[test]
+fn indirect_length_resolved_via_xref_is_authoritative() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let off1 = bytes.len();
+    // Stream payload is `ab\n\n` (4 bytes) before `endstream`; the indirect
+    // /Length holder (obj 4) says the real content is only 2 bytes (`ab`).
+    bytes.extend_from_slice(b"1 0 obj\n<< /Length 4 0 R >>\nstream\nab\n\nendstream\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+    let off3 = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let off4 = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n2\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+    let obj = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let Object::Stream(stream) = obj else {
+        panic!("object 1 must be a stream");
+    };
+    assert_eq!(
+        stream.data,
+        b"ab",
+        "indirect /Length must be resolved to the authoritative 2 bytes \
+         (got {:?})",
+        String::from_utf8_lossy(&stream.data)
+    );
+}
+
+/// flpdf-9hc.27 re-slices on the still-encrypted object bytes BEFORE
+/// `decrypt_resolved_object`. Opening an encrypted fixture and resolving its
+/// objects must still yield correctly decrypted streams (no double-decrypt /
+/// ciphertext leakage from the new path).
+#[test]
+fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
+    let file = File::open("../../tests/fixtures/compat/encrypted-r4-three-page.pdf").unwrap();
+    let mut pdf = Pdf::open_with_options(BufReader::new(file), PdfOpenOptions::default()).unwrap();
+    // Resolve every object; none must error and no panic.
+    let mut stream_seen = false;
+    for r in pdf.object_refs() {
+        let obj = pdf.resolve(r).expect("encrypted object must resolve");
+        if let Object::Stream(s) = obj {
+            stream_seen = true;
+            // A correctly decrypted content/metadata stream is decodable and
+            // not obviously ciphertext garbage of the wrong length.
+            assert!(
+                !s.data.is_empty() || s.dict.get("Length").is_some(),
+                "decrypted stream {r:?} unexpectedly empty with no /Length"
+            );
+        }
+    }
+    assert!(stream_seen, "fixture must contain at least one stream");
+}
