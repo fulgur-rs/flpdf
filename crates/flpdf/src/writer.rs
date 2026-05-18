@@ -112,6 +112,25 @@ pub struct WriteOptions {
     /// Mirrors `qpdf --force-version`.
     pub force_version: Option<String>,
 
+    /// When `true`, suppress the `%% Original object ID: N M` comments that the
+    /// QDF writer would otherwise emit before each object.
+    ///
+    /// Mirrors `qpdf --no-original-object-ids`. qpdf's own help: *"Omit
+    /// comments in a QDF file indicating the object ID an object had in the
+    /// original file."* Observed against qpdf 11.9.0, this flag affects **only**
+    /// QDF output (`qpdf --qdf` vs `qpdf --qdf --no-original-object-ids`); JSON
+    /// v1 and v2 output are byte-identical with or without it, so this field is
+    /// intentionally **not** wired into any JSON path.
+    ///
+    /// `flpdf`'s current [`write_qdf`] does not yet emit the `%% Original
+    /// object ID` comments at all (the QDF-comment body is tracked under epic
+    /// `flpdf-9hc.6`). This flag is therefore plumbed through `WriteOptions`
+    /// for acceptance and forward-compatibility; the eventual QDF-comment
+    /// emitter will read this bool to decide whether to skip the annotation.
+    /// With no emission point today, the default (`false`) and the flag both
+    /// produce byte-identical QDF output.
+    pub no_original_object_ids: bool,
+
     /// When `true`, decode every stream through its filter pipeline and re-emit
     /// the document end-to-end with a single `/FlateDecode` filter applied to
     /// each stream.  The output contains no `/Prev` chain, no `ObjStm`, and no

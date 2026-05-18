@@ -176,6 +176,7 @@ struct Cli {
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
+              "no_original_object_ids",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -286,6 +287,13 @@ struct Cli {
     /// those bytes is out of scope here — see flpdf-vrn).
     #[arg(long = "linearize-pass1")]
     linearize_pass1: Option<PathBuf>,
+    /// Omit the `%% Original object ID: N M` comments that QDF output would
+    /// otherwise carry (top-level alias of `flpdf rewrite
+    /// --no-original-object-ids`; qpdf `--no-original-object-ids`
+    /// equivalent). A compatible rewrite/QDF modifier — like `--static-id` it
+    /// does not conflict with the rewrite-mode positionals.
+    #[arg(long = "no-original-object-ids")]
+    no_original_object_ids: bool,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -683,6 +691,17 @@ struct RewriteCommand {
     /// Mirrors `qpdf --force-version`.
     #[arg(long = "force-version")]
     force_version: Option<String>,
+    /// Omit the `%% Original object ID: N M` comments that QDF output would
+    /// otherwise carry. Mirrors `qpdf --no-original-object-ids`.
+    ///
+    /// Observed (qpdf 11.9.0): this flag changes only QDF output; qpdf JSON
+    /// v1/v2 is byte-identical with or without it, so flpdf does not wire it
+    /// into any JSON path. flpdf's QDF writer does not yet emit these
+    /// comments (epic flpdf-9hc.6 owns the comment body); the flag is
+    /// accepted and plumbed for forward-compatibility, so today it is a
+    /// byte-level no-op.
+    #[arg(long = "no-original-object-ids")]
+    no_original_object_ids: bool,
     /// Decode every stream through its filter chain and re-emit the document
     /// end-to-end with a single /FlateDecode filter per stream.  The output
     /// contains no /Prev chain.  Cannot be combined with --linearize.
@@ -999,6 +1018,7 @@ fn main() {
         }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.no_original_object_ids = args.no_original_object_ids;
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
@@ -1045,6 +1065,7 @@ fn main() {
         // subcommand's page-op dispatch below.
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.no_original_object_ids = args.no_original_object_ids;
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
                 "y" => options.compress_streams = CompressStreams::Yes,
@@ -1084,6 +1105,7 @@ fn main() {
     } else {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.no_original_object_ids = args.no_original_object_ids;
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
@@ -1356,6 +1378,7 @@ fn run_command(command: Commands) -> CliResult<()> {
             options.static_id = cmd.static_id;
             options.min_version = cmd.min_version;
             options.force_version = cmd.force_version;
+            options.no_original_object_ids = cmd.no_original_object_ids;
             options.full_rewrite = cmd.full_rewrite;
             options.object_streams = cmd.object_streams.into();
             options.compress_streams = match cmd.compress_streams {
