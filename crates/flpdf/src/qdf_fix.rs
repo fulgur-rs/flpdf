@@ -207,7 +207,13 @@ fn find_name_token_from(hay: &[u8], name: &[u8], from: usize) -> Option<usize> {
 /// Scan a stream dictionary slice for `/Length M G R` (indirect) or
 /// `/Length <int>` (direct). Returns `Indirect(M)` or `Direct`.
 enum LengthKind {
+    /// Indirect `/Length M 0 R` — canonical QDF only ever uses generation 0.
     Indirect(u32),
+    /// Indirect `/Length M G R` with `G != 0` — not canonical QDF; qdf_fix
+    /// keys holders by object number only, so a non-zero generation cannot be
+    /// validated/rewritten safely. Treated as an explicit error rather than
+    /// silently rewriting the wrong-generation object (flpdf-9hc.25).
+    IndirectUnsupportedGeneration,
     Direct,
     None,
 }
@@ -236,8 +242,12 @@ fn classify_length(dict: &[u8]) -> LengthKind {
     let second = it.next();
     let third = it.next();
     if let (Some(g), Some(r)) = (second, third) {
-        if g.parse::<u32>().is_ok() && r == "R" {
-            return LengthKind::Indirect(first.parse().unwrap());
+        if let (Ok(gen), "R") = (g.parse::<u32>(), r) {
+            return if gen == 0 {
+                LengthKind::Indirect(first.parse().unwrap())
+            } else {
+                LengthKind::IndirectUnsupportedGeneration
+            };
         }
     }
     LengthKind::Direct
@@ -386,6 +396,13 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             let dict = &body_region[kw_end..stream_kw_abs];
             match classify_length(dict) {
                 LengthKind::Indirect(m) => length_holder = Some(m),
+                LengthKind::IndirectUnsupportedGeneration => {
+                    return Err(Error::parse(
+                        line_start,
+                        "fix_qdf: stream /Length holder with non-zero generation \
+                         is not supported (canonical QDF uses generation 0)",
+                    ));
+                }
                 LengthKind::Direct | LengthKind::None => {
                     // Canonical qpdf QDF always uses an indirect length for
                     // real streams; the oracle does not rewrite a direct

@@ -774,3 +774,25 @@ fn same_length_indirect_holder_reuse_is_ok() {
     );
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
+
+/// flpdf-9hc.25 (roborev #199): an indirect `/Length M G R` with a non-zero
+/// generation is not canonical QDF and cannot be validated/rewritten by
+/// object-number-keyed holder tracking — it must be an explicit error, not a
+/// silent wrong-generation rewrite.
+#[test]
+fn nonzero_generation_indirect_length_holder_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 4 1 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"4 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("non-zero generation"),
+        "non-zero-generation indirect /Length holder must be rejected, got: {err}"
+    );
+}
