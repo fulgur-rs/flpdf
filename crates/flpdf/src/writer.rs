@@ -1164,76 +1164,25 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
     }
 }
 
-/// Write `pdf` as a flat, qdf-style dump (qpdf's `--qdf` form).
+/// Write `pdf` in canonical QDF form (qpdf's `--qdf`).
 ///
-/// Every known object is rewritten in `(number, generation)` order with no compression
-/// applied, the cross-reference table is rebuilt as a classic `xref` section, and a
-/// minimal trailer pointing at `/Root` is emitted. The result is intended for human
-/// inspection, diffing, and reproducibility tests rather than smallest-on-disk output.
+/// This is a thin wrapper over the canonical QDF entrypoint
+/// [`write_pdf_with_options`] with `WriteOptions { qdf: true, full_rewrite:
+/// true, .. }` — the same path the `flpdf qdf` / `flpdf rewrite --qdf` CLI
+/// uses. It therefore goes through the QDF serializers built by epic
+/// `flpdf-9hc.6` (decoded streams, indirect `/Length` holders, `%QDF-1.0`
+/// header, `%% Original object ID:` comments, classic `xref` table, and the
+/// `trailer <<` dict layout). The previous standalone implementation used the
+/// compact non-QDF serializers and diverged from this path (flpdf-9hc.24).
 ///
-/// Returns [`crate::Error::Missing`] if the input has no `/Root`, and
-/// [`crate::Error::Unsupported`] if the same object number appears more than once in
-/// the cache (which would indicate a cross-reference table that we'd otherwise
-/// misrender).
-pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, mut out: W) -> Result<()> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Err(crate::Error::Missing("/Root"));
+/// Returns [`crate::Error::Missing`] if the input has no `/Root`.
+pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<()> {
+    let options = WriteOptions {
+        qdf: true,
+        full_rewrite: true,
+        ..WriteOptions::default()
     };
-
-    let mut object_refs = pdf.object_refs();
-    object_refs.sort_by_key(|object_ref| (object_ref.number, object_ref.generation));
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(format!("%PDF-{}\n", pdf.version()).as_bytes());
-    bytes.extend_from_slice(QPDF_BINARY_MARKER);
-
-    let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
-    for object_ref in &object_refs {
-        let object = pdf.resolve(*object_ref)?;
-        if offsets
-            .insert(object_ref.number, (object_ref.generation, bytes.len()))
-            .is_some()
-        {
-            return Err(crate::Error::Unsupported(format!(
-                "duplicate object number {} in xref table",
-                object_ref.number
-            )));
-        }
-        bytes.extend_from_slice(
-            format!("{} {} obj\n", object_ref.number, object_ref.generation).as_bytes(),
-        );
-        object.write_pdf(&mut bytes);
-        bytes.extend_from_slice(b"\nendobj\n");
-    }
-
-    let xref_offset = bytes.len();
-    let object_count = object_refs
-        .iter()
-        .map(|object_ref| object_ref.number)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1) as usize;
-
-    bytes.extend_from_slice(format!("xref\n0 {}\n", object_count).as_bytes());
-    bytes.extend_from_slice(b"0000000000 65535 f \n");
-    for number in 1..object_count {
-        match offsets.get(&(number as u32)) {
-            Some((generation, offset)) => {
-                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes())
-            }
-            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
-        }
-    }
-
-    let mut trailer = Dictionary::new();
-    trailer.insert("Size", Object::Integer(object_count as i64));
-    trailer.insert("Root", Object::Reference(root_ref));
-    bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(&mut bytes);
-    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-
-    out.write_all(&bytes)?;
-    Ok(())
+    write_pdf_with_options(pdf, out, &options)
 }
 
 // ---------------------------------------------------------------------------
