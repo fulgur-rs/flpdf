@@ -644,3 +644,63 @@ fn trailer_close_ignores_brackets_in_string() {
     );
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
+
+/// Regression for roborev #193 (1): a real object stream with a `%comment`
+/// token-separator between `/Type` and `/ObjStm` must still be rejected.
+#[test]
+fn objstm_with_comment_between_type_and_objstm_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 2 0\n2 0 obj\n");
+    pdf.extend_from_slice(
+        b"<<\n  /Type %an inline comment\n  /ObjStm\n  /N 1\n>>\nstream\nx\nendstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"xref\n0 3\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n",
+    );
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("ObjStm"),
+        "object stream with /Type %comment /ObjStm must be Unsupported, got: {err}"
+    );
+}
+
+/// Regression for roborev #193 (2): a NON-stream object whose literal string
+/// value contains line-anchored `stream`/`endstream`/`endobj` byte sequences
+/// must not be mis-detected as a stream / mis-spanned. The string lives inside
+/// `<<...>>`, before the dict close, so the dict-close-anchored stream scan
+/// must ignore it; the object's real `endobj` is the terminator.
+#[test]
+fn stream_keywords_inside_dict_string_not_mistaken_for_stream() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    // /Note's string contains lines `stream`, `endstream`, `endobj`.
+    pdf.extend_from_slice(b"<<\n  /Type /Catalog\n  /Note (line\nstream\nfake body\nendstream\nendobj\n)\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Pages\n  /Count 0\n  /Kids [\n  ]\n>>\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"xref\n0 3\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n",
+    );
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed (string keywords ignored)");
+    // Both objects preserved; the decoy string kept verbatim; one regenerated xref.
+    assert!(
+        find(
+            &fixed,
+            b"/Note (line\nstream\nfake body\nendstream\nendobj\n)"
+        )
+        .is_some(),
+        "decoy string must be preserved verbatim:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert!(
+        find(&fixed, b"\n2 0 obj\n").is_some(),
+        "object 2 must not be lost to mis-span"
+    );
+    assert!(
+        find(&fixed, b"\nxref\n0 3\n").is_some(),
+        "exactly one regenerated xref"
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
