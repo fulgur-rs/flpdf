@@ -228,6 +228,169 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Regression for roborev job 991 (qdf_fix.rs ~251):
+///   A decompressed QDF stream body may contain a line-anchored `endobj` (and
+///   `xref`). The naive "first line-anchored endobj after N G obj" would
+///   truncate the object span there, corrupting subsequent xref/length repair.
+///   fix_qdf must anchor the endobj search AFTER `endstream`.
+#[test]
+fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
+    // obj 1: stream whose decompressed body contains BOTH a line `endobj` and
+    // a line `xref` — the canonical regression case for roborev 991.
+    // /Length is indirect (held by obj 4). xref offsets are bogus zeros.
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(b"<<\n  /Length 4 0 R\n>>\n");
+    // Stream body contains both `endobj` and `xref` on their own lines.
+    pdf.extend_from_slice(
+        b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"%% Original object ID: 4 0\n4 0 obj\n0\nendobj\n\n");
+    // Real (tail) xref table with deliberately wrong offsets.
+    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed on stream-body-endobj input");
+
+    // The entire stream body (including the inner `endobj` and `xref` lines)
+    // must be preserved verbatim between `stream\n` and `endstream`.
+    assert!(
+        find(
+            &fixed,
+            b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream"
+        )
+        .is_some(),
+        "stream body (incl. inner `endobj` and `xref`) must be preserved verbatim;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+
+    // Exactly one regenerated xref table at the tail (the one we emitted).
+    assert!(
+        find(&fixed, b"\nxref\n0 5\n").is_some(),
+        "real xref table must be regenerated at the tail"
+    );
+
+    // /Length holder (obj 4) recomputed to the verbatim content byte count:
+    // "some content\nendobj\nmore content\nxref\nfinal line\n" = 50 bytes.
+    let expected_len = b"some content\nendobj\nmore content\nxref\nfinal line\n".len();
+    let expected_holder = format!("4 0 obj\n{expected_len}\nendobj");
+    assert!(
+        find(&fixed, expected_holder.as_bytes()).is_some(),
+        "indirect /Length holder must be recomputed to {expected_len};\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+
+    // Idempotent.
+    let again = flpdf::fix_qdf(&fixed).expect("fix_qdf must be idempotent");
+    assert_eq!(
+        again, fixed,
+        "fix_qdf must be idempotent on stream-body-endobj output"
+    );
+}
+
+/// Regression for roborev job 992 (qdf_fix.rs ~189 classify_length):
+///   A stream dict containing `/Length1 999` before the real `/Length H 0 R`
+///   must not fool classify_length into treating `/Length1` as `/Length`.
+///   fix_qdf must locate and recompute the REAL indirect length holder H.
+#[test]
+fn length1_not_mistaken_for_indirect_length() {
+    // obj 1: stream with `/Length1 999` before the real `/Length 4 0 R`.
+    // obj 4 is the length holder. Bogus xref offsets.
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    // /Length1 appears BEFORE /Length — the false-match scenario.
+    pdf.extend_from_slice(b"<<\n  /Length1 999\n  /Length 4 0 R\n>>\n");
+    pdf.extend_from_slice(b"stream\nhello world\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"%% Original object ID: 4 0\n4 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed with /Length1 in dict");
+
+    // /Length holder obj 4 must be recomputed to the stream body byte count:
+    // "hello world\n" = 12 bytes.
+    let expected_len = b"hello world\n".len();
+    let expected_holder = format!("4 0 obj\n{expected_len}\nendobj");
+    assert!(
+        find(&fixed, expected_holder.as_bytes()).is_some(),
+        "indirect /Length holder must be recomputed to {expected_len} (not fooled by /Length1);\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+
+    // /Length1 must NOT have been misread as the holder reference — obj 999
+    // does not exist, so if classify_length had parsed 999 as the holder num
+    // the function would return an error above. The fact that we got Ok(fixed)
+    // already proves we didn't pick /Length1. Assert the stale holder (0) is
+    // gone and the correct value is present.
+    assert!(
+        find(&fixed, b"4 0 obj\n0\nendobj").is_none(),
+        "stale holder value 0 must have been replaced"
+    );
+
+    // Idempotent.
+    let again = flpdf::fix_qdf(&fixed).expect("fix_qdf must be idempotent");
+    assert_eq!(
+        again, fixed,
+        "fix_qdf must be idempotent on /Length1 output"
+    );
+}
+
+/// Negative control for roborev job 992: a dict with ONLY `/Length1` and a
+/// direct `/Length` integer has no indirect holder; fix_qdf must leave the
+/// direct length verbatim (the oracle/design: direct lengths are out of scope).
+#[test]
+fn direct_length_with_length1_left_verbatim() {
+    // obj 1: stream with `/Length1 999` and a DIRECT `/Length 11`.
+    // No length-holder object exists.
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(b"<<\n  /Length1 999\n  /Length 11\n>>\n");
+    pdf.extend_from_slice(b"stream\nhello world\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 3\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed on direct-length input");
+
+    // The direct /Length 11 must be preserved verbatim (fix_qdf does not
+    // rewrite direct lengths — that is intentionally out of scope).
+    assert!(
+        find(&fixed, b"/Length 11\n").is_some(),
+        "direct /Length must be preserved verbatim;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+
+    // No spurious holder rewrite: /Length1 must not be touched.
+    assert!(
+        find(&fixed, b"/Length1 999\n").is_some(),
+        "/Length1 must be preserved verbatim"
+    );
+}
+
 /// Closed loop for flpdf-9hc.6.12: the flpdf QDF writer and flpdf::fix_qdf
 /// must mesh. Produce a real QDF via the writer (it now emits indirect
 /// `/Length H 0 R` + a bare-integer holder), hand-edit a stream's decoded
@@ -328,4 +491,156 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
         again, fixed,
         "fix_qdf must be idempotent on repaired writer QDF"
     );
+}
+
+/// Regression for roborev job 993: `/Length` appearing inside a string value
+/// or a comment in the stream dict must NOT be mistaken for the real key.
+/// fix_qdf must still locate the genuine indirect `/Length H 0 R` and
+/// recompute holder H after the stream content is edited.
+#[test]
+fn length_inside_string_or_comment_not_mistaken_for_key() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    // Decoy `/Length` inside a literal string AND a comment, before the real
+    // indirect /Length key.
+    pdf.extend_from_slice(b"<<\n  /Note (a /Length 999 decoy)\n");
+    pdf.extend_from_slice(b"  %% /Length 888 in a comment\n");
+    pdf.extend_from_slice(b"  /Length 3 0 R\n>>\n");
+    pdf.extend_from_slice(b"stream\nABCDEFGHIJ\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"3 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 4\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+
+    // Holder object 3 must be recomputed to the on-disk content length of the
+    // stream payload ("ABCDEFGHIJ\n" = 11 bytes, payload + framing EOL).
+    assert!(
+        find(&fixed, b"\n3 0 obj\n11\nendobj").is_some(),
+        "indirect /Length holder 3 must be recomputed (decoy /Length in string/comment ignored):\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    // The decoy string and comment are preserved verbatim.
+    assert!(find(&fixed, b"/Note (a /Length 999 decoy)").is_some());
+    assert!(find(&fixed, b"%% /Length 888 in a comment").is_some());
+
+    // Idempotent.
+    assert_eq!(
+        flpdf::fix_qdf(&fixed).expect("idempotent"),
+        fixed,
+        "fix_qdf must be idempotent"
+    );
+}
+
+/// Regression for roborev job 994 #1: `/ObjStm` inside a string/comment must
+/// NOT trigger the Unsupported(ObjStm) rejection. A valid QDF with no real
+/// object stream but text mentioning /ObjStm must repair normally.
+#[test]
+fn objstm_substring_in_string_not_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(
+        b"<<\n  /Type /Catalog\n  /Note (this mentions /ObjStm but is not one)\n",
+    );
+    pdf.extend_from_slice(b"  %% /ObjStm in a comment too\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must not reject string-only /ObjStm");
+    assert!(find(&fixed, b"/Note (this mentions /ObjStm but is not one)").is_some());
+    assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
+}
+
+/// Regression for roborev job 994 #2: a trailer key like `/SizeExtra` before
+/// the real `/Size` must not absorb the recomputed size.
+#[test]
+fn sizeextra_not_mistaken_for_size() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    // /SizeExtra (decoy) and a /Note string containing /Size, before real /Size.
+    pdf.extend_from_slice(
+        b"trailer <<\n  /SizeExtra 7\n  /Note (/Size 999)\n  /Root 1 0 R\n  /Size 4242\n>>\nstartxref\n0\n%%EOF\n",
+    );
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+    // Real /Size recomputed to 2 (max obj number 1 + 1); decoys untouched.
+    assert!(
+        find(&fixed, b"/Size 2\n").is_some(),
+        "real /Size must be rewritten to 2:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert!(
+        find(&fixed, b"/SizeExtra 7\n").is_some(),
+        "/SizeExtra must be untouched"
+    );
+    assert!(
+        find(&fixed, b"/Note (/Size 999)").is_some(),
+        "string decoy must be verbatim"
+    );
+    assert!(
+        find(&fixed, b"/Size 4242").is_none(),
+        "stale real /Size must be gone"
+    );
+}
+
+/// Regression for roborev job 995: `/ObjStm` as a non-/Type name value (or
+/// after a custom key) must NOT trigger the Unsupported(ObjStm) rejection —
+/// only a real `/Type /ObjStm` object stream is unsupported.
+#[test]
+fn objstm_as_plain_name_value_not_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    pdf.extend_from_slice(b"<<\n  /SomeKey /ObjStm\n  /Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed =
+        flpdf::fix_qdf(&pdf).expect("fix_qdf must accept /ObjStm as a non-/Type name value");
+    assert!(find(&fixed, b"/SomeKey /ObjStm").is_some());
+    assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
+}
+
+/// Regression for roborev job 996: `>>` inside a trailer string/comment must
+/// not be taken as the dict close, so the real /Size is still rewritten.
+#[test]
+fn trailer_close_ignores_brackets_in_string() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    // Decoy `>>` inside a literal string AND a comment, before the real
+    // closing `>>`; the real /Size sits after the decoys.
+    pdf.extend_from_slice(
+        b"trailer <<\n  /Note (closing >> here)\n  %% another >> in a comment\n  /Root 1 0 R\n  /Size 4242\n>>\nstartxref\n0\n%%EOF\n",
+    );
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+    assert!(
+        find(&fixed, b"/Size 2\n").is_some(),
+        "real /Size must be rewritten despite >> in string/comment:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert!(
+        find(&fixed, b"/Size 4242").is_none(),
+        "stale /Size must be gone"
+    );
+    assert!(
+        find(&fixed, b"/Note (closing >> here)").is_some(),
+        "string decoy verbatim"
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }

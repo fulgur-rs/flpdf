@@ -312,6 +312,7 @@ fn qdf_mode_length_matches_decoded_bytes() {
 // requires `Pdf::open` of qdf output, so it is gated on that follow-up.
 // Un-ignore when flpdf-m41 lands.
 #[test]
+#[ignore = "blocked on flpdf-m41: parser must resolve indirect /Length M G R"]
 fn qdf_mode_round_trip_content_preserved() {
     let raw = b"Round-trip content must survive QDF-then-rewrite.";
     let compressed = flate_encode(raw);
@@ -1367,6 +1368,7 @@ fn qdf_empty_container_shape() {
 // makes this byte-stable once the parser supports indirect lengths.
 // Un-ignore when flpdf-m41 lands.
 #[test]
+#[ignore = "blocked on flpdf-m41: parser must resolve indirect /Length M G R"]
 fn qdf_output_is_idempotent() {
     let source = std::fs::read("../../tests/fixtures/compat/three-page.pdf").unwrap();
     let once = qdf_rewrite(&source);

@@ -49,6 +49,7 @@
 //! Running [`fix_qdf`] on an already-valid QDF file is a no-op, and the
 //! function is idempotent: `fix_qdf(fix_qdf(x)) == fix_qdf(x)`.
 
+use crate::parser::{is_delimiter, is_ws};
 use crate::{Error, Result};
 
 /// One parsed `N G obj ... endobj` body in the input.
@@ -136,29 +137,71 @@ fn rfind_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
     found
 }
 
-/// Compute the verbatim stream length for an object whose body starts a stream.
+/// Find the PDF name token `name` (e.g. `b"/Length"`, `b"/Size"`,
+/// `b"/ObjStm"`) inside `hay`, in object syntax only.
 ///
-/// `body` is the bytes from just after the `N G obj` line to the object's
-/// `endobj`. Returns `Some(len)` if a `stream` keyword is found.
-fn compute_stream_len(body: &[u8]) -> Option<usize> {
-    // Find the `stream` keyword. It appears on its own line after the dict;
-    // match it line-anchored so a `stream` byte sequence inside a dictionary
-    // string/name value cannot be mistaken for the keyword.
-    let kw = find_line_keyword_from(body, b"stream", 0)?;
-    // Skip the keyword and its end-of-line marker (CRLF, LF, or lone CR), as
-    // per the PDF stream convention. Content begins immediately after.
-    let mut content_start = kw + b"stream".len();
-    if body.get(content_start) == Some(&b'\r') {
-        content_start += 1;
+/// Walks the bytes skipping literal strings `(...)` (balanced parens, `\`
+/// escapes), hex strings `<...>` (while treating `<<`/`>>` as dictionary
+/// delimiters, not strings), and `%` comments, so a copy of `name` appearing
+/// inside a string/comment is ignored. `name` matches only when the byte
+/// immediately after it is a PDF whitespace/delimiter (ISO 32000-1 §7.2) or
+/// end-of-slice, so `/Length1`, `/SizeExtra`, etc. are not mistaken for
+/// `/Length` / `/Size`. Returns the start offset of the match.
+fn find_name_token(hay: &[u8], name: &[u8]) -> Option<usize> {
+    find_name_token_from(hay, name, 0)
+}
+
+/// Like [`find_name_token`] but starts scanning at `from`. `from` must be a
+/// position in normal object context (not inside a string/hex/comment) — all
+/// internal callers pass either `0` or a position just past a previously
+/// matched name token, which satisfies this.
+fn find_name_token_from(hay: &[u8], name: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < hay.len() {
+        match hay[i] {
+            // `%` comment runs to end of line (PDF §7.2.4).
+            b'%' => {
+                while i < hay.len() && hay[i] != b'\n' && hay[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            // `<<` / `>>` are dict delimiters, not hex strings.
+            b'<' if hay.get(i + 1) == Some(&b'<') => i += 2,
+            b'>' if hay.get(i + 1) == Some(&b'>') => i += 2,
+            // Hex string `<...>` — skip to the closing `>`.
+            b'<' => {
+                i += 1;
+                while i < hay.len() && hay[i] != b'>' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Literal string `(...)` — balanced parens, `\` escapes.
+            b'(' => {
+                i += 1;
+                let mut depth = 1usize;
+                while i < hay.len() && depth > 0 {
+                    match hay[i] {
+                        b'\\' => i += 1, // skip escaped byte
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            // Candidate name token in normal object context.
+            b'/' if hay[i..].starts_with(name) => {
+                let after = hay.get(i + name.len());
+                if after.is_none_or(|&b| is_ws(b) || is_delimiter(b)) {
+                    return Some(i);
+                }
+                i += 1; // longer name (`/Length1` etc.) — keep scanning.
+            }
+            _ => i += 1,
+        }
     }
-    if body.get(content_start) == Some(&b'\n') {
-        content_start += 1;
-    }
-    // `endstream` is only the terminator when it starts a line — matching
-    // qpdf's `fix-qdf` convention. This prevents an `endstream` byte sequence
-    // appearing inside binary/text stream content from truncating the count.
-    let end = find_line_keyword_from(body, b"endstream", content_start)?;
-    Some(end - content_start)
+    None
 }
 
 /// Scan a stream dictionary slice for `/Length M G R` (indirect) or
@@ -170,10 +213,14 @@ enum LengthKind {
 }
 
 fn classify_length(dict: &[u8]) -> LengthKind {
-    let Some(p) = find_subslice(dict, b"/Length") else {
+    // Find the PDF *name token* `/Length` in object syntax (skipping strings,
+    // hex strings, and comments; requiring a trailing token boundary so
+    // `/Length1` etc. do not match).
+    let needle = b"/Length";
+    let Some(p) = find_name_token(dict, needle) else {
         return LengthKind::None;
     };
-    let rest = &dict[p + b"/Length".len()..];
+    let rest = &dict[p + needle.len()..];
     let s = match std::str::from_utf8(rest) {
         Ok(s) => s,
         Err(_) => return LengthKind::None,
@@ -205,7 +252,27 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// The recomputed value to be written into a length-holder object.
 fn detect_objstm(body: &[u8]) -> bool {
-    find_subslice(body, b"/ObjStm").is_some()
+    // An object stream is `<< ... /Type /ObjStm ... >>`. Only reject when a
+    // `/Type` *name token* has the *value* name token `/ObjStm` — not merely
+    // any `/ObjStm` (it could be an unrelated name value like
+    // `/SomeKey /ObjStm`, and copies in strings/comments are skipped anyway).
+    let mut from = 0;
+    while let Some(tp) = find_name_token_from(body, b"/Type", from) {
+        let mut j = tp + b"/Type".len();
+        // Skip PDF whitespace between the key and its value.
+        while body.get(j).is_some_and(|&b| is_ws(b)) {
+            j += 1;
+        }
+        if body[j..].starts_with(b"/ObjStm")
+            && body
+                .get(j + b"/ObjStm".len())
+                .is_none_or(|&b| is_ws(b) || is_delimiter(b))
+        {
+            return true;
+        }
+        from = tp + b"/Type".len();
+    }
+    false
 }
 
 /// Read and recompute a hand-edited QDF file.
@@ -233,8 +300,47 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     let mut objects: Vec<ObjectSpan> = Vec::new();
     let mut cursor = 0usize;
     while let Some((num, gen, line_start, kw_end)) = find_next_obj(body_region, cursor) {
-        // Object body runs until the matching `endobj` keyword.
-        let endobj = find_line_keyword_from(body_region, b"endobj", kw_end)
+        // Determine whether this object contains a stream BEFORE searching for
+        // `endobj`. A decompressed QDF stream body may itself contain a line
+        // that starts with `endobj`, which would truncate the object span if we
+        // searched for `endobj` naively. The real `endobj` always follows the
+        // `endstream` keyword, so for stream objects we anchor the search there.
+        let mut stream_info: Option<(usize, usize, usize)> = None; // (stream_kw, content_start, endstream_kw)
+        if let Some(stream_kw) = find_line_keyword_from(body_region, b"stream", kw_end) {
+            // Only treat it as this object's stream if there is no `endobj`
+            // before the `stream` keyword (otherwise the stream belongs to a
+            // later object).
+            let first_endobj = find_line_keyword_from(body_region, b"endobj", kw_end);
+            let stream_is_ours = match first_endobj {
+                None => true,
+                Some(eob) => stream_kw < eob,
+            };
+            if stream_is_ours {
+                // Compute content_start: just past the `stream` EOL.
+                let mut content_start = stream_kw + b"stream".len();
+                if body_region.get(content_start) == Some(&b'\r') {
+                    content_start += 1;
+                }
+                if body_region.get(content_start) == Some(&b'\n') {
+                    content_start += 1;
+                }
+                // Search for `endstream` starting from content_start.
+                if let Some(endstream_kw) =
+                    find_line_keyword_from(body_region, b"endstream", content_start)
+                {
+                    stream_info = Some((stream_kw, content_start, endstream_kw));
+                }
+            }
+        }
+
+        // `endobj` search begins AFTER `endstream` when a stream is present, so
+        // that a line-anchored `endobj` inside the stream body is not mistaken
+        // for the object terminator.
+        let endobj_search_from = match stream_info {
+            Some((_, _, endstream_kw)) => endstream_kw + b"endstream".len(),
+            None => kw_end,
+        };
+        let endobj = find_line_keyword_from(body_region, b"endobj", endobj_search_from)
             .ok_or_else(|| Error::parse(line_start, "fix_qdf: object without matching `endobj`"))?;
         let end = endobj + b"endobj".len();
         let body = &body_region[kw_end..endobj];
@@ -245,23 +351,22 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             ));
         }
 
-        // Determine the stream-dict slice (between `<<` ... `>>`) if any, then
-        // whether this object has a stream and how its /Length is stored.
+        // Determine stream length and indirect /Length holder using the already-
+        // computed stream span (avoids rescanning body_region).
         let mut stream_len = None;
         let mut length_holder = None;
-        if let Some(stream_kw) = find_line_keyword_from(body, b"stream", 0) {
-            // `endstream` must follow; if not this `stream` is incidental text.
-            if find_line_keyword_from(body, b"endstream", stream_kw).is_some() {
-                stream_len = compute_stream_len(body);
-                // The dictionary is everything before the `stream` keyword.
-                let dict = &body[..stream_kw];
-                match classify_length(dict) {
-                    LengthKind::Indirect(m) => length_holder = Some(m),
-                    LengthKind::Direct | LengthKind::None => {
-                        // Canonical qpdf QDF always uses an indirect length for
-                        // real streams; the oracle does not rewrite a direct
-                        // one. Leave it untouched (verbatim preservation).
-                    }
+        if let Some((stream_kw_abs, content_start_abs, endstream_kw_abs)) = stream_info {
+            // Stream length: verbatim bytes between content_start and endstream.
+            stream_len = Some(endstream_kw_abs - content_start_abs);
+            // Dictionary is everything between kw_end and the `stream` keyword
+            // (relative to kw_end, which is where `body` starts).
+            let dict = &body_region[kw_end..stream_kw_abs];
+            match classify_length(dict) {
+                LengthKind::Indirect(m) => length_holder = Some(m),
+                LengthKind::Direct | LengthKind::None => {
+                    // Canonical qpdf QDF always uses an indirect length for
+                    // real streams; the oracle does not rewrite a direct
+                    // one. Leave it untouched (verbatim preservation).
                 }
             }
         }
@@ -471,28 +576,59 @@ fn rewrite_length_holder(out: &mut Vec<u8>, obj_bytes: &[u8], new_len: usize) ->
 fn find_matching_dict_close(input: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
-    while i + 1 < input.len() {
-        if &input[i..i + 2] == b"<<" {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        if &input[i..i + 2] == b">>" {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
+    while i < input.len() {
+        match input[i] {
+            // `%` comment runs to end of line.
+            b'%' => {
+                while i < input.len() && input[i] != b'\n' && input[i] != b'\r' {
+                    i += 1;
+                }
             }
-            i += 2;
-            continue;
+            // `<<` / `>>` are dict delimiters (checked before single `<`/`>`).
+            b'<' if input.get(i + 1) == Some(&b'<') => {
+                depth += 1;
+                i += 2;
+            }
+            b'>' if input.get(i + 1) == Some(&b'>') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 2;
+            }
+            // Hex string `<...>` — skip to the closing `>`.
+            b'<' => {
+                i += 1;
+                while i < input.len() && input[i] != b'>' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Literal string `(...)` — balanced parens, `\` escapes.
+            b'(' => {
+                i += 1;
+                let mut sdepth = 1usize;
+                while i < input.len() && sdepth > 0 {
+                    match input[i] {
+                        b'\\' => i += 1, // skip escaped byte
+                        b'(' => sdepth += 1,
+                        b')' => sdepth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
         }
-        i += 1;
     }
     None
 }
 
 /// Rewrite the `/Size <n>` entry inside a trailer dictionary slice.
 fn rewrite_size(trailer: &[u8], size: u32) -> Vec<u8> {
-    let Some(p) = find_subslice(trailer, b"/Size") else {
+    // `/Size` as a real name token only — skip strings/hex/comments and
+    // reject `/SizeExtra` etc. via the trailing token-boundary check.
+    let Some(p) = find_name_token(trailer, b"/Size") else {
         return trailer.to_vec();
     };
     let mut out = Vec::with_capacity(trailer.len() + 4);
