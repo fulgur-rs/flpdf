@@ -50,6 +50,7 @@
 //! function is idempotent: `fix_qdf(fix_qdf(x)) == fix_qdf(x)`.
 
 use crate::{Error, Result};
+use crate::parser::{is_delimiter, is_ws};
 
 /// One parsed `N G obj ... endobj` body in the input.
 #[derive(Debug, Clone)]
@@ -136,30 +137,6 @@ fn rfind_line_keyword(input: &[u8], kw: &[u8]) -> Option<usize> {
     found
 }
 
-/// Compute the verbatim stream length for an object whose body starts a stream.
-///
-/// `body` is the bytes from just after the `N G obj` line to the object's
-/// `endobj`. Returns `Some(len)` if a `stream` keyword is found.
-fn compute_stream_len(body: &[u8]) -> Option<usize> {
-    // Find the `stream` keyword. It appears on its own line after the dict;
-    // match it line-anchored so a `stream` byte sequence inside a dictionary
-    // string/name value cannot be mistaken for the keyword.
-    let kw = find_line_keyword_from(body, b"stream", 0)?;
-    // Skip the keyword and its end-of-line marker (CRLF, LF, or lone CR), as
-    // per the PDF stream convention. Content begins immediately after.
-    let mut content_start = kw + b"stream".len();
-    if body.get(content_start) == Some(&b'\r') {
-        content_start += 1;
-    }
-    if body.get(content_start) == Some(&b'\n') {
-        content_start += 1;
-    }
-    // `endstream` is only the terminator when it starts a line — matching
-    // qpdf's `fix-qdf` convention. This prevents an `endstream` byte sequence
-    // appearing inside binary/text stream content from truncating the count.
-    let end = find_line_keyword_from(body, b"endstream", content_start)?;
-    Some(end - content_start)
-}
 
 /// Scan a stream dictionary slice for `/Length M G R` (indirect) or
 /// `/Length <int>` (direct). Returns `Indirect(M)` or `Direct`.
@@ -170,10 +147,33 @@ enum LengthKind {
 }
 
 fn classify_length(dict: &[u8]) -> LengthKind {
-    let Some(p) = find_subslice(dict, b"/Length") else {
-        return LengthKind::None;
+    // Search for the PDF *name token* `/Length` — not just a byte substring.
+    // `/Length` must be followed immediately by a PDF whitespace or delimiter
+    // (ISO 32000-1 §7.2) or by end-of-slice, so that `/Length1`, `/LengthX`,
+    // etc. are not mistaken for the real `/Length` key.
+    let mut search_from = 0;
+    let needle = b"/Length";
+    let p = loop {
+        let offset = match find_subslice(&dict[search_from..], needle) {
+            Some(o) => o,
+            None => return LengthKind::None,
+        };
+        let abs = search_from + offset;
+        let after_pos = abs + needle.len();
+        match dict.get(after_pos) {
+            // End of slice: this is a bare `/Length` token — accept it.
+            None => break abs,
+            // Delimiter or whitespace after `Length`: valid token boundary.
+            Some(&b) if is_ws(b) || is_delimiter(b) => break abs,
+            // Anything else (e.g. `1` in `/Length1`): not a match — skip past
+            // this occurrence and keep scanning.
+            _ => {
+                search_from = abs + 1;
+                continue;
+            }
+        }
     };
-    let rest = &dict[p + b"/Length".len()..];
+    let rest = &dict[p + needle.len()..];
     let s = match std::str::from_utf8(rest) {
         Ok(s) => s,
         Err(_) => return LengthKind::None,
@@ -233,8 +233,45 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     let mut objects: Vec<ObjectSpan> = Vec::new();
     let mut cursor = 0usize;
     while let Some((num, gen, line_start, kw_end)) = find_next_obj(body_region, cursor) {
-        // Object body runs until the matching `endobj` keyword.
-        let endobj = find_line_keyword_from(body_region, b"endobj", kw_end)
+        // Determine whether this object contains a stream BEFORE searching for
+        // `endobj`. A decompressed QDF stream body may itself contain a line
+        // that starts with `endobj`, which would truncate the object span if we
+        // searched for `endobj` naively. The real `endobj` always follows the
+        // `endstream` keyword, so for stream objects we anchor the search there.
+        let mut stream_info: Option<(usize, usize, usize)> = None; // (stream_kw, content_start, endstream_kw)
+        if let Some(stream_kw) = find_line_keyword_from(body_region, b"stream", kw_end) {
+            // Only treat it as this object's stream if there is no `endobj`
+            // before the `stream` keyword (otherwise the stream belongs to a
+            // later object).
+            let first_endobj = find_line_keyword_from(body_region, b"endobj", kw_end);
+            let stream_is_ours = match first_endobj {
+                None => true,
+                Some(eob) => stream_kw < eob,
+            };
+            if stream_is_ours {
+                // Compute content_start: just past the `stream` EOL.
+                let mut content_start = stream_kw + b"stream".len();
+                if body_region.get(content_start) == Some(&b'\r') {
+                    content_start += 1;
+                }
+                if body_region.get(content_start) == Some(&b'\n') {
+                    content_start += 1;
+                }
+                // Search for `endstream` starting from content_start.
+                if let Some(endstream_kw) = find_line_keyword_from(body_region, b"endstream", content_start) {
+                    stream_info = Some((stream_kw, content_start, endstream_kw));
+                }
+            }
+        }
+
+        // `endobj` search begins AFTER `endstream` when a stream is present, so
+        // that a line-anchored `endobj` inside the stream body is not mistaken
+        // for the object terminator.
+        let endobj_search_from = match stream_info {
+            Some((_, _, endstream_kw)) => endstream_kw + b"endstream".len(),
+            None => kw_end,
+        };
+        let endobj = find_line_keyword_from(body_region, b"endobj", endobj_search_from)
             .ok_or_else(|| Error::parse(line_start, "fix_qdf: object without matching `endobj`"))?;
         let end = endobj + b"endobj".len();
         let body = &body_region[kw_end..endobj];
@@ -245,23 +282,22 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             ));
         }
 
-        // Determine the stream-dict slice (between `<<` ... `>>`) if any, then
-        // whether this object has a stream and how its /Length is stored.
+        // Determine stream length and indirect /Length holder using the already-
+        // computed stream span (avoids rescanning body_region).
         let mut stream_len = None;
         let mut length_holder = None;
-        if let Some(stream_kw) = find_line_keyword_from(body, b"stream", 0) {
-            // `endstream` must follow; if not this `stream` is incidental text.
-            if find_line_keyword_from(body, b"endstream", stream_kw).is_some() {
-                stream_len = compute_stream_len(body);
-                // The dictionary is everything before the `stream` keyword.
-                let dict = &body[..stream_kw];
-                match classify_length(dict) {
-                    LengthKind::Indirect(m) => length_holder = Some(m),
-                    LengthKind::Direct | LengthKind::None => {
-                        // Canonical qpdf QDF always uses an indirect length for
-                        // real streams; the oracle does not rewrite a direct
-                        // one. Leave it untouched (verbatim preservation).
-                    }
+        if let Some((stream_kw_abs, content_start_abs, endstream_kw_abs)) = stream_info {
+            // Stream length: verbatim bytes between content_start and endstream.
+            stream_len = Some(endstream_kw_abs - content_start_abs);
+            // Dictionary is everything between kw_end and the `stream` keyword
+            // (relative to kw_end, which is where `body` starts).
+            let dict = &body_region[kw_end..stream_kw_abs];
+            match classify_length(dict) {
+                LengthKind::Indirect(m) => length_holder = Some(m),
+                LengthKind::Direct | LengthKind::None => {
+                    // Canonical qpdf QDF always uses an indirect length for
+                    // real streams; the oracle does not rewrite a direct
+                    // one. Leave it untouched (verbatim preservation).
                 }
             }
         }
