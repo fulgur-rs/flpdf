@@ -576,21 +576,50 @@ fn rewrite_length_holder(out: &mut Vec<u8>, obj_bytes: &[u8], new_len: usize) ->
 fn find_matching_dict_close(input: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
-    while i + 1 < input.len() {
-        if &input[i..i + 2] == b"<<" {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        if &input[i..i + 2] == b">>" {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
+    while i < input.len() {
+        match input[i] {
+            // `%` comment runs to end of line.
+            b'%' => {
+                while i < input.len() && input[i] != b'\n' && input[i] != b'\r' {
+                    i += 1;
+                }
             }
-            i += 2;
-            continue;
+            // `<<` / `>>` are dict delimiters (checked before single `<`/`>`).
+            b'<' if input.get(i + 1) == Some(&b'<') => {
+                depth += 1;
+                i += 2;
+            }
+            b'>' if input.get(i + 1) == Some(&b'>') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 2;
+            }
+            // Hex string `<...>` — skip to the closing `>`.
+            b'<' => {
+                i += 1;
+                while i < input.len() && input[i] != b'>' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Literal string `(...)` — balanced parens, `\` escapes.
+            b'(' => {
+                i += 1;
+                let mut sdepth = 1usize;
+                while i < input.len() && sdepth > 0 {
+                    match input[i] {
+                        b'\\' => i += 1, // skip escaped byte
+                        b'(' => sdepth += 1,
+                        b')' => sdepth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
         }
-        i += 1;
     }
     None
 }
