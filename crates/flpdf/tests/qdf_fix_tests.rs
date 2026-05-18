@@ -243,7 +243,9 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
     pdf.extend_from_slice(b"<<\n  /Length 4 0 R\n>>\n");
     // Stream body contains both `endobj` and `xref` on their own lines.
-    pdf.extend_from_slice(b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream\nendobj\n\n",
+    );
     pdf.extend_from_slice(
         b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
@@ -262,7 +264,11 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     // The entire stream body (including the inner `endobj` and `xref` lines)
     // must be preserved verbatim between `stream\n` and `endstream`.
     assert!(
-        find(&fixed, b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream").is_some(),
+        find(
+            &fixed,
+            b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream"
+        )
+        .is_some(),
         "stream body (incl. inner `endobj` and `xref`) must be preserved verbatim;\ngot:\n{}",
         String::from_utf8_lossy(&fixed)
     );
@@ -285,7 +291,10 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
 
     // Idempotent.
     let again = flpdf::fix_qdf(&fixed).expect("fix_qdf must be idempotent");
-    assert_eq!(again, fixed, "fix_qdf must be idempotent on stream-body-endobj output");
+    assert_eq!(
+        again, fixed,
+        "fix_qdf must be idempotent on stream-body-endobj output"
+    );
 }
 
 /// Regression for roborev job 992 (qdf_fix.rs ~189 classify_length):
@@ -338,7 +347,10 @@ fn length1_not_mistaken_for_indirect_length() {
 
     // Idempotent.
     let again = flpdf::fix_qdf(&fixed).expect("fix_qdf must be idempotent");
-    assert_eq!(again, fixed, "fix_qdf must be idempotent on /Length1 output");
+    assert_eq!(
+        again, fixed,
+        "fix_qdf must be idempotent on /Length1 output"
+    );
 }
 
 /// Negative control for roborev job 992: a dict with ONLY `/Length1` and a
@@ -478,5 +490,50 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
     assert_eq!(
         again, fixed,
         "fix_qdf must be idempotent on repaired writer QDF"
+    );
+}
+
+/// Regression for roborev job 993: `/Length` appearing inside a string value
+/// or a comment in the stream dict must NOT be mistaken for the real key.
+/// fix_qdf must still locate the genuine indirect `/Length H 0 R` and
+/// recompute holder H after the stream content is edited.
+#[test]
+fn length_inside_string_or_comment_not_mistaken_for_key() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
+    // Decoy `/Length` inside a literal string AND a comment, before the real
+    // indirect /Length key.
+    pdf.extend_from_slice(b"<<\n  /Note (a /Length 999 decoy)\n");
+    pdf.extend_from_slice(b"  %% /Length 888 in a comment\n");
+    pdf.extend_from_slice(b"  /Length 3 0 R\n>>\n");
+    pdf.extend_from_slice(b"stream\nABCDEFGHIJ\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"3 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 4\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"0000000000 00000 n \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
+
+    let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
+
+    // Holder object 3 must be recomputed to the on-disk content length of the
+    // stream payload ("ABCDEFGHIJ\n" = 11 bytes, payload + framing EOL).
+    assert!(
+        find(&fixed, b"\n3 0 obj\n11\nendobj").is_some(),
+        "indirect /Length holder 3 must be recomputed (decoy /Length in string/comment ignored):\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    // The decoy string and comment are preserved verbatim.
+    assert!(find(&fixed, b"/Note (a /Length 999 decoy)").is_some());
+    assert!(find(&fixed, b"%% /Length 888 in a comment").is_some());
+
+    // Idempotent.
+    assert_eq!(
+        flpdf::fix_qdf(&fixed).expect("idempotent"),
+        fixed,
+        "fix_qdf must be idempotent"
     );
 }
