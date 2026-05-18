@@ -179,9 +179,30 @@ fn assert_qdf_invariants(bytes: &[u8], expect_streams: bool) {
         contains(bytes, b"%QDF-1.0"),
         "QDF must carry the %QDF-1.0 header marker"
     );
+    // Every `%% Original object ID: A B` line must be immediately followed by
+    // the matching `A B obj` line (the annotation is well-formed and adjacent
+    // to its object). Synthetic length-holder objects (flpdf-9hc.6.12) carry
+    // no such comment by design and are simply not annotated — so we assert
+    // structural correctness of each annotation, not a bare substring.
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut annotated = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let Some(id) = line.strip_prefix("%% Original object ID: ") else {
+            continue;
+        };
+        annotated += 1;
+        let expected_obj = format!("{} obj", id.trim());
+        assert_eq!(
+            lines.get(i + 1).map(|s| s.trim_end_matches('\r')),
+            Some(expected_obj.as_str()),
+            "QDF `%% Original object ID: {id}` must be immediately followed \
+             by `{expected_obj}`"
+        );
+    }
     assert!(
-        contains(bytes, b"%% Original object ID:"),
-        "QDF must annotate every indirect object with %% Original object ID:"
+        annotated > 0,
+        "QDF must annotate its indirect objects with %% Original object ID:"
     );
     assert!(
         contains(bytes, b"\nxref\n"),
