@@ -802,6 +802,184 @@ fn qdf_original_object_id_comments_suppressed_when_flag_true() {
 // (n) qdf=false: no "%% Original object ID:" lines regardless of flag value.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// (o) qdf=true with xref-stream source → output must use classic xref table
+//     (flpdf-9hc.6.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// QDF mode must force a classic xref table even when the source PDF used an
+/// xref stream.  The output must:
+///   - contain "\nxref\n" (classic table marker)
+///   - contain "\ntrailer\n" (classic trailer keyword)
+///   - NOT contain "/Type /XRef" (no xref stream)
+#[test]
+fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
+    // build_pdf_with_objstm_for_qdf() produces a PDF-1.5 xref-stream document.
+    let source = build_pdf_with_objstm_for_qdf();
+
+    // Verify the source really has an xref stream (sanity guard for this test).
+    assert!(
+        source
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "test setup error: source fixture must use an xref stream"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Classic xref table marker (leading newline avoids matching "startxref\n").
+    assert!(
+        output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "qdf=true must emit a classic xref table (\\nxref\\n) even for an xref-stream source"
+    );
+
+    // Classic trailer keyword — present only in table-form output.
+    assert!(
+        output
+            .windows(b"\ntrailer\n".len())
+            .any(|w| w == b"\ntrailer\n"),
+        "qdf=true must emit a classic trailer dict (\\ntrailer\\n) even for an xref-stream source"
+    );
+
+    // No xref stream must remain.
+    assert!(
+        !output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "qdf=true must not emit any /Type /XRef stream"
+    );
+
+    // Output must be structurally valid.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "qdf xref-stream→table output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (p) qdf=true with classic-xref-table source → stays classic (regression guard)
+//     (flpdf-9hc.6.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When the source PDF already uses a classic xref table, qdf=true must keep it
+/// that way — classic table in, classic table out.
+#[test]
+fn qdf_mode_keeps_xref_table_when_source_has_classic_table() {
+    let raw = b"Classic-xref regression guard payload.";
+    let compressed = flate_encode(raw);
+
+    // build_minimal_pdf_with_stream always produces a classic xref-table PDF.
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+
+    // Sanity: source must not have an xref stream.
+    assert!(
+        !source
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "test setup error: source fixture must use a classic xref table"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "qdf=true on a classic-table source must still emit a classic xref table"
+    );
+    assert!(
+        output
+            .windows(b"\ntrailer\n".len())
+            .any(|w| w == b"\ntrailer\n"),
+        "qdf=true on a classic-table source must still emit a classic trailer"
+    );
+    assert!(
+        !output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "qdf=true on a classic-table source must not emit /Type /XRef"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (q) qdf=true + object_streams=Generate → classic xref table, no /ObjStm
+//     (flpdf-9hc.6.6 override holds even with Generate requested)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When qdf=true and object_streams=Generate are both set, QDF wins: the output
+/// must use a classic xref table and must not contain any /Type /ObjStm.
+#[test]
+fn qdf_mode_forces_xref_table_with_generate_override() {
+    let source = build_pdf_with_objstm_for_qdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Classic xref table must be present.
+    assert!(
+        output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "qdf=true + Generate must still emit a classic xref table"
+    );
+    assert!(
+        output
+            .windows(b"\ntrailer\n".len())
+            .any(|w| w == b"\ntrailer\n"),
+        "qdf=true + Generate must still emit a classic trailer"
+    );
+
+    // No xref stream.
+    assert!(
+        !output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "qdf=true + Generate must not emit /Type /XRef"
+    );
+
+    // No ObjStm (6.2 regression guard still holds).
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    for obj_ref in reopened.object_refs() {
+        if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
+            let is_objstm = matches!(
+                s.dict.get("Type"),
+                Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
+            );
+            assert!(
+                !is_objstm,
+                "qdf=true + Generate must not emit /Type /ObjStm; found at obj {}",
+                obj_ref.number
+            );
+        }
+    }
+
+    // Output must be valid.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "qdf+Generate xref-table output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
 /// Non-QDF output must never contain "%% Original object ID:" lines,
 /// whether no_original_object_ids is true or false.
 #[test]
