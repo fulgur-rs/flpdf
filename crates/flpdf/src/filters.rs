@@ -71,9 +71,10 @@ where
             if filter_name == b"Crypt" {
                 return decrypt_crypt(get_decode_params(decode_params, 0), stream_data);
             }
-            let decoded =
-                apply_single_filter_decode(filter_name, stream_data).map_err(Error::Unsupported)?;
-            apply_decode_params(get_decode_params(decode_params, 0), &decoded)
+            let params = get_decode_params(decode_params, 0);
+            let decoded = apply_single_filter_decode(filter_name, stream_data, params)
+                .map_err(Error::Unsupported)?;
+            apply_decode_params(params, &decoded)
         }
         Some(Object::Array(filters)) => {
             let mut decoded = stream_data.to_vec();
@@ -86,10 +87,10 @@ where
                 if filter_name == b"Crypt" {
                     decoded = decrypt_crypt(get_decode_params(decode_params, index), &decoded)?;
                 } else {
-                    decoded = apply_single_filter_decode(filter_name, &decoded)
+                    let params = get_decode_params(decode_params, index);
+                    decoded = apply_single_filter_decode(filter_name, &decoded, params)
                         .map_err(Error::Unsupported)?;
-                    decoded =
-                        apply_decode_params(get_decode_params(decode_params, index), &decoded)?;
+                    decoded = apply_decode_params(params, &decoded)?;
                 }
             }
             Ok(decoded)
@@ -304,6 +305,7 @@ fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) 
 fn apply_single_filter_decode(
     filter_name: &[u8],
     stream_data: &[u8],
+    decode_params: Option<&Object>,
 ) -> std::result::Result<Vec<u8>, String> {
     if filter_name == b"FlateDecode" {
         let mut decoded = Vec::new();
@@ -312,6 +314,19 @@ fn apply_single_filter_decode(
             .read_to_end(&mut decoded)
             .map_err(|error| error.to_string())?;
         return Ok(decoded);
+    }
+
+    if filter_name == b"LZWDecode" {
+        // EarlyChange (default 1 per PDF spec): when 1, the code width increases
+        // one symbol *before* the table fills; when 0, it increases *after*.
+        let early_change = match decode_params {
+            Some(Object::Dictionary(params)) => match params.get("EarlyChange") {
+                Some(Object::Integer(v)) => *v != 0,
+                _ => true, // default EarlyChange = 1
+            },
+            _ => true, // no DecodeParms → default EarlyChange = 1
+        };
+        return lzw_decode(stream_data, early_change);
     }
 
     if filter_name == b"ASCII85Decode" {
@@ -330,6 +345,127 @@ fn apply_single_filter_decode(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
     ))
+}
+
+/// Decode an LZW-compressed byte stream as defined by PDF §7.4.4 (LZWDecode).
+///
+/// PDF's LZW variant:
+/// - Starts at 9-bit codes; maximum code width is 12 bits.
+/// - Code 256 = ClearTable (resets the table to the initial state and next code
+///   width to 9 bits).
+/// - Code 257 = EOD (end of data; any remaining bits in the current byte are
+///   discarded).
+/// - `early_change`: when `true` (PDF default / EarlyChange=1), the code width
+///   increments one code *before* the table is full (i.e. when the next code
+///   to be added would exceed the current code width capacity).  When `false`
+///   (EarlyChange=0), the width increments *after* the table fills.
+fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, String> {
+    const CLEAR_CODE: u16 = 256;
+    const EOD_CODE: u16 = 257;
+    const FIRST_CODE: u16 = 258;
+    const MAX_BITS: u32 = 12;
+    const MAX_TABLE_SIZE: usize = 1 << MAX_BITS; // 4096
+
+    // The string table: each entry is the byte sequence it represents.
+    // Entries 0–255 are the literal single-byte strings; 256 and 257 are
+    // control codes (not stored in the table as strings).
+    let mut table: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+    // Pad to index 258 so FIRST_CODE aligns with the next push.
+    table.push(vec![]); // slot 256 (ClearCode sentinel — never looked up)
+    table.push(vec![]); // slot 257 (EOD sentinel — never looked up)
+
+    let mut output = Vec::new();
+    let mut bit_buf: u64 = 0;
+    let mut bits_in_buf: u32 = 0;
+    let mut code_bits: u32 = 9;
+
+    // The "next table index" at which the width bumps.  With early_change=true
+    // the bump triggers when next_entry == (1 << code_bits) - 1 (one slot before
+    // the table fills); with early_change=false it triggers when
+    // next_entry == (1 << code_bits) (table exactly full).
+    let early_offset: usize = if early_change { 1 } else { 0 };
+
+    let mut prev_entry: Option<Vec<u8>> = None;
+
+    let mut byte_pos = 0usize;
+
+    loop {
+        // Fill the bit buffer until it has at least `code_bits` bits.
+        while bits_in_buf < code_bits {
+            if byte_pos >= data.len() {
+                // Ran out of input before EOD code — treat as implicit EOD.
+                return Ok(output);
+            }
+            bit_buf = (bit_buf << 8) | u64::from(data[byte_pos]);
+            bits_in_buf += 8;
+            byte_pos += 1;
+        }
+
+        // Extract the next `code_bits`-wide code from the MSB side.
+        let shift = bits_in_buf - code_bits;
+        let code = ((bit_buf >> shift) & ((1u64 << code_bits) - 1)) as u16;
+        bits_in_buf -= code_bits;
+        bit_buf &= (1u64 << bits_in_buf) - 1;
+
+        if code == EOD_CODE {
+            break;
+        }
+
+        if code == CLEAR_CODE {
+            // Reset: truncate the table back to the 256 literals + 2 sentinels.
+            table.truncate(FIRST_CODE as usize);
+            code_bits = 9;
+            prev_entry = None;
+            continue;
+        }
+
+        // Resolve the code to its string.
+        let entry: Vec<u8> = if (code as usize) < table.len() {
+            table[code as usize].clone()
+        } else if code as usize == table.len() {
+            // The classic "KwKwK" case: the code being added is the one we're
+            // currently processing.  Its string is prev + first_byte(prev).
+            match &prev_entry {
+                Some(prev) => {
+                    let mut s = prev.clone();
+                    s.push(prev[0]);
+                    s
+                }
+                None => {
+                    return Err(format!(
+                        "LZWDecode: code {code} is one past table end but no previous entry"
+                    ))
+                }
+            }
+        } else {
+            return Err(format!(
+                "LZWDecode: code {code} out of range (table size {})",
+                table.len()
+            ));
+        };
+
+        output.extend_from_slice(&entry);
+
+        // Add a new entry = prev_string + first_byte(current_string).
+        if let Some(ref prev) = prev_entry {
+            if table.len() < MAX_TABLE_SIZE {
+                let mut new_entry = prev.clone();
+                new_entry.push(entry[0]);
+                table.push(new_entry);
+
+                // Bump code width when the table reaches the trigger threshold.
+                if code_bits < MAX_BITS
+                    && table.len() == (1usize << code_bits) - early_offset
+                {
+                    code_bits += 1;
+                }
+            }
+        }
+
+        prev_entry = Some(entry);
+    }
+
+    Ok(output)
 }
 
 fn apply_single_filter_encode(

@@ -178,6 +178,38 @@ pub struct WriteOptions {
     /// Applied to every stream in the full-rewrite output.  The incremental-update
     /// path emits streams verbatim from the input and is unaffected.
     pub newline_before_endstream: NewlineBeforeEndstream,
+
+    /// Emit the document in QDF (Query Data Format) mode.
+    ///
+    /// When `true` (and `full_rewrite` is also `true`), every stream that uses a
+    /// "safe text" filter chain — [`FlateDecode`], [`LZWDecode`], [`ASCIIHexDecode`],
+    /// [`ASCII85Decode`], [`RunLengthDecode`] — is fully decoded and written as raw
+    /// bytes.  The `/Filter` and `/DecodeParms` entries are removed from the stream
+    /// dictionary and `/Length` is updated to the decoded byte count, making the
+    /// stream data human-readable in a text editor.
+    ///
+    /// Image/binary codecs that flpdf cannot decompress — `DCTDecode`, `JBIG2Decode`,
+    /// `JPXDecode`, `CCITTFaxDecode` — and any unknown filter are left **untouched**:
+    /// the compressed bytes and the original `/Filter` chain are preserved verbatim.
+    /// This matches qpdf's own QDF behaviour.
+    ///
+    /// When `true`, this setting takes precedence over [`compress_streams`] for the
+    /// per-object stream emission: the stream is always emitted decompressed regardless
+    /// of the `compress_streams` value.  The xref stream and ObjStm containers are
+    /// governed solely by `compress_streams` and are not affected by this flag
+    /// (QDF-specific xref/ObjStm behaviour is handled by later epic layers).
+    ///
+    /// The CLI flag `--qdf` is wired up in epic layer 6.8; until then this field
+    /// is the library-level entry point.  Test via
+    /// `WriteOptions { qdf: true, full_rewrite: true, .. }`.
+    ///
+    /// [`FlateDecode`]: https://pdf.pizza/spec/7.4.4
+    /// [`LZWDecode`]: https://pdf.pizza/spec/7.4.4
+    /// [`ASCIIHexDecode`]: https://pdf.pizza/spec/7.4.2
+    /// [`ASCII85Decode`]: https://pdf.pizza/spec/7.4.3
+    /// [`RunLengthDecode`]: https://pdf.pizza/spec/7.4.5
+    /// [`compress_streams`]: WriteOptions::compress_streams
+    pub qdf: bool,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
@@ -1361,7 +1393,14 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         );
 
         if let Object::Stream(stream) = object {
-            let reencoded = apply_stream_compress_policy(&stream, options.compress_streams);
+            // QDF mode always decodes streams to raw bytes (CompressStreams::No).
+            // For non-QDF full-rewrite the compress_streams option governs.
+            let compress_policy = if options.qdf {
+                CompressStreams::No
+            } else {
+                options.compress_streams
+            };
+            let reencoded = apply_stream_compress_policy(&stream, compress_policy);
             if let Object::Stream(ref s) = reencoded {
                 write_stream_to_buf(&mut bytes, s, options.newline_before_endstream);
             } else {
