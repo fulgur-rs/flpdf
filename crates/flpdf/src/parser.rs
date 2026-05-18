@@ -136,7 +136,16 @@ impl<'a> Parser<'a> {
 
         let data_start = self.pos;
         let length = match direct_length.and_then(|n| usize::try_from(n).ok()) {
-            Some(length) if data_start + length <= self.input.len() => length,
+            // `checked_add` so a malformed huge direct /Length cannot overflow
+            // the bounds check (debug panic / release wrap-then-OOB-slice on
+            // untrusted input); on overflow fall through to endstream-scan.
+            Some(length)
+                if data_start
+                    .checked_add(length)
+                    .is_some_and(|end| end <= self.input.len()) =>
+            {
+                length
+            }
             // Indirect / missing / invalid / out-of-range /Length: recover the
             // payload boundary by locating the line-anchored `endstream`
             // keyword (what qpdf and conformant readers do). The indirect
