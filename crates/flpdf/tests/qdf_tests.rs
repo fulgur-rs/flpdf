@@ -729,7 +729,9 @@ fn qdf_original_object_id_comments_emitted_when_flag_false() {
         let pattern = format!("{}{}", comment_line, obj_line);
         let pattern_bytes = pattern.as_bytes();
         assert!(
-            output.windows(pattern_bytes.len()).any(|w| w == pattern_bytes),
+            output
+                .windows(pattern_bytes.len())
+                .any(|w| w == pattern_bytes),
             "expected contiguous pattern {:?} in QDF output (obj {} {})",
             pattern,
             num,
