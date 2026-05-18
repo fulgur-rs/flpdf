@@ -829,15 +829,28 @@ impl<R: Read + Seek> Pdf<R> {
                                 // streams whose data legitimately ends with a
                                 // newline (flpdf-9hc.27).
                                 //
-                                // When `auth_end >= endstream_pos` the holder
-                                // counts the whole window including the
-                                // framing EOL — flpdf's own QDF convention.
-                                // There the parser's endstream-scan (which
-                                // strips exactly one framing EOL) already
-                                // yields the correct logical content and keeps
-                                // QDF round-trip / idempotence byte-stable, so
-                                // leave it untouched. A too-large/garbage
-                                // holder also falls here → safe fallback.
+                                // The comparison is STRICT `<` by design.
+                                // `auth_end == endstream_pos` is ambiguous:
+                                // it is produced BOTH by flpdf's QDF holder
+                                // convention (n counts the whole window incl.
+                                // the framing EOL) AND by a non-conformant
+                                // PDF lacking the ISO 32000-1 §7.3.8.1
+                                // mandatory pre-`endstream` EOL. These want
+                                // opposite handling and are indistinguishable
+                                // from the object bytes alone. Treating the
+                                // exact-window case as QDF (keep the parser's
+                                // endstream-scan, which strips one framing
+                                // EOL) preserves the pinned QDF round-trip /
+                                // idempotence invariant; relaxing to `<=`
+                                // empirically regresses qdf_tests
+                                // `qdf_mode_round_trip_content_preserved` and
+                                // `qdf_output_is_idempotent` (verified). The
+                                // residual non-conformant exact-window case is
+                                // the spec-aligned edge documented in
+                                // flpdf-9hc.27; a whole-file QDF-detection
+                                // refinement is tracked as flpdf-9hc.28.
+                                // A too-large/garbage holder also lands here
+                                // → safe endstream-scan fallback.
                                 if auth_end < isl.endstream_pos && auth_end <= bytes.len() {
                                     stream.data = bytes[isl.data_start..auth_end].to_vec();
                                 }
