@@ -1,4 +1,5 @@
-//! Tests for QDF stream decompression (flpdf-9hc.6.1).
+//! Tests for QDF stream decompression (flpdf-9hc.6.1) and ObjStm
+//! decomposition (flpdf-9hc.6.2).
 //!
 //! Covers:
 //!   (a) LZWDecode unit test — known-vector decode with EarlyChange=1 (default).
@@ -11,10 +12,13 @@
 //!   (g) qdf=true full-rewrite: round-trip — re-writing the QDF output via
 //!       full-rewrite recovers byte-identical decoded content.
 //!   (h) qdf=true full-rewrite: LZWDecode stream decoded and /Filter absent.
+//!   (j) qdf=true: ObjStm decomposition — output has no /Type /ObjStm,
+//!       formerly-compressed objects appear as plain indirect.
+//!   (k) qdf=true + object_streams=Generate: qdf overrides Generate, no ObjStm.
 
 use flpdf::{
-    filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef, Pdf, Stream,
-    WriteOptions,
+    check_reader, filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef,
+    ObjectStreamMode, Pdf, Stream, WriteOptions,
 };
 use std::io::Cursor;
 
@@ -392,4 +396,217 @@ fn apply_stream_compress_no_decodes_lzw() {
         b"ABABABABABABAB",
         "CompressStreams::No must produce decoded bytes for LZWDecode"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ObjStm decomposition helpers (flpdf-9hc.6.2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a zlib-compressed ObjStm payload from (object-number, raw-bytes) pairs.
+fn build_objstm_payload_6_2(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut header = String::new();
+    let mut body = Vec::new();
+    for (index, (number, object_data)) in members.iter().enumerate() {
+        let offset = body.len();
+        header.push_str(&format!("{} {} ", number, offset));
+        body.extend_from_slice(object_data);
+        if index + 1 < members.len() {
+            body.push(b'\n');
+        }
+    }
+    let mut decoded = Vec::new();
+    decoded.extend_from_slice(header.as_bytes());
+    decoded.extend_from_slice(&body);
+
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&decoded).unwrap();
+    let encoded = enc.finish().unwrap();
+    (encoded, header.len())
+}
+
+fn append_u24_be_6_2(bytes: &mut Vec<u8>, value: u32) {
+    let b = value.to_be_bytes();
+    bytes.extend_from_slice(&b[1..]);
+}
+
+fn append_xref_entry_6_2(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
+    entries.push(entry_type);
+    append_u24_be_6_2(entries, field1);
+    entries.push(field2);
+}
+
+/// Build a minimal xref-stream PDF that has one ObjStm containing obj 2 (Pages).
+///
+///   0 free
+///   1 Catalog (plain indirect)
+///   2 Pages   (compressed in ObjStm 3, index 0)
+///   3 ObjStm
+///   4 XRef stream
+fn build_pdf_with_objstm_for_qdf() -> Vec<u8> {
+    let objstm_num: u32 = 3;
+    let xref_num: u32 = 4;
+    let total_size: u32 = xref_num + 1;
+
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let pages_bytes: &[u8] = b"<< /Type /Pages /Count 0 /Kids [] >>";
+    let (stream_data, first) = build_objstm_payload_6_2(&[(2, pages_bytes)]);
+    let n_members: u32 = 1;
+
+    let objstm_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "{objstm_num} 0 obj\n<< /Type /ObjStm /N {n_members} /First {first} /Length {} /Filter /FlateDecode >>\nstream\n",
+            stream_data.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+
+    let mut xref_entries: Vec<u8> = Vec::new();
+    append_xref_entry_6_2(&mut xref_entries, 0, 0, 0);
+    append_xref_entry_6_2(&mut xref_entries, 1, catalog_offset as u32, 0);
+    append_xref_entry_6_2(&mut xref_entries, 2, objstm_num, 0); // Pages in ObjStm
+    append_xref_entry_6_2(&mut xref_entries, 1, objstm_offset as u32, 0);
+    append_xref_entry_6_2(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "{xref_num} 0 obj\n<< /Type /XRef /Size {total_size} /Root 1 0 R /W [1 3 1] /Index [0 {total_size}] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (j) qdf=true: ObjStm decomposition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// qdf=true on an ObjStm-containing PDF must produce output with:
+///   - no /Type /ObjStm objects
+///   - formerly-compressed object (Pages, obj 2) present as plain indirect
+///   - output is a valid PDF
+#[test]
+fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
+    let source = build_pdf_with_objstm_for_qdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Output must be a structurally valid PDF.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "qdf ObjStm-decompose output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // No /Type /ObjStm must exist in the output.
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    for obj_ref in reopened.object_refs() {
+        if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
+            let is_objstm = matches!(
+                s.dict.get("Type"),
+                Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
+            );
+            assert!(
+                !is_objstm,
+                "qdf=true must not emit any /Type /ObjStm; found one at obj {}",
+                obj_ref.number
+            );
+        }
+    }
+
+    // Object 2 (originally inside the ObjStm) must be resolvable with its
+    // original number and must be the Pages dict.
+    let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
+    let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
+    match &pages {
+        Object::Dictionary(d) => {
+            assert_eq!(
+                d.get("Type"),
+                Some(&Object::Name(b"Pages".to_vec())),
+                "object 2 must be the Pages dict after ObjStm decomposition"
+            );
+        }
+        other => panic!("object 2 should be a Dictionary, got {:?}", other),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (k) qdf=true + object_streams=Generate → qdf overrides Generate, no ObjStm
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When both qdf=true and object_streams=Generate are set, qdf wins:
+/// the output must not contain any /Type /ObjStm.
+#[test]
+fn qdf_overrides_generate_mode_no_objstm() {
+    let source = build_pdf_with_objstm_for_qdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Output must be valid.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "qdf+Generate output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // qdf must override Generate — no /Type /ObjStm in output.
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    for obj_ref in reopened.object_refs() {
+        if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
+            let is_objstm = matches!(
+                s.dict.get("Type"),
+                Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
+            );
+            assert!(
+                !is_objstm,
+                "qdf=true must override Generate and emit no /Type /ObjStm; found one at obj {}",
+                obj_ref.number
+            );
+        }
+    }
+
+    // Object 2 must still be resolvable as the Pages dict.
+    let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
+    let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
+    match &pages {
+        Object::Dictionary(d) => {
+            assert_eq!(
+                d.get("Type"),
+                Some(&Object::Name(b"Pages".to_vec())),
+                "object 2 (Pages) must be resolvable after qdf+Generate rewrite"
+            );
+        }
+        other => panic!("object 2 should be a Dictionary, got {:?}", other),
+    }
 }

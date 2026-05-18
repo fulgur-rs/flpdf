@@ -142,9 +142,20 @@ pub(crate) struct PackingPlan {
 /// names the policy, and the planner's batch cap defaults to qpdf's value of
 /// 100.  Future writer-side knobs (e.g. an explicit cap override) would be
 /// threaded through this conversion.
+///
+/// When `options.qdf` is `true`, the effective mode is forced to
+/// [`ObjectStreamMode::Disable`] regardless of `options.object_streams`.  QDF
+/// output must not contain any ObjStm containers.  `options.object_streams` is
+/// intentionally left unmodified so that layer 6.6 can detect conflicts between
+/// `--qdf` and an explicit `--object-streams=generate` flag.
 pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> PlannerConfig {
+    let mode = if options.qdf {
+        ObjectStreamMode::Disable
+    } else {
+        options.object_streams
+    };
     PlannerConfig {
-        mode: options.object_streams,
+        mode,
         batch_size_cap: DEFAULT_BATCH_SIZE_CAP,
     }
 }
@@ -1212,5 +1223,56 @@ mod tests {
         };
         let config = planner_config_from_options(&options);
         assert_eq!(config.mode, ObjectStreamMode::Generate);
+    }
+
+    // ── QDF forces Disable mode (flpdf-9hc.6.2) ─────────────────────────────
+
+    #[test]
+    fn qdf_flag_forces_disable_mode_over_preserve() {
+        let options = crate::WriteOptions {
+            qdf: true,
+            object_streams: ObjectStreamMode::Preserve,
+            ..Default::default()
+        };
+        let config = planner_config_from_options(&options);
+        assert_eq!(
+            config.mode,
+            ObjectStreamMode::Disable,
+            "qdf=true must force effective mode to Disable (was Preserve)"
+        );
+        // original field must be unchanged
+        assert_eq!(options.object_streams, ObjectStreamMode::Preserve);
+    }
+
+    #[test]
+    fn qdf_flag_forces_disable_mode_over_generate() {
+        let options = crate::WriteOptions {
+            qdf: true,
+            object_streams: ObjectStreamMode::Generate,
+            ..Default::default()
+        };
+        let config = planner_config_from_options(&options);
+        assert_eq!(
+            config.mode,
+            ObjectStreamMode::Disable,
+            "qdf=true must force effective mode to Disable (was Generate)"
+        );
+        // original field must be unchanged so layer 6.6 can detect the conflict
+        assert_eq!(options.object_streams, ObjectStreamMode::Generate);
+    }
+
+    #[test]
+    fn qdf_false_does_not_override_generate() {
+        let options = crate::WriteOptions {
+            qdf: false,
+            object_streams: ObjectStreamMode::Generate,
+            ..Default::default()
+        };
+        let config = planner_config_from_options(&options);
+        assert_eq!(
+            config.mode,
+            ObjectStreamMode::Generate,
+            "qdf=false must not change the object_streams mode"
+        );
     }
 }
