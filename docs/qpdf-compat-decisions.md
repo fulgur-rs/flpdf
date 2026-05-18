@@ -121,6 +121,12 @@ Grouped by area for navigation.
 **Owner:** unassigned  
 **Rationale:** For V=5 R=6 the file key is 32 independent random bytes; byte-identical output with qpdf is fundamentally not achievable except via fixed seeds. Decision pending on whether to use random keys + provide a `--deterministic-id` mode that matches qpdf's deterministic seed derivation, or always use random keys and forgo byte equality. Linked to `.13.3`.
 
+#### `flpdf-9hc.13.2` — default /ID generation (random per save)
+
+**Decision:** observable  
+**Owner:** Mitsuru Hayasaka  
+**Rationale:** The default trailer `/ID` is freshly randomized per save (ISO 32000-1 §14.4): element 1 preserved from a well-formed source `/ID` on re-save, element 2 always fresh. This matches qpdf's *observable* default behaviour (random `/ID`s differ between runs); exact byte parity with qpdf's `/ID` is inherently impossible because both tools randomize independently. Consequence for the byte-identical safety net: `tests/golden/compat-matrix.md`'s `flpdf-sha` fingerprint and `byte-equal` column are now computed with the trailer `/ID` array **elided** — fingerprinting it verbatim would be non-deterministic. This was an intentional golden re-bless; comparator verdicts are unchanged (still `32 diverge + 4 match`), and `plain` vs `static-id` fixtures now share a fingerprint, proving the only inter-mode difference is `/ID`. Deterministic / static `/ID` modes are tracked separately under `.13.3` (deferred) and `.13.4` (--static-id, byte-parity with qpdf's pi-digit constant, accepted). `tests/golden/baseline-static-id.md` is unaffected (no drift).
+
 ## Cross-references
 
 - Subepic `flpdf-9hc.20`: bytes-identical roadmap (this registry is the
