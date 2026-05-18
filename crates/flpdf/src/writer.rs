@@ -1349,6 +1349,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
     bytes.extend_from_slice(QPDF_BINARY_MARKER);
+    if options.qdf {
+        bytes.extend_from_slice(b"%QDF-1.0\n");
+        bytes.extend_from_slice(b"\n");
+    }
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 

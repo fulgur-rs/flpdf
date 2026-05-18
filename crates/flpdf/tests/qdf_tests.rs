@@ -554,6 +554,87 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// (l) %QDF-1.0 header marker (flpdf-9hc.6.4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// QDF output must contain "%QDF-1.0\n" immediately after the binary marker line.
+#[test]
+fn qdf_header_contains_qdf_marker() {
+    let raw = b"QDF header marker test payload.";
+    let compressed = flate_encode(raw);
+
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Must contain "%QDF-1.0" somewhere in the output.
+    assert!(
+        output.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0"),
+        "qdf=true must emit %QDF-1.0 in the output"
+    );
+
+    // Verify exact layout: %PDF-x.y\n  → binary marker → %QDF-1.0\n → \n
+    // Split into lines to check the sequence.
+    let header_area = &output[..output.len().min(128)];
+    let mut lines = header_area.split(|&b| b == b'\n');
+    let line1 = lines.next().expect("line 1 (%PDF-...)");
+    assert!(
+        line1.starts_with(b"%PDF-"),
+        "line 1 must be the %PDF- version line, got: {:?}",
+        line1
+    );
+    let line2 = lines.next().expect("line 2 (binary marker)");
+    assert_eq!(
+        line2,
+        b"%\xbf\xf7\xa2\xfe",
+        "line 2 must be the binary marker %BF F7 A2 FE (without the newline)"
+    );
+    let line3 = lines.next().expect("line 3 (%QDF-1.0)");
+    assert_eq!(
+        line3, b"%QDF-1.0",
+        "line 3 must be %QDF-1.0 immediately after the binary marker"
+    );
+    let line4 = lines.next().expect("line 4 (blank line)");
+    assert_eq!(line4, b"", "line 4 must be a blank line after %QDF-1.0");
+}
+
+/// Non-QDF output must NOT contain "%QDF-1.0" but still has the binary marker.
+#[test]
+fn non_qdf_header_has_no_qdf_marker_but_has_binary_marker() {
+    let raw = b"Non-QDF header test payload.";
+    let compressed = flate_encode(raw);
+
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = false;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Must NOT contain "%QDF-1.0".
+    assert!(
+        !output.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0"),
+        "qdf=false must NOT emit %QDF-1.0"
+    );
+
+    // Must still contain the binary marker.
+    let marker = b"%\xbf\xf7\xa2\xfe";
+    assert!(
+        output.windows(marker.len()).any(|w| w == marker),
+        "non-QDF output must still contain the binary marker %BF F7 A2 FE"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // (k) qdf=true + object_streams=Generate → qdf overrides Generate, no ObjStm
 // ─────────────────────────────────────────────────────────────────────────────
 
