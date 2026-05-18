@@ -15,6 +15,11 @@
 //!   (j) qdf=true: ObjStm decomposition — output has no /Type /ObjStm,
 //!       formerly-compressed objects appear as plain indirect.
 //!   (k) qdf=true + object_streams=Generate: qdf overrides Generate, no ObjStm.
+//!   (l) qdf=true + no_original_object_ids=false: "%% Original object ID: N G"
+//!       appears immediately before each "N G obj" line (≥2 objects verified).
+//!   (m) qdf=true + no_original_object_ids=true: no "%% Original object ID:"
+//!       lines; "N G obj" lines still present.
+//!   (n) qdf=false: no "%% Original object ID:" lines regardless of flag.
 
 use flpdf::{
     check_reader, filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef,
@@ -688,5 +693,141 @@ fn qdf_overrides_generate_mode_no_objstm() {
             );
         }
         other => panic!("object 2 should be a Dictionary, got {:?}", other),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (l) qdf=true + no_original_object_ids=false:
+//     "%% Original object ID: N G" immediately precedes each "N G obj" line.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// QDF output with no_original_object_ids=false: for every indirect object at
+/// number N generation G, the byte sequence
+/// `%% Original object ID: N G\nN G obj\n` must appear contiguously.
+/// We verify at least objects 1, 2, and 3 — the three objects that
+/// `build_minimal_pdf_with_stream` always produces.
+#[test]
+fn qdf_original_object_id_comments_emitted_when_flag_false() {
+    let raw = b"Original-object-id comment test payload.";
+    let compressed = flate_encode(raw);
+
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.no_original_object_ids = false; // default, but set explicitly
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Helper: assert the comment+obj pair appears contiguously for (num, gen).
+    let check_pair = |num: u32, gen: u16| {
+        let comment_line = format!("%% Original object ID: {} {}\n", num, gen);
+        let obj_line = format!("{} {} obj\n", num, gen);
+        let pattern = format!("{}{}", comment_line, obj_line);
+        let pattern_bytes = pattern.as_bytes();
+        assert!(
+            output.windows(pattern_bytes.len()).any(|w| w == pattern_bytes),
+            "expected contiguous pattern {:?} in QDF output (obj {} {})",
+            pattern,
+            num,
+            gen
+        );
+    };
+
+    // Verify at least 3 distinct objects (1 0, 2 0, 3 0).
+    check_pair(1, 0);
+    check_pair(2, 0);
+    check_pair(3, 0);
+
+    // The output must still be a valid PDF (xref offsets point at "N G obj").
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "QDF output with original-object-id comments must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (m) qdf=true + no_original_object_ids=true:
+//     no "%% Original object ID:" lines; "N G obj" lines still present.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When no_original_object_ids=true the comment lines must be absent, but the
+/// "N G obj" header lines must still be present.
+#[test]
+fn qdf_original_object_id_comments_suppressed_when_flag_true() {
+    let raw = b"Suppress-original-id-comment test.";
+    let compressed = flate_encode(raw);
+
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.no_original_object_ids = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let comment_marker = b"%% Original object ID:";
+    let comment_count = output
+        .windows(comment_marker.len())
+        .filter(|w| *w == comment_marker)
+        .count();
+    assert_eq!(
+        comment_count, 0,
+        "qdf=true + no_original_object_ids=true must emit zero '%% Original object ID:' lines"
+    );
+
+    // "N G obj\n" lines for objects 1, 2, 3 must still be present.
+    for (num, gen) in [(1u32, 0u16), (2, 0), (3, 0)] {
+        let obj_line = format!("{} {} obj\n", num, gen);
+        assert!(
+            output
+                .windows(obj_line.len())
+                .any(|w| w == obj_line.as_bytes()),
+            "'{num} {gen} obj' line must still be present when no_original_object_ids=true"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (n) qdf=false: no "%% Original object ID:" lines regardless of flag value.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Non-QDF output must never contain "%% Original object ID:" lines,
+/// whether no_original_object_ids is true or false.
+#[test]
+fn non_qdf_never_emits_original_object_id_comments() {
+    let raw = b"Non-QDF original-id absence test.";
+    let compressed = flate_encode(raw);
+
+    let comment_marker = b"%% Original object ID:";
+
+    for flag in [false, true] {
+        let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+        let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.qdf = false;
+        options.no_original_object_ids = flag;
+
+        let mut output = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+        let count = output
+            .windows(comment_marker.len())
+            .filter(|w| *w == comment_marker)
+            .count();
+        assert_eq!(
+            count, 0,
+            "qdf=false must emit zero '%% Original object ID:' lines (no_original_object_ids={flag})"
+        );
     }
 }
