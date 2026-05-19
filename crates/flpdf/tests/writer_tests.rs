@@ -3539,7 +3539,7 @@ fn incremental_generate_fallback_table_source_is_byte_identical() {
     );
     // Sanity: no ObjStm container was emitted on the feature side.
     assert!(
-        !window_contains(&out_b, b"/Type /ObjStm"),
+        count_substrings(&out_b, b"/Type /ObjStm") == 0,
         "fallback output must contain no /Type /ObjStm container"
     );
 }
@@ -3616,11 +3616,11 @@ fn incremental_generate_fallback_preserve_and_disable_are_byte_identical() {
          if this fails the gate never engages and test coverage is vacuous"
     );
     assert!(
-        window_contains(&out_generate, b"/Type /ObjStm"),
+        count_substrings(&out_generate, b"/Type /ObjStm") > 0,
         "Generate side must actually emit an /ObjStm container (gate engaged)"
     );
     assert!(
-        !window_contains(&out_preserve, b"/Type /ObjStm"),
+        count_substrings(&out_preserve, b"/Type /ObjStm") == 0,
         "Preserve fallback must contain no /ObjStm container"
     );
 }
@@ -3630,7 +3630,7 @@ fn incremental_generate_fallback_preserve_and_disable_are_byte_identical() {
 ///
 /// The fixture is an xref-stream source with an extra content-stream object
 /// (obj 3, an `Object::Stream`). Only obj 3 is mutated. `is_eligible_for_objstm`
-/// rejects `Object::Stream` (object_streams.rs:51), so `partition_objstm_eligible`
+/// rejects `Object::Stream` (writer/object_streams.rs:51), so `partition_objstm_eligible`
 /// returns an EMPTY packable → `packable.is_empty()` → fallback to
 /// `touched_object_refs.clone()`, `objstm_inc = None`.
 ///
@@ -3738,7 +3738,7 @@ fn incremental_generate_fallback_empty_packable_is_byte_identical() {
 
     // Empirical proof the chosen mutation really is ineligible: no container.
     assert!(
-        !window_contains(&out_b, b"/Type /ObjStm"),
+        count_substrings(&out_b, b"/Type /ObjStm") == 0,
         "the only mutated object is a Stream (ObjStm-ineligible); the Generate \
          side must emit NO /Type /ObjStm container — if it does, the packable \
          was not empty and this test is comparing two engaging paths"
@@ -3748,9 +3748,4 @@ fn incremental_generate_fallback_empty_packable_is_byte_identical() {
         "Generate with an empty packable (only ineligible object touched) must \
          be byte-identical to the legacy (Preserve) plain incremental write"
     );
-}
-
-/// Substring search over a byte buffer (no `[u8]::contains` for slices).
-fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
