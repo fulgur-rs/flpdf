@@ -3288,3 +3288,128 @@ fn incremental_generate_roundtrip_packs_mutated_object_into_objstm() {
         "(e) /Prev must equal the source's last startxref"
     );
 }
+
+/// Structural-correctness gate: a generate-mode incremental update (mutated
+/// plain object packed into a freshly-allocated ObjStm, appended over an
+/// xref-stream source with full_rewrite=false) must produce a PDF that qpdf
+/// accepts.
+///
+/// `qpdf --check` validates the whole framing: xref offsets, the /Prev chain,
+/// container as a type-1 object, the compressed member as a type-2 entry, and
+/// trailer /Size. `qpdf --show-object=2` additionally proves qpdf walked the
+/// /Prev chain into the new container, decompressed the mutated object, and
+/// rendered the *updated* value (the `FlpdfMutated` marker).
+///
+/// Gated on qpdf availability via the established `is_qpdf_available()` helper;
+/// when qpdf is absent the structural gate is not exercised.
+#[test]
+fn incremental_generate_qpdf_check() {
+    if !is_qpdf_available() {
+        eprintln!("qpdf not available; skipping incremental_generate_qpdf_check structural gate");
+        return;
+    }
+
+    // Fixture replicates `incremental_generate_roundtrip_packs_mutated_object_into_objstm`
+    // (inline, per this file's convention — no shared helper extraction).
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, source_xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let source = bytes;
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+
+    let mutated_ref = ObjectRef::new(2, 0);
+    let mutated_value = Object::Dictionary({
+        let mut d = Dictionary::new();
+        d.insert("Type", Object::Name(b"Pages".to_vec()));
+        d.insert("Count", Object::Integer(0));
+        d.insert("Kids", Object::Array(Vec::new()));
+        d.insert("FlpdfMutated", Object::Boolean(true));
+        d
+    });
+    pdf.set_object(mutated_ref, mutated_value);
+
+    let mut options = WriteOptions::default();
+    options.object_streams = ObjectStreamMode::Generate;
+    options.full_rewrite = false;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let path = std::env::temp_dir().join(format!(
+        "flpdf-incremental-generate-qpdf-{}.pdf",
+        std::process::id()
+    ));
+    fs::write(&path, &output).unwrap();
+
+    // (1) Structural validation: `qpdf --check` must accept the framing.
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(&path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to invoke qpdf --check: {err}"));
+
+    // (2) The mutated object must be resolvable through the /Prev chain into
+    // the new ObjStm container, rendering the *updated* value.
+    let show = Command::new("qpdf")
+        .arg("--show-object=2")
+        .arg(&path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to invoke qpdf --show-object: {err}"));
+
+    let _ = fs::remove_file(&path);
+
+    assert!(
+        check.status.success(),
+        "qpdf --check failed on incremental generate output:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    assert!(
+        show.status.success(),
+        "qpdf --show-object=2 failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&show.stdout),
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let show_out = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        show_out.contains("FlpdfMutated"),
+        "qpdf --show-object=2 must render the mutated object's updated value \
+         (expected /FlpdfMutated marker); got:\n{show_out}"
+    );
+}
