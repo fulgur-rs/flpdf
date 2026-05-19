@@ -313,6 +313,10 @@ Then:
 
 > The container is emitted inside the `if` block via `write_incremental_objstm`, so it precedes plain objects in `bytes` and `container_offset` is its true byte position. No ordering ambiguity.
 
+**Framing-divergence decision (resolved during Task 4 review — DO NOT re-litigate, just apply):**
+Keep `write_incremental_objstm` emitting via `write_object` as-is. It does NOT honor `options.newline_before_endstream`, whereas the full-rewrite ObjStm path uses manual `format!` + `write_stream_to_buf(..., options.newline_before_endstream)` + `endobj`. This divergence is **unobservable under the default config**: `Object::Stream::write_pdf` and `write_stream_to_buf` are byte-identical under `NewlineBeforeEndstream::Yes`; they differ only under `NewlineBeforeEndstream::No` AND an ObjStm payload whose last byte is `\n`/`\r` (near-empty surface with Flate output). Task 6's `qpdf --check` is the gate that would surface any real delta; the fix (if ever needed) is a local ~4-line swap to manual-emit with zero API impact. As part of this task's commit, **add to `write_incremental_objstm`'s doc comment** a sentence recording this bounded, intentional contract, e.g.:
+> Container framing is emitted via `write_object` (single unconditional `\n` before `endstream`); unlike the full-rewrite ObjStm path it does not consult `options.newline_before_endstream`. Observable only under `NewlineBeforeEndstream::No` with a payload ending in `\n`/`\r` (not the default). Revisit if the Task 6 qpdf cross-check exposes a delta.
+
 **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p flpdf incremental_generate_roundtrip`
