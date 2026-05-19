@@ -368,10 +368,12 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     xref_offsets.extend(rewritten_stream_offsets);
     let final_offsets =
         merge_source_and_touched_offsets(&source_offsets, &xref_offsets, &deleted_table_entries);
+    let empty_compressed = BTreeMap::new();
     let final_xref_offsets = merge_source_and_touched_offsets_for_xref_stream(
         &source_xref_offsets,
         &xref_offsets,
         &deleted_object_refs,
+        &empty_compressed,
     );
     let mut object_count = match pdf.last_xref_form() {
         XrefForm::Table => resolve_object_count(pdf.trailer().get("Size"), &final_offsets),
@@ -711,10 +713,23 @@ fn merge_source_and_touched_offsets_for_xref_stream(
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
     touched_offsets: &BTreeMap<u32, (u16, usize)>,
     deleted_object_refs: &[ObjectRef],
+    compressed: &BTreeMap<u32, (u32, u32)>,
 ) -> BTreeMap<u32, (u16, XrefOffset)> {
     let mut merged = source_offsets.clone();
     for (number, (generation, offset)) in touched_offsets {
         merged.insert(*number, (*generation, XrefOffset::Offset(*offset as u64)));
+    }
+    for (number, (stream, index)) in compressed {
+        merged.insert(
+            *number,
+            (
+                0,
+                XrefOffset::Compressed {
+                    stream: *stream,
+                    index: *index,
+                },
+            ),
+        );
     }
     for (number, (generation, next)) in build_deleted_entries(source_offsets, deleted_object_refs) {
         merged.insert(number, (generation, XrefOffset::Free { next }));
@@ -2430,6 +2445,72 @@ mod tests {
             container,
             ObjectRef::new(1, 0),
             "zero/empty inputs must yield the minimal container number 1"
+        );
+    }
+
+    #[test]
+    fn merge_source_and_touched_offsets_for_xref_stream_handles_compressed() {
+        // Source-only entry (must pass through unchanged).
+        let mut source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+        source_offsets.insert(5, (0, XrefOffset::Offset(42)));
+
+        // Plain touched entry -> XrefOffset::Offset.
+        let mut touched: BTreeMap<u32, (u16, usize)> = BTreeMap::new();
+        touched.insert(7, (0, 100));
+
+        // Deleted ref -> XrefOffset::Free.
+        let deleted = vec![ObjectRef::new(5, 0)];
+
+        // Compressed (ObjStm member) entries -> XrefOffset::Compressed, gen 0.
+        let mut compressed: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+        compressed.insert(9, (20, 3));
+
+        let merged = merge_source_and_touched_offsets_for_xref_stream(
+            &source_offsets,
+            &touched,
+            &deleted,
+            &compressed,
+        );
+
+        // (i) compressed numbers become Compressed { stream, index } with gen 0.
+        assert_eq!(
+            merged.get(&9),
+            Some(&(
+                0,
+                XrefOffset::Compressed {
+                    stream: 20,
+                    index: 3
+                }
+            )),
+            "compressed member must become a type-2 Compressed entry with generation 0"
+        );
+
+        // (ii) plain touched entry still becomes Offset.
+        assert_eq!(
+            merged.get(&7),
+            Some(&(0, XrefOffset::Offset(100))),
+            "plain touched entry must still become an Offset entry"
+        );
+
+        // (iii) deleted ref still becomes Free.
+        match merged.get(&5) {
+            Some((_, XrefOffset::Free { .. })) => {}
+            other => panic!("deleted ref must become a Free entry, got {other:?}"),
+        }
+
+        // (iv) source-only entry passes through unchanged when not touched/deleted.
+        let mut source_only: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+        source_only.insert(11, (2, XrefOffset::Offset(999)));
+        let passthrough = merge_source_and_touched_offsets_for_xref_stream(
+            &source_only,
+            &BTreeMap::new(),
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            passthrough.get(&11),
+            Some(&(2, XrefOffset::Offset(999))),
+            "untouched source-only entry must pass through unchanged"
         );
     }
 }
