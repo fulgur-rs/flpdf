@@ -193,9 +193,13 @@ fn static_id_emits_test_only_warning_on_stderr() {
 }
 
 #[test]
-fn static_id_top_level_alias_emits_warning() {
-    // The qpdf-shaped top-level alias (`flpdf --static-id in out`) must warn
-    // identically to the `rewrite` subcommand.
+fn static_id_top_level_alias_is_silent() {
+    // The qpdf-shaped top-level alias (`flpdf --static-id in out`) exists to
+    // mirror qpdf's command surface, and qpdf emits no warning for
+    // `--static-id`. Emitting one here diverges from that documented contract
+    // and regresses the qtest parity suite (8 allowlist subtests assert a
+    // clean stderr). The test-only safety warning is retained on flpdf's
+    // native `rewrite --static-id` surface instead (flpdf-4x6).
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("out.pdf");
@@ -207,7 +211,7 @@ fn static_id_top_level_alias_emits_warning() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("testing only"));
+        .stderr(predicate::str::contains("testing only").not());
 }
 
 #[test]
