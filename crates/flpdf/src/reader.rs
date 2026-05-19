@@ -38,6 +38,12 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 pub struct Pdf<R: Read + Seek> {
     reader: R,
     version: String,
+    /// `true` when the file header carries the `%QDF-1.0` marker (qpdf/flpdf
+    /// QDF form). Used by [`resolve`](Self::resolve) to disambiguate the
+    /// exact-window indirect `/Length` case: QDF holders count the framing
+    /// EOL (keep the parser's endstream-scan to preserve round-trip), whereas
+    /// non-QDF holders are the spec content length (flpdf-9hc.28).
+    is_qdf: bool,
     trailer: Dictionary,
     startxref: u64,
     last_xref_form: XrefForm,
@@ -383,9 +389,23 @@ impl<R: Read + Seek> Pdf<R> {
             })
             .collect();
         let cache = ObjectCache::from_offsets(&loaded.entries);
+        // Sniff the file header for the `%QDF-1.0` marker (flpdf-9hc.28). It
+        // sits within the first few lines (`%PDF-x.y`, binary marker,
+        // `%QDF-1.0`); 64 bytes is ample. Best-effort: any read error → false.
+        let is_qdf = {
+            let mut header = [0u8; 64];
+            let n = reader
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| reader.read(&mut header))
+                .unwrap_or(0);
+            header[..n]
+                .windows(b"%QDF-1.0".len())
+                .any(|w| w == b"%QDF-1.0")
+        };
         let mut pdf = Self {
             reader,
             version: loaded.version,
+            is_qdf,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
             last_xref_form: loaded.last_xref_form,
@@ -861,7 +881,23 @@ impl<R: Read + Seek> Pdf<R> {
                                 // refinement is tracked as flpdf-9hc.28.
                                 // A too-large/garbage holder also lands here
                                 // → safe endstream-scan fallback.
-                                if auth_end < isl.endstream_pos && auth_end <= bytes.len() {
+                                // flpdf-9hc.28: the exact-window case
+                                // (auth_end == endstream_pos) is ambiguous —
+                                // QDF holders count the framing EOL (keep the
+                                // parser's endstream-scan / one-EOL trim to
+                                // preserve QDF round-trip & idempotence),
+                                // whereas a non-QDF holder is the spec content
+                                // length and must be honoured verbatim (fixes
+                                // a non-conformant stream whose data ends with
+                                // a newline). Whole-file QDF detection picks
+                                // the correct branch: strict `<` for QDF,
+                                // inclusive `<=` for non-QDF.
+                                let within_window = if self.is_qdf {
+                                    auth_end < isl.endstream_pos
+                                } else {
+                                    auth_end <= isl.endstream_pos
+                                };
+                                if within_window && auth_end <= bytes.len() {
                                     stream.data = bytes[isl.data_start..auth_end].to_vec();
                                 }
                             }

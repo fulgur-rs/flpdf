@@ -1640,3 +1640,67 @@ fn cyclic_indirect_length_holder_terminates() {
         "cyclic /Length holder must still resolve to a stream (endstream-scan fallback)"
     );
 }
+
+// ── flpdf-9hc.28: whole-file QDF detection for exact-window indirect /Length ──
+
+fn exact_window_indirect_length_pdf(header: &[u8]) -> Vec<u8> {
+    // obj 1: stream `ab\n` followed *directly* by `endstream` (non-conformant:
+    // no mandatory pre-endstream EOL). Indirect /Length holder (obj 4) gives
+    // the spec content length 3 — auth_end == endstream_pos (exact window).
+    let mut bytes = header.to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Length 4 0 R >>\nstream\nab\nendstream\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+    let off3 = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let off4 = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n3\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for off in [off1, off2, off3, off4] {
+        bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+/// Non-QDF file: the authoritative indirect /Length (3 bytes) is honoured
+/// verbatim even in the exact-window case, so the stream keeps its trailing
+/// newline (`ab\n`) instead of the endstream-scan dropping it.
+#[test]
+fn non_qdf_exact_window_indirect_length_preserves_trailing_newline() {
+    let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n");
+    let mut pdf = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("object 1 must be a stream");
+    };
+    assert_eq!(
+        s.data,
+        b"ab\n",
+        "non-QDF exact-window indirect /Length must keep the trailing newline, got {:?}",
+        String::from_utf8_lossy(&s.data)
+    );
+}
+
+/// Same object bytes but the header carries `%QDF-1.0`: whole-file QDF
+/// detection keeps the strict `<` branch (endstream-scan / one-EOL trim) so
+/// QDF round-trip & idempotence stay byte-stable. The discriminator flips on
+/// the marker alone.
+#[test]
+fn qdf_marker_keeps_endstream_scan_for_exact_window() {
+    let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n");
+    let mut pdf = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("object 1 must be a stream");
+    };
+    assert_eq!(
+        s.data,
+        b"ab",
+        "QDF-marked file must keep endstream-scan (one EOL trimmed) for the \
+         exact-window case, got {:?}",
+        String::from_utf8_lossy(&s.data)
+    );
+}
