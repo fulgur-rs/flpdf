@@ -844,6 +844,38 @@ fn allocate_incremental_objstm_container(
     Ok(ObjectRef::new(number, 0))
 }
 
+/// Emit the incremental-update ObjStm container object into `bytes` and return
+/// its byte offset together with the `(member, index-within-container)` pairs.
+///
+/// The container body and stream wrapper are produced by the exact same helpers
+/// the full-rewrite path uses ([`object_streams::emit_objstm_body`] /
+/// [`object_streams::wrap_objstm_body`]); the compress policy mirrors the
+/// full-rewrite call site verbatim (`options.compress_streams`).  The returned
+/// member map is consumed by Task 5 to build type-2 (compressed) xref entries
+/// via `write_incremental_xref_stream`'s `compressed_members` parameter.
+///
+/// Wired into the incremental write path by Task 5 (flpdf-9hc.5.9); the
+/// `#[allow(dead_code)]` mirrors the Task 1 convention until then.
+#[allow(dead_code)]
+fn write_incremental_objstm<R: Read + Seek>(
+    bytes: &mut Vec<u8>,
+    pdf: &mut Pdf<R>,
+    container_ref: ObjectRef,
+    packable: &[ObjectRef],
+    options: &WriteOptions,
+) -> Result<(usize, Vec<(ObjectRef, u32)>)> {
+    let body = object_streams::emit_objstm_body(pdf, packable)?;
+    let stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+    let offset = bytes.len();
+    write_object(bytes, container_ref, &Object::Stream(stream))?;
+    let members = packable
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| (r, i as u32))
+        .collect();
+    Ok((offset, members))
+}
+
 fn build_source_xref_offsets(
     source_offsets: BTreeMap<ObjectRef, XrefOffset>,
 ) -> BTreeMap<u32, (u16, XrefOffset)> {
@@ -2561,5 +2593,131 @@ mod tests {
                 "object in both compressed and deleted must resolve to Free (deleted loop runs last), got {other:?}"
             ),
         }
+    }
+    // --- write_incremental_objstm (flpdf-9hc.5.9, Task 4) -------------------
+
+    /// Append a W=[1 3 1] xref-stream entry: 1-byte type, 3-byte big-endian
+    /// field-1, 1-byte field-2.
+    fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, f1: u32, f2: u8) {
+        entries.push(entry_type);
+        entries.push((f1 >> 16) as u8);
+        entries.push((f1 >> 8) as u8);
+        entries.push(f1 as u8);
+        entries.push(f2);
+    }
+
+    /// Build a minimal xref-STREAM PDF (PDF-1.5) with three plain, generation-0,
+    /// non-stream indirect objects resolvable through the xref stream:
+    ///   1 0  Catalog            (plain dict — ObjStm-eligible)
+    ///   2 0  Pages              (plain dict — ObjStm-eligible)
+    ///   3 0  neutral plain dict (plain dict — ObjStm-eligible)
+    ///   4 0  XRef stream        (self-referential, W=[1 3 1])
+    fn build_xref_stream_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        // (object_number, offset)
+        let mut offsets: Vec<(u32, usize)> = Vec::new();
+
+        offsets.push((1, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offsets.push((2, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+        offsets.push((3, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n<< /Subtype /Marker /Value 42 >>\nendobj\n");
+
+        let xref_num: u32 = 4;
+        let total_size = xref_num + 1; // entries 0..=4
+        let xref_offset = bytes.len();
+
+        // Xref stream payload (W=[1 3 1], /Index [0 total_size]).
+        let mut entries: Vec<u8> = Vec::new();
+        append_xref_stream_entry(&mut entries, 0, 0, 0); // 0: free head
+        for (_num, off) in &offsets {
+            append_xref_stream_entry(&mut entries, 1, *off as u32, 0);
+        }
+        // Object 4: the XRef stream itself (self-referential offset).
+        append_xref_stream_entry(&mut entries, 1, xref_offset as u32, 0);
+
+        bytes.extend_from_slice(
+            format!(
+                "{xref_num} 0 obj\n<< /Type /XRef /Size {total_size} /Root 1 0 R /W [1 3 1] /Index [0 {total_size}] /Length {} >>\nstream\n",
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn write_incremental_objstm_emits_container_and_member_index_map() {
+        let fixture = build_xref_stream_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("xref-stream fixture must open");
+
+        // Two plain, gen-0, ObjStm-eligible objects, resolved via the xref
+        // stream. Sanity-check the fixture before exercising the emitter.
+        let m0 = ObjectRef::new(2, 0); // Pages
+        let m1 = ObjectRef::new(3, 0); // neutral plain dict
+        assert!(
+            matches!(pdf.resolve(m0).unwrap(), Object::Dictionary(_)),
+            "obj 2 must resolve from the xref stream as a plain dictionary"
+        );
+        assert!(
+            matches!(pdf.resolve(m1).unwrap(), Object::Dictionary(_)),
+            "obj 3 must resolve from the xref stream as a plain dictionary"
+        );
+
+        let packable = [m0, m1];
+        // Container number sits above every existing object (max 4) -> 5.
+        let container_ref = ObjectRef::new(5, 0);
+        let options = WriteOptions::default();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        // Prefix bytes so the returned offset is provably relative to the
+        // buffer start, not zero by accident.
+        bytes.extend_from_slice(b"%incremental-tail-marker\n");
+        let prefix_len = bytes.len();
+
+        let (container_offset, members) =
+            write_incremental_objstm(&mut bytes, &mut pdf, container_ref, &packable, &options)
+                .expect("write_incremental_objstm must succeed");
+
+        // Offset points at the appended container, after the prefix.
+        assert_eq!(
+            container_offset, prefix_len,
+            "container_offset must mark where the container object begins"
+        );
+
+        // Member map is the packable slice paired with its 0-based index.
+        assert_eq!(
+            members,
+            vec![(m0, 0u32), (m1, 1u32)],
+            "members must be [(packable[0],0),(packable[1],1)] in packable order"
+        );
+
+        // The appended bytes carry a real serialised ObjStm container object.
+        let container_bytes = &bytes[container_offset..];
+        let container_str = String::from_utf8_lossy(container_bytes);
+        assert!(
+            container_str.starts_with(&format!("{} 0 obj", container_ref.number)),
+            "container must open with `{} 0 obj`, got: {:?}",
+            container_ref.number,
+            &container_str[..container_str.len().min(32)]
+        );
+        assert!(
+            container_str.contains("/Type /ObjStm"),
+            "container dict must declare /Type /ObjStm"
+        );
+        assert!(
+            container_str.contains("/N 2"),
+            "container dict must declare /N 2 for the two packed members"
+        );
+        assert!(
+            container_str.contains("endobj"),
+            "container object must be terminated with endobj"
+        );
     }
 }
