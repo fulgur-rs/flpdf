@@ -3413,3 +3413,344 @@ fn incremental_generate_qpdf_check() {
          (expected /FlpdfMutated marker); got:\n{show_out}"
     );
 }
+
+// ── flpdf-9hc.5.9 Task 7: fallback regression for the incremental generate gate
+//
+// The Task-5 gate (writer.rs) is exactly:
+//
+//   use_objstm = (object_streams == Generate)
+//             && (last_xref_form == Stream)
+//             && (partition_objstm_eligible yields a NON-EMPTY packable)
+//
+// When ANY condition is false the incremental path is byte-identical to the
+// pre-Task-5 plain incremental write: `plain_touched == touched_object_refs`
+// and `objstm_inc` stays `None`. The three tests below each disable EXACTLY
+// ONE gate condition and assert the full output `Vec<u8>` is byte-identical
+// to the legacy (gate-not-engaging) write of the SAME source + SAME mutation.
+//
+// Because line 384 of writer.rs is the ONLY incremental-path reader of
+// `options.object_streams`, a leak — any code outside the gate that started
+// branching on `Generate` — would make the two sides diverge and fail these
+// asserts. The fixtures are built so the gate predicate IS exercised on every
+// run (table form, or mode toggled, or ineligible-only mutation), which is
+// what makes each assert_eq! non-tautological. Test 2 additionally proves the
+// gate genuinely ENGAGES when all three conditions hold (assert_ne!), so the
+// "does not engage in Preserve/Disable" equalities are not vacuous.
+
+/// Build a minimal xref-TABLE PDF (classic `xref`/`trailer`/`startxref`)
+/// carrying a plain, gen-0, non-stream /Type /Pages object (eligible for
+/// ObjStm packing). Used by test 1: the gate's `XrefForm::Stream` condition
+/// is false for a table source, so `use_objstm` is false regardless of mode.
+fn build_minimal_pdf_with_xref_table() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Test 1 — gate condition disabled: **`XrefForm::Stream`** (source is a
+/// classic xref TABLE).
+///
+/// Two sides, identical source + identical mutation, differing ONLY in
+/// `object_streams`:
+///   - side A (legacy baseline): `Preserve` (the pre-Task-5 default)
+///   - side B (feature path):    `Generate`
+///
+/// Because the source uses an xref TABLE, `matches!(last_xref_form, Stream)`
+/// is false on BOTH sides, so `use_objstm` is false and both take the plain
+/// incremental path. The outputs MUST be byte-identical: the Generate request
+/// must not perturb the write when the xref-form condition gates it out.
+///
+/// Non-tautological: the two calls differ by `object_streams` (Generate vs
+/// Preserve) — the exact axis the gate keys on. If any logic outside the
+/// gate branched on `Generate`, side B would differ and this assert_eq! would
+/// fail. The mutated object is genuinely ObjStm-eligible (gen-0, non-stream,
+/// /Type /Pages), so only the xref-form condition keeps the gate shut — the
+/// predicate is really exercised.
+#[test]
+fn incremental_generate_fallback_table_source_is_byte_identical() {
+    let source = build_minimal_pdf_with_xref_table();
+    {
+        let mut r = Cursor::new(&source);
+        let loaded = load_xref_and_trailer(&mut r).unwrap();
+        assert_eq!(
+            loaded.last_xref_form,
+            XrefForm::Table,
+            "fixture must be xref-TABLE form so the Generate gate's stream condition is false"
+        );
+    }
+
+    let mutated_ref = ObjectRef::new(2, 0);
+    let mutated_value = Object::Dictionary({
+        let mut d = Dictionary::new();
+        d.insert("Type", Object::Name(b"Pages".to_vec()));
+        d.insert("Count", Object::Integer(0));
+        d.insert("Kids", Object::Array(Vec::new()));
+        d.insert("FlpdfMutated", Object::Boolean(true));
+        d
+    });
+
+    // Side A — legacy baseline: default (Preserve) mode, plain incremental.
+    let mut pdf_a = Pdf::open(Cursor::new(source.clone())).unwrap();
+    pdf_a.set_object(mutated_ref, mutated_value.clone());
+    let mut opts_a = WriteOptions::default();
+    opts_a.object_streams = ObjectStreamMode::Preserve;
+    opts_a.full_rewrite = false;
+    // `static_id` makes the trailer /ID deterministic so the only thing the
+    // assert can detect is a gate-driven divergence (without it the random
+    // /ID differs every call and would mask the comparison).
+    opts_a.static_id = true;
+    let mut out_a = Vec::new();
+    write_pdf_with_options(&mut pdf_a, &mut out_a, &opts_a).unwrap();
+
+    // Side B — feature path: Generate mode, but xref-form gate condition false.
+    let mut pdf_b = Pdf::open(Cursor::new(source.clone())).unwrap();
+    pdf_b.set_object(mutated_ref, mutated_value.clone());
+    let mut opts_b = WriteOptions::default();
+    opts_b.object_streams = ObjectStreamMode::Generate;
+    opts_b.full_rewrite = false;
+    opts_b.static_id = true;
+    let mut out_b = Vec::new();
+    write_pdf_with_options(&mut pdf_b, &mut out_b, &opts_b).unwrap();
+
+    assert_eq!(
+        out_a, out_b,
+        "Generate over an xref-TABLE source must be byte-identical to the \
+         legacy (Preserve) plain incremental write — the gate's Stream \
+         condition is false so the new path must not engage"
+    );
+    // Sanity: no ObjStm container was emitted on the feature side.
+    assert!(
+        !window_contains(&out_b, b"/Type /ObjStm"),
+        "fallback output must contain no /Type /ObjStm container"
+    );
+}
+
+/// Test 2 — gate condition disabled: **`object_streams == Generate`**
+/// (Preserve and Disable both gate out by mode), Stream source.
+///
+/// The source IS xref-stream form and the mutation IS ObjStm-eligible, so the
+/// ONLY thing keeping the gate shut for Preserve/Disable is the mode. Three
+/// outputs from identical source + identical mutation:
+///   - `out_preserve`  : object_streams = Preserve  (legacy baseline)
+///   - `out_disable`   : object_streams = Disable
+///   - `out_generate`  : object_streams = Generate  (gate ENGAGES here)
+///
+/// Asserts:
+///   - `out_preserve == out_disable` — both gate out by mode; identical to
+///     the pre-Task-5 plain incremental write.
+///   - `out_generate != out_preserve` — the discriminator. This proves the
+///     gate DOES fire when all three conditions hold, which is what makes the
+///     Preserve/Disable equality a meaningful regression assertion rather
+///     than a vacuous truth. (writer.rs:384 is the only incremental reader of
+///     `object_streams`, so Preserve vs Disable run literally identical code
+///     here; the assert_ne! against Generate is what gives this test teeth.)
+#[test]
+fn incremental_generate_fallback_preserve_and_disable_are_byte_identical() {
+    let source = build_minimal_pdf_with_xref_stream();
+    {
+        let mut r = Cursor::new(&source);
+        let loaded = load_xref_and_trailer(&mut r).unwrap();
+        assert_eq!(
+            loaded.last_xref_form,
+            XrefForm::Stream,
+            "fixture must be xref-STREAM form so only the mode keeps the gate shut"
+        );
+    }
+
+    let mutated_ref = ObjectRef::new(2, 0);
+    let mutated_value = Object::Dictionary({
+        let mut d = Dictionary::new();
+        d.insert("Type", Object::Name(b"Pages".to_vec()));
+        d.insert("Count", Object::Integer(0));
+        d.insert("Kids", Object::Array(Vec::new()));
+        d.insert("FlpdfMutated", Object::Boolean(true));
+        d
+    });
+
+    let write_with = |mode: ObjectStreamMode| -> Vec<u8> {
+        let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+        pdf.set_object(mutated_ref, mutated_value.clone());
+        let mut opts = WriteOptions::default();
+        opts.object_streams = mode;
+        opts.full_rewrite = false;
+        // Deterministic /ID — see test 1 rationale.
+        opts.static_id = true;
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+        out
+    };
+
+    let out_preserve = write_with(ObjectStreamMode::Preserve);
+    let out_disable = write_with(ObjectStreamMode::Disable);
+    let out_generate = write_with(ObjectStreamMode::Generate);
+
+    assert_eq!(
+        out_preserve, out_disable,
+        "Preserve and Disable both gate out by mode — each must be byte-identical \
+         to the legacy plain incremental write"
+    );
+    // Discriminator: proves the gate genuinely engages when ALL conditions
+    // hold, so the equality above is a real (non-vacuous) regression check.
+    assert_ne!(
+        out_generate, out_preserve,
+        "Generate (all gate conditions true) MUST diverge from the fallback — \
+         if this fails the gate never engages and test coverage is vacuous"
+    );
+    assert!(
+        window_contains(&out_generate, b"/Type /ObjStm"),
+        "Generate side must actually emit an /ObjStm container (gate engaged)"
+    );
+    assert!(
+        !window_contains(&out_preserve, b"/Type /ObjStm"),
+        "Preserve fallback must contain no /ObjStm container"
+    );
+}
+
+/// Test 3 — gate condition disabled: **non-empty packable** (Generate +
+/// Stream source, but the ONLY mutated object is ObjStm-INELIGIBLE).
+///
+/// The fixture is an xref-stream source with an extra content-stream object
+/// (obj 3, an `Object::Stream`). Only obj 3 is mutated. `is_eligible_for_objstm`
+/// rejects `Object::Stream` (object_streams.rs:51), so `partition_objstm_eligible`
+/// returns an EMPTY packable → `packable.is_empty()` → fallback to
+/// `touched_object_refs.clone()`, `objstm_inc = None`.
+///
+/// Two sides, identical source + identical (stream) mutation:
+///   - side A (legacy baseline): `Preserve`
+///   - side B (feature path):    `Generate` (mode + Stream true, packable empty)
+///
+/// Outputs MUST be byte-identical: with an empty packable the Generate path
+/// collapses to exactly the plain incremental write.
+///
+/// Non-tautological: sides differ by `object_streams` (Generate vs Preserve).
+/// The Stream + Generate conditions ARE both true on side B, so only the
+/// empty-packable condition keeps the gate shut — the predicate is genuinely
+/// exercised. Verified empirically: side B emits no `/Type /ObjStm`.
+#[test]
+fn incremental_generate_fallback_empty_packable_is_byte_identical() {
+    // xref-stream fixture extended with obj 3 = a FlateDecode content stream.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let stream_payload = b"BT /F1 12 Tf (hello) Tj ET";
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(stream_payload).unwrap();
+    let compressed = enc.finish().unwrap();
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    // Entries are contiguous for objects 0..=4: obj0 free, obj1 catalog,
+    // obj2 pages, obj3 content stream, obj4 the xref stream itself.
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[1] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, offsets[2] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 3 1] /Index [0 5] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let source = bytes;
+    {
+        let mut r = Cursor::new(&source);
+        let loaded = load_xref_and_trailer(&mut r).unwrap();
+        assert_eq!(
+            loaded.last_xref_form,
+            XrefForm::Stream,
+            "fixture must be xref-STREAM form so only the empty-packable condition gates out"
+        );
+    }
+
+    // The mutation: a NEW stream value for obj 3 — an Object::Stream, which
+    // is ObjStm-INELIGIBLE, so the packable set is empty.
+    let mutated_ref = ObjectRef::new(3, 0);
+    let mutated_value = Object::Stream(flpdf::Stream {
+        dict: {
+            let mut d = Dictionary::new();
+            d.insert("Length", Object::Integer(stream_payload.len() as i64));
+            d.insert("FlpdfMutated", Object::Boolean(true));
+            d
+        },
+        data: stream_payload.to_vec(),
+    });
+
+    // Side A — legacy baseline: Preserve, plain incremental.
+    let mut pdf_a = Pdf::open(Cursor::new(source.clone())).unwrap();
+    pdf_a.set_object(mutated_ref, mutated_value.clone());
+    let mut opts_a = WriteOptions::default();
+    opts_a.object_streams = ObjectStreamMode::Preserve;
+    opts_a.full_rewrite = false;
+    // Deterministic /ID — see test 1 rationale.
+    opts_a.static_id = true;
+    let mut out_a = Vec::new();
+    write_pdf_with_options(&mut pdf_a, &mut out_a, &opts_a).unwrap();
+
+    // Side B — feature path: Generate + Stream source, but empty packable.
+    let mut pdf_b = Pdf::open(Cursor::new(source.clone())).unwrap();
+    pdf_b.set_object(mutated_ref, mutated_value.clone());
+    let mut opts_b = WriteOptions::default();
+    opts_b.object_streams = ObjectStreamMode::Generate;
+    opts_b.full_rewrite = false;
+    opts_b.static_id = true;
+    let mut out_b = Vec::new();
+    write_pdf_with_options(&mut pdf_b, &mut out_b, &opts_b).unwrap();
+
+    // Empirical proof the chosen mutation really is ineligible: no container.
+    assert!(
+        !window_contains(&out_b, b"/Type /ObjStm"),
+        "the only mutated object is a Stream (ObjStm-ineligible); the Generate \
+         side must emit NO /Type /ObjStm container — if it does, the packable \
+         was not empty and this test is comparing two engaging paths"
+    );
+    assert_eq!(
+        out_a, out_b,
+        "Generate with an empty packable (only ineligible object touched) must \
+         be byte-identical to the legacy (Preserve) plain incremental write"
+    );
+}
+
+/// Substring search over a byte buffer (no `[u8]::contains` for slices).
+fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
