@@ -393,14 +393,15 @@ impl<R: Read + Seek> Pdf<R> {
         // sits within the first few lines (`%PDF-x.y`, binary marker,
         // `%QDF-1.0`); 64 bytes is ample. Best-effort: any read error → false.
         let is_qdf = {
-            let mut header = [0u8; 64];
-            let n = reader
-                .seek(SeekFrom::Start(0))
-                .and_then(|_| reader.read(&mut header))
-                .unwrap_or(0);
-            header[..n]
-                .windows(b"%QDF-1.0".len())
-                .any(|w| w == b"%QDF-1.0")
+            // `Read::read` may return a short read (BufReader, pipes, …), so
+            // a single call could split `%QDF-1.0` across reads and miss it.
+            // `take(64).read_to_end` reads until 64 bytes or EOF regardless of
+            // chunking. Best-effort: any error → false.
+            let mut header = Vec::with_capacity(64);
+            if reader.seek(SeekFrom::Start(0)).is_ok() {
+                let _ = reader.by_ref().take(64).read_to_end(&mut header);
+            }
+            header.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0")
         };
         let mut pdf = Self {
             reader,

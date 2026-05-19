@@ -1704,3 +1704,39 @@ fn qdf_marker_keeps_endstream_scan_for_exact_window() {
         String::from_utf8_lossy(&s.data)
     );
 }
+
+/// flpdf-9hc.28 (coderabbit #200): the %QDF-1.0 header sniff must survive a
+/// reader that returns short reads (1 byte at a time) — a single
+/// `Read::read` could otherwise split the marker and miss it.
+#[test]
+fn qdf_marker_detected_through_short_reads() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    struct OneByteReader(std::io::Cursor<Vec<u8>>);
+    impl Read for OneByteReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.0.read(&mut buf[..1])
+        }
+    }
+    impl Seek for OneByteReader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n");
+    let mut pdf = Pdf::open(OneByteReader(std::io::Cursor::new(pdf))).unwrap();
+    let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("object 1 must be a stream");
+    };
+    // QDF detected despite 1-byte reads → strict `<` → endstream-scan trim.
+    assert_eq!(
+        s.data,
+        b"ab",
+        "QDF marker must be detected through short reads (got {:?})",
+        String::from_utf8_lossy(&s.data)
+    );
+}
