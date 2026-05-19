@@ -911,8 +911,10 @@ fn allocate_incremental_objstm_container(
 /// the full-rewrite path uses ([`object_streams::emit_objstm_body`] /
 /// [`object_streams::wrap_objstm_body`]); the compress policy mirrors the
 /// full-rewrite call site verbatim (`options.compress_streams`).  The returned
-/// member map is consumed by Task 5 to build type-2 (compressed) xref entries
-/// via `write_incremental_xref_stream`'s `compressed_members` parameter.
+/// member map is consumed by `write_pdf_incremental` (flpdf-9hc.5.9 Task 5)
+/// to build type-2 (compressed) xref entries via
+/// `merge_source_and_touched_offsets_for_xref_stream`'s `compressed_members`
+/// parameter.
 ///
 /// Container framing is emitted via `write_object` (single unconditional `\n`
 /// before `endstream`); unlike the full-rewrite ObjStm path it does not
