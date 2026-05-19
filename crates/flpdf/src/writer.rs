@@ -918,9 +918,10 @@ fn allocate_incremental_objstm_container(
 ///
 /// Container framing is emitted via `write_object` (single unconditional `\n`
 /// before `endstream`); unlike the full-rewrite ObjStm path it does not
-/// consult `options.newline_before_endstream`. Observable only under
-/// `NewlineBeforeEndstream::No` with a payload ending in `\n`/`\r` (not the
-/// default). Revisit if the Task 6 qpdf cross-check exposes a delta.
+/// consult `options.newline_before_endstream`. The `incremental_generate_qpdf_check`
+/// cross-check confirms `qpdf --check` reports no delta under the default
+/// `NewlineBeforeEndstream::Yes`; a divergence is only possible under
+/// `NewlineBeforeEndstream::No` with a payload ending in `\n`/`\r`.
 ///
 /// Wired into the incremental write path by `write_pdf_incremental`
 /// (flpdf-9hc.5.9 Task 5).
