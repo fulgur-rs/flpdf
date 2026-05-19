@@ -90,7 +90,10 @@ fn repaired_output_passes_qpdf_check() {
         eprintln!("qpdf not available; skipping qpdf --check verification");
         return;
     }
-    let tmp = std::env::temp_dir().join("flpdf_qdf_fix_check.pdf");
+    // Per-invocation unique temp dir: a fixed shared path races under
+    // parallel `cargo test` / concurrent CI jobs (flpdf-9hc.26).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tmp = dir.path().join("fix-check.pdf");
     for case in [
         "corrupt-length",
         "corrupt-shift",
@@ -112,7 +115,7 @@ fn repaired_output_passes_qpdf_check() {
             String::from_utf8_lossy(&out.stdout)
         );
     }
-    let _ = fs::remove_file(&tmp);
+    // `dir` (TempDir) is removed on drop — no manual cleanup needed.
 }
 
 /// If the live `fix-qdf` oracle is present, confirm our committed goldens still
@@ -468,7 +471,9 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
 
     // qpdf must accept the closed-loop result.
     if Command::new("qpdf").arg("--version").output().is_ok() {
-        let tmp = std::env::temp_dir().join("flpdf_qdf_closed_loop.pdf");
+        // Per-invocation unique temp dir (flpdf-9hc.26).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tmp = dir.path().join("closed-loop.pdf");
         fs::write(&tmp, &fixed).unwrap();
         let out = Command::new("qpdf")
             .arg("--check")
@@ -480,7 +485,7 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
             "qpdf --check failed on closed-loop output:\n{}",
             String::from_utf8_lossy(&out.stdout)
         );
-        let _ = fs::remove_file(&tmp);
+        // `dir` (TempDir) is removed on drop.
     } else {
         eprintln!("qpdf not available; skipping qpdf --check in closed-loop test");
     }
