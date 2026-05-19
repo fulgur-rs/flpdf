@@ -343,6 +343,17 @@ pub fn write_pdf_with_options<R: Read + Seek, W: Write>(
     write_pdf_incremental(pdf, out, options)
 }
 
+/// Bookkeeping for a Generate-mode incremental ObjStm container: its
+/// allocated reference, its byte offset within the appended section (a
+/// type-1 / plain xref entry), and the `member number -> (container number,
+/// index)` map used to emit type-2 (compressed) xref-stream entries.
+struct ObjStmIncremental {
+    container: ObjectRef,
+    container_offset: usize,
+    /// member number -> (container number, index)
+    compressed: BTreeMap<u32, (u32, u32)>,
+}
+
 fn write_pdf_incremental<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
@@ -361,20 +372,69 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     let source_xref_offsets = build_source_xref_offsets(pdf.source_xref_entries());
     let (touched_object_refs, deleted_object_refs, touched_objstm_members) =
         collect_touched_object_refs(pdf);
-    let mut xref_offsets = write_incremental_objects(&mut bytes, pdf, &touched_object_refs)?;
+
+    // flpdf-9hc.5.9 Task 5: Generate-mode incremental ObjStm packing. The gate
+    // is exactly (Generate mode) AND (source last xref is a stream) AND
+    // (non-empty packable). If any condition fails the path is byte-identical
+    // to plain incremental: `plain_touched == touched_object_refs` and
+    // `objstm_inc` stays `None`. `touched_objstm_members` (existing-ObjStm
+    // members) and `deleted_object_refs` are untouched and continue through
+    // their existing paths.
+    let empty_compressed: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+    let use_objstm = options.object_streams == ObjectStreamMode::Generate
+        && matches!(pdf.last_xref_form(), XrefForm::Stream);
+
+    let mut objstm_inc: Option<ObjStmIncremental> = None;
+    let plain_touched: Vec<ObjectRef> = if use_objstm {
+        let (packable, plain_remaining) = partition_objstm_eligible(pdf, &touched_object_refs)?;
+        if packable.is_empty() {
+            touched_object_refs.clone()
+        } else {
+            let declared =
+                resolve_xref_stream_object_count(pdf.trailer().get("Size"), &source_xref_offsets);
+            let container = allocate_incremental_objstm_container(
+                &source_xref_offsets,
+                &touched_object_refs,
+                &deleted_object_refs,
+                declared,
+            )?;
+            let (container_offset, members) =
+                write_incremental_objstm(&mut bytes, pdf, container, &packable, options)?;
+            let mut compressed = BTreeMap::new();
+            for (r, idx) in members {
+                compressed.insert(r.number, (container.number, idx));
+            }
+            objstm_inc = Some(ObjStmIncremental {
+                container,
+                container_offset,
+                compressed,
+            });
+            plain_remaining
+        }
+    } else {
+        touched_object_refs.clone()
+    };
+
+    let mut xref_offsets = write_incremental_objects(&mut bytes, pdf, &plain_touched)?;
+    if let Some(oi) = &objstm_inc {
+        // The container is a plain (type-1) indirect object in the appended
+        // section; its byte offset was captured before any plain object.
+        xref_offsets.insert(oi.container.number, (0, oi.container_offset));
+    }
     let deleted_table_entries = build_deleted_table_entries(pdf, &deleted_object_refs);
     let rewritten_stream_offsets =
         write_updated_object_streams(&mut bytes, pdf, &touched_objstm_members)?;
     xref_offsets.extend(rewritten_stream_offsets);
     let final_offsets =
         merge_source_and_touched_offsets(&source_offsets, &xref_offsets, &deleted_table_entries);
-    // TODO(flpdf-9hc.5.9 Task 5): replace with the compressed-member map from write_incremental_objstm.
-    let empty_compressed = BTreeMap::new();
     let final_xref_offsets = merge_source_and_touched_offsets_for_xref_stream(
         &source_xref_offsets,
         &xref_offsets,
         &deleted_object_refs,
-        &empty_compressed,
+        objstm_inc
+            .as_ref()
+            .map(|o| &o.compressed)
+            .unwrap_or(&empty_compressed),
     );
     let mut object_count = match pdf.last_xref_form() {
         XrefForm::Table => resolve_object_count(pdf.trailer().get("Size"), &final_offsets),
@@ -382,6 +442,9 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
             resolve_xref_stream_object_count(pdf.trailer().get("Size"), &final_xref_offsets)
         }
     };
+    if let Some(oi) = &objstm_inc {
+        object_count = object_count.max(oi.container.number as usize + 1);
+    }
 
     let xref_offset = match pdf.last_xref_form() {
         XrefForm::Table => write_incremental_xref(&mut bytes, &final_offsets)?,
@@ -452,10 +515,8 @@ fn collect_touched_object_refs<R: Read + Seek>(
 /// Split `touched` into (objstm_packable, plain_remaining) using the same
 /// eligibility predicate as the full-rewrite ObjStm packer. Order-preserving.
 ///
-/// Wired into the incremental Generate-mode gate by a later task
-/// (flpdf-9hc.5.9 Task 5); `dead_code` is allowed until then, matching the
-/// `object_streams` module's own "consumed by upcoming code" allowance.
-#[allow(dead_code)]
+/// Wired into the incremental Generate-mode gate by `write_pdf_incremental`
+/// (flpdf-9hc.5.9 Task 5).
 fn partition_objstm_eligible<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     touched: &[ObjectRef],
@@ -820,9 +881,8 @@ fn next_xref_stream_object_number(
 /// space (source xref max, touched, deleted) so it never collides with a
 /// `delete_object` free entry.
 ///
-/// Wired into the incremental write path by Task 5 (flpdf-9hc.5.9); the
-/// `#[allow(dead_code)]` mirrors the Task 1 convention until then.
-#[allow(dead_code)]
+/// Wired into the incremental write path by `write_pdf_incremental`
+/// (flpdf-9hc.5.9 Task 5).
 fn allocate_incremental_objstm_container(
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
     touched: &[ObjectRef],
@@ -854,9 +914,14 @@ fn allocate_incremental_objstm_container(
 /// member map is consumed by Task 5 to build type-2 (compressed) xref entries
 /// via `write_incremental_xref_stream`'s `compressed_members` parameter.
 ///
-/// Wired into the incremental write path by Task 5 (flpdf-9hc.5.9); the
-/// `#[allow(dead_code)]` mirrors the Task 1 convention until then.
-#[allow(dead_code)]
+/// Container framing is emitted via `write_object` (single unconditional `\n`
+/// before `endstream`); unlike the full-rewrite ObjStm path it does not
+/// consult `options.newline_before_endstream`. Observable only under
+/// `NewlineBeforeEndstream::No` with a payload ending in `\n`/`\r` (not the
+/// default). Revisit if the Task 6 qpdf cross-check exposes a delta.
+///
+/// Wired into the incremental write path by `write_pdf_incremental`
+/// (flpdf-9hc.5.9 Task 5).
 fn write_incremental_objstm<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     pdf: &mut Pdf<R>,

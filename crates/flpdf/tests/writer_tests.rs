@@ -2,8 +2,8 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_pdf_with_options,
-    write_qdf, CompressStreams, Dictionary, Object, ObjectRef, Pdf, WriteOptions, XrefForm,
-    XrefOffset,
+    write_qdf, CompressStreams, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, WriteOptions,
+    XrefForm, XrefOffset,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -3124,4 +3124,167 @@ fn full_rewrite_preserves_catalog_version_verbatim_under_force_version() {
         ),
         other => panic!("expected /Catalog /Version /1.7 to be preserved, got {other:?}"),
     }
+}
+
+/// flpdf-9hc.5.9 Task 5: incremental write of an xref-stream source with
+/// `ObjectStreamMode::Generate` packs a mutated plain eligible object into a
+/// freshly-allocated ObjStm container appended in the incremental update.
+///
+/// All assertions go through the public reader API
+/// (`Pdf::open`/`resolve` and `load_xref_and_trailer`); no hand parsing of
+/// xref bytes. The plan's `pdf.compressed_parent(...)` check is expressed via
+/// `LoadedXref::entries` (`XrefOffset::Compressed`) because
+/// `Pdf::compressed_parent` / `Pdf::previous_xref_offset` are `pub(crate)`
+/// and not reachable from the integration-test crate.
+#[test]
+fn incremental_generate_roundtrip_packs_mutated_object_into_objstm() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut object_offsets = Vec::new();
+
+    let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+
+    add_object(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+    add_object(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut object_offsets,
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[0] as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_offsets[1] as u32, 0);
+
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, source_xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let source = bytes;
+    {
+        let mut src_reader = Cursor::new(&source);
+        let src_loaded = load_xref_and_trailer(&mut src_reader).unwrap();
+        assert_eq!(
+            src_loaded.last_xref_form,
+            XrefForm::Stream,
+            "fixture must be xref-stream form for the Generate gate to engage"
+        );
+    }
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+
+    // Mutate object 2 — a plain, gen-0, non-stream, /Type /Pages dict, which is
+    // eligible for ObjStm packing (only /ObjStm and /XRef types are blocked).
+    let mutated_ref = ObjectRef::new(2, 0);
+    let mutated_value = Object::Dictionary({
+        let mut d = Dictionary::new();
+        d.insert("Type", Object::Name(b"Pages".to_vec()));
+        d.insert("Count", Object::Integer(0));
+        d.insert("Kids", Object::Array(Vec::new()));
+        d.insert("FlpdfMutated", Object::Boolean(true));
+        d
+    });
+    pdf.set_object(mutated_ref, mutated_value.clone());
+
+    let mut options = WriteOptions::default();
+    options.object_streams = ObjectStreamMode::Generate;
+    options.full_rewrite = false;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Container number is whatever `allocate_incremental_objstm_container`
+    // computes: max(max_source=3, max_touched=2, max_deleted=0,
+    // declared_size-1=3) + 1 == 4.
+    let expected_container = ObjectRef::new(4, 0);
+
+    // (a)+(b): re-open and resolve via the reader API.
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
+    assert_eq!(
+        reopened.resolve(mutated_ref).unwrap(),
+        mutated_value,
+        "(a) mutated object must resolve to the new value"
+    );
+    let root_ref = reopened.root_ref().expect("expected /Root");
+    let Object::Dictionary(catalog) = reopened.resolve(root_ref).unwrap() else {
+        panic!("(b) /Root must still resolve to a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Type"),
+        Some(&Object::Name(b"Catalog".to_vec())),
+        "(b) untouched /Catalog must still resolve"
+    );
+
+    // (c): mutated object is now compressed into the new container at index 0,
+    // and the container resolves to an /ObjStm stream.
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.last_xref_form,
+        XrefForm::Stream,
+        "output must remain xref-stream form"
+    );
+    match loaded.entries.get(&mutated_ref) {
+        Some(XrefOffset::Compressed { stream, index }) => {
+            assert_eq!(
+                *stream, expected_container.number,
+                "(c) mutated object must be compressed into the new container"
+            );
+            assert_eq!(*index, 0, "(c) mutated object must be at ObjStm index 0");
+        }
+        other => panic!(
+            "(c) mutated object {mutated_ref:?} must have a compressed xref entry, got {other:?}"
+        ),
+    }
+    let Object::Stream(container_stream) = reopened.resolve(expected_container).unwrap() else {
+        panic!("(c) container {expected_container:?} must resolve to a stream");
+    };
+    assert_eq!(
+        container_stream.dict.get("Type"),
+        Some(&Object::Name(b"ObjStm".to_vec())),
+        "(c) container /Type must be /ObjStm"
+    );
+
+    // (d): trailer /Size covers the new container number.
+    let size = as_integer(
+        loaded
+            .trailer
+            .get("Size")
+            .expect("(d) appended xref stream must declare /Size"),
+    )
+    .expect("(d) /Size must be an integer");
+    assert!(
+        size > i64::from(expected_container.number),
+        "(d) trailer /Size ({size}) must be >= container number + 1 ({})",
+        expected_container.number + 1
+    );
+
+    // (e): /Prev points at the source's last startxref.
+    let prev = as_integer(
+        loaded
+            .trailer
+            .get("Prev")
+            .expect("(e) appended xref stream must carry /Prev"),
+    )
+    .expect("(e) /Prev must be an integer");
+    assert_eq!(
+        prev,
+        i64::try_from(source_xref_offset).unwrap(),
+        "(e) /Prev must equal the source's last startxref"
+    );
 }
