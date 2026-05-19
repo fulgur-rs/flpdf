@@ -253,8 +253,10 @@ struct Cli {
     linearize: bool,
     /// Use a fixed value for the trailer /ID's changing identifier
     /// (top-level alias of `flpdf rewrite --static-id`). Testing only;
-    /// never for production output. Emits a stderr warning when used
-    /// (suppress with the FLPDF_STATIC_ID_QUIET env var).
+    /// never for production output. This qpdf-shaped alias mirrors qpdf,
+    /// which is silent for `--static-id`, so it emits no warning; the
+    /// test-only diagnostic lives on the native `rewrite --static-id`
+    /// surface instead (flpdf-4x6).
     #[arg(long = "static-id")]
     static_id: bool,
     /// Strip encryption and advisory permission restrictions from the output
@@ -938,28 +940,33 @@ impl From<CliPasswordMode> for PasswordMode {
 ///
 /// `--static-id` exists purely so test/parity harnesses can produce a
 /// byte-stable trailer `/ID`; it must never be used for production output.
-/// `main` therefore emits a stderr warning whenever the flag is requested
-/// (flpdf-9hc.13.4). Test harnesses that legitimately need the deterministic
-/// ID — and that assert on a clean stderr to mirror qpdf's qtest "no output"
-/// condition — set this variable to opt out of the diagnostic. It is
-/// deliberately *not* a CLI flag: the top-level `--static-id` alias mirrors
-/// qpdf's command surface, which has no such switch.
+/// flpdf's *native* surface (`rewrite --static-id`) therefore emits a stderr
+/// warning whenever the flag is requested (flpdf-9hc.13.4). The top-level
+/// qpdf-shaped alias (`flpdf --static-id …`) exists solely to mirror qpdf's
+/// command surface, and qpdf emits no such warning — so the alias stays
+/// silent to honour that contract and keep the qtest parity suite green
+/// (flpdf-4x6).
+///
+/// This env var opts the *native* surface out of the diagnostic: harnesses
+/// that exercise `rewrite --static-id` and assert on a clean stderr set it.
+/// It is deliberately *not* a CLI flag (the qpdf-shaped alias has no such
+/// switch).
 const STATIC_ID_QUIET_ENV: &str = "FLPDF_STATIC_ID_QUIET";
 
-/// Returns true when `--static-id` was requested on either the top-level
-/// qpdf-shaped alias or the `rewrite` subcommand.
-fn static_id_requested(args: &Cli) -> bool {
-    if args.static_id {
-        return true;
-    }
+/// Returns true when `--static-id` was requested via flpdf's native
+/// `rewrite` subcommand. The top-level qpdf-shaped alias deliberately does
+/// *not* count here: it mirrors qpdf, which is silent for `--static-id`
+/// (flpdf-4x6).
+fn static_id_warning_applies(args: &Cli) -> bool {
     matches!(&args.command, Some(Commands::Rewrite(cmd)) if cmd.static_id)
 }
 
 /// Emit the test-only warning for `--static-id` exactly once, unless
 /// suppressed via [`STATIC_ID_QUIET_ENV`]. Writes to stderr only and never
-/// changes the process exit code.
+/// changes the process exit code. Only the native `rewrite` surface warns;
+/// the top-level qpdf-shaped alias stays silent for qpdf parity.
 fn warn_if_static_id(args: &Cli) {
-    if !static_id_requested(args) {
+    if !static_id_warning_applies(args) {
         return;
     }
     if std::env::var_os(STATIC_ID_QUIET_ENV).is_some() {
@@ -975,10 +982,12 @@ fn main() {
     let args = Cli::parse();
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
-    // for deterministic test/parity output; warn loudly (stderr only, exit
-    // code unchanged) so it is never mistaken for a production option. Done
-    // here, after clap parsing succeeds and before any rewrite work, so the
-    // warning never precedes a usage error yet is always visible.
+    // for deterministic test/parity output. The native `rewrite --static-id`
+    // surface warns loudly (stderr only, exit code unchanged) so it is never
+    // mistaken for a production option; the top-level qpdf-shaped alias stays
+    // silent to mirror qpdf (flpdf-4x6). Done here, after clap parsing
+    // succeeds and before any rewrite work, so the warning never precedes a
+    // usage error yet is always visible.
     warn_if_static_id(&args);
 
     // Top-level `--qdf --linearize` is rejected here, before the dispatch
