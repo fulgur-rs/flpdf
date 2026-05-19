@@ -446,6 +446,31 @@ fn collect_touched_object_refs<R: Read + Seek>(
     )
 }
 
+/// Split `touched` into (objstm_packable, plain_remaining) using the same
+/// eligibility predicate as the full-rewrite ObjStm packer. Order-preserving.
+///
+/// Wired into the incremental Generate-mode gate by a later task
+/// (flpdf-9hc.5.9 Task 5); `dead_code` is allowed until then, matching the
+/// `object_streams` module's own "consumed by upcoming code" allowance.
+#[allow(dead_code)]
+fn partition_objstm_eligible<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    touched: &[ObjectRef],
+) -> Result<(Vec<ObjectRef>, Vec<ObjectRef>)> {
+    let ctx = object_streams::eligibility_context(pdf)?;
+    let mut packable = Vec::new();
+    let mut plain = Vec::new();
+    for &r in touched {
+        let obj = pdf.resolve(r)?;
+        if object_streams::is_eligible_for_objstm(r, &obj, &ctx) {
+            packable.push(r);
+        } else {
+            plain.push(r);
+        }
+    }
+    Ok((packable, plain))
+}
+
 #[derive(Clone, Copy)]
 enum XrefTableEntry {
     InUse { generation: u16, offset: usize },
@@ -2220,5 +2245,96 @@ mod tests {
         );
         assert_eq!(str_bytes(&v[0]).len(), 16);
         assert_eq!(str_bytes(&v[1]).len(), 16);
+    }
+
+    // --- partition_objstm_eligible (flpdf-9hc.5.9, Task 1) ------------------
+
+    /// Build a minimal xref-table PDF with five resolvable indirects:
+    ///   1 0  Catalog            (plain dict — eligible, but used for /Root)
+    ///   2 0  Pages              (plain dict — eligible)
+    ///   3 0  neutral plain dict (eligible)
+    ///   4 0  stream object      (ineligible — Object::Stream)
+    ///   5 1  plain dict, gen 1  (ineligible — generation != 0)
+    fn build_partition_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        // (object_number, generation, offset)
+        let mut entries: Vec<(u32, u16, usize)> = Vec::new();
+
+        entries.push((1, 0, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        entries.push((2, 0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+        entries.push((3, 0, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n<< /Subtype /Marker /Value 42 >>\nendobj\n");
+
+        entries.push((4, 0, bytes.len()));
+        let stream_data = b"hello";
+        bytes.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", stream_data.len()).as_bytes(),
+        );
+        bytes.extend_from_slice(stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        entries.push((5, 1, bytes.len()));
+        bytes.extend_from_slice(b"5 1 obj\n<< /Subtype /OldGen /Value 7 >>\nendobj\n");
+
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (_num, generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn partition_objstm_eligible_splits_packable_and_plain_in_order() {
+        let bytes = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&bytes).expect("fixture must open");
+
+        let plain_dict = ObjectRef::new(3, 0);
+        let stream_ref = ObjectRef::new(4, 0);
+        let gen1_ref = ObjectRef::new(5, 1);
+
+        // Sanity-check the fixture is wired correctly before exercising the
+        // helper: each object must resolve to the expected variant.
+        assert!(
+            matches!(pdf.resolve(plain_dict).unwrap(), Object::Dictionary(_)),
+            "obj 3 must resolve as a plain dictionary"
+        );
+        assert!(
+            matches!(pdf.resolve(stream_ref).unwrap(), Object::Stream(_)),
+            "obj 4 must resolve as a stream"
+        );
+        assert!(
+            matches!(pdf.resolve(gen1_ref).unwrap(), Object::Dictionary(_)),
+            "obj 5 (gen 1) must resolve as a plain dictionary"
+        );
+
+        // Interleave the input so the assertion proves order preservation,
+        // not mere set membership.
+        let touched = [stream_ref, plain_dict, gen1_ref];
+        let (packable, plain) =
+            partition_objstm_eligible(&mut pdf, &touched).expect("partition must succeed");
+
+        assert_eq!(
+            packable,
+            vec![plain_dict],
+            "only the generation-0 non-stream dict is ObjStm-packable"
+        );
+        assert_eq!(
+            plain,
+            vec![stream_ref, gen1_ref],
+            "stream and gen!=0 objects stay plain, in original order"
+        );
     }
 }
