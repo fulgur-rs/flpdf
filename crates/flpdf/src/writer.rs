@@ -815,10 +815,12 @@ fn allocate_incremental_objstm_container(
     let max_source = source_offsets.keys().copied().next_back().unwrap_or(0);
     let max_touched = touched.iter().map(|r| r.number).max().unwrap_or(0);
     let max_deleted = deleted.iter().map(|r| r.number).max().unwrap_or(0);
+    let declared_u32 = u32::try_from(declared_size.saturating_sub(1))
+        .map_err(|_| crate::Error::Unsupported("declared /Size does not fit u32".to_string()))?;
     let base = max_source
         .max(max_touched)
         .max(max_deleted)
-        .max(declared_size.saturating_sub(1) as u32);
+        .max(declared_u32);
     let number = base.checked_add(1).ok_or_else(|| {
         crate::Error::Unsupported("ObjStm container number does not fit u32".to_string())
     })?;
@@ -2408,6 +2410,26 @@ mod tests {
             container,
             ObjectRef::new(30, 0),
             "declared_size must dominate when it exceeds all input numbers"
+        );
+    }
+
+    #[test]
+    fn allocate_incremental_objstm_container_zero_inputs() {
+        // Empty source/touched/deleted and declared_size = 0 pins the lower
+        // boundary: every max() collapses to 0, declared_size.saturating_sub(1)
+        // is 0, and base + 1 = 1 -> ObjectRef::new(1, 0).
+        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+        let touched: Vec<ObjectRef> = Vec::new();
+        let deleted: Vec<ObjectRef> = Vec::new();
+
+        let container =
+            allocate_incremental_objstm_container(&source_offsets, &touched, &deleted, 0)
+                .expect("allocation must succeed");
+
+        assert_eq!(
+            container,
+            ObjectRef::new(1, 0),
+            "zero/empty inputs must yield the minimal container number 1"
         );
     }
 }
