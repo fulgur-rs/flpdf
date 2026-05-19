@@ -799,6 +799,32 @@ fn next_xref_stream_object_number(
         .ok_or_else(|| crate::Error::Unsupported("xref object number does not fit u32".to_string()))
 }
 
+/// Allocate a fresh ObjStm container number strictly above the existing input
+/// space (source xref max, touched, deleted) so it never collides with a
+/// `delete_object` free entry.
+///
+/// Wired into the incremental write path by Task 5 (flpdf-9hc.5.9); the
+/// `#[allow(dead_code)]` mirrors the Task 1 convention until then.
+#[allow(dead_code)]
+fn allocate_incremental_objstm_container(
+    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    touched: &[ObjectRef],
+    deleted: &[ObjectRef],
+    declared_size: usize,
+) -> Result<ObjectRef> {
+    let max_source = source_offsets.keys().copied().next_back().unwrap_or(0);
+    let max_touched = touched.iter().map(|r| r.number).max().unwrap_or(0);
+    let max_deleted = deleted.iter().map(|r| r.number).max().unwrap_or(0);
+    let base = max_source
+        .max(max_touched)
+        .max(max_deleted)
+        .max(declared_size.saturating_sub(1) as u32);
+    let number = base.checked_add(1).ok_or_else(|| {
+        crate::Error::Unsupported("ObjStm container number does not fit u32".to_string())
+    })?;
+    Ok(ObjectRef::new(number, 0))
+}
+
 fn build_source_xref_offsets(
     source_offsets: BTreeMap<ObjectRef, XrefOffset>,
 ) -> BTreeMap<u32, (u16, XrefOffset)> {
@@ -2335,6 +2361,53 @@ mod tests {
             plain,
             vec![stream_ref, gen1_ref],
             "stream and gen!=0 objects stay plain, in original order"
+        );
+    }
+
+    // --- allocate_incremental_objstm_container (flpdf-9hc.5.9, Task 2) -------
+
+    #[test]
+    fn allocate_incremental_objstm_container_clears_all_input_space() {
+        // Max source key = 11, max touched num = 9, max deleted num = 15.
+        // The container must sit strictly above every input number so it can
+        // never collide with a delete_object free entry: 15 + 1 = 16.
+        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::from([
+            (4, (0, XrefOffset::Offset(100))),
+            (11, (0, XrefOffset::Offset(200))),
+        ]);
+        let touched = vec![ObjectRef::new(7, 0), ObjectRef::new(9, 0)];
+        let deleted = vec![ObjectRef::new(15, 0), ObjectRef::new(3, 0)];
+
+        let container =
+            allocate_incremental_objstm_container(&source_offsets, &touched, &deleted, 0)
+                .expect("allocation must succeed");
+
+        assert_eq!(
+            container,
+            ObjectRef::new(16, 0),
+            "container number must be max(source,touched,deleted) + 1"
+        );
+        assert_eq!(container.generation, 0, "container generation must be 0");
+    }
+
+    #[test]
+    fn allocate_incremental_objstm_container_respects_declared_size() {
+        // Source/touched/deleted are all tiny, but declared /Size = 30 means
+        // numbers up to 29 are reserved; the container must be 30, i.e.
+        // declared_size.saturating_sub(1) + 1.
+        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> =
+            BTreeMap::from([(2, (0, XrefOffset::Offset(50)))]);
+        let touched = vec![ObjectRef::new(1, 0)];
+        let deleted = vec![ObjectRef::new(3, 0)];
+
+        let container =
+            allocate_incremental_objstm_container(&source_offsets, &touched, &deleted, 30)
+                .expect("allocation must succeed");
+
+        assert_eq!(
+            container,
+            ObjectRef::new(30, 0),
+            "declared_size must dominate when it exceeds all input numbers"
         );
     }
 }
