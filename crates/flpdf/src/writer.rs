@@ -368,6 +368,7 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     xref_offsets.extend(rewritten_stream_offsets);
     let final_offsets =
         merge_source_and_touched_offsets(&source_offsets, &xref_offsets, &deleted_table_entries);
+    // TODO(flpdf-9hc.5.9 Task 5): replace with the compressed-member map from write_incremental_objstm.
     let empty_compressed = BTreeMap::new();
     let final_xref_offsets = merge_source_and_touched_offsets_for_xref_stream(
         &source_xref_offsets,
@@ -713,16 +714,17 @@ fn merge_source_and_touched_offsets_for_xref_stream(
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
     touched_offsets: &BTreeMap<u32, (u16, usize)>,
     deleted_object_refs: &[ObjectRef],
-    compressed: &BTreeMap<u32, (u32, u32)>,
+    compressed_members: &BTreeMap<u32, (u32, u32)>,
 ) -> BTreeMap<u32, (u16, XrefOffset)> {
     let mut merged = source_offsets.clone();
     for (number, (generation, offset)) in touched_offsets {
         merged.insert(*number, (*generation, XrefOffset::Offset(*offset as u64)));
     }
-    for (number, (stream, index)) in compressed {
+    for (number, (stream, index)) in compressed_members {
         merged.insert(
             *number,
             (
+                // Type-2 (compressed) xref entries require the object's generation to be 0 (ISO 32000-1 §7.5.8.3); the third field carries the ObjStm index, not a generation.
                 0,
                 XrefOffset::Compressed {
                     stream: *stream,
@@ -2512,5 +2514,52 @@ mod tests {
             Some(&(2, XrefOffset::Offset(999))),
             "untouched source-only entry must pass through unchanged"
         );
+    }
+
+    #[test]
+    fn merge_source_and_touched_offsets_for_xref_stream_overlap_precedence() {
+        // Characterises the loop-ordering contract: touched -> compressed -> deleted.
+        // Object 8: present in BOTH touched_offsets AND compressed_members.
+        //           The compressed loop runs after the touched loop, so it must win.
+        // Object 9: present in BOTH compressed_members AND deleted_object_refs.
+        //           The deleted loop runs last, so Free must win.
+        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+
+        let mut touched: BTreeMap<u32, (u16, usize)> = BTreeMap::new();
+        touched.insert(8, (0, 100));
+
+        let mut compressed_members: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+        compressed_members.insert(8, (20, 3));
+        compressed_members.insert(9, (21, 4));
+
+        let deleted = vec![ObjectRef::new(9, 0)];
+
+        let merged = merge_source_and_touched_offsets_for_xref_stream(
+            &source_offsets,
+            &touched,
+            &deleted,
+            &compressed_members,
+        );
+
+        // Object 8: compressed loop runs after touched -> Compressed wins.
+        assert_eq!(
+            merged.get(&8),
+            Some(&(
+                0,
+                XrefOffset::Compressed {
+                    stream: 20,
+                    index: 3
+                }
+            )),
+            "object in both touched and compressed must resolve to Compressed (compressed loop runs after touched)"
+        );
+
+        // Object 9: deleted loop runs last -> Free wins over Compressed.
+        match merged.get(&9) {
+            Some((_, XrefOffset::Free { .. })) => {}
+            other => panic!(
+                "object in both compressed and deleted must resolve to Free (deleted loop runs last), got {other:?}"
+            ),
+        }
     }
 }
