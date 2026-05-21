@@ -333,6 +333,38 @@ fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) 
     Ok(decoded)
 }
 
+/// Apply a single PNG filter to one byte and return the encoded (filtered) byte.
+///
+/// Shared between the optimum-cost loop and the per-row encoding loop so that
+/// the filter logic exists in exactly one place.
+#[inline]
+fn png_filter_byte(filter: u8, raw: u8, left: u8, above: u8, upper_left: u8) -> u8 {
+    match filter {
+        0 => raw,
+        1 => raw.wrapping_sub(left),
+        2 => raw.wrapping_sub(above),
+        3 => {
+            let avg = ((u16::from(left) + u16::from(above)) / 2) as u8;
+            raw.wrapping_sub(avg)
+        }
+        4 => {
+            let p = i16::from(left) + i16::from(above) - i16::from(upper_left);
+            let pa = (p - i16::from(left)).abs();
+            let pb = (p - i16::from(above)).abs();
+            let pc = (p - i16::from(upper_left)).abs();
+            let predictor_val = if pa <= pb && pa <= pc {
+                left
+            } else if pb <= pc {
+                above
+            } else {
+                upper_left
+            };
+            raw.wrapping_sub(predictor_val)
+        }
+        _ => unreachable!("png_filter_byte expects filter in 0..=4"),
+    }
+}
+
 fn encode_png_predictor(
     bytes: &[u8],
     row_bytes: usize,
@@ -351,59 +383,36 @@ fn encode_png_predictor(
     let mut previous_row = vec![0u8; row_bytes];
 
     for raw_row in bytes.chunks_exact(row_bytes) {
-        // Determine which filter byte to use for this row
+        // Determine which filter byte to use for this row. For predictor 15
+        // (Optimum) we accumulate all 5 filters' costs in a single pass over
+        // the row to avoid iterating 5× and recomputing neighbor values for
+        // each filter (libpng minimum-sum heuristic).
         let filter_byte = if predictor == 15 {
-            // Optimum: pick filter 0..4 that minimises sum of |i8| of filtered bytes
-            let mut best_filter = 0u8;
-            let mut best_cost = u64::MAX;
-            for f in 0u8..5 {
-                let cost: u64 = (0..row_bytes)
-                    .map(|i| {
-                        let raw = raw_row[i];
-                        let left = if i >= bytes_per_pixel {
-                            raw_row[i - bytes_per_pixel]
-                        } else {
-                            0
-                        };
-                        let above = previous_row[i];
-                        let upper_left = if i >= bytes_per_pixel {
-                            previous_row[i - bytes_per_pixel]
-                        } else {
-                            0
-                        };
-                        let filtered = match f {
-                            0 => raw,
-                            1 => raw.wrapping_sub(left),
-                            2 => raw.wrapping_sub(above),
-                            3 => {
-                                let avg = ((u16::from(left) + u16::from(above)) / 2) as u8;
-                                raw.wrapping_sub(avg)
-                            }
-                            4 => {
-                                let p = left as i16 + above as i16 - upper_left as i16;
-                                let pa = (p - left as i16).abs();
-                                let pb = (p - above as i16).abs();
-                                let pc = (p - upper_left as i16).abs();
-                                let predictor_val = if pa <= pb && pa <= pc {
-                                    left
-                                } else if pb <= pc {
-                                    above
-                                } else {
-                                    upper_left
-                                };
-                                raw.wrapping_sub(predictor_val)
-                            }
-                            _ => unreachable!(),
-                        };
-                        u64::from((filtered as i8).unsigned_abs())
-                    })
-                    .sum();
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_filter = f;
+            let mut costs = [0u64; 5];
+            for i in 0..row_bytes {
+                let raw = raw_row[i];
+                let left = if i >= bytes_per_pixel {
+                    raw_row[i - bytes_per_pixel]
+                } else {
+                    0
+                };
+                let above = previous_row[i];
+                let upper_left = if i >= bytes_per_pixel {
+                    previous_row[i - bytes_per_pixel]
+                } else {
+                    0
+                };
+                for (f, cost) in costs.iter_mut().enumerate() {
+                    let filtered = png_filter_byte(f as u8, raw, left, above, upper_left);
+                    *cost += u64::from((filtered as i8).unsigned_abs());
                 }
             }
-            best_filter
+            costs
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &c)| c)
+                .map(|(i, _)| i as u8)
+                .expect("costs has 5 entries")
         } else {
             // Fixed filter: Predictor 10→0, 11→1, 12→2, 13→3, 14→4
             predictor - 10
@@ -424,35 +433,14 @@ fn encode_png_predictor(
             } else {
                 0
             };
-
-            let filtered = match filter_byte {
-                0 => raw,
-                1 => raw.wrapping_sub(left),
-                2 => raw.wrapping_sub(above),
-                3 => {
-                    let avg = ((u16::from(left) + u16::from(above)) / 2) as u8;
-                    raw.wrapping_sub(avg)
-                }
-                4 => {
-                    let p = left as i16 + above as i16 - upper_left as i16;
-                    let pa = (p - left as i16).abs();
-                    let pb = (p - above as i16).abs();
-                    let pc = (p - upper_left as i16).abs();
-                    let predictor_val = if pa <= pb && pa <= pc {
-                        left
-                    } else if pb <= pc {
-                        above
-                    } else {
-                        upper_left
-                    };
-                    raw.wrapping_sub(predictor_val)
-                }
-                _ => unreachable!(),
-            };
-            encoded.push(filtered);
+            encoded.push(png_filter_byte(filter_byte, raw, left, above, upper_left));
         }
 
-        previous_row = raw_row.to_vec();
+        // Reuse previous_row's buffer instead of allocating a fresh Vec each
+        // row. previous_row was initialised with `row_bytes` zeros and
+        // raw_row is row_bytes long (guaranteed by `chunks_exact(row_bytes)`),
+        // so the lengths always match.
+        previous_row.copy_from_slice(raw_row);
     }
 
     Ok(encoded)
