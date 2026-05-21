@@ -94,13 +94,23 @@ fn build_pdf_with_filter_array(
     );
 
     // Object 4: stream with the multi-filter chain.
+    //
+    // /DecodeParms is serialised into the stream header via Object::write_pdf
+    // (rather than left only in the in-memory dict consumed by encode) so the
+    // parameters are also visible to a subsequent reader/show-stream pass.
     offsets.push(pdf_bytes.len());
-    let stream_header = format!(
-        "4 0 obj\n<< /Length {} /Filter {} >>\nstream\n",
+    let mut stream_header = format!(
+        "4 0 obj\n<< /Length {} /Filter {}",
         encoded.len(),
         filter_array_str
-    );
-    pdf_bytes.extend_from_slice(stream_header.as_bytes());
+    )
+    .into_bytes();
+    if let Some(parms) = stream_dict.get("DecodeParms") {
+        stream_header.extend_from_slice(b" /DecodeParms ");
+        parms.write_pdf(&mut stream_header);
+    }
+    stream_header.extend_from_slice(b" >>\nstream\n");
+    pdf_bytes.extend_from_slice(&stream_header);
     pdf_bytes.extend_from_slice(&encoded);
     pdf_bytes.extend_from_slice(b"\nendstream\nendobj\n");
 
