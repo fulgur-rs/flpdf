@@ -85,7 +85,11 @@ fn chain_ascii85_then_flate_with_predictor_decode_params() {
     // 5 rows × 4 columns of raw image-like data — must be divisible by Columns (4)
     let columns: usize = 4;
     let row_count: usize = 5;
-    let raw: Vec<u8> = (0u8..((columns * row_count) as u8)).collect();
+    // Generate deterministic bytes that wrap at 256. Using a usize range with
+    // `% 256` keeps the test robust if these dimensions are ever raised above
+    // the point where columns * row_count exceeds 255 (where a plain
+    // `(0u8..(columns * row_count) as u8)` range would silently truncate).
+    let raw: Vec<u8> = (0..columns * row_count).map(|i| (i % 256) as u8).collect();
     assert_eq!(raw.len(), columns * row_count);
 
     // DecodeParms = [null, << /Predictor 12 /Columns 4 /Colors 1 /BitsPerComponent 8 >>]
