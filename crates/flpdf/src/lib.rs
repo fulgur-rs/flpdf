@@ -128,7 +128,7 @@ pub use subset_prune::prune_after_subset;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
     write_pdf_with_options, write_qdf, write_stream_to_buf, CompressStreams,
-    NewlineBeforeEndstream, ObjectStreamMode, WriteOptions,
+    NewlineBeforeEndstream, ObjectStreamMode, StreamDataMode, WriteOptions,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,

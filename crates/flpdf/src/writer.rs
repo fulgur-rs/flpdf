@@ -46,6 +46,84 @@ pub enum CompressStreams {
     No,
 }
 
+/// Controls how the full-rewrite path handles stream data.
+///
+/// This is the higher-level policy that mirrors qpdf's `--stream-data` option.
+/// When set on [`WriteOptions`], it **overrides** [`WriteOptions::compress_streams`]
+/// for regular indirect streams (non-xref, non-ObjStm container bodies).
+///
+/// # Semantics
+///
+/// | Variant      | Equivalent `CompressStreams` | Behaviour |
+/// |-------------|-------------------------------|-----------|
+/// | `Preserve`  | bypass (no decode/re-encode)  | Pass dict + raw data verbatim; `apply_stream_compress_policy` is not called |
+/// | `Uncompress`| `CompressStreams::No`         | Decode through all declared filters, emit raw bytes without any `/Filter` |
+/// | `Compress`  | `CompressStreams::Yes`        | Decode, then re-encode with a single `/FlateDecode` filter |
+///
+/// # Interaction with `--compress-streams`
+///
+/// When `WriteOptions::stream_data` is `Some(mode)`, the mode takes precedence
+/// over `WriteOptions::compress_streams` for per-object stream bodies.
+/// Structural streams (xref streams, ObjStm containers) continue to use
+/// `compress_streams` regardless of `stream_data`.
+///
+/// # Interaction with QDF mode
+///
+/// When `WriteOptions::qdf` is `true`, QDF wins: every applicable stream is
+/// decoded to raw bytes (equivalent to `Uncompress`), overriding even
+/// `stream_data = Some(Preserve)`.  This matches qpdf's behaviour where `--qdf`
+/// takes precedence over `--stream-data=preserve`.
+///
+/// # Default
+///
+/// The default is `None` on [`WriteOptions`] — no `stream_data` is set — which
+/// preserves full backward compatibility with the existing `compress_streams`
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDataMode {
+    /// Pass streams through verbatim — no decode or re-encode.
+    ///
+    /// The stream dictionary and raw data bytes are emitted unchanged.  This
+    /// bypasses [`apply_stream_compress_policy`] entirely, so a stream carrying
+    /// `/Filter /FlateDecode` will still carry that filter in the output.
+    Preserve,
+    /// Decode and emit raw bytes without any `/Filter`.
+    ///
+    /// Equivalent to `CompressStreams::No`: the declared filter chain is decoded
+    /// and the raw bytes are written without any `/Filter` or `/DecodeParms`.
+    /// Streams that cannot be decoded (e.g. DCTDecode) are emitted verbatim.
+    Uncompress,
+    /// Decode and re-encode with a single `/FlateDecode` filter.
+    ///
+    /// Equivalent to `CompressStreams::Yes`: the declared filter chain is decoded
+    /// and the result is re-encoded with FlateDecode.
+    Compress,
+}
+
+/// Compute the effective stream policy for regular indirect streams.
+///
+/// Returns `Some(policy)` meaning "call `apply_stream_compress_policy` with
+/// this policy", or `None` meaning "preserve mode: skip decode/re-encode and
+/// emit the stream verbatim".
+///
+/// # Priority
+///
+/// 1. QDF mode (`options.qdf`) always returns `Some(CompressStreams::No)` —
+///    QDF requires fully decoded streams regardless of `stream_data`.
+/// 2. `options.stream_data = Some(mode)` overrides `options.compress_streams`.
+/// 3. `options.stream_data = None` falls back to `options.compress_streams`.
+pub(crate) fn effective_stream_policy(options: &WriteOptions) -> Option<CompressStreams> {
+    if options.qdf {
+        return Some(CompressStreams::No);
+    }
+    match options.stream_data {
+        Some(StreamDataMode::Preserve) => None,
+        Some(StreamDataMode::Uncompress) => Some(CompressStreams::No),
+        Some(StreamDataMode::Compress) => Some(CompressStreams::Yes),
+        None => Some(options.compress_streams),
+    }
+}
+
 /// Controls whether a newline is explicitly inserted immediately before the
 /// `endstream` keyword.
 ///
@@ -210,6 +288,28 @@ pub struct WriteOptions {
     /// [`RunLengthDecode`]: https://pdf.pizza/spec/7.4.5
     /// [`compress_streams`]: WriteOptions::compress_streams
     pub qdf: bool,
+
+    /// Higher-level stream data policy (qpdf `--stream-data={preserve,uncompress,compress}`).
+    ///
+    /// When set, this overrides [`compress_streams`] for regular indirect stream bodies.
+    /// Structural streams (xref streams and ObjStm containers) are not affected and
+    /// continue to use [`compress_streams`].
+    ///
+    /// | Value                          | Effect on regular streams            |
+    /// |-------------------------------|--------------------------------------|
+    /// | `None` (default)              | Fall back to `compress_streams`      |
+    /// | `Some(StreamDataMode::Preserve)` | Emit dict + raw bytes verbatim    |
+    /// | `Some(StreamDataMode::Uncompress)` | Decode, emit raw (no `/Filter`) |
+    /// | `Some(StreamDataMode::Compress)`   | Decode, re-encode with FlateDecode |
+    ///
+    /// **Note:** when `qdf = true`, QDF takes precedence over every `stream_data`
+    /// value (including `Preserve`) and forces decoded output.
+    ///
+    /// **Note:** JSON output paths (`json_inspect`) are not yet wired to this field;
+    /// only the full-rewrite path is affected (tracked separately).
+    ///
+    /// [`compress_streams`]: WriteOptions::compress_streams
+    pub stream_data: Option<StreamDataMode>,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
@@ -1605,13 +1705,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         );
 
         if let Object::Stream(stream) = object {
-            // QDF mode always decodes streams to raw bytes (CompressStreams::No).
-            // For non-QDF full-rewrite the compress_streams option governs.
-            let compress_policy = if options.qdf {
-                CompressStreams::No
-            } else {
-                options.compress_streams
-            };
+            // Determine the effective stream policy.
+            // QDF always wins (decoded), and effective_stream_policy handles
+            // that; None means preserve mode: emit the stream verbatim.
             // Capture the pre-policy /Length form so an existing indirect
             // holder (from a prior qdf pass) can be reused for byte-stable
             // idempotence instead of allocating a new number.
@@ -1621,7 +1717,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 }
                 _ => None,
             };
-            let reencoded = apply_stream_compress_policy(&stream, compress_policy);
+            let reencoded = match effective_stream_policy(options) {
+                Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
+                // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
+                None => Object::Stream(stream.clone()),
+            };
             if let Object::Stream(ref s) = reencoded {
                 if options.qdf {
                     // QDF: split the stream's /Length into a separate
