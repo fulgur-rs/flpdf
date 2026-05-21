@@ -269,28 +269,34 @@ fn stream_data_none_falls_back_to_compress_streams() {
     let raw = b"Backward-compat: stream_data=None must defer to compress_streams.";
     let src = make_pdf_with_stream(raw, Some(b"FlateDecode"));
 
-    // With stream_data=None and compress_streams=No, behaviour must equal the
-    // old compress_streams=No path (Uncompress semantics).
-    let mut opts_new = base_opts();
-    opts_new.stream_data = None;
-    opts_new.compress_streams = CompressStreams::No;
-    let mut opts_old = base_opts();
-    opts_old.stream_data = None;
-    opts_old.compress_streams = CompressStreams::No;
+    // Fallback path: `stream_data = None` + `compress_streams = No` must
+    // produce identical output to the explicit `stream_data = Some(Uncompress)`
+    // path. Comparing them (rather than two identical configs) is what makes
+    // this a regression test for the sentinel→Uncompress fallback.
+    let mut opts_fallback = base_opts();
+    opts_fallback.stream_data = None;
+    opts_fallback.compress_streams = CompressStreams::No;
+    let mut opts_explicit = base_opts();
+    opts_explicit.stream_data = Some(StreamDataMode::Uncompress);
+    // compress_streams must not affect the explicit path; set it to the opposite
+    // value to prove --stream-data overrides --compress-streams.
+    opts_explicit.compress_streams = CompressStreams::Yes;
 
-    let out_new = full_rewrite(&src, &opts_new);
-    let out_old = full_rewrite(&src, &opts_old);
+    let out_fallback = full_rewrite(&src, &opts_fallback);
+    let out_explicit = full_rewrite(&src, &opts_explicit);
 
-    let s_new = extract_stream_obj(&out_new);
-    let s_old = extract_stream_obj(&out_old);
+    let s_fallback = extract_stream_obj(&out_fallback);
+    let s_explicit = extract_stream_obj(&out_explicit);
 
     assert_eq!(
-        s_new.dict.get("Filter"),
-        s_old.dict.get("Filter"),
-        "backward compat: /Filter must match"
+        s_fallback.dict.get("Filter"),
+        s_explicit.dict.get("Filter"),
+        "fallback (None + compress_streams=No) and explicit (Some(Uncompress)) \
+         must agree on /Filter"
     );
     assert_eq!(
-        s_new.data, s_old.data,
-        "backward compat: stream data must match"
+        s_fallback.data, s_explicit.data,
+        "fallback (None + compress_streams=No) and explicit (Some(Uncompress)) \
+         must agree on stream data"
     );
 }
