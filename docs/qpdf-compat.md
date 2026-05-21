@@ -150,6 +150,16 @@ markdown diff so reviewers can pinpoint the regressing tuple.
 The PR template's `Compat matrix` checkbox is the human checkpoint:
 re-blessing a baseline must be a deliberate act, not an accident.
 
+## Multi-filter chain coverage
+
+Filter arrays such as `[/ASCII85Decode /FlateDecode]` and
+`[/FlateDecode /ASCIIHexDecode]` are supported on both the decode and
+encode paths. DecodeParms arrays with `null` entries (meaning "no
+parameters for this filter") are handled correctly. The
+`stream-data-uncompress` column in the compat matrix exercises the
+`--stream-data=uncompress` path on the existing fixture corpus, providing
+regression coverage for sub-6 filter-stripping logic.
+
 ## Where to dig deeper
 
 - `tests/golden/README.md` — qpdf version + per-reference index
