@@ -1535,8 +1535,17 @@ fn run_command(command: Commands) -> CliResult<()> {
                 CliYesNo::Yes => NewlineBeforeEndstream::Yes,
                 CliYesNo::No => NewlineBeforeEndstream::No,
             };
-            // --stream-data overrides --compress-streams when set.
+            // --stream-data overrides --compress-streams when set. The
+            // policy is only applied by the full-rewrite path; without this
+            // promotion the flag would be silently dropped on invocations
+            // that would otherwise take the incremental path (e.g. with
+            // --remove-unreferenced-resources=no on unencrypted input).
+            // Mirrors the same auto-promotion done for --qdf, --min-version,
+            // --force-version, and the content-mutation flags below.
             options.stream_data = cmd.stream_data.map(Into::into);
+            if options.stream_data.is_some() {
+                options.full_rewrite = true;
+            }
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
