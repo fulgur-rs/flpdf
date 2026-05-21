@@ -10,7 +10,7 @@ use flpdf::{
     check_reader_with_options, filters, fonts,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects, DecodeLevel,
-        JsonKey, JsonObjectSelector, StreamDataMode,
+        JsonKey, JsonObjectSelector, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
@@ -22,7 +22,7 @@ use flpdf::{
     resources::remove_unreferenced_resources,
     write_pdf_with_options, CompressStreams, Dictionary, NewlineBeforeEndstream, Object, ObjectRef,
     ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources, Severity,
-    Stream, WriteOptions,
+    Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -818,6 +818,19 @@ struct RewriteCommand {
           help = "Insert newline before endstream keyword (qpdf default: y)")]
     newline_before_endstream: CliYesNo,
 
+    /// Stream data mode (qpdf --stream-data={preserve,uncompress,compress}).
+    ///
+    /// Higher-level policy that overrides --compress-streams when set.
+    /// - `preserve`: pass streams through verbatim — no decode or re-encode.
+    /// - `uncompress`: decode streams and emit raw bytes (no /Filter).
+    /// - `compress`: decode streams and re-encode with /FlateDecode.
+    ///
+    /// Default: not set (falls back to --compress-streams).
+    /// When both --stream-data and --compress-streams are supplied, --stream-data wins.
+    /// Only affects the full-rewrite path.
+    #[arg(long = "stream-data", value_enum)]
+    stream_data: Option<CliStreamDataMode>,
+
     /// qpdf-compatible page-operation flags (--pages / --rotate /
     /// --split-pages / --collate / --empty). See [`PageOpArgs`].
     #[command(flatten)]
@@ -838,6 +851,27 @@ impl From<CliObjectStreamMode> for ObjectStreamMode {
             CliObjectStreamMode::Preserve => ObjectStreamMode::Preserve,
             CliObjectStreamMode::Disable => ObjectStreamMode::Disable,
             CliObjectStreamMode::Generate => ObjectStreamMode::Generate,
+        }
+    }
+}
+
+/// Stream data mode for `--stream-data` (qpdf-compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliStreamDataMode {
+    /// Pass streams through verbatim — no decode or re-encode.
+    Preserve,
+    /// Decode streams and emit raw bytes (no /Filter).
+    Uncompress,
+    /// Decode streams and re-encode with /FlateDecode.
+    Compress,
+}
+
+impl From<CliStreamDataMode> for StreamDataMode {
+    fn from(v: CliStreamDataMode) -> Self {
+        match v {
+            CliStreamDataMode::Preserve => StreamDataMode::Preserve,
+            CliStreamDataMode::Uncompress => StreamDataMode::Uncompress,
+            CliStreamDataMode::Compress => StreamDataMode::Compress,
         }
     }
 }
@@ -1272,9 +1306,9 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     };
 
     let stream_mode = match stream_data_raw {
-        "none" => StreamDataMode::None,
-        "inline" => StreamDataMode::Inline,
-        "file" => StreamDataMode::File {
+        "none" => JsonStreamDataMode::None,
+        "inline" => JsonStreamDataMode::Inline,
+        "file" => JsonStreamDataMode::File {
             prefix: prefix_default(),
         },
         other => {
@@ -1319,7 +1353,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // this scoping, --json-key=pages --json-stream-data=file would dump
     // every stream to the filesystem even though the qpdf section was
     // filtered out of the output.
-    if let StreamDataMode::File { ref prefix } = stream_mode {
+    if let JsonStreamDataMode::File { ref prefix } = stream_mode {
         let wanted_refs = collect_datafile_object_refs(&v2);
         // Reuse the same `pdf` handle the JSON was built from. Re-opening
         // the input here would risk the file being swapped mid-run, so the
@@ -1501,6 +1535,8 @@ fn run_command(command: Commands) -> CliResult<()> {
                 CliYesNo::Yes => NewlineBeforeEndstream::Yes,
                 CliYesNo::No => NewlineBeforeEndstream::No,
             };
+            // --stream-data overrides --compress-streams when set.
+            options.stream_data = cmd.stream_data.map(Into::into);
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
