@@ -1720,7 +1720,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             let reencoded = match effective_stream_policy(options) {
                 Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
                 // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
-                None => Object::Stream(stream.clone()),
+                // `stream` is owned (moved out of the resolved `object`) and is
+                // not used after this match, so we can move it directly instead
+                // of cloning the (potentially large) data buffer.
+                None => Object::Stream(stream),
             };
             if let Object::Stream(ref s) = reencoded {
                 if options.qdf {
