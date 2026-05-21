@@ -61,6 +61,9 @@ enum Flag {
     Plain,
     StaticId,
     Linearize,
+    /// Exercises `--stream-data=uncompress`, which strips all stream filters
+    /// and writes raw decoded bytes.  This column guards sub-6 regressions.
+    StreamDataUncompress,
 }
 
 impl Flag {
@@ -69,6 +72,7 @@ impl Flag {
             Flag::Plain => "plain",
             Flag::StaticId => "static-id",
             Flag::Linearize => "linearize",
+            Flag::StreamDataUncompress => "stream-data-uncompress",
         }
     }
 
@@ -78,6 +82,7 @@ impl Flag {
             Flag::Plain => &[],
             Flag::StaticId => &["--static-id"],
             Flag::Linearize => &["--linearize"],
+            Flag::StreamDataUncompress => &["--stream-data=uncompress"],
         }
     }
 }
@@ -139,6 +144,19 @@ const MATRIX: &[Entry] = &[
     Entry {
         fixture: "attachment-two-page.pdf",
         flag: Flag::StaticId,
+    },
+    // StreamDataUncompress column — guards the sub-6 --stream-data=uncompress path
+    Entry {
+        fixture: "one-page.pdf",
+        flag: Flag::StreamDataUncompress,
+    },
+    Entry {
+        fixture: "two-page.pdf",
+        flag: Flag::StreamDataUncompress,
+    },
+    Entry {
+        fixture: "three-page.pdf",
+        flag: Flag::StreamDataUncompress,
     },
 ];
 
