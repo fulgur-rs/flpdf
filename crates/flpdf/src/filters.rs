@@ -41,7 +41,7 @@ where
 }
 
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
-    encode_stream_data_with_filters(dict.get("Filter"), stream_data)
+    encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
 
 fn decode_stream_data_with_filters(
@@ -102,22 +102,30 @@ where
     }
 }
 
-fn encode_stream_data_with_filters(filter: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
+fn encode_stream_data_with_filters(
+    filter: Option<&Object>,
+    decode_params: Option<&Object>,
+    stream_data: &[u8],
+) -> Result<Vec<u8>> {
     match filter {
         None => Ok(stream_data.to_vec()),
         Some(Object::Name(filter_name)) => {
-            apply_single_filter_encode(filter_name, stream_data).map_err(Error::Unsupported)
+            let params = get_decode_params(decode_params, 0);
+            let after_predictor = apply_encode_params(params, stream_data)?;
+            apply_single_filter_encode(filter_name, &after_predictor).map_err(Error::Unsupported)
         }
         Some(Object::Array(filters)) => {
             // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
             // order, so encoding must apply them in reverse for round-tripping.
             let mut encoded = stream_data.to_vec();
-            for filter in filters.iter().rev() {
+            for (index, filter) in filters.iter().enumerate().rev() {
                 let Object::Name(filter_name) = filter else {
                     return Err(Error::Unsupported(
                         "unsupported stream filter type: expected name".to_string(),
                     ));
                 };
+                let params = get_decode_params(decode_params, index);
+                encoded = apply_encode_params(params, &encoded)?;
                 encoded = apply_single_filter_encode(filter_name, &encoded)
                     .map_err(Error::Unsupported)?;
             }
@@ -139,9 +147,14 @@ fn get_decode_params(params: Option<&Object>, index: usize) -> Option<&Object> {
     }
 }
 
-fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
+/// Extract PNG predictor parameters from a DecodeParms dictionary.
+///
+/// Returns `Ok(None)` when no predictor is needed (no dict, no Predictor key, or Predictor ≤ 1).
+/// Returns `Ok(Some((predictor, row_bytes, bytes_per_pixel)))` for PNG predictors 10..=15.
+/// Returns `Err` for Predictor 2 or any other unsupported value.
+fn extract_predictor_params(decode_params: Option<&Object>) -> Result<Option<(u8, usize, usize)>> {
     let Some(Object::Dictionary(params)) = decode_params else {
-        return Ok(stream_data.to_vec());
+        return Ok(None);
     };
 
     let predictor = match params.get("Predictor") {
@@ -153,11 +166,11 @@ fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Re
                 "/DecodeParms /Predictor must be integer".to_string(),
             ))
         }
-        None => return Ok(stream_data.to_vec()),
+        None => return Ok(None),
     };
 
     if predictor <= 1 {
-        return Ok(stream_data.to_vec());
+        return Ok(None);
     }
 
     if predictor == 2 {
@@ -227,7 +240,25 @@ fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Re
         .ok_or_else(|| Error::Unsupported("/DecodeParms /Predictor overflow".to_string()))?;
     let bytes_per_pixel = bits_per_pixel.div_ceil(8).max(1);
 
-    decode_png_predictor(stream_data, row_bytes, bytes_per_pixel)
+    Ok(Some((predictor, row_bytes, bytes_per_pixel)))
+}
+
+fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
+    match extract_predictor_params(decode_params)? {
+        None => Ok(stream_data.to_vec()),
+        Some((_predictor, row_bytes, bytes_per_pixel)) => {
+            decode_png_predictor(stream_data, row_bytes, bytes_per_pixel)
+        }
+    }
+}
+
+fn apply_encode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
+    match extract_predictor_params(decode_params)? {
+        None => Ok(stream_data.to_vec()),
+        Some((predictor, row_bytes, bytes_per_pixel)) => {
+            encode_png_predictor(stream_data, row_bytes, bytes_per_pixel, predictor)
+        }
+    }
 }
 
 fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) -> Result<Vec<u8>> {
@@ -300,6 +331,131 @@ fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) 
     }
 
     Ok(decoded)
+}
+
+fn encode_png_predictor(
+    bytes: &[u8],
+    row_bytes: usize,
+    bytes_per_pixel: usize,
+    predictor: u8,
+) -> Result<Vec<u8>> {
+    if row_bytes == 0 || !bytes.len().is_multiple_of(row_bytes) {
+        return Err(Error::Unsupported(
+            "raw data not divisible by row_bytes".to_string(),
+        ));
+    }
+
+    let row_count = bytes.len() / row_bytes;
+    // Each encoded row = 1 filter byte + row_bytes of filtered data
+    let mut encoded = Vec::with_capacity(row_count * (row_bytes + 1));
+    let mut previous_row = vec![0u8; row_bytes];
+
+    for raw_row in bytes.chunks_exact(row_bytes) {
+        // Determine which filter byte to use for this row
+        let filter_byte = if predictor == 15 {
+            // Optimum: pick filter 0..4 that minimises sum of |i8| of filtered bytes
+            let mut best_filter = 0u8;
+            let mut best_cost = u64::MAX;
+            for f in 0u8..5 {
+                let cost: u64 = (0..row_bytes)
+                    .map(|i| {
+                        let raw = raw_row[i];
+                        let left = if i >= bytes_per_pixel {
+                            raw_row[i - bytes_per_pixel]
+                        } else {
+                            0
+                        };
+                        let above = previous_row[i];
+                        let upper_left = if i >= bytes_per_pixel {
+                            previous_row[i - bytes_per_pixel]
+                        } else {
+                            0
+                        };
+                        let filtered = match f {
+                            0 => raw,
+                            1 => raw.wrapping_sub(left),
+                            2 => raw.wrapping_sub(above),
+                            3 => {
+                                let avg = ((u16::from(left) + u16::from(above)) / 2) as u8;
+                                raw.wrapping_sub(avg)
+                            }
+                            4 => {
+                                let p = left as i16 + above as i16 - upper_left as i16;
+                                let pa = (p - left as i16).abs();
+                                let pb = (p - above as i16).abs();
+                                let pc = (p - upper_left as i16).abs();
+                                let predictor_val = if pa <= pb && pa <= pc {
+                                    left
+                                } else if pb <= pc {
+                                    above
+                                } else {
+                                    upper_left
+                                };
+                                raw.wrapping_sub(predictor_val)
+                            }
+                            _ => unreachable!(),
+                        };
+                        u64::from((filtered as i8).unsigned_abs())
+                    })
+                    .sum();
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_filter = f;
+                }
+            }
+            best_filter
+        } else {
+            // Fixed filter: Predictor 10→0, 11→1, 12→2, 13→3, 14→4
+            predictor - 10
+        };
+
+        encoded.push(filter_byte);
+
+        for i in 0..row_bytes {
+            let raw = raw_row[i];
+            let left = if i >= bytes_per_pixel {
+                raw_row[i - bytes_per_pixel]
+            } else {
+                0
+            };
+            let above = previous_row[i];
+            let upper_left = if i >= bytes_per_pixel {
+                previous_row[i - bytes_per_pixel]
+            } else {
+                0
+            };
+
+            let filtered = match filter_byte {
+                0 => raw,
+                1 => raw.wrapping_sub(left),
+                2 => raw.wrapping_sub(above),
+                3 => {
+                    let avg = ((u16::from(left) + u16::from(above)) / 2) as u8;
+                    raw.wrapping_sub(avg)
+                }
+                4 => {
+                    let p = left as i16 + above as i16 - upper_left as i16;
+                    let pa = (p - left as i16).abs();
+                    let pb = (p - above as i16).abs();
+                    let pc = (p - upper_left as i16).abs();
+                    let predictor_val = if pa <= pb && pa <= pc {
+                        left
+                    } else if pb <= pc {
+                        above
+                    } else {
+                        upper_left
+                    };
+                    raw.wrapping_sub(predictor_val)
+                }
+                _ => unreachable!(),
+            };
+            encoded.push(filtered);
+        }
+
+        previous_row = raw_row.to_vec();
+    }
+
+    Ok(encoded)
 }
 
 fn apply_single_filter_decode(
@@ -853,5 +1009,111 @@ mod tests {
             encoded_array, encoded_name,
             "Array form with one filter should produce the same bytes as the Name form"
         );
+    }
+
+    // ----- PNG predictor encode round-trip tests -----
+
+    fn png_predictor_dict(predictor: i64, columns: i64) -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(predictor));
+        parms.insert("Columns", Object::Integer(columns));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+        dict
+    }
+
+    fn png_predictor_dict_rgb(predictor: i64, columns: i64) -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(predictor));
+        parms.insert("Columns", Object::Integer(columns));
+        parms.insert("Colors", Object::Integer(3));
+        parms.insert("BitsPerComponent", Object::Integer(8));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+        dict
+    }
+
+    /// Simple 2-row, 4-column grayscale raw data for predictor round-trip tests.
+    fn sample_raw_4x2() -> Vec<u8> {
+        vec![
+            10, 20, 30, 40, // row 0
+            50, 60, 70, 80, // row 1
+        ]
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_10_round_trip() {
+        let dict = png_predictor_dict(10, 4);
+        let raw = sample_raw_4x2();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_11_round_trip() {
+        let dict = png_predictor_dict(11, 4);
+        let raw = sample_raw_4x2();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_12_round_trip() {
+        let dict = png_predictor_dict(12, 4);
+        let raw = sample_raw_4x2();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_13_round_trip() {
+        let dict = png_predictor_dict(13, 4);
+        let raw = sample_raw_4x2();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_14_round_trip() {
+        let dict = png_predictor_dict(14, 4);
+        let raw = sample_raw_4x2();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_15_round_trip() {
+        let dict = png_predictor_dict(15, 4);
+        let raw = sample_raw_4x2();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_handles_multi_row() {
+        // row_bytes=8, rows=4 → 32 bytes total
+        let dict = png_predictor_dict(12, 8);
+        let raw: Vec<u8> = (0u8..32).collect();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_rgb_fixture_round_trip() {
+        // Colors=3, BitsPerComponent=8, Columns=4 → row_bytes=12, rows=4 → 48 bytes
+        let dict = png_predictor_dict_rgb(15, 4);
+        let raw: Vec<u8> = (0u8..48).collect();
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert_eq!(decoded, raw);
     }
 }
