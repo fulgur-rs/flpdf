@@ -14,8 +14,8 @@
 //!    `--linearize` is fatal (exit 1).
 //!
 //! qpdf is used only as an external `--check` oracle and follows the same
-//! skip policy as `cli_object_streams_qpdf_parity.rs`: hard-fail on Linux CI,
-//! soft-skip locally / on Windows / macOS.
+//! skip policy as `cli_object_streams_qpdf_parity.rs`: hard-fail on CI,
+//! soft-skip locally.
 
 use assert_cmd::Command;
 use predicates::prelude::*;

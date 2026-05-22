@@ -16,12 +16,12 @@
 //! resolved.  The KNOWN list is empty; any new qpdf warning will immediately hard-fail.
 //!
 //! When qpdf is not installed:
-//! - **Linux CI** (`CI` env var set, non-Windows): the test panics — qpdf is
-//!   treated as a hard requirement so missing it on CI is a build failure, not
-//!   a silent gap.  CI installs qpdf via `apt-get` so this branch normally
-//!   does not fire.
-//! - **Local runs and Windows CI**: prints a diagnostic message via
-//!   `eprintln!` and returns early (qpdf-dependent tests skip).
+//! - **CI** (`CI` env var set): the test panics — qpdf is treated as a hard
+//!   requirement so missing it on CI is a build failure, not a silent gap.
+//!   CI installs qpdf on Linux (apt), macOS (Homebrew) and Windows (choco),
+//!   so this branch normally does not fire.
+//! - **Local runs**: print a diagnostic message via `eprintln!` and return
+//!   early (qpdf-dependent tests skip).
 
 use assert_cmd::Command as CargoCommand;
 use std::path::{Path, PathBuf};
