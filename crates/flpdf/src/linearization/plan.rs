@@ -196,16 +196,25 @@ fn compute_closure<R: Read + Seek>(
                             if !seen_parents.insert(parent_ref) {
                                 continue;
                             }
-                            // Propagate genuine resolve failures (I/O or
-                            // parse errors) instead of silently degrading the
-                            // closure — mirrors the main BFS loop's
-                            // `pdf.resolve(current)?`. A parent that merely
-                            // resolves to a non-dictionary (e.g. a free or
-                            // missing object yielding Null) is still tolerated:
-                            // the walk just climbs past it.
-                            let parent_obj = pdf.resolve(parent_ref)?;
-                            let Object::Dictionary(parent_dict) = &parent_obj else {
-                                continue;
+                            // Resolve the parent. Genuine resolve failures
+                            // (I/O or parse errors) propagate via `?` instead
+                            // of silently degrading the closure — mirroring
+                            // the main BFS loop's `pdf.resolve(current)?`.
+                            let parent_dict = match pdf.resolve(parent_ref)? {
+                                Object::Dictionary(dict) => dict,
+                                // A /Parent that indirects through a plain
+                                // reference object: follow the chain so the
+                                // real ancestor still joins the closure, as
+                                // the main BFS loop does via collect_direct_refs.
+                                // seen_parents bounds any reference cycle.
+                                Object::Reference(r) => {
+                                    to_visit.push(r);
+                                    continue;
+                                }
+                                // Any other non-dictionary parent (a free or
+                                // missing object resolving to Null, etc.) is
+                                // tolerated: the walk just climbs past it.
+                                _ => continue,
                             };
                             for (pk, pv) in parent_dict.iter() {
                                 if pk == b"Kids" {
@@ -1774,6 +1783,98 @@ mod tests {
         assert!(
             result.is_err(),
             "from_pdf must propagate a /Parent-chain resolve error, got Ok"
+        );
+    }
+
+    /// Build a single-page PDF whose page `/Parent` indirects through a plain
+    /// reference object (`4 0 obj  5 0 R  endobj`) before reaching the real
+    /// ancestor `/Pages` node (object 5), which carries an inherited
+    /// `/Resources`.
+    ///
+    /// PDF allows an indirect object to hold a bare reference, so `resolve`
+    /// can legitimately return `Object::Reference`. The `/Parent` walk must
+    /// follow that chain — exactly as the main BFS loop does via
+    /// `collect_direct_refs` — or the inherited resource is silently dropped
+    /// from the closure.
+    fn reference_chain_parent_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        // Real page tree used by page_refs (walks /Kids downward only).
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        // Page leaf: /Parent points at object 4, a reference-chain hop.
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        // Object 4: a plain indirect reference to object 5 — resolve(4 0 R)
+        // returns Object::Reference(5 0 R), not a dictionary.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n5 0 R\nendobj\n");
+
+        // Object 5: the real ancestor /Pages node, carrying inherited
+        // /Resources that must join the page closure once the chain is walked.
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Type /Pages /Resources 6 0 R >>\nendobj\n");
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n");
+
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref_section = format!(
+            "xref\n0 8\n\
+            0000000000 65535 f \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n",
+            off1, off2, off3, off4, off5, off6, off7,
+        );
+        pdf.extend_from_slice(xref_section.as_bytes());
+
+        let trailer = format!(
+            "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref_start,
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        pdf
+    }
+
+    /// flpdf-ws2 (PR review): the `/Parent`-chain walk must follow a parent
+    /// that resolves to a bare `Object::Reference`, mirroring the main BFS
+    /// loop. Otherwise inherited resources reached through a reference-chain
+    /// `/Parent` are silently stranded outside the page closure.
+    #[test]
+    fn from_pdf_follows_reference_chain_parent() {
+        let bytes = reference_chain_parent_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        // Single-page document: the page's whole closure is Part 2.
+        let resources_ref = ObjectRef::new(6, 0);
+        let font_ref = ObjectRef::new(7, 0);
+        assert!(
+            plan.part2_objects.contains(&resources_ref),
+            "/Resources reached through a reference-chain /Parent must join the page closure"
+        );
+        assert!(
+            plan.part2_objects.contains(&font_ref),
+            "/Font reached transitively via the inherited /Resources must join the closure"
         );
     }
 
