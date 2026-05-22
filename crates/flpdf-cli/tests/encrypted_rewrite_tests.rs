@@ -231,13 +231,9 @@ fn ensure_qpdf_or_skip() -> bool {
     }
 
     let on_ci = std::env::var_os("CI").is_some();
-    // Windows (choco) and macOS (Homebrew) both hit the separately-tracked
-    // qpdf vector::_M_range_check defect (flpdf-d4k), so CI deliberately does
-    // not install qpdf there — treat both as skip-allowed, not a hard-fail.
-    let qpdf_install_skipped = cfg!(any(target_os = "windows", target_os = "macos"));
-    if on_ci && !qpdf_install_skipped {
+    if on_ci {
         panic!(
-            "qpdf is required for encrypted plaintext rewrite tests on CI (Linux); install qpdf before running this test suite"
+            "qpdf is required for encrypted plaintext rewrite tests on CI; install qpdf before running this test suite"
         );
     }
     eprintln!(

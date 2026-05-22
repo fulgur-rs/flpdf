@@ -35,17 +35,16 @@ fn qpdf_available() -> bool {
 }
 
 /// Returns `true` when the caller should return early (qpdf missing and skip
-/// allowed). Panics on Linux CI where qpdf is a hard dependency.
+/// allowed). Panics on CI where qpdf is a hard dependency.
 #[must_use]
 fn skip_if_qpdf_missing() -> bool {
     if qpdf_available() {
         return false;
     }
     let on_ci = std::env::var_os("CI").is_some();
-    let qpdf_install_skipped = cfg!(any(target_os = "windows", target_os = "macos"));
-    if on_ci && !qpdf_install_skipped {
+    if on_ci {
         panic!(
-            "qpdf is required for cli_qdf tests on CI (Linux); install qpdf \
+            "qpdf is required for cli_qdf tests on CI; install qpdf \
              in the workflow before running this test suite"
         );
     }
@@ -76,7 +75,10 @@ fn fixture_with_stream() -> tempfile::NamedTempFile {
     let objects: Vec<Vec<u8>> = vec![
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
         b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n"
+        // `/Resources` is a required (inheritable) Page attribute; qpdf 12.x
+        // warns and bumps `qpdf --check` to exit 3 without it (qpdf 11.x was
+        // silent), so the empty (but valid) resources dict is spelled out.
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> /Contents 4 0 R >>\nendobj\n"
             .to_vec(),
         b"4 0 obj\n<< /Length 9 >>\nstream\nHello PDF\nendstream\nendobj\n".to_vec(),
     ];

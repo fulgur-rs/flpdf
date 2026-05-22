@@ -52,10 +52,9 @@ fn skip_if_qpdf_missing() -> bool {
         return false;
     }
     let on_ci = std::env::var_os("CI").is_some();
-    let qpdf_install_skipped = cfg!(any(target_os = "windows", target_os = "macos"));
-    if on_ci && !qpdf_install_skipped {
+    if on_ci {
         panic!(
-            "qpdf is required for cli_qdf_roundtrip_matrix tests on CI (Linux); \
+            "qpdf is required for cli_qdf_roundtrip_matrix tests on CI; \
              install qpdf in the workflow before running this test suite"
         );
     }
@@ -67,15 +66,28 @@ fn skip_if_qpdf_missing() -> bool {
     true
 }
 
+/// Sentinel returned by [`qpdf_check_code`] when qpdf 12.x aborts `--check`
+/// with its upstream empty-page-tree `vector::at()` crash (flpdf-d4k) instead
+/// of producing a real exit code. The zero-page fixture (`minimal.pdf`) is a
+/// valid PDF — qpdf 11.x and the spec accept it — so callers treat this as
+/// "oracle unavailable for this input" and skip the qpdf gate. Self-heals
+/// once qpdf fixes the bug upstream.
+const QPDF_EMPTY_PAGE_TREE_BUG: i32 = i32::MIN;
+
 /// Exit code of `qpdf --check <path>` (0 = clean, 3 = succeeded with
-/// warnings, 2 = errors).
+/// warnings, 2 = errors), or [`QPDF_EMPTY_PAGE_TREE_BUG`] when qpdf hit the
+/// upstream zero-page crash. libstdc++ renders the crash as
+/// `vector::_M_range_check: ...`, libc++ (macOS) as a bare `vector`; both
+/// surface on stderr as a line starting `ERROR: vector`.
 fn qpdf_check_code(path: &Path) -> i32 {
-    ShellCommand::new("qpdf")
+    let out = ShellCommand::new("qpdf")
         .args(["--check", path.to_str().unwrap()])
-        .status()
-        .expect("failed to spawn qpdf")
-        .code()
-        .unwrap_or(-1)
+        .output()
+        .expect("failed to spawn qpdf");
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("ERROR: vector") {
+        return QPDF_EMPTY_PAGE_TREE_BUG;
+    }
+    out.status.code().unwrap_or(-1)
 }
 
 /// `qpdf --qdf <path> -` re-canonicalization exit code (qpdf re-parses the
@@ -118,11 +130,22 @@ fn qpdf_no_worse_than(actual: i32, baseline: i32) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `tests/fixtures` resolved relative to the crate manifest.
+///
+/// `canonicalize()` makes the path absolute and verifies it exists, but on
+/// Windows it returns a `\\?\`-verbatim path that the bundled `qpdf` binary
+/// cannot open (`qpdf: open ...: No such file or directory`). Strip that
+/// prefix so fixture paths handed to qpdf stay openable on every platform.
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
         .canonicalize()
-        .expect("tests/fixtures must exist")
+        .expect("tests/fixtures must exist");
+    // `\\?\D:\...` -> `D:\...`. CI/test checkouts always live on a drive,
+    // never a `\\?\UNC\...` share, so a plain prefix strip is sufficient.
+    match dir.to_str() {
+        Some(s) => PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s)),
+        None => dir,
+    }
 }
 
 fn fixture(rel: &str) -> PathBuf {
@@ -343,6 +366,14 @@ fn cell_a_rewrite_qdf_invariants_and_qpdf_parity() {
         }
 
         let out_code = qpdf_check_code(&out);
+        if out_code == QPDF_EMPTY_PAGE_TREE_BUG {
+            eprintln!(
+                "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                 skipping the qpdf gate for zero-page fixture {}",
+                spec.rel
+            );
+            continue;
+        }
         if spec.qpdf_clean {
             assert_eq!(
                 out_code, 0,
@@ -584,6 +615,14 @@ fn cell_c_qdf_to_normal_round_trip() {
             continue;
         }
         let code = qpdf_check_code(&normal);
+        if code == QPDF_EMPTY_PAGE_TREE_BUG {
+            eprintln!(
+                "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                 skipping the qpdf gate for zero-page fixture {}",
+                spec.rel
+            );
+            continue;
+        }
         if spec.qpdf_clean {
             assert_eq!(
                 code, 0,
@@ -637,11 +676,18 @@ fn cell_d_fix_qdf_is_noop_and_idempotent_on_clean() {
         // invariants (guards against fixture rot).
         assert_qdf_invariants(&clean_bytes, clean_name != "minimal-clean.qdf");
         if !skip_if_qpdf_missing() {
-            assert_eq!(
-                qpdf_check_code(&clean),
-                0,
-                "committed clean fixture {clean_name} must pass qpdf --check"
-            );
+            let code = qpdf_check_code(&clean);
+            if code == QPDF_EMPTY_PAGE_TREE_BUG {
+                eprintln!(
+                    "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                     skipping the qpdf gate for zero-page fixture {clean_name}"
+                );
+            } else {
+                assert_eq!(
+                    code, 0,
+                    "committed clean fixture {clean_name} must pass qpdf --check"
+                );
+            }
         }
     }
 }

@@ -151,9 +151,13 @@ fn distinct_pages_pdf(n: usize) -> tempfile::NamedTempFile {
     for i in 0..n {
         offsets.push(buf.len());
         let w = (i + 1) * 100;
+        // `/Resources` is a required (inheritable) Page attribute; qpdf 12.x
+        // warns ("Resources is missing or invalid") and bumps `qpdf --check`
+        // to exit 3 without it, where qpdf 11.x stayed silent.
         buf.extend_from_slice(
             format!(
-                "{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 200] >>\nendobj\n",
+                "{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 200] \
+                 /Resources << >> >>\nendobj\n",
                 3 + i
             )
             .as_bytes(),

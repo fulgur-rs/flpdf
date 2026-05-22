@@ -49,18 +49,17 @@ fn qpdf_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Same skip policy as `cli_static_id.rs`: hard-fail on Linux CI (qpdf is a
-/// required oracle there), soft-skip locally / on Windows when qpdf is absent.
+/// Same skip policy as `cli_static_id.rs`: hard-fail on CI (qpdf is a required
+/// oracle, installed on every runner), soft-skip locally when qpdf is absent.
 #[must_use]
 fn skip_if_qpdf_missing() -> bool {
     if qpdf_available() {
         return false;
     }
     let on_ci = std::env::var_os("CI").is_some();
-    let on_linux = cfg!(target_os = "linux");
-    if on_ci && on_linux {
+    if on_ci {
         panic!(
-            "qpdf is required for cli_linearize_objstm tests on CI (Linux); \
+            "qpdf is required for cli_linearize_objstm tests on CI; \
              install qpdf in the workflow before running this test suite"
         );
     }

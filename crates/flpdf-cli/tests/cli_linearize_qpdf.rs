@@ -73,30 +73,23 @@ fn qpdf_available() -> bool {
 /// caller should *return early* (qpdf is missing AND this environment is
 /// allowed to skip).
 ///
-/// On Linux CI (`CI` env var set, non-Windows) missing qpdf is a hard
-/// failure: the oracle tests are the only thing that catches regressions in
-/// flpdf's hint stream against an external tool, so silently skipping them
-/// would leave a blind spot.  CI installs qpdf via `apt-get` for this.
+/// On CI (`CI` env var set) missing qpdf is a hard failure on every runner:
+/// the oracle tests are the only thing that catches regressions in flpdf's
+/// hint stream against an external tool, so silently skipping them would
+/// leave a blind spot.  CI installs qpdf on Linux (apt), macOS (Homebrew)
+/// and Windows (choco).
 ///
-/// On Windows CI we do *not* install qpdf yet (choco's qpdf surfaces an
-/// unrelated runtime error on existing writer_tests output, tracked
-/// separately), so qpdf-dependent tests print a diagnostic via
-/// `eprintln!` and return early there.  Locally (no `CI` env var) tests
-/// behave the same way: a `skipping: ...` line is emitted on stderr and
-/// the test exits without exercising qpdf.
+/// Locally (no `CI` env var) a missing qpdf is allowed: a `skipping: ...`
+/// line is emitted on stderr and the test exits without exercising qpdf.
 #[must_use]
 fn skip_if_qpdf_missing() -> bool {
     if qpdf_available() {
         return false;
     }
     let on_ci = std::env::var_os("CI").is_some();
-    // Windows (choco) and macOS (Homebrew) both hit the separately-tracked
-    // qpdf vector::_M_range_check defect (flpdf-d4k), so CI deliberately does
-    // not install qpdf there — treat both as skip-allowed, not a hard-fail.
-    let qpdf_install_skipped = cfg!(any(target_os = "windows", target_os = "macos"));
-    if on_ci && !qpdf_install_skipped {
+    if on_ci {
         panic!(
-            "qpdf is required for cli_linearize_qpdf tests on CI (Linux); \
+            "qpdf is required for cli_linearize_qpdf tests on CI; \
              install qpdf in the workflow before running this test suite"
         );
     }
