@@ -468,12 +468,19 @@ pub fn build_qpdf_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
 ) -> Result<JsonValue, ConvertError> {
-    build_qpdf_key_with_stream_mode(pdf, metadata, &StreamDataMode::None)
+    // StreamDataMode::None emits dict only, so the decode level is irrelevant.
+    build_qpdf_key_with_stream_mode(
+        pdf,
+        metadata,
+        DecodeLevel::Generalized,
+        &StreamDataMode::None,
+    )
 }
 
 /// Like [`build_qpdf_key`], but accepts a [`StreamDataMode`] that controls
 /// whether each `obj:N M R` stream entry includes `data` (Inline) or
-/// `datafile` (File) alongside `dict`.
+/// `datafile` (File) alongside `dict`, plus a [`DecodeLevel`] that controls
+/// how the `Inline` payload is decoded (see [`stream_payload_for_decode_level`]).
 ///
 /// # Stream entry shapes
 ///
@@ -481,12 +488,19 @@ pub fn build_qpdf_key<R: Read + Seek>(
 /// - `Inline` → `{ "stream": { "data": "<base64>", "dict": ... } }`
 /// - `File`   → `{ "stream": { "datafile": "<prefix>-<obj_num>", "dict": ... } }`
 ///
+/// For `Inline`, `decode_level` selects between the raw filter-encoded bytes
+/// (`DecodeLevel::None`) and the filter-decoded content (any other level),
+/// matching `qpdf --json-stream-data=inline --decode-level=...`. `File` mode
+/// emits only the side-file path here; the caller writes the bytes and must
+/// apply the same `decode_level` (see [`stream_payload_for_decode_level`]).
+///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any object cannot be converted to JSON.
 pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
+    decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
 ) -> Result<JsonValue, ConvertError> {
     // ── 1. Build metadata object (fixed key order per qpdf v2 spec) ────────
@@ -533,9 +547,12 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
                         JsonValue::Object(vec![("dict".to_string(), dict_json)])
                     }
                     StreamDataMode::Inline => {
-                        // Encode raw stream bytes as base64 under "data".
+                        // Encode the stream payload as base64 under "data".
+                        // The payload is decoded per `decode_level` so that
+                        // Inline output matches `qpdf --decode-level=...`.
                         // Key order: data, dict (alphabetical).
-                        let data_str = base64_encode(&stream.data);
+                        let payload = stream_payload_for_decode_level(stream, decode_level);
+                        let data_str = base64_encode(&payload);
                         JsonValue::Object(vec![
                             ("data".to_string(), JsonValue::String(data_str)),
                             ("dict".to_string(), dict_json),
@@ -606,6 +623,33 @@ impl DecodeLevel {
             DecodeLevel::Generalized => "generalized",
             DecodeLevel::Specialized => "specialized",
             DecodeLevel::All => "all",
+        }
+    }
+}
+
+// ── stream_payload_for_decode_level ──────────────────────────────────────────
+
+/// Return the stream payload bytes to emit for a given [`DecodeLevel`].
+///
+/// `stream.data` is assumed to be the resolved (decrypted, but still
+/// filter-encoded) bytes returned by [`Pdf::resolve`](crate::reader::Pdf::resolve).
+///
+/// - [`DecodeLevel::None`] → the raw filter-encoded bytes, verbatim.
+/// - Any other level → the filter-decoded content, computed via
+///   [`crate::filters::decode_stream_data`].
+///
+/// flpdf only implements generalized filters, so `Generalized`, `Specialized`
+/// and `All` are equivalent here (qpdf treats `specialized`/`all` as supersets
+/// of `generalized`). When the filter pipeline cannot decode a stream — e.g. an
+/// unsupported filter such as `DCTDecode` — this falls back to the raw bytes
+/// rather than erroring, matching qpdf, which emits the raw payload for filters
+/// it does not decode rather than failing the whole document.
+pub fn stream_payload_for_decode_level(stream: &Stream, decode_level: DecodeLevel) -> Vec<u8> {
+    match decode_level {
+        DecodeLevel::None => stream.data.clone(),
+        DecodeLevel::Generalized | DecodeLevel::Specialized | DecodeLevel::All => {
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .unwrap_or_else(|_| stream.data.clone())
         }
     }
 }
@@ -2670,7 +2714,7 @@ pub fn build_qpdf_json_v2_with_options<R: Read + Seek>(
         pushed_inherited_page_resources: false,
         called_get_all_pages: true,
     };
-    let qpdf = build_qpdf_key_with_stream_mode(pdf, qpdf_metadata, stream_mode)?;
+    let qpdf = build_qpdf_key_with_stream_mode(pdf, qpdf_metadata, decode_level, stream_mode)?;
     pairs.push(("qpdf".to_string(), qpdf));
 
     Ok(JsonValue::Object(pairs))
@@ -6415,6 +6459,7 @@ mod tests {
     // build_qpdf_key_with_stream_mode result.
     fn get_obj7_stream_inner(
         pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>,
+        decode_level: DecodeLevel,
         mode: &StreamDataMode,
     ) -> Vec<(String, JsonValue)> {
         let meta = QpdfMetadata {
@@ -6424,7 +6469,7 @@ mod tests {
             called_get_all_pages: true,
         };
         let JsonValue::Array(elems) =
-            build_qpdf_key_with_stream_mode(pdf, meta, mode).expect("build failed")
+            build_qpdf_key_with_stream_mode(pdf, meta, decode_level, mode).expect("build failed")
         else {
             panic!("expected Array");
         };
@@ -6451,7 +6496,8 @@ mod tests {
     #[test]
     fn stream_data_mode_none_emits_dict_only() {
         let mut pdf = load_one_page_pdf();
-        let inner = get_obj7_stream_inner(&mut pdf, &StreamDataMode::None);
+        let inner =
+            get_obj7_stream_inner(&mut pdf, DecodeLevel::Generalized, &StreamDataMode::None);
         // Must have exactly one key: "dict"
         assert_eq!(
             inner.len(),
@@ -6462,32 +6508,73 @@ mod tests {
         assert_eq!(inner[0].0, "dict");
     }
 
-    // ── Test 2: StreamDataMode::Inline → data + dict; base64 round-trips ─────
+    // ── Test 2: StreamDataMode::Inline → data + dict; base64 shape ──────────
 
     #[test]
     fn stream_data_mode_inline_emits_base64_data_and_dict() {
         let mut pdf = load_one_page_pdf();
 
-        // First, capture the raw bytes of obj:7 to verify round-trip.
-        let oref = crate::ObjectRef::new(7, 0);
-        let obj7_raw = pdf.resolve_borrowed(oref).expect("resolve obj:7");
-        let raw_bytes = match obj7_raw {
-            Object::Stream(s) => s.data.clone(),
-            other => panic!("obj:7 is not a Stream: {other:?}"),
-        };
-
-        let inner = get_obj7_stream_inner(&mut pdf, &StreamDataMode::Inline);
+        let inner = get_obj7_stream_inner(&mut pdf, DecodeLevel::None, &StreamDataMode::Inline);
         // Must have exactly two keys: "data", "dict" (alphabetical)
         assert_eq!(inner.len(), 2, "Inline mode: expected 2 keys");
         assert_eq!(inner[0].0, "data", "first key must be 'data'");
         assert_eq!(inner[1].0, "dict", "second key must be 'dict'");
+        assert!(
+            matches!(&inner[0].1, JsonValue::String(_)),
+            "data must be a base64 String"
+        );
+    }
 
-        // The data value must be a base64 string that decodes back to raw_bytes.
+    // ── Test 2a: Inline + DecodeLevel::None emits the raw (filter-encoded)
+    //            stream bytes — matching `qpdf --decode-level=none`. ─────────
+
+    #[test]
+    fn stream_data_mode_inline_decode_level_none_emits_raw_bytes() {
+        let mut pdf = load_one_page_pdf();
+
+        // obj:7 of one-page.pdf is an ASCII85Decode+FlateDecode content stream.
+        // resolve() returns the decrypted-but-still-filter-encoded bytes.
+        let oref = crate::ObjectRef::new(7, 0);
+        let raw_bytes = match pdf.resolve(oref).expect("resolve obj:7") {
+            Object::Stream(s) => s.data.clone(),
+            other => panic!("obj:7 is not a Stream: {other:?}"),
+        };
+
+        let inner = get_obj7_stream_inner(&mut pdf, DecodeLevel::None, &StreamDataMode::Inline);
         let JsonValue::String(b64) = &inner[0].1 else {
             panic!("data is not a String");
         };
         let decoded = base64_decode_test_helper(b64);
-        assert_eq!(decoded, raw_bytes, "base64 round-trip failed");
+        assert_eq!(
+            decoded, raw_bytes,
+            "DecodeLevel::None must emit the raw filter-encoded stream bytes"
+        );
+    }
+
+    // ── Test 2b: Inline + DecodeLevel::Generalized emits the filter-decoded
+    //            content — matching `qpdf --decode-level=generalized`. ───────
+
+    #[test]
+    fn stream_data_mode_inline_decode_level_generalized_emits_decoded_bytes() {
+        let mut pdf = load_one_page_pdf();
+
+        let inner =
+            get_obj7_stream_inner(&mut pdf, DecodeLevel::Generalized, &StreamDataMode::Inline);
+        let JsonValue::String(b64) = &inner[0].1 else {
+            panic!("data is not a String");
+        };
+        let decoded = base64_decode_test_helper(b64);
+
+        // Ground truth captured from:
+        //   qpdf --json=2 --json-stream-data=inline --decode-level=generalized \
+        //        tests/fixtures/compat/one-page.pdf
+        let expected_prefix: &[u8] =
+            b"1 0 0 1 0 0 cm  BT /F1 12 Tf 14.4 TL ET\nBT 1 0 0 1 72 720 Tm";
+        assert!(
+            decoded.starts_with(expected_prefix),
+            "DecodeLevel::Generalized must emit filter-decoded content; got {:?}",
+            String::from_utf8_lossy(&decoded[..decoded.len().min(64)])
+        );
     }
 
     // ── Test 3: StreamDataMode::File → datafile path + dict ──────────────────
@@ -6497,6 +6584,7 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let inner = get_obj7_stream_inner(
             &mut pdf,
+            DecodeLevel::Generalized,
             &StreamDataMode::File {
                 prefix: "out".to_string(),
             },
@@ -6540,7 +6628,8 @@ mod tests {
                 called_get_all_pages: true,
             };
             let JsonValue::Array(elems) =
-                build_qpdf_key_with_stream_mode(&mut pdf, meta, mode).expect("build failed")
+                build_qpdf_key_with_stream_mode(&mut pdf, meta, DecodeLevel::Generalized, mode)
+                    .expect("build failed")
             else {
                 panic!("expected Array");
             };
@@ -6632,6 +6721,109 @@ mod tests {
         assert!(
             matches!(&stream_inner[0].1, JsonValue::String(_)),
             "data must be a String"
+        );
+    }
+
+    // ── Test 7: build_qpdf_json_v2_with_options threads DecodeLevel to the
+    //           qpdf key — None vs Generalized yield different stream data. ──
+
+    #[test]
+    fn build_qpdf_json_v2_with_options_threads_decode_level_to_qpdf_key() {
+        // Extract obj:7 0 R inline "data" base64 for a given DecodeLevel.
+        fn obj7_inline_data(decode_level: DecodeLevel) -> String {
+            let mut pdf = load_one_page_pdf();
+            let v2 =
+                build_qpdf_json_v2_with_options(&mut pdf, decode_level, &StreamDataMode::Inline)
+                    .expect("build failed");
+            let JsonValue::Object(top) = &v2 else {
+                panic!("top is not Object");
+            };
+            let qpdf = top
+                .iter()
+                .find(|(k, _)| k == "qpdf")
+                .map(|(_, v)| v)
+                .expect("qpdf key");
+            let JsonValue::Array(arr) = qpdf else {
+                panic!("qpdf not Array");
+            };
+            let JsonValue::Object(obj_map) = &arr[1] else {
+                panic!("qpdf[1] not Object");
+            };
+            let obj7 = obj_map
+                .iter()
+                .find(|(k, _)| k == "obj:7 0 R")
+                .map(|(_, v)| v)
+                .expect("obj:7");
+            let JsonValue::Object(obj7_pairs) = obj7 else {
+                panic!("obj:7 not Object");
+            };
+            let JsonValue::Object(stream_inner) = &obj7_pairs[0].1 else {
+                panic!("stream not Object");
+            };
+            let JsonValue::String(b64) = &stream_inner[0].1 else {
+                panic!("data not String");
+            };
+            b64.clone()
+        }
+
+        let none_b64 = obj7_inline_data(DecodeLevel::None);
+        let generalized_b64 = obj7_inline_data(DecodeLevel::Generalized);
+        assert_ne!(
+            none_b64, generalized_b64,
+            "DecodeLevel must reach the qpdf key: None and Generalized must differ \
+             for a filtered stream"
+        );
+
+        let generalized = base64_decode_test_helper(&generalized_b64);
+        assert!(
+            generalized.starts_with(b"1 0 0 1 0 0 cm  BT /F1 12 Tf"),
+            "Generalized must emit filter-decoded content via build_qpdf_json_v2_with_options"
+        );
+    }
+
+    // ── Test 8: stream_payload_for_decode_level helper ──────────────────────
+
+    #[test]
+    fn stream_payload_decode_level_none_returns_raw() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let raw_payload = b"raw payload";
+        let encoded = crate::filters::encode_stream_data(&dict, raw_payload).expect("encode");
+        let stream = Stream::new(dict, encoded.clone());
+        assert_eq!(
+            stream_payload_for_decode_level(&stream, DecodeLevel::None),
+            encoded,
+            "DecodeLevel::None must return the raw filter-encoded bytes verbatim"
+        );
+    }
+
+    #[test]
+    fn stream_payload_decode_level_generalized_decodes_filters() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let raw_payload = b"decode me through the filter pipeline";
+        let encoded = crate::filters::encode_stream_data(&dict, raw_payload).expect("encode");
+        let stream = Stream::new(dict, encoded);
+        assert_eq!(
+            stream_payload_for_decode_level(&stream, DecodeLevel::Generalized),
+            raw_payload,
+            "DecodeLevel::Generalized must return filter-decoded content"
+        );
+    }
+
+    #[test]
+    fn stream_payload_unsupported_filter_falls_back_to_raw() {
+        // flpdf cannot decode DCTDecode; qpdf emits the raw bytes for filters
+        // it does not decode, so the helper must fall back to raw rather than
+        // error out and break the whole JSON document.
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"DCTDecode".to_vec()));
+        let raw_payload = b"\xff\xd8\xff\xe0 not really a jpeg";
+        let stream = Stream::new(dict, raw_payload.to_vec());
+        assert_eq!(
+            stream_payload_for_decode_level(&stream, DecodeLevel::Generalized),
+            raw_payload,
+            "an undecodable filter must fall back to the raw stream bytes"
         );
     }
 

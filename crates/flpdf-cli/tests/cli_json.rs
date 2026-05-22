@@ -5,6 +5,7 @@
 ///   --json-key invalid / --json-object invalid /
 ///   --json-stream-data inline / --json-stream-data file side files.
 use assert_cmd::Command;
+use flpdf::{filters, Dictionary, Object};
 use predicates::prelude::*;
 use std::io::Write;
 
@@ -475,4 +476,139 @@ fn json_flag_conflicts_with_compress_streams() {
     ])
     .assert()
     .code(2);
+}
+
+// ===========================================================================
+// flpdf-5st: --json-stream-data must apply DecodeLevel to the stream payload.
+//
+// build_qpdf_json_v2_with_options is invoked with DecodeLevel::Generalized, so
+// inline `data` and file-mode side files must carry the *filter-decoded*
+// content (qpdf --decode-level=generalized), not the raw compressed bytes.
+// The fixtures above use unfiltered streams and cannot catch this — these
+// tests use a FlateDecode-wrapped content stream where decoded != raw.
+// ===========================================================================
+
+/// One-page PDF whose content stream (object `4 0 R`) is FlateDecode-wrapped.
+fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
+    let mut d = Dictionary::new();
+    d.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let encoded = filters::encode_stream_data(&d, content).expect("encode FlateDecode stream");
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            encoded.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&encoded);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 5\n\
+         0000000000 65535 f \n\
+         {off1:010} 00000 n \n\
+         {off2:010} 00000 n \n\
+         {off3:010} 00000 n \n\
+         {off4:010} 00000 n \n"
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+/// Minimal RFC 4648 base64 encoder, for asserting on inline `data` values.
+fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(A[((n >> 18) & 0x3F) as usize] as char);
+        out.push(A[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// --json-stream-data file: side files must hold the filter-decoded content.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_stream_data_file_side_file_holds_decoded_content() {
+    let content = b"BT /F1 24 Tf 1 0 0 1 100 700 Tm (Decoded side-file payload) Tj ET";
+    let input = write_temp_pdf(&one_page_pdf_with_flate_stream(content));
+    let temp = tempfile::tempdir().unwrap();
+    let out_path = temp.path().join("out.json");
+    let prefix = temp.path().join("sf").to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "--json-output",
+        out_path.to_str().unwrap(),
+        "--json-stream-data",
+        "file",
+        "--json-stream-prefix",
+        &prefix,
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let side_file = format!("{prefix}-004");
+    let written = std::fs::read(&side_file).expect("side file must exist");
+    assert_eq!(
+        written, content,
+        "file-mode side file must hold the filter-decoded content \
+         (DecodeLevel::Generalized), not the raw FlateDecode bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --json-stream-data inline: the base64 `data` must be the decoded content.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_stream_data_inline_holds_decoded_content() {
+    let content = b"BT /F1 24 Tf 1 0 0 1 100 700 Tm (Decoded inline payload) Tj ET";
+    let input = write_temp_pdf(&one_page_pdf_with_flate_stream(content));
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--json",
+        "--json-stream-data",
+        "inline",
+        input.path().to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    // Inline mode at DecodeLevel::Generalized must base64 the decoded content.
+    .stdout(predicate::str::contains(base64_encode(content)));
 }

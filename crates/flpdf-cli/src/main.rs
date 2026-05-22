@@ -10,7 +10,8 @@ use flpdf::{
     check_reader_with_options, filters, fonts,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
-        format_json_side_file_path, DecodeLevel, JsonKey, JsonObjectSelector,
+        format_json_side_file_path, stream_payload_for_decode_level, DecodeLevel, JsonKey,
+        JsonObjectSelector,
         StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
@@ -1546,7 +1547,12 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     let mut pdf = open_pdf(input, cli.repair, &cli.password)?;
 
     // 5. Build JSON.
-    let mut v2 = build_qpdf_json_v2_with_options(&mut pdf, DecodeLevel::Generalized, &stream_mode)
+    //
+    // `decode_level` governs both the inline `data` payloads (applied inside
+    // build_qpdf_json_v2_with_options) and the file-mode side files written in
+    // step 9 below — the two must agree, so they share this single value.
+    let decode_level = DecodeLevel::Generalized;
+    let mut v2 = build_qpdf_json_v2_with_options(&mut pdf, decode_level, &stream_mode)
         .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
     // 6. Apply --json-key filter.
@@ -1588,7 +1594,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
                 // Side-file name must match the JSON `datafile` value;
                 // both come from the same helper to avoid divergence.
                 let side_path = format_json_side_file_path(prefix, oref.number);
-                std::fs::write(&side_path, &stream.data)?;
+                // Apply the same DecodeLevel the JSON body was built with so
+                // the side file matches what inline mode would emit.
+                let payload = stream_payload_for_decode_level(&stream, decode_level);
+                std::fs::write(&side_path, payload)?;
             }
         }
     }
