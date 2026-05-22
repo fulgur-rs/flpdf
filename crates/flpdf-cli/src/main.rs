@@ -9,8 +9,9 @@ use flpdf::{
 use flpdf::{
     check_reader_with_options, filters, fonts,
     json_inspect::{
-        build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects, DecodeLevel,
-        JsonKey, JsonObjectSelector, StreamDataMode as JsonStreamDataMode,
+        build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
+        format_json_side_file_path, DecodeLevel, JsonKey, JsonObjectSelector,
+        StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
@@ -1361,11 +1362,9 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         for oref in wanted_refs {
             let obj = pdf.resolve(oref)?;
             if let Object::Stream(stream) = obj {
-                // qpdf names side files `<prefix>-<obj>` where <obj> is
-                // the bare object number with no zero-padding (verified
-                // against qpdf 11.9.0). Match that so tooling written
-                // against qpdf's layout finds the files.
-                let side_path = format!("{prefix}-{}", oref.number);
+                // Side-file name must match the JSON `datafile` value;
+                // both come from the same helper to avoid divergence.
+                let side_path = format_json_side_file_path(prefix, oref.number);
                 std::fs::write(&side_path, &stream.data)?;
             }
         }
