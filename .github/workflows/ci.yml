@@ -73,21 +73,28 @@ jobs:
         with:
           shared-key: ${{ matrix.cache-key }}
 
-      # qpdf is required by crates/flpdf-cli/tests/cli_linearize_qpdf.rs as
-      # an external oracle.  Install it on Linux (apt — covers both amd64 and
-      # the ubuntu-24.04-arm runner) so the oracle suite hard-fails on missing
-      # qpdf (skip_if_qpdf_missing).
+      # qpdf is an external oracle for the cross-check suites (cli_linearize_qpdf,
+      # cli_qdf*, cli_object_streams_qpdf_parity, writer_tests, ...). Install it
+      # on every runner so those suites hard-fail when qpdf is missing rather
+      # than silently skipping (skip_if_qpdf_missing).
       #
-      # On Windows AND macOS we deliberately do NOT install qpdf: both the
-      # choco (Windows) and Homebrew (macOS) packages surface the same
-      # unrelated qpdf runtime error on existing writer_tests output
-      # (vector::_M_range_check) — empirically reproduced on macos-latest via
-      # brew — tracked separately in flpdf-d4k.  The qpdf-dependent tests
-      # therefore skip silently on Windows/macOS runners (is_qpdf_available()
-      # == false) and the qpdf oracle gate only fires on Linux.
+      # qpdf 12.x (choco on Windows, Homebrew on macOS) aborts `qpdf --check`
+      # on a zero-page PDF with an upstream `std::vector::at()` crash
+      # (`ERROR: vector...`); the apt qpdf 11.x on Linux does not. The few
+      # tests that `qpdf --check` a zero-page fixture detect that crash by its
+      # stderr signature and skip just that gate (flpdf-d4k) — so qpdf can be
+      # installed on all runners without the upstream bug breaking CI.
       - name: Install qpdf (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y qpdf
+
+      - name: Install qpdf (macOS)
+        if: runner.os == 'macOS'
+        run: brew install qpdf
+
+      - name: Install qpdf (Windows)
+        if: runner.os == 'Windows'
+        run: choco install qpdf -y --no-progress
 
       - name: Run tests in required order
         shell: bash

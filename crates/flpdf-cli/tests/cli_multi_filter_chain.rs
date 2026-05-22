@@ -87,10 +87,16 @@ fn build_pdf_with_filter_array(
     offsets.push(pdf_bytes.len());
     pdf_bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
 
-    // Object 3: Page
+    // Object 3: Page.
+    //
+    // `/Resources` is a required (inheritable) Page attribute. qpdf 11.x
+    // tolerated its absence silently, but qpdf 12.x emits a `Resources is
+    // missing or invalid; repairing` warning that bumps `qpdf --check` to
+    // exit 3 — so the empty (but valid) resources dict is spelled out here.
     offsets.push(pdf_bytes.len());
     pdf_bytes.extend_from_slice(
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << >> /Contents 4 0 R >>\nendobj\n",
     );
 
     // Object 4: stream with the multi-filter chain.
