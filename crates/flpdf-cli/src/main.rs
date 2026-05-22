@@ -1597,7 +1597,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
                 // Apply the same DecodeLevel the JSON body was built with so
                 // the side file matches what inline mode would emit.
                 let payload = stream_payload_for_decode_level(&stream, decode_level);
-                std::fs::write(&side_path, payload)?;
+                std::fs::write(&side_path, &*payload)?;
             }
         }
     }

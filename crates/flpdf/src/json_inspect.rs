@@ -7,6 +7,7 @@
 use crate::json::JsonValue;
 use crate::object::{Dictionary, Object, Stream};
 use crate::reader::Pdf;
+use std::borrow::Cow;
 use std::io::{Read, Seek};
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
@@ -644,12 +645,21 @@ impl DecodeLevel {
 /// unsupported filter such as `DCTDecode` — this falls back to the raw bytes
 /// rather than erroring, matching qpdf, which emits the raw payload for filters
 /// it does not decode rather than failing the whole document.
-pub fn stream_payload_for_decode_level(stream: &Stream, decode_level: DecodeLevel) -> Vec<u8> {
+///
+/// Returns a [`Cow`] so the raw-bytes paths ([`DecodeLevel::None`] and the
+/// decode-error fallback) borrow `stream.data` instead of copying it — only the
+/// successful decode path allocates (it must: the decoded bytes are new).
+pub fn stream_payload_for_decode_level(
+    stream: &Stream,
+    decode_level: DecodeLevel,
+) -> Cow<'_, [u8]> {
     match decode_level {
-        DecodeLevel::None => stream.data.clone(),
+        DecodeLevel::None => Cow::Borrowed(&stream.data),
         DecodeLevel::Generalized | DecodeLevel::Specialized | DecodeLevel::All => {
-            crate::filters::decode_stream_data(&stream.dict, &stream.data)
-                .unwrap_or_else(|_| stream.data.clone())
+            match crate::filters::decode_stream_data(&stream.dict, &stream.data) {
+                Ok(decoded) => Cow::Owned(decoded),
+                Err(_) => Cow::Borrowed(&stream.data),
+            }
         }
     }
 }
@@ -6790,9 +6800,14 @@ mod tests {
         let raw_payload = b"raw payload";
         let encoded = crate::filters::encode_stream_data(&dict, raw_payload).expect("encode");
         let stream = Stream::new(dict, encoded.clone());
+        let payload = stream_payload_for_decode_level(&stream, DecodeLevel::None);
+        assert!(
+            matches!(payload, Cow::Borrowed(_)),
+            "DecodeLevel::None must borrow stream.data, not allocate a copy"
+        );
         assert_eq!(
-            stream_payload_for_decode_level(&stream, DecodeLevel::None),
-            encoded,
+            &*payload,
+            &encoded[..],
             "DecodeLevel::None must return the raw filter-encoded bytes verbatim"
         );
     }
@@ -6805,7 +6820,7 @@ mod tests {
         let encoded = crate::filters::encode_stream_data(&dict, raw_payload).expect("encode");
         let stream = Stream::new(dict, encoded);
         assert_eq!(
-            stream_payload_for_decode_level(&stream, DecodeLevel::Generalized),
+            &*stream_payload_for_decode_level(&stream, DecodeLevel::Generalized),
             raw_payload,
             "DecodeLevel::Generalized must return filter-decoded content"
         );
@@ -6820,9 +6835,13 @@ mod tests {
         dict.insert("Filter", Object::Name(b"DCTDecode".to_vec()));
         let raw_payload = b"\xff\xd8\xff\xe0 not really a jpeg";
         let stream = Stream::new(dict, raw_payload.to_vec());
+        let payload = stream_payload_for_decode_level(&stream, DecodeLevel::Generalized);
+        assert!(
+            matches!(payload, Cow::Borrowed(_)),
+            "an undecodable filter must fall back to a borrow of the raw bytes"
+        );
         assert_eq!(
-            stream_payload_for_decode_level(&stream, DecodeLevel::Generalized),
-            raw_payload,
+            &*payload, raw_payload,
             "an undecodable filter must fall back to the raw stream bytes"
         );
     }
