@@ -300,10 +300,19 @@ pub enum StreamDataMode {
     /// Yields `{ "stream": { "data": "<base64>", "dict": ... } }`.
     Inline,
     /// Emit a side-file path under `datafile`.
-    /// Yields `{ "stream": { "datafile": "<prefix>-<obj_num:03>", "dict": ... } }`.
+    /// Yields `{ "stream": { "datafile": "<prefix>-<obj_num>", "dict": ... } }`.
     /// The CLI is responsible for actually writing the bytes; this layer only
     /// computes the file name from `prefix` + the object number.
     File { prefix: String },
+}
+
+/// Format the side-file path for a `File`-mode stream entry.
+///
+/// qpdf 11.9.0 names side files `<prefix>-<obj_num>` — the bare object
+/// number with no zero-padding. Centralized here so the JSON `datafile`
+/// value and the CLI side-file writer always produce the same name.
+pub fn format_json_side_file_path(prefix: &str, obj_num: u32) -> String {
+    format!("{prefix}-{obj_num}")
 }
 
 // ── base64_encode ─────────────────────────────────────────────────────────────
@@ -365,7 +374,7 @@ pub fn build_qpdf_key<R: Read + Seek>(
 ///
 /// - `None`   → `{ "stream": { "dict": ... } }`
 /// - `Inline` → `{ "stream": { "data": "<base64>", "dict": ... } }`
-/// - `File`   → `{ "stream": { "datafile": "<prefix>-<obj_num:03>", "dict": ... } }`
+/// - `File`   → `{ "stream": { "datafile": "<prefix>-<obj_num>", "dict": ... } }`
 ///
 /// # Errors
 ///
@@ -429,10 +438,8 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
                     }
                     StreamDataMode::File { prefix } => {
                         // Emit a side-file path under "datafile".
-                        // Naming: <prefix>-<obj_num> (bare number, no
-                        // zero-padding — matches qpdf 11.9.0).
                         // Key order: datafile, dict (alphabetical).
-                        let datafile = format!("{prefix}-{}", oref.number);
+                        let datafile = format_json_side_file_path(prefix, oref.number);
                         JsonValue::Object(vec![
                             ("datafile".to_string(), JsonValue::String(datafile)),
                             ("dict".to_string(), dict_json),
@@ -6309,6 +6316,17 @@ mod tests {
 
         // datafile must be "<prefix>-<obj_num>" = "out-7" for obj:7
         assert_eq!(inner[0].1, JsonValue::String("out-7".to_string()));
+    }
+
+    // ── Test 3b: side-file naming has no zero-padding (qpdf 11.9.0) ───────────
+
+    #[test]
+    fn format_json_side_file_path_uses_bare_object_number() {
+        // qpdf 11.9.0 emits "<prefix>-<obj>" with no zero-padding, for
+        // single- and multi-digit object numbers alike.
+        assert_eq!(format_json_side_file_path("qp", 7), "qp-7");
+        assert_eq!(format_json_side_file_path("qp", 42), "qp-42");
+        assert_eq!(format_json_side_file_path("qp", 100), "qp-100");
     }
 
     // ── Test 4: trailer is not affected by mode ───────────────────────────────
