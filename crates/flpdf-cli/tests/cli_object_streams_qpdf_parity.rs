@@ -18,9 +18,9 @@
 //!    `one-page.pdf` (no eligible object is left uncompressed in either output).
 //!
 //! When qpdf is not installed:
-//! - **Linux CI** (`CI` env var set, non-Windows): the test panics — qpdf is a hard
-//!   requirement on CI.
-//! - **Local / Windows CI**: prints a diagnostic and returns early (tests skip).
+//! - **CI** (`CI` env var set): the test panics — qpdf is a hard requirement
+//!   on CI.
+//! - **Local runs**: print a diagnostic and return early (tests skip).
 
 use assert_cmd::Command as CargoCommand;
 use flpdf::{Object, ObjectRef, Pdf};

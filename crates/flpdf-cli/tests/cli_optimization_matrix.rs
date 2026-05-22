@@ -53,8 +53,8 @@
 //! # qpdf gating
 //!
 //! Tests that call `qpdf --check` require qpdf on PATH.
-//! - **Linux CI** (`CI` env var set, non-Windows): panics if qpdf is absent.
-//! - **Local / Windows CI**: prints a diagnostic and skips the qpdf guard.
+//! - **CI** (`CI` env var set): panics if qpdf is absent.
+//! - **Local runs**: print a diagnostic and skip the qpdf guard.
 
 use assert_cmd::Command as CargoCommand;
 use flpdf::{

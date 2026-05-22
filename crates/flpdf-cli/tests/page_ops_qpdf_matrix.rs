@@ -653,8 +653,8 @@ fn split_pages_one_filename_matches_qpdf() {
     let src = fixture_abs(THREE_PAGE);
 
     // Cross-check the qpdf baseline only where qpdf is present (skipped on
-    // Windows CI / hosts without /usr/bin/qpdf); the flpdf assertion below
-    // always runs against the qpdf-11.9.0-observed expected names.
+    // hosts without qpdf on PATH); the flpdf assertion below always runs
+    // against the expected split-output names.
     if qpdf_available() {
         run_qpdf(&[
             src.to_str().unwrap(),

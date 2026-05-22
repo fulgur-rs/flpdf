@@ -246,7 +246,7 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
         .success();
 
     // qpdf cross-check is skipped when qpdf is unavailable (soft-skip locally,
-    // hard-fail on Linux CI) — the byte-identity assertions below do not need
+    // hard-fail on CI) — the byte-identity assertions below do not need
     // qpdf and always run.
     if !skip_if_qpdf_missing() {
         let (ok, msg) = qpdf_check_linearization(&out_disable);

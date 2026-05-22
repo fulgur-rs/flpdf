@@ -15,9 +15,9 @@
 //!      Exercises that flpdf can re-read its own QDF (indirect /Length, m41).
 //!  (d) `qdf-fix` is a byte no-op on a valid clean QDF and idempotent.
 //!
-//! qpdf 11.9.0 is the external oracle. Every live-qpdf assertion is gated
-//! behind an availability check (same hard-fail-on-Linux-CI / soft-skip
-//! policy as `cli_qdf.rs` / `cli_object_streams_qpdf_parity.rs`).
+//! qpdf is the external oracle. Every live-qpdf assertion is gated behind an
+//! availability check (same hard-fail-on-CI / soft-skip-locally policy as
+//! `cli_qdf.rs` / `cli_object_streams_qpdf_parity.rs`).
 //!
 //! NOTE on `real-numbers-regression.pdf`: this is an intentionally malformed
 //! regression fixture. `qpdf --check` returns exit 3 ("succeeded with
@@ -84,10 +84,25 @@ fn qpdf_check_code(path: &Path) -> i32 {
         .args(["--check", path.to_str().unwrap()])
         .output()
         .expect("failed to spawn qpdf");
-    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("ERROR: vector") {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Anchored to a line *starting* `ERROR: vector` (not an unanchored
+    // substring) so a real qpdf error that merely mentions the word is not
+    // misclassified as the upstream zero-page crash.
+    if !out.status.success()
+        && stderr
+            .lines()
+            .any(|line| line.trim_end().starts_with("ERROR: vector"))
+    {
         return QPDF_EMPTY_PAGE_TREE_BUG;
     }
-    out.status.code().unwrap_or(-1)
+    let code = out.status.code().unwrap_or(-1);
+    // `.output()` captures qpdf's stderr (needed for the signature check
+    // above); surface it on a genuine failure so a CI assertion carries
+    // qpdf's own diagnostic rather than only an exit code.
+    if code != 0 && !stderr.trim().is_empty() {
+        eprintln!("qpdf --check {} (exit {code}):\n{stderr}", path.display());
+    }
+    code
 }
 
 /// `qpdf --qdf <path> -` re-canonicalization exit code (qpdf re-parses the

@@ -1803,7 +1803,13 @@ fn is_qpdf_available() -> bool {
 /// hits this bug it cannot serve as an oracle — callers skip the `--check`
 /// gate rather than fail it. Self-heals once qpdf fixes the bug upstream.
 fn qpdf_hit_empty_page_tree_bug(qpdf: &std::process::Output) -> bool {
-    !qpdf.status.success() && String::from_utf8_lossy(&qpdf.stderr).contains("ERROR: vector")
+    // Anchored to a line *starting* `ERROR: vector` (not an unanchored
+    // substring) so a real qpdf error that merely mentions the word is not
+    // mistaken for the upstream crash.
+    !qpdf.status.success()
+        && String::from_utf8_lossy(&qpdf.stderr)
+            .lines()
+            .any(|line| line.trim_end().starts_with("ERROR: vector"))
 }
 
 fn parse_startxref(bytes: &[u8]) -> u64 {

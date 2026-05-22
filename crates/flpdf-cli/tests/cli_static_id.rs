@@ -11,8 +11,7 @@
 //!    deferred to the writer-whitespace task in epic 9hc.20.
 //!
 //! Sub-test (2) needs qpdf as an external oracle and follows the same skip
-//! rules as `cli_linearize_qpdf.rs`: hard-fail on Linux CI, soft-skip locally
-//! and on Windows.
+//! rules as `cli_linearize_qpdf.rs`: hard-fail on CI, soft-skip locally.
 
 use assert_cmd::Command as CargoCommand;
 use predicates::prelude::*;
