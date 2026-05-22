@@ -429,9 +429,10 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
                     }
                     StreamDataMode::File { prefix } => {
                         // Emit a side-file path under "datafile".
-                        // Naming: <prefix>-<obj_num:03>
+                        // Naming: <prefix>-<obj_num> (bare number, no
+                        // zero-padding — matches qpdf 11.9.0).
                         // Key order: datafile, dict (alphabetical).
-                        let datafile = format!("{prefix}-{:03}", oref.number);
+                        let datafile = format!("{prefix}-{}", oref.number);
                         JsonValue::Object(vec![
                             ("datafile".to_string(), JsonValue::String(datafile)),
                             ("dict".to_string(), dict_json),
@@ -6306,8 +6307,8 @@ mod tests {
         assert_eq!(inner[0].0, "datafile", "first key must be 'datafile'");
         assert_eq!(inner[1].0, "dict", "second key must be 'dict'");
 
-        // datafile must be "<prefix>-<obj_num:03>" = "out-007" for obj:7
-        assert_eq!(inner[0].1, JsonValue::String("out-007".to_string()));
+        // datafile must be "<prefix>-<obj_num>" = "out-7" for obj:7
+        assert_eq!(inner[0].1, JsonValue::String("out-7".to_string()));
     }
 
     // ── Test 4: trailer is not affected by mode ───────────────────────────────

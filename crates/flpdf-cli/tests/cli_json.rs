@@ -250,7 +250,7 @@ fn json_stream_data_file_creates_side_files() {
     );
 
     // At least one side file should exist (object 4 is the content stream).
-    let side_file = format!("{prefix}-004");
+    let side_file = format!("{prefix}-4");
     assert!(
         std::path::Path::new(&side_file).exists(),
         "expected side file {side_file} to exist"
@@ -325,7 +325,7 @@ fn json_key_pages_does_not_write_side_files_for_filtered_streams() {
     // --json-key=pages filters out the qpdf section entirely, so there
     // should be no datafile references in the final JSON and therefore no
     // side files should be written.
-    let side_file = format!("{prefix}-004");
+    let side_file = format!("{prefix}-4");
     assert!(
         !std::path::Path::new(&side_file).exists(),
         "no side file should be written when qpdf section is filtered out (got {side_file})"
