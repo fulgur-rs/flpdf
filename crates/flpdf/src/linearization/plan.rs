@@ -196,8 +196,15 @@ fn compute_closure<R: Read + Seek>(
                             if !seen_parents.insert(parent_ref) {
                                 continue;
                             }
-                            let Ok(Object::Dictionary(parent_dict)) = pdf.resolve(parent_ref)
-                            else {
+                            // Propagate genuine resolve failures (I/O or
+                            // parse errors) instead of silently degrading the
+                            // closure — mirrors the main BFS loop's
+                            // `pdf.resolve(current)?`. A parent that merely
+                            // resolves to a non-dictionary (e.g. a free or
+                            // missing object yielding Null) is still tolerated:
+                            // the walk just climbs past it.
+                            let parent_obj = pdf.resolve(parent_ref)?;
+                            let Object::Dictionary(parent_dict) = &parent_obj else {
                                 continue;
                             };
                             for (pk, pv) in parent_dict.iter() {
@@ -1693,6 +1700,80 @@ mod tests {
         assert!(
             !plan.part4_rest.contains(&resources_ref),
             "shared inherited /Resources must NOT end up in part4_rest"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // flpdf-ws2: compute_closure's /Parent-chain walk must propagate
+    // pdf.resolve errors instead of swallowing them.
+    // -----------------------------------------------------------------------
+
+    /// Build a single-page PDF whose page `/Parent` points at a stream object
+    /// with a `/Length` that overshoots its payload.
+    ///
+    /// `page_refs` walks `/Kids` downward only, so it never resolves object 4;
+    /// the only code path that resolves it is the `/Parent`-chain walk inside
+    /// `compute_closure`. Resolving object 4 yields a genuine parse error
+    /// (not `Ok(Null)`), so a correct walker must surface that error.
+    fn page_parent_resolve_error_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        // Page leaf: /Parent deliberately points at the malformed object 4,
+        // not the Pages node. page_refs collects this page via /Kids without
+        // ever touching /Parent, so object 4 is resolved exclusively by
+        // compute_closure's ancestor walk.
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        // Object 4: a stream whose /Length (9) overshoots the 2-byte payload,
+        // so parse_indirect_object_detailed rejects it and resolve returns Err.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length 9 >>\nstream\nab\nendstream\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        let xref_section = format!(
+            "xref\n0 5\n\
+            0000000000 65535 f \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n\
+            {:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref_section.as_bytes());
+
+        let trailer = format!(
+            "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref_start,
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        pdf
+    }
+
+    /// flpdf-ws2 regression: `compute_closure`'s `/Parent`-chain walk must
+    /// propagate `pdf.resolve` errors rather than swallowing them with
+    /// `let Ok(..) else { continue }`. A swallowed error lets `from_pdf`
+    /// return a degraded plan (truncated closure / hint tables) for a
+    /// malformed document, which a downstream writer would then emit as an
+    /// invalid linearized PDF.
+    #[test]
+    fn from_pdf_propagates_parent_chain_resolve_error() {
+        let bytes = page_parent_resolve_error_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture xref/trailer must parse");
+        let result = LinearizationPlan::from_pdf(&mut pdf);
+        assert!(
+            result.is_err(),
+            "from_pdf must propagate a /Parent-chain resolve error, got Ok"
         );
     }
 
