@@ -372,8 +372,7 @@ fn dict_declares_type_xref(dict: &[u8]) -> bool {
             // Candidate `/Type` name token in real object context.
             b'/' if dict[i..].starts_with(TYPE_KEY) => {
                 let after_key = i + TYPE_KEY.len();
-                let key_terminated = after_key >= dict.len()
-                    || is_pdf_ws_or_delim(dict[after_key]);
+                let key_terminated = after_key >= dict.len() || is_pdf_ws_or_delim(dict[after_key]);
                 if !key_terminated {
                     // Longer name like `/TypeFoo` — advance one byte and
                     // keep scanning (still inside the outer match arms so
@@ -387,8 +386,8 @@ fn dict_declares_type_xref(dict: &[u8]) -> bool {
                 }
                 if dict[j..].starts_with(XREF_VAL) {
                     let after_val = j + XREF_VAL.len();
-                    let val_terminated = after_val >= dict.len()
-                        || is_pdf_ws_or_delim(dict[after_val]);
+                    let val_terminated =
+                        after_val >= dict.len() || is_pdf_ws_or_delim(dict[after_val]);
                     if val_terminated {
                         return true;
                     }
