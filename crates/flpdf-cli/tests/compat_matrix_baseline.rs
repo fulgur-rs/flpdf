@@ -317,41 +317,105 @@ fn trailer_dict_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Whether `dict` (the bytes from `<<` to `>>` inclusive) declares
-/// `/Type /XRef` at any level.  We accept any whitespace between the
-/// `/Type` key and the `/XRef` value, and reject `/TypeX` / `/XRefY`
-/// false matches via simple token-boundary checks.
+/// `/Type /XRef` as PDF name tokens in real object context.
+///
+/// The scan must skip literal strings `(...)`, hex strings `<...>`, and
+/// `%` end-of-line comments — otherwise a `/Title (Doc /Type /XRef ed)`
+/// or a `% /Type /XRef comment` would false-trigger over-elision, exactly
+/// the failure mode this PR exists to prevent.  Mirrors the state machine
+/// in `flpdf::qdf_fix::find_name_token_from`, which is private to its
+/// crate.
+///
+/// The `/Type` name token is matched anywhere inside `dict` (including
+/// nested sub-dicts), accepting the small false-positive risk of a body
+/// dict that nests `<< /Type /XRef >>` literally — no real PDF does this,
+/// and the shape only over-elides (never under-elides) `/ID` arrays.
 fn dict_declares_type_xref(dict: &[u8]) -> bool {
     const TYPE_KEY: &[u8] = b"/Type";
     const XREF_VAL: &[u8] = b"/XRef";
     let mut i = 0usize;
-    while i + TYPE_KEY.len() <= dict.len() {
-        if &dict[i..i + TYPE_KEY.len()] != TYPE_KEY {
-            i += 1;
-            continue;
-        }
-        let mut j = i + TYPE_KEY.len();
-        // Reject `/TypeFoo`: next byte must be whitespace, `/`, or end.
-        if j < dict.len() && !matches!(dict[j], b' ' | b'\t' | b'\r' | b'\n' | b'/') {
-            i += 1;
-            continue;
-        }
-        while j < dict.len() && matches!(dict[j], b' ' | b'\t' | b'\r' | b'\n') {
-            j += 1;
-        }
-        if dict[j..].starts_with(XREF_VAL) {
-            let after = j + XREF_VAL.len();
-            let ok_end = after >= dict.len()
-                || matches!(
-                    dict[after],
-                    b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>' | b'[' | b'('
-                );
-            if ok_end {
-                return true;
+    while i < dict.len() {
+        match dict[i] {
+            // `%` comment runs to end of line (PDF §7.2.4).
+            b'%' => {
+                while i < dict.len() && dict[i] != b'\n' && dict[i] != b'\r' {
+                    i += 1;
+                }
             }
+            // `<<` / `>>` are dict delimiters, not hex strings — step past
+            // them without descending into bracket-matching (any `/Type`
+            // inside a nested dict still counts; see doc comment).
+            b'<' if dict.get(i + 1) == Some(&b'<') => i += 2,
+            b'>' if dict.get(i + 1) == Some(&b'>') => i += 2,
+            // Hex string `<...>` — skip to its closing `>`.
+            b'<' => {
+                i += 1;
+                while i < dict.len() && dict[i] != b'>' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Literal string `(...)` — balanced parens, `\` escapes.
+            b'(' => {
+                i += 1;
+                let mut depth = 1usize;
+                while i < dict.len() && depth > 0 {
+                    match dict[i] {
+                        b'\\' => i += 1, // skip escaped byte
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            // Candidate `/Type` name token in real object context.
+            b'/' if dict[i..].starts_with(TYPE_KEY) => {
+                let after_key = i + TYPE_KEY.len();
+                let key_terminated = after_key >= dict.len()
+                    || is_pdf_ws_or_delim(dict[after_key]);
+                if !key_terminated {
+                    // Longer name like `/TypeFoo` — advance one byte and
+                    // keep scanning (still inside the outer match arms so
+                    // strings/comments stay skipped).
+                    i += 1;
+                    continue;
+                }
+                let mut j = after_key;
+                while j < dict.len() && is_pdf_ws(dict[j]) {
+                    j += 1;
+                }
+                if dict[j..].starts_with(XREF_VAL) {
+                    let after_val = j + XREF_VAL.len();
+                    let val_terminated = after_val >= dict.len()
+                        || is_pdf_ws_or_delim(dict[after_val]);
+                    if val_terminated {
+                        return true;
+                    }
+                }
+                // `/Type` keyed to a non-`/XRef` value; keep scanning past
+                // the key to allow a later `/Type /XRef` (defensive — PDF
+                // dicts must not duplicate keys, but the scan is cheap).
+                i = after_key;
+            }
+            _ => i += 1,
         }
-        i += 1;
     }
     false
+}
+
+/// PDF whitespace per ISO 32000-1 §7.2.
+fn is_pdf_ws(b: u8) -> bool {
+    matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
+/// PDF whitespace or delimiter — the legal terminators of a name token.
+fn is_pdf_ws_or_delim(b: u8) -> bool {
+    is_pdf_ws(b)
+        || matches!(
+            b,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
 }
 
 /// Forward-search for the leftmost occurrence of `kw` at-or-after `from`
@@ -781,6 +845,123 @@ fn elide_trailer_id_arrays_id_prefix_name_collision_preserved() {
         !contains_subslice(&out, b"<trailerid>"),
         "trailer /ID array must still be elided"
     );
+}
+
+#[test]
+fn elide_trailer_id_arrays_type_xref_inside_literal_string_preserved() {
+    // Body object's /Title string contains the literal bytes `/Type /XRef`.
+    // A naive byte scan would mistake the body dict for an xref-stream dict
+    // and over-elide its `/ID` — the exact false positive Gemini flagged.
+    let pdf: &[u8] = b"%PDF-1.4\n\
+        1 0 obj\n<< /Type /Catalog /Title (Doc with /Type /XRef in title) \
+        /ID [<bodyid01>] /Pages 2 0 R >>\nendobj\n\
+        xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+        trailer\n<< /Size 2 /Root 1 0 R /ID [<trailerid>] >>\nstartxref\n55\n%%EOF\n";
+    let out = elide_trailer_id_arrays(pdf);
+    assert!(
+        contains_subslice(&out, b"/ID [<bodyid01>]"),
+        "body /ID must survive even when the body dict's string contains the \
+         bytes `/Type /XRef`; output: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !contains_subslice(&out, b"<trailerid>"),
+        "trailer /ID must still be elided"
+    );
+    assert_eq!(count_subslice(&out, b"/ID <ELIDED>"), 1);
+}
+
+#[test]
+fn elide_trailer_id_arrays_type_xref_inside_comment_preserved() {
+    // `%` comment carrying the bytes `/Type /XRef` must not be picked up.
+    let pdf: &[u8] = b"%PDF-1.4\n\
+        1 0 obj\n<< /Type /Catalog\n% /Type /XRef would-be-bait\n\
+        /ID [<bodyid01>] /Pages 2 0 R >>\nendobj\n\
+        xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+        trailer\n<< /Size 2 /Root 1 0 R /ID [<trailerid>] >>\nstartxref\n55\n%%EOF\n";
+    let out = elide_trailer_id_arrays(pdf);
+    assert!(
+        contains_subslice(&out, b"/ID [<bodyid01>]"),
+        "body /ID must survive when a comment carries `/Type /XRef` bytes; \
+         output: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !contains_subslice(&out, b"<trailerid>"),
+        "trailer /ID must still be elided"
+    );
+    assert_eq!(count_subslice(&out, b"/ID <ELIDED>"), 1);
+}
+
+#[test]
+fn elide_trailer_id_arrays_type_xref_inside_hex_string_preserved() {
+    // Hex string bodies are arbitrary hex bytes — they should not be
+    // scanned as name-token context.  PDF readers do not interpret the
+    // ASCII inside a hex string, but a regex-style scan would.  This test
+    // proves the dict scanner treats `< ... >` (single brackets) as opaque.
+    let pdf: &[u8] = b"%PDF-1.4\n\
+        1 0 obj\n<< /Type /Catalog /Hex <2f54797065202f58526566> \
+        /ID [<bodyid01>] /Pages 2 0 R >>\nendobj\n\
+        xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+        trailer\n<< /Size 2 /Root 1 0 R /ID [<trailerid>] >>\nstartxref\n55\n%%EOF\n";
+    let out = elide_trailer_id_arrays(pdf);
+    assert!(
+        contains_subslice(&out, b"/ID [<bodyid01>]"),
+        "body /ID must survive when a hex string encodes `/Type /XRef`; \
+         output: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !contains_subslice(&out, b"<trailerid>"),
+        "trailer /ID must still be elided"
+    );
+}
+
+#[test]
+fn elide_trailer_id_arrays_type_xref_value_inside_string_preserved() {
+    // The `/Type` key is real, but its actual value is `/Catalog`; a string
+    // farther in the dict happens to contain `/XRef`.  Must not match.
+    let pdf: &[u8] = b"%PDF-1.4\n\
+        1 0 obj\n<< /Type /Catalog /Note (mentions /XRef in passing) \
+        /ID [<bodyid01>] /Pages 2 0 R >>\nendobj\n\
+        xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+        trailer\n<< /Size 2 /Root 1 0 R /ID [<trailerid>] >>\nstartxref\n55\n%%EOF\n";
+    let out = elide_trailer_id_arrays(pdf);
+    assert!(
+        contains_subslice(&out, b"/ID [<bodyid01>]"),
+        "body /ID must survive when /Type is followed by /Catalog and a later \
+         string contains `/XRef`; output: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !contains_subslice(&out, b"<trailerid>"),
+        "trailer /ID must still be elided"
+    );
+}
+
+#[test]
+fn dict_declares_type_xref_unit_cases() {
+    // Positive cases.
+    assert!(dict_declares_type_xref(b"<< /Type /XRef /Size 5 >>"));
+    assert!(dict_declares_type_xref(b"<< /Size 5 /Type /XRef >>"));
+    assert!(dict_declares_type_xref(b"<<\n/Type\n/XRef\n>>"));
+    // Negative: string / comment / hex-string carry the bytes.
+    assert!(!dict_declares_type_xref(
+        b"<< /Type /Catalog /Title (/Type /XRef) >>"
+    ));
+    assert!(!dict_declares_type_xref(
+        b"<< /Type /Catalog\n%/Type /XRef\n>>"
+    ));
+    assert!(!dict_declares_type_xref(
+        b"<< /Type /Catalog /Hex <2f54797065202f58526566> >>"
+    ));
+    // Negative: `/Type` keyed to a non-`/XRef` value with `/XRef` text elsewhere.
+    assert!(!dict_declares_type_xref(
+        b"<< /Type /Catalog /Note (uses /XRef in title) >>"
+    ));
+    // Negative: name-prefix collisions.
+    assert!(!dict_declares_type_xref(b"<< /TypeFoo /XRef >>"));
+    assert!(!dict_declares_type_xref(b"<< /Type /XRefExtra >>"));
 }
 
 #[test]
