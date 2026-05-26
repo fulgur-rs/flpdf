@@ -320,8 +320,9 @@ pub struct LinearizedOffsets {
     /// Total number of pages — corresponds to `/N`.
     pub page_count: u32,
 
-    /// Placeholder byte ranges inside the Part 1 bytes, forwarded to
-    /// sub-task 2.9 for in-place patching.
+    /// Placeholder byte ranges inside the Part 1 bytes.  Pre-back-patch these
+    /// are 10-wide zero slots; post-back-patch the back-patcher updates them
+    /// to point at the rewritten variable-width decimal value bytes.
     pub part1_placeholders: Part1Placeholders,
 
     /// `new_object_number → byte_offset` map covering every object in the
@@ -334,6 +335,12 @@ pub struct LinearizedOffsets {
     /// bytes.  The back-patcher overwrites this range with the actual
     /// `last_xref_keyword_offset` value.
     pub first_trailer_prev_range: std::ops::Range<usize>,
+
+    /// Absolute byte range spanning the rewritable param-dict region:
+    /// `<<` through the end of the trailing pad (inclusive of `\nendobj\n`).
+    /// The back-patcher splices a variable-width dict body + space-pad into
+    /// this region in one operation (flpdf-9hc.20.25).
+    pub dict_writable_region: std::ops::Range<usize>,
 }
 
 /// The finished linearized PDF together with the offset metadata.
@@ -1283,6 +1290,7 @@ pub fn write_linearized<R: Read + Seek>(
     let eff_version = effective_pdf_version(pdf.version(), options, true);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
+    let part1_dict_region = part1.dict_writable_region.clone();
 
     let catalog_orig = plan.root_ref.ok_or_else(|| {
         crate::Error::Unsupported(
@@ -1771,6 +1779,7 @@ pub fn write_linearized<R: Read + Seek>(
         part1_placeholders,
         xref_offsets: final_xref_offsets,
         first_trailer_prev_range: final_first_trailer_prev_range,
+        dict_writable_region: part1_dict_region,
     };
 
     Ok(LinearizedDocument {
