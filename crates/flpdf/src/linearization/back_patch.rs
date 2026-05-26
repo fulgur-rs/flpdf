@@ -112,13 +112,7 @@ impl Part1Values {
 fn render_compact_dict(values: &Part1Values) -> Vec<u8> {
     format!(
         "<< /Linearized 1 /L {} /H [ {} {} ] /O {} /E {} /N {} /T {} >>\nendobj\n",
-        values.l,
-        values.h_offset,
-        values.h_length,
-        values.o,
-        values.e,
-        values.n,
-        values.t,
+        values.l, values.h_offset, values.h_length, values.o, values.e, values.n, values.t,
     )
     .into_bytes()
 }
@@ -136,12 +130,12 @@ fn compute_post_splice_placeholders(
     // Literal prefixes in `render_compact_dict`, in field emission order.
     const PREFIXES: [&[u8]; 7] = [
         b"<< /Linearized 1 /L ", // before /L
-        b" /H [ ",                // before /H[0]
-        b" ",                     // before /H[1]
-        b" ] /O ",                // before /O
-        b" /E ",                  // before /E
-        b" /N ",                  // before /N
-        b" /T ",                  // before /T
+        b" /H [ ",               // before /H[0]
+        b" ",                    // before /H[1]
+        b" ] /O ",               // before /O
+        b" /E ",                 // before /E
+        b" /N ",                 // before /N
+        b" /T ",                 // before /T
     ];
     let widths = [
         digit_width(values.l),
@@ -448,12 +442,13 @@ mod tests {
         // Each updated range must contain the variable-width decimal of its value.
         let check = |range: &std::ops::Range<usize>, expected: u64, name: &str| {
             let s = std::str::from_utf8(&bytes[range.clone()]).expect("UTF-8");
-            let parsed: u64 = s.parse().unwrap_or_else(|e| {
-                panic!("{name}: '{s}' must be a decimal integer: {e}")
-            });
+            let parsed: u64 = s
+                .parse()
+                .unwrap_or_else(|e| panic!("{name}: '{s}' must be a decimal integer: {e}"));
             assert_eq!(parsed, expected, "{name}: expected {expected}, got '{s}'");
             assert_eq!(
-                s, expected.to_string(),
+                s,
+                expected.to_string(),
                 "{name}: must be variable-width (no zero-padding); got '{s}'"
             );
         };
@@ -509,7 +504,10 @@ mod tests {
 
         let ph = &offsets.part1_placeholders;
         for range in ph.as_slice() {
-            assert!(!range.is_empty(), "post-splice value range must be non-empty");
+            assert!(
+                !range.is_empty(),
+                "post-splice value range must be non-empty"
+            );
             for &b in &bytes[range.clone()] {
                 assert!(
                     b.is_ascii_digit(),
@@ -544,7 +542,8 @@ mod tests {
         let pad_start = region.start + endobj_pos + endobj_needle.len();
         for &b in &bytes[pad_start..region.end] {
             assert_eq!(
-                b, b' ',
+                b,
+                b' ',
                 "trailing pad must be ASCII space; got {b:?} at offset within \
                  [{pad_start}..{end}]",
                 end = region.end

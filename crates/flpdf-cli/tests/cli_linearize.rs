@@ -117,7 +117,11 @@ fn check_linearization_tampered_l_exits_1() {
             .expect("/L value must terminate at a non-digit");
     assert!(val_end > val_start, "/L value must have at least one digit");
     let last = val_end - 1;
-    bytes[last] = if bytes[last] == b'9' { b'0' } else { bytes[last] + 1 };
+    bytes[last] = if bytes[last] == b'9' {
+        b'0'
+    } else {
+        bytes[last] + 1
+    };
 
     let tampered_path = outdir.path().join("tampered.pdf");
     std::fs::write(&tampered_path, &bytes).unwrap();
@@ -582,7 +586,12 @@ fn extract_int_field(bytes: &[u8], key: &[u8]) -> (usize, Vec<u8>) {
     let pos = bytes
         .windows(key.len())
         .position(|w| w == key)
-        .unwrap_or_else(|| panic!("param dict key {:?} not found", String::from_utf8_lossy(key)));
+        .unwrap_or_else(|| {
+            panic!(
+                "param dict key {:?} not found",
+                String::from_utf8_lossy(key)
+            )
+        });
     let val_start = pos + key.len();
     let val_end = bytes[val_start..]
         .iter()
@@ -615,9 +624,9 @@ fn linearize_param_dict_integers_are_variable_width_decimal() {
     // representation of its numeric value (no leading zeros).
     let check_no_leading_zero = |label: &str, digits: &[u8]| {
         let s = std::str::from_utf8(digits).expect("digits utf-8");
-        let parsed: u64 = s.parse().unwrap_or_else(|e| {
-            panic!("{label} value '{s}' must be a valid decimal integer: {e}")
-        });
+        let parsed: u64 = s
+            .parse()
+            .unwrap_or_else(|e| panic!("{label} value '{s}' must be a valid decimal integer: {e}"));
         let canonical = parsed.to_string();
         assert_eq!(
             s, canonical,

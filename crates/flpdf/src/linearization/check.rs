@@ -773,7 +773,11 @@ mod tests {
         assert!(val_end > val_start, "/L value must have at least one digit");
         // Increment the last digit (with wrap) to make the value wrong.
         let last = val_end - 1;
-        bytes[last] = if bytes[last] == b'9' { b'0' } else { bytes[last] + 1 };
+        bytes[last] = if bytes[last] == b'9' {
+            b'0'
+        } else {
+            bytes[last] + 1
+        };
 
         let result = check_linearization_bytes(&bytes);
         assert!(
