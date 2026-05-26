@@ -1,9 +1,8 @@
 //! Back-patcher for Part 1 linearization parameter dictionary (sub-task 2.9).
 //!
-//! After layout is complete and all byte offsets are known, this module fills
-//! in the 10-digit zero-padded decimal placeholders that
-//! [`Part1Bytes::build`](crate::linearization::part1::Part1Bytes::build)
-//! left in the linearization parameter dictionary:
+//! After layout is complete and all byte offsets are known, this module
+//! rewrites the linearization parameter dictionary with **variable-width**
+//! decimal values (qpdf byte format, flpdf-9hc.20.25):
 //!
 //! | Param dict key | Source field in [`LinearizedOffsets`]       |
 //! |----------------|---------------------------------------------|
@@ -15,11 +14,39 @@
 //! | `/T`           | `last_xref_offset`                          |
 //! | `/N`           | `page_count`                                |
 //!
-//! # Placeholder discipline
+//! # Splice-and-pad discipline
 //!
-//! Every placeholder is exactly [`PLACEHOLDER_WIDTH`] (10) ASCII decimal digits.
-//! The back-patcher verifies that each value fits within 10 digits before
-//! writing, returning [`crate::Error::Unsupported`] if it does not.
+//! [`Part1Bytes::build`](crate::linearization::part1::Part1Bytes::build) lays
+//! the dict out with 10-digit zero-padded placeholders followed by a fixed
+//! [`PARAM_DICT_TRAILING_PAD`](crate::linearization::part1::PARAM_DICT_TRAILING_PAD)
+//! byte reserve of ASCII space.  This module rewrites the entire
+//! `dict_writable_region` in a single splice:
+//!
+//! ```text
+//! "<< /Linearized 1 /L V /H [ V V ] /O V /E V /N V /T V >>\nendobj\n"
+//! + ' ' × (region_len − new_dict_len)
+//! ```
+//!
+//! The compaction is monotone (each value emits as ≤ 10 decimal bytes) so the
+//! reserve always covers it, and the total Part 1 byte length stays constant.
+//! Downstream offsets — which the writer computed against the placeholder
+//! layout — therefore never shift.
+//!
+//! `LinearizedOffsets.part1_placeholders` is updated post-splice to point at
+//! the new variable-width value bytes, so callers can keep using it to inspect
+//! the back-patched values.
+//!
+//! # Errors
+//!
+//! Returns [`crate::Error::Unsupported`] when:
+//! * any numeric value exceeds 10^10 − 1 and therefore cannot fit even at the
+//!   upper-bound width,
+//! * the rendered dict body does not fit within `dict_writable_region` (would
+//!   only happen on an internal layout invariant violation), or
+//! * the `/Prev` placeholder in the first trailer is malformed.
+//!
+//! All checks run as a preflight pass before any byte is mutated, so an `Err`
+//! leaves `bytes` byte-wise unchanged.
 //!
 //! # Usage
 //!
@@ -29,7 +56,9 @@
 //! // doc.bytes now contains the complete, patched linearized PDF.
 //! ```
 
-use crate::linearization::part1::PLACEHOLDER_WIDTH;
+use std::ops::Range;
+
+use crate::linearization::part1::{Part1Placeholders, PLACEHOLDER_WIDTH};
 use crate::linearization::writer::{LinearizedDocument, LinearizedOffsets, PREV_PLACEHOLDER_WIDTH};
 use crate::Result;
 
@@ -46,88 +75,207 @@ const MAX_PLACEHOLDER_VALUE: u64 = {
 };
 
 // ---------------------------------------------------------------------------
+// Variable-width compaction helpers
+// ---------------------------------------------------------------------------
+
+/// The seven numeric values that go into the linearization parameter dict, in
+/// the same emission order as the placeholders.
+#[derive(Debug, Clone, Copy)]
+struct Part1Values {
+    l: u64,
+    h_offset: u64,
+    h_length: u64,
+    o: u64,
+    e: u64,
+    n: u64,
+    t: u64,
+}
+
+impl Part1Values {
+    fn from_offsets(offsets: &LinearizedOffsets) -> Self {
+        Self {
+            l: offsets.file_length as u64,
+            h_offset: offsets.hint_stream_offset as u64,
+            h_length: offsets.hint_stream_length as u64,
+            o: u64::from(offsets.first_page_object_new_num),
+            e: offsets.end_of_first_page_offset as u64,
+            n: u64::from(offsets.page_count),
+            t: offsets.last_xref_offset as u64,
+        }
+    }
+}
+
+/// Render the variable-width dict body (including the trailing `\nendobj\n`
+/// marker).  Layout must match `Part1Bytes::build`'s placeholder layout
+/// exactly: qpdf-aligned key order
+/// `/Linearized /L /H /O /E /N /T`.
+fn render_compact_dict(values: &Part1Values) -> Vec<u8> {
+    format!(
+        "<< /Linearized 1 /L {} /H [ {} {} ] /O {} /E {} /N {} /T {} >>\nendobj\n",
+        values.l,
+        values.h_offset,
+        values.h_length,
+        values.o,
+        values.e,
+        values.n,
+        values.t,
+    )
+    .into_bytes()
+}
+
+/// Compute the post-splice byte range for each value field within the
+/// rewritten dict region.
+///
+/// Mirrors [`render_compact_dict`]'s template — any change to that template
+/// must be reflected here so `LinearizedOffsets.part1_placeholders` keeps
+/// pointing at the rewritten value bytes.
+fn compute_post_splice_placeholders(
+    region_start: usize,
+    values: &Part1Values,
+) -> Part1Placeholders {
+    // Literal prefixes in `render_compact_dict`, in field emission order.
+    const PREFIXES: [&[u8]; 7] = [
+        b"<< /Linearized 1 /L ", // before /L
+        b" /H [ ",                // before /H[0]
+        b" ",                     // before /H[1]
+        b" ] /O ",                // before /O
+        b" /E ",                  // before /E
+        b" /N ",                  // before /N
+        b" /T ",                  // before /T
+    ];
+    let widths = [
+        digit_width(values.l),
+        digit_width(values.h_offset),
+        digit_width(values.h_length),
+        digit_width(values.o),
+        digit_width(values.e),
+        digit_width(values.n),
+        digit_width(values.t),
+    ];
+
+    let mut cursor = region_start;
+    let mut ranges: [Range<usize>; 7] = std::array::from_fn(|_| 0..0);
+    for i in 0..7 {
+        cursor += PREFIXES[i].len();
+        ranges[i] = cursor..cursor + widths[i];
+        cursor += widths[i];
+    }
+    Part1Placeholders {
+        l: ranges[0].clone(),
+        h_offset: ranges[1].clone(),
+        h_length: ranges[2].clone(),
+        o: ranges[3].clone(),
+        e: ranges[4].clone(),
+        n: ranges[5].clone(),
+        t: ranges[6].clone(),
+    }
+}
+
+/// Decimal digit count for `n` (always ≥ 1: `digit_width(0) == 1`).
+fn digit_width(n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut n = n;
+    let mut w = 0;
+    while n > 0 {
+        n /= 10;
+        w += 1;
+    }
+    w
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Overwrite each placeholder range in `bytes` with the known value from
-/// `offsets`, encoded as a 10-digit zero-padded decimal ASCII string.
+/// Splice the variable-width linearization parameter dictionary into `bytes`
+/// using the values from `offsets`, then back-patch the `/Prev` field in the
+/// Part 1 (first) trailer.
 ///
-/// Also back-patches the `/Prev` field in the Part 1 (first) trailer using
-/// `offsets.first_trailer_prev_range` and `offsets.last_xref_keyword_offset`.
-/// The `/Prev` value is written as a left-justified decimal integer padded on
-/// the right with spaces to `PREV_PLACEHOLDER_WIDTH` bytes.
+/// Behaviour:
+/// * The rewritable region runs from `<<` through the trailing pad reserve
+///   (the writer stores its absolute span in `offsets.dict_writable_region`).
+/// * `<< /Linearized 1 /L V /H [ V V ] /O V /E V /N V /T V >>\nendobj\n` is
+///   written at the region start, then the remainder of the region is filled
+///   with ASCII space (`b' '`) — total region length is unchanged so every
+///   downstream byte offset stays consistent with the writer's probe.
+/// * `offsets.part1_placeholders` is updated to point at the new
+///   variable-width value bytes inside `bytes` so callers can keep using it
+///   to inspect the back-patched values.
+/// * `/Prev` is written left-justified, space-padded to `PREV_PLACEHOLDER_WIDTH`.
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Unsupported`] if any value exceeds the maximum
-/// representable in [`PLACEHOLDER_WIDTH`] decimal digits (i.e. ≥ 10^10), or
-/// if the `/Prev` value does not fit in `PREV_PLACEHOLDER_WIDTH` characters.
+/// Returns [`crate::Error::Unsupported`] if any value exceeds 10^10 − 1 (in
+/// which case the placeholder reserve cannot guarantee fit), if the rendered
+/// dict body is larger than the rewritable region, or if `/Prev` is malformed.
 ///
 /// # Panics
 ///
-/// Does not panic; placeholder range widths and value bounds are
-/// validated in a preflight pass before any byte is mutated, so an `Err`
-/// leaves `bytes` byte-wise unchanged.
-pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> Result<()> {
-    // Defensive guard: all placeholder ranges must be valid before we start.
-    if !offsets.part1_placeholders.all_valid() {
-        return Err(crate::Error::Unsupported(
-            "back_patch_param_dict: Part1Placeholders are invalid (wrong width or overlapping)"
-                .to_string(),
-        ));
-    }
+/// Does not panic; all bounds and value limits are validated in a preflight
+/// pass before any byte is mutated, so an `Err` leaves `bytes` byte-wise
+/// unchanged.
+pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &mut LinearizedOffsets) -> Result<()> {
+    let values = Part1Values::from_offsets(offsets);
 
-    // Build a list of (range, value) pairs for uniform processing.
-    let ph = &offsets.part1_placeholders;
-    let patches: &[(&std::ops::Range<usize>, u64, &str)] = &[
-        (&ph.l, offsets.file_length as u64, "/L"),
-        (&ph.h_offset, offsets.hint_stream_offset as u64, "/H[0]"),
-        (&ph.h_length, offsets.hint_stream_length as u64, "/H[1]"),
-        (&ph.o, u64::from(offsets.first_page_object_new_num), "/O"),
-        (&ph.e, offsets.end_of_first_page_offset as u64, "/E"),
-        (&ph.t, offsets.last_xref_offset as u64, "/T"),
-        (&ph.n, u64::from(offsets.page_count), "/N"),
+    // -----------------------------------------------------------------------
+    // Pass 1: preflight value bounds, region bounds, /Prev placeholder.
+    // -----------------------------------------------------------------------
+    let value_labels = [
+        (values.l, "/L"),
+        (values.h_offset, "/H[0]"),
+        (values.h_length, "/H[1]"),
+        (values.o, "/O"),
+        (values.e, "/E"),
+        (values.n, "/N"),
+        (values.t, "/T"),
     ];
-
-    // -----------------------------------------------------------------------
-    // Pass 1: preflight all patches (range bounds + value overflow) before
-    // mutating any byte.  This guarantees that an Err leaves `bytes` byte-
-    // wise unchanged, so a caller that recovers from the error sees a
-    // consistent buffer.
-    // -----------------------------------------------------------------------
-    for (range, value, key_name) in patches {
-        if range.end > bytes.len() {
+    for (v, label) in value_labels {
+        if v > MAX_PLACEHOLDER_VALUE {
             return Err(crate::Error::Unsupported(format!(
-                "back_patch_param_dict: {} placeholder range {:?} out of bounds for buffer length {}",
-                key_name,
-                range,
-                bytes.len()
-            )));
-        }
-        if *value > MAX_PLACEHOLDER_VALUE {
-            return Err(crate::Error::Unsupported(format!(
-                "back_patch_param_dict: {} value {} exceeds maximum \
-                 {PLACEHOLDER_WIDTH}-digit placeholder value ({})",
-                key_name, value, MAX_PLACEHOLDER_VALUE,
+                "back_patch_param_dict: {label} value {v} exceeds maximum \
+                 {PLACEHOLDER_WIDTH}-digit placeholder value ({MAX_PLACEHOLDER_VALUE})",
             )));
         }
     }
 
-    // Preflight the /Prev range (if non-empty).
-    let prev_range = &offsets.first_trailer_prev_range;
+    let region = offsets.dict_writable_region.clone();
+    if region.end > bytes.len() {
+        return Err(crate::Error::Unsupported(format!(
+            "back_patch_param_dict: dict_writable_region {:?} out of bounds for \
+             buffer length {}",
+            region,
+            bytes.len()
+        )));
+    }
+
+    let new_dict = render_compact_dict(&values);
+    if new_dict.len() > region.len() {
+        return Err(crate::Error::Unsupported(format!(
+            "back_patch_param_dict: rendered dict ({} bytes) exceeds reserved \
+             dict_writable_region ({} bytes) — Part 1 trailing pad too small",
+            new_dict.len(),
+            region.len()
+        )));
+    }
+
+    // Preflight the /Prev range (if non-empty).  Copy the range out so the
+    // mutable update of `offsets.part1_placeholders` below does not conflict
+    // with an outstanding borrow of `offsets`.
+    let prev_range = offsets.first_trailer_prev_range.clone();
+    let prev_value = offsets.last_xref_keyword_offset;
     if !prev_range.is_empty() {
         if prev_range.end > bytes.len() {
             return Err(crate::Error::Unsupported(format!(
-                "back_patch_param_dict: /Prev placeholder range {:?} out of bounds for buffer length {}",
-                prev_range,
+                "back_patch_param_dict: /Prev placeholder range {prev_range:?} out of bounds for buffer length {}",
                 bytes.len()
             )));
         }
         if prev_range.len() != PREV_PLACEHOLDER_WIDTH {
             return Err(crate::Error::Unsupported(format!(
-                "back_patch_param_dict: /Prev placeholder range has length {} (expected {})",
+                "back_patch_param_dict: /Prev placeholder range has length {} (expected {PREV_PLACEHOLDER_WIDTH})",
                 prev_range.len(),
-                PREV_PLACEHOLDER_WIDTH,
             )));
         }
         // Value is last_xref_keyword_offset; no overflow check needed for a usize on
@@ -135,29 +283,32 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &LinearizedOffsets) -> R
     }
 
     // -----------------------------------------------------------------------
-    // Pass 2: apply all writes.  After Pass 1 every range / value is known
-    // good, so this loop cannot fail.
+    // Pass 2: splice the new dict body and pad, then update placeholder ranges.
     // -----------------------------------------------------------------------
-    for (range, value, _key_name) in patches {
-        let formatted = format!("{value:0PLACEHOLDER_WIDTH$}");
-        debug_assert_eq!(
-            formatted.len(),
-            PLACEHOLDER_WIDTH,
-            "formatted value '{formatted}' must be exactly {PLACEHOLDER_WIDTH} bytes",
-        );
-        bytes[(*range).clone()].copy_from_slice(formatted.as_bytes());
+    let region_start = region.start;
+    let region_end = region.end;
+    // Write the dict body first.
+    bytes[region_start..region_start + new_dict.len()].copy_from_slice(&new_dict);
+    // Fill the remainder of the rewritable region with ASCII space — this is
+    // the qpdf-style trailing pad that absorbs the bytes saved by compaction.
+    for b in &mut bytes[region_start + new_dict.len()..region_end] {
+        *b = b' ';
     }
+
+    // Update placeholder ranges to point at the rewritten variable-width
+    // value bytes, so callers inspecting `offsets.part1_placeholders` see the
+    // current value positions (not the obsolete pre-splice 10-wide slots).
+    offsets.part1_placeholders = compute_post_splice_placeholders(region_start, &values);
 
     // Write the /Prev value (left-justified, space-padded on the right).
     if !prev_range.is_empty() {
-        let prev_value = offsets.last_xref_keyword_offset;
         let formatted = format!("{prev_value:<PREV_PLACEHOLDER_WIDTH$}");
         debug_assert_eq!(
             formatted.len(),
             PREV_PLACEHOLDER_WIDTH,
             "formatted /Prev value must be exactly {PREV_PLACEHOLDER_WIDTH} bytes",
         );
-        bytes[prev_range.clone()].copy_from_slice(formatted.as_bytes());
+        bytes[prev_range].copy_from_slice(formatted.as_bytes());
     }
 
     Ok(())
@@ -178,7 +329,7 @@ impl LinearizedDocument {
     ///
     /// Propagates any error from [`back_patch_param_dict`].
     pub fn back_patch(&mut self) -> Result<()> {
-        back_patch_param_dict(&mut self.bytes, &self.offsets)
+        back_patch_param_dict(&mut self.bytes, &mut self.offsets)
     }
 }
 
@@ -274,11 +425,12 @@ mod tests {
             xref_offsets: BTreeMap::new(),
             // Empty range — tests that cover /Prev back-patching supply their own.
             first_trailer_prev_range: 0..0,
+            dict_writable_region: part1.dict_writable_region.clone(),
         }
     }
 
     // -----------------------------------------------------------------------
-    // 1. back_patch writes correct 10-digit values at each placeholder range
+    // 1. back_patch writes correct variable-width values at each updated range
     // -----------------------------------------------------------------------
     #[test]
     fn back_patch_writes_values_at_correct_ranges() {
@@ -287,21 +439,22 @@ mod tests {
         let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
         let file_len = bytes.len() + 99_999; // arbitrary > part1
-        let offsets = minimal_offsets(&part1, file_len);
+        let mut offsets = minimal_offsets(&part1, file_len);
 
-        back_patch_param_dict(&mut bytes, &offsets).expect("back_patch should succeed");
+        back_patch_param_dict(&mut bytes, &mut offsets).expect("back_patch should succeed");
 
         let ph = &offsets.part1_placeholders;
 
-        // Each range must now contain the 10-digit formatted value.
+        // Each updated range must contain the variable-width decimal of its value.
         let check = |range: &std::ops::Range<usize>, expected: u64, name: &str| {
             let s = std::str::from_utf8(&bytes[range.clone()]).expect("UTF-8");
-            let parsed: u64 = s.trim_start_matches('0').parse().unwrap_or(0);
+            let parsed: u64 = s.parse().unwrap_or_else(|e| {
+                panic!("{name}: '{s}' must be a decimal integer: {e}")
+            });
             assert_eq!(parsed, expected, "{name}: expected {expected}, got '{s}'");
             assert_eq!(
-                s.len(),
-                PLACEHOLDER_WIDTH,
-                "{name}: length must be {PLACEHOLDER_WIDTH}"
+                s, expected.to_string(),
+                "{name}: must be variable-width (no zero-padding); got '{s}'"
             );
         };
 
@@ -315,40 +468,34 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Bytes outside placeholder ranges are not modified
+    // 2. Bytes outside the dict_writable_region are not modified
+    //
+    //    Inside the region the splice rewrites every byte (dict body shrinks,
+    //    trailing pad grows), so the regression that matters is "do not touch
+    //    anything outside the reserved region".
     // -----------------------------------------------------------------------
     #[test]
-    fn back_patch_leaves_non_placeholder_bytes_unchanged() {
+    fn back_patch_leaves_bytes_outside_region_unchanged() {
         let plan = minimal_plan();
         let renumber = RenumberMap::from_plan(&plan);
         let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let original = part1.bytes.clone();
         let mut bytes = original.clone();
-        let offsets = minimal_offsets(&part1, bytes.len() + 1);
+        let mut offsets = minimal_offsets(&part1, bytes.len() + 1);
 
-        back_patch_param_dict(&mut bytes, &offsets).expect("back_patch");
+        back_patch_param_dict(&mut bytes, &mut offsets).expect("back_patch");
 
-        let ph = &offsets.part1_placeholders;
-        let mut all_ranges: Vec<std::ops::Range<usize>> = ph.as_slice().to_vec();
-        all_ranges.sort_by_key(|r| r.start);
-
-        // Collect all byte positions covered by placeholder ranges.
-        let placeholder_positions: std::collections::HashSet<usize> =
-            all_ranges.iter().flat_map(|r| r.clone()).collect();
-
-        // Every byte NOT in a placeholder must be identical to the original.
-        for (i, (&orig, &patched)) in original.iter().zip(bytes.iter()).enumerate() {
-            if !placeholder_positions.contains(&i) {
-                assert_eq!(
-                    orig, patched,
-                    "byte at index {i} (outside placeholders) was modified"
-                );
-            }
-        }
+        let region = offsets.dict_writable_region.clone();
+        // Bytes BEFORE the region (header + `N 0 obj\n`) must be untouched.
+        assert_eq!(&bytes[..region.start], &original[..region.start]);
+        // Bytes AFTER the region (none in the standalone build, but check the
+        // tail just in case the buffer ever grows): must be untouched.
+        assert_eq!(&bytes[region.end..], &original[region.end..]);
     }
 
     // -----------------------------------------------------------------------
-    // 3. After back-patching, all placeholder ranges contain only digit bytes
+    // 3. After back-patching, every updated placeholder range contains only
+    //    ASCII digits (no leading zeros, no spaces).
     // -----------------------------------------------------------------------
     #[test]
     fn after_back_patch_placeholders_are_all_digits() {
@@ -356,18 +503,52 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
         let mut bytes = part1.bytes.clone();
-        let offsets = minimal_offsets(&part1, bytes.len() + 42);
+        let mut offsets = minimal_offsets(&part1, bytes.len() + 42);
 
-        back_patch_param_dict(&mut bytes, &offsets).expect("back_patch");
+        back_patch_param_dict(&mut bytes, &mut offsets).expect("back_patch");
 
         let ph = &offsets.part1_placeholders;
         for range in ph.as_slice() {
+            assert!(!range.is_empty(), "post-splice value range must be non-empty");
             for &b in &bytes[range.clone()] {
                 assert!(
                     b.is_ascii_digit(),
                     "byte {b} at position in {range:?} is not an ASCII digit"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3b. Trailing-pad region after the rewritten dict is filled with ASCII
+    //     space — qpdf's byte format, used to keep Part 1 length constant.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn after_back_patch_trailing_region_is_ascii_space() {
+        let plan = minimal_plan();
+        let renumber = RenumberMap::from_plan(&plan);
+        let part1 = Part1Bytes::build(&plan, &renumber, "1.4");
+        let mut bytes = part1.bytes.clone();
+        let mut offsets = minimal_offsets(&part1, bytes.len() + 42);
+
+        back_patch_param_dict(&mut bytes, &mut offsets).expect("back_patch");
+
+        // Find the `\nendobj\n` marker — every byte after it (within the
+        // dict_writable_region) must be ASCII space.
+        let region = &offsets.dict_writable_region;
+        let endobj_needle = b"\nendobj\n";
+        let endobj_pos = bytes[region.clone()]
+            .windows(endobj_needle.len())
+            .position(|w| w == endobj_needle)
+            .expect("rewritten dict must contain `\\nendobj\\n`");
+        let pad_start = region.start + endobj_pos + endobj_needle.len();
+        for &b in &bytes[pad_start..region.end] {
+            assert_eq!(
+                b, b' ',
+                "trailing pad must be ASCII space; got {b:?} at offset within \
+                 [{pad_start}..{end}]",
+                end = region.end
+            );
         }
     }
 
@@ -385,7 +566,7 @@ mod tests {
         let mut offsets = minimal_offsets(&part1, 10_000_000_000);
         offsets.file_length = 10_000_000_000; // usize, fine on 64-bit
 
-        let result = back_patch_param_dict(&mut bytes, &offsets);
+        let result = back_patch_param_dict(&mut bytes, &mut offsets);
         assert!(
             result.is_err(),
             "back_patch must return Err when /L value overflows 10 digits"
@@ -401,7 +582,7 @@ mod tests {
         let mut offsets = minimal_offsets(&part1, 100);
         offsets.hint_stream_offset = 10_000_000_000;
 
-        let result = back_patch_param_dict(&mut bytes, &offsets);
+        let result = back_patch_param_dict(&mut bytes, &mut offsets);
         assert!(result.is_err(), "back_patch must Err on /H[0] overflow");
     }
 
@@ -414,12 +595,13 @@ mod tests {
         let mut offsets = minimal_offsets(&part1, 100);
         offsets.last_xref_offset = 10_000_000_001;
 
-        let result = back_patch_param_dict(&mut bytes, &offsets);
+        let result = back_patch_param_dict(&mut bytes, &mut offsets);
         assert!(result.is_err(), "back_patch must Err on /T overflow");
     }
 
-    /// Regression: when a late field overflows, no earlier placeholder
-    /// should have been written (preflight-then-write contract).
+    /// Regression: a value-overflow Err must leave `bytes` byte-wise unchanged
+    /// (preflight-then-write contract).  Without preflight, a late-field error
+    /// could leave the splice half-applied with an inconsistent dict.
     #[test]
     fn overflow_on_late_field_leaves_bytes_unchanged() {
         let plan = minimal_plan();
@@ -428,16 +610,16 @@ mod tests {
         let original = part1.bytes.clone();
         let mut bytes = original.clone();
 
-        // All fields legal except /T (sixth in the patch list).
+        // All fields legal except /T (last in the value-label list).
         let mut offsets = minimal_offsets(&part1, 100);
         offsets.file_length = 12345; // would normally write a non-zero /L
         offsets.last_xref_offset = 10_000_000_000; // overflow on a late field
 
-        let result = back_patch_param_dict(&mut bytes, &offsets);
+        let result = back_patch_param_dict(&mut bytes, &mut offsets);
         assert!(result.is_err(), "back_patch must Err on /T overflow");
         assert_eq!(
             bytes, original,
-            "overflow on a late field must NOT leave earlier placeholders mutated \
+            "overflow on a late field must NOT leave the dict half-rewritten \
              (preflight-then-write contract)"
         );
     }
@@ -450,31 +632,31 @@ mod tests {
         let mut doc = build_linearized();
         doc.back_patch().expect("LinearizedDocument::back_patch");
 
-        // /L must now be the actual file length (10 digits, zero-padded).
-        let expected_l = format!("{:010}", doc.offsets.file_length);
+        // /L must now be the actual file length, written as variable-width decimal.
+        let expected_l = doc.offsets.file_length.to_string();
         let ph = &doc.offsets.part1_placeholders;
         let actual_l = std::str::from_utf8(&doc.bytes[ph.l.clone()]).expect("UTF-8");
         assert_eq!(
             actual_l, expected_l,
-            "/L must be back-patched to file_length"
+            "/L must be back-patched to file_length (variable-width)"
         );
     }
 
     // -----------------------------------------------------------------------
-    // 6. Byte-level substring: "/L 0000NNNNNN" appears in output
+    // 6. Byte-level substring: "/L <decimal>" appears in output, no zero pad
     // -----------------------------------------------------------------------
     #[test]
     fn output_contains_l_substring() {
         let mut doc = build_linearized();
         doc.back_patch().expect("back_patch");
 
-        let expected_value = format!("{:010}", doc.offsets.file_length);
-        let needle = format!("/L {}", expected_value);
+        let expected_value = doc.offsets.file_length.to_string();
+        let needle = format!("/L {expected_value} ");
         assert!(
             doc.bytes
                 .windows(needle.len())
                 .any(|w| w == needle.as_bytes()),
-            "back-patched bytes must contain '{needle}'"
+            "back-patched bytes must contain '{needle}' (variable-width)"
         );
     }
 
@@ -501,7 +683,7 @@ mod tests {
         let ph = &doc.offsets.part1_placeholders;
         let t_bytes = &doc.bytes[ph.t.clone()];
         let t_str = std::str::from_utf8(t_bytes).expect("UTF-8");
-        let t_val: usize = t_str.trim_start_matches('0').parse().unwrap_or(0);
+        let t_val: usize = t_str.parse().expect("/T decimal");
         assert_eq!(
             t_val, doc.offsets.last_xref_offset,
             "/T back-patched value must equal last_xref_offset"
@@ -519,7 +701,7 @@ mod tests {
         let ph = &doc.offsets.part1_placeholders;
         let n_bytes = &doc.bytes[ph.n.clone()];
         let n_str = std::str::from_utf8(n_bytes).expect("UTF-8");
-        let n_val: u32 = n_str.trim_start_matches('0').parse().unwrap_or(0);
+        let n_val: u32 = n_str.parse().expect("/N decimal");
         assert_eq!(n_val, doc.offsets.page_count, "/N must equal page_count");
     }
 
@@ -532,9 +714,19 @@ mod tests {
         doc1.back_patch().expect("first back_patch");
         let after_first = doc1.bytes.clone();
 
-        // Second call on the already-patched bytes.
-        // (offsets.part1_placeholders still refers to the same byte positions.)
-        back_patch_param_dict(&mut doc1.bytes, &doc1.offsets).expect("second back_patch");
+        // Second call on the already-spliced bytes.  Placeholders point at
+        // the variable-width values now; the splice should still produce the
+        // same dict + same pad → same bytes.
+        back_patch_param_dict(&mut doc1.bytes, &mut doc1.offsets).expect("second back_patch");
         assert_eq!(doc1.bytes, after_first, "back_patch must be idempotent");
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. PLACEHOLDER_WIDTH is the public cap used by the preflight; ensure
+    //     it stays the qpdf-spec 10 (so 10^10 stays the value overflow limit).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn placeholder_width_constant_is_ten() {
+        assert_eq!(PLACEHOLDER_WIDTH, 10);
     }
 }

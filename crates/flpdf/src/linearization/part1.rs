@@ -8,21 +8,31 @@
 //!    (10-digit) decimal placeholders for all numeric values that are not
 //!    yet known at layout time.
 //!
-//! # Placeholder discipline
+//! # Placeholder discipline + trailing pad
 //!
-//! Every numeric value in the dict is represented as a **10-digit, zero-padded**
-//! ASCII decimal string (e.g. `0000000000`).  This fixed-width encoding means
-//! that a back-patcher (sub-task 2.9) can overwrite values in-place without
-//! shifting any downstream byte offsets.
+//! Every numeric value in the dict is initially represented as a **10-digit,
+//! zero-padded** ASCII decimal string (e.g. `0000000000`).  This fixed-width
+//! encoding means that a back-patcher (sub-task 2.9) can overwrite values
+//! in-place without shifting any downstream byte offsets.
 //!
-//! [`Part1Placeholders`] records the exact byte ranges of each placeholder so
-//! the back-patcher can find and replace them without scanning the file.
+//! Immediately after `endobj\n`, the emitter reserves
+//! [`PARAM_DICT_TRAILING_PAD`] bytes of ASCII space (`b' '`).  Once the
+//! back-patcher knows the final numeric values, it rewrites the dict with
+//! **variable-width** decimals (matching qpdf's byte format, flpdf-9hc.20.25)
+//! and grows this trailing pad to absorb the bytes saved, so the total Part 1
+//! byte length stays constant.  Without the reserve, shrinking the dict would
+//! shift every downstream offset and force a second convergence loop.
+//!
+//! [`Part1Placeholders`] records the exact byte ranges of each placeholder
+//! (pre-back-patch, 10-wide; post-back-patch the back-patcher updates them
+//! to point at the rewritten variable-width value bytes).  `dict_writable_region`
+//! covers the splice target: from `<<` through the end of the trailing pad.
 //!
 //! # Scope
 //!
-//! This module emits **header + object 1 only**.  The Part 1 xref subsection
-//! and trailer (required by the linearized format) are written by the full
-//! orchestrator in sub-task 2.8.
+//! This module emits **header + object 1 + trailing pad** only.  The Part 1
+//! xref subsection and trailer (required by the linearized format) are
+//! written by the full orchestrator in sub-task 2.8.
 
 use std::ops::Range;
 
@@ -30,23 +40,43 @@ use super::plan::LinearizationPlan;
 use super::renumber::RenumberMap;
 
 // ---------------------------------------------------------------------------
-// Placeholder width
+// Placeholder width and trailing pad reserve
 // ---------------------------------------------------------------------------
 
-/// Number of ASCII digits used for every numeric placeholder.
+/// Initial number of ASCII digits used for every numeric placeholder.
+///
+/// After the back-patcher compacts the dict to variable-width decimals, each
+/// field's actual byte count is `value.to_string().len()` (1..=10 for any
+/// value ≤ 10^10 − 1).
 pub const PLACEHOLDER_WIDTH: usize = 10;
 
 /// The placeholder bytes (10 ASCII `b'0'` characters).
 const PLACEHOLDER: &[u8] = b"0000000000";
 
+/// Number of pad bytes reserved after `endobj\n` so the dict can be rewritten
+/// with variable-width decimal values without shifting Part 1's total length.
+///
+/// = `7 fields × (PLACEHOLDER_WIDTH − 1)` = 63.  This is the tight upper bound
+/// on bytes saved by compaction: each of the 7 numeric fields shrinks by at
+/// most `PLACEHOLDER_WIDTH − 1` characters (= 10 − 1 for value `0` rendered
+/// as the single byte `b"0"`).
+pub const PARAM_DICT_TRAILING_PAD: usize = 7 * (PLACEHOLDER_WIDTH - 1);
+
 // ---------------------------------------------------------------------------
 // Part1Placeholders
 // ---------------------------------------------------------------------------
 
-/// Byte ranges of each placeholder inside the [`Part1Bytes`] buffer.
+/// Byte ranges of each numeric value field inside the [`Part1Bytes`] buffer.
 ///
-/// Each range points to exactly [`PLACEHOLDER_WIDTH`] bytes of ASCII `b'0'`.
-/// The back-patcher (sub-task 2.9) writes the true values into these ranges.
+/// **Pre-back-patch**: every range is exactly [`PLACEHOLDER_WIDTH`] bytes of
+/// ASCII `b'0'`.  This is the [`all_valid`](Self::all_valid) invariant.
+///
+/// **Post-back-patch** (after [`back_patch_param_dict`](crate::linearization::back_patch_param_dict)):
+/// the back-patcher splices the variable-width compact dict into place and
+/// updates these ranges to point at the rewritten value bytes — each range
+/// becomes 1..=10 bytes wide (`value.to_string().len()`).  The
+/// [`all_valid`](Self::all_valid) check no longer holds and is intentionally
+/// not maintained post-splice.
 ///
 /// ## Which fields need back-patching
 ///
@@ -97,8 +127,15 @@ impl Part1Placeholders {
         ]
     }
 
-    /// Returns `true` if all seven placeholder ranges are pairwise disjoint and
-    /// each has a width of exactly [`PLACEHOLDER_WIDTH`].
+    /// Returns `true` iff this is the **pre-back-patch** layout:
+    /// all seven placeholder ranges are pairwise disjoint and each has a
+    /// width of exactly [`PLACEHOLDER_WIDTH`].
+    ///
+    /// Post-back-patch the ranges shrink to their variable-width value bytes,
+    /// so this returns `false` after a successful
+    /// [`back_patch_param_dict`](crate::linearization::back_patch_param_dict)
+    /// call — the writer asserts this invariant only on the freshly built
+    /// `Part1Bytes`.
     pub fn all_valid(&self) -> bool {
         let ranges = self.as_slice();
         for r in &ranges {
@@ -122,24 +159,35 @@ impl Part1Placeholders {
 // Part1Bytes
 // ---------------------------------------------------------------------------
 
-/// The serialized bytes for Part 1 (header + linearization parameter dict)
-/// together with the placeholder positions needed for back-patching.
+/// The serialized bytes for Part 1 (header + linearization parameter dict +
+/// trailing pad) together with the placeholder positions needed for
+/// back-patching and the writable region used by the variable-width compaction.
 ///
 /// Construct via [`Part1Bytes::build`].
 #[derive(Debug, Clone)]
 pub struct Part1Bytes {
-    /// Raw bytes: file header followed by object 1.
+    /// Raw bytes: file header, then `N 0 obj\n<< ... >>\nendobj\n`, then
+    /// [`PARAM_DICT_TRAILING_PAD`] bytes of ASCII space pad.
     pub bytes: Vec<u8>,
-    /// Byte positions of every numeric placeholder in `bytes`.
+    /// Byte positions of every numeric value field in `bytes`.  Pre-back-patch
+    /// these are 10 ASCII `0` characters; post-back-patch they point at the
+    /// rewritten variable-width decimal bytes.
     pub placeholders: Part1Placeholders,
-    /// Byte offset within `bytes` of the `1 0 obj` token (i.e. the start of
-    /// object 1's body, after the file header).  The linearized writer needs
-    /// this for the Part 1 xref subsection's offset entry.
+    /// Byte offset within `bytes` of the `N 0 obj` token (i.e. the start of
+    /// the param-dict object's body, after the file header).  The linearized
+    /// writer needs this for the Part 1 xref subsection's offset entry.
     ///
     /// Exposed instead of having callers hardcode the header length so that
     /// changes to the header format (PDF version bump, binary marker change)
     /// do not silently break downstream xref entries.
     pub obj1_offset: usize,
+    /// Byte range spanned by the rewritable param-dict region:
+    /// `<<` through the end of the trailing pad (inclusive of `\nendobj\n`).
+    ///
+    /// The variable-width back-patcher overwrites this entire region with a
+    /// compact dict body + `\nendobj\n` + spaces to fill, keeping the total
+    /// region length (and thus all downstream offsets) constant.
+    pub dict_writable_region: Range<usize>,
 }
 
 impl Part1Bytes {
@@ -197,6 +245,10 @@ impl Part1Bytes {
         // do not need to compute the file header length out of band.
         let param_dict_offset = bytes.len();
         bytes.extend_from_slice(format!("{param_dict_obj_number} 0 obj\n").as_bytes());
+        // Capture the start of the dict body — this is where the back-patcher's
+        // splice begins (everything from `<<` through the trailing pad is
+        // rewritable).
+        let dict_writable_start = bytes.len();
         bytes.extend_from_slice(b"<< /Linearized 1 /L ");
 
         // /L placeholder
@@ -253,6 +305,17 @@ impl Part1Bytes {
         bytes.extend_from_slice(b" >>\n");
         bytes.extend_from_slice(b"endobj\n");
 
+        // ------------------------------------------------------------------
+        // Trailing pad: reserve space for variable-width dict compaction.
+        //
+        // The back-patcher rewrites the dict with variable-width decimals
+        // (qpdf byte format) and grows this pad to absorb the saved bytes
+        // — total Part 1 byte length stays constant so downstream offsets
+        // never shift.
+        // ------------------------------------------------------------------
+        let dict_writable_end = bytes.len() + PARAM_DICT_TRAILING_PAD;
+        bytes.resize(dict_writable_end, b' ');
+
         let placeholders = Part1Placeholders {
             l: l_start..l_end,
             h_offset: h_offset_start..h_offset_end,
@@ -267,6 +330,7 @@ impl Part1Bytes {
             bytes,
             placeholders,
             obj1_offset: param_dict_offset,
+            dict_writable_region: dict_writable_start..dict_writable_end,
         }
     }
 

@@ -757,19 +757,24 @@ mod tests {
     #[test]
     fn tampered_l_is_rejected() {
         let mut bytes = build_linearized_bytes();
-        // Find "/L 0000" and bump the last digit by 1 to make /L wrong.
-        let needle = b"/L 0";
-        if let Some(pos) = bytes.windows(needle.len()).position(|w| w == needle) {
-            // Find the end of the 10-digit number (pos + 3 to pos + 13).
-            let val_start = pos + 3; // after "/L "
-            let val_end = val_start + 10;
-            // Increment the last digit (with wrapping) to make the value wrong.
-            bytes[val_end - 1] = if bytes[val_end - 1] == b'9' {
-                b'0'
-            } else {
-                bytes[val_end - 1] + 1
-            };
-        }
+        // Find "/L " followed by ASCII digits (variable-width post flpdf-9hc.20.25)
+        // and bump the last digit by 1 to make /L wrong.
+        let needle = b"/L ";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("linearized output must contain /L");
+        let val_start = pos + needle.len();
+        let val_end = val_start
+            + bytes[val_start..]
+                .iter()
+                .position(|&b| !b.is_ascii_digit())
+                .expect("/L value must be followed by a non-digit terminator");
+        assert!(val_end > val_start, "/L value must have at least one digit");
+        // Increment the last digit (with wrap) to make the value wrong.
+        let last = val_end - 1;
+        bytes[last] = if bytes[last] == b'9' { b'0' } else { bytes[last] + 1 };
+
         let result = check_linearization_bytes(&bytes);
         assert!(
             matches!(result, Err(LinearizationCheckError::InvalidParam { .. })),

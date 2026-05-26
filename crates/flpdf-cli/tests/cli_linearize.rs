@@ -101,22 +101,23 @@ fn check_linearization_tampered_l_exits_1() {
         .assert()
         .success();
 
-    // Read and tamper: find "/L 0" and bump one digit so /L != file_length.
+    // Read and tamper: find "/L " followed by ASCII digits (variable-width
+    // post flpdf-9hc.20.25) and bump the last digit so /L != file_length.
     let mut bytes = std::fs::read(&linearized_path).unwrap();
-    let needle = b"/L 0";
-    if let Some(pos) = bytes.windows(needle.len()).position(|w| w == needle) {
-        // The 10-digit value starts at pos + 3 (after "/L ").
-        let val_start = pos + 3;
-        let val_end = val_start + 10;
-        // Change the last digit to make /L wrong.
-        bytes[val_end - 1] = if bytes[val_end - 1] == b'9' {
-            b'0'
-        } else {
-            bytes[val_end - 1] + 1
-        };
-    } else {
-        panic!("could not find '/L 0' in linearized output for tampering");
-    }
+    let needle = b"/L ";
+    let pos = bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("could not find '/L ' in linearized output for tampering");
+    let val_start = pos + needle.len();
+    let val_end = val_start
+        + bytes[val_start..]
+            .iter()
+            .position(|&b| !b.is_ascii_digit())
+            .expect("/L value must terminate at a non-digit");
+    assert!(val_end > val_start, "/L value must have at least one digit");
+    let last = val_end - 1;
+    bytes[last] = if bytes[last] == b'9' { b'0' } else { bytes[last] + 1 };
 
     let tampered_path = outdir.path().join("tampered.pdf");
     std::fs::write(&tampered_path, &bytes).unwrap();
@@ -561,5 +562,134 @@ fn linearize_part1_startxref_is_zero_main_startxref_is_real() {
     assert_eq!(
         main_val, last_xref_pos,
         "Part 6 main startxref ({main_val}) must equal last xref keyword offset ({last_xref_pos})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Param dict integers are variable-width decimal (no zero-padding),
+//     matching qpdf byte format (flpdf-9hc.20.25).
+//
+//     qpdf emits e.g. `/L 1701 /H [ 601 118 ] /O 6 /E 1198 /N 1 /T 1523`,
+//     not flpdf's earlier `/L 0000001701 /H [ 0000000601 0000000118 ] ...`
+//     fixed-width form.  Each integer field's decimal text matches the
+//     minimal representation of its value, with no leading zeros (except
+//     for value 0 itself, which is the single byte `0`).
+// ---------------------------------------------------------------------------
+
+/// Extract the bytes of the value following `key` (e.g. `/L `) up to the next
+/// non-digit byte. Returns the digit slice including its position.
+fn extract_int_field(bytes: &[u8], key: &[u8]) -> (usize, Vec<u8>) {
+    let pos = bytes
+        .windows(key.len())
+        .position(|w| w == key)
+        .unwrap_or_else(|| panic!("param dict key {:?} not found", String::from_utf8_lossy(key)));
+    let val_start = pos + key.len();
+    let val_end = bytes[val_start..]
+        .iter()
+        .position(|&b| !b.is_ascii_digit())
+        .map(|p| val_start + p)
+        .expect("integer field must terminate");
+    (val_start, bytes[val_start..val_end].to_vec())
+}
+
+#[test]
+fn linearize_param_dict_integers_are_variable_width_decimal() {
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("lin.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--static-id",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+
+    // For every integer field, the digit-text must be the minimal decimal
+    // representation of its numeric value (no leading zeros).
+    let check_no_leading_zero = |label: &str, digits: &[u8]| {
+        let s = std::str::from_utf8(digits).expect("digits utf-8");
+        let parsed: u64 = s.parse().unwrap_or_else(|e| {
+            panic!("{label} value '{s}' must be a valid decimal integer: {e}")
+        });
+        let canonical = parsed.to_string();
+        assert_eq!(
+            s, canonical,
+            "{label} must be variable-width decimal with no zero-padding; \
+             got '{s}', expected '{canonical}' (= {parsed})"
+        );
+    };
+
+    let (_, l_digits) = extract_int_field(&bytes, b"/L ");
+    check_no_leading_zero("/L", &l_digits);
+
+    // /H [ X Y ]
+    let h_pos = bytes
+        .windows(b"/H [ ".len())
+        .position(|w| w == b"/H [ ")
+        .expect("/H array");
+    let h_inner_start = h_pos + b"/H [ ".len();
+    let space1 = bytes[h_inner_start..]
+        .iter()
+        .position(|&b| b == b' ')
+        .map(|p| h_inner_start + p)
+        .expect("/H[0] terminator");
+    check_no_leading_zero("/H[0]", &bytes[h_inner_start..space1]);
+    let h1_start = space1 + 1;
+    let space2 = bytes[h1_start..]
+        .iter()
+        .position(|&b| b == b' ')
+        .map(|p| h1_start + p)
+        .expect("/H[1] terminator");
+    check_no_leading_zero("/H[1]", &bytes[h1_start..space2]);
+
+    let (_, o_digits) = extract_int_field(&bytes, b"/O ");
+    check_no_leading_zero("/O", &o_digits);
+    let (_, e_digits) = extract_int_field(&bytes, b"/E ");
+    check_no_leading_zero("/E", &e_digits);
+    let (_, n_digits) = extract_int_field(&bytes, b"/N ");
+    check_no_leading_zero("/N", &n_digits);
+    let (_, t_digits) = extract_int_field(&bytes, b"/T ");
+    check_no_leading_zero("/T", &t_digits);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Param dict /L value equals total file length after variable-width
+//     compaction (flpdf-9hc.20.25 — value semantics regression guard).
+// ---------------------------------------------------------------------------
+#[test]
+fn linearize_l_value_equals_file_length_post_compact() {
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("lin.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--static-id",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    let (_, l_digits) = extract_int_field(&bytes, b"/L ");
+    let l_val: usize = std::str::from_utf8(&l_digits)
+        .unwrap()
+        .parse()
+        .expect("/L numeric");
+    assert_eq!(
+        l_val,
+        bytes.len(),
+        "/L ({l_val}) must equal the total file length ({})",
+        bytes.len()
     );
 }
