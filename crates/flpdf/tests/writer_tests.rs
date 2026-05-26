@@ -3447,6 +3447,319 @@ fn incremental_generate_qpdf_check() {
     );
 }
 
+/// flpdf-9hc.5.12: combined-paths regression. A single incremental Generate
+/// write over an xref-stream source must, in ONE pass, satisfy all three
+/// flows independently:
+///
+/// - (a) a freshly-mutated plain eligible object is packed into a NEW ObjStm
+///   container (type-2 compressed entry with `stream` == new container);
+/// - (b) a deleted object emits a type-0 free entry;
+/// - (c) a touched existing-ObjStm member is patched IN PLACE — its xref
+///   entry stays `Compressed{ stream: original_container, index: original_index }`.
+///
+/// The flpdf-9hc.5.9 stack already covers each path in isolation, plus a
+/// qpdf-check on the packable-only path; the combined-paths interaction is
+/// currently satisfied only transitively (the gate routes plain-packable
+/// through `partition_objstm_eligible` while leaving `deleted_object_refs`
+/// and `touched_objstm_members` on their pre-existing flows). This
+/// integration test hardens against a future refactor accidentally
+/// re-entangling those flows — e.g. routing an existing-ObjStm-member touch
+/// through the new packer (which would flip its `stream` from the source
+/// container to the new container and would silently re-pack rather than
+/// patch in place).
+#[test]
+fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member() {
+    // Build an xref-stream-form source with:
+    //   1 0 obj   /Catalog
+    //   2 0 obj   /Pages (compressed in ObjStm container 3, index 0)
+    //   3 0 obj   ObjStm  (Flate, single member)
+    //   4 0 obj   plain   (to be deleted in the incremental update)
+    //   5 0 obj   plain   (to be touched → packed into NEW ObjStm)
+    //   6 0 obj   xref stream
+    //
+    // /Catalog references object 2 via /Pages so the document is structurally
+    // walkable from /Root through the ObjStm container; objects 4 and 5 are
+    // unreferenced from /Catalog, which qpdf --check tolerates as warnings.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // ObjStm container 3 holding member object 2 (Pages dict).
+    let member2_source = b"<< /Type /Pages /Count 0 /Kids [] /FlpdfMemberSource true >>";
+    let (objstm_data, objstm_first) = build_flate_objstm_payload(&[(2, member2_source)]);
+    let obj3_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /ObjStm /N 1 /First {} /Length {} /Filter /FlateDecode >>\nstream\n",
+            objstm_first,
+            objstm_data.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let obj4_offset = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n<< /FlpdfTag (deletable) >>\nendobj\n");
+
+    let obj5_offset = bytes.len();
+    bytes.extend_from_slice(b"5 0 obj\n<< /FlpdfTag (packable-source) >>\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0); // 0: free head
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0); // 1: type-1
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0); // 2: type-2 (in stream 3, idx 0)
+    append_xref_stream_entry(&mut xref_entries, 1, obj3_offset as u32, 0); // 3: ObjStm container
+    append_xref_stream_entry(&mut xref_entries, 1, obj4_offset as u32, 0); // 4: type-1
+    append_xref_stream_entry(&mut xref_entries, 1, obj5_offset as u32, 0); // 5: type-1
+
+    let source_xref_offset = bytes.len();
+    append_xref_stream_entry(&mut xref_entries, 1, source_xref_offset as u32, 0); // 6: xref stream
+
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 3 1] /Index [0 7] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{source_xref_offset}\n%%EOF\n").as_bytes());
+
+    let source = bytes;
+    {
+        let mut src_reader = Cursor::new(&source);
+        let src_loaded = load_xref_and_trailer(&mut src_reader).unwrap();
+        assert_eq!(
+            src_loaded.last_xref_form,
+            XrefForm::Stream,
+            "fixture must be xref-stream form for the Generate gate to engage"
+        );
+        // Confirm the fixture sets up object 2 as an existing ObjStm member —
+        // this is the load-bearing precondition of path (c); without it
+        // `set_object(2,…)` would not populate `compressed_member_parents`
+        // and the writer would route obj2 through the plain-touched path.
+        match src_loaded.entries.get(&ObjectRef::new(2, 0)) {
+            Some(XrefOffset::Compressed { stream, index }) => {
+                assert_eq!(*stream, 3, "fixture: obj 2 must be in source ObjStm 3");
+                assert_eq!(*index, 0, "fixture: obj 2 must be at source ObjStm index 0");
+            }
+            other => {
+                panic!("fixture must register obj 2 as Compressed in source xref; got {other:?}")
+            }
+        }
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+
+    // (c) Rewrite the existing ObjStm member — same /Pages-shaped dict, new
+    // tag to make the round-trip distinguishable.
+    let member_ref = ObjectRef::new(2, 0);
+    let member_rewritten = Object::Dictionary({
+        let mut d = Dictionary::new();
+        d.insert("Type", Object::Name(b"Pages".to_vec()));
+        d.insert("Count", Object::Integer(0));
+        d.insert("Kids", Object::Array(Vec::new()));
+        d.insert("FlpdfMemberRewritten", Object::Boolean(true));
+        d
+    });
+    pdf.set_object(member_ref, member_rewritten.clone());
+
+    // (b) Delete object 4 → must emit a type-0 free entry.
+    let deleted_ref = ObjectRef::new(4, 0);
+    pdf.delete_object(deleted_ref);
+
+    // (a) Touch object 5 with a plain eligible dict → packed into NEW ObjStm.
+    let packed_ref = ObjectRef::new(5, 0);
+    let packed_value = Object::Dictionary({
+        let mut d = Dictionary::new();
+        d.insert("FlpdfTag", Object::String(b"packable-rewritten".to_vec()));
+        d.insert("FlpdfPacked", Object::Boolean(true));
+        d
+    });
+    pdf.set_object(packed_ref, packed_value.clone());
+
+    let mut options = WriteOptions::default();
+    options.object_streams = ObjectStreamMode::Generate;
+    options.full_rewrite = false;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // New container number per `allocate_incremental_objstm_container`:
+    //   max(max_source=6, max_touched=5, max_deleted=4, declared_size-1=6) + 1 = 7.
+    let expected_new_container = ObjectRef::new(7, 0);
+
+    // Round-trip resolutions through the public reader API.
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
+    assert_eq!(
+        reopened.resolve(member_ref).unwrap(),
+        member_rewritten,
+        "(c) touched existing-ObjStm member must resolve to the rewritten value"
+    );
+    assert_eq!(
+        reopened.resolve(packed_ref).unwrap(),
+        packed_value,
+        "(a) packed object must resolve to the rewritten value"
+    );
+    assert_eq!(
+        reopened.resolve(deleted_ref).unwrap(),
+        Object::Null,
+        "(b) deleted object must resolve to /Null"
+    );
+    // /Catalog and the source ObjStm container must still be reachable.
+    let root_ref = reopened.root_ref().expect("expected /Root");
+    let Object::Dictionary(catalog) = reopened.resolve(root_ref).unwrap() else {
+        panic!("/Root must resolve to a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Type"),
+        Some(&Object::Name(b"Catalog".to_vec())),
+        "/Catalog must still resolve"
+    );
+
+    // Inspect the appended xref stream directly so each path's *xref entry
+    // kind* is asserted, not just its resolution result.
+    let mut output_reader = Cursor::new(&output);
+    let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
+    assert_eq!(
+        loaded.last_xref_form,
+        XrefForm::Stream,
+        "output must remain xref-stream form"
+    );
+
+    // (a) packed → type-2 compressed entry in the NEW container at index 0.
+    match loaded.entries.get(&packed_ref) {
+        Some(XrefOffset::Compressed { stream, index }) => {
+            assert_eq!(
+                *stream, expected_new_container.number,
+                "(a) packed object must be compressed into the freshly-allocated container"
+            );
+            assert_eq!(
+                *index, 0,
+                "(a) packed object must be at new-container index 0"
+            );
+        }
+        other => panic!(
+            "(a) packed object {packed_ref:?} must have a Compressed xref entry, got {other:?}"
+        ),
+    }
+    // New container itself must be a plain type-1 indirect object.
+    match loaded.entries.get(&expected_new_container) {
+        Some(XrefOffset::Offset(_)) => {}
+        other => panic!(
+            "(a) new ObjStm container {expected_new_container:?} must have a type-1 Offset entry, got {other:?}"
+        ),
+    }
+    // And the new container's body must actually be an /ObjStm stream.
+    let Object::Stream(container_stream) = reopened.resolve(expected_new_container).unwrap() else {
+        panic!("(a) new container {expected_new_container:?} must resolve to a stream");
+    };
+    assert_eq!(
+        container_stream.dict.get("Type"),
+        Some(&Object::Name(b"ObjStm".to_vec())),
+        "(a) new container /Type must be /ObjStm"
+    );
+
+    // (b) deleted → type-0 free entry. `build_deleted_entries` bumps the
+    // generation by 1 (incremented_generation), so the new free entry lives at
+    // ObjectRef{ number: 4, generation: 1 } in the appended xref stream.
+    let deleted_free_key = ObjectRef::new(deleted_ref.number, 1);
+    match loaded.entries.get(&deleted_free_key) {
+        Some(XrefOffset::Free { .. }) => {}
+        other => panic!(
+            "(b) deleted object {deleted_ref:?} must produce a Free xref entry at gen 1, got {other:?}"
+        ),
+    }
+
+    // (c) existing-ObjStm member — IN-PLACE patch. The defining property of
+    // this regression test: `stream` must remain the SOURCE container (3),
+    // not flip to the freshly-allocated one. A future refactor that routes
+    // existing-member touches through the new packer would flip `stream` to
+    // 7 and trip this assertion.
+    let source_container = ObjectRef::new(3, 0);
+    match loaded.entries.get(&member_ref) {
+        Some(XrefOffset::Compressed { stream, index }) => {
+            assert_eq!(
+                *stream, source_container.number,
+                "(c) touched existing-ObjStm member must stay in its source container — \
+                 if this fires with stream={} (the new container), the existing-member \
+                 path has been re-entangled with the new packer",
+                expected_new_container.number
+            );
+            assert_eq!(
+                *index, 0,
+                "(c) touched existing-ObjStm member must retain its source index"
+            );
+        }
+        other => panic!(
+            "(c) touched existing-ObjStm member {member_ref:?} must have a Compressed xref entry, got {other:?}"
+        ),
+    }
+    // The source container must have been rewritten at a NEW offset (the
+    // patched payload reflects the touched member); its xref kind stays
+    // type-1 Offset.
+    match loaded.entries.get(&source_container) {
+        Some(XrefOffset::Offset(_)) => {}
+        other => panic!(
+            "(c) source ObjStm container {source_container:?} must remain type-1 Offset after patch, got {other:?}"
+        ),
+    }
+    // And the patched container must actually contain the rewritten member.
+    let Object::Stream(patched) = reopened.resolve(source_container).unwrap() else {
+        panic!("(c) source container {source_container:?} must still resolve to a stream");
+    };
+    assert_eq!(
+        patched.dict.get("Type"),
+        Some(&Object::Name(b"ObjStm".to_vec())),
+        "(c) source container /Type must stay /ObjStm"
+    );
+
+    // /Prev must point at the source's last startxref (incremental linkage).
+    let prev = as_integer(
+        loaded
+            .trailer
+            .get("Prev")
+            .expect("appended xref stream must carry /Prev"),
+    )
+    .expect("/Prev must be an integer");
+    assert_eq!(
+        prev,
+        i64::try_from(source_xref_offset).unwrap(),
+        "/Prev must equal the source's last startxref"
+    );
+
+    // qpdf --check structural gate (skipped if qpdf is unavailable).
+    if is_qpdf_available() {
+        let path = std::env::temp_dir().join(format!(
+            "flpdf-incremental-generate-combined-{}.pdf",
+            std::process::id()
+        ));
+        fs::write(&path, &output).unwrap();
+        let check = Command::new("qpdf")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to invoke qpdf --check: {err}"));
+        let _ = fs::remove_file(&path);
+        if qpdf_hit_empty_page_tree_bug(&check) {
+            eprintln!(
+                "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                 skipping the qpdf --check gate for this zero-page fixture"
+            );
+        } else {
+            assert!(
+                check.status.success(),
+                "qpdf --check failed on combined-paths incremental generate output:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+}
+
 // ── flpdf-9hc.5.9 Task 7: fallback regression for the incremental generate gate
 //
 // The Task-5 gate (writer.rs) is exactly:
