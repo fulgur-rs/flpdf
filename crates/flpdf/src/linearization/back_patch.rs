@@ -167,16 +167,9 @@ fn compute_post_splice_placeholders(
 
 /// Decimal digit count for `n` (always ≥ 1: `digit_width(0) == 1`).
 fn digit_width(n: u64) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut n = n;
-    let mut w = 0;
-    while n > 0 {
-        n /= 10;
-        w += 1;
-    }
-    w
+    // `checked_ilog10()` is None for 0 and ilog10(x) + 1 for any positive x;
+    // it compiles down to a leading-zero-count + LUT, no loop or division.
+    (n.checked_ilog10().unwrap_or(0) + 1) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -285,9 +278,7 @@ pub fn back_patch_param_dict(bytes: &mut [u8], offsets: &mut LinearizedOffsets) 
     bytes[region_start..region_start + new_dict.len()].copy_from_slice(&new_dict);
     // Fill the remainder of the rewritable region with ASCII space — this is
     // the qpdf-style trailing pad that absorbs the bytes saved by compaction.
-    for b in &mut bytes[region_start + new_dict.len()..region_end] {
-        *b = b' ';
-    }
+    bytes[region_start + new_dict.len()..region_end].fill(b' ');
 
     // Update placeholder ranges to point at the rewritten variable-width
     // value bytes, so callers inspecting `offsets.part1_placeholders` see the
