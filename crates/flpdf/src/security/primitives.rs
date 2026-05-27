@@ -17,7 +17,7 @@
 //! losing the unused-detector for everything else.
 #![allow(dead_code)]
 
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use aes::Aes256;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
@@ -141,6 +141,18 @@ pub(crate) fn aes256_cbc_decrypt(
 pub(crate) fn aes256_ecb_decrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
     let dec = <Aes256 as KeyInit>::new(key.into());
     dec.decrypt_block(block.into());
+}
+
+/// Encrypt one AES-256-ECB block in place.
+///
+/// Used by V=5 R=6 Algorithm 10 (`/Perms` blob construction): the 16-byte
+/// plaintext block carrying `/P` + `/EncryptMetadata` + `adb` magic is
+/// encrypted single-block-ECB with the file encryption key. Algorithm 13
+/// reverses this via [`aes256_ecb_decrypt_block`] during reader-side
+/// validation.
+pub(crate) fn aes256_ecb_encrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
+    let enc = <Aes256 as KeyInit>::new(key.into());
+    enc.encrypt_block(block.into());
 }
 
 /// Compute the MD5 digest of `data`.
