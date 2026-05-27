@@ -318,17 +318,20 @@ fn classify_divergences(
         return CellStatus::Pass;
     }
     // Drain ALL divergences against the allowlist before classifying, so every
-    // allowlist entry that should match gets its `matched` flag set. Using
-    // Iterator::any would short-circuit on the first unknown and miss later
-    // allowlisted siblings, leading to spurious stale-allowlist failures.
-    let unknown_count = divs
-        .iter()
-        .filter(|d| allowlist.match_divergence(fixture, d).is_none())
-        .count();
-    if unknown_count > 0 {
-        CellStatus::Unknown { divergences: divs }
+    // allowlist entry that should match gets its `matched` flag set. partition
+    // walks the whole vec (no short-circuit), and also lets us keep allowlisted
+    // and unknown divergences in separate buckets so CellStatus::Unknown only
+    // ever carries the truly-unknown ones — otherwise unknown_divergences()
+    // would wrongly report allowlisted siblings as unknown.
+    let (known, unknown): (Vec<Divergence>, Vec<Divergence>) = divs
+        .into_iter()
+        .partition(|d| allowlist.match_divergence(fixture, d).is_some());
+    if unknown.is_empty() {
+        CellStatus::Known { divergences: known }
     } else {
-        CellStatus::Known { divergences: divs }
+        CellStatus::Unknown {
+            divergences: unknown,
+        }
     }
 }
 
@@ -986,6 +989,38 @@ mod tests {
         let cells = compute_matrix("f.pdf", &qpdf, &flpdf, &mut al);
         let qpdf_cell = cells.iter().find(|c| c.key == "qpdf").unwrap();
         assert!(matches!(qpdf_cell.status, CellStatus::Known { .. }));
+        assert!(al.stale_entries().is_empty());
+    }
+
+    #[test]
+    fn matrix_unknown_cell_excludes_allowlisted_siblings() {
+        // When a cell has both allowlisted and non-allowlisted divergences, the
+        // Unknown variant must contain ONLY the unknown ones — otherwise
+        // unknown_divergences() (and the test failure message) wrongly lists
+        // allowlisted divergences as unknown.
+        let qpdf = json!({"parameters": {"a_unknown": 1, "z_allowed": 2}});
+        let flpdf = json!({"parameters": {"a_unknown": 9, "z_allowed": 8}});
+        let allowlist_json = r#"{"entries":[{
+            "fixture":"f.pdf","path":"$.parameters.z_allowed",
+            "category":"x","beads_ref":"","reason":""
+        }]}"#;
+        let mut al = Allowlist::from_json_str(allowlist_json).unwrap();
+        let cells = compute_matrix("f.pdf", &qpdf, &flpdf, &mut al);
+        let params = cells.iter().find(|c| c.key == "parameters").unwrap();
+        match &params.status {
+            CellStatus::Unknown { divergences } => {
+                assert_eq!(
+                    divergences.len(),
+                    1,
+                    "Unknown must contain only unknown divs, got {} ({:?})",
+                    divergences.len(),
+                    divergences.iter().map(|d| &d.path).collect::<Vec<_>>(),
+                );
+                assert_eq!(divergences[0].path, "$.parameters.a_unknown");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // The allowlist entry was still marked as used (no stale).
         assert!(al.stale_entries().is_empty());
     }
 

@@ -14,7 +14,7 @@
 
 The matrix columns reflect the **qpdf JSON v2** top-level keys as actually emitted by `qpdf --json=2` (verified empirically against qpdf 11.9.0 on `minimal.pdf` and `compat/one-page.pdf`, and cross-checked against `qpdf --json-help=2`). The 9 keys are:
 
-```
+```text
 acroform, attachments, encrypt, outlines, pagelabels, pages, parameters, qpdf, version
 ```
 
