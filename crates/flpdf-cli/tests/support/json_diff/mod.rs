@@ -258,8 +258,6 @@ pub enum CellStatus {
     Unknown { divergences: Vec<Divergence> },
     /// Key missing in both qpdf and flpdf output.
     Missing,
-    /// Key present in only one side — counted as a divergence.
-    PresentOnOneSide { qpdf_present: bool },
 }
 
 pub fn compute_matrix(
@@ -275,10 +273,6 @@ pub fn compute_matrix(
             let b = flpdf.get(key);
             let status = match (a, b) {
                 (None, None) => CellStatus::Missing,
-                (Some(_), None) => CellStatus::PresentOnOneSide { qpdf_present: true },
-                (None, Some(_)) => CellStatus::PresentOnOneSide {
-                    qpdf_present: false,
-                },
                 (Some(av), Some(bv)) => {
                     let raw = diff_values(av, bv);
                     let divs: Vec<Divergence> = raw
@@ -295,29 +289,47 @@ pub fn compute_matrix(
                             }
                         })
                         .collect();
-
-                    if divs.is_empty() {
-                        CellStatus::Pass
-                    } else {
-                        // Drain ALL divergences against the allowlist before classifying, so every
-                        // allowlist entry that should match gets its `matched` flag set. Using
-                        // Iterator::any would short-circuit on the first unknown and miss later
-                        // allowlisted siblings, leading to spurious stale-allowlist failures.
-                        let unknown_count = divs
-                            .iter()
-                            .filter(|d| allowlist.match_divergence(fixture, d).is_none())
-                            .count();
-                        if unknown_count > 0 {
-                            CellStatus::Unknown { divergences: divs }
-                        } else {
-                            CellStatus::Known { divergences: divs }
-                        }
-                    }
+                    classify_divergences(fixture, divs, allowlist)
+                }
+                (qv, fv) => {
+                    // One-sided top-level key: synthesize a divergence at $.<key>
+                    // so the same allowlist + Known/Unknown classification pipeline
+                    // applies. Without this, a wholly-missing key would silently
+                    // bypass the corpus runner's unknown_divergences() assertion.
+                    let synth = Divergence {
+                        path: format!("$.{key}"),
+                        qpdf: qv.cloned().unwrap_or(Value::Null),
+                        flpdf: fv.cloned().unwrap_or(Value::Null),
+                    };
+                    classify_divergences(fixture, vec![synth], allowlist)
                 }
             };
             MatrixCell { key, status }
         })
         .collect()
+}
+
+fn classify_divergences(
+    fixture: &str,
+    divs: Vec<Divergence>,
+    allowlist: &mut Allowlist,
+) -> CellStatus {
+    if divs.is_empty() {
+        return CellStatus::Pass;
+    }
+    // Drain ALL divergences against the allowlist before classifying, so every
+    // allowlist entry that should match gets its `matched` flag set. Using
+    // Iterator::any would short-circuit on the first unknown and miss later
+    // allowlisted siblings, leading to spurious stale-allowlist failures.
+    let unknown_count = divs
+        .iter()
+        .filter(|d| allowlist.match_divergence(fixture, d).is_none())
+        .count();
+    if unknown_count > 0 {
+        CellStatus::Unknown { divergences: divs }
+    } else {
+        CellStatus::Known { divergences: divs }
+    }
 }
 
 #[derive(Debug)]
@@ -343,7 +355,6 @@ impl Report {
             for c in &f.cells {
                 match &c.status {
                     CellStatus::Missing => {} // excluded
-                    CellStatus::PresentOnOneSide { .. } => present += 1,
                     CellStatus::Pass | CellStatus::Known { .. } => {
                         pass += 1;
                         present += 1;
@@ -432,12 +443,6 @@ impl Report {
                         format!("FAIL({})", divergences.len())
                     }
                     Some(CellStatus::Missing) => "n/a".to_string(),
-                    Some(CellStatus::PresentOnOneSide { qpdf_present: true }) => {
-                        "qonly".to_string()
-                    }
-                    Some(CellStatus::PresentOnOneSide {
-                        qpdf_present: false,
-                    }) => "fonly".to_string(),
                     None => "?".to_string(),
                 };
                 s.push_str(&format!(" {} |", glyph));
@@ -476,12 +481,6 @@ impl Report {
                                 ("unknown", divergences.iter().collect())
                             }
                             CellStatus::Missing => ("missing", vec![]),
-                            CellStatus::PresentOnOneSide { qpdf_present: true } => {
-                                ("qpdf-only", vec![])
-                            }
-                            CellStatus::PresentOnOneSide {
-                                qpdf_present: false,
-                            } => ("flpdf-only", vec![]),
                         };
                         let divs_json: Vec<Value> = divs
                             .iter()
@@ -949,6 +948,45 @@ mod tests {
         assert_eq!(v["fixtures"][0]["fixture"], "a.pdf");
         assert_eq!(v["fixtures"][0]["cells"][0]["key"], "parameters");
         assert_eq!(v["fixtures"][0]["cells"][0]["status"], "pass");
+    }
+
+    #[test]
+    fn matrix_one_sided_top_level_key_surfaces_as_unknown_when_not_allowlisted() {
+        // Regression for false-negative: if qpdf has a top-level key flpdf is
+        // missing (or vice versa), the schema-diff test must FAIL unless the gap
+        // is explicitly allowlisted at $.<key>.
+        let qpdf = json!({"parameters": {"x": 1}, "qpdf": ["..."]});
+        let flpdf = json!({"parameters": {"x": 1}}); // missing "qpdf"
+        let mut al = Allowlist::from_json_str(r#"{"entries":[]}"#).unwrap();
+        let cells = compute_matrix("f.pdf", &qpdf, &flpdf, &mut al);
+        let qpdf_cell = cells.iter().find(|c| c.key == "qpdf").unwrap();
+        match &qpdf_cell.status {
+            CellStatus::Unknown { divergences } => {
+                assert_eq!(divergences.len(), 1);
+                assert_eq!(divergences[0].path, "$.qpdf");
+                assert!(
+                    divergences[0].flpdf.is_null(),
+                    "flpdf side must be Null when the key is missing on flpdf"
+                );
+            }
+            other => panic!("expected Unknown for one-sided key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matrix_one_sided_top_level_key_can_be_allowlisted() {
+        // When the gap is explicit and allowlisted, the cell becomes Known.
+        let qpdf = json!({"parameters": {"x": 1}, "qpdf": ["..."]});
+        let flpdf = json!({"parameters": {"x": 1}});
+        let allowlist_json = r#"{"entries":[{
+            "fixture":"f.pdf","path":"$.qpdf",
+            "category":"flpdf-feature-gap","beads_ref":"","reason":"flpdf v2 output skips qpdf section"
+        }]}"#;
+        let mut al = Allowlist::from_json_str(allowlist_json).unwrap();
+        let cells = compute_matrix("f.pdf", &qpdf, &flpdf, &mut al);
+        let qpdf_cell = cells.iter().find(|c| c.key == "qpdf").unwrap();
+        assert!(matches!(qpdf_cell.status, CellStatus::Known { .. }));
+        assert!(al.stale_entries().is_empty());
     }
 
     #[test]
