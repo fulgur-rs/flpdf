@@ -1063,6 +1063,227 @@ pub(crate) fn build_v4_encrypt_dict(params: &V4EncryptParams<'_>) -> Result<(Dic
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Writer side — V=5 R=6 /Encrypt dictionary (flpdf-9hc.4.3) + /Perms blob
+// (Algorithm 10, the V=5 R=6 piece of flpdf-9hc.4.8)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// ISO 32000-2 Algorithm 10 — Encode and AES-256-ECB-encrypt the 16-byte
+/// `/Perms` block.
+///
+/// Plaintext layout (PDF 1.7 §7.6.4.6 / ISO 32000-2 §7.6.4.4.5):
+///
+/// | Bytes | Content                                                    |
+/// |-------|------------------------------------------------------------|
+/// | 0..4  | `/P` as a signed 32-bit little-endian integer              |
+/// | 4..8  | `0xFF` × 4 (sign-extension of `/P` into the unsigned word) |
+/// | 8     | `b'T'` if `encrypt_metadata`, else `b'F'`                  |
+/// | 9..12 | ASCII magic `b"adb"`                                       |
+/// | 12..16| `random_tail` (spec-arbitrary; round-tripped opaquely)     |
+///
+/// Encrypted with AES-256 in ECB mode (single block) under `file_key`.
+/// Verified by the reader via the inverse path in `r6_perms_warning`.
+pub(crate) fn compute_perms_blob(
+    p: i32,
+    encrypt_metadata: bool,
+    random_tail: &[u8; 4],
+    file_key: &[u8; 32],
+) -> [u8; 16] {
+    let mut block = [0u8; 16];
+    block[0..4].copy_from_slice(&p.to_le_bytes());
+    block[4..8].copy_from_slice(&[0xFF; 4]);
+    block[8] = if encrypt_metadata { b'T' } else { b'F' };
+    block[9..12].copy_from_slice(b"adb");
+    block[12..16].copy_from_slice(random_tail);
+    crate::security::primitives::aes256_ecb_encrypt_block(file_key, &mut block);
+    block
+}
+
+/// Wrap `file_key` for a V=5 R=6 password using a zero IV and AES-256-CBC
+/// with no padding (exactly 32 plaintext bytes → 32 ciphertext bytes).
+///
+/// Shared by Algorithm 8 (writer-side `/UE`) and Algorithm 9 (writer-side
+/// `/OE`); the reverse path is [`aes256_cbc_zero_iv_unwrap`].
+fn aes256_cbc_zero_iv_wrap(file_key: &[u8; 32], aes_key: &[u8; 32]) -> [u8; 32] {
+    let iv = [0u8; 16];
+    let mut buf = *file_key;
+    let enc = <Encryptor<Aes256> as KeyIvInit>::new(aes_key.into(), (&iv).into());
+    // Plaintext is exactly two 16-byte blocks, so no padding is appended.
+    enc.encrypt_padded_mut::<NoPadding>(&mut buf, 32)
+        .expect("32-byte input is exactly 2 AES blocks; padding-less encrypt cannot fail");
+    buf
+}
+
+/// ISO 32000-2 Algorithm 8 — Compute the V=5 R=6 `/U` and `/UE` entries.
+///
+/// Returns `(u_entry, ue_entry)`:
+///
+/// - `u_entry` (48 bytes): `validation_hash` (32) ‖ `validation_salt` (8) ‖
+///   `key_salt` (8).
+/// - `ue_entry` (32 bytes): AES-256-CBC(zero IV, key = `r6_password_hash(
+///   user_password, key_salt, &[])`) over `file_key`.
+///
+/// `validation_salt` and `key_salt` are spec-mandated random 8-byte values;
+/// `file_key` is a spec-mandated random 32-byte value. The caller supplies
+/// them so that production callers can use a CSPRNG and tests can use
+/// fixed bytes for reproducibility.
+pub(crate) fn compute_u_ue_r6(
+    user_password: &[u8],
+    file_key: &[u8; 32],
+    validation_salt: &[u8; 8],
+    key_salt: &[u8; 8],
+) -> ([u8; 48], [u8; 32]) {
+    let validation_hash = r6_password_hash(user_password, validation_salt, &[]);
+    let aes_key = r6_password_hash(user_password, key_salt, &[]);
+    let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+
+    let mut u_entry = [0u8; 48];
+    u_entry[0..32].copy_from_slice(&validation_hash);
+    u_entry[32..40].copy_from_slice(validation_salt);
+    u_entry[40..48].copy_from_slice(key_salt);
+    (u_entry, ue_entry)
+}
+
+/// ISO 32000-2 Algorithm 9 — Compute the V=5 R=6 `/O` and `/OE` entries.
+///
+/// Mirrors [`compute_u_ue_r6`] using `owner_password`, the matching salts,
+/// and with `user_entry` (the full 48-byte `/U`) appended to the hash
+/// inputs, per the spec's "extra" parameter. `/U` must therefore be
+/// computed first.
+pub(crate) fn compute_o_oe_r6(
+    owner_password: &[u8],
+    user_entry: &[u8; 48],
+    file_key: &[u8; 32],
+    validation_salt: &[u8; 8],
+    key_salt: &[u8; 8],
+) -> ([u8; 48], [u8; 32]) {
+    let validation_hash = r6_password_hash(owner_password, validation_salt, user_entry);
+    let aes_key = r6_password_hash(owner_password, key_salt, user_entry);
+    let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+
+    let mut o_entry = [0u8; 48];
+    o_entry[0..32].copy_from_slice(&validation_hash);
+    o_entry[32..40].copy_from_slice(validation_salt);
+    o_entry[40..48].copy_from_slice(key_salt);
+    (o_entry, oe_entry)
+}
+
+/// User-supplied configuration for [`build_v5_r6_encrypt_dict`].
+///
+/// Passwords MUST be SASLprep-normalized bytes per the V=5 spec; the
+/// caller is responsible for running [`crate::security::password::normalize_password`]
+/// with `PasswordMode::Unicode` before invoking this builder.
+pub(crate) struct V5R6EncryptParams<'a> {
+    /// SASLprep'd user password bytes (truncated to 127 bytes by Algorithm 2.B
+    /// inside `r6_password_hash`).
+    pub user_password: &'a [u8],
+    /// SASLprep'd owner password bytes. Unlike V<5 there is no empty-owner
+    /// fallback to the user password — the caller decides what to pass.
+    pub owner_password: &'a [u8],
+    /// `/P` permission flags (signed 32-bit, also encoded into `/Perms`).
+    pub p: i32,
+    /// `/EncryptMetadata` flag. Encoded into `/Perms` byte 8 (`'T'`/`'F'`)
+    /// and into the dictionary as `/EncryptMetadata false` when false; the
+    /// spec-default `true` is omitted to match qpdf.
+    pub encrypt_metadata: bool,
+}
+
+/// Spec-random secret material consumed by [`build_v5_r6_encrypt_dict`].
+///
+/// Pulled out into a separate struct so production callers can fill it
+/// from a CSPRNG and tests can pin every byte to a fixed value for
+/// reproducibility — V=5 R=6 has no path to byte-identical output with
+/// qpdf without controlling every random input.
+pub(crate) struct V5R6Secrets<'a> {
+    /// 32-byte file encryption key (the "FEK"). Random per spec.
+    pub file_key: &'a [u8; 32],
+    /// 8-byte validation salt for the user password (`/U[32..40]`).
+    pub user_validation_salt: &'a [u8; 8],
+    /// 8-byte key-derivation salt for the user password (`/U[40..48]`).
+    pub user_key_salt: &'a [u8; 8],
+    /// 8-byte validation salt for the owner password (`/O[32..40]`).
+    pub owner_validation_salt: &'a [u8; 8],
+    /// 8-byte key-derivation salt for the owner password (`/O[40..48]`).
+    pub owner_key_salt: &'a [u8; 8],
+    /// 4 spec-arbitrary bytes appended to the `/Perms` plaintext block
+    /// (bytes 12..16, after the `'adb'` magic).
+    pub perms_random_tail: &'a [u8; 4],
+}
+
+/// Construct the `/Encrypt` dictionary for V=5 R=6 (AES-256, ISO 32000-2)
+/// from passwords, permissions, and pre-generated secrets. Returns the
+/// dictionary; the file encryption key is `secrets.file_key` (the caller
+/// already owns it).
+///
+/// Computation order:
+///
+/// 1. `/U` + `/UE` via [`compute_u_ue_r6`] (Algorithm 8).
+/// 2. `/O` + `/OE` via [`compute_o_oe_r6`] (Algorithm 9, depends on `/U`).
+/// 3. `/Perms` via [`compute_perms_blob`] (Algorithm 10, depends on
+///    `file_key`).
+///
+/// Emitted dictionary keys (qpdf-compatible): `/CF` `/Filter` `/Length`
+/// `/O` `/OE` `/P` `/Perms` `/R` `/StmF` `/StrF` `/U` `/UE` `/V`
+/// (and `/EncryptMetadata` only when false). `/CF/StdCF/CFM` is `AESV3`
+/// per the V=5 R=6 spec.
+pub(crate) fn build_v5_r6_encrypt_dict(
+    params: &V5R6EncryptParams<'_>,
+    secrets: &V5R6Secrets<'_>,
+) -> Dictionary {
+    // Algorithm 8: /U + /UE.
+    let (u_entry, ue_entry) = compute_u_ue_r6(
+        params.user_password,
+        secrets.file_key,
+        secrets.user_validation_salt,
+        secrets.user_key_salt,
+    );
+
+    // Algorithm 9: /O + /OE (uses /U as extra).
+    let (o_entry, oe_entry) = compute_o_oe_r6(
+        params.owner_password,
+        &u_entry,
+        secrets.file_key,
+        secrets.owner_validation_salt,
+        secrets.owner_key_salt,
+    );
+
+    // Algorithm 10: /Perms.
+    let perms = compute_perms_blob(
+        params.p,
+        params.encrypt_metadata,
+        secrets.perms_random_tail,
+        secrets.file_key,
+    );
+
+    // /CF /StdCF entry (CFM AESV3, Length 32).
+    let mut std_cf = Dictionary::new();
+    std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
+    std_cf.insert("CFM", Object::Name(b"AESV3".to_vec()));
+    std_cf.insert("Length", Object::Integer(32));
+
+    let mut cf = Dictionary::new();
+    cf.insert("StdCF", Object::Dictionary(std_cf));
+
+    let mut dict = Dictionary::new();
+    dict.insert("CF", Object::Dictionary(cf));
+    dict.insert("Filter", Object::Name(b"Standard".to_vec()));
+    dict.insert("Length", Object::Integer(256));
+    dict.insert("O", Object::String(o_entry.to_vec()));
+    dict.insert("OE", Object::String(oe_entry.to_vec()));
+    dict.insert("P", Object::Integer(i64::from(params.p)));
+    dict.insert("Perms", Object::String(perms.to_vec()));
+    dict.insert("R", Object::Integer(6));
+    dict.insert("StmF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("StrF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("U", Object::String(u_entry.to_vec()));
+    dict.insert("UE", Object::String(ue_entry.to_vec()));
+    dict.insert("V", Object::Integer(5));
+    if !params.encrypt_metadata {
+        dict.insert("EncryptMetadata", Object::Boolean(false));
+    }
+    dict
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Algorithm 1 — Per-object key derivation (V=1/V=2/V=4)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -3224,5 +3445,292 @@ mod tests {
                 assert_eq!(owner_key, expected_file_key, "owner round-trip: {case}");
             }
         }
+    }
+
+    // ── Writer side — V=5 R=6 /Encrypt dictionary + /Perms blob ───────────────
+    //   (flpdf-9hc.4.3 + Algorithm 10 piece of flpdf-9hc.4.8)
+    //
+    // V=5 R=6 cannot be byte-matched against qpdf fixtures: the spec requires
+    // a random file key and random salts on every encryption, so qpdf's
+    // output bytes are non-reproducible from these inputs alone. Coverage is
+    // therefore round-trip-based: build with fixed secrets, then verify the
+    // result authenticates via `check_user_password_r6` / `check_owner_password_r6`
+    // back to the same file key. The /Perms decrypt path is covered by feeding
+    // the built dictionary's `Perms` bytes through `aes256_ecb_decrypt_block`
+    // and asserting the plaintext block matches its known structure.
+
+    /// Fixed secrets for V=5 R=6 tests — every random field pinned so failures
+    /// are reproducible.
+    struct V5SecretsFixture {
+        file_key: [u8; 32],
+        user_validation_salt: [u8; 8],
+        user_key_salt: [u8; 8],
+        owner_validation_salt: [u8; 8],
+        owner_key_salt: [u8; 8],
+        perms_random_tail: [u8; 4],
+    }
+
+    fn fixture_v5_secrets() -> V5SecretsFixture {
+        V5SecretsFixture {
+            file_key: [0x11; 32],
+            user_validation_salt: [0x21; 8],
+            user_key_salt: [0x22; 8],
+            owner_validation_salt: [0x31; 8],
+            owner_key_salt: [0x32; 8],
+            perms_random_tail: [0x41; 4],
+        }
+    }
+
+    #[test]
+    fn compute_perms_blob_encodes_p_metadata_magic_then_aes_ecb_encrypts() {
+        let file_key = [0x55u8; 32];
+        let random_tail = [0xAAu8; 4];
+        let p: i32 = -12;
+        let encrypted = compute_perms_blob(p, true, &random_tail, &file_key);
+
+        // Decrypt and inspect the underlying 16-byte block.
+        let mut decrypted = encrypted;
+        crate::security::primitives::aes256_ecb_decrypt_block(&file_key, &mut decrypted);
+        assert_eq!(&decrypted[0..4], &p.to_le_bytes());
+        assert_eq!(&decrypted[4..8], &[0xFFu8; 4]);
+        assert_eq!(decrypted[8], b'T');
+        assert_eq!(&decrypted[9..12], b"adb");
+        assert_eq!(&decrypted[12..16], &random_tail);
+
+        // And with encrypt_metadata=false, byte 8 flips to 'F'.
+        let encrypted_f = compute_perms_blob(p, false, &random_tail, &file_key);
+        let mut decrypted_f = encrypted_f;
+        crate::security::primitives::aes256_ecb_decrypt_block(&file_key, &mut decrypted_f);
+        assert_eq!(decrypted_f[8], b'F');
+    }
+
+    #[test]
+    fn compute_u_ue_r6_round_trips_via_check_user_password_r6() {
+        let s = fixture_v5_secrets();
+        let user_pw = b"user-pw";
+
+        let (u_entry, ue_entry) = compute_u_ue_r6(
+            user_pw,
+            &s.file_key,
+            &s.user_validation_salt,
+            &s.user_key_salt,
+        );
+
+        // The reader's check function requires a full StandardHandlerR5Inputs;
+        // for the user-only path it only reads `u` and `ue`, so the owner
+        // fields just need to satisfy the borrow — they are never inspected.
+        let dummy_oe = [0u8; 32];
+        let inputs = StandardHandlerR5Inputs {
+            u: &u_entry,
+            o: &u_entry, // unused by check_user_password_r6
+            ue: &ue_entry,
+            oe: &dummy_oe, // unused by check_user_password_r6
+        };
+        let recovered = check_user_password_r6(user_pw, &inputs).unwrap();
+        assert_eq!(recovered, s.file_key.to_vec());
+    }
+
+    #[test]
+    fn compute_u_ue_r6_rejects_wrong_password() {
+        let s = fixture_v5_secrets();
+        let (u_entry, ue_entry) = compute_u_ue_r6(
+            b"correct",
+            &s.file_key,
+            &s.user_validation_salt,
+            &s.user_key_salt,
+        );
+        let dummy_oe = [0u8; 32];
+        let inputs = StandardHandlerR5Inputs {
+            u: &u_entry,
+            o: &u_entry,
+            ue: &ue_entry,
+            oe: &dummy_oe,
+        };
+        let err = check_user_password_r6(b"wrong", &inputs).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Encrypted(crate::error::EncryptedError::BadPassword)
+        ));
+    }
+
+    #[test]
+    fn compute_o_oe_r6_round_trips_via_check_owner_password_r6() {
+        let s = fixture_v5_secrets();
+        let user_pw = b"u";
+        let owner_pw = b"o";
+
+        let (u_entry, ue_entry) = compute_u_ue_r6(
+            user_pw,
+            &s.file_key,
+            &s.user_validation_salt,
+            &s.user_key_salt,
+        );
+        let (o_entry, oe_entry) = compute_o_oe_r6(
+            owner_pw,
+            &u_entry,
+            &s.file_key,
+            &s.owner_validation_salt,
+            &s.owner_key_salt,
+        );
+
+        let inputs = StandardHandlerR5Inputs {
+            u: &u_entry,
+            o: &o_entry,
+            ue: &ue_entry,
+            oe: &oe_entry,
+        };
+        let recovered = check_owner_password_r6(owner_pw, &inputs).unwrap();
+        assert_eq!(recovered, s.file_key.to_vec());
+    }
+
+    /// Internal round-trip: a full V=5 R=6 dictionary built by
+    /// `build_v5_r6_encrypt_dict` must authenticate both passwords via the
+    /// reader path and return the same `file_key`. Also validates /Perms
+    /// against [`r6_perms_warning`]-equivalent decrypt+check inline (since
+    /// `r6_perms_warning` lives in reader.rs and is private).
+    #[test]
+    fn build_v5_r6_encrypt_dict_round_trips_user_owner_and_perms() {
+        for encrypt_metadata in [true, false] {
+            let s = fixture_v5_secrets();
+            let p: i32 = -1340;
+            let user_pw = b"alpha";
+            let owner_pw = b"omega";
+
+            let dict = build_v5_r6_encrypt_dict(
+                &V5R6EncryptParams {
+                    user_password: user_pw,
+                    owner_password: owner_pw,
+                    p,
+                    encrypt_metadata,
+                },
+                &V5R6Secrets {
+                    file_key: &s.file_key,
+                    user_validation_salt: &s.user_validation_salt,
+                    user_key_salt: &s.user_key_salt,
+                    owner_validation_salt: &s.owner_validation_salt,
+                    owner_key_salt: &s.owner_key_salt,
+                    perms_random_tail: &s.perms_random_tail,
+                },
+            );
+
+            // Static dict fields.
+            assert_eq!(dict.get("V"), Some(&Object::Integer(5)));
+            assert_eq!(dict.get("R"), Some(&Object::Integer(6)));
+            assert_eq!(dict.get("Length"), Some(&Object::Integer(256)));
+            assert_eq!(dict.get("P"), Some(&Object::Integer(i64::from(p))));
+            assert_eq!(dict.get("StmF"), Some(&Object::Name(b"StdCF".to_vec())));
+            assert_eq!(dict.get("StrF"), Some(&Object::Name(b"StdCF".to_vec())));
+            if encrypt_metadata {
+                assert!(dict.get("EncryptMetadata").is_none());
+            } else {
+                assert_eq!(dict.get("EncryptMetadata"), Some(&Object::Boolean(false)));
+            }
+
+            // /CF/StdCF/CFM = AESV3.
+            let Some(Object::Dictionary(cf)) = dict.get("CF") else {
+                panic!("expected /CF");
+            };
+            let Some(Object::Dictionary(std_cf)) = cf.get("StdCF") else {
+                panic!("expected /CF/StdCF");
+            };
+            assert_eq!(std_cf.get("CFM"), Some(&Object::Name(b"AESV3".to_vec())));
+            assert_eq!(std_cf.get("Length"), Some(&Object::Integer(32)));
+
+            // Round-trip authentication.
+            let Some(Object::String(u)) = dict.get("U") else {
+                unreachable!()
+            };
+            let Some(Object::String(ue)) = dict.get("UE") else {
+                unreachable!()
+            };
+            let Some(Object::String(o)) = dict.get("O") else {
+                unreachable!()
+            };
+            let Some(Object::String(oe)) = dict.get("OE") else {
+                unreachable!()
+            };
+            let u48 = hex48(&hex::encode(u));
+            let o48 = hex48(&hex::encode(o));
+            let ue32 = hex32(&hex::encode(ue));
+            let oe32 = hex32(&hex::encode(oe));
+            let inputs = StandardHandlerR5Inputs {
+                u: &u48,
+                o: &o48,
+                ue: &ue32,
+                oe: &oe32,
+            };
+            let user_key = check_user_password_r6(user_pw, &inputs).unwrap();
+            let owner_key = check_owner_password_r6(owner_pw, &inputs).unwrap();
+            assert_eq!(user_key, s.file_key.to_vec());
+            assert_eq!(owner_key, s.file_key.to_vec());
+
+            // /Perms decrypts to the matching P + EncryptMetadata + 'adb'.
+            let Some(Object::String(perms_bytes)) = dict.get("Perms") else {
+                unreachable!()
+            };
+            let mut perms_block: [u8; 16] = perms_bytes.as_slice().try_into().unwrap();
+            crate::security::primitives::aes256_ecb_decrypt_block(&s.file_key, &mut perms_block);
+            assert_eq!(i32::from_le_bytes(perms_block[0..4].try_into().unwrap()), p);
+            assert_eq!(&perms_block[4..8], &[0xFFu8; 4]);
+            assert_eq!(perms_block[8], if encrypt_metadata { b'T' } else { b'F' });
+            assert_eq!(&perms_block[9..12], b"adb");
+        }
+    }
+
+    /// SASLprep'd non-ASCII passwords (mirrors `tests/fixtures/encrypted/
+    /// v5-aes-256-r6-utf8.pdf` coverage) must round-trip through the V=5 R=6
+    /// builder + reader pair when the caller has already normalized them.
+    #[test]
+    fn build_v5_r6_encrypt_dict_round_trips_utf8_passwords() {
+        use crate::security::password::{normalize_password, PasswordMode};
+        let user_raw = "café".as_bytes();
+        let owner_raw = "résumé".as_bytes();
+        let user_pw = normalize_password(user_raw, PasswordMode::Unicode, 6).unwrap();
+        let owner_pw = normalize_password(owner_raw, PasswordMode::Unicode, 6).unwrap();
+
+        let s = fixture_v5_secrets();
+        let dict = build_v5_r6_encrypt_dict(
+            &V5R6EncryptParams {
+                user_password: &user_pw,
+                owner_password: &owner_pw,
+                p: -4,
+                encrypt_metadata: true,
+            },
+            &V5R6Secrets {
+                file_key: &s.file_key,
+                user_validation_salt: &s.user_validation_salt,
+                user_key_salt: &s.user_key_salt,
+                owner_validation_salt: &s.owner_validation_salt,
+                owner_key_salt: &s.owner_key_salt,
+                perms_random_tail: &s.perms_random_tail,
+            },
+        );
+
+        let Some(Object::String(u)) = dict.get("U") else {
+            unreachable!()
+        };
+        let Some(Object::String(ue)) = dict.get("UE") else {
+            unreachable!()
+        };
+        let Some(Object::String(o)) = dict.get("O") else {
+            unreachable!()
+        };
+        let Some(Object::String(oe)) = dict.get("OE") else {
+            unreachable!()
+        };
+        let u48 = hex48(&hex::encode(u));
+        let o48 = hex48(&hex::encode(o));
+        let ue32 = hex32(&hex::encode(ue));
+        let oe32 = hex32(&hex::encode(oe));
+        let inputs = StandardHandlerR5Inputs {
+            u: &u48,
+            o: &o48,
+            ue: &ue32,
+            oe: &oe32,
+        };
+        let user_key = check_user_password_r6(&user_pw, &inputs).unwrap();
+        let owner_key = check_owner_password_r6(&owner_pw, &inputs).unwrap();
+        assert_eq!(user_key, s.file_key.to_vec());
+        assert_eq!(owner_key, s.file_key.to_vec());
     }
 }
