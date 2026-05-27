@@ -1,3 +1,109 @@
 {
-  "entries": []
+  "entries": [
+    {
+      "fixture": "compat/three-page.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[0]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "compat/three-page.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "compat/linearized-one-page.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "compat/attachment-two-page.pdf",
+      "path": "$.qpdf[1].\"obj:8 0 R\".stream.dict.\"/Params\".\"/CheckSum\"",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "EmbeddedFile /Params /CheckSum is a 16-byte MD5 not encoded as UTF-8; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "compat/attachment-two-page.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "qdf-fix/one-page-clean.qdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "qdf-roundtrip/three-page-clean.qdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[0]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "qdf-roundtrip/three-page-clean.qdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v4-aes-128-r4.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[0]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v4-aes-128-r4.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v5-aes-256-r6.pdf",
+      "path": "$.qpdf[1].\"obj:3 0 R\".value.\"/OE\"",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "Encrypt dict /OE (R6 owner-encryption key) is 32 random bytes; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v5-aes-256-r6.pdf",
+      "path": "$.qpdf[1].\"obj:3 0 R\".value.\"/Perms\"",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "Encrypt dict /Perms (R6 encrypted permissions) is 16 random bytes; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v5-aes-256-r6.pdf",
+      "path": "$.qpdf[1].\"obj:3 0 R\".value.\"/UE\"",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "Encrypt dict /UE (R6 user-encryption key) is 32 random bytes; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v5-aes-256-r6.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[0]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    },
+    {
+      "fixture": "encrypted/v5-aes-256-r6.pdf",
+      "path": "$.qpdf[1].trailer.value.\"/ID\"[1]",
+      "category": "flpdf-feature-gap",
+      "beads_ref": "flpdf-9hc.11.15",
+      "reason": "trailer /ID bytes are not valid UTF-8 round-trip; qpdf emits 'b:<hex>', flpdf emits 'u:<utf8-lossy>'. Byte content is identical."
+    }
+  ]
 }

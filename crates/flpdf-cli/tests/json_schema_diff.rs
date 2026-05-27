@@ -16,11 +16,84 @@ struct FixtureSpec {
     password: Option<&'static str>,
 }
 
-const CORPUS: &[FixtureSpec] = &[FixtureSpec {
-    label: "minimal.pdf",
-    relative_path: "minimal.pdf",
-    password: None,
-}];
+const CORPUS: &[FixtureSpec] = &[
+    FixtureSpec {
+        label: "minimal.pdf",
+        relative_path: "minimal.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/one-page.pdf",
+        relative_path: "compat/one-page.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/two-page.pdf",
+        relative_path: "compat/two-page.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/three-page.pdf",
+        relative_path: "compat/three-page.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/linearized-one-page.pdf",
+        relative_path: "compat/linearized-one-page.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/attachment-two-page.pdf",
+        relative_path: "compat/attachment-two-page.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/multi-contents-one-page.pdf",
+        relative_path: "compat/multi-contents-one-page.pdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "compat/unref-resources-one-page.pdf",
+        relative_path: "compat/unref-resources-one-page.pdf",
+        password: None,
+    },
+    // qdf-fix/qdf-golden/qdf-roundtrip: QDF-form PDFs (qpdf's debug output
+    // format, re-parsed as PDFs). Cover diverse content trees and xref shapes.
+    FixtureSpec {
+        label: "qdf-fix/one-page-clean.qdf",
+        relative_path: "qdf-fix/one-page-clean.qdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "qdf-golden/minimal.qdf",
+        relative_path: "qdf-golden/minimal.qdf",
+        password: None,
+    },
+    FixtureSpec {
+        label: "qdf-roundtrip/three-page-clean.qdf",
+        relative_path: "qdf-roundtrip/three-page-clean.qdf",
+        password: None,
+    },
+    // SKIP: qdf-roundtrip/three-page-edited-payload.qdf — intentionally damaged
+    // (qpdf reconstructs xref with warnings, flpdf rejects with "parse error
+    // at byte 3: expected integer"). Schema-diff is not the right test
+    // surface for repair-path divergence.
+    // SKIP: qdf-fix/corrupt-*.qdf — all intentionally corrupted variants used
+    // by the qdf-fix repair test; same reason as above.
+    // Encrypted: AES-128 (V=4 R=4) and AES-256 (V=5 R=6). RC4 fixtures
+    // require flpdf's --allow-weak-crypto flag, which the support module's
+    // run_flpdf_json helper does not currently pass, so they are excluded.
+    FixtureSpec {
+        label: "encrypted/v4-aes-128-r4.pdf",
+        relative_path: "encrypted/v4-aes-128-r4.pdf",
+        password: Some("user-v4-aes"),
+    },
+    FixtureSpec {
+        label: "encrypted/v5-aes-256-r6.pdf",
+        relative_path: "encrypted/v5-aes-256-r6.pdf",
+        password: Some("user-v5-r6"),
+    },
+];
 
 fn workspace_fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
