@@ -10,6 +10,16 @@
 
 **Tech Stack:** Rust 2021, `serde_json` (new dev-dep), `assert_cmd` (existing), `tempfile` (existing). `qpdf 11.x` CLI on PATH (test skips with eprintln if absent).
 
+## qpdf JSON v2 top-level schema
+
+The matrix columns reflect the **qpdf JSON v2** top-level keys as actually emitted by `qpdf --json=2` (verified empirically against qpdf 11.9.0 on `minimal.pdf` and `compat/one-page.pdf`, and cross-checked against `qpdf --json-help=2`). The 9 keys are:
+
+```
+acroform, attachments, encrypt, outlines, pagelabels, pages, parameters, qpdf, version
+```
+
+Note: an earlier draft of this plan listed `objects`/`objectinfo` as separate top-level keys — that was the qpdf JSON v1 schema. In v2 those are folded into a single `qpdf` array containing `[metadata_dict, objects_dict]`.
+
 ## Deviations from beads `DESIGN`
 
 The beads issue's design specified the allowlist in **TOML**. To avoid adding a `toml` crate dependency (none currently in workspace), this plan uses **JSON** for the allowlist (`tests/fixtures/json-diff/allowed-divergences.json`). Same data, parsed via `serde_json::Value`. Update the issue design with `bd update --design` after Task 1 lands if the deviation is approved.
@@ -542,7 +552,7 @@ git commit -m "feat(test/json-diff): allowlist load + match + stale-entry detect
 **Files:**
 - Modify: `crates/flpdf-cli/tests/support/json_diff/mod.rs`
 
-**Goal:** Given two top-level JSON v2 documents, produce a `Vec<MatrixCell>` where `key` is one of qpdf JSON v2 top-level keys (version/parameters/objects/objectinfo/pages/pagelabels/outlines/acroform/attachments/encrypt) and `status` indicates pass/known/unknown/missing.
+**Goal:** Given two top-level JSON v2 documents, produce a `Vec<MatrixCell>` where `key` is one of qpdf JSON v2 top-level keys (acroform/attachments/encrypt/outlines/pagelabels/pages/parameters/qpdf/version — see the schema note at the top of this plan) and `status` indicates pass/known/unknown/missing.
 
 **Step 1: Write failing tests**
 
@@ -550,9 +560,8 @@ Append:
 
 ```rust
 const QPDF_V2_KEYS: &[&str] = &[
-    "version", "parameters", "objects", "objectinfo",
-    "pages", "pagelabels", "outlines", "acroform",
-    "attachments", "encrypt",
+    "acroform", "attachments", "encrypt", "outlines",
+    "pagelabels", "pages", "parameters", "qpdf", "version",
 ];
 
 #[test]
@@ -562,13 +571,13 @@ fn matrix_keys_are_all_qpdf_v2_top_level() {
 
 #[test]
 fn matrix_cell_pass_when_subtrees_equal() {
-    let qpdf = json!({"parameters": {"version": 2}, "objects": {}});
-    let flpdf = json!({"parameters": {"version": 2}, "objects": {}});
+    let qpdf = json!({"parameters": {"version": 2}, "pages": []});
+    let flpdf = json!({"parameters": {"version": 2}, "pages": []});
     let mut al = Allowlist::from_json_str(r#"{"entries":[]}"#).unwrap();
     let cells = compute_matrix("smoke.pdf", &qpdf, &flpdf, &mut al);
     let by_key: std::collections::HashMap<_, _> = cells.iter().map(|c| (c.key, &c.status)).collect();
     assert!(matches!(by_key.get("parameters").unwrap(), CellStatus::Pass));
-    assert!(matches!(by_key.get("objects").unwrap(), CellStatus::Pass));
+    assert!(matches!(by_key.get("pages").unwrap(), CellStatus::Pass));
     assert!(matches!(by_key.get("version").unwrap(), CellStatus::Missing));
 }
 
@@ -614,9 +623,8 @@ Add to `mod.rs`:
 ```rust
 pub fn top_level_keys() -> &'static [&'static str] {
     &[
-        "version", "parameters", "objects", "objectinfo",
-        "pages", "pagelabels", "outlines", "acroform",
-        "attachments", "encrypt",
+        "acroform", "attachments", "encrypt", "outlines",
+        "pagelabels", "pages", "parameters", "qpdf", "version",
     ]
 }
 
@@ -736,7 +744,7 @@ fn qpdf_returns_object_with_top_level_keys() {
     assert!(v.is_object());
     let obj = v.as_object().unwrap();
     assert!(obj.contains_key("parameters"), "missing parameters: {:?}", obj.keys().collect::<Vec<_>>());
-    assert!(obj.contains_key("objects"));
+    assert!(obj.contains_key("qpdf"), "missing 'qpdf' top-level key (qpdf JSON v2 schema): {:?}", obj.keys().collect::<Vec<_>>());
 }
 
 #[test]
@@ -838,13 +846,13 @@ fn dummy_fixture_result(fixture: &str, cells: Vec<MatrixCell>) -> FixtureResult 
 fn report_overall_pass_rate_counts_pass_and_known() {
     let cells_a = vec![
         MatrixCell { key: "parameters", status: CellStatus::Pass },
-        MatrixCell { key: "objects",    status: CellStatus::Pass },
+        MatrixCell { key: "qpdf",       status: CellStatus::Pass },
         MatrixCell { key: "pages",      status: CellStatus::Known { divergences: vec![Divergence { path: "$.pages[0].x".into(), qpdf: json!(1), flpdf: json!(2) }] } },
         MatrixCell { key: "encrypt",    status: CellStatus::Missing },
     ];
     let cells_b = vec![
         MatrixCell { key: "parameters", status: CellStatus::Pass },
-        MatrixCell { key: "objects",    status: CellStatus::Unknown { divergences: vec![Divergence { path: "$.objects.x".into(), qpdf: json!(1), flpdf: json!(2) }] } },
+        MatrixCell { key: "qpdf",       status: CellStatus::Unknown { divergences: vec![Divergence { path: "$.qpdf[1].x".into(), qpdf: json!(1), flpdf: json!(2) }] } },
         MatrixCell { key: "pages",      status: CellStatus::Pass },
         MatrixCell { key: "encrypt",    status: CellStatus::Missing },
     ];
@@ -855,8 +863,8 @@ fn report_overall_pass_rate_counts_pass_and_known() {
         ],
         stale_allowlist: vec![],
     };
-    // present cells: a has 3 (params Pass, objects Pass, pages Known), b has 3
-    // (params Pass, objects Unknown, pages Pass). Total present = 6.
+    // present cells: a has 3 (params Pass, qpdf Pass, pages Known), b has 3
+    // (params Pass, qpdf Unknown, pages Pass). Total present = 6.
     // pass-or-known: 3 (a) + 2 (b) = 5. Expected 5/6.
     assert_eq!(report.overall_pass_rate(), (5, 6));
 }
@@ -864,9 +872,9 @@ fn report_overall_pass_rate_counts_pass_and_known() {
 #[test]
 fn report_unknown_divergences_collected() {
     let cells = vec![MatrixCell {
-        key: "objects",
+        key: "qpdf",
         status: CellStatus::Unknown {
-            divergences: vec![Divergence { path: "$.objects.x".into(), qpdf: json!(1), flpdf: json!(2) }],
+            divergences: vec![Divergence { path: "$.qpdf[1].x".into(), qpdf: json!(1), flpdf: json!(2) }],
         },
     }];
     let report = Report {
@@ -876,7 +884,7 @@ fn report_unknown_divergences_collected() {
     let unknown = report.unknown_divergences();
     assert_eq!(unknown.len(), 1);
     assert_eq!(unknown[0].1, "a.pdf");
-    assert_eq!(unknown[0].2.path, "$.objects.x");
+    assert_eq!(unknown[0].2.path, "$.qpdf[1].x");
 }
 
 #[test]
@@ -1322,7 +1330,7 @@ Expected: clean.
 
 - [ ] `crates/flpdf-cli/tests/json_schema_diff.rs` exists and is invoked by `cargo test`.
 - [ ] Corpus contains ≥10 fixtures spanning compat/qdf-fix/qdf-golden/qdf-roundtrip/encrypted.
-- [ ] Matrix columns include all 10 qpdf v2 top-level keys.
+- [ ] Matrix columns include all 9 qpdf v2 top-level keys.
 - [ ] `target/json-diff/report.md` and `target/json-diff/report.json` produced after `cargo test`.
 - [ ] Allowlist at `tests/fixtures/json-diff/allowed-divergences.json` (JSON, per Deviations note).
 - [ ] Unknown divergences → test fail; stale allowlist entries → test fail.
@@ -1331,7 +1339,7 @@ Expected: clean.
 **Step 3: Update beads issue notes**
 
 ```bash
-bd update flpdf-9hc.11.14 --notes "Implemented as Rust integration test in crates/flpdf-cli/tests/json_schema_diff.rs. Support module: tests/support/json_diff/mod.rs. Allowlist: tests/fixtures/json-diff/allowed-divergences.json (JSON, not TOML — see plan deviation). Reports written to target/json-diff/. Corpus = ${N} fixtures covering all 10 qpdf v2 top-level keys."
+bd update flpdf-9hc.11.14 --notes "Implemented as Rust integration test in crates/flpdf-cli/tests/json_schema_diff.rs. Support module: tests/support/json_diff/mod.rs. Allowlist: tests/fixtures/json-diff/allowed-divergences.json (JSON, not TOML — see plan deviation). Reports written to target/json-diff/. Corpus = ${N} fixtures covering all 9 qpdf v2 top-level keys."
 ```
 
 **Step 4: Close beads issue**

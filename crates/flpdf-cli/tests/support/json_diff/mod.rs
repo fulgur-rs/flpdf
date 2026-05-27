@@ -232,16 +232,15 @@ fn is_simple_key(k: &str) -> bool {
 
 pub fn top_level_keys() -> &'static [&'static str] {
     &[
-        "version",
-        "parameters",
-        "objects",
-        "objectinfo",
-        "pages",
-        "pagelabels",
-        "outlines",
         "acroform",
         "attachments",
         "encrypt",
+        "outlines",
+        "pagelabels",
+        "pages",
+        "parameters",
+        "qpdf",
+        "version",
     ]
 }
 
@@ -544,16 +543,15 @@ mod tests {
     }
 
     const QPDF_V2_KEYS: &[&str] = &[
-        "version",
-        "parameters",
-        "objects",
-        "objectinfo",
-        "pages",
-        "pagelabels",
-        "outlines",
         "acroform",
         "attachments",
         "encrypt",
+        "outlines",
+        "pagelabels",
+        "pages",
+        "parameters",
+        "qpdf",
+        "version",
     ];
 
     #[test]
@@ -563,8 +561,8 @@ mod tests {
 
     #[test]
     fn matrix_cell_pass_when_subtrees_equal() {
-        let qpdf = json!({"parameters": {"version": 2}, "objects": {}});
-        let flpdf = json!({"parameters": {"version": 2}, "objects": {}});
+        let qpdf = json!({"parameters": {"version": 2}, "pages": []});
+        let flpdf = json!({"parameters": {"version": 2}, "pages": []});
         let mut al = Allowlist::from_json_str(r#"{"entries":[]}"#).unwrap();
         let cells = compute_matrix("smoke.pdf", &qpdf, &flpdf, &mut al);
         let by_key: std::collections::HashMap<_, _> =
@@ -573,7 +571,7 @@ mod tests {
             by_key.get("parameters").unwrap(),
             CellStatus::Pass
         ));
-        assert!(matches!(by_key.get("objects").unwrap(), CellStatus::Pass));
+        assert!(matches!(by_key.get("pages").unwrap(), CellStatus::Pass));
         assert!(matches!(
             by_key.get("version").unwrap(),
             CellStatus::Missing
@@ -626,15 +624,9 @@ mod tests {
             "missing parameters: {:?}",
             obj.keys().collect::<Vec<_>>()
         );
-        // qpdf 11.x emits the legacy "qpdf" top-level key for the object
-        // section; qpdf 12+ split it into "objects" + "objectinfo". Accept
-        // either so this test stays green across the qpdf versions we target.
-        // top_level_keys() currently lists the qpdf-12 spelling only — see
-        // the report from Task 5 for the implication on Task 7's corpus
-        // runner when running against qpdf 11.x.
         assert!(
-            obj.contains_key("objects") || obj.contains_key("qpdf"),
-            "expected 'objects' (qpdf 12+) or 'qpdf' (qpdf 11.x); got: {:?}",
+            obj.contains_key("qpdf"),
+            "missing 'qpdf' top-level key (qpdf JSON v2 schema): {:?}",
             obj.keys().collect::<Vec<_>>()
         );
     }
