@@ -12,6 +12,55 @@
 
 use serde_json::Value;
 use std::path::Path;
+use std::process::Command;
+
+/// Invoke `qpdf --json=2 --json-stream-data=none [--password=X] <fixture>`
+/// and return the parsed JSON.
+///
+/// The caller is responsible for checking `super::is_qpdf_available()` first;
+/// this helper does not skip on its own.
+pub fn run_qpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, String> {
+    let mut cmd = Command::new("qpdf");
+    cmd.arg("--json=2").arg("--json-stream-data=none");
+    if let Some(p) = password {
+        cmd.arg(format!("--password={p}"));
+    }
+    cmd.arg(fixture);
+    let out = cmd.output().map_err(|e| format!("spawn qpdf: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "qpdf exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("qpdf parse: {e}"))
+}
+
+/// Invoke the local `flpdf` binary (via assert_cmd::cargo_bin) with
+/// `--json=2 --json-stream-data=none [--password=X] <fixture>` and return the
+/// parsed JSON.
+///
+/// flpdf's clap surface accepts `--json=2` with `require_equals = true` and
+/// `--json-stream-data=none`; see `crates/flpdf-cli/src/main.rs` for the flag
+/// definitions. Verified by pre-flight check during Task 5 (flpdf-9hc.11.14).
+pub fn run_flpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, String> {
+    let mut cmd = assert_cmd::Command::cargo_bin("flpdf").map_err(|e| e.to_string())?;
+    cmd.arg("--json=2").arg("--json-stream-data=none");
+    if let Some(p) = password {
+        cmd.arg(format!("--password={p}"));
+    }
+    cmd.arg(fixture);
+    let out = cmd.output().map_err(|e| format!("spawn flpdf: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "flpdf exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("flpdf parse: {e}"))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Divergence {
@@ -559,6 +608,44 @@ mod tests {
         let cells = compute_matrix("foo.pdf", &qpdf, &flpdf, &mut al);
         let params = cells.iter().find(|c| c.key == "parameters").unwrap();
         assert!(matches!(params.status, CellStatus::Known { .. }));
+    }
+
+    #[test]
+    fn qpdf_returns_object_with_top_level_keys() {
+        if !super::super::is_qpdf_available() {
+            eprintln!("skipping: qpdf not on PATH");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/minimal.pdf");
+        let v = run_qpdf_json(&path, None).expect("qpdf --json=2 on minimal.pdf");
+        assert!(v.is_object());
+        let obj = v.as_object().unwrap();
+        assert!(
+            obj.contains_key("parameters"),
+            "missing parameters: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        // qpdf 11.x emits the legacy "qpdf" top-level key for the object
+        // section; qpdf 12+ split it into "objects" + "objectinfo". Accept
+        // either so this test stays green across the qpdf versions we target.
+        // top_level_keys() currently lists the qpdf-12 spelling only — see
+        // the report from Task 5 for the implication on Task 7's corpus
+        // runner when running against qpdf 11.x.
+        assert!(
+            obj.contains_key("objects") || obj.contains_key("qpdf"),
+            "expected 'objects' (qpdf 12+) or 'qpdf' (qpdf 11.x); got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn flpdf_returns_object_with_top_level_keys() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/minimal.pdf");
+        let v = run_flpdf_json(&path, None).expect("flpdf --json=2 on minimal.pdf");
+        assert!(v.is_object());
+        assert!(v.as_object().unwrap().contains_key("parameters"));
     }
 
     #[test]
