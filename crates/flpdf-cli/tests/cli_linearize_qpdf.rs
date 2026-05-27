@@ -614,3 +614,67 @@ fn classify_hint_table_warning_is_known() {
         "hint-table-length-mismatch is no longer a known issue — must be Fail"
     );
 }
+
+// ---------------------------------------------------------------------------
+// flpdf-602: Page Offset Hint Table per-page content_length must be non-zero
+// ---------------------------------------------------------------------------
+
+/// Returns the `content_length:` values per page from `qpdf --show-linearization`.
+fn qpdf_show_linearization_content_lengths(path: &Path) -> Vec<u64> {
+    let out = ShellCommand::new("qpdf")
+        .args(["--show-linearization", path.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn qpdf --show-linearization");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("content_length:")
+                .map(|rest| rest.trim().parse::<u64>().expect("parse content_length"))
+        })
+        .collect()
+}
+
+/// flpdf-602: after linearizing, every page's content_length in the page-offset
+/// hint table must be non-zero.  qpdf reuses page-length as content-length
+/// (Adobe implementation note 127), so we mirror that — pages with body bytes
+/// must report a positive content_length to give fast-web-view readers a usable
+/// initial-rendering hint.
+#[test]
+fn linearize_populates_per_page_content_length() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let tmp = tempdir().unwrap();
+    for fixture_name in &["one-page.pdf", "two-page.pdf", "three-page.pdf"] {
+        let input = fixture_path(fixture_name);
+        let output = tmp.path().join(format!("lin-{fixture_name}"));
+
+        let ok = linearize_via_flpdf(&input, &output);
+        assert!(ok, "flpdf --linearize {fixture_name} failed");
+
+        // qpdf --check-linearization must still accept the output.
+        assert_eq!(
+            qpdf_linearization_verdict(&output),
+            Verdict::Pass,
+            "qpdf --check-linearization regressed on {fixture_name}"
+        );
+
+        let lengths = qpdf_show_linearization_content_lengths(&output);
+        assert!(
+            !lengths.is_empty(),
+            "qpdf --show-linearization on {fixture_name} produced no \
+             content_length entries"
+        );
+        for (i, &len) in lengths.iter().enumerate() {
+            assert!(
+                len > 0,
+                "page {i} of {fixture_name} has content_length=0; \
+                 expected non-zero per flpdf-602 AC, got {lengths:?}"
+            );
+        }
+    }
+}
