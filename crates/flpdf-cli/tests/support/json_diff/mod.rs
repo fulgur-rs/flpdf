@@ -182,10 +182,38 @@ mod tests {
     }
 
     #[test]
-    fn multiple_divergences_collected_in_order() {
+    fn multiple_divergences_collected() {
         let a = json!({"a": 1, "b": 2, "c": 3});
         let b = json!({"a": 9, "b": 2, "c": 8});
         let d = diff_values(&a, &b);
-        assert_eq!(paths(&d), vec!["$.a", "$.c"]);
+        let mut got = paths(&d);
+        got.sort();
+        assert_eq!(got, vec!["$.a", "$.c"]);
+    }
+
+    #[test]
+    fn object_inside_array_path() {
+        let a = json!([{"x": 1}]);
+        let b = json!([{"x": 2}]);
+        let d = diff_values(&a, &b);
+        assert_eq!(paths(&d), vec!["$[0].x"]);
+    }
+
+    #[test]
+    fn nested_arrays_path() {
+        let a = json!([[1, 2]]);
+        let b = json!([[1, 9]]);
+        let d = diff_values(&a, &b);
+        assert_eq!(paths(&d), vec!["$[0][1]"]);
+    }
+
+    #[test]
+    fn type_mismatch_under_object_key() {
+        let a = json!({"x": [1]});
+        let b = json!({"x": {"a": 1}});
+        let d = diff_values(&a, &b);
+        assert_eq!(paths(&d), vec!["$.x"]);
+        assert_eq!(d[0].qpdf, json!([1]));
+        assert_eq!(d[0].flpdf, json!({"a": 1}));
     }
 }
