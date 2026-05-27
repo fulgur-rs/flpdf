@@ -200,7 +200,11 @@ fn use_hex_string(bytes: &[u8]) -> bool {
 /// big-endian (`0xFE 0xFF`); the caller is expected to have stripped the
 /// BOM before calling.
 fn lossy_utf16_to_utf8(bytes: &[u8], is_le: bool) -> String {
-    let mut out = String::new();
+    // bytes.len() is a sound capacity hint: each UTF-16 unit is 2 bytes and
+    // expands to 1–3 UTF-8 bytes (4 only for surrogate pairs, which consume
+    // 4 UTF-16 bytes). For ASCII-dominant inputs this slightly over-allocates;
+    // for BMP-heavy inputs it is roughly accurate.
+    let mut out = String::with_capacity(bytes.len());
     let mut codepoint: u32 = 0;
     let mut i = 0;
     while i + 1 < bytes.len() {
@@ -263,8 +267,15 @@ fn pdf_string_to_json_string(bytes: &[u8]) -> String {
             return format!("u:{text}");
         }
     }
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    format!("b:{hex}")
+    // Hex-encode with a single allocation: "b:" prefix + 2 nibbles per byte.
+    // Avoids the per-byte format!() allocation of the previous implementation.
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("b:");
+    for &b in bytes {
+        out.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble < 16"));
+        out.push(char::from_digit(u32::from(b & 0xf), 16).expect("nibble < 16"));
+    }
+    out
 }
 
 /// Encode a PDF name byte sequence into a `/NAME` JSON string using the
