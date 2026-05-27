@@ -796,14 +796,18 @@ fn validate_v1_v2_params(params: &V1V2EncryptParams<'_>) -> Result<usize> {
 }
 
 /// PDF 1.7 §7.6.3.4 Algorithm 3 — Compute the 32-byte `/O` (owner password)
-/// entry for V=1/V=2.
+/// entry for the Standard handler when V<5.
 ///
-/// `n` is the file-key length in bytes (5 for V=1; 5..=16 for V=2). The
-/// algorithm is independent of the file encryption key: it derives an RC4
-/// key from the owner password (using [`derive_owner_password_rc4_key`]) and
-/// encrypts the padded user password with it (single pass for R=2; 20
-/// ascending passes for R≥3, the inverse of Algorithm 7's descending
-/// passes in [`check_owner_password`]).
+/// `n` is the file-key length in bytes (5 for V=1; 5..=16 for V=2; 16 for
+/// V=4). The algorithm is independent of the file encryption key: it derives
+/// an RC4 key from the owner password (using [`derive_owner_password_rc4_key`])
+/// and encrypts the padded user password with it (single pass for R=2; 20
+/// ascending passes for R≥3, the inverse of Algorithm 7's descending passes
+/// in [`check_owner_password`] / [`check_owner_password_v4`]).
+///
+/// Accepts r ∈ {2, 3, 4}. V=4/R=4 uses the same Algorithm 3 path as R=3.
+/// V=5 R=5/R=6 use a wholly different algorithm (Algorithm 2.A/2.B) and are
+/// not handled here.
 ///
 /// If `owner_password` is empty, the user password is used instead per
 /// Algorithm 3 step 1.
@@ -834,7 +838,10 @@ pub(crate) fn compute_o_entry(
 }
 
 /// PDF 1.7 §7.6.3.4 Algorithms 4 (R=2) and 5 (R≥3) — Compute the 32-byte
-/// `/U` (user password) entry for V=1/V=2.
+/// `/U` (user password) entry for the Standard handler when V<5.
+///
+/// Accepts r ∈ {2, 3, 4}. V=4/R=4 uses the same Algorithm 5 path as R=3.
+/// V=5 R=5/R=6 derive `/U` differently (Algorithm 8) and are not handled here.
 ///
 /// For R≥3 the spec mandates only the first 16 bytes; this implementation
 /// pads the remaining 16 with zeros for determinism. qpdf, by contrast,
@@ -905,6 +912,125 @@ pub(crate) fn build_v1_v2_encrypt_dict(
     dict.insert("P", Object::Integer(i64::from(params.p)));
     dict.insert("U", Object::String(u_entry.to_vec()));
     dict.insert("O", Object::String(o_entry.to_vec()));
+
+    Ok((dict, file_key))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Writer side — /Encrypt dictionary construction (V=4 CF; flpdf-9hc.4.2)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Cipher method selected for V=4's single named crypt filter (`/StdCF`).
+///
+/// Only RC4-128 (`/CFM /V2`) and AES-128 (`/CFM /AESV2`) are emitted by
+/// [`build_v4_encrypt_dict`]; `/Identity` is a use-site selector, never a
+/// filter method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V4CryptMethod {
+    /// `/CFM /V2` — RC4-128.
+    Rc4,
+    /// `/CFM /AESV2` — AES-128 CBC.
+    Aes,
+}
+
+impl V4CryptMethod {
+    fn cfm_name(self) -> &'static [u8] {
+        match self {
+            V4CryptMethod::Rc4 => b"V2",
+            V4CryptMethod::Aes => b"AESV2",
+        }
+    }
+}
+
+/// Inputs for building a V=4 `/Encrypt` dictionary via [`build_v4_encrypt_dict`].
+///
+/// V=4 is fixed at R=4 and Length=128 (16-byte file key); only the cipher
+/// method (`V2` vs `AESV2`) and `/EncryptMetadata` vary. Per qpdf's emit
+/// behavior, this builder produces a single `/StdCF` entry that both
+/// `/StmF` and `/StrF` reference; `/EFF` is omitted (PDF default is
+/// `/EFF` ⇒ `/StmF` fallback).
+pub(crate) struct V4EncryptParams<'a> {
+    /// Cipher method for the `/StdCF` entry.
+    pub method: V4CryptMethod,
+    /// Raw bytes of the user password (post-`PasswordMode` normalization).
+    pub user_password: &'a [u8],
+    /// Raw bytes of the owner password. Empty falls back to `user_password`
+    /// per Algorithm 3 step 1.
+    pub owner_password: &'a [u8],
+    /// `/P` permission flags (signed 32-bit).
+    pub p: i32,
+    /// First element of the `/ID` array. Required by Algorithms 2 and 5.
+    pub id0: &'a [u8],
+    /// `/EncryptMetadata` flag. When `false`, Algorithm 2 step 3 appends
+    /// `0xFF×4` to the file-key MD5 input AND the `/Metadata` stream is
+    /// left unencrypted by the stream-encryption pass (flpdf-9hc.4.6). When
+    /// `true` (the spec default), the key is emitted without the suffix and
+    /// the `/Metadata` stream is encrypted; the entry itself is omitted from
+    /// the dictionary to match qpdf's defaults-elision.
+    pub encrypt_metadata: bool,
+}
+
+/// Construct the `/Encrypt` dictionary for V=4 from passwords, permissions,
+/// and a crypt-filter method, returning the dictionary and the derived
+/// 16-byte file encryption key.
+///
+/// Algorithmic order mirrors [`build_v1_v2_encrypt_dict`]: `/O` (Algorithm 3,
+/// shared via [`compute_o_entry`]) → file key (Algorithm 2 V=4 path via
+/// [`compute_file_key_v4`], which honors `encrypt_metadata`) → `/U`
+/// (Algorithm 5, shared via [`compute_u_entry`]).
+///
+/// The emitted dictionary follows qpdf's defaults-elision: when
+/// `encrypt_metadata` is the spec default `true`, the `/EncryptMetadata`
+/// entry is omitted entirely. `/EFF` is also omitted because the PDF
+/// default (`/EFF` absent ⇒ `/StmF`) already covers embedded files with
+/// the same filter.
+pub(crate) fn build_v4_encrypt_dict(params: &V4EncryptParams<'_>) -> Result<(Dictionary, Vec<u8>)> {
+    let n: usize = 16; // V=4 is fixed at Length=128 (16 bytes).
+
+    // Algorithm 3: /O.
+    let o_entry = compute_o_entry(params.user_password, params.owner_password, 4, n)?;
+
+    // Algorithm 2 (V=4 path): file encryption key (uses /O + /EncryptMetadata).
+    // See `build_v1_v2_encrypt_dict` for why `dummy_u` is safe.
+    let dummy_u = [0u8; 32];
+    let inputs = StandardHandlerInputs {
+        v: 4,
+        r: 4,
+        length_bits: 128,
+        p: params.p,
+        id0: params.id0,
+        u: &dummy_u,
+        o: &o_entry,
+        encrypt_metadata: params.encrypt_metadata,
+    };
+    let file_key = compute_file_key_v4(params.user_password, &inputs)?;
+
+    // Algorithm 5: /U.
+    let u_entry = compute_u_entry(&file_key, params.id0, 4)?;
+
+    // /CF /StdCF entry.
+    let mut std_cf = Dictionary::new();
+    std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
+    std_cf.insert("CFM", Object::Name(params.method.cfm_name().to_vec()));
+    std_cf.insert("Length", Object::Integer(16));
+
+    let mut cf = Dictionary::new();
+    cf.insert("StdCF", Object::Dictionary(std_cf));
+
+    let mut dict = Dictionary::new();
+    dict.insert("CF", Object::Dictionary(cf));
+    dict.insert("Filter", Object::Name(b"Standard".to_vec()));
+    dict.insert("Length", Object::Integer(128));
+    dict.insert("O", Object::String(o_entry.to_vec()));
+    dict.insert("P", Object::Integer(i64::from(params.p)));
+    dict.insert("R", Object::Integer(4));
+    dict.insert("StmF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("StrF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("U", Object::String(u_entry.to_vec()));
+    dict.insert("V", Object::Integer(4));
+    if !params.encrypt_metadata {
+        dict.insert("EncryptMetadata", Object::Boolean(false));
+    }
 
     Ok((dict, file_key))
 }
@@ -2829,5 +2955,215 @@ mod tests {
             err,
             crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
         ));
+    }
+
+    // ── Writer side — V=4 /Encrypt dictionary builder (flpdf-9hc.4.2) ─────────
+    //
+    // KAT vectors are extracted from tests/fixtures/encrypted/v4-rc4-128-r4.pdf
+    // and v4-aes-128-r4.pdf (qpdf with --static-id, /ID[0]=FIXTURE_ID0_HEX).
+    // The V=4 dict adds /CF/StdCF/StmF/StrF on top of the V=1/V=2 fields; /O
+    // and /U use the same Algorithm 3 / Algorithm 5 paths as R=3, so the same
+    // `compute_o_entry` / `compute_u_entry` helpers cover them. The file key
+    // is derived via the V=4-specific `compute_file_key_v4` (Algorithm 2's
+    // R=4 path with the conditional `0xFF×4` tail when !encrypt_metadata).
+    //
+    // End-to-end Pdf::open round-trip remains under flpdf-9hc.4.12.
+
+    // V=4 RC4-128 fixture (v4-rc4-128-r4.pdf):
+    const V4_RC4_USER_PW: &[u8] = b"user-v4-rc4";
+    const V4_RC4_OWNER_PW: &[u8] = b"owner-v4-rc4";
+    const V4_RC4_P: i32 = -4;
+    const V4_RC4_O_HEX: &str = "66ee8d10464227e1f7de280cc6d908994be938ed5d13df45e1207f46ff706a49";
+    const V4_RC4_U_HEX: &str = "2eee85f0d2d3ef2af0aaf33fbb3fcfbb0122456a91bae5134273a6db134c87c4";
+
+    // V=4 AES-128 fixture (v4-aes-128-r4.pdf):
+    const V4_AES_USER_PW: &[u8] = b"user-v4-aes";
+    const V4_AES_OWNER_PW: &[u8] = b"owner-v4-aes";
+    const V4_AES_P: i32 = -4;
+    const V4_AES_O_HEX: &str = "45e6b96017cf9931c644c37ff3623a540b9b675d7e92f0a2b2a3e4faa3a619d6";
+    const V4_AES_U_HEX: &str = "8d568cdb54df17765ff9626b887cdf4d0122456a91bae5134273a6db134c87c4";
+
+    /// Helper: assert the /StdCF crypt-filter sub-dictionary matches the
+    /// expected `/CFM` name (`V2` or `AESV2`).
+    fn assert_std_cf_entry(dict: &Dictionary, expected_cfm: &[u8]) {
+        let Some(Object::Dictionary(cf)) = dict.get("CF") else {
+            panic!("expected /CF Dictionary");
+        };
+        let Some(Object::Dictionary(std_cf)) = cf.get("StdCF") else {
+            panic!("expected /CF/StdCF Dictionary");
+        };
+        assert_eq!(
+            std_cf.get("AuthEvent"),
+            Some(&Object::Name(b"DocOpen".to_vec()))
+        );
+        assert_eq!(
+            std_cf.get("CFM"),
+            Some(&Object::Name(expected_cfm.to_vec()))
+        );
+        assert_eq!(std_cf.get("Length"), Some(&Object::Integer(16)));
+    }
+
+    #[test]
+    fn build_v4_encrypt_dict_rc4_matches_qpdf_fixture() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let (dict, _file_key) = build_v4_encrypt_dict(&V4EncryptParams {
+            method: V4CryptMethod::Rc4,
+            user_password: V4_RC4_USER_PW,
+            owner_password: V4_RC4_OWNER_PW,
+            p: V4_RC4_P,
+            id0: &id0,
+            encrypt_metadata: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Name(b"Standard".to_vec()))
+        );
+        assert_eq!(dict.get("V"), Some(&Object::Integer(4)));
+        assert_eq!(dict.get("R"), Some(&Object::Integer(4)));
+        assert_eq!(dict.get("Length"), Some(&Object::Integer(128)));
+        assert_eq!(dict.get("P"), Some(&Object::Integer(i64::from(V4_RC4_P))));
+        assert_eq!(dict.get("StmF"), Some(&Object::Name(b"StdCF".to_vec())));
+        assert_eq!(dict.get("StrF"), Some(&Object::Name(b"StdCF".to_vec())));
+        assert_eq!(dict.get("O"), Some(&Object::String(from_hex(V4_RC4_O_HEX))));
+        // /U first 16 bytes are spec-mandated; trailing 16 are arbitrary
+        // (qpdf emits non-zero, this implementation zero-pads).
+        let Some(Object::String(u)) = dict.get("U") else {
+            panic!("expected /U String");
+        };
+        let expected = from_hex(V4_RC4_U_HEX);
+        assert_eq!(u[..16], expected[..16]);
+        assert_eq!(u[16..], [0u8; 16]);
+        // /EncryptMetadata=true is omitted (matches qpdf defaults-elision).
+        assert!(dict.get("EncryptMetadata").is_none());
+        assert_std_cf_entry(&dict, b"V2");
+    }
+
+    #[test]
+    fn build_v4_encrypt_dict_aes_matches_qpdf_fixture() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let (dict, _file_key) = build_v4_encrypt_dict(&V4EncryptParams {
+            method: V4CryptMethod::Aes,
+            user_password: V4_AES_USER_PW,
+            owner_password: V4_AES_OWNER_PW,
+            p: V4_AES_P,
+            id0: &id0,
+            encrypt_metadata: true,
+        })
+        .unwrap();
+
+        assert_eq!(dict.get("V"), Some(&Object::Integer(4)));
+        assert_eq!(dict.get("R"), Some(&Object::Integer(4)));
+        assert_eq!(dict.get("Length"), Some(&Object::Integer(128)));
+        assert_eq!(dict.get("P"), Some(&Object::Integer(i64::from(V4_AES_P))));
+        assert_eq!(dict.get("O"), Some(&Object::String(from_hex(V4_AES_O_HEX))));
+        let Some(Object::String(u)) = dict.get("U") else {
+            panic!("expected /U String");
+        };
+        let expected = from_hex(V4_AES_U_HEX);
+        assert_eq!(u[..16], expected[..16]);
+        assert_eq!(u[16..], [0u8; 16]);
+        assert!(dict.get("EncryptMetadata").is_none());
+        assert_std_cf_entry(&dict, b"AESV2");
+    }
+
+    /// `encrypt_metadata = false` triggers (a) the Algorithm 2 R=4 file-key
+    /// 0xFF×4 tail and (b) emission of the `/EncryptMetadata false` dict
+    /// entry. Verified via internal round-trip through `check_user_password_v4`.
+    #[test]
+    fn build_v4_encrypt_dict_emits_encrypt_metadata_false_and_round_trips() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let (dict, expected_file_key) = build_v4_encrypt_dict(&V4EncryptParams {
+            method: V4CryptMethod::Aes,
+            user_password: b"user",
+            owner_password: b"owner",
+            p: -4,
+            id0: &id0,
+            encrypt_metadata: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dict.get("EncryptMetadata"),
+            Some(&Object::Boolean(false)),
+            "/EncryptMetadata=false must be emitted explicitly"
+        );
+
+        let Some(Object::String(u_bytes)) = dict.get("U") else {
+            unreachable!()
+        };
+        let Some(Object::String(o_bytes)) = dict.get("O") else {
+            unreachable!()
+        };
+        let mut u32 = [0u8; 32];
+        u32.copy_from_slice(u_bytes);
+        let mut o32 = [0u8; 32];
+        o32.copy_from_slice(o_bytes);
+
+        let inputs = StandardHandlerInputs {
+            v: 4,
+            r: 4,
+            length_bits: 128,
+            p: -4,
+            id0: &id0,
+            u: &u32,
+            o: &o32,
+            encrypt_metadata: false,
+        };
+        let user_key = check_user_password_v4(b"user", &inputs).unwrap();
+        let owner_key = check_owner_password_v4(b"owner", &inputs).unwrap();
+        assert_eq!(user_key, expected_file_key);
+        assert_eq!(owner_key, expected_file_key);
+    }
+
+    /// Internal round-trip: every V=4 method × encrypt_metadata combination
+    /// must authenticate via `check_user_password_v4` / `check_owner_password_v4`
+    /// and return the same file key as the builder.
+    #[test]
+    fn build_v4_encrypt_dict_round_trips_user_and_owner_check() {
+        for method in [V4CryptMethod::Rc4, V4CryptMethod::Aes] {
+            for encrypt_metadata in [true, false] {
+                let id0 = from_hex(FIXTURE_ID0_HEX);
+                let (dict, expected_file_key) = build_v4_encrypt_dict(&V4EncryptParams {
+                    method,
+                    user_password: b"u",
+                    owner_password: b"o",
+                    p: -1,
+                    id0: &id0,
+                    encrypt_metadata,
+                })
+                .unwrap();
+
+                let Some(Object::String(u_bytes)) = dict.get("U") else {
+                    unreachable!()
+                };
+                let Some(Object::String(o_bytes)) = dict.get("O") else {
+                    unreachable!()
+                };
+                let mut u32 = [0u8; 32];
+                u32.copy_from_slice(u_bytes);
+                let mut o32 = [0u8; 32];
+                o32.copy_from_slice(o_bytes);
+
+                let inputs = StandardHandlerInputs {
+                    v: 4,
+                    r: 4,
+                    length_bits: 128,
+                    p: -1,
+                    id0: &id0,
+                    u: &u32,
+                    o: &o32,
+                    encrypt_metadata,
+                };
+                let case = format!("method={method:?} encrypt_metadata={encrypt_metadata}");
+                let user_key = check_user_password_v4(b"u", &inputs)
+                    .unwrap_or_else(|e| panic!("user check failed for {case}: {e:?}"));
+                assert_eq!(user_key, expected_file_key, "user round-trip: {case}");
+                let owner_key = check_owner_password_v4(b"o", &inputs)
+                    .unwrap_or_else(|e| panic!("owner check failed for {case}: {e:?}"));
+                assert_eq!(owner_key, expected_file_key, "owner round-trip: {case}");
+            }
+        }
     }
 }
