@@ -17,9 +17,12 @@
 //!
 //! This implementation adopts the same simplifications used by qpdf:
 //!
-//! * **1-group model**: all shared objects are placed in a single group
-//!   (M = 1).  This is spec-compliant; the group structure is
-//!   implementation-defined.
+//! * **1-object-per-group model (M = N)**: each shared object forms its own
+//!   group, so the number of groups equals the number of shared objects.
+//!   This is spec-compliant (the group structure is implementation-defined)
+//!   and matches qpdf's `writeHSharedObject` in `QPDF_linearization.cc`,
+//!   which always emits `nbits_nobjects = 0` and per-entry
+//!   `nobjects_minus_one = 0` — i.e. each group contains exactly one object.
 //! * **Signature suppressed**: the per-object signature flag is always 0
 //!   (signature computation, e.g. MD5, is not performed).  When the flag is 0
 //!   the 16-byte signature field is omitted from the encoded stream.
@@ -161,9 +164,11 @@ pub struct SharedObjectEntry {
 ///
 /// # Group model
 ///
-/// This implementation uses the **1-group model**: all shared objects are placed
-/// in a single group (M = 1), or M = 0 when there are no shared objects.  This
-/// matches qpdf's default behaviour.
+/// This implementation uses the **1-object-per-group model**: each shared
+/// object forms its own group, so M = N (the number of shared objects), or
+/// M = 0 when there are no shared objects.  This matches qpdf's behaviour
+/// (`writeHSharedObject` in `QPDF_linearization.cc`), which emits
+/// `nbits_nobjects = 0` and `nobjects_minus_one = 0` for every entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedObjectHintTable {
     /// The 7-item header.
