@@ -5,6 +5,7 @@
 //! structured [`MatrixReport`]s.
 
 pub mod comparators;
+pub mod json_diff;
 pub use comparators::{QpdfJsonComparator, StructuralComparator};
 
 use std::path::{Path, PathBuf};

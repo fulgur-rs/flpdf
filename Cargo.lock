@@ -337,6 +337,7 @@ dependencies = [
  "clap",
  "flpdf",
  "predicates",
+ "serde_json",
  "tempfile",
 ]
 
