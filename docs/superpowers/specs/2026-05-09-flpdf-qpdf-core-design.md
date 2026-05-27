@@ -60,7 +60,7 @@ Input APIs accept `Read + Seek` sources. Opening a PDF performs only the initial
 - Locate `startxref` near the end of the file.
 - Read xref table or xref stream.
 - Follow trailer `/Prev` chains.
-- Initialize encryption metadata if present, while initial encrypted document support may return an explicit unsupported error.
+- Initialize and authenticate the Standard security handler if `/Encrypt` is present. See [Security And Encryption](#security-and-encryption) for the supported handler and revision matrix.
 
 The reader does not parse every indirect object during open. Indirect objects are represented as `ObjectRef` values and resolved through the cache when accessed.
 
@@ -106,6 +106,30 @@ Initial output uses a conservative xref table and plain indirect objects rather 
 
 Signature preservation and history-preserving edits belong to the future `Incremental` mode.
 
+## Security And Encryption
+
+`flpdf` ships read-side support for the Standard security handler. Public-Key handlers and write-side re-encryption are deferred.
+
+Supported on the read path:
+
+- Standard handler `/V=1, R=2` (RC4-40), `/V=2, R=3` (RC4-128), `/V=4, R=4` (AESv2 / RC4 via `/CF`), and `/V=5, R=5`/`R=6` (AES-256). RC4-backed handlers require the `--allow-weak-crypto` opt-in.
+- User and owner password authentication, including the qpdf-compatible `--password-is-hex-key` mode (precomputed file key in hex, bypassing Algorithm 2 / 2.A / 2.B / 6 / 7 derivation).
+- Authenticated `/Encrypt` parameters surfaced via the `EncryptionInfo` snapshot (`/V`, `/R`, `/Length`, `/Filter`, `/P`, `/EncryptMetadata`, per-CF method names) for the `show-encryption` / `is-encrypted` / `requires-password` / `show-encryption-key` inspection subcommands.
+- Stream- and string-level decryption applied lazily through the cache, so callers see plaintext object content regardless of crypt filter selection.
+
+Public library surface:
+
+- `flpdf::Pdf::open_with_options(reader, PdfOpenOptions { password, password_mode, allow_weak_crypto, password_is_hex_key, .. })` — the open entry point for encrypted documents.
+- `Pdf::is_encrypted`, `Pdf::encryption_info`, `Pdf::permissions`, `Pdf::user_password_matched`, `Pdf::owner_password_matched`, `Pdf::uses_weak_crypto`, `Pdf::encryption_file_key`.
+- `flpdf::Error::Encrypted(EncryptedError)` with `BadPassword`, `UnsupportedHandler { filter, v, r, cfm }`, `Malformed { reason }`, and `WeakCryptoNotAllowed` variants. Diagnostics use stable `[encrypted.*]` keys (`encrypted.bad-password`, `encrypted.unsupported-handler`, `encrypted.malformed`, `encrypted.weak-crypto-not-allowed`).
+
+Until write-side re-encryption ships, the rewrite writer drops `/Encrypt` from the output trailer: encrypted input that authenticated at open time is therefore decrypted-then-rewritten as plaintext, matching the behavior of `qpdf --decrypt`. Authentication failures (`Error::Encrypted(BadPassword)`) surface at `Pdf::open_with_options` time, not from the writer. The opt-in `--remove-restrictions` flag is the explicit spelling of this default and additionally clears advisory permission state (`/P`, `/U`, `/O`) when only a stripped copy is desired.
+
+Deferred (tracked separately):
+
+- Write-side re-encryption: `--encrypt user-pw owner-pw key-len -- ...`, `--decrypt`, `--copy-encryption-from`, the deterministic test affordances (`--static-aes-iv`, `--deterministic-id`), and the `--allow-insecure` opt-in for V=5 R=6 with an empty owner password.
+- Public-Key security handlers.
+
 ## CLI Design
 
 The first CLI supports:
@@ -130,7 +154,7 @@ The `flpdf` crate will be split into focused modules.
 - `writer`: rewrite writer, renumbering, xref output.
 - `filters`: stream filter implementations, initially including uncompressed streams and Flate where required for common PDF 1.7 structures.
 - `diagnostics`: structured warning and error reporting.
-- `security`: encryption/decryption extension point, initially explicit unsupported paths where needed.
+- `security`: Standard security handler (V=1/V=2/V=4/V=5) read-path decryption, password authentication, and the `Error::Encrypted` typed error surface. Write-side re-encryption is an extension point reserved for a later epic.
 - `check`: `CheckReport` construction and structural validation.
 
 ## Dependency Policy
@@ -186,7 +210,7 @@ After the first milestone, expand in this order unless project needs change:
 - xref stream and object stream completeness.
 - Stream filter coverage.
 - Recovery improvements.
-- Encryption and decryption.
+- Write-side re-encryption (`--encrypt` / `--decrypt` / `--copy-encryption-from`). Read-side Standard handler decryption is already shipped — see [Security And Encryption](#security-and-encryption).
 - Page tree helpers and page operations.
 - qpdf CLI compatibility expansion.
 - Incremental update writing.
