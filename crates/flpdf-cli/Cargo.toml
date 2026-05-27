@@ -26,4 +26,5 @@ flpdf = { path = "../flpdf", version = "0.1.3" }
 assert_cmd.workspace = true
 flpdf = { path = "../flpdf", version = "0.1.3" }
 predicates.workspace = true
+serde_json = { workspace = true }
 tempfile.workspace = true
