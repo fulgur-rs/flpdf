@@ -181,6 +181,100 @@ fn is_simple_key(k: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+pub fn top_level_keys() -> &'static [&'static str] {
+    &[
+        "version",
+        "parameters",
+        "objects",
+        "objectinfo",
+        "pages",
+        "pagelabels",
+        "outlines",
+        "acroform",
+        "attachments",
+        "encrypt",
+    ]
+}
+
+#[derive(Debug)]
+pub struct MatrixCell {
+    pub key: &'static str,
+    pub status: CellStatus,
+}
+
+#[derive(Debug)]
+pub enum CellStatus {
+    /// Subtree present in both, no divergences.
+    Pass,
+    /// Subtree present, all divergences are in the allowlist.
+    Known {
+        #[allow(dead_code)]
+        divergences: Vec<Divergence>,
+    },
+    /// Subtree present but at least one divergence is not allowlisted.
+    Unknown { divergences: Vec<Divergence> },
+    /// Key missing in both qpdf and flpdf output.
+    Missing,
+    /// Key present in only one side — counted as a divergence.
+    PresentOnOneSide {
+        #[allow(dead_code)]
+        qpdf_present: bool,
+    },
+}
+
+pub fn compute_matrix(
+    fixture: &str,
+    qpdf: &Value,
+    flpdf: &Value,
+    allowlist: &mut Allowlist,
+) -> Vec<MatrixCell> {
+    top_level_keys()
+        .iter()
+        .map(|&key| {
+            let a = qpdf.get(key);
+            let b = flpdf.get(key);
+            let status = match (a, b) {
+                (None, None) => CellStatus::Missing,
+                (Some(_), None) => CellStatus::PresentOnOneSide { qpdf_present: true },
+                (None, Some(_)) => CellStatus::PresentOnOneSide {
+                    qpdf_present: false,
+                },
+                (Some(av), Some(bv)) => {
+                    let raw = diff_values(av, bv);
+                    let divs: Vec<Divergence> = raw
+                        .into_iter()
+                        .map(|d| {
+                            let new_path = if d.path == "$" {
+                                format!("$.{key}")
+                            } else {
+                                format!("$.{key}{}", &d.path[1..])
+                            };
+                            Divergence {
+                                path: new_path,
+                                ..d
+                            }
+                        })
+                        .collect();
+
+                    if divs.is_empty() {
+                        CellStatus::Pass
+                    } else {
+                        let any_unknown = divs
+                            .iter()
+                            .any(|d| allowlist.match_divergence(fixture, d).is_none());
+                        if any_unknown {
+                            CellStatus::Unknown { divergences: divs }
+                        } else {
+                            CellStatus::Known { divergences: divs }
+                        }
+                    }
+                }
+            };
+            MatrixCell { key, status }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +487,72 @@ mod tests {
         };
         let _ = al.match_divergence("compat/foo.pdf", &div);
         assert!(al.stale_entries().is_empty());
+    }
+
+    const QPDF_V2_KEYS: &[&str] = &[
+        "version",
+        "parameters",
+        "objects",
+        "objectinfo",
+        "pages",
+        "pagelabels",
+        "outlines",
+        "acroform",
+        "attachments",
+        "encrypt",
+    ];
+
+    #[test]
+    fn matrix_keys_are_all_qpdf_v2_top_level() {
+        assert_eq!(top_level_keys(), QPDF_V2_KEYS);
+    }
+
+    #[test]
+    fn matrix_cell_pass_when_subtrees_equal() {
+        let qpdf = json!({"parameters": {"version": 2}, "objects": {}});
+        let flpdf = json!({"parameters": {"version": 2}, "objects": {}});
+        let mut al = Allowlist::from_json_str(r#"{"entries":[]}"#).unwrap();
+        let cells = compute_matrix("smoke.pdf", &qpdf, &flpdf, &mut al);
+        let by_key: std::collections::HashMap<_, _> =
+            cells.iter().map(|c| (c.key, &c.status)).collect();
+        assert!(matches!(
+            by_key.get("parameters").unwrap(),
+            CellStatus::Pass
+        ));
+        assert!(matches!(by_key.get("objects").unwrap(), CellStatus::Pass));
+        assert!(matches!(
+            by_key.get("version").unwrap(),
+            CellStatus::Missing
+        ));
+    }
+
+    #[test]
+    fn matrix_cell_unknown_when_divergence_not_in_allowlist() {
+        let qpdf = json!({"parameters": {"version": 2}});
+        let flpdf = json!({"parameters": {"version": 3}});
+        let mut al = Allowlist::from_json_str(r#"{"entries":[]}"#).unwrap();
+        let cells = compute_matrix("foo.pdf", &qpdf, &flpdf, &mut al);
+        let params = cells.iter().find(|c| c.key == "parameters").unwrap();
+        match &params.status {
+            CellStatus::Unknown { divergences } => {
+                assert_eq!(divergences.len(), 1);
+                assert_eq!(divergences[0].path, "$.parameters.version");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matrix_cell_known_when_divergence_is_allowlisted() {
+        let qpdf = json!({"parameters": {"version": 2}});
+        let flpdf = json!({"parameters": {"version": 3}});
+        let allowlist_json = r#"{"entries":[{
+            "fixture":"foo.pdf","path":"$.parameters.version",
+            "category":"flpdf-feature-gap","beads_ref":"","reason":""
+        }]}"#;
+        let mut al = Allowlist::from_json_str(allowlist_json).unwrap();
+        let cells = compute_matrix("foo.pdf", &qpdf, &flpdf, &mut al);
+        let params = cells.iter().find(|c| c.key == "parameters").unwrap();
+        assert!(matches!(params.status, CellStatus::Known { .. }));
     }
 }
