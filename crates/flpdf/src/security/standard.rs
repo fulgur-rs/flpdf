@@ -795,6 +795,26 @@ fn validate_v1_v2_params(params: &V1V2EncryptParams<'_>) -> Result<usize> {
     Ok((params.length_bits / 8) as usize)
 }
 
+/// Guard for [`compute_o_entry`] / [`compute_u_entry`]: the writer-side
+/// Algorithm 3 / 5 paths are defined only for the V<5 Standard handler
+/// revisions (r ∈ {2, 3, 4}). V=5 R=5/R=6 use a wholly different family
+/// (Algorithms 2.A/2.B/8/9) and dispatch via separate writer functions
+/// (e.g. `compute_u_ue_r6` once flpdf-9hc.4.3 lands); silently routing an
+/// r=5 (or any other) value through the R≥3 branch would produce
+/// well-formed but cryptographically wrong bytes.
+fn ensure_v_lt_5_revision(r: i64, entry: &str) -> Result<()> {
+    if matches!(r, 2..=4) {
+        Ok(())
+    } else {
+        Err(EncryptedError::Malformed {
+            reason: format!(
+                "/R {r} is unsupported for {entry} computation; expected one of 2, 3, 4"
+            ),
+        }
+        .into())
+    }
+}
+
 /// PDF 1.7 §7.6.3.4 Algorithm 3 — Compute the 32-byte `/O` (owner password)
 /// entry for the Standard handler when V<5.
 ///
@@ -805,9 +825,10 @@ fn validate_v1_v2_params(params: &V1V2EncryptParams<'_>) -> Result<usize> {
 /// ascending passes for R≥3, the inverse of Algorithm 7's descending passes
 /// in [`check_owner_password`] / [`check_owner_password_v4`]).
 ///
-/// Accepts r ∈ {2, 3, 4}. V=4/R=4 uses the same Algorithm 3 path as R=3.
-/// V=5 R=5/R=6 use a wholly different algorithm (Algorithm 2.A/2.B) and are
-/// not handled here.
+/// Accepts r ∈ {2, 3, 4}; any other revision is rejected with
+/// [`EncryptedError::Malformed`]. V=4/R=4 uses the same Algorithm 3 path as
+/// R=3. V=5 R=5/R=6 use a wholly different algorithm (Algorithm 2.A/2.B)
+/// and are not handled here.
 ///
 /// If `owner_password` is empty, the user password is used instead per
 /// Algorithm 3 step 1.
@@ -817,6 +838,8 @@ pub(crate) fn compute_o_entry(
     r: i64,
     n: usize,
 ) -> Result<[u8; 32]> {
+    ensure_v_lt_5_revision(r, "/O")?;
+
     let effective_owner: &[u8] = if owner_password.is_empty() {
         user_password
     } else {
@@ -840,14 +863,18 @@ pub(crate) fn compute_o_entry(
 /// PDF 1.7 §7.6.3.4 Algorithms 4 (R=2) and 5 (R≥3) — Compute the 32-byte
 /// `/U` (user password) entry for the Standard handler when V<5.
 ///
-/// Accepts r ∈ {2, 3, 4}. V=4/R=4 uses the same Algorithm 5 path as R=3.
-/// V=5 R=5/R=6 derive `/U` differently (Algorithm 8) and are not handled here.
+/// Accepts r ∈ {2, 3, 4}; any other revision is rejected with
+/// [`EncryptedError::Malformed`]. V=4/R=4 uses the same Algorithm 5 path
+/// as R=3. V=5 R=5/R=6 derive `/U` differently (Algorithm 8) and are not
+/// handled here.
 ///
 /// For R≥3 the spec mandates only the first 16 bytes; this implementation
 /// pads the remaining 16 with zeros for determinism. qpdf, by contrast,
 /// emits non-zero bytes there; readers (including [`check_user_password`])
 /// ignore the trailing 16 for R≥3, so either choice round-trips.
 pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8; 32]> {
+    ensure_v_lt_5_revision(r, "/U")?;
+
     if r == 2 {
         let mut buf = PASSWORD_PADDING;
         rc4(file_key, &mut buf)?;
@@ -2955,6 +2982,38 @@ mod tests {
             err,
             crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
         ));
+    }
+
+    /// Defensive guard: `compute_o_entry` and `compute_u_entry` document
+    /// support for r ∈ {2, 3, 4} only. R=5 (and any other out-of-range
+    /// value) must be rejected explicitly rather than silently routed
+    /// through the R≥3 Algorithm 3 / Algorithm 5 paths — V=5 R=5/R=6 use a
+    /// wholly different family (Algorithm 2.A/2.B/8/9) and would emit
+    /// well-formed but cryptographically wrong bytes if the writer fell
+    /// through.
+    #[test]
+    fn compute_o_and_u_entry_reject_revisions_outside_2_3_4() {
+        let id0 = [0u8; 16];
+        let file_key = [0u8; 16];
+
+        for bad_r in [-1i64, 0, 1, 5, 6, 100] {
+            let err_o = compute_o_entry(b"u", b"o", bad_r, 16).unwrap_err();
+            assert!(
+                matches!(
+                    err_o,
+                    crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
+                ),
+                "compute_o_entry r={bad_r} should reject with Malformed, got: {err_o:?}"
+            );
+            let err_u = compute_u_entry(&file_key, &id0, bad_r).unwrap_err();
+            assert!(
+                matches!(
+                    err_u,
+                    crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
+                ),
+                "compute_u_entry r={bad_r} should reject with Malformed, got: {err_u:?}"
+            );
+        }
     }
 
     // ── Writer side — V=4 /Encrypt dictionary builder (flpdf-9hc.4.2) ─────────
