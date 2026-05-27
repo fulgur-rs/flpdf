@@ -45,7 +45,7 @@
 
 use crate::error::{EncryptedError, Result};
 use crate::security::primitives::{md5, rc4, sha256, sha384, sha512};
-use crate::{Object, ObjectRef};
+use crate::{Dictionary, Object, ObjectRef};
 use aes::{Aes128, Aes256};
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use cbc::{Decryptor, Encryptor};
@@ -648,29 +648,15 @@ pub(crate) fn check_owner_password(
 ) -> Result<Vec<u8>> {
     let n = validate_inputs(inputs)?;
 
-    // Step 1: Pad/truncate the owner password to 32 bytes.
-    let padded_owner = pad_password(password);
-
-    // Step 2: Compute the RC4 key from the owner password.
-    //   MD5(padded_owner), then 50× if R≥3, take first n bytes.
-    //
-    // Per PDF 1.7 §7.6.3.4 Algorithm 3 step 3, the R≥3 loop feeds the full
-    // 16-byte MD5 digest back as input (no n-truncation). Truncating to n
-    // would break n<16 cases like V=2/R=3/Length∈{40,56,64,...}.
-    let mut digest = md5(&padded_owner);
-    if inputs.r >= 3 {
-        for _ in 0..50 {
-            digest = md5(&digest);
-        }
-    }
-    let rc4_key = &digest[..n];
+    // Steps 1-2: derive the RC4 key from the (padded) owner password.
+    let rc4_key = derive_owner_password_rc4_key(password, inputs.r, n);
 
     // Step 3: Use the RC4 key to decrypt /O and recover the (padded) user password.
     let mut candidate = *inputs.o; // 32 bytes
 
     if inputs.r == 2 {
         // Single RC4 pass.
-        rc4(rc4_key, &mut candidate)?;
+        rc4(&rc4_key, &mut candidate)?;
     } else {
         // 20 passes in DESCENDING order (i = 19..=0).
         for i in (0u8..=19).rev() {
@@ -701,6 +687,226 @@ pub(crate) fn check_owner_password_v4(
         rc4(&xor_key, &mut candidate)?;
     }
     check_user_password_v4(&candidate, inputs)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Writer side — /Encrypt dictionary construction (V=1/V=2; flpdf-9hc.4.1)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Inputs for building a V=1 or V=2 `/Encrypt` dictionary via
+/// [`build_v1_v2_encrypt_dict`].
+///
+/// The V/R/Length matrix is the same as the reader-side [`StandardHandlerInputs`]
+/// accepts for V=1/V=2: V=1 ⇒ R=2/Length=40; V=2 ⇒ R∈{2,3} with R=2 fixed at
+/// Length=40 and R=3 spanning Length∈[40,128] in 8-bit steps.
+pub(crate) struct V1V2EncryptParams<'a> {
+    /// `/V` — algorithm version (1 or 2).
+    pub v: i64,
+    /// `/R` — revision (2 or 3 for V=1/V=2).
+    pub r: i64,
+    /// `/Length` in bits (40–128, must be a multiple of 8).
+    pub length_bits: i64,
+    /// Raw bytes of the user password (post-`PasswordMode` normalization).
+    pub user_password: &'a [u8],
+    /// Raw bytes of the owner password. Empty falls back to `user_password`
+    /// per Algorithm 3 step 1.
+    pub owner_password: &'a [u8],
+    /// `/P` permission flags (signed 32-bit).
+    pub p: i32,
+    /// First element of the `/ID` array. Required by Algorithms 2 and 5.
+    pub id0: &'a [u8],
+}
+
+/// Derive the owner-password RC4 key shared by Algorithm 3 (writer: encrypt
+/// padded user password → `/O`) and Algorithm 7 (reader: decrypt `/O` →
+/// padded user password).
+///
+/// Pads `password` to 32 bytes, takes MD5, and for R≥3 iterates 50 further
+/// MD5 passes over the FULL 16-byte digest (NOT the n-truncated prefix; see
+/// the `alg3_owner_key_iteration_uses_full_digest_for_short_keys` regression
+/// test). Returns the first `n` bytes.
+fn derive_owner_password_rc4_key(password: &[u8], r: i64, n: usize) -> Vec<u8> {
+    let padded = pad_password(password);
+    let mut digest = md5(&padded);
+    if r >= 3 {
+        for _ in 0..50 {
+            digest = md5(&digest);
+        }
+    }
+    digest[..n].to_vec()
+}
+
+/// Compute the first 16 bytes of `/U` for R≥3 (Algorithm 5, steps 1-4).
+///
+/// Shared by the writer ([`compute_u_entry`]) and the reader
+/// ([`check_user_password`] R≥3 branch); the writer emits these bytes as the
+/// first 16 of `/U`, the reader compares them against the first 16 of the
+/// stored `/U`.
+fn compute_u_first_16_r3plus(file_key: &[u8], id0: &[u8]) -> Result<[u8; 16]> {
+    let mut md5_input = Vec::with_capacity(32 + id0.len());
+    md5_input.extend_from_slice(&PASSWORD_PADDING);
+    md5_input.extend_from_slice(id0);
+    let mut data = md5(&md5_input);
+
+    rc4(file_key, &mut data)?;
+    for i in 1u8..=19 {
+        let xor_key: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
+        rc4(&xor_key, &mut data)?;
+    }
+    Ok(data)
+}
+
+/// Validate `params` for V=1/V=2 writer side. Mirrors the reader-side
+/// [`validate_inputs`] V/R/Length matrix.
+fn validate_v1_v2_params(params: &V1V2EncryptParams<'_>) -> Result<usize> {
+    let unsupported = || -> crate::error::Error {
+        EncryptedError::UnsupportedHandler {
+            filter: "Standard".into(),
+            v: params.v,
+            r: params.r,
+            cfm: None,
+        }
+        .into()
+    };
+
+    if params.v != 1 && params.v != 2 {
+        return Err(unsupported());
+    }
+    if params.r != 2 && params.r != 3 {
+        return Err(unsupported());
+    }
+    // V=1 is fixed at R=2 / Length=40 by spec.
+    if params.v == 1 && (params.r != 2 || params.length_bits != 40) {
+        return Err(unsupported());
+    }
+    // R=2 is a 40-bit revision regardless of V.
+    if params.r == 2 && params.length_bits != 40 {
+        return Err(unsupported());
+    }
+    if params.length_bits < 40 || params.length_bits > 128 || params.length_bits % 8 != 0 {
+        return Err(EncryptedError::Malformed {
+            reason: format!(
+                "/Length {} is invalid; must be a multiple of 8 between 40 and 128",
+                params.length_bits
+            ),
+        }
+        .into());
+    }
+    Ok((params.length_bits / 8) as usize)
+}
+
+/// PDF 1.7 §7.6.3.4 Algorithm 3 — Compute the 32-byte `/O` (owner password)
+/// entry for V=1/V=2.
+///
+/// `n` is the file-key length in bytes (5 for V=1; 5..=16 for V=2). The
+/// algorithm is independent of the file encryption key: it derives an RC4
+/// key from the owner password (using [`derive_owner_password_rc4_key`]) and
+/// encrypts the padded user password with it (single pass for R=2; 20
+/// ascending passes for R≥3, the inverse of Algorithm 7's descending
+/// passes in [`check_owner_password`]).
+///
+/// If `owner_password` is empty, the user password is used instead per
+/// Algorithm 3 step 1.
+pub(crate) fn compute_o_entry(
+    user_password: &[u8],
+    owner_password: &[u8],
+    r: i64,
+    n: usize,
+) -> Result<[u8; 32]> {
+    let effective_owner: &[u8] = if owner_password.is_empty() {
+        user_password
+    } else {
+        owner_password
+    };
+
+    let rc4_key = derive_owner_password_rc4_key(effective_owner, r, n);
+
+    let mut buf: [u8; 32] = pad_password(user_password);
+    if r == 2 {
+        rc4(&rc4_key, &mut buf)?;
+    } else {
+        for i in 0u8..=19 {
+            let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
+            rc4(&xor_key, &mut buf)?;
+        }
+    }
+    Ok(buf)
+}
+
+/// PDF 1.7 §7.6.3.4 Algorithms 4 (R=2) and 5 (R≥3) — Compute the 32-byte
+/// `/U` (user password) entry for V=1/V=2.
+///
+/// For R≥3 the spec mandates only the first 16 bytes; this implementation
+/// pads the remaining 16 with zeros for determinism. qpdf, by contrast,
+/// emits non-zero bytes there; readers (including [`check_user_password`])
+/// ignore the trailing 16 for R≥3, so either choice round-trips.
+pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8; 32]> {
+    if r == 2 {
+        let mut buf = PASSWORD_PADDING;
+        rc4(file_key, &mut buf)?;
+        Ok(buf)
+    } else {
+        let first16 = compute_u_first_16_r3plus(file_key, id0)?;
+        let mut u = [0u8; 32];
+        u[..16].copy_from_slice(&first16);
+        Ok(u)
+    }
+}
+
+/// Construct the `/Encrypt` dictionary for V=1 or V=2 from passwords and
+/// permissions, returning the dictionary and the derived file encryption key.
+///
+/// The file key is returned alongside the dictionary because the
+/// string/stream encryption passes (flpdf-9hc.4.5 / flpdf-9hc.4.6) need it
+/// to derive per-object keys via [`per_object_key`]; the dictionary alone
+/// does not carry it.
+///
+/// Algorithmic order: `/O` (Algorithm 3) → file key (Algorithm 2, consumes
+/// `/O`) → `/U` (Algorithm 4/5, consumes file key). Each step's output is an
+/// input to the next.
+pub(crate) fn build_v1_v2_encrypt_dict(
+    params: &V1V2EncryptParams<'_>,
+) -> Result<(Dictionary, Vec<u8>)> {
+    let n = validate_v1_v2_params(params)?;
+
+    // Algorithm 3: /O.
+    let o_entry = compute_o_entry(params.user_password, params.owner_password, params.r, n)?;
+
+    // Algorithm 2: file encryption key (uses /O).
+    //
+    // `dummy_u` is a placeholder for `StandardHandlerInputs.u`. `compute_file_key`
+    // does not read `u` — Algorithm 2 only consumes `/O`, `/P`, `/ID[0]`, and
+    // `/EncryptMetadata` — so any 32 bytes are safe here. If that ever changes,
+    // the `compute_u_entry` call below (which depends on this file key) would
+    // see a stale key and the round-trip tests in this module would fail.
+    let dummy_u = [0u8; 32];
+    let inputs = StandardHandlerInputs {
+        v: params.v,
+        r: params.r,
+        length_bits: params.length_bits,
+        p: params.p,
+        id0: params.id0,
+        u: &dummy_u,
+        o: &o_entry,
+        // V<5 R<4: the 0xFF×4 tail is not appended; /EncryptMetadata is
+        // unused by Algorithm 2 for these revisions.
+        encrypt_metadata: true,
+    };
+    let file_key = compute_file_key(params.user_password, &inputs)?;
+
+    // Algorithm 4 (R=2) or Algorithm 5 (R=3): /U.
+    let u_entry = compute_u_entry(&file_key, params.id0, params.r)?;
+
+    let mut dict = Dictionary::new();
+    dict.insert("Filter", Object::Name(b"Standard".to_vec()));
+    dict.insert("V", Object::Integer(params.v));
+    dict.insert("R", Object::Integer(params.r));
+    dict.insert("Length", Object::Integer(params.length_bits));
+    dict.insert("P", Object::Integer(i64::from(params.p)));
+    dict.insert("U", Object::String(u_entry.to_vec()));
+    dict.insert("O", Object::String(o_entry.to_vec()));
+
+    Ok((dict, file_key))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2276,5 +2482,352 @@ mod tests {
             eff: Some("OtherCF".to_string()),
         };
         assert_eq!(selectors.eff_or_stm(), Some("OtherCF"));
+    }
+
+    // ── Writer side — /Encrypt dictionary builder (flpdf-9hc.4.1) ─────────────
+    //
+    // The KAT vectors below are extracted from the qpdf-generated fixtures in
+    // tests/fixtures/encrypted/ (see that directory's README.md for the qpdf
+    // invocations). They use the static `/ID[0]` value
+    // 31415926535897932384626433832795 (qpdf `--static-id`) so /O, /U, and the
+    // file key are reproducible. Round-tripping `compute_o_entry` and
+    // `compute_u_entry` against these vectors validates writer-side bytes
+    // against an independent implementation without needing the stream/string
+    // encryption passes (those land in flpdf-9hc.4.5/4.6).
+    //
+    // End-to-end Pdf::open + encryption_info() round-trip belongs to
+    // flpdf-9hc.4.12 (encrypt round-trip + cross-implementation cross-check);
+    // 4.1's deliverable stops at the dict builder and its algorithmic checks.
+
+    /// qpdf `--static-id` /ID[0] used by every fixture in tests/fixtures/encrypted/.
+    const FIXTURE_ID0_HEX: &str = "31415926535897932384626433832795";
+
+    // V=1/R=2 fixture (tests/fixtures/encrypted/v1-rc4-40-r2.pdf):
+    //   user password "user-v1", owner password "owner-v1", /P -4.
+    const V1_USER_PW: &[u8] = b"user-v1";
+    const V1_OWNER_PW: &[u8] = b"owner-v1";
+    const V1_P: i32 = -4;
+    const V1_O_HEX: &str = "a13a6ff5151908fad9da01ab4b8ccf1258e94ab91306d6c5a7fac00377dc02ac";
+    const V1_U_HEX: &str = "3d29da9d916afcc3333b74d4116428981f7db3b0b7d098d2b826664c7276db99";
+
+    // V=2/R=3/Length=128 fixture (tests/fixtures/encrypted/v2-rc4-128-r3.pdf):
+    //   user password "user-v2", owner password "owner-v2", /P -4.
+    const V2_USER_PW: &[u8] = b"user-v2";
+    const V2_OWNER_PW: &[u8] = b"owner-v2";
+    const V2_P: i32 = -4;
+    const V2_O_HEX: &str = "ceaafcfb139dc80f6697cbe3de6f61fecd35aa578924fa58c5f801f79a9ec0e5";
+    const V2_U_HEX: &str = "3bba8cbe0870bbe46d1b0ec88a66d9300122456a91bae5134273a6db134c87c4";
+
+    #[test]
+    fn compute_o_entry_matches_qpdf_v1_r2_fixture() {
+        let o = compute_o_entry(V1_USER_PW, V1_OWNER_PW, 2, 5).unwrap();
+        assert_eq!(o, hex32(V1_O_HEX));
+    }
+
+    #[test]
+    fn compute_o_entry_matches_qpdf_v2_r3_fixture() {
+        let o = compute_o_entry(V2_USER_PW, V2_OWNER_PW, 3, 16).unwrap();
+        assert_eq!(o, hex32(V2_O_HEX));
+    }
+
+    #[test]
+    fn compute_u_entry_matches_qpdf_v1_r2_fixture() {
+        // R=2: /O feeds Algorithm 2; build the file key the same way and
+        // verify /U byte-for-byte.
+        let o = hex32(V1_O_HEX);
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let dummy_u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 1,
+            r: 2,
+            length_bits: 40,
+            p: V1_P,
+            id0: &id0,
+            u: &dummy_u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let file_key = compute_file_key(V1_USER_PW, &inputs).unwrap();
+        let u = compute_u_entry(&file_key, &id0, 2).unwrap();
+        assert_eq!(u, hex32(V1_U_HEX));
+    }
+
+    #[test]
+    fn compute_u_entry_matches_qpdf_v2_r3_fixture_first_16_bytes() {
+        let o = hex32(V2_O_HEX);
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let dummy_u = [0u8; 32];
+        let inputs = StandardHandlerInputs {
+            v: 2,
+            r: 3,
+            length_bits: 128,
+            p: V2_P,
+            id0: &id0,
+            u: &dummy_u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+        let file_key = compute_file_key(V2_USER_PW, &inputs).unwrap();
+        let u = compute_u_entry(&file_key, &id0, 3).unwrap();
+        // Per spec, only the first 16 bytes of /U are deterministic for R≥3.
+        // qpdf populates the trailing 16 with non-zero bytes; this
+        // implementation pads with zeros. Compare only the spec-mandated half.
+        let expected = hex32(V2_U_HEX);
+        assert_eq!(u[..16], expected[..16]);
+        assert_eq!(u[16..], [0u8; 16]);
+    }
+
+    /// Algorithm 3 step 1: an empty owner password falls back to the user
+    /// password. Verified by checking that `compute_o_entry(user, "")` and
+    /// `compute_o_entry(user, user)` produce the same /O.
+    #[test]
+    fn compute_o_entry_empty_owner_pw_falls_back_to_user_pw() {
+        let user_pw = b"only-user";
+        let o_with_empty_owner = compute_o_entry(user_pw, b"", 3, 16).unwrap();
+        let o_with_user_as_owner = compute_o_entry(user_pw, user_pw, 3, 16).unwrap();
+        assert_eq!(o_with_empty_owner, o_with_user_as_owner);
+    }
+
+    #[test]
+    fn build_v1_v2_encrypt_dict_v1_r2_matches_qpdf_fixture() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let (dict, _file_key) = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 1,
+            r: 2,
+            length_bits: 40,
+            user_password: V1_USER_PW,
+            owner_password: V1_OWNER_PW,
+            p: V1_P,
+            id0: &id0,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Name(b"Standard".to_vec()))
+        );
+        assert_eq!(dict.get("V"), Some(&Object::Integer(1)));
+        assert_eq!(dict.get("R"), Some(&Object::Integer(2)));
+        assert_eq!(dict.get("Length"), Some(&Object::Integer(40)));
+        assert_eq!(dict.get("P"), Some(&Object::Integer(i64::from(V1_P))));
+        assert_eq!(dict.get("U"), Some(&Object::String(from_hex(V1_U_HEX))),);
+        assert_eq!(dict.get("O"), Some(&Object::String(from_hex(V1_O_HEX))),);
+    }
+
+    #[test]
+    fn build_v1_v2_encrypt_dict_v2_r3_matches_qpdf_fixture_modulo_u_tail() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let (dict, _file_key) = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 2,
+            r: 3,
+            length_bits: 128,
+            user_password: V2_USER_PW,
+            owner_password: V2_OWNER_PW,
+            p: V2_P,
+            id0: &id0,
+        })
+        .unwrap();
+
+        assert_eq!(dict.get("V"), Some(&Object::Integer(2)));
+        assert_eq!(dict.get("R"), Some(&Object::Integer(3)));
+        assert_eq!(dict.get("Length"), Some(&Object::Integer(128)));
+        assert_eq!(dict.get("P"), Some(&Object::Integer(i64::from(V2_P))));
+        assert_eq!(dict.get("O"), Some(&Object::String(from_hex(V2_O_HEX))),);
+        // /U: first 16 bytes are spec-mandated and must match qpdf; trailing 16
+        // are arbitrary per spec, this implementation pads with zeros.
+        let Some(Object::String(u)) = dict.get("U") else {
+            panic!("expected /U String");
+        };
+        let expected = from_hex(V2_U_HEX);
+        assert_eq!(u[..16], expected[..16]);
+        assert_eq!(u[16..], [0u8; 16]);
+    }
+
+    /// Internal round-trip: a dictionary built by [`build_v1_v2_encrypt_dict`]
+    /// must authenticate the same user and owner passwords through the reader
+    /// path ([`check_user_password`] / [`check_owner_password`]), returning
+    /// the same file encryption key.
+    #[test]
+    fn build_v1_v2_encrypt_dict_round_trips_user_and_owner_check() {
+        for (v, r, length_bits, user_pw, owner_pw, p) in [
+            (
+                1i64,
+                2i64,
+                40i64,
+                b"user-v1" as &[u8],
+                b"owner-v1" as &[u8],
+                -4i32,
+            ),
+            (2, 3, 128, b"user-v2", b"owner-v2", -4),
+            (2, 3, 40, b"short-key", b"another-owner", -1),
+            (2, 3, 128, b"", b"", -1), // empty passwords (both fall through padding)
+        ] {
+            let id0 = from_hex(FIXTURE_ID0_HEX);
+            let (dict, expected_file_key) = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+                v,
+                r,
+                length_bits,
+                user_password: user_pw,
+                owner_password: owner_pw,
+                p,
+                id0: &id0,
+            })
+            .unwrap_or_else(|e| panic!("build failed for V={v}/R={r}/L={length_bits}: {e:?}"));
+
+            let Some(Object::String(u_bytes)) = dict.get("U") else {
+                panic!("expected /U String");
+            };
+            let Some(Object::String(o_bytes)) = dict.get("O") else {
+                panic!("expected /O String");
+            };
+            let mut u32 = [0u8; 32];
+            u32.copy_from_slice(u_bytes);
+            let mut o32 = [0u8; 32];
+            o32.copy_from_slice(o_bytes);
+
+            let inputs = StandardHandlerInputs {
+                v,
+                r,
+                length_bits,
+                p,
+                id0: &id0,
+                u: &u32,
+                o: &o32,
+                encrypt_metadata: true,
+            };
+            let user_file_key = check_user_password(user_pw, &inputs).unwrap_or_else(|e| {
+                panic!("user check failed for V={v}/R={r}/L={length_bits}: {e:?}")
+            });
+            assert_eq!(user_file_key, expected_file_key, "user round-trip key");
+
+            let owner_file_key = check_owner_password(owner_pw, &inputs).unwrap_or_else(|e| {
+                panic!("owner check failed for V={v}/R={r}/L={length_bits}: {e:?}")
+            });
+            assert_eq!(owner_file_key, expected_file_key, "owner round-trip key");
+        }
+    }
+
+    /// Wrong user password against a built dict must produce `BadPassword`.
+    #[test]
+    fn build_v1_v2_encrypt_dict_rejects_wrong_user_password() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let (dict, _) = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 2,
+            r: 3,
+            length_bits: 128,
+            user_password: b"correct-user",
+            owner_password: b"correct-owner",
+            p: -4,
+            id0: &id0,
+        })
+        .unwrap();
+
+        let Some(Object::String(u_bytes)) = dict.get("U") else {
+            unreachable!()
+        };
+        let Some(Object::String(o_bytes)) = dict.get("O") else {
+            unreachable!()
+        };
+        let mut u32 = [0u8; 32];
+        u32.copy_from_slice(u_bytes);
+        let mut o32 = [0u8; 32];
+        o32.copy_from_slice(o_bytes);
+
+        let inputs = StandardHandlerInputs {
+            v: 2,
+            r: 3,
+            length_bits: 128,
+            p: -4,
+            id0: &id0,
+            u: &u32,
+            o: &o32,
+            encrypt_metadata: true,
+        };
+        let err = check_user_password(b"wrong-password", &inputs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Encrypted(crate::error::EncryptedError::BadPassword)
+            ),
+            "expected BadPassword, got: {err:?}"
+        );
+    }
+
+    // ── Writer side — validation rejects ──────────────────────────────────────
+
+    #[test]
+    fn build_v1_v2_encrypt_dict_rejects_v4() {
+        let id0 = [0u8; 16];
+        let err = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 4,
+            r: 4,
+            length_bits: 128,
+            user_password: b"",
+            owner_password: b"",
+            p: -1,
+            id0: &id0,
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Encrypted(crate::error::EncryptedError::UnsupportedHandler { .. })
+        ));
+    }
+
+    #[test]
+    fn build_v1_v2_encrypt_dict_rejects_v1_with_length_128() {
+        let id0 = [0u8; 16];
+        let err = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 1,
+            r: 2,
+            length_bits: 128, // V=1 is 40-bit only
+            user_password: b"",
+            owner_password: b"",
+            p: -1,
+            id0: &id0,
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Encrypted(crate::error::EncryptedError::UnsupportedHandler { .. })
+        ));
+    }
+
+    #[test]
+    fn build_v1_v2_encrypt_dict_rejects_r2_with_length_128() {
+        let id0 = [0u8; 16];
+        let err = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 2,
+            r: 2,
+            length_bits: 128, // R=2 is 40-bit only
+            user_password: b"",
+            owner_password: b"",
+            p: -1,
+            id0: &id0,
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Encrypted(crate::error::EncryptedError::UnsupportedHandler { .. })
+        ));
+    }
+
+    #[test]
+    fn build_v1_v2_encrypt_dict_rejects_non_multiple_of_8_length() {
+        let id0 = [0u8; 16];
+        let err = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
+            v: 2,
+            r: 3,
+            length_bits: 50, // not a multiple of 8
+            user_password: b"",
+            owner_password: b"",
+            p: -1,
+            id0: &id0,
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Encrypted(crate::error::EncryptedError::Malformed { .. })
+        ));
     }
 }
