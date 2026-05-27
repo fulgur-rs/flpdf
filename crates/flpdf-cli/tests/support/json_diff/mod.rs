@@ -259,10 +259,15 @@ pub fn compute_matrix(
                     if divs.is_empty() {
                         CellStatus::Pass
                     } else {
-                        let any_unknown = divs
+                        // Drain ALL divergences against the allowlist before classifying, so every
+                        // allowlist entry that should match gets its `matched` flag set. Using
+                        // Iterator::any would short-circuit on the first unknown and miss later
+                        // allowlisted siblings, leading to spurious stale-allowlist failures.
+                        let unknown_count = divs
                             .iter()
-                            .any(|d| allowlist.match_divergence(fixture, d).is_none());
-                        if any_unknown {
+                            .filter(|d| allowlist.match_divergence(fixture, d).is_none())
+                            .count();
+                        if unknown_count > 0 {
                             CellStatus::Unknown { divergences: divs }
                         } else {
                             CellStatus::Known { divergences: divs }
@@ -554,5 +559,33 @@ mod tests {
         let cells = compute_matrix("foo.pdf", &qpdf, &flpdf, &mut al);
         let params = cells.iter().find(|c| c.key == "parameters").unwrap();
         assert!(matches!(params.status, CellStatus::Known { .. }));
+    }
+
+    #[test]
+    fn matrix_marks_later_allowlisted_div_even_when_earlier_is_unknown() {
+        // Regression: compute_matrix must visit every divergence in a cell to
+        // mark allowlist entries as used. If classification short-circuits on
+        // the first unknown, a sibling allowlisted divergence is left unmarked
+        // and stale_entries() returns a false positive — which would fail the
+        // Task 7 corpus runner's stale_allowlist.is_empty() assertion.
+        //
+        // Key names a_unknown / z_allowed force alphabetical ordering inside
+        // serde_json::Map (a BTreeMap by default) so the unknown appears first.
+        let qpdf = json!({"parameters": {"a_unknown": 1, "z_allowed": 2}});
+        let flpdf = json!({"parameters": {"a_unknown": 9, "z_allowed": 8}});
+        let allowlist_json = r#"{"entries":[{
+            "fixture":"f.pdf","path":"$.parameters.z_allowed",
+            "category":"x","beads_ref":"","reason":""
+        }]}"#;
+        let mut al = Allowlist::from_json_str(allowlist_json).unwrap();
+        let _ = compute_matrix("f.pdf", &qpdf, &flpdf, &mut al);
+        assert!(
+            al.stale_entries().is_empty(),
+            "allowlist entry must be matched even when a sibling is unknown; stale = {:?}",
+            al.stale_entries()
+                .iter()
+                .map(|e| &e.path)
+                .collect::<Vec<_>>(),
+        );
     }
 }
