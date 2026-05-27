@@ -152,9 +152,12 @@ fn json_schema_diff_corpus() {
         stale_allowlist: stale,
     };
 
-    std::fs::create_dir_all(report_dir()).ok();
-    std::fs::write(report_dir().join("report.md"), report.to_markdown()).ok();
-    std::fs::write(report_dir().join("report.json"), report.to_json()).ok();
+    let out_dir = report_dir();
+    std::fs::create_dir_all(&out_dir).expect("create target/json-diff");
+    std::fs::write(out_dir.join("report.md"), report.to_markdown())
+        .expect("write target/json-diff/report.md");
+    std::fs::write(out_dir.join("report.json"), report.to_json())
+        .expect("write target/json-diff/report.json");
 
     let invocation_errors: Vec<String> = report
         .fixtures
