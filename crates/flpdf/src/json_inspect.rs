@@ -158,19 +158,113 @@ pub(crate) fn decode_pdf_text_string(bytes: &[u8]) -> Option<String> {
     Some(out)
 }
 
-/// Classify a PDF string as either a `u:` text string or `b:` binary string.
+/// Heuristic that mirrors qpdf's `QPDF_String::useHexString()` (libqpdf
+/// `QPDF_String.cc`): returns true when the PDF string contains enough
+/// non-printable or non-ASCII bytes that qpdf would emit it as a
+/// `b:<hex>` blob in JSON v2 output rather than attempting a PDFDocEncoding
+/// round-trip.
 ///
-/// Text bytes are decoded through [`decode_pdf_text_string`]; only when the
-/// byte sequence cannot be decoded as PDF text do we fall back to the
-/// hex-encoded `b:` form.  This matches qpdf JSON v2 behavior for
-/// UTF-16-marked text strings, PDFDocEncoded metadata, and binary IDs.
-fn pdf_string_to_json_string(bytes: &[u8]) -> String {
-    if let Some(text) = decode_pdf_text_string(bytes) {
-        format!("u:{text}")
-    } else {
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        format!("b:{hex}")
+/// Rules (with byte values expressed as unsigned `u8` — qpdf uses signed
+/// `char` arithmetic but the semantics are identical):
+/// - `0x20..=0x7E` (printable ASCII): considered plain, contributes nothing.
+/// - `0x18..=0x1F`, `0x7F`, `0x80..=0xFF`: count as `non_ascii`.
+/// - `\n \r \t \b \f` (`0x08 0x09 0x0A 0x0C 0x0D`): considered plain.
+/// - Any other byte below `0x20` (e.g. NUL, 0x01, 0x0B, 0x0E..0x17):
+///   short-circuit and force hex.
+///
+/// After the scan, hex is used when `5 * non_ascii > len` — i.e. when more
+/// than 20% of the bytes are non-ASCII / control symbols.
+fn use_hex_string(bytes: &[u8]) -> bool {
+    let mut non_ascii: usize = 0;
+    for &b in bytes {
+        match b {
+            0x20..=0x7E => continue,
+            0x18..=0x1F | 0x7F | 0x80..=0xFF => non_ascii += 1,
+            0x08 | 0x09 | 0x0A | 0x0C | 0x0D => continue,
+            _ => return true,
+        }
     }
+    5 * non_ascii > bytes.len()
+}
+
+/// Lossy UTF-16 → UTF-8 decoder matching `QUtil::utf16_to_utf8` in qpdf.
+///
+/// A trailing odd byte is silently ignored; a high surrogate without a
+/// following low surrogate is dropped; a low surrogate without a preceding
+/// high surrogate yields its low 10 bits as a codepoint. Invalid scalar
+/// values (e.g. lone surrogates surviving the above) are silently skipped
+/// via [`char::from_u32`]. This intentionally mirrors qpdf so that JSON v2
+/// output stays byte-identical for fixtures containing the same input.
+///
+/// `is_le` selects little-endian byte order (BOM `0xFF 0xFE`) versus
+/// big-endian (`0xFE 0xFF`); the caller is expected to have stripped the
+/// BOM before calling.
+fn lossy_utf16_to_utf8(bytes: &[u8], is_le: bool) -> String {
+    let mut out = String::new();
+    let mut codepoint: u32 = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let (msb_idx, lsb_idx) = if is_le { (i + 1, i) } else { (i, i + 1) };
+        let bits = (u16::from(bytes[msb_idx]) << 8) | u16::from(bytes[lsb_idx]);
+        match bits & 0xFC00 {
+            0xD800 => {
+                codepoint = 0x10000 + ((u32::from(bits) & 0x3FF) << 10);
+                i += 2;
+                continue;
+            }
+            0xDC00 => {
+                codepoint += u32::from(bits) & 0x3FF;
+            }
+            _ => {
+                codepoint = u32::from(bits);
+            }
+        }
+        if let Some(c) = char::from_u32(codepoint) {
+            out.push(c);
+        }
+        codepoint = 0;
+        i += 2;
+    }
+    out
+}
+
+/// Classify a PDF string as either a `u:` text string or `b:` binary string
+/// using the same decision tree as qpdf's `QPDF_String::writeJSON` (JSON v2).
+///
+/// The order of checks mirrors qpdf's `libqpdf/QPDF_String.cc` exactly:
+/// 1. UTF-16 BOM (`FE FF` BE or `FF FE` LE): decode lossily and emit
+///    `u:<utf8>`. Matches `util::is_utf16` + `QUtil::utf16_to_utf8`.
+/// 2. UTF-8 BOM (`EF BB BF`): emit `u:<rest>` for the substring after the
+///    BOM. qpdf trusts the BOM without re-validating UTF-8 — we additionally
+///    require `std::str::from_utf8` to succeed so we never emit invalid
+///    UTF-8 ourselves.
+/// 3. Run [`use_hex_string`]; if it returns `false`, attempt PDFDocEncoding
+///    decode. A successful decode is equivalent to qpdf's
+///    `utf8_to_pdf_doc(...)` round-trip because our
+///    [`decode_pdf_text_string`] returns `None` for any byte without a
+///    1-to-1 PDFDoc mapping — so decode-success implies round-trip-success.
+/// 4. Otherwise emit `b:<hex>` (lowercase).
+fn pdf_string_to_json_string(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return format!("u:{}", lossy_utf16_to_utf8(rest, false));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return format!("u:{}", lossy_utf16_to_utf8(rest, true));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(s) = std::str::from_utf8(rest) {
+            return format!("u:{s}");
+        }
+    }
+    if !use_hex_string(bytes) {
+        // PDFDocEncoding decode-success ⇒ 1-to-1 mapping ⇒ no separate
+        // round-trip check needed (see [`decode_pdf_text_string`]).
+        if let Some(text) = decode_pdf_text_string(bytes) {
+            return format!("u:{text}");
+        }
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!("b:{hex}")
 }
 
 /// Encode a PDF name byte sequence into a `/NAME` JSON string using the
@@ -2763,11 +2857,29 @@ mod tests {
     }
 
     #[test]
-    fn object_string_pdfdoc_high_byte_decodes_as_text() {
-        // 0xC7 is "Ç" (LATIN CAPITAL LETTER C WITH CEDILLA) in PDFDocEncoding
-        // == ISO 8859-1. qpdf treats this as a text string.
+    fn object_string_pdfdoc_high_byte_too_dense_falls_back_to_binary() {
+        // 0xC7 ("Ç" in PDFDocEncoding) counts as non-ASCII under qpdf's
+        // useHexString() heuristic. With non_ascii=1 and len=3, 5*1 > 3 so
+        // qpdf emits b:<hex>; flpdf matches that.
         let result = pdf_object_to_json(&Object::String(vec![b'A', 0xC7, b'B'])).unwrap();
-        assert_eq!(result, JsonValue::String("u:A\u{00C7}B".to_string()));
+        assert_eq!(result, JsonValue::String("b:41c742".to_string()));
+    }
+
+    #[test]
+    fn object_string_pdfdoc_high_byte_sparse_decodes_as_text() {
+        // With non_ascii=1 and len=16, 5*1 = 5 ≤ 16 → qpdf attempts the
+        // PDFDocEncoding round-trip and emits u:<text>. 0xC7 → "Ç".
+        let bytes: Vec<u8> = b"the quick"
+            .iter()
+            .copied()
+            .chain(std::iter::once(0xC7u8))
+            .chain(b"brown!!".iter().copied())
+            .collect();
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(
+            result,
+            JsonValue::String("u:the quick\u{00C7}brown!!".to_string())
+        );
     }
 
     #[test]
@@ -2795,17 +2907,66 @@ mod tests {
     }
 
     #[test]
-    fn object_string_utf16be_with_odd_length_falls_back_to_binary() {
-        // FEFF + 0041 + 00 (truncated last unit) → binary fallback.
+    fn object_string_utf16be_with_odd_length_drops_trailing_byte() {
+        // FEFF + 0041 + 00 (truncated last unit). qpdf silently ignores
+        // the trailing odd byte and emits u:A; flpdf matches that.
         let bytes = vec![0xFE, 0xFF, 0x00, 0x41, 0x00];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("b:feff004100".to_string()));
+        assert_eq!(result, JsonValue::String("u:A".to_string()));
     }
 
     #[test]
-    fn object_string_undefined_pdfdoc_byte_falls_back_to_binary() {
-        // 0x00 (NUL) is unassigned in PDFDocEncoding; the whole string falls
-        // through to the binary path. This is the qpdf-equivalent treatment
+    fn object_string_random_md5_emits_hex() {
+        // 16 random bytes (MD5-shaped /ID payload) — well over the 20%
+        // non-ASCII threshold of useHexString(), so qpdf emits b:<hex>.
+        let bytes = vec![
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e,
+        ];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(
+            result,
+            JsonValue::String("b:d41d8cd98f00b204e9800998ecf8427e".to_string())
+        );
+    }
+
+    #[test]
+    fn object_string_single_x1e_forces_hex() {
+        // 0x1E falls in the 0x18..=0x1F range that useHexString counts as
+        // non_ascii; with len=3 the 5*non_ascii > len threshold triggers.
+        let result = pdf_object_to_json(&Object::String(vec![b'A', 0x1E, b'B'])).unwrap();
+        assert_eq!(result, JsonValue::String("b:411e42".to_string()));
+    }
+
+    #[test]
+    fn object_string_del_0x7f_forces_hex() {
+        // 0x7F (DEL) is counted as non_ascii by qpdf.
+        let result = pdf_object_to_json(&Object::String(vec![b'A', 0x7F, b'B'])).unwrap();
+        assert_eq!(result, JsonValue::String("b:417f42".to_string()));
+    }
+
+    #[test]
+    fn object_string_explicit_utf8_bom_decodes() {
+        // EF BB BF + "AB" → u:AB. The BOM is stripped; the remainder is
+        // emitted as a UTF-8 string.
+        let bytes = vec![0xEF, 0xBB, 0xBF, b'A', b'B'];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("u:AB".to_string()));
+    }
+
+    #[test]
+    fn object_string_explicit_utf8_bom_non_ascii() {
+        // EF BB BF + "café" (UTF-8 bytes for café) → u:café.
+        let bytes = vec![0xEF, 0xBB, 0xBF, b'c', b'a', b'f', 0xC3, 0xA9];
+        let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
+        assert_eq!(result, JsonValue::String("u:café".to_string()));
+    }
+
+    #[test]
+    fn object_string_with_nul_falls_back_to_binary() {
+        // 0x00 (NUL) is below 0x20 and not one of the allowed control bytes
+        // (\b \t \n \f \r), so use_hex_string short-circuits to true and the
+        // whole string is emitted as b:<hex> — the qpdf-equivalent treatment
         // for an /ID array element that contains a NUL.
         let bytes = vec![0xab, 0xcd, 0x00, 0xef];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
