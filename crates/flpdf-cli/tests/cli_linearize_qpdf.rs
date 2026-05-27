@@ -625,6 +625,16 @@ fn qpdf_show_linearization_content_lengths(path: &Path) -> Vec<u64> {
         .args(["--show-linearization", path.to_str().unwrap()])
         .output()
         .expect("failed to spawn qpdf --show-linearization");
+    // Without this check a qpdf crash would silently produce an empty Vec, and
+    // the caller would fail at "no content_length entries" — masking the real
+    // qpdf error.  Assert success and surface exit code + stderr first.
+    assert!(
+        out.status.success(),
+        "qpdf --show-linearization failed: exit={:?}, stderr={}, stdout={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout
         .lines()

@@ -1528,12 +1528,17 @@ pub fn write_linearized<R: Read + Seek>(
             po_table.header.bits_page_length_delta = bits_delta_pl;
             po_table.header.least_content_length = least_pl;
             po_table.header.bits_content_length_delta = bits_delta_pl;
-            for (i, &bl) in per_page_byte_lengths.iter().enumerate() {
-                if i < po_table.entries.len() {
-                    let delta = bl.saturating_sub(least_pl);
-                    po_table.entries[i].page_length_minus_least = delta;
-                    po_table.entries[i].content_stream_length = delta;
-                }
+            // `per_page_byte_lengths.len() == page_hints.len() ==
+            // po_table.entries.len()` is enforced by the length check at the
+            // top of this block, so zip is bounds-check-free.
+            for (entry, &bl) in po_table
+                .entries
+                .iter_mut()
+                .zip(per_page_byte_lengths.iter())
+            {
+                let delta = bl.saturating_sub(least_pl);
+                entry.page_length_minus_least = delta;
+                entry.content_stream_length = delta;
             }
         }
 
