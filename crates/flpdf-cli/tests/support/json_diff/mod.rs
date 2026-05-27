@@ -74,9 +74,7 @@ pub struct AllowlistEntry {
     pub fixture: String,
     pub path: String,
     pub category: String,
-    #[allow(dead_code)]
     pub beads_ref: String,
-    #[allow(dead_code)]
     pub reason: String,
 }
 
@@ -255,19 +253,13 @@ pub enum CellStatus {
     /// Subtree present in both, no divergences.
     Pass,
     /// Subtree present, all divergences are in the allowlist.
-    Known {
-        #[allow(dead_code)]
-        divergences: Vec<Divergence>,
-    },
+    Known { divergences: Vec<Divergence> },
     /// Subtree present but at least one divergence is not allowlisted.
     Unknown { divergences: Vec<Divergence> },
     /// Key missing in both qpdf and flpdf output.
     Missing,
     /// Key present in only one side — counted as a divergence.
-    PresentOnOneSide {
-        #[allow(dead_code)]
-        qpdf_present: bool,
-    },
+    PresentOnOneSide { qpdf_present: bool },
 }
 
 pub fn compute_matrix(
@@ -326,6 +318,199 @@ pub fn compute_matrix(
             MatrixCell { key, status }
         })
         .collect()
+}
+
+#[derive(Debug)]
+pub struct FixtureResult {
+    pub fixture: String,
+    pub cells: Vec<MatrixCell>,
+    pub qpdf_error: Option<String>,
+    pub flpdf_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct Report {
+    pub fixtures: Vec<FixtureResult>,
+    pub stale_allowlist: Vec<AllowlistEntry>,
+}
+
+impl Report {
+    /// (pass_or_known_count, present_cell_count)
+    pub fn overall_pass_rate(&self) -> (usize, usize) {
+        let mut pass = 0usize;
+        let mut present = 0usize;
+        for f in &self.fixtures {
+            for c in &f.cells {
+                match &c.status {
+                    CellStatus::Missing => {} // excluded
+                    CellStatus::PresentOnOneSide { .. } => present += 1,
+                    CellStatus::Pass | CellStatus::Known { .. } => {
+                        pass += 1;
+                        present += 1;
+                    }
+                    CellStatus::Unknown { .. } => {
+                        present += 1;
+                    }
+                }
+            }
+        }
+        (pass, present)
+    }
+
+    /// All unknown divergences flattened: (key, fixture, &Divergence).
+    pub fn unknown_divergences(&self) -> Vec<(&'static str, &str, &Divergence)> {
+        let mut out = Vec::new();
+        for f in &self.fixtures {
+            for c in &f.cells {
+                if let CellStatus::Unknown { divergences } = &c.status {
+                    for d in divergences {
+                        out.push((c.key, f.fixture.as_str(), d));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn unknown_summary(&self) -> String {
+        let mut s = String::new();
+        for (key, fixture, d) in self.unknown_divergences() {
+            s.push_str(&format!(
+                "  {fixture}  [{key}]  {}\n    qpdf: {}\n    flpdf: {}\n",
+                d.path, d.qpdf, d.flpdf
+            ));
+        }
+        s
+    }
+
+    pub fn stale_summary(&self) -> String {
+        let mut s = String::new();
+        for e in &self.stale_allowlist {
+            s.push_str(&format!("  {}  {}  {}\n", e.fixture, e.path, e.category));
+        }
+        s
+    }
+
+    pub fn to_markdown(&self) -> String {
+        let keys = top_level_keys();
+        let (pass, present) = self.overall_pass_rate();
+        let pct = if present == 0 {
+            0.0
+        } else {
+            100.0 * pass as f64 / present as f64
+        };
+
+        let mut s = String::new();
+        s.push_str("# qpdf JSON schema-diff report\n\n");
+        s.push_str(&format!(
+            "Overall pass rate: **{}/{}** ({:.1}%) — present cells only\n\n",
+            pass, present, pct
+        ));
+
+        s.push_str("| fixture |");
+        for k in keys {
+            s.push_str(&format!(" {} |", k));
+        }
+        s.push('\n');
+        s.push_str("|---|");
+        for _ in keys {
+            s.push_str("---|");
+        }
+        s.push('\n');
+
+        for f in &self.fixtures {
+            s.push_str(&format!("| `{}` |", f.fixture));
+            let cell_by_key: std::collections::HashMap<&str, &MatrixCell> =
+                f.cells.iter().map(|c| (c.key, c)).collect();
+            for k in keys {
+                let glyph = match cell_by_key.get(k).map(|c| &c.status) {
+                    Some(CellStatus::Pass) => "ok".to_string(),
+                    Some(CellStatus::Known { divergences }) => {
+                        format!("known({})", divergences.len())
+                    }
+                    Some(CellStatus::Unknown { divergences }) => {
+                        format!("FAIL({})", divergences.len())
+                    }
+                    Some(CellStatus::Missing) => "n/a".to_string(),
+                    Some(CellStatus::PresentOnOneSide { qpdf_present: true }) => {
+                        "qonly".to_string()
+                    }
+                    Some(CellStatus::PresentOnOneSide {
+                        qpdf_present: false,
+                    }) => "fonly".to_string(),
+                    None => "?".to_string(),
+                };
+                s.push_str(&format!(" {} |", glyph));
+            }
+            s.push('\n');
+        }
+
+        if !self.unknown_divergences().is_empty() {
+            s.push_str("\n## Unknown divergences\n\n");
+            s.push_str(&self.unknown_summary());
+        }
+
+        if !self.stale_allowlist.is_empty() {
+            s.push_str("\n## Stale allowlist entries\n\n");
+            s.push_str(&self.stale_summary());
+        }
+
+        s
+    }
+
+    pub fn to_json(&self) -> String {
+        let fixtures: Vec<Value> = self
+            .fixtures
+            .iter()
+            .map(|f| {
+                let cells: Vec<Value> = f
+                    .cells
+                    .iter()
+                    .map(|c| {
+                        let (status, divs): (&str, Vec<&Divergence>) = match &c.status {
+                            CellStatus::Pass => ("pass", vec![]),
+                            CellStatus::Known { divergences } => {
+                                ("known", divergences.iter().collect())
+                            }
+                            CellStatus::Unknown { divergences } => {
+                                ("unknown", divergences.iter().collect())
+                            }
+                            CellStatus::Missing => ("missing", vec![]),
+                            CellStatus::PresentOnOneSide { qpdf_present: true } => {
+                                ("qpdf-only", vec![])
+                            }
+                            CellStatus::PresentOnOneSide {
+                                qpdf_present: false,
+                            } => ("flpdf-only", vec![]),
+                        };
+                        let divs_json: Vec<Value> = divs
+                            .iter()
+                            .map(|d| {
+                                serde_json::json!({"path": d.path, "qpdf": d.qpdf, "flpdf": d.flpdf})
+                            })
+                            .collect();
+                        serde_json::json!({"key": c.key, "status": status, "divergences": divs_json})
+                    })
+                    .collect();
+                serde_json::json!({
+                    "fixture": f.fixture,
+                    "qpdf_error": f.qpdf_error,
+                    "flpdf_error": f.flpdf_error,
+                    "cells": cells,
+                })
+            })
+            .collect();
+        let (pass, present) = self.overall_pass_rate();
+        let payload = serde_json::json!({
+            "overall": {"pass_or_known": pass, "present": present},
+            "fixtures": fixtures,
+            "stale_allowlist": self.stale_allowlist.iter().map(|e| serde_json::json!({
+                "fixture": e.fixture, "path": e.path, "category": e.category,
+                "beads_ref": e.beads_ref, "reason": e.reason,
+            })).collect::<Vec<_>>(),
+        });
+        serde_json::to_string_pretty(&payload).unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +823,132 @@ mod tests {
         let v = run_flpdf_json(&path, None).expect("flpdf --json=2 on minimal.pdf");
         assert!(v.is_object());
         assert!(v.as_object().unwrap().contains_key("parameters"));
+    }
+
+    fn dummy_fixture_result(fixture: &str, cells: Vec<MatrixCell>) -> FixtureResult {
+        FixtureResult {
+            fixture: fixture.to_string(),
+            cells,
+            qpdf_error: None,
+            flpdf_error: None,
+        }
+    }
+
+    #[test]
+    fn report_overall_pass_rate_counts_pass_and_known() {
+        let cells_a = vec![
+            MatrixCell {
+                key: "parameters",
+                status: CellStatus::Pass,
+            },
+            MatrixCell {
+                key: "pages",
+                status: CellStatus::Pass,
+            },
+            MatrixCell {
+                key: "outlines",
+                status: CellStatus::Known {
+                    divergences: vec![Divergence {
+                        path: "$.outlines[0].x".into(),
+                        qpdf: json!(1),
+                        flpdf: json!(2),
+                    }],
+                },
+            },
+            MatrixCell {
+                key: "encrypt",
+                status: CellStatus::Missing,
+            },
+        ];
+        let cells_b = vec![
+            MatrixCell {
+                key: "parameters",
+                status: CellStatus::Pass,
+            },
+            MatrixCell {
+                key: "pages",
+                status: CellStatus::Unknown {
+                    divergences: vec![Divergence {
+                        path: "$.pages[0].x".into(),
+                        qpdf: json!(1),
+                        flpdf: json!(2),
+                    }],
+                },
+            },
+            MatrixCell {
+                key: "outlines",
+                status: CellStatus::Pass,
+            },
+            MatrixCell {
+                key: "encrypt",
+                status: CellStatus::Missing,
+            },
+        ];
+        let report = Report {
+            fixtures: vec![
+                dummy_fixture_result("a.pdf", cells_a),
+                dummy_fixture_result("b.pdf", cells_b),
+            ],
+            stale_allowlist: vec![],
+        };
+        // present cells: a has 3 (params Pass, pages Pass, outlines Known), b has 3
+        // (params Pass, pages Unknown, outlines Pass). Total present = 6.
+        // pass-or-known: 3 (a) + 2 (b) = 5. Expected 5/6.
+        assert_eq!(report.overall_pass_rate(), (5, 6));
+    }
+
+    #[test]
+    fn report_unknown_divergences_collected() {
+        let cells = vec![MatrixCell {
+            key: "pages",
+            status: CellStatus::Unknown {
+                divergences: vec![Divergence {
+                    path: "$.pages[0].x".into(),
+                    qpdf: json!(1),
+                    flpdf: json!(2),
+                }],
+            },
+        }];
+        let report = Report {
+            fixtures: vec![dummy_fixture_result("a.pdf", cells)],
+            stale_allowlist: vec![],
+        };
+        let unknown = report.unknown_divergences();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].1, "a.pdf");
+        assert_eq!(unknown[0].2.path, "$.pages[0].x");
+    }
+
+    #[test]
+    fn report_markdown_includes_matrix_header() {
+        let report = Report {
+            fixtures: vec![],
+            stale_allowlist: vec![],
+        };
+        let md = report.to_markdown();
+        assert!(md.contains("| fixture"));
+        for key in top_level_keys() {
+            assert!(md.contains(key), "markdown missing header column '{key}'");
+        }
+    }
+
+    #[test]
+    fn report_json_round_trips() {
+        let report = Report {
+            fixtures: vec![dummy_fixture_result(
+                "a.pdf",
+                vec![MatrixCell {
+                    key: "parameters",
+                    status: CellStatus::Pass,
+                }],
+            )],
+            stale_allowlist: vec![],
+        };
+        let s = report.to_json();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["fixtures"][0]["fixture"], "a.pdf");
+        assert_eq!(v["fixtures"][0]["cells"][0]["key"], "parameters");
+        assert_eq!(v["fixtures"][0]["cells"][0]["status"], "pass");
     }
 
     #[test]
