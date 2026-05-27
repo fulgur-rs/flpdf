@@ -348,23 +348,27 @@ impl PageOffsetHintTable {
         // does NOT appear in the hint stream header per Annex F.3.1.  It is
         // stored separately in `LinearizedOffsets.first_page_object_new_num`.
         //
-        // items 5 / bits_page_length_delta and 7 / bits_content_offset_delta
-        // and 9 / bits_content_length_delta: since all page_length and content
-        // values are 0 (placeholder) at this stage, the deltas are 0 and
-        // bits = 0.  The back-patcher will update the least_* fields and
-        // per-page entries; the encoder must re-derive bit widths at encode
-        // time using the final values.
+        // items 5 / bits_page_length_delta and 9 / bits_content_length_delta:
+        // since all page_length and content values are 0 (placeholder) at this
+        // stage, the deltas are 0 and bits = 0.  The writer's back-patch pass
+        // updates the least_* fields, the bit-width fields, and the per-page
+        // entries together.
+        //
+        // items 6 / least_content_offset and 7 / bits_content_offset_delta
+        // remain 0 in the final stream too — qpdf does not compute real
+        // content-stream offsets (see writer.rs / Adobe implementation note
+        // 127).
         // ------------------------------------------------------------------
         let header = PageOffsetHeader {
             least_object_count,
-            location_of_first_page: 0, // placeholder — back-patched by sub-task 2.9
+            location_of_first_page: 0, // placeholder — back-patched by writer
             bits_object_count_delta: bits_needed(object_count_delta),
-            least_page_length: 0, // placeholder — back-patched by sub-task 2.9
-            bits_page_length_delta: 0, // placeholder — re-derived by encoder after back-patch
-            least_content_offset: 0, // placeholder — back-patched by sub-task 2.9
-            bits_content_offset_delta: 0, // placeholder — re-derived by encoder after back-patch
-            least_content_length: 0, // placeholder — back-patched by sub-task 2.9
-            bits_content_length_delta: 0, // placeholder — re-derived by encoder after back-patch
+            least_page_length: 0,         // placeholder — back-patched by writer
+            bits_page_length_delta: 0,    // placeholder — back-patched by writer
+            least_content_offset: 0,      // qpdf-equivalent: always 0 in final output
+            bits_content_offset_delta: 0, // qpdf-equivalent: always 0 in final output
+            least_content_length: 0,      // placeholder — back-patched by writer
+            bits_content_length_delta: 0, // placeholder — back-patched by writer
             bits_shared_object_count: bits_needed(greatest_shared_count as u64),
             bits_shared_object_id: bits_needed(greatest_shared_id),
             bits_numerator: 0, // numerators are all 0 (qpdf default), so 0 bits needed

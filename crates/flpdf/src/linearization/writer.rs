@@ -1512,14 +1512,27 @@ pub fn write_linearized<R: Read + Seek>(
         po_table.header.location_of_first_page = hint_stream_offset as u64;
 
         // Page length fields.
+        //
+        // Content-stream fields (items 6-9 of header, items 6-7 of each per-page
+        // entry) follow qpdf's heuristic from QPDF_linearization.cc:1786-1808:
+        // since the page objects are not interleaved with the content stream,
+        // qpdf reuses the page-length values for the content-length fields and
+        // leaves the content-offset fields at 0 (matching Adobe implementation
+        // note 127).  Mirroring this gives readers a usable initial-rendering
+        // hint and keeps us on the path toward bytes-identical hint streams.
         if !per_page_byte_lengths.is_empty() {
             let least_pl = per_page_byte_lengths.iter().copied().min().unwrap_or(0);
             let max_pl = per_page_byte_lengths.iter().copied().max().unwrap_or(0);
+            let bits_delta_pl = bits_needed(max_pl.saturating_sub(least_pl));
             po_table.header.least_page_length = least_pl;
-            po_table.header.bits_page_length_delta = bits_needed(max_pl.saturating_sub(least_pl));
+            po_table.header.bits_page_length_delta = bits_delta_pl;
+            po_table.header.least_content_length = least_pl;
+            po_table.header.bits_content_length_delta = bits_delta_pl;
             for (i, &bl) in per_page_byte_lengths.iter().enumerate() {
                 if i < po_table.entries.len() {
-                    po_table.entries[i].page_length_minus_least = bl.saturating_sub(least_pl);
+                    let delta = bl.saturating_sub(least_pl);
+                    po_table.entries[i].page_length_minus_least = delta;
+                    po_table.entries[i].content_stream_length = delta;
                 }
             }
         }
