@@ -112,7 +112,7 @@ Signature preservation and history-preserving edits belong to the future `Increm
 
 Supported on the read path:
 
-- Standard handler `/V=1, R=2` (RC4-40), `/V=2, R=3` (RC4-128), `/V=4, R=4` (AESv2 / RC4 via `/CF`), and `/V=5, R=5`/`R=6` (AES-256). RC4-backed handlers require the `--allow-weak-crypto` opt-in.
+- Standard handler `/V=1, R=2` (RC4-40), `/V=2, R=3` (RC4-128), `/V=4, R=4` (AESv2 / RC4 via `/CF`), and `/V=5, R=5`/`R=6` (AES-256). RC4-backed handlers (`/V=1, R=2`, `/V=2, R=3`, `/V=4, R=4` when its `/CF` selects RC4) **and** the deprecated pre-ISO 32000-2 `/V=5, R=5` AES-256 handler require the `--allow-weak-crypto` opt-in; the modern `/V=5, R=6` does not.
 - User and owner password authentication, including the qpdf-compatible `--password-is-hex-key` mode (precomputed file key in hex, bypassing Algorithm 2 / 2.A / 2.B / 6 / 7 derivation).
 - Authenticated `/Encrypt` parameters surfaced via the `EncryptionInfo` snapshot (`/V`, `/R`, `/Length`, `/Filter`, `/P`, `/EncryptMetadata`, per-CF method names) for the `show-encryption` / `is-encrypted` / `requires-password` / `show-encryption-key` inspection subcommands.
 - Stream- and string-level decryption applied lazily through the cache, so callers see plaintext object content regardless of crypt filter selection.
@@ -123,7 +123,7 @@ Public library surface:
 - `Pdf::is_encrypted`, `Pdf::encryption_info`, `Pdf::permissions`, `Pdf::user_password_matched`, `Pdf::owner_password_matched`, `Pdf::uses_weak_crypto`, `Pdf::encryption_file_key`.
 - `flpdf::Error::Encrypted(EncryptedError)` with `BadPassword`, `UnsupportedHandler { filter, v, r, cfm }`, `Malformed { reason }`, and `WeakCryptoNotAllowed` variants. Diagnostics use stable `[encrypted.*]` keys (`encrypted.bad-password`, `encrypted.unsupported-handler`, `encrypted.malformed`, `encrypted.weak-crypto-not-allowed`).
 
-Until write-side re-encryption ships, the rewrite writer drops `/Encrypt` from the output trailer: encrypted input that authenticated at open time is therefore decrypted-then-rewritten as plaintext, matching the behavior of `qpdf --decrypt`. Authentication failures (`Error::Encrypted(BadPassword)`) surface at `Pdf::open_with_options` time, not from the writer. The opt-in `--remove-restrictions` flag is the explicit spelling of this default and additionally clears advisory permission state (`/P`, `/U`, `/O`) when only a stripped copy is desired.
+Until write-side re-encryption ships, the rewrite writer drops `/Encrypt` from the output trailer: encrypted input that authenticated at open time is therefore decrypted-then-rewritten as plaintext, matching the behavior of `qpdf --decrypt`. Authentication failures (`Error::Encrypted(EncryptedError::BadPassword)`) surface at `Pdf::open_with_options` time, not from the writer. The opt-in `--remove-restrictions` flag is the explicit spelling of this default and additionally clears advisory permission state (`/P`, `/U`, `/O`) when only a stripped copy is desired.
 
 Deferred (tracked separately):
 
