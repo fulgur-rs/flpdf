@@ -1294,15 +1294,14 @@ fn explicit_crypt_mode(
 }
 
 fn stream_has_explicit_crypt_filter(dict: &Dictionary) -> bool {
-    match dict.get("Filter") {
-        Some(filter) if filter.as_name() == Some(b"Crypt".as_slice()) => true,
-        Some(filter) => filter.as_array().is_some_and(|filters| {
-            filters
-                .iter()
-                .any(|filter| filter.as_name() == Some(b"Crypt".as_slice()))
-        }),
-        None => false,
-    }
+    dict.get("Filter").is_some_and(|filter| {
+        filter.as_name() == Some(b"Crypt".as_slice())
+            || filter.as_array().is_some_and(|filters| {
+                filters
+                    .iter()
+                    .any(|filter| filter.as_name() == Some(b"Crypt".as_slice()))
+            })
+    })
 }
 
 fn is_metadata_stream(dict: &Dictionary) -> bool {
@@ -1637,19 +1636,13 @@ fn r5_or_r6_mode_for_selector(
 }
 
 fn crypt_filter_selector(encrypt: &Dictionary, key: &str) -> Result<Option<String>> {
-    match encrypt.get(key) {
-        None => Ok(None),
-        Some(value) => value
-            .as_name()
-            .map(|name| String::from_utf8_lossy(name).to_string())
-            .map(Some)
-            .ok_or_else(|| {
-                EncryptedError::Malformed {
-                    reason: format!("/{key} entry is not a name"),
-                }
-                .into()
-            }),
-    }
+    let Some(value) = encrypt.get(key) else {
+        return Ok(None);
+    };
+    let name = value.as_name().ok_or_else(|| EncryptedError::Malformed {
+        reason: format!("/{key} entry is not a name"),
+    })?;
+    Ok(Some(String::from_utf8_lossy(name).into_owned()))
 }
 
 fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Option<String>> {
@@ -1665,19 +1658,13 @@ fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Opti
         }
         .into());
     };
-    match filter.get("CFM") {
-        None => Ok(None),
-        Some(value) => value
-            .as_name()
-            .map(|cfm| String::from_utf8_lossy(cfm).to_string())
-            .map(Some)
-            .ok_or_else(|| {
-                EncryptedError::Malformed {
-                    reason: format!("/CF/{name}/CFM entry is not a name"),
-                }
-                .into()
-            }),
-    }
+    let Some(value) = filter.get("CFM") else {
+        return Ok(None);
+    };
+    let cfm = value.as_name().ok_or_else(|| EncryptedError::Malformed {
+        reason: format!("/CF/{name}/CFM entry is not a name"),
+    })?;
+    Ok(Some(String::from_utf8_lossy(cfm).into_owned()))
 }
 
 fn crypt_filter_modes(
