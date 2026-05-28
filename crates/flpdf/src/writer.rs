@@ -3292,10 +3292,13 @@ mod tests {
     fn static_aes_iv_forces_all_zero_ivs_for_streams_and_strings() {
         use std::io::Cursor;
 
-        let minimal_pdf = include_bytes!("../../../tests/fixtures/minimal.pdf");
-        let input = minimal_pdf.to_vec();
+        // build_partition_fixture has a real content stream (obj 4 = b"hello"),
+        // so encryption actually exercises AES stream IV generation. minimal.pdf
+        // has no streams and no encryptable strings, so it would never emit an
+        // IV and the zero-IV assertion below would be vacuous.
+        let fixture = build_partition_fixture();
 
-        let mut pdf = Pdf::open(Cursor::new(input)).expect("open minimal.pdf");
+        let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
         let mut out = Vec::new();
         let options = WriteOptions {
             full_rewrite: true,
@@ -3311,15 +3314,40 @@ mod tests {
 
         // The output must be deterministic: running again with the same options
         // must produce byte-identical bytes.
-        let mut pdf2 = Pdf::open(Cursor::new(
-            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
-        ))
-        .unwrap();
+        let mut pdf2 = Pdf::open(Cursor::new(fixture.clone())).unwrap();
         let mut out2 = Vec::new();
         write_pdf_with_options(&mut pdf2, &mut out2, &options).expect("encrypted write 2");
         assert_eq!(
             out, out2,
             "static_id + static_aes_iv must produce byte-identical output on two runs"
+        );
+
+        // Substantive check (the property the test name claims): each AES-CBC
+        // stream stores its 16-byte IV as the first bytes of the stream payload
+        // (PDF 1.7 §7.6.2). The full-rewrite writer serialises every stream as
+        // `>>\nstream\n<payload>` (see `Object` serialisation), so the bytes
+        // immediately following a `\nstream\n` delimiter are the IV. The
+        // `\nendstream\n` terminator cannot alias this needle — the byte before
+        // `stream` there is `d`, not `\n`. The encrypted path forces a classic
+        // xref *table* and disables ObjStm, so every stream in the output is an
+        // AES-encrypted content/metadata stream whose IV must be all-zero.
+        const NEEDLE: &[u8] = b"\nstream\n";
+        let mut checked = 0usize;
+        let mut pos = 0usize;
+        while let Some(rel) = out[pos..].windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+            let payload = pos + rel + NEEDLE.len();
+            let iv = &out[payload..payload + 16];
+            assert_eq!(
+                iv,
+                &[0u8; 16],
+                "static_aes_iv: stream payload at byte {payload} must begin with a zero AES IV, got {iv:02x?}"
+            );
+            checked += 1;
+            pos = payload;
+        }
+        assert!(
+            checked > 0,
+            "expected at least one encrypted stream to verify the static IV against"
         );
     }
 
