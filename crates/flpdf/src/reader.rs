@@ -794,7 +794,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn linearized_hint_ref(&mut self) -> Result<Option<ObjectRef>> {
         let candidate = ObjectRef::new(1, 0);
         let object = self.resolve(candidate)?;
-        let Object::Dictionary(dict) = object else {
+        let Some(dict) = object.into_dict() else {
             return Ok(None);
         };
 
@@ -944,7 +944,7 @@ impl<R: Read + Seek> Pdf<R> {
             Some(CacheEntry::Reserved) => return Ok(Object::Null),
         };
 
-        let Object::Stream(stream_object) = stream_object else {
+        let Some(stream_object) = stream_object.into_stream() else {
             return Ok(Object::Null);
         };
 
@@ -1008,7 +1008,7 @@ impl<R: Read + Seek> Pdf<R> {
         target_index: u32,
     ) -> Result<(ObjectRef, u32)> {
         let stream_object = self.resolve(stream_ref)?;
-        let Object::Stream(stream_object) = stream_object else {
+        let Some(stream_object) = stream_object.into_stream() else {
             return Err(Error::parse(0, "compressed parent is not an object stream"));
         };
         let (parent_ref, parent_index, _) =
@@ -1062,7 +1062,7 @@ impl<R: Read + Seek> Pdf<R> {
 
         if let Some(parent_ref) = stream_object.dict.get_ref("Extends") {
             let parent_object = self.resolve(parent_ref)?;
-            let Object::Stream(parent_stream) = parent_object else {
+            let Some(parent_stream) = parent_object.into_stream() else {
                 return Err(Error::parse(0, "object stream /Extends is not a stream"));
             };
             self.collect_object_stream_chain(parent_ref, &parent_stream, streams, seen)?;

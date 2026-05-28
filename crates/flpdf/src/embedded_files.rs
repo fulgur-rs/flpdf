@@ -188,7 +188,7 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
     filespec_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     let fs_obj = pdf.resolve(filespec_ref)?;
-    let Object::Dictionary(fs_dict) = fs_obj else {
+    let Some(fs_dict) = fs_obj.into_dict() else {
         return Ok(None);
     };
     let ef_dict: Dictionary = match fs_dict.get("EF") {
@@ -203,8 +203,8 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
         _ => return Ok(None),
     };
     for key in &["UF", "F", "Unix", "Mac", "DOS"] {
-        if let Some(Object::Reference(r)) = ef_dict.get(key) {
-            return Ok(Some(*r));
+        if let Some(r) = ef_dict.get(key).and_then(Object::as_ref_id) {
+            return Ok(Some(r));
         }
     }
     Ok(None)
@@ -266,7 +266,7 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     target_ref: ObjectRef,
 ) -> Result<()> {
     let obj = pdf.resolve(dict_ref)?;
-    let Object::Dictionary(mut dict) = obj else {
+    let Some(mut dict) = obj.into_dict() else {
         return Ok(());
     };
 
@@ -392,7 +392,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         None => return Ok(vec![]),
     };
     let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog_obj else {
+    let Some(catalog) = catalog_obj.into_dict() else {
         return Ok(vec![]);
     };
 
@@ -451,7 +451,7 @@ fn collect_name_tree<R: Read + Seek>(
     }
 
     let node_obj = pdf.resolve(node_ref)?;
-    let Object::Dictionary(node) = node_obj else {
+    let Some(node) = node_obj.into_dict() else {
         // Malformed node — skip.
         return Ok(());
     };
@@ -468,19 +468,17 @@ fn collect_name_tree_dict<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<()> {
     // Leaf node: /Names holds [(key, val), ...] pairs as a flat array.
-    if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
-        collect_leaf_pairs(pairs, out);
+    if let Some(pairs) = node.get("Names").and_then(Object::as_array) {
+        collect_leaf_pairs(pairs.to_vec(), out);
         return Ok(());
     }
 
     // Intermediate node: /Kids holds [node_ref, ...].
-    if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
-        for kid in &kids {
-            if let Object::Reference(child_ref) = kid {
-                collect_name_tree(pdf, *child_ref, out, visited, depth + 1, max_depth)?;
-            }
-            // Non-reference kids are skipped (malformed tree).
+    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
+        for child_ref in kids.iter().filter_map(Object::as_ref_id) {
+            collect_name_tree(pdf, child_ref, out, visited, depth + 1, max_depth)?;
         }
+        // Non-reference kids are skipped (malformed tree).
     }
     // A node with neither /Names nor /Kids is treated as empty.
 
@@ -593,15 +591,13 @@ fn collect_name_tree_dict_raw<R: Read + Seek>(
     depth: usize,
     max_depth: usize,
 ) -> Result<()> {
-    if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
-        collect_leaf_pairs_raw(pairs, out);
+    if let Some(pairs) = node.get("Names").and_then(Object::as_array) {
+        collect_leaf_pairs_raw(pairs.to_vec(), out);
         return Ok(());
     }
-    if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
-        for kid in &kids {
-            if let Object::Reference(child_ref) = kid {
-                collect_name_tree_raw(pdf, *child_ref, out, visited, depth + 1, max_depth)?;
-            }
+    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
+        for child_ref in kids.iter().filter_map(Object::as_ref_id) {
+            collect_name_tree_raw(pdf, child_ref, out, visited, depth + 1, max_depth)?;
         }
     }
     Ok(())
@@ -713,7 +709,7 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
         None => return Ok(()),
     };
     let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(mut catalog) = catalog_obj else {
+    let Some(mut catalog) = catalog_obj.into_dict() else {
         return Ok(());
     };
 
@@ -1151,13 +1147,13 @@ mod tests {
         else {
             panic!("expected page dict");
         };
-        if let Some(Object::Reference(r)) = page_after.get("AF") {
+        if let Some(r) = page_after.get("AF").and_then(Object::as_ref_id) {
             assert_eq!(
-                *r, af_array_ref,
+                r, af_array_ref,
                 "page /AF must still point at the surviving shared array"
             );
             assert!(
-                pdf.resolve(*r).is_ok(),
+                pdf.resolve(r).is_ok(),
                 "page /AF reference must resolve (not dangling)"
             );
         }
@@ -1511,7 +1507,7 @@ mod tests {
         // Add /AF to catalog pointing at fs_ref.
         let catalog_ref = pdf.root_ref().expect("root");
         let catalog_obj = pdf.resolve(catalog_ref).expect("resolve catalog");
-        let Object::Dictionary(mut catalog) = catalog_obj else {
+        let Some(mut catalog) = catalog_obj.into_dict() else {
             panic!("expected catalog dict");
         };
         catalog.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
@@ -1522,7 +1518,7 @@ mod tests {
         assert_eq!(page_refs.len(), 1, "fixture has one page");
         let page_ref = page_refs[0];
         let page_obj = pdf.resolve(page_ref).expect("resolve page");
-        let Object::Dictionary(mut page_dict) = page_obj else {
+        let Some(mut page_dict) = page_obj.into_dict() else {
             panic!("expected page dict");
         };
         page_dict.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
@@ -1534,7 +1530,7 @@ mod tests {
 
         // /AF on catalog must be gone.
         let catalog_obj2 = pdf.resolve(catalog_ref).expect("resolve catalog after");
-        let Object::Dictionary(catalog2) = catalog_obj2 else {
+        let Some(catalog2) = catalog_obj2.into_dict() else {
             panic!("expected catalog dict");
         };
         assert!(
@@ -1544,7 +1540,7 @@ mod tests {
 
         // /AF on page must be gone.
         let page_obj2 = pdf.resolve(page_ref).expect("resolve page after");
-        let Object::Dictionary(page_dict2) = page_obj2 else {
+        let Some(page_dict2) = page_obj2.into_dict() else {
             panic!("expected page dict");
         };
         assert!(

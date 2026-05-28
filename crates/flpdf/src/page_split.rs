@@ -124,7 +124,7 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
     // Resolve the /Pages root ref from the catalog so we can mutate it per chunk.
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
     let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog_dict) = catalog_obj else {
+    let Some(catalog_dict) = catalog_obj.into_dict() else {
         return Err(Error::Unsupported(
             "document catalog is not a dictionary".to_string(),
         ));
@@ -334,7 +334,7 @@ fn write_chunk(
 
     // Read the current /Pages root dictionary.
     let pages_obj = pdf.resolve(pages_root_ref)?;
-    let Object::Dictionary(mut pages_dict) = pages_obj else {
+    let Some(mut pages_dict) = pages_obj.into_dict() else {
         return Err(Error::Unsupported(
             "document /Pages root is not a dictionary".to_string(),
         ));
@@ -352,7 +352,7 @@ fn write_chunk(
     // Reparent each chunk page to the (sole) /Pages root.
     for &page_ref in chunk_refs {
         let page_obj = pdf.resolve(page_ref)?;
-        if let Object::Dictionary(mut page_dict) = page_obj {
+        if let Some(mut page_dict) = page_obj.into_dict() {
             // Update /Parent to point to the /Pages root (may already be correct
             // for flat page trees, but flatten inherited trees here).
             page_dict.insert("Parent", Object::Reference(pages_root_ref));

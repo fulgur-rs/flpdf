@@ -335,7 +335,7 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
 
         for &category in RESOURCE_CATEGORIES {
             let cat_key = category.as_bytes();
-            if let Some(Object::Reference(cat_ref)) = res_dict.get(category).cloned() {
+            if let Some(cat_ref) = res_dict.get(category).and_then(Object::as_ref_id) {
                 let key: CatRefKey = (cat_key.to_vec(), cat_ref);
 
                 let seen = cat_ref_seen_groups.entry(key.clone()).or_default();
@@ -413,7 +413,7 @@ fn resources_location<R: Read + Seek>(
         depth += 1;
 
         let node_obj = pdf.resolve(current)?;
-        let Object::Dictionary(dict) = node_obj else {
+        let Some(dict) = node_obj.into_dict() else {
             return Ok(ResourcesLoc::None);
         };
 
@@ -505,7 +505,7 @@ fn collect_from_stream<R: Read + Seek>(
                 // /CS operand in an inline image may reference /ColorSpace.
                 // Abbreviated key is /CS (ISO 32000-1 Table 93).
                 let cs_val = dict.get("CS").or_else(|| dict.get("ColorSpace")).cloned();
-                if let Some(Object::Name(name)) = cs_val {
+                if let Some(name) = cs_val.and_then(Object::into_name) {
                     if !is_builtin_inline_image_cs(&name) {
                         used.entry(b"ColorSpace".to_vec()).or_default().insert(name);
                     }
@@ -531,10 +531,10 @@ fn process_operator<R: Read + Seek>(
     match operator {
         // /XObject — `name Do`
         b"Do" => {
-            if let Some(Object::Name(name)) = operands.first() {
+            if let Some(name) = operands.first().and_then(Object::as_name) {
                 used.entry(b"XObject".to_vec())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(name.to_vec());
 
                 // Recurse into Form XObjects.
                 recurse_form_xobject(pdf, name, resources, used, visited, depth)?;
@@ -543,48 +543,48 @@ fn process_operator<R: Read + Seek>(
 
         // /Font — `name size Tf`
         b"Tf" => {
-            if let Some(Object::Name(name)) = operands.first() {
+            if let Some(name) = operands.first().and_then(Object::as_name) {
                 used.entry(b"Font".to_vec())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(name.to_vec());
             }
         }
 
         // /ExtGState — `name gs`
         b"gs" => {
-            if let Some(Object::Name(name)) = operands.first() {
+            if let Some(name) = operands.first().and_then(Object::as_name) {
                 used.entry(b"ExtGState".to_vec())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(name.to_vec());
             }
         }
 
         // /ColorSpace — `name cs` (non-stroking) / `name CS` (stroking)
         b"cs" | b"CS" => {
-            if let Some(Object::Name(name)) = operands.first() {
+            if let Some(name) = operands.first().and_then(Object::as_name) {
                 if !is_builtin_color_space_cs_op(name) {
                     used.entry(b"ColorSpace".to_vec())
                         .or_default()
-                        .insert(name.clone());
+                        .insert(name.to_vec());
                 }
             }
         }
 
         // /Pattern — `scn` / `SCN`: last operand may be a Name (pattern name).
         b"scn" | b"SCN" => {
-            if let Some(Object::Name(name)) = operands.last() {
+            if let Some(name) = operands.last().and_then(Object::as_name) {
                 used.entry(b"Pattern".to_vec())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(name.to_vec());
             }
         }
 
         // /Shading — `name sh`
         b"sh" => {
-            if let Some(Object::Name(name)) = operands.first() {
+            if let Some(name) = operands.first().and_then(Object::as_name) {
                 used.entry(b"Shading".to_vec())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(name.to_vec());
             }
         }
 
@@ -592,10 +592,10 @@ fn process_operator<R: Read + Seek>(
         // Operand index 1 is the property list: a Name → /Properties ref, or
         // a direct dict << … >> (not a /Properties ref; skip).
         b"BDC" | b"DP" => {
-            if let Some(Object::Name(name)) = operands.get(1) {
+            if let Some(name) = operands.get(1).and_then(Object::as_name) {
                 used.entry(b"Properties".to_vec())
                     .or_default()
-                    .insert(name.clone());
+                    .insert(name.to_vec());
             }
         }
 
@@ -773,7 +773,7 @@ fn prune_resources_object<R: Read + Seek>(
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     let obj = pdf.resolve(res_ref)?;
-    let Object::Dictionary(mut res_dict) = obj else {
+    let Some(mut res_dict) = obj.into_dict() else {
         return Ok(()); // not a dict — nothing to prune
     };
 
@@ -792,7 +792,7 @@ fn prune_inline_resources<R: Read + Seek>(
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     let page_obj = pdf.resolve(page_ref)?;
-    let Object::Dictionary(mut page_dict) = page_obj else {
+    let Some(mut page_dict) = page_obj.into_dict() else {
         return Err(Error::Unsupported(format!(
             "page {page_ref} resolved to non-dictionary"
         )));
@@ -824,7 +824,7 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
     let ancestor_obj = pdf.resolve(ancestor_ref)?;
-    let Object::Dictionary(mut ancestor_dict) = ancestor_obj else {
+    let Some(mut ancestor_dict) = ancestor_obj.into_dict() else {
         return Ok(()); // not a dict — nothing to prune
     };
 
@@ -920,7 +920,7 @@ fn apply_pruning<R: Read + Seek>(
                     // Yes (or Auto with group_count == 1): prune using the
                     // global union, not just the per-group `used`.
                     let resolved = pdf.resolve(cat_ref)?;
-                    let Object::Dictionary(mut cat_dict) = resolved else {
+                    let Some(mut cat_dict) = resolved.into_dict() else {
                         continue; // not a dict — skip safely
                     };
 
@@ -951,7 +951,7 @@ fn apply_pruning<R: Read + Seek>(
                     // to the legacy per-group path which leaves the dict untouched
                     // when used_names is empty — a safe conservative choice.
                     let resolved = pdf.resolve(cat_ref)?;
-                    let Object::Dictionary(mut cat_dict) = resolved else {
+                    let Some(mut cat_dict) = resolved.into_dict() else {
                         continue;
                     };
 

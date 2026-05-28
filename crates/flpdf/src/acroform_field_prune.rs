@@ -126,7 +126,7 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     };
 
     let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog_obj else {
+    let Some(catalog) = catalog_obj.into_dict() else {
         return Ok(());
     };
 
@@ -216,7 +216,7 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         // All fields dropped → remove /AcroForm from catalog entirely,
         // matching qpdf's observed behaviour.
         let catalog_obj2 = pdf.resolve(catalog_ref)?;
-        if let Object::Dictionary(mut cat) = catalog_obj2 {
+        if let Some(mut cat) = catalog_obj2.into_dict() {
             cat.remove("AcroForm");
             pdf.set_object(catalog_ref, Object::Dictionary(cat));
         }
@@ -234,7 +234,7 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
                 // /AcroForm was a direct dictionary on the catalog — write it
                 // back into the catalog.
                 let catalog_obj2 = pdf.resolve(catalog_ref)?;
-                if let Object::Dictionary(mut cat) = catalog_obj2 {
+                if let Some(mut cat) = catalog_obj2.into_dict() {
                     cat.insert("AcroForm", Object::Dictionary(new_acroform));
                     pdf.set_object(catalog_ref, Object::Dictionary(cat));
                 }
@@ -260,7 +260,7 @@ fn collect_page_widgets<R: Read + Seek>(
     widget_to_page: &mut BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
     let page_obj = pdf.resolve(page_ref)?;
-    let Object::Dictionary(page_dict) = page_obj else {
+    let Some(page_dict) = page_obj.into_dict() else {
         return Ok(());
     };
 
@@ -285,7 +285,7 @@ fn collect_page_widgets<R: Read + Seek>(
         };
 
         let annot_obj = pdf.resolve(annot_ref)?;
-        let Object::Dictionary(annot_dict) = annot_obj else {
+        let Some(annot_dict) = annot_obj.into_dict() else {
             continue;
         };
 
@@ -336,7 +336,7 @@ fn field_has_retained_widget<R: Read + Seek>(
     }
 
     let field_obj = pdf.resolve(field_ref)?;
-    let Object::Dictionary(field_dict) = field_obj else {
+    let Some(field_dict) = field_obj.into_dict() else {
         return Ok(false);
     };
 
@@ -385,7 +385,7 @@ fn update_widget_page_ref<R: Read + Seek>(
     new_page_ref: ObjectRef,
 ) -> Result<()> {
     let widget_obj = pdf.resolve(widget_ref)?;
-    if let Object::Dictionary(mut dict) = widget_obj {
+    if let Some(mut dict) = widget_obj.into_dict() {
         dict.insert("P", Object::Reference(new_page_ref));
         pdf.set_object(widget_ref, Object::Dictionary(dict));
     }
@@ -417,7 +417,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     }
 
     let field_obj = pdf.resolve(field_ref)?;
-    let Object::Dictionary(field_dict) = field_obj else {
+    let Some(field_dict) = field_obj.into_dict() else {
         return Ok(());
     };
 
@@ -451,7 +451,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
 
         // Resolve the kid to check if it is a widget dict.
         let kid_obj = pdf.resolve(kid_ref)?;
-        let Object::Dictionary(kid_dict) = kid_obj else {
+        let Some(kid_dict) = kid_obj.into_dict() else {
             continue;
         };
 
@@ -464,7 +464,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
             if !widget_to_page.contains_key(&kid_ref) {
                 // Widget on a dropped page — remove stale /P.
                 let kid_obj2 = pdf.resolve(kid_ref)?;
-                if let Object::Dictionary(mut d) = kid_obj2 {
+                if let Some(mut d) = kid_obj2.into_dict() {
                     d.remove("P");
                     pdf.set_object(kid_ref, Object::Dictionary(d));
                 }
@@ -651,13 +651,7 @@ mod tests {
             _ => return vec![],
         };
         match acro_dict.get("Fields").cloned() {
-            Some(Object::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| match v {
-                    Object::Reference(r) => Some(*r),
-                    _ => None,
-                })
-                .collect(),
+            Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
             _ => vec![],
         }
     }

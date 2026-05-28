@@ -489,7 +489,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
 
             let node_obj = self.pdf.resolve(current)?;
-            let Object::Dictionary(dict) = node_obj else {
+            let Some(dict) = node_obj.into_dict() else {
                 return Err(Error::Unsupported(format!(
                     "field tree node {current} is not a dictionary"
                 )));
@@ -536,7 +536,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
 
             let node_obj = self.pdf.resolve(current)?;
-            let Object::Dictionary(dict) = node_obj else {
+            let Some(dict) = node_obj.into_dict() else {
                 return Err(Error::Unsupported(format!(
                     "field tree node {current} is not a dictionary"
                 )));
@@ -581,7 +581,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
 
             let node_obj = self.pdf.resolve(current)?;
-            let Object::Dictionary(dict) = node_obj else {
+            let Some(dict) = node_obj.into_dict() else {
                 return Err(Error::Unsupported(format!(
                     "field tree node {current} is not a dictionary"
                 )));

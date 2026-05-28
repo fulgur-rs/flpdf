@@ -746,7 +746,7 @@ fn collect_image_refs<R: Read + Seek>(
             _ => continue,
         };
         let resolved = pdf.resolve(xobj_ref).map_err(ConvertError::from)?;
-        if let Object::Stream(stream) = &resolved {
+        if let Some(stream) = resolved.as_stream() {
             if let Some(Object::Name(subtype)) = stream.dict.get("Subtype") {
                 if subtype.as_slice() == b"Image" {
                     image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
@@ -892,8 +892,8 @@ fn walk_pagelabels<R: Read + Seek>(
     };
 
     // /Nums takes priority over /Kids (spec §7.9.7 leaf vs. intermediate).
-    if let Some(Object::Array(nums)) = dict.get("Nums") {
-        let nums = nums.clone();
+    if let Some(nums) = dict.get("Nums").and_then(Object::as_array) {
+        let nums = nums.to_vec();
         let mut iter = nums.into_iter();
         while let (Some(idx_obj), Some(label_obj)) = (iter.next(), iter.next()) {
             let idx = match idx_obj {
@@ -915,8 +915,8 @@ fn walk_pagelabels<R: Read + Seek>(
     }
 
     // No /Nums — try /Kids (intermediate node).
-    if let Some(Object::Array(kids)) = dict.get("Kids") {
-        let kids = kids.clone();
+    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
+        let kids = kids.to_vec();
         for kid in kids {
             let kid_ref = match kid {
                 Object::Reference(r) => r,
@@ -1737,8 +1737,8 @@ fn walk_embedded_files_name_tree<R: Read + Seek>(
     };
 
     // /Names: leaf node with [name1 value1 name2 value2 ...] pairs
-    if let Some(Object::Array(names)) = dict.get("Names") {
-        let names = names.clone();
+    if let Some(names) = dict.get("Names").and_then(Object::as_array) {
+        let names = names.to_vec();
         let mut iter = names.into_iter();
         while let (Some(name_obj), Some(value_obj)) = (iter.next(), iter.next()) {
             // name is a PDF string (text or byte string)
@@ -1760,8 +1760,8 @@ fn walk_embedded_files_name_tree<R: Read + Seek>(
     }
 
     // /Kids: intermediate node
-    if let Some(Object::Array(kids)) = dict.get("Kids") {
-        let kids = kids.clone();
+    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
+        let kids = kids.to_vec();
         for kid in kids {
             let kid_ref = match kid {
                 Object::Reference(r) => r,
