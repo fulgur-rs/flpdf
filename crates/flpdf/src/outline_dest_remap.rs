@@ -99,7 +99,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         None => return Ok(()), // No catalog, nothing to do.
     };
     let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog_obj else {
+    let Some(catalog) = catalog_obj.into_dict() else {
         return Ok(());
     };
 
@@ -163,7 +163,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
             NamesLoc::Indirect(r) => {
                 if names_now_empty {
                     let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                    if let Object::Dictionary(mut cat) = catalog_obj3 {
+                    if let Some(mut cat) = catalog_obj3.into_dict() {
                         cat.remove("Names");
                         pdf.set_object(catalog_ref, Object::Dictionary(cat));
                     }
@@ -173,7 +173,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
             }
             NamesLoc::DirectInCatalog => {
                 let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                if let Object::Dictionary(mut cat) = catalog_obj3 {
+                if let Some(mut cat) = catalog_obj3.into_dict() {
                     if names_now_empty {
                         cat.remove("Names");
                     } else {
@@ -187,7 +187,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
     // 2b. Legacy /Catalog /Dests dictionary (PDF 1.1 style)
     let catalog_obj2 = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog2) = catalog_obj2 else {
+    let Some(catalog2) = catalog_obj2.into_dict() else {
         return Ok(());
     };
     match catalog2.get("Dests").cloned() {
@@ -198,7 +198,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
             // Legacy /Dests held as a direct dictionary on the catalog.
             let new_dests = prune_dests_dict(pdf, dests, &surviving, &mut surviving_names)?;
             let catalog_obj3 = pdf.resolve(catalog_ref)?;
-            if let Object::Dictionary(mut cat) = catalog_obj3 {
+            if let Some(mut cat) = catalog_obj3.into_dict() {
                 cat.insert("Dests", Object::Dictionary(new_dests));
                 pdf.set_object(catalog_ref, Object::Dictionary(cat));
             }
@@ -209,7 +209,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // --- Step 3: Remap / drop the outline tree ----------------------------
     if let Some(outlines_obj_ref) = outlines_ref {
         let outline_root_obj = pdf.resolve(outlines_obj_ref)?;
-        if let Object::Dictionary(outline_root) = outline_root_obj {
+        if let Some(outline_root) = outline_root_obj.into_dict() {
             if let Some(first_ref) = outline_root.get_ref("First") {
                 // Walk the top-level items, collecting which to keep/drop.
                 let mut kept: Vec<ObjectRef> = Vec::new();
@@ -229,7 +229,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
                 if kept.is_empty() {
                     // All top-level items dropped → remove /Outlines from catalog.
                     let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                    if let Object::Dictionary(mut cat) = catalog_obj3 {
+                    if let Some(mut cat) = catalog_obj3.into_dict() {
                         cat.remove("Outlines");
                         pdf.set_object(catalog_ref, Object::Dictionary(cat));
                     }
@@ -240,7 +240,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
                     // Recount visible descendants for the outline root.
                     let new_count = count_visible_descendants(pdf, &kept, max_depth)?;
                     let outline_root_obj2 = pdf.resolve(outlines_obj_ref)?;
-                    if let Object::Dictionary(mut root_dict) = outline_root_obj2 {
+                    if let Some(mut root_dict) = outline_root_obj2.into_dict() {
                         // Preserve sign: root /Count is always positive (not closed),
                         // but we re-set it anyway to be safe.
                         root_dict.insert("Count", Object::Integer(new_count));
@@ -288,7 +288,7 @@ fn prune_name_tree<R: Read + Seek>(
         return Ok(true);
     }
     let node_obj = pdf.resolve(node_ref)?;
-    let Object::Dictionary(node) = node_obj else {
+    let Some(node) = node_obj.into_dict() else {
         return Ok(true); // Malformed node — treat as empty.
     };
 
@@ -298,14 +298,14 @@ fn prune_name_tree<R: Read + Seek>(
     if has_names {
         // Leaf node: /Names is a flat [(name, dest), ...] array.
         let names_val = node.get("Names").cloned();
-        if let Some(Object::Array(pairs)) = names_val {
+        if let Some(pairs) = names_val.and_then(Object::into_array) {
             let filtered = prune_name_pairs(pdf, pairs, surviving, surviving_names)?;
             if filtered.is_empty() {
                 return Ok(true); // Node is now empty.
             }
             // Rebuild the node with the filtered /Names and updated /Limits.
             let node_obj2 = pdf.resolve(node_ref)?;
-            if let Object::Dictionary(mut d) = node_obj2 {
+            if let Some(mut d) = node_obj2.into_dict() {
                 let limits = compute_limits(&filtered);
                 d.insert("Names", Object::Array(filtered));
                 if let Some(lim) = limits {
@@ -323,17 +323,8 @@ fn prune_name_tree<R: Read + Seek>(
     if has_kids {
         // Intermediate node: /Kids is an array of child node refs.
         let kids_val = node.get("Kids").cloned();
-        if let Some(Object::Array(kids)) = kids_val {
-            let child_refs: Vec<ObjectRef> = kids
-                .iter()
-                .filter_map(|k| {
-                    if let Object::Reference(r) = k {
-                        Some(*r)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        if let Some(kids) = kids_val.and_then(Object::into_array) {
+            let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
 
             let mut surviving_kids: Vec<ObjectRef> = Vec::new();
             for child_ref in child_refs {
@@ -357,7 +348,7 @@ fn prune_name_tree<R: Read + Seek>(
 
             // Rebuild node with surviving kids and recomputed /Limits.
             let node_obj2 = pdf.resolve(node_ref)?;
-            if let Object::Dictionary(mut d) = node_obj2 {
+            if let Some(mut d) = node_obj2.into_dict() {
                 d.insert(
                     "Kids",
                     Object::Array(
@@ -411,13 +402,7 @@ fn prune_name_tree_node_dict<R: Read + Seek>(
         return Ok((d, false));
     }
     if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
-        let child_refs: Vec<ObjectRef> = kids
-            .iter()
-            .filter_map(|k| match k {
-                Object::Reference(r) => Some(*r),
-                _ => None,
-            })
-            .collect();
+        let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
         let mut surviving_kids: Vec<ObjectRef> = Vec::new();
         for child_ref in child_refs {
             if !prune_name_tree(
@@ -523,7 +508,7 @@ fn prune_legacy_dests<R: Read + Seek>(
     surviving_names: &mut BTreeSet<Vec<u8>>,
 ) -> Result<()> {
     let dests_obj = pdf.resolve(dests_ref)?;
-    let Object::Dictionary(dests) = dests_obj else {
+    let Some(dests) = dests_obj.into_dict() else {
         return Ok(());
     };
     let new_dests = prune_dests_dict(pdf, dests, surviving, surviving_names)?;
@@ -605,7 +590,7 @@ fn collect_siblings<R: Read + Seek>(
         }
 
         let item_obj = pdf.resolve(item_ref)?;
-        let Object::Dictionary(item) = item_obj else {
+        let Some(item) = item_obj.into_dict() else {
             break; // Malformed — stop this chain.
         };
 
@@ -636,7 +621,7 @@ fn collect_siblings<R: Read + Seek>(
                 if child_kept.is_empty() {
                     // All children dropped: update parent to remove First/Last/Count.
                     let item_obj2 = pdf.resolve(item_ref)?;
-                    if let Object::Dictionary(mut d) = item_obj2 {
+                    if let Some(mut d) = item_obj2.into_dict() {
                         d.remove("First");
                         d.remove("Last");
                         // With no children, the item has zero descendants, so
@@ -652,7 +637,7 @@ fn collect_siblings<R: Read + Seek>(
                     stitch_siblings(pdf, &child_kept, item_ref)?;
                     let visible = count_visible_descendants(pdf, &child_kept, max_depth)?;
                     let item_obj2 = pdf.resolve(item_ref)?;
-                    if let Object::Dictionary(mut d) = item_obj2 {
+                    if let Some(mut d) = item_obj2.into_dict() {
                         let count_sign = match d.get("Count") {
                             Some(Object::Integer(n)) if *n < 0 => -1i64,
                             _ => 1i64,
@@ -709,7 +694,7 @@ fn drop_subtree<R: Read + Seek>(
             break;
         }
         let item_obj = pdf.resolve(item_ref)?;
-        let Object::Dictionary(item) = item_obj else {
+        let Some(item) = item_obj.into_dict() else {
             break;
         };
         if let Some(child_first) = item.get_ref("First") {
@@ -729,7 +714,7 @@ fn stitch_siblings<R: Read + Seek>(
 ) -> Result<()> {
     for (i, &item_ref) in kept.iter().enumerate() {
         let item_obj = pdf.resolve(item_ref)?;
-        let Object::Dictionary(mut d) = item_obj else {
+        let Some(mut d) = item_obj.into_dict() else {
             continue;
         };
         d.insert("Parent", Object::Reference(parent_ref));
@@ -770,12 +755,12 @@ fn count_visible_in_chain<R: Read + Seek>(
     let mut count = items.len() as i64;
     for &item_ref in items {
         let item_obj = pdf.resolve(item_ref)?;
-        let Object::Dictionary(d) = item_obj else {
+        let Some(d) = item_obj.into_dict() else {
             continue;
         };
         // If the item's /Count is positive (open), add its visible descendants.
-        if let Some(Object::Integer(n)) = d.get("Count") {
-            if *n > 0 {
+        if let Some(n) = d.get("Count").and_then(Object::as_integer) {
+            if n > 0 {
                 count += n;
             }
         }
@@ -805,7 +790,7 @@ fn item_survives<R: Read + Seek>(
         // follow it to the terminal object before classifying.
         let (resolved, _) = resolve_ref_chain(pdf, action)?;
         let action = &resolved;
-        if let Object::Dictionary(a) = action {
+        if let Some(a) = action.as_dict() {
             // Only handle GoTo actions (/S /GoTo).
             let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
             if is_goto {
@@ -877,7 +862,7 @@ fn remap_item_dest<R: Read + Seek>(
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
     let item_obj = pdf.resolve(item_ref)?;
-    let Object::Dictionary(mut d) = item_obj else {
+    let Some(mut d) = item_obj.into_dict() else {
         return Ok(());
     };
 
@@ -901,7 +886,7 @@ fn remap_item_dest<R: Read + Seek>(
         // action object. action_target is the LAST ref in the chain so an
         // in-place rewrite updates the object /A ultimately points at.
         let (action_obj, action_target) = resolve_ref_chain(pdf, &a_val)?;
-        if let Object::Dictionary(mut action) = action_obj {
+        if let Some(mut action) = action_obj.into_dict() {
             let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
             if is_goto {
                 if let Some(d_val) = action.get("D").cloned() {
@@ -973,8 +958,8 @@ fn remap_dest_value_depth<R: Read + Seek>(
         }
         // Array form `[pageRef /Fit ...]`.
         Object::Array(arr) => {
-            if let Some(Object::Reference(old)) = arr.first() {
-                if let Some(&new_ref) = surviving.get(old) {
+            if let Some(old) = arr.first().and_then(Object::as_ref_id) {
+                if let Some(&new_ref) = surviving.get(&old) {
                     let mut a = arr.clone();
                     a[0] = Object::Reference(new_ref);
                     return Ok(Some(Object::Array(a)));
@@ -1063,8 +1048,8 @@ fn merge_node_limits<R: Read + Seek>(
     let first_kid_obj = pdf.resolve(kids[0])?;
     let last_kid_obj = pdf.resolve(*kids.last().expect("non-empty"))?;
 
-    let first_min = if let Object::Dictionary(d) = &first_kid_obj {
-        if let Some(Object::Array(lim)) = d.get("Limits") {
+    let first_min = if let Some(d) = first_kid_obj.as_dict() {
+        if let Some(lim) = d.get("Limits").and_then(Object::as_array) {
             lim.first().cloned()
         } else {
             None
@@ -1073,8 +1058,8 @@ fn merge_node_limits<R: Read + Seek>(
         None
     };
 
-    let last_max = if let Object::Dictionary(d) = &last_kid_obj {
-        if let Some(Object::Array(lim)) = d.get("Limits") {
+    let last_max = if let Some(d) = last_kid_obj.as_dict() {
+        if let Some(lim) = d.get("Limits").and_then(Object::as_array) {
             lim.last().cloned()
         } else {
             None
@@ -1502,7 +1487,7 @@ mod tests {
             .position(|o| matches!(o, Object::String(b) if b == b"dest_p1"));
         if let Some(idx) = p1_idx {
             let dest = &names[idx * 2 + 1];
-            if let Object::Array(arr) = dest {
+            if let Some(arr) = dest.as_array() {
                 assert_eq!(
                     arr.first(),
                     Some(&Object::Reference(new_p1)),
@@ -1520,7 +1505,7 @@ mod tests {
             .position(|o| matches!(o, Object::String(b) if b == b"dest_p3"));
         if let Some(idx) = p3_idx {
             let dest = &names[idx * 2 + 1];
-            if let Object::Array(arr) = dest {
+            if let Some(arr) = dest.as_array() {
                 assert_eq!(
                     arr.first(),
                     Some(&Object::Reference(new_p3)),
@@ -1580,7 +1565,7 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         let item20 = dict_of(&mut pdf, ObjectRef::new(20, 0));
-        if let Some(Object::Array(arr)) = item20.get("Dest") {
+        if let Some(arr) = item20.get("Dest").and_then(Object::as_array) {
             assert_eq!(
                 arr.first(),
                 Some(&Object::Reference(first_new)),
@@ -1749,7 +1734,7 @@ mod tests {
             .iter()
             .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(40, 0))));
         let dest40 = pdf.resolve(ObjectRef::new(40, 0)).unwrap();
-        let Object::Array(arr) = dest40 else {
+        let Some(arr) = dest40.into_array() else {
             panic!("obj 40 should remain a dest array");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
@@ -1826,7 +1811,7 @@ mod tests {
         };
         // (d1) survives; its dict-form dest /D page ref is remapped.
         let dest = &names[1];
-        let Object::Dictionary(dd) = dest else {
+        let Some(dd) = dest.as_dict() else {
             panic!("dict-form dest expected, got {dest:?}");
         };
         let Some(Object::Array(arr)) = dd.get("D") else {
@@ -1877,7 +1862,7 @@ mod tests {
         assert_eq!(item20.get_ref("Dest"), Some(ObjectRef::new(40, 0)));
         // The referenced dest object 40 had its page ref remapped in place.
         let dest40 = pdf.resolve(ObjectRef::new(40, 0)).unwrap();
-        let Object::Array(arr) = dest40 else {
+        let Some(arr) = dest40.into_array() else {
             panic!("obj 40 should stay a dest array");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
@@ -2054,7 +2039,7 @@ mod tests {
         assert_eq!(kept, vec![b"d1".as_slice()], "d2 -> removed page dropped");
         // obj 40 (referenced by d1's /D) had its page ref remapped in place.
         let dest40 = pdf.resolve(ObjectRef::new(40, 0)).unwrap();
-        let Object::Array(arr) = dest40 else {
+        let Some(arr) = dest40.into_array() else {
             panic!("obj 40 should remain a dest array");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
