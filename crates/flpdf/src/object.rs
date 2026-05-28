@@ -248,6 +248,22 @@ impl Object {
         }
     }
 
+    /// Consume this object and return its decoded PDF name bytes, if it is [`Object::Name`].
+    pub fn into_name(self) -> Option<Vec<u8>> {
+        match self {
+            Object::Name(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Consume this object and return its string bytes, if it is [`Object::String`].
+    pub fn into_string(self) -> Option<Vec<u8>> {
+        match self {
+            Object::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// Return true if this object is [`Object::Null`].
     pub fn is_null(&self) -> bool {
         matches!(self, Object::Null)
