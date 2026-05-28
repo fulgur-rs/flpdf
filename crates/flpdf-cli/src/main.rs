@@ -171,7 +171,7 @@ struct Cli {
           require_equals = true,
           value_name = "VERSION", value_parser = ["2"],
           conflicts_with_all = [
-              "check", "linearize", "static_id", "dump_object",
+              "check", "linearize", "static_id", "static_aes_iv", "dump_object",
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
