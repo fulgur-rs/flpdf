@@ -1733,8 +1733,18 @@ fn encrypt_stream_payload_for_writer(
 
     let mut iv = [0u8; 16];
     if matches!(ctx.object_key_alg, ObjectKeyAlg::Aes) {
-        getrandom::getrandom(&mut iv)
-            .expect("OS CSPRNG (getrandom) must be available for AES IV generation");
+        // Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
+        // entropy in a chroot at boot) as `Unsupported` instead of panicking.
+        // This site returns `Result`, so propagation is straightforward; the
+        // string-encryption walker counterpart in
+        // `encrypt_strings_in_object_for_writer` goes through a `FnMut`
+        // closure that cannot today propagate the error — that path is
+        // tracked separately (see flpdf-9hc.4.9 follow-up).
+        getrandom::getrandom(&mut iv).map_err(|e| {
+            crate::Error::Unsupported(format!(
+                "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
+            ))
+        })?;
     }
 
     match ctx.object_key_alg {
