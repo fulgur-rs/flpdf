@@ -1871,12 +1871,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // with a clear diagnostic rather than silently producing a corrupt file.
     //
     // Invariant: at most ONE of encrypt / copy_encryption is set.  The CLI
-    // enforces this via conflicts_with; assert here for safety so library
-    // callers are also caught.
-    assert!(
-        !(options.encrypt.is_some() && options.copy_encryption.is_some()),
-        "encrypt and copy_encryption are mutually exclusive"
-    );
+    // enforces this via conflicts_with; guard here too so a library caller
+    // that passes both gets a recoverable error rather than a panic.
+    if options.encrypt.is_some() && options.copy_encryption.is_some() {
+        return Err(crate::Error::Unsupported(
+            "encrypt and copy_encryption are mutually exclusive".to_string(),
+        ));
+    }
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
 
     if encrypting && options.qdf {
