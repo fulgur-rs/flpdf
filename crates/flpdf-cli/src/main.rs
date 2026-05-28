@@ -21,9 +21,9 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version,
     resources::remove_unreferenced_resources,
-    write_pdf_with_options, CompressStreams, Dictionary, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources, Severity,
-    Stream, StreamDataMode, WriteOptions,
+    write_pdf_with_options, CompressStreams, Dictionary, EncryptParams, NewlineBeforeEndstream,
+    Object, ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions,
+    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -175,7 +175,7 @@ struct Cli {
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
-              "decrypt",
+              "decrypt", "encrypt",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf",
@@ -428,6 +428,45 @@ struct Cli {
                 terminate segment with --"
     )]
     copy_attachments_from: Vec<String>,
+
+    /// Encrypt the output (qpdf `--encrypt` compatible).
+    ///
+    /// Syntax: `--encrypt USER-PW OWNER-PW KEY-LEN [sub-flags] --`
+    ///
+    /// USER-PW / OWNER-PW are the two password strings; KEY-LEN selects
+    /// the algorithm (`40` → V=1, `128` → V=2 or V=4, `256` → V=5 R=6).
+    /// The walking-skeleton release (flpdf-9hc.4.9) only supports
+    /// `KEY-LEN=128` together with `--use-aes=y` (= V=4 AES-128); the
+    /// other algorithms have their dict builders shipped but no writer
+    /// dispatch yet and are rejected with a clear "not yet supported"
+    /// diagnostic. Permission sub-flags (`--print`, `--modify`, etc.) are
+    /// likewise rejected for now; the default "all permissions granted"
+    /// is used implicitly.
+    ///
+    /// The `--` terminator ends the sub-flag segment. The tokens after
+    /// `--` are the INPUT / OUTPUT positionals.
+    #[arg(
+        long = "encrypt",
+        num_args = 3..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
+        // Reject combinations that don't make sense on the rewrite path.
+        // --linearize / --remove-restrictions / --decrypt overlaps with
+        // --encrypt are rejected because they imply contradictory output
+        // forms; --check / --dump-object / --show-* are inspection paths
+        // that don't produce an output file at all.
+        conflicts_with_all = [
+            "check", "dump_object", "show_info", "show_catalog",
+            "show_metadata", "show_outline", "show_fonts",
+            "show_npages", "show_pages",
+            "linearize", "remove_restrictions", "decrypt", "qdf",
+        ],
+        help = "Encrypt output (qpdf --encrypt compatible): \
+                USER-PW OWNER-PW KEY-LEN [sub-flags] -- ; \
+                walking skeleton supports 128 with --use-aes=y only"
+    )]
+    encrypt: Vec<String>,
 
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -743,6 +782,18 @@ struct RewriteCommand {
     /// They become distinguishable once `--encrypt` (flpdf-9hc.4.9) lands.
     #[arg(long = "decrypt")]
     decrypt: bool,
+    /// Encrypt the output (qpdf `--encrypt` compatible). See the top-level
+    /// `--encrypt` documentation for the full syntax and the walking-skeleton
+    /// restrictions (KEY-LEN=128 + --use-aes=y only, default permissions).
+    #[arg(
+        long = "encrypt",
+        num_args = 3..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
+        conflicts_with_all = ["linearize", "remove_restrictions", "decrypt", "qdf"]
+    )]
+    encrypt: Vec<String>,
     /// Set a minimum PDF version for the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.
@@ -1267,6 +1318,24 @@ fn main() {
                 }
             }
         }
+        // Top-level --encrypt: parse the segment and stash on WriteOptions.
+        // The library layer (writer.rs) does the heavy lifting (id0 resolution,
+        // dict build, per-object encryption). Force full_rewrite=true because
+        // the incremental write path cannot rewrite source bytes through an
+        // encryption pass. Parse errors are surfaced as exit-2 diagnostics —
+        // the same pattern the surrounding --compress-streams parser uses.
+        if !args.encrypt.is_empty() {
+            match parse_encrypt_segment(&args.encrypt) {
+                Ok(params) => {
+                    options.encrypt = Some(params);
+                    options.full_rewrite = true;
+                }
+                Err(e) => {
+                    eprintln!("flpdf: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         run_rewrite(
             args.input,
             args.output,
@@ -1586,6 +1655,22 @@ fn run_command(command: Commands) -> CliResult<()> {
             if options.stream_data.is_some() {
                 options.full_rewrite = true;
             }
+            // `rewrite --encrypt`: parse the segment, stash on WriteOptions,
+            // and force full_rewrite (the incremental write path cannot
+            // rewrite source bytes through an encryption pass). Mirrors the
+            // top-level alias dispatch in the surrounding `else` branch.
+            if !cmd.encrypt.is_empty() {
+                match parse_encrypt_segment(&cmd.encrypt) {
+                    Ok(params) => {
+                        options.encrypt = Some(params);
+                        options.full_rewrite = true;
+                    }
+                    Err(e) => {
+                        eprintln!("flpdf: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
@@ -1727,6 +1812,125 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
     // Clean — exit 0.
     println!("PDF check succeeded");
     Ok(())
+}
+
+/// Parse the qpdf-shaped `--encrypt USER-PW OWNER-PW KEY-LEN [sub-flags]`
+/// segment into an [`EncryptParams`].
+///
+/// `tokens` is the captured `Vec<String>` from clap's `value_terminator="--"`
+/// + `num_args = 3..` segment; it does not include the trailing `--` itself
+///   (clap consumes it as the terminator).
+///
+/// Walking-skeleton acceptance matrix (flpdf-9hc.4.9):
+///
+/// - **KEY-LEN**: only `128` is supported. `40` / `256` are rejected with
+///   a "not yet supported" diagnostic naming the responsible algorithm
+///   variant (V=1, V=5 R=6) so users can find the tracking issue.
+/// - **`--use-aes=y`**: REQUIRED. Without it, `--encrypt … 128` would mean
+///   V=2 RC4-128 per qpdf default, which has no writer dispatch yet.
+/// - **`--use-aes=n` / other sub-flags** (`--print`, `--modify`,
+///   `--extract`, `--annotate`, `--form`, `--assemble`, `--force-V4`,
+///   `--force-R5`): rejected, follow-up work tracked on flpdf-9hc.4.9.
+fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
+    if tokens.len() < 3 {
+        return Err(format!(
+            "--encrypt requires USER-PW OWNER-PW KEY-LEN (got {} arg(s))",
+            tokens.len()
+        )
+        .into());
+    }
+    let user_pw = tokens[0].as_bytes().to_vec();
+    let owner_pw = tokens[1].as_bytes().to_vec();
+    let key_len: u32 = tokens[2].parse().map_err(|_| {
+        format!(
+            "--encrypt KEY-LEN must be a positive integer (40 / 128 / 256), got: {:?}",
+            tokens[2]
+        )
+    })?;
+
+    match key_len {
+        40 => {
+            return Err(
+                "--encrypt KEY-LEN=40 (V=1 RC4-40) is not yet supported in this release; \
+                 dict builder is shipped (flpdf-9hc.4.1) but the writer pipeline only \
+                 covers V=4 AES-128 in the walking skeleton (flpdf-9hc.4.9 follow-up)"
+                    .into(),
+            );
+        }
+        128 => { /* V=2 RC4-128 or V=4 (AES/RC4) — narrowed below by --use-aes */ }
+        256 => {
+            return Err(
+                "--encrypt KEY-LEN=256 (V=5 R=6 AES-256) is not yet supported in this release; \
+                 dict builder is shipped (flpdf-9hc.4.3) but the writer pipeline only \
+                 covers V=4 AES-128 in the walking skeleton (flpdf-9hc.4.9 follow-up)"
+                    .into(),
+            );
+        }
+        other => {
+            return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {other})").into());
+        }
+    }
+
+    // Parse sub-flags. Walking skeleton only honours `--use-aes=y`; every
+    // other sub-flag is rejected with a clear message so users do not get a
+    // silent shrug when they pass `--print=none` and expect it to work.
+    let mut use_aes: Option<bool> = None;
+    for tok in &tokens[3..] {
+        let (flag, val) = tok.split_once('=').unwrap_or((tok.as_str(), ""));
+        match flag {
+            "--use-aes" => {
+                use_aes = Some(match val {
+                    "y" => true,
+                    "n" => false,
+                    other => {
+                        return Err(format!("--use-aes must be y or n (got {other:?})").into());
+                    }
+                });
+            }
+            "--print"
+            | "--modify"
+            | "--extract"
+            | "--annotate"
+            | "--form"
+            | "--assemble"
+            | "--accessibility"
+            | "--force-V4"
+            | "--force-R5"
+            | "--allow-insecure"
+            | "--cleartext-metadata" => {
+                return Err(format!(
+                    "encryption sub-flag {flag:?} is not yet supported in this release; \
+                     follow-up work tracked on flpdf-9hc.4.9 (typed PermissionsConfig + \
+                     CLI flag wiring)"
+                )
+                .into());
+            }
+            other => {
+                return Err(format!(
+                    "unknown --encrypt sub-flag {other:?}; supported in this release: --use-aes=y"
+                )
+                .into());
+            }
+        }
+    }
+
+    // KEY-LEN=128 + missing/`--use-aes=n` would be qpdf-default V=2 RC4-128
+    // which has no writer dispatch yet (covered by the dict builder in #219
+    // but the integration is the follow-up). Require explicit AES selection.
+    match use_aes {
+        Some(true) => Ok(EncryptParams::v4_aes128(user_pw, owner_pw)),
+        Some(false) => Err(
+            "--encrypt … 128 --use-aes=n (V=2 / V=4 RC4-128) is not yet supported; \
+             the walking skeleton only wires V=4 AES-128. Use --use-aes=y."
+                .into(),
+        ),
+        None => Err(
+            "--encrypt … 128 without --use-aes defaults to V=2 RC4-128 per qpdf, \
+             which is not yet wired through the writer. Pass --use-aes=y to opt \
+             into V=4 AES-128 (the only mode supported in this release)."
+                .into(),
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
