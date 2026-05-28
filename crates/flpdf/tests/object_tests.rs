@@ -54,7 +54,14 @@ fn object_accessors_return_borrowed_variant_payloads() {
     assert!(Object::Null.is_null());
 
     assert_eq!(Object::Integer(42).as_dict(), None);
+    assert_eq!(Object::Integer(42).as_stream(), None);
     assert_eq!(Object::Null.as_array(), None);
+    assert_eq!(Object::Null.as_name(), None);
+    assert_eq!(Object::Null.as_string(), None);
+    assert_eq!(Object::Null.as_integer(), None);
+    assert_eq!(Object::Null.as_real(), None);
+    assert_eq!(Object::Null.as_bool(), None);
+    assert_eq!(Object::Null.as_ref_id(), None);
     assert!(!Object::Boolean(false).is_null());
 }
 
@@ -88,6 +95,8 @@ fn object_mut_accessors_allow_in_place_updates() {
     );
 
     assert_eq!(Object::Null.as_dict_mut(), None);
+    assert_eq!(Object::Null.as_stream_mut(), None);
+    assert_eq!(Object::Null.as_array_mut(), None);
 }
 
 #[test]
@@ -96,12 +105,18 @@ fn object_into_accessors_consume_matching_variants() {
     dict.insert("Type", Object::Name(b"Catalog".to_vec()));
     let stream = Stream::new(dict.clone(), b"payload".to_vec());
     let array = vec![Object::Integer(1), Object::Integer(2)];
+    let name = b"Catalog".to_vec();
+    let string = b"payload".to_vec();
 
     assert_eq!(Object::Dictionary(dict.clone()).into_dict(), Some(dict));
     assert_eq!(Object::Stream(stream.clone()).into_stream(), Some(stream));
     assert_eq!(Object::Array(array.clone()).into_array(), Some(array));
+    assert_eq!(Object::Name(name.clone()).into_name(), Some(name));
+    assert_eq!(Object::String(string.clone()).into_string(), Some(string));
 
     assert_eq!(Object::Null.into_dict(), None);
     assert_eq!(Object::Integer(1).into_stream(), None);
     assert_eq!(Object::String(b"x".to_vec()).into_array(), None);
+    assert_eq!(Object::Null.into_name(), None);
+    assert_eq!(Object::Null.into_string(), None);
 }
