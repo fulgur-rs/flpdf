@@ -167,10 +167,12 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases; never errors.
     pub fn mimetype(&self) -> Result<Option<Vec<u8>>> {
-        Ok(match self.stream.dict.get("Subtype") {
-            Some(Object::Name(bytes)) => Some(bytes.clone()),
-            _ => None,
-        })
+        Ok(self
+            .stream
+            .dict
+            .get("Subtype")
+            .and_then(Object::as_name)
+            .map(ToOwned::to_owned))
     }
 
     /// Return the `/Params` sub-dictionary, if present.
@@ -190,10 +192,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn creation_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.params().and_then(|p| match p.get("CreationDate") {
-            Some(Object::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        }))
+        Ok(self
+            .params()
+            .and_then(|p| p.get("CreationDate"))
+            .and_then(Object::as_string)
+            .map(ToOwned::to_owned))
     }
 
     /// Return `/Params /ModDate` as a raw PDF date byte sequence.
@@ -202,10 +205,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn modification_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.params().and_then(|p| match p.get("ModDate") {
-            Some(Object::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        }))
+        Ok(self
+            .params()
+            .and_then(|p| p.get("ModDate"))
+            .and_then(Object::as_string)
+            .map(ToOwned::to_owned))
     }
 
     /// Return `/Params /CheckSum` as raw bytes (typically a 16-byte MD5 hash).
@@ -214,10 +218,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn checksum(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.params().and_then(|p| match p.get("CheckSum") {
-            Some(Object::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        }))
+        Ok(self
+            .params()
+            .and_then(|p| p.get("CheckSum"))
+            .and_then(Object::as_string)
+            .map(ToOwned::to_owned))
     }
 
     /// Return `/Params /Size` — the uncompressed file size in bytes.
@@ -226,10 +231,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn size(&self) -> Result<Option<i64>> {
-        Ok(self.params().and_then(|p| match p.get("Size") {
-            Some(Object::Integer(n)) => Some(*n),
-            _ => None,
-        }))
+        Ok(self
+            .params()
+            .and_then(|p| p.get("Size"))
+            .and_then(Object::as_integer))
     }
 }
 
@@ -278,10 +283,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn filename(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(match dict.get("F") {
-            Some(Object::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        })
+        Ok(dict
+            .get("F")
+            .and_then(Object::as_string)
+            .map(ToOwned::to_owned))
     }
 
     /// Return `/UF` — the Unicode-encoded file name as raw PDF string bytes.
@@ -295,10 +300,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn uf(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(match dict.get("UF") {
-            Some(Object::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        })
+        Ok(dict
+            .get("UF")
+            .and_then(Object::as_string)
+            .map(ToOwned::to_owned))
     }
 
     /// Return `/Desc` — the file description as raw PDF string bytes.
@@ -308,10 +313,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn description(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(match dict.get("Desc") {
-            Some(Object::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        })
+        Ok(dict
+            .get("Desc")
+            .and_then(Object::as_string)
+            .map(ToOwned::to_owned))
     }
 
     /// Return `/AFRelationship` — the associated-file relationship as raw
@@ -322,10 +327,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn af_relationship(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(match dict.get("AFRelationship") {
-            Some(Object::Name(bytes)) => Some(bytes.clone()),
-            _ => None,
-        })
+        Ok(dict
+            .get("AFRelationship")
+            .and_then(Object::as_name)
+            .map(ToOwned::to_owned))
     }
 
     /// Resolve and return the embedded file stream.
@@ -387,10 +392,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         // higher-priority key does not mask a valid lower-priority one.
         let candidates: Vec<ObjectRef> = ["UF", "F", "Unix", "Mac", "DOS"]
             .iter()
-            .filter_map(|k| match ef_dict.get(k) {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            })
+            .filter_map(|k| ef_dict.get(k).and_then(Object::as_ref_id))
             .collect();
 
         for ef_ref in candidates {

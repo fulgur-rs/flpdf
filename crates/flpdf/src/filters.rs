@@ -67,38 +67,42 @@ where
 {
     match filter {
         None => Ok(stream_data.to_vec()),
-        Some(Object::Name(filter_name)) => {
-            if filter_name == b"Crypt" {
-                return decrypt_crypt(get_decode_params(decode_params, 0), stream_data);
-            }
-            let params = get_decode_params(decode_params, 0);
-            let decoded = apply_single_filter_decode(filter_name, stream_data, params)
-                .map_err(Error::Unsupported)?;
-            apply_decode_params(params, &decoded)
-        }
-        Some(Object::Array(filters)) => {
-            let mut decoded = stream_data.to_vec();
-            for (index, filter) in filters.iter().enumerate() {
-                let Object::Name(filter_name) = filter else {
-                    return Err(Error::Unsupported(
-                        "unsupported stream filter type: expected name".to_string(),
-                    ));
-                };
+        Some(filter) => {
+            if let Some(filter_name) = filter.as_name() {
                 if filter_name == b"Crypt" {
-                    decoded = decrypt_crypt(get_decode_params(decode_params, index), &decoded)?;
-                } else {
-                    let params = get_decode_params(decode_params, index);
-                    decoded = apply_single_filter_decode(filter_name, &decoded, params)
-                        .map_err(Error::Unsupported)?;
-                    decoded = apply_decode_params(params, &decoded)?;
+                    return decrypt_crypt(get_decode_params(decode_params, 0), stream_data);
                 }
+                let params = get_decode_params(decode_params, 0);
+                let decoded = apply_single_filter_decode(filter_name, stream_data, params)
+                    .map_err(Error::Unsupported)?;
+                return apply_decode_params(params, &decoded);
             }
-            Ok(decoded)
+
+            if let Some(filters) = filter.as_array() {
+                let mut decoded = stream_data.to_vec();
+                for (index, filter) in filters.iter().enumerate() {
+                    let Some(filter_name) = filter.as_name() else {
+                        return Err(Error::Unsupported(
+                            "unsupported stream filter type: expected name".to_string(),
+                        ));
+                    };
+                    if filter_name == b"Crypt" {
+                        decoded = decrypt_crypt(get_decode_params(decode_params, index), &decoded)?;
+                    } else {
+                        let params = get_decode_params(decode_params, index);
+                        decoded = apply_single_filter_decode(filter_name, &decoded, params)
+                            .map_err(Error::Unsupported)?;
+                        decoded = apply_decode_params(params, &decoded)?;
+                    }
+                }
+                return Ok(decoded);
+            }
+
+            Err(Error::Unsupported(format!(
+                "unsupported stream filter syntax: {}",
+                object_debug_repr(filter)
+            )))
         }
-        Some(other) => Err(Error::Unsupported(format!(
-            "unsupported stream filter syntax: {}",
-            object_debug_repr(other)
-        ))),
     }
 }
 
@@ -109,42 +113,76 @@ fn encode_stream_data_with_filters(
 ) -> Result<Vec<u8>> {
     match filter {
         None => Ok(stream_data.to_vec()),
-        Some(Object::Name(filter_name)) => {
-            let params = get_decode_params(decode_params, 0);
-            let after_predictor = apply_encode_params(params, stream_data)?;
-            apply_single_filter_encode(filter_name, &after_predictor).map_err(Error::Unsupported)
-        }
-        Some(Object::Array(filters)) => {
-            // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
-            // order, so encoding must apply them in reverse for round-tripping.
-            let mut encoded = stream_data.to_vec();
-            for (index, filter) in filters.iter().enumerate().rev() {
-                let Object::Name(filter_name) = filter else {
-                    return Err(Error::Unsupported(
-                        "unsupported stream filter type: expected name".to_string(),
-                    ));
-                };
-                let params = get_decode_params(decode_params, index);
-                encoded = apply_encode_params(params, &encoded)?;
-                encoded = apply_single_filter_encode(filter_name, &encoded)
-                    .map_err(Error::Unsupported)?;
+        Some(filter) => {
+            if let Some(filter_name) = filter.as_name() {
+                let params = get_decode_params(decode_params, 0);
+                let after_predictor = apply_encode_params(params, stream_data)?;
+                return apply_single_filter_encode(filter_name, &after_predictor)
+                    .map_err(Error::Unsupported);
             }
-            Ok(encoded)
+
+            if let Some(filters) = filter.as_array() {
+                // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
+                // order, so encoding must apply them in reverse for round-tripping.
+                let mut encoded = stream_data.to_vec();
+                for (index, filter) in filters.iter().enumerate().rev() {
+                    let Some(filter_name) = filter.as_name() else {
+                        return Err(Error::Unsupported(
+                            "unsupported stream filter type: expected name".to_string(),
+                        ));
+                    };
+                    let params = get_decode_params(decode_params, index);
+                    encoded = apply_encode_params(params, &encoded)?;
+                    encoded = apply_single_filter_encode(filter_name, &encoded)
+                        .map_err(Error::Unsupported)?;
+                }
+                return Ok(encoded);
+            }
+
+            Err(Error::Unsupported(format!(
+                "unsupported stream filter syntax: {}",
+                object_debug_repr(filter)
+            )))
         }
-        Some(other) => Err(Error::Unsupported(format!(
-            "unsupported stream filter syntax: {}",
-            object_debug_repr(other)
-        ))),
     }
 }
 
 fn get_decode_params(params: Option<&Object>, index: usize) -> Option<&Object> {
     match params {
         None => None,
-        Some(Object::Dictionary(_)) => Some(params.unwrap()),
-        Some(Object::Array(values)) => values.get(index),
-        Some(_) => None,
+        Some(param) if param.as_dict().is_some() => Some(param),
+        Some(param) => param.as_array().and_then(|values| values.get(index)),
     }
+}
+
+fn integer_decode_param(params: &Dictionary, key: &str) -> Result<Option<i64>> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_integer()
+            .map(Some)
+            .ok_or_else(|| Error::Unsupported(format!("/DecodeParms /{key} must be integer"))),
+    }
+}
+
+fn non_negative_usize_param(params: &Dictionary, key: &str) -> Result<Option<usize>> {
+    integer_decode_param(params, key)?
+        .map(|value| {
+            usize::try_from(value).map_err(|_| {
+                Error::Unsupported(format!("/DecodeParms /{key} must be non-negative"))
+            })
+        })
+        .transpose()
+}
+
+fn non_negative_u8_param(params: &Dictionary, key: &str) -> Result<Option<u8>> {
+    integer_decode_param(params, key)?
+        .map(|value| {
+            u8::try_from(value).map_err(|_| {
+                Error::Unsupported(format!("/DecodeParms /{key} must be non-negative"))
+            })
+        })
+        .transpose()
 }
 
 /// Extract PNG predictor parameters from a DecodeParms dictionary.
@@ -153,20 +191,12 @@ fn get_decode_params(params: Option<&Object>, index: usize) -> Option<&Object> {
 /// Returns `Ok(Some((predictor, row_bytes, bytes_per_pixel)))` for PNG predictors 10..=15.
 /// Returns `Err` for Predictor 2 or any other unsupported value.
 fn extract_predictor_params(decode_params: Option<&Object>) -> Result<Option<(u8, usize, usize)>> {
-    let Some(Object::Dictionary(params)) = decode_params else {
+    let Some(params) = decode_params.and_then(Object::as_dict) else {
         return Ok(None);
     };
 
-    let predictor = match params.get("Predictor") {
-        Some(Object::Integer(value)) => u8::try_from(*value).map_err(|_| {
-            Error::Unsupported("/DecodeParms /Predictor must be non-negative".to_string())
-        })?,
-        Some(_) => {
-            return Err(Error::Unsupported(
-                "/DecodeParms /Predictor must be integer".to_string(),
-            ))
-        }
-        None => return Ok(None),
+    let Some(predictor) = non_negative_u8_param(params, "Predictor")? else {
+        return Ok(None);
     };
 
     if predictor <= 1 {
@@ -185,45 +215,11 @@ fn extract_predictor_params(decode_params: Option<&Object>) -> Result<Option<(u8
         )));
     }
 
-    let colors = match params.get("Colors") {
-        None => 1usize,
-        Some(Object::Integer(value)) => usize::try_from(*value).map_err(|_| {
-            Error::Unsupported("/DecodeParms /Colors must be non-negative".to_string())
-        })?,
-        Some(_) => {
-            return Err(Error::Unsupported(
-                "/DecodeParms /Colors must be integer".to_string(),
-            ))
-        }
-    };
-
-    let bits_per_component = match params.get("BitsPerComponent") {
-        None => 8usize,
-        Some(Object::Integer(value)) => usize::try_from(*value).map_err(|_| {
-            Error::Unsupported("/DecodeParms /BitsPerComponent must be non-negative".to_string())
-        })?,
-        Some(_) => {
-            return Err(Error::Unsupported(
-                "/DecodeParms /BitsPerComponent must be integer".to_string(),
-            ))
-        }
-    };
-
-    let columns = match params.get("Columns") {
-        Some(Object::Integer(value)) => usize::try_from(*value).map_err(|_| {
-            Error::Unsupported("/DecodeParms /Columns must be non-negative".to_string())
-        })?,
-        Some(_) => {
-            return Err(Error::Unsupported(
-                "/DecodeParms /Columns must be integer".to_string(),
-            ))
-        }
-        None => {
-            return Err(Error::Unsupported(
-                "/DecodeParms /Columns required for PNG predictor".to_string(),
-            ))
-        }
-    };
+    let colors = non_negative_usize_param(params, "Colors")?.unwrap_or(1);
+    let bits_per_component = non_negative_usize_param(params, "BitsPerComponent")?.unwrap_or(8);
+    let columns = non_negative_usize_param(params, "Columns")?.ok_or_else(|| {
+        Error::Unsupported("/DecodeParms /Columns required for PNG predictor".to_string())
+    })?;
 
     let row_bits = columns
         .checked_mul(colors)
