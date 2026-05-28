@@ -1648,11 +1648,20 @@ where
 /// | `Array(a)`         | absent                   | `Array([Crypt, ...a])`       | `Array([crypt_dict, Null × a.len()])` |
 /// | `Array(a)`         | `Array(p)` (`p.len()==a.len()`) | `Array([Crypt, ...a])` | `Array([crypt_dict, ...p])`        |
 ///
-/// Other input shapes (mismatched `/DecodeParms` array length, or a single
-/// `Dictionary` paired with an `Array` `/Filter`) are normalized to the
-/// closest match by padding the leftover slots with `Null`. The function
-/// does not detect or merge an existing `/Crypt` entry — callers that
-/// might re-apply this on the same dictionary should check first.
+/// Other input shapes are normalized to maintain the function's contract
+/// of always emitting a well-formed `/Crypt`-led chain:
+///
+/// - Mismatched `/DecodeParms` array length, or a single `Dictionary`
+///   paired with an `Array` `/Filter`: leftover slots are padded with `Null`.
+/// - `/Filter` that is neither a `Name` nor an `Array` (malformed per
+///   spec): the malformed `/Filter` and any existing `/DecodeParms` are
+///   discarded and replaced with the singleton `/Crypt` entry, because
+///   propagating a malformed entry would let downstream readers treat
+///   encrypted streams as plaintext (or vice versa).
+///
+/// The function does not detect or merge an existing `/Crypt` entry —
+/// callers that might re-apply this on the same dictionary should check
+/// first.
 pub(crate) fn prepend_crypt_filter_to_stream_dict(dict: &mut Dictionary, cf_name: &[u8]) {
     let mut crypt_dp = Dictionary::new();
     crypt_dp.insert("Type", Object::Name(b"CryptFilterDecodeParms".to_vec()));
@@ -1716,12 +1725,17 @@ pub(crate) fn prepend_crypt_filter_to_stream_dict(dict: &mut Dictionary, cf_name
         }
         Some(other) => {
             // /Filter was neither a Name nor an Array (malformed per spec).
-            // Preserve the original entries (best-effort) and emit /Crypt as
-            // a singleton — callers passing such inputs already have a bug.
-            dict.insert("Filter", other);
-            if let Some(dp) = existing_decode_parms {
-                dict.insert("DecodeParms", dp);
-            }
+            // Normalize to a singleton /Crypt entry; the malformed /Filter
+            // and any /DecodeParms cannot be meaningfully preserved in a
+            // well-formed filter chain. Callers passing such inputs already
+            // have a bug; we honor the function's contract (always prepend
+            // /Crypt — PDF 1.7 §7.4.10 requires it at index 0) rather than
+            // propagate the malformation. Downstream readers would otherwise
+            // treat encrypted streams as plaintext (or vice versa), which is
+            // a worse failure mode than discarding a malformed dict entry.
+            let _ = (other, existing_decode_parms); // intentionally discarded
+            dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+            dict.insert("DecodeParms", crypt_dp_obj);
         }
     }
 }
@@ -4546,6 +4560,61 @@ mod tests {
             fl[0],
             Object::Name(b"Crypt".to_vec()),
             "/Crypt must be first per PDF 1.7 §7.4.10"
+        );
+    }
+
+    /// Malformed `/Filter` (neither `Name` nor `Array`) must be normalized
+    /// to a singleton `/Crypt` entry, discarding the malformed `/Filter`
+    /// and any existing `/DecodeParms`. The function's contract is to
+    /// always prepend `/Crypt`; propagating the malformation would let
+    /// downstream readers treat encrypted streams as plaintext (or vice
+    /// versa). Inputs covered: `Integer`, `Boolean`, and `Name`-with-
+    /// preexisting-Dict-DecodeParms-paired-with-Integer-filter (mixed
+    /// malformation).
+    #[test]
+    fn prepend_crypt_filter_normalizes_malformed_filter_type_to_singleton_crypt() {
+        // Integer /Filter (clearly malformed per spec).
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Integer(42));
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"Identity");
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Name(b"Crypt".to_vec())),
+            "malformed /Filter (Integer) must be normalized to /Crypt singleton"
+        );
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&crypt_dp_dict_for_name(b"Identity")),
+        );
+
+        // Boolean /Filter — also malformed.
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Boolean(true));
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"StdCF");
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Name(b"Crypt".to_vec())),
+            "malformed /Filter (Boolean) must be normalized to /Crypt singleton"
+        );
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&crypt_dp_dict_for_name(b"StdCF")),
+        );
+
+        // Malformed /Filter paired with a (would-be-valid) /DecodeParms Dict —
+        // the malformed entry's DecodeParms cannot be meaningfully aligned
+        // with the singleton /Crypt chain, so it is discarded.
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Integer(99));
+        let mut stale_dp = Dictionary::new();
+        stale_dp.insert("Predictor", Object::Integer(12));
+        dict.insert("DecodeParms", Object::Dictionary(stale_dp));
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"Identity");
+        assert_eq!(dict.get("Filter"), Some(&Object::Name(b"Crypt".to_vec())),);
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&crypt_dp_dict_for_name(b"Identity")),
+            "stale /DecodeParms must be discarded — it cannot be aligned with the singleton chain"
         );
     }
 }
