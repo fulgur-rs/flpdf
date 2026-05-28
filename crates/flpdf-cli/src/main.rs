@@ -1606,12 +1606,22 @@ fn run_command(command: Commands) -> CliResult<()> {
                 // the rewrite-only passes. Silently dropping them would make
                 // `rewrite --rotate=90 --normalize-content=y ...` partially
                 // succeed; reject the unsupported combination loudly instead.
-                if normalize_content || coalesce_contents || cmd.remove_restrictions {
+                //
+                // --decrypt is rejected for the same reason: the page-ops
+                // pipeline already rejects encrypted inputs (so a useful
+                // --decrypt + page-ops combination is impossible), and on
+                // plaintext input --decrypt is a silent no-op anyway —
+                // rejecting upfront surfaces the unsupported combination
+                // instead of leaving the user wondering whether decryption
+                // happened.
+                if normalize_content || coalesce_contents || cmd.remove_restrictions || cmd.decrypt
+                {
                     eprintln!(
                         "flpdf: --normalize-content / --coalesce-contents / \
-                         --remove-restrictions are not applied in the \
-                         --pages/--rotate/--split-pages/--collate pipeline; \
-                         rerun without them or without the page operation"
+                         --remove-restrictions / --decrypt are not applied \
+                         in the --pages/--rotate/--split-pages/--collate \
+                         pipeline; rerun without them or without the page \
+                         operation"
                     );
                     std::process::exit(1);
                 }

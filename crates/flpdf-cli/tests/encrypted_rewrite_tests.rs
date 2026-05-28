@@ -405,6 +405,33 @@ fn decrypt_conflicts_with_inspection_subcommands() {
         .stderr(predicates::str::contains("cannot be used"));
 }
 
+/// `--decrypt` combined with the page-ops pipeline (`--pages` / `--rotate` /
+/// `--split-pages` / `--collate`) must be rejected upfront, mirroring the
+/// existing `--remove-restrictions` rejection. The page-ops pipeline does not
+/// thread the rewrite-only flags, and on encrypted input it rejects the file
+/// outright — so silently passing through `--decrypt` would leave the user
+/// guessing whether decryption actually happened.
+#[test]
+fn decrypt_is_rejected_when_combined_with_page_operations() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("decrypt-pages.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--decrypt", "--pages", ".", "1-z", "--"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--decrypt"))
+        .stderr(predicates::str::contains("are not applied in the --pages"));
+    assert!(
+        !output.exists(),
+        "no output must be produced when the unsupported combination is rejected"
+    );
+}
+
 fn ensure_qpdf_or_skip() -> bool {
     let available = ShellCommand::new("qpdf")
         .arg("--version")
