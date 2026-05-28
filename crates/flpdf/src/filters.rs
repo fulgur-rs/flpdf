@@ -148,21 +148,22 @@ fn encode_stream_data_with_filters(
 }
 
 fn get_decode_params(params: Option<&Object>, index: usize) -> Option<&Object> {
-    match params {
-        None => None,
-        Some(param) if param.as_dict().is_some() => Some(param),
-        Some(param) => param.as_array().and_then(|values| values.get(index)),
+    let param = params?;
+    if param.as_dict().is_some() {
+        Some(param)
+    } else {
+        param.as_array()?.get(index)
     }
 }
 
 fn integer_decode_param(params: &Dictionary, key: &str) -> Result<Option<i64>> {
-    match params.get(key) {
-        None => Ok(None),
-        Some(value) => value
-            .as_integer()
-            .map(Some)
-            .ok_or_else(|| Error::Unsupported(format!("/DecodeParms /{key} must be integer"))),
-    }
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_integer()
+        .map(Some)
+        .ok_or_else(|| Error::Unsupported(format!("/DecodeParms /{key} must be integer")))
 }
 
 fn non_negative_usize_param(params: &Dictionary, key: &str) -> Result<Option<usize>> {
