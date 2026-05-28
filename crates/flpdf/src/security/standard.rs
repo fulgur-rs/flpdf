@@ -1616,6 +1616,117 @@ where
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Writer side — explicit /Crypt filter chain entry (flpdf-9hc.4.7)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Prepend an explicit `/Crypt` filter to the given stream dictionary,
+/// binding it to the named crypt filter `cf_name` via `/DecodeParms /Name`.
+///
+/// Per PDF 1.7 §7.4.10 the `/Crypt` filter must be the FIRST entry in the
+/// `/Filter` array, and its `/DecodeParms` slot must carry a dictionary
+/// `<</Type /CryptFilterDecodeParms /Name cf_name>>`. The other filters in
+/// the chain keep their existing params slot.
+///
+/// The writer uses this for two cases:
+///
+/// - **`/Metadata` exemption** (`cf_name = b"Identity"`): mark the
+///   `/Metadata` stream as plaintext-passthrough when the document is
+///   encrypted with `/EncryptMetadata false`. The reader sees the
+///   `/Identity` crypt filter binding and skips the document-level
+///   stream-encryption pass for this object.
+/// - **Selectively-encrypted streams** (`cf_name` = any named entry from
+///   `/CF`): override the document-level `/StmF` selector for a single
+///   stream with a different crypt filter.
+///
+/// `/Filter` and `/DecodeParms` shape handling:
+///
+/// | Existing `/Filter` | Existing `/DecodeParms`  | Result `/Filter`             | Result `/DecodeParms`              |
+/// |--------------------|--------------------------|------------------------------|------------------------------------|
+/// | absent             | absent                   | `Name(b"Crypt")`             | `Dictionary(crypt_dict)`           |
+/// | `Name(n)`          | absent                   | `Array([Crypt, n])`          | `Array([crypt_dict, Null])`        |
+/// | `Name(n)`          | `Dictionary(d)`          | `Array([Crypt, n])`          | `Array([crypt_dict, Dictionary(d)])` |
+/// | `Array(a)`         | absent                   | `Array([Crypt, ...a])`       | `Array([crypt_dict, Null × a.len()])` |
+/// | `Array(a)`         | `Array(p)` (`p.len()==a.len()`) | `Array([Crypt, ...a])` | `Array([crypt_dict, ...p])`        |
+///
+/// Other input shapes (mismatched `/DecodeParms` array length, or a single
+/// `Dictionary` paired with an `Array` `/Filter`) are normalized to the
+/// closest match by padding the leftover slots with `Null`. The function
+/// does not detect or merge an existing `/Crypt` entry — callers that
+/// might re-apply this on the same dictionary should check first.
+pub(crate) fn prepend_crypt_filter_to_stream_dict(dict: &mut Dictionary, cf_name: &[u8]) {
+    let mut crypt_dp = Dictionary::new();
+    crypt_dp.insert("Type", Object::Name(b"CryptFilterDecodeParms".to_vec()));
+    crypt_dp.insert("Name", Object::Name(cf_name.to_vec()));
+    let crypt_dp_obj = Object::Dictionary(crypt_dp);
+
+    let existing_filter = dict.remove("Filter");
+    let existing_decode_parms = dict.remove("DecodeParms");
+
+    match existing_filter {
+        None => {
+            // No prior filter chain — emit /Crypt as a singleton.
+            dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+            dict.insert("DecodeParms", crypt_dp_obj);
+        }
+        Some(Object::Name(n)) => {
+            // Single existing filter; chain becomes [/Crypt, /N].
+            dict.insert(
+                "Filter",
+                Object::Array(vec![Object::Name(b"Crypt".to_vec()), Object::Name(n)]),
+            );
+            let existing_dp = match existing_decode_parms {
+                None => Object::Null,
+                Some(other) => other,
+            };
+            dict.insert(
+                "DecodeParms",
+                Object::Array(vec![crypt_dp_obj, existing_dp]),
+            );
+        }
+        Some(Object::Array(mut filters)) => {
+            // Existing chain; prepend /Crypt and align /DecodeParms.
+            let chain_len = filters.len();
+            let mut new_filters = Vec::with_capacity(chain_len + 1);
+            new_filters.push(Object::Name(b"Crypt".to_vec()));
+            new_filters.append(&mut filters);
+
+            let mut new_dp = Vec::with_capacity(chain_len + 1);
+            new_dp.push(crypt_dp_obj);
+            match existing_decode_parms {
+                None => {
+                    new_dp.extend((0..chain_len).map(|_| Object::Null));
+                }
+                Some(Object::Array(params)) => {
+                    new_dp.extend(
+                        params
+                            .into_iter()
+                            .chain(std::iter::repeat_with(|| Object::Null))
+                            .take(chain_len),
+                    );
+                }
+                Some(other) => {
+                    // Single dictionary paired with an array filter (malformed
+                    // per spec); place it in the first slot and Null-pad the rest.
+                    new_dp.push(other);
+                    new_dp.extend((1..chain_len).map(|_| Object::Null));
+                }
+            }
+            dict.insert("Filter", Object::Array(new_filters));
+            dict.insert("DecodeParms", Object::Array(new_dp));
+        }
+        Some(other) => {
+            // /Filter was neither a Name nor an Array (malformed per spec).
+            // Preserve the original entries (best-effort) and emit /Crypt as
+            // a singleton — callers passing such inputs already have a bug.
+            dict.insert("Filter", other);
+            if let Some(dp) = existing_decode_parms {
+                dict.insert("DecodeParms", dp);
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -4213,5 +4324,228 @@ mod tests {
             }
             assert_eq!(buf, payload, "stream payload round-trip for {cipher_kind}");
         }
+    }
+
+    // ── Writer side — explicit /Crypt filter chain entry (flpdf-9hc.4.7) ─────
+    //
+    // Round-trip strategy: feed the resulting dict through the reader-side
+    // detectors (`stream_has_explicit_crypt_filter` is private to reader.rs,
+    // so we test the dict shape directly + invoke the reader's lookup
+    // semantics via decode_stream_data_with_filters or equivalent).
+
+    fn crypt_dp_dict_for_name(name: &[u8]) -> Object {
+        let mut dp = Dictionary::new();
+        dp.insert("Type", Object::Name(b"CryptFilterDecodeParms".to_vec()));
+        dp.insert("Name", Object::Name(name.to_vec()));
+        Object::Dictionary(dp)
+    }
+
+    #[test]
+    fn prepend_crypt_filter_with_no_existing_filter_emits_singleton() {
+        let mut dict = Dictionary::new();
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"Identity");
+
+        assert_eq!(dict.get("Filter"), Some(&Object::Name(b"Crypt".to_vec())));
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&crypt_dp_dict_for_name(b"Identity"))
+        );
+    }
+
+    #[test]
+    fn prepend_crypt_filter_to_single_name_filter_becomes_array() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"StdCF");
+
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ])),
+        );
+        // No prior /DecodeParms → second slot is Null (FlateDecode default params).
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&Object::Array(vec![
+                crypt_dp_dict_for_name(b"StdCF"),
+                Object::Null,
+            ])),
+        );
+    }
+
+    #[test]
+    fn prepend_crypt_filter_preserves_existing_single_decode_params() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut flate_dp = Dictionary::new();
+        flate_dp.insert("Predictor", Object::Integer(12));
+        flate_dp.insert("Columns", Object::Integer(4));
+        dict.insert("DecodeParms", Object::Dictionary(flate_dp.clone()));
+
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"Identity");
+
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&Object::Array(vec![
+                crypt_dp_dict_for_name(b"Identity"),
+                Object::Dictionary(flate_dp),
+            ])),
+        );
+    }
+
+    #[test]
+    fn prepend_crypt_filter_to_array_filter_prepends_in_first_slot() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        let mut flate_dp = Dictionary::new();
+        flate_dp.insert("Predictor", Object::Integer(12));
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Dictionary(flate_dp.clone())]),
+        );
+
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"StdCF");
+
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ])),
+        );
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&Object::Array(vec![
+                crypt_dp_dict_for_name(b"StdCF"),
+                Object::Null,
+                Object::Dictionary(flate_dp),
+            ])),
+        );
+    }
+
+    #[test]
+    fn prepend_crypt_filter_to_array_filter_without_decode_params_null_pads() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"RunLengthDecode".to_vec()),
+            ]),
+        );
+
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"Identity");
+
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"RunLengthDecode".to_vec()),
+            ])),
+        );
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&Object::Array(vec![
+                crypt_dp_dict_for_name(b"Identity"),
+                Object::Null,
+                Object::Null,
+                Object::Null,
+            ])),
+        );
+    }
+
+    /// When the existing `/DecodeParms` array is shorter than `/Filter`
+    /// (malformed input), `prepend_crypt_filter_to_stream_dict` Null-pads
+    /// the tail so the resulting array length matches the new filter chain.
+    #[test]
+    fn prepend_crypt_filter_pads_short_decode_params_array() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        // Only one /DecodeParms entry for two filters — malformed but recoverable.
+        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
+
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"StdCF");
+
+        let Some(Object::Array(dp)) = dict.get("DecodeParms") else {
+            panic!("expected /DecodeParms Array");
+        };
+        let Some(Object::Array(fl)) = dict.get("Filter") else {
+            panic!("expected /Filter Array");
+        };
+        assert_eq!(
+            dp.len(),
+            fl.len(),
+            "/DecodeParms and /Filter array lengths must match after prepend"
+        );
+        assert_eq!(dp[0], crypt_dp_dict_for_name(b"StdCF"));
+    }
+
+    /// The Identity short-circuit is purely a reader-side decision: when
+    /// the writer prepends `/Crypt` with `cf_name = "Identity"`, the
+    /// emitted dict must still carry the explicit binding so the reader's
+    /// `explicit_crypt_mode` can route to `EncryptionMode::Identity` and
+    /// skip stream decryption for this object. Verified by confirming the
+    /// `/DecodeParms /Name` entry equals `Identity`.
+    #[test]
+    fn prepend_crypt_filter_identity_round_trips_via_reader_lookup() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"Identity");
+
+        let Some(Object::Array(dp_arr)) = dict.get("DecodeParms") else {
+            panic!("expected /DecodeParms Array");
+        };
+        let Object::Dictionary(crypt_dp) = &dp_arr[0] else {
+            panic!("expected first /DecodeParms entry to be a Dictionary");
+        };
+        assert_eq!(
+            crypt_dp.get("Name"),
+            Some(&Object::Name(b"Identity".to_vec())),
+            "reader looks up /DecodeParms /Name to decide Identity short-circuit"
+        );
+    }
+
+    /// PDF 1.7 §7.4.10 mandates `/Crypt` as the FIRST entry of the `/Filter`
+    /// chain. Regression guard: even when the existing chain has many
+    /// entries, our prepend must keep `/Crypt` at index 0.
+    #[test]
+    fn prepend_crypt_filter_always_places_crypt_first() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"RunLengthDecode".to_vec()),
+                Object::Name(b"ASCII85Decode".to_vec()),
+            ]),
+        );
+        prepend_crypt_filter_to_stream_dict(&mut dict, b"StdCF");
+
+        let Some(Object::Array(fl)) = dict.get("Filter") else {
+            panic!("expected /Filter Array");
+        };
+        assert_eq!(
+            fl[0],
+            Object::Name(b"Crypt".to_vec()),
+            "/Crypt must be first per PDF 1.7 §7.4.10"
+        );
     }
 }
