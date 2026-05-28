@@ -261,6 +261,12 @@ struct Cli {
     /// surface instead (flpdf-4x6).
     #[arg(long = "static-id")]
     static_id: bool,
+    /// Force every AES CBC IV to all-zero bytes instead of a random value
+    /// (top-level alias of `flpdf rewrite --static-aes-iv`).
+    /// **Testing only; produces insecure deterministic IVs, NOT for
+    /// production.** Mirrors `qpdf --static-aes-iv`.
+    #[arg(long = "static-aes-iv", hide = true)]
+    static_aes_iv: bool,
     /// Strip encryption and advisory permission restrictions from the output
     /// (top-level alias of `flpdf rewrite --remove-restrictions`; qpdf
     /// `--remove-restrictions` equivalent). Does NOT bypass authentication.
@@ -754,6 +760,11 @@ struct RewriteCommand {
     /// FLPDF_STATIC_ID_QUIET env var).
     #[arg(long = "static-id")]
     static_id: bool,
+    /// Force every AES CBC IV to all-zero bytes instead of a random value.
+    /// **Testing only; produces insecure deterministic IVs, NOT for
+    /// production.** Mirrors `qpdf --static-aes-iv`.
+    #[arg(long = "static-aes-iv", hide = true)]
+    static_aes_iv: bool,
     /// Strip encryption and advisory permission restrictions from the output
     /// (qpdf `--remove-restrictions` equivalent).
     ///
@@ -1207,6 +1218,7 @@ fn main() {
         }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.static_aes_iv = args.static_aes_iv;
         options.no_original_object_ids = args.no_original_object_ids;
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
@@ -1272,6 +1284,7 @@ fn main() {
         }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.static_aes_iv = args.static_aes_iv;
         options.no_original_object_ids = args.no_original_object_ids;
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
@@ -1312,6 +1325,7 @@ fn main() {
     } else {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.static_aes_iv = args.static_aes_iv;
         options.no_original_object_ids = args.no_original_object_ids;
         // Top-level `--qdf` is an alias of `rewrite --qdf`. The QDF code path
         // lives in the full-rewrite writer, so --qdf must imply
@@ -1644,6 +1658,7 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
             let mut options = WriteOptions::default();
             options.static_id = cmd.static_id;
+            options.static_aes_iv = cmd.static_aes_iv;
             options.min_version = cmd.min_version;
             options.force_version = cmd.force_version;
             options.no_original_object_ids = cmd.no_original_object_ids;
