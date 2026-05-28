@@ -1434,53 +1434,19 @@ fn main() {
                 }
             }
         }
-        // Top-level --encrypt: parse the segment and stash on WriteOptions.
-        // The library layer (writer.rs) does the heavy lifting (id0 resolution,
-        // dict build, per-object encryption). Force full_rewrite=true because
-        // the incremental write path cannot rewrite source bytes through an
-        // encryption pass. Parse errors are surfaced as exit-2 diagnostics —
-        // the same pattern the surrounding --compress-streams parser uses.
-        if !args.encrypt.is_empty() {
-            match parse_encrypt_segment(&args.encrypt) {
-                Ok(params) => {
-                    options.encrypt = Some(params);
-                    options.full_rewrite = true;
-                }
-                Err(e) => {
-                    eprintln!("flpdf: {e}");
-                    std::process::exit(2);
-                }
-            }
-        }
-        // Top-level --copy-encryption-from: open the donor, validate its
-        // encryption scheme, and stash CopyEncryptionSource on WriteOptions.
-        // Force full_rewrite=true for the same reason as --encrypt.
-        if let Some(ref donor_path) = args.copy_encryption_from {
-            match build_copy_encryption_source(
-                donor_path,
-                args.encryption_file_password.as_deref(),
-            ) {
-                Ok(src) => {
-                    options.copy_encryption = Some(src);
-                    options.full_rewrite = true;
-                }
-                Err(e) => {
-                    eprintln!("flpdf: {e}");
-                    std::process::exit(2);
-                }
-            }
-        }
-        // Reject --copy-encryption-from combined with page operations
-        // (same reason as --encrypt: the page-op pipeline doesn't thread
-        // copy_encryption through its extraction paths).
-        if options.copy_encryption.is_some() && page_ops_active(&args.page_ops) {
-            eprintln!(
-                "flpdf: --copy-encryption-from is not applied in the \
-                 --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without --copy-encryption-from or without the page operation"
-            );
-            std::process::exit(1);
-        }
+        // Top-level --encrypt / --copy-encryption-from: wire encryption onto
+        // WriteOptions (shared with the `rewrite` surface via
+        // apply_encryption_options). Both force full_rewrite because the
+        // incremental writer cannot run an encryption pass; parse / donor-open
+        // errors exit 2. The page-op pipeline does not thread either option, so
+        // the `else if page_ops_active` arm above already rejects them; this is
+        // the non-page-op branch, so no further page-op guard is needed here.
+        apply_encryption_options(
+            &mut options,
+            &args.encrypt,
+            args.copy_encryption_from.as_deref(),
+            args.encryption_file_password.as_deref(),
+        );
         run_rewrite(
             args.input,
             args.output,
@@ -1801,39 +1767,16 @@ fn run_command(command: Commands) -> CliResult<()> {
             if options.stream_data.is_some() {
                 options.full_rewrite = true;
             }
-            // `rewrite --encrypt`: parse the segment, stash on WriteOptions,
-            // and force full_rewrite (the incremental write path cannot
-            // rewrite source bytes through an encryption pass). Mirrors the
-            // top-level alias dispatch in the surrounding `else` branch.
-            if !cmd.encrypt.is_empty() {
-                match parse_encrypt_segment(&cmd.encrypt) {
-                    Ok(params) => {
-                        options.encrypt = Some(params);
-                        options.full_rewrite = true;
-                    }
-                    Err(e) => {
-                        eprintln!("flpdf: {e}");
-                        std::process::exit(2);
-                    }
-                }
-            }
-            // `rewrite --copy-encryption-from`: open donor, validate, stash.
-            // Same full_rewrite promotion as --encrypt.
-            if let Some(ref donor_path) = cmd.copy_encryption_from {
-                match build_copy_encryption_source(
-                    donor_path,
-                    cmd.encryption_file_password.as_deref(),
-                ) {
-                    Ok(src) => {
-                        options.copy_encryption = Some(src);
-                        options.full_rewrite = true;
-                    }
-                    Err(e) => {
-                        eprintln!("flpdf: {e}");
-                        std::process::exit(2);
-                    }
-                }
-            }
+            // `rewrite --encrypt` / `--copy-encryption-from`: wire encryption
+            // onto WriteOptions (shared with the top-level surface via
+            // apply_encryption_options). Both force full_rewrite — the
+            // incremental write path cannot run an encryption pass.
+            apply_encryption_options(
+                &mut options,
+                &cmd.encrypt,
+                cmd.copy_encryption_from.as_deref(),
+                cmd.encryption_file_password.as_deref(),
+            );
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
@@ -1981,6 +1924,46 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
     // Clean — exit 0.
     println!("PDF check succeeded");
     Ok(())
+}
+
+/// Wire `--encrypt` / `--copy-encryption-from` onto `options`, shared by the
+/// top-level and `rewrite` surfaces so the two stay in lock-step. Both options
+/// force `full_rewrite` because the incremental write path cannot run an
+/// encryption pass. A `--encrypt` parse error or a `--copy-encryption-from`
+/// donor-open/validation error prints a `flpdf:`-prefixed diagnostic and exits
+/// 2, matching the surrounding option parsers. The two options are mutually
+/// exclusive at the CLI layer (clap `conflicts_with`), so at most one branch
+/// fires.
+fn apply_encryption_options(
+    options: &mut WriteOptions,
+    encrypt: &[String],
+    copy_encryption_from: Option<&std::path::Path>,
+    encryption_file_password: Option<&str>,
+) {
+    if !encrypt.is_empty() {
+        match parse_encrypt_segment(encrypt) {
+            Ok(params) => {
+                options.encrypt = Some(params);
+                options.full_rewrite = true;
+            }
+            Err(e) => {
+                eprintln!("flpdf: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Some(donor_path) = copy_encryption_from {
+        match build_copy_encryption_source(donor_path, encryption_file_password) {
+            Ok(src) => {
+                options.copy_encryption = Some(src);
+                options.full_rewrite = true;
+            }
+            Err(e) => {
+                eprintln!("flpdf: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 }
 
 /// Open a donor PDF at `path` (with optional `password`) and extract the
