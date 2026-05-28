@@ -136,7 +136,7 @@ impl PermissionsConfig {
 
         // Bits 1-2: reserved, must be 0 (already 0).
         // Bit 3 (0x004): any print permission.
-        if matches!(self.print, PrintPermission::Low | PrintPermission::High) {
+        if self.print != PrintPermission::None {
             bits |= 0x004;
         }
         // Bit 4 (0x008): modify_contents.
@@ -166,7 +166,7 @@ impl PermissionsConfig {
             bits |= 0x400;
         }
         // Bit 12 (0x800): print_high_quality — only meaningful when bit 3 is set.
-        if matches!(self.print, PrintPermission::High) {
+        if self.print == PrintPermission::High {
             bits |= 0x800;
         }
         // Bits 13-32: reserved, must be 1 for R≥3.
