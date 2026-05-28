@@ -584,11 +584,7 @@ fn rewrite_subcommand_static_aes_iv_produces_deterministic_output() {
 /// Build a donor PDF encrypted with V=4 AES-128 and return the path.
 /// Uses `--static-id --static-aes-iv` so the donor is deterministic, but the
 /// CSPRNG path is exercised by the copy-encryption tests themselves.
-fn make_donor_pdf(
-    tmp: &tempfile::TempDir,
-    user_pw: &str,
-    owner_pw: &str,
-) -> PathBuf {
+fn make_donor_pdf(tmp: &tempfile::TempDir, user_pw: &str, owner_pw: &str) -> PathBuf {
     let donor = tmp.path().join("donor.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
