@@ -29,3 +29,9 @@ sha2 = "0.10"
 stringprep = "0.1"
 hex = "0.4"
 serde_json = "1"
+# Cryptographically secure RNG for encryption write-side IV / random-bytes use
+# (flpdf-9hc.4.9 --encrypt). Pure-Rust frontend; OS APIs underneath
+# (Linux getrandom(2), macOS SecRandomCopyBytes, Windows BCryptGenRandom).
+# Already present as a transitive dep via tempfile/etc — direct declaration
+# is free build-closure-wise.
+getrandom = "0.2"
