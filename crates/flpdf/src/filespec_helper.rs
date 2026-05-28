@@ -1219,7 +1219,7 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
                 0,
                 DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
             )?;
-            if let Object::Dictionary(d) = dict_obj {
+            if let Some(d) = dict_obj.into_dict() {
                 ef_stream.dict = d;
             }
         }
@@ -1276,7 +1276,7 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
                 0,
                 DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
             )?;
-            if let Object::Dictionary(d) = fs_obj {
+            if let Some(d) = fs_obj.into_dict() {
                 new_fs = d;
             }
         }
@@ -1351,7 +1351,7 @@ mod tests {
         fs_ref: ObjectRef,
     ) -> crate::object::Stream {
         let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
-        let Object::Dictionary(fs_dict) = fs_obj else {
+        let Some(fs_dict) = fs_obj.into_dict() else {
             panic!("expected dictionary");
         };
         let ef_sub = match fs_dict.get("EF") {
@@ -1491,7 +1491,7 @@ mod tests {
             .expect("build");
 
         let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
-        let Object::Dictionary(fs_dict) = fs_obj else {
+        let Some(fs_dict) = fs_obj.into_dict() else {
             panic!("expected dictionary");
         };
         let f = match fs_dict.get("F") {
@@ -1517,7 +1517,7 @@ mod tests {
             .expect("build");
 
         let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
-        let Object::Dictionary(fs_dict) = fs_obj else {
+        let Some(fs_dict) = fs_obj.into_dict() else {
             panic!("expected dictionary");
         };
         let f = match fs_dict.get("F") {
@@ -1667,7 +1667,7 @@ mod tests {
         let fs_ref = add_attachment_from_path(&mut pdf, b"report.pdf", &file_path).expect("attach");
 
         let fs_obj = pdf.resolve(fs_ref).expect("resolve");
-        let Object::Dictionary(fs_dict) = fs_obj else {
+        let Some(fs_dict) = fs_obj.into_dict() else {
             panic!("expected dict");
         };
         let f = match fs_dict.get("F") {
@@ -1711,7 +1711,7 @@ mod tests {
             .expect("attach non-ASCII basename");
 
         let fs_obj = pdf.resolve(fs_ref).expect("resolve");
-        let Object::Dictionary(fs_dict) = fs_obj else {
+        let Some(fs_dict) = fs_obj.into_dict() else {
             panic!("expected dict");
         };
         let f = match fs_dict.get("F") {

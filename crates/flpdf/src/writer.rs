@@ -668,7 +668,7 @@ fn write_updated_object_streams<R: Read + Seek>(
 
     for (stream_ref, member_refs) in members_by_stream {
         let stream_object = pdf.resolve(*stream_ref)?;
-        let Object::Stream(stream) = stream_object else {
+        let Some(stream) = stream_object.into_stream() else {
             return Err(crate::Error::Unsupported(format!(
                 "object {} is not an object stream",
                 stream_ref.number

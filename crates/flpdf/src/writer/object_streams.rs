@@ -53,7 +53,7 @@ pub(crate) fn is_eligible_for_objstm(
     }
 
     // 3 & 4. Check /Type for Dictionary objects.
-    if let Object::Dictionary(dict) = object {
+    if let Some(dict) = object.as_dict() {
         if dict_type_is(dict, b"ObjStm") || dict_type_is(dict, b"XRef") {
             return false;
         }
@@ -197,7 +197,7 @@ pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Se
     let refs: Vec<ObjectRef> = pdf.object_refs();
     for r in refs {
         let obj = pdf.resolve(r)?;
-        if let Object::Stream(s) = &obj {
+        if let Some(s) = obj.as_stream() {
             if dict_type_is(&s.dict, b"ObjStm") {
                 if let Some(Object::Reference(len_ref)) = s.dict.get("Length") {
                     excluded.insert(*len_ref);

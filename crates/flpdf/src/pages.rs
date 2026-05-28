@@ -46,7 +46,7 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
 ) -> Result<Vec<ObjectRef>> {
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
     let catalog = pdf.resolve(catalog_ref)?;
-    let Object::Dictionary(catalog) = catalog else {
+    let Some(catalog) = catalog.into_dict() else {
         return Err(Error::Unsupported(format!(
             "document catalog {catalog_ref} is not a dictionary"
         )));
@@ -96,7 +96,7 @@ pub fn page_content_bytes<R: Read + Seek>(
 ) -> Result<Vec<u8>> {
     // Resolve the page object itself.
     let page_obj = pdf.resolve(page_ref)?;
-    let Object::Dictionary(page_dict) = page_obj else {
+    let Some(page_dict) = page_obj.into_dict() else {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot extract /Contents"
         )));
@@ -261,7 +261,7 @@ fn collect_content_streams<R: Read + Seek>(
 pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<()> {
     // ── 1. Resolve the page dictionary ────────────────────────────────────────
     let page_obj = pdf.resolve(page_ref)?;
-    let Object::Dictionary(page_dict) = page_obj else {
+    let Some(page_dict) = page_obj.into_dict() else {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot coalesce /Contents"
         )));
@@ -381,7 +381,7 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
 
     // ── 6. Re-resolve the page dictionary (it may have been evicted) and patch /Contents ─
     let page_obj2 = pdf.resolve(page_ref)?;
-    let Object::Dictionary(mut new_page_dict) = page_obj2 else {
+    let Some(mut new_page_dict) = page_obj2.into_dict() else {
         return Err(Error::Unsupported(format!(
             "object {page_ref} unexpectedly not a dictionary after coalesce"
         )));
@@ -451,7 +451,7 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
         }
 
         let node_obj = pdf.resolve(current)?;
-        let Object::Dictionary(dict) = node_obj else {
+        let Some(dict) = node_obj.into_dict() else {
             // Not a dictionary — cannot walk further.
             return Ok(None);
         };
@@ -520,7 +520,7 @@ fn walk_page_tree<R: Read + Seek>(
     }
 
     let node_obj = pdf.resolve(node)?;
-    let Object::Dictionary(dict) = node_obj else {
+    let Some(dict) = node_obj.into_dict() else {
         return Ok(());
     };
 
@@ -533,7 +533,7 @@ fn walk_page_tree<R: Read + Seek>(
         .unwrap_or_default();
 
     if node_type.as_slice() == b"Pages" {
-        if let Some(Object::Array(kids)) = dict.get("Kids") {
+        if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
             for kid in kids {
                 if let Object::Reference(reference) = kid {
                     walk_page_tree(pdf, *reference, seen, pages, depth + 1, max_depth)?;

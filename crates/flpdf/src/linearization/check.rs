@@ -155,7 +155,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     let first_obj = pdf
         .resolve(first_obj_ref)
         .map_err(LinearizationCheckError::from)?;
-    let Object::Dictionary(param_dict) = first_obj else {
+    let Some(param_dict) = first_obj.into_dict() else {
         return Err(LinearizationCheckError::NotLinearized);
     };
 

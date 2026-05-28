@@ -164,7 +164,7 @@ fn compute_closure<R: Read + Seek>(
             if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page"));
 
         if is_pages_node || is_page_leaf {
-            if let Object::Dictionary(dict) = &obj {
+            if let Some(dict) = obj.as_dict() {
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
                         // Pages → sibling pages — never follow.
