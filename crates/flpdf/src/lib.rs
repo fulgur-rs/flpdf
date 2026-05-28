@@ -100,7 +100,6 @@ pub use embedded_files::{
     LEAF_MAX,
 };
 pub use encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
-pub use security::standard::ObjectKeyAlg;
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{
     add_attachment_from_path, copy_attachments_from, encode_utf16be, extract_attachment,
@@ -129,6 +128,7 @@ pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};
 pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
+pub use security::standard::ObjectKeyAlg;
 pub use subset_prune::prune_after_subset;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,

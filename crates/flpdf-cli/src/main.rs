@@ -1997,12 +1997,7 @@ fn build_copy_encryption_source(
     let info = donor
         .encryption_info()
         .map_err(|e| format!("--copy-encryption-from: failed to read encryption info: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "--copy-encryption-from: donor {:?} is not encrypted",
-                path
-            )
-        })?;
+        .ok_or_else(|| format!("--copy-encryption-from: donor {:?} is not encrypted", path))?;
 
     // Walking-skeleton scope: only V=4 AES-128 (StmF=AESV2 / StrF=AESV2).
     // Note: encryption_info uses qpdf_name() which returns "AESv2" (lowercase v).
@@ -2036,24 +2031,19 @@ fn build_copy_encryption_source(
     // Extract the /Encrypt ObjectRef from the donor trailer, then resolve it.
     // Pull the ref while holding the trailer borrow, then drop that borrow
     // before calling resolve() which needs &mut self.
-    let encrypt_ref = donor
-        .trailer()
-        .get_ref("Encrypt")
-        .ok_or_else(|| {
-            format!(
-                "--copy-encryption-from: donor {:?} has no /Encrypt in trailer",
-                path
-            )
-        })?;
+    let encrypt_ref = donor.trailer().get_ref("Encrypt").ok_or_else(|| {
+        format!(
+            "--copy-encryption-from: donor {:?} has no /Encrypt in trailer",
+            path
+        )
+    })?;
 
-    let encrypt_obj = donor
-        .resolve(encrypt_ref)
-        .map_err(|e| {
-            format!(
-                "--copy-encryption-from: failed to resolve /Encrypt in {:?}: {e}",
-                path
-            )
-        })?;
+    let encrypt_obj = donor.resolve(encrypt_ref).map_err(|e| {
+        format!(
+            "--copy-encryption-from: failed to resolve /Encrypt in {:?}: {e}",
+            path
+        )
+    })?;
 
     let encrypt_dict = match encrypt_obj {
         Object::Dictionary(d) => d,
