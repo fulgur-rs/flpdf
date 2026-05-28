@@ -25,7 +25,9 @@
 //! testing is the separate `--static-aes-iv` flag tracked under
 //! flpdf-9hc.4.13.
 
+use crate::object::Dictionary;
 use crate::permissions::PermissionsConfig;
+use crate::security::standard::ObjectKeyAlg;
 
 /// Encryption method to apply at write time.
 ///
@@ -90,4 +92,36 @@ impl EncryptParams {
             encrypt_metadata: true,
         }
     }
+}
+
+/// Donor `/Encrypt` dictionary and derived file key for the
+/// `--copy-encryption-from` write path (flpdf-9hc.4.11).
+///
+/// Built by the CLI layer from the donor PDF's on-disk state (opened with
+/// [`crate::Pdf::open_with_options`]) and stored in
+/// [`crate::WriteOptions::copy_encryption`].  The writer uses it to construct
+/// an [`crate::writer::EncryptionContext`] directly, bypassing the normal
+/// password-derivation path.
+///
+/// **Scope:** Only V=4 AES-128 donors are supported in this release.
+/// Donors using other schemes (V=1/V=2/V=4 RC4/V=5 R=6) are rejected at the
+/// CLI layer with a clear "not yet supported (flpdf-9hc.4.9 follow-up)"
+/// diagnostic.
+#[derive(Debug, Clone)]
+pub struct CopyEncryptionSource {
+    /// The donor's `/Encrypt` dictionary, copied verbatim.  The writer emits
+    /// it as a new indirect object in the output, referencing it from the
+    /// trailer's `/Encrypt` entry.
+    pub encrypt_dict: Dictionary,
+    /// The donor's recovered file encryption key (from
+    /// [`crate::Pdf::encryption_file_key`]).  The writer uses it directly
+    /// instead of re-deriving a key from a password, so that encrypted strings
+    /// and streams are consistent with the copied `/O` / `/U` / `/P` entries.
+    pub file_key: Vec<u8>,
+    /// The donor's `/ID[0]` bytes.  Copied into the output trailer's `/ID[0]`
+    /// position; Algorithm 2 key derivation is pinned to this value.
+    pub id0: Vec<u8>,
+    /// Per-object key derivation algorithm implied by the donor's crypt filter.
+    /// Always [`ObjectKeyAlg::Aes`] for the V=4 AES-128 walking-skeleton scope.
+    pub object_key_alg: ObjectKeyAlg,
 }

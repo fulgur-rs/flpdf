@@ -99,7 +99,8 @@ pub use embedded_files::{
     list_embedded_files_with_max_depth, remove_attachment, DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
     LEAF_MAX,
 };
-pub use encrypt_setup::{EncryptMethod, EncryptParams};
+pub use encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
+pub use security::standard::ObjectKeyAlg;
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{
     add_attachment_from_path, copy_attachments_from, encode_utf16be, extract_attachment,

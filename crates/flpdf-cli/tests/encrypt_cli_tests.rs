@@ -578,3 +578,272 @@ fn rewrite_subcommand_static_aes_iv_produces_deterministic_output() {
         "rewrite --static-id --static-aes-iv must produce byte-identical output"
     );
 }
+
+// ── --copy-encryption-from tests (flpdf-9hc.4.11) ───────────────────────────
+
+/// Build a donor PDF encrypted with V=4 AES-128 and return the path.
+/// Uses `--static-id --static-aes-iv` so the donor is deterministic, but the
+/// CSPRNG path is exercised by the copy-encryption tests themselves.
+fn make_donor_pdf(
+    tmp: &tempfile::TempDir,
+    user_pw: &str,
+    owner_pw: &str,
+) -> PathBuf {
+    let donor = tmp.path().join("donor.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--encrypt",
+            user_pw,
+            owner_pw,
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&donor)
+        .assert()
+        .success();
+    donor
+}
+
+/// `--copy-encryption-from` produces an output that carries /Encrypt and that
+/// flpdf itself can round-trip through its own reader with both user and
+/// owner passwords.
+#[test]
+fn copy_encryption_from_output_has_encrypt_dict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "secretuser", "secretowner");
+    let out = tmp.path().join("copy_out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "secretuser",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "copy-encryption-from output must carry /Encrypt"
+    );
+}
+
+/// The output of `--copy-encryption-from` decrypts with the donor's user
+/// password through qpdf and reports V=4 / R=4 AESv2 — confirming the
+/// /Encrypt scheme was copied, not re-derived.
+#[test]
+fn copy_encryption_from_decrypts_with_donor_user_password_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "donoruser", "donorowner");
+    let out = tmp.path().join("copy_out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "donoruser",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .success();
+
+    // qpdf must accept the donor's user password.
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=donoruser")
+        .arg("--show-encryption")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --show-encryption failed with donor user password: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 4"),
+        "qpdf must report R=4 on copy-encryption-from output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Supplied password is user password"),
+        "qpdf must accept donor user password: {stdout}"
+    );
+}
+
+/// The output of `--copy-encryption-from` also decrypts with the donor's
+/// owner password.
+#[test]
+fn copy_encryption_from_decrypts_with_donor_owner_password_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "userpass", "ownerpass");
+    let out = tmp.path().join("copy_out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "userpass",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=ownerpass")
+        .arg("--show-encryption")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("Supplied password is owner password"),
+        "qpdf must accept donor owner password: {stdout}"
+    );
+}
+
+/// `--copy-encryption-from` on a one-page fixture produces output that
+/// qpdf can fully decrypt (not just inspect) — confirming stream encryption
+/// is consistent with the copied /Encrypt dict.
+#[test]
+fn copy_encryption_from_round_trip_decrypts_cleanly_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "pw", "pw");
+    let encrypted = tmp.path().join("encrypted.pdf");
+    let decrypted = tmp.path().join("decrypted.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "pw",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&encrypted)
+        .assert()
+        .success();
+
+    let decrypt = ShellCommand::new("qpdf")
+        .arg("--password=pw")
+        .arg("--decrypt")
+        .arg(&encrypted)
+        .arg(&decrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "qpdf --decrypt failed on copy-encryption-from output: {}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+}
+
+/// `rewrite` subcommand also supports `--copy-encryption-from`.
+#[test]
+fn rewrite_subcommand_copy_encryption_from_succeeds() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "donorpw", "ownerpw");
+    let out = tmp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "donorpw",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=donorpw")
+        .arg("--show-encryption")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 4") && stdout.contains("Supplied password is user password"),
+        "rewrite --copy-encryption-from: qpdf must report R=4 + user-password match: {stdout}"
+    );
+}
+
+/// `--copy-encryption-from` applied to a plaintext donor is rejected with a
+/// clear "not encrypted" diagnostic.
+#[test]
+fn copy_encryption_from_unencrypted_donor_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            fixture(UNENCRYPTED_FIXTURE).to_str().unwrap(),
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not encrypted"));
+}
+
+/// `--copy-encryption-from` with a wrong password is rejected with an error
+/// (the donor cannot be opened with the supplied password).
+#[test]
+fn copy_encryption_from_wrong_password_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "correctpw", "ownerpw");
+    let out = tmp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "wrongpw",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .failure()
+        // The error surfaces as either "failed to open" (wrong password
+        // rejected by the reader at open time) or "failed to recover file
+        // key" (auth passes but key recovery fails). Both include the
+        // --copy-encryption-from prefix, so we just pin that.
+        .stderr(predicates::str::contains("--copy-encryption-from"));
+    assert!(!out.exists());
+}

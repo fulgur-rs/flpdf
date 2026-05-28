@@ -354,6 +354,24 @@ pub struct WriteOptions {
     ///   [`ObjectStreamMode::Disable`] (ObjStm containers encrypt as a
     ///   single blob, not per-member, requiring a separate code path).
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
+
+    /// Copy the `/Encrypt` dictionary verbatim from a donor PDF and re-use its
+    /// file encryption key (qpdf `--copy-encryption-from` equivalent —
+    /// flpdf-9hc.4.11).
+    ///
+    /// When set the writer bypasses the normal password-derivation path and
+    /// constructs an [`EncryptionContext`] directly from the pre-recovered file
+    /// key, the donor's `/Encrypt` dict, and the donor's `/ID[0]`.  The output
+    /// can therefore be decrypted with the donor's user and owner passwords.
+    ///
+    /// Exactly one of `encrypt` and `copy_encryption` may be set; the CLI
+    /// enforces mutual exclusion via `conflicts_with`.  The writer asserts this
+    /// invariant at the top of the full-rewrite path.
+    ///
+    /// **Scope:** Only V=4 AES-128 donors are supported (flpdf-9hc.4.9 walking
+    /// skeleton); other schemes are rejected by the CLI before this field is
+    /// populated.
+    pub copy_encryption: Option<crate::encrypt_setup::CopyEncryptionSource>,
 }
 
 /// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
@@ -1614,6 +1632,37 @@ fn build_encryption_context<R: Read + Seek>(
     })
 }
 
+/// Build an [`EncryptionContext`] from a donor [`CopyEncryptionSource`]
+/// (flpdf-9hc.4.11 `--copy-encryption-from` path).
+///
+/// Unlike [`build_encryption_context`], this function does **not** derive a
+/// file key from passwords: it takes the donor's already-recovered file key
+/// verbatim, copies the donor's `/Encrypt` dictionary wholesale, and pins
+/// `/ID[0]` to the donor's permanent identifier.  The output can then be
+/// decrypted with the donor's original user or owner password because all the
+/// ingredients of Algorithm 2 (key-length, `/O`, `/P`, `/ID[0]`) are
+/// reproduced exactly.
+fn build_copy_encryption_context(
+    src: &crate::encrypt_setup::CopyEncryptionSource,
+    options: &WriteOptions,
+    existing_max: u32,
+) -> Result<EncryptionContext> {
+    let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
+        crate::Error::Unsupported(
+            "full-rewrite copy-encryption: /Encrypt object number overflows u32".to_string(),
+        )
+    })?;
+
+    Ok(EncryptionContext {
+        encrypt_dict: src.encrypt_dict.clone(),
+        file_key: src.file_key.clone(),
+        object_key_alg: src.object_key_alg,
+        encrypt_ref: ObjectRef::new(encrypt_num, 0),
+        id0: src.id0.clone(),
+        static_aes_iv: options.static_aes_iv,
+    })
+}
+
 /// Resolve the `/ID[0]` bytes to use for the encrypted output's file key
 /// derivation AND the output trailer's `/ID` array. Preference order:
 ///
@@ -1815,14 +1864,26 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
 
-    // ── flpdf-9hc.4.9 walking-skeleton encryption preflight ──────────────────
-    // The encrypted-output path piggybacks on the simple full-rewrite case:
-    // classic xref Table form, no ObjStm batches, no QDF. Reject the
-    // incompatible flag combinations upfront with a clear diagnostic rather
-    // than silently producing a corrupt file.
-    if options.encrypt.is_some() && options.qdf {
+    // ── flpdf-9hc.4.9 / 4.11 walking-skeleton encryption preflight ─────────
+    // The encrypted-output path (both --encrypt and --copy-encryption-from)
+    // piggybacks on the simple full-rewrite case: classic xref Table form, no
+    // ObjStm batches, no QDF.  Reject incompatible flag combinations upfront
+    // with a clear diagnostic rather than silently producing a corrupt file.
+    //
+    // Invariant: at most ONE of encrypt / copy_encryption is set.  The CLI
+    // enforces this via conflicts_with; assert here for safety so library
+    // callers are also caught.
+    assert!(
+        !(options.encrypt.is_some() && options.copy_encryption.is_some()),
+        "encrypt and copy_encryption are mutually exclusive"
+    );
+    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+
+    if encrypting && options.qdf {
         return Err(crate::Error::Unsupported(
-            "--encrypt cannot be combined with --qdf (flpdf-9hc.4.9 walking skeleton)".to_string(),
+            "--encrypt / --copy-encryption-from cannot be combined with --qdf \
+             (flpdf-9hc.4.9 walking skeleton)"
+                .to_string(),
         ));
     }
 
@@ -1832,7 +1893,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // code path (flpdf-9hc.4.9 follow-up). Override the caller's
     // object_streams setting with Disable when encryption is active.
     let planner_options;
-    let planner_config = if options.encrypt.is_some() {
+    let planner_config = if encrypting {
         planner_options = WriteOptions {
             object_streams: ObjectStreamMode::Disable,
             ..options.clone()
@@ -1863,13 +1924,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         effective_xref_form = XrefForm::Table;
     }
 
-    // flpdf-9hc.4.9 walking skeleton: force classic xref Table form for the
-    // encrypted path. Xref streams can carry /Encrypt in their dict, but the
-    // emission path (line ~1924+) doesn't yet exclude the xref stream's own
-    // bytes from encryption — needs its own handling. Table form is what
-    // qpdf emits for default `--encrypt …` output (per the v4-aes-128-r4.pdf
-    // fixture in tests/fixtures/encrypted/) so this matches user expectation.
-    if options.encrypt.is_some() {
+    // flpdf-9hc.4.9 / 4.11 walking skeleton: force classic xref Table form
+    // for the encrypted path (both --encrypt and --copy-encryption-from).
+    // Xref streams can carry /Encrypt in their dict, but the emission path
+    // doesn't yet exclude the xref stream's own bytes from encryption —
+    // needs its own handling. Table form is what qpdf emits for default
+    // `--encrypt …` output so this matches user expectation.
+    if encrypting {
         effective_xref_form = XrefForm::Table;
     }
 
@@ -1913,7 +1974,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         }
     }
 
-    // ── flpdf-9hc.4.9 walking-skeleton encryption context ────────────────────
+    // ── flpdf-9hc.4.9 / 4.11 walking-skeleton encryption context ───────────
     // Built ONCE up front (not inside the emission loop) so:
     // - /ID[0] is decided before any object is encrypted (Algorithm 2 derives
     //   the file key from /ID[0]; the trailer must carry the SAME bytes).
@@ -1927,6 +1988,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             params,
             existing_max,
         )?)
+    } else if let Some(ref src) = options.copy_encryption {
+        Some(build_copy_encryption_context(src, options, existing_max)?)
     } else {
         None
     };
