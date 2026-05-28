@@ -175,6 +175,7 @@ struct Cli {
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
+              "decrypt",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf",
@@ -279,6 +280,30 @@ struct Cli {
               "show_npages", "show_pages",
           ])]
     remove_restrictions: bool,
+    /// Strip the `/Encrypt` dictionary from the output (top-level alias of
+    /// `flpdf rewrite --decrypt`; qpdf `--decrypt` equivalent). On
+    /// encrypted input requires `--password` to authenticate; on plaintext
+    /// input it is a no-op pass-through. Silent in both cases (matching
+    /// qpdf), unlike `--remove-restrictions` which prints a one-line
+    /// diagnostic when an encrypted input was de-restricted.
+    ///
+    /// Relationship with `--remove-restrictions`: on the current rewrite
+    /// path the two flags produce IDENTICAL output bytes because flpdf
+    /// always strips `/Encrypt` (and `/P` only exists inside `/Encrypt`).
+    /// The flags differ only in intent and diagnostic. They become
+    /// distinguishable once `--encrypt` (flpdf-9hc.4.9) lands and the
+    /// rewrite gains the ability to preserve or produce encryption.
+    // Same conflict semantics as --remove-restrictions: this is a
+    // rewrite-path modifier and must be rejected against the inspection
+    // subcommands so `flpdf --check --decrypt in out` is a usage error
+    // rather than silently ignoring the flag (and OUTPUT).
+    #[arg(long = "decrypt",
+          conflicts_with_all = [
+              "check", "dump_object", "show_info", "show_catalog",
+              "show_metadata", "show_outline", "show_fonts",
+              "show_npages", "show_pages",
+          ])]
+    decrypt: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
     /// currently a no-op: flpdf does not re-encode stream contents on
     /// rewrite.  Provided so qtest commands parse cleanly.
@@ -700,10 +725,24 @@ struct RewriteCommand {
     /// intent explicit and prints a one-line diagnostic when an encrypted
     /// (restricted) input was de-restricted. It does NOT bypass authentication
     /// — an auth-requiring input without a working --password is rejected
-    /// exactly as a plain `rewrite` would reject it. (Full decryption-mode
-    /// semantics are tracked separately as `--decrypt`, flpdf-9hc.4.10.)
+    /// exactly as a plain `rewrite` would reject it.
+    ///
+    /// See `--decrypt` for the silent qpdf-compatible variant; on the current
+    /// rewrite path the two flags produce identical output bytes.
     #[arg(long = "remove-restrictions")]
     remove_restrictions: bool,
+    /// Strip the `/Encrypt` dictionary from the output (qpdf `--decrypt`
+    /// equivalent). On encrypted input requires `--password` to
+    /// authenticate; on plaintext input it is a no-op pass-through. Silent
+    /// in both cases, matching qpdf `--decrypt`.
+    ///
+    /// Relationship with `--remove-restrictions`: on the current rewrite
+    /// path the two flags produce identical output bytes because flpdf
+    /// always drops `/Encrypt` and `/P` only lives inside `/Encrypt`. The
+    /// flags differ only in intent and diagnostic (this one is silent).
+    /// They become distinguishable once `--encrypt` (flpdf-9hc.4.9) lands.
+    #[arg(long = "decrypt")]
+    decrypt: bool,
     /// Set a minimum PDF version for the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.
@@ -1137,6 +1176,7 @@ fn main() {
             &args.password,
             true,
             args.remove_restrictions,
+            args.decrypt,
             false,                              // normalize_content
             false,                              // coalesce_contents
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
@@ -1234,6 +1274,7 @@ fn main() {
             &args.password,
             false,
             args.remove_restrictions,
+            args.decrypt,
             false,                              // normalize_content
             false,                              // coalesce_contents
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
@@ -1617,6 +1658,7 @@ fn run_command(command: Commands) -> CliResult<()> {
                 &cmd.password,
                 cmd.linearize,
                 cmd.remove_restrictions,
+                cmd.decrypt,
                 normalize_content,
                 coalesce_contents,
                 remove_unref,
@@ -1685,6 +1727,7 @@ fn run_rewrite(
     password: &PasswordArgs,
     linearize: bool,
     remove_restrictions: bool,
+    decrypt: bool,
     normalize_content: bool,
     coalesce_contents: bool,
     remove_unref: CliRemoveUnreferencedResources,
@@ -1693,18 +1736,30 @@ fn run_rewrite(
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
 
-    // SCOPE BOUNDARY (flpdf-9hc.3.18 vs --decrypt / flpdf-9hc.4.10):
-    // `--remove-restrictions` adds NO new decryption logic. A plaintext
-    // `rewrite` of an authenticated encrypted input already drops the
-    // /Encrypt dictionary (crates/flpdf/src/writer.rs trailer.remove
-    // /xref_dict.remove "Encrypt"), and the advisory permission bits live
-    // only inside /Encrypt /P, so the rewritten output is inherently
-    // unrestricted (Pdf::permissions() on it is None). This flag therefore
-    // only makes intent explicit and emits a one-line diagnostic. It never
-    // bypasses authentication: `open_pdf` below performs the same auth as a
-    // plain `rewrite`, so a wrong/missing password is rejected identically
-    // and the diagnostic (printed only after a successful write) is never
-    // reached. Full decryption-mode semantics remain out of scope here.
+    // SCOPE BOUNDARY (flpdf-9hc.3.18 vs flpdf-9hc.4.10):
+    // `--remove-restrictions` and `--decrypt` both add NO new decryption
+    // logic. A plaintext `rewrite` of an authenticated encrypted input
+    // already drops the /Encrypt dictionary (crates/flpdf/src/writer.rs
+    // trailer.remove / xref_dict.remove "Encrypt"), and the advisory
+    // permission bits live only inside /Encrypt /P, so the rewritten
+    // output is inherently unrestricted (Pdf::permissions() on it is
+    // None). On the current rewrite path the two flags therefore produce
+    // identical output bytes; they differ only in intent and diagnostic:
+    //
+    // - `--remove-restrictions` prints a one-line diagnostic when an
+    //   encrypted input was de-restricted (flpdf-9hc.3.18).
+    // - `--decrypt` is silent in both cases, matching qpdf `--decrypt`
+    //   (flpdf-9hc.4.10).
+    //
+    // Neither flag bypasses authentication: `open_pdf` below performs the
+    // same auth as a plain `rewrite`, so a wrong/missing password is
+    // rejected identically and any diagnostic (printed only after a
+    // successful write) is never reached. `decrypt` is currently a flag-
+    // only parameter; it becomes behaviorally meaningful once `--encrypt`
+    // (flpdf-9hc.4.9) lands and the rewrite gains the ability to preserve
+    // or produce encryption — at that point `--decrypt` will override
+    // `--encrypt` back to plaintext.
+    let _ = decrypt;
     if linearize {
         let mut pdf = open_pdf(&input, repair, password)?;
         reject_encrypted_write(&pdf)?;
