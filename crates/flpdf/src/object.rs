@@ -128,6 +128,131 @@ impl Object {
         Self::Reference(object_ref)
     }
 
+    /// Return this object as a dictionary, if it is [`Object::Dictionary`].
+    pub fn as_dict(&self) -> Option<&Dictionary> {
+        match self {
+            Object::Dictionary(dict) => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// Return this object as a mutable dictionary, if it is [`Object::Dictionary`].
+    pub fn as_dict_mut(&mut self) -> Option<&mut Dictionary> {
+        match self {
+            Object::Dictionary(dict) => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// Return this object as a stream, if it is [`Object::Stream`].
+    pub fn as_stream(&self) -> Option<&Stream> {
+        match self {
+            Object::Stream(stream) => Some(stream),
+            _ => None,
+        }
+    }
+
+    /// Return this object as a mutable stream, if it is [`Object::Stream`].
+    pub fn as_stream_mut(&mut self) -> Option<&mut Stream> {
+        match self {
+            Object::Stream(stream) => Some(stream),
+            _ => None,
+        }
+    }
+
+    /// Return this object as an array slice, if it is [`Object::Array`].
+    pub fn as_array(&self) -> Option<&[Object]> {
+        match self {
+            Object::Array(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Return this object as a mutable array vector, if it is [`Object::Array`].
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Object>> {
+        match self {
+            Object::Array(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Return this object as decoded PDF name bytes, if it is [`Object::Name`].
+    pub fn as_name(&self) -> Option<&[u8]> {
+        match self {
+            Object::Name(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Return this object as string bytes, if it is [`Object::String`].
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Object::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Return this object as an integer, if it is [`Object::Integer`].
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Object::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Return this object as a real number, if it is [`Object::Real`].
+    pub fn as_real(&self) -> Option<f64> {
+        match self {
+            Object::Real(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Return this object as a boolean, if it is [`Object::Boolean`].
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Object::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Return this object as an indirect-object reference, if it is [`Object::Reference`].
+    pub fn as_ref_id(&self) -> Option<ObjectRef> {
+        match self {
+            Object::Reference(object_ref) => Some(*object_ref),
+            _ => None,
+        }
+    }
+
+    /// Consume this object and return its dictionary, if it is [`Object::Dictionary`].
+    pub fn into_dict(self) -> Option<Dictionary> {
+        match self {
+            Object::Dictionary(dict) => Some(dict),
+            _ => None,
+        }
+    }
+
+    /// Consume this object and return its stream, if it is [`Object::Stream`].
+    pub fn into_stream(self) -> Option<Stream> {
+        match self {
+            Object::Stream(stream) => Some(stream),
+            _ => None,
+        }
+    }
+
+    /// Consume this object and return its array, if it is [`Object::Array`].
+    pub fn into_array(self) -> Option<Vec<Object>> {
+        match self {
+            Object::Array(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Return true if this object is [`Object::Null`].
+    pub fn is_null(&self) -> bool {
+        matches!(self, Object::Null)
+    }
+
     /// Serialize this object into PDF syntax, appending to `out`.
     ///
     /// Strings whose bytes are all printable are emitted as literal `(...)` strings;
