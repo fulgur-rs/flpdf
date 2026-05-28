@@ -893,17 +893,16 @@ fn walk_pagelabels<R: Read + Seek>(
 
     // /Nums takes priority over /Kids (spec §7.9.7 leaf vs. intermediate).
     if let Some(nums) = dict.get("Nums").and_then(Object::as_array) {
-        let nums = nums.to_vec();
-        let mut iter = nums.into_iter();
+        let mut iter = nums.iter();
         while let (Some(idx_obj), Some(label_obj)) = (iter.next(), iter.next()) {
             let idx = match idx_obj {
-                Object::Integer(n) => n,
+                Object::Integer(n) => *n,
                 _ => continue, // malformed — skip pair
             };
             // Label value may be a direct Dictionary or an indirect Reference.
             let label_dict = match label_obj {
-                Object::Dictionary(d) => d,
-                Object::Reference(r) => match pdf.resolve(r).map_err(ConvertError::from)? {
+                Object::Dictionary(d) => d.clone(),
+                Object::Reference(r) => match pdf.resolve(*r).map_err(ConvertError::from)? {
                     Object::Dictionary(d) => d,
                     _ => continue,
                 },
@@ -1738,20 +1737,19 @@ fn walk_embedded_files_name_tree<R: Read + Seek>(
 
     // /Names: leaf node with [name1 value1 name2 value2 ...] pairs
     if let Some(names) = dict.get("Names").and_then(Object::as_array) {
-        let names = names.to_vec();
-        let mut iter = names.into_iter();
+        let mut iter = names.iter();
         while let (Some(name_obj), Some(value_obj)) = (iter.next(), iter.next()) {
             // name is a PDF string (text or byte string)
             let name_str = match name_obj {
-                Object::String(bytes) => decode_pdf_text_string(&bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+                Object::String(bytes) => decode_pdf_text_string(bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
                 _ => continue,
             };
             // value can be either an indirect reference or a direct filespec
             // dictionary inlined in the name tree.
             let source = match value_obj {
-                Object::Reference(r) => FilespecSource::Indirect(r),
-                Object::Dictionary(d) => FilespecSource::Direct(d),
+                Object::Reference(r) => FilespecSource::Indirect(*r),
+                Object::Dictionary(d) => FilespecSource::Direct(d.clone()),
                 _ => continue,
             };
             entries.push((name_str, source));
