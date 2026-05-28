@@ -21,9 +21,9 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version,
     resources::remove_unreferenced_resources,
-    write_pdf_with_options, CompressStreams, Dictionary, EncryptParams, NewlineBeforeEndstream,
-    Object, ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions,
-    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
+    write_pdf_with_options, CompressStreams, CopyEncryptionSource, Dictionary, EncryptParams,
+    NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PasswordMode, Pdf,
+    PdfOpenOptions, RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -467,12 +467,51 @@ struct Cli {
             "show_metadata", "show_outline", "show_fonts",
             "show_npages", "show_pages",
             "linearize", "remove_restrictions", "decrypt", "qdf",
+            "copy_encryption_from",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] -- ; \
                 walking skeleton supports 128 with --use-aes=y only"
     )]
     encrypt: Vec<String>,
+
+    /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
+    /// output encryption (qpdf --copy-encryption-from equivalent —
+    /// flpdf-9hc.4.11).
+    ///
+    /// Supply the donor's password via `--encryption-file-password` (empty
+    /// string if the donor has no user password).  Only V=4 AES-128 donors are
+    /// supported in the walking-skeleton release; other schemes are rejected
+    /// with a "not yet supported" diagnostic.
+    ///
+    /// Mutually exclusive with `--encrypt`.
+    #[arg(
+        long = "copy-encryption-from",
+        value_name = "FILE",
+        conflicts_with_all = [
+            "encrypt",
+            "check", "dump_object", "show_info", "show_catalog",
+            "show_metadata", "show_outline", "show_fonts",
+            "show_npages", "show_pages",
+            "linearize", "remove_restrictions", "decrypt", "qdf",
+        ],
+        help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
+                pair with --encryption-file-password"
+    )]
+    copy_encryption_from: Option<PathBuf>,
+
+    /// Password to open the donor PDF specified by `--copy-encryption-from`.
+    ///
+    /// Omit (or pass an empty string) if the donor has no user password.
+    /// This is the *donor's* password, not the output file's password
+    /// (the output inherits the donor's passwords exactly).
+    #[arg(
+        long = "encryption-file-password",
+        value_name = "PW",
+        requires = "copy_encryption_from",
+        help = "User password to open the donor PDF for --copy-encryption-from"
+    )]
+    encryption_file_password: Option<String>,
 
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -569,6 +608,10 @@ struct PageOpArgs {
     empty: bool,
 }
 
+// The RewriteCommand variant is large by design (it holds many optional flags).
+// Boxing it would require matching `Commands::Rewrite(cmd)` with a deref in
+// every match arm — a larger refactor than warranted for this lint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Commands {
     #[command(about = "Validate PDF structure and report diagnostics")]
@@ -802,9 +845,43 @@ struct RewriteCommand {
         value_terminator = "--",
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
-        conflicts_with_all = ["linearize", "remove_restrictions", "decrypt", "qdf"]
+        conflicts_with_all = [
+            "linearize", "remove_restrictions", "decrypt", "qdf",
+            "copy_encryption_from",
+        ]
     )]
     encrypt: Vec<String>,
+    /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
+    /// output encryption (qpdf --copy-encryption-from equivalent —
+    /// flpdf-9hc.4.11).
+    ///
+    /// Supply the donor's password via `--encryption-file-password` (empty
+    /// string if the donor has no user password).  Only V=4 AES-128 donors are
+    /// supported in the walking-skeleton release; other schemes are rejected
+    /// with a "not yet supported" diagnostic.
+    ///
+    /// Mutually exclusive with `--encrypt`.
+    #[arg(
+        long = "copy-encryption-from",
+        value_name = "FILE",
+        conflicts_with_all = [
+            "encrypt",
+            "linearize", "remove_restrictions", "decrypt", "qdf",
+        ],
+        help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
+                pair with --encryption-file-password"
+    )]
+    copy_encryption_from: Option<PathBuf>,
+    /// Password to open the donor PDF specified by `--copy-encryption-from`.
+    ///
+    /// Omit (or pass an empty string) if the donor has no user password.
+    #[arg(
+        long = "encryption-file-password",
+        value_name = "PW",
+        requires = "copy_encryption_from",
+        help = "User password to open the donor PDF for --copy-encryption-from"
+    )]
+    encryption_file_password: Option<String>,
     /// Set a minimum PDF version for the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.
@@ -1282,6 +1359,14 @@ fn main() {
             );
             std::process::exit(1);
         }
+        if args.copy_encryption_from.is_some() {
+            eprintln!(
+                "flpdf: --copy-encryption-from is not applied in the \
+                 --pages/--rotate/--split-pages/--collate pipeline; \
+                 rerun without --copy-encryption-from or without the page operation"
+            );
+            std::process::exit(1);
+        }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
         options.static_aes_iv = args.static_aes_iv;
@@ -1366,6 +1451,35 @@ fn main() {
                     std::process::exit(2);
                 }
             }
+        }
+        // Top-level --copy-encryption-from: open the donor, validate its
+        // encryption scheme, and stash CopyEncryptionSource on WriteOptions.
+        // Force full_rewrite=true for the same reason as --encrypt.
+        if let Some(ref donor_path) = args.copy_encryption_from {
+            match build_copy_encryption_source(
+                donor_path,
+                args.encryption_file_password.as_deref(),
+            ) {
+                Ok(src) => {
+                    options.copy_encryption = Some(src);
+                    options.full_rewrite = true;
+                }
+                Err(e) => {
+                    eprintln!("flpdf: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        // Reject --copy-encryption-from combined with page operations
+        // (same reason as --encrypt: the page-op pipeline doesn't thread
+        // copy_encryption through its extraction paths).
+        if options.copy_encryption.is_some() && page_ops_active(&args.page_ops) {
+            eprintln!(
+                "flpdf: --copy-encryption-from is not applied in the \
+                 --pages/--rotate/--split-pages/--collate pipeline; \
+                 rerun without --copy-encryption-from or without the page operation"
+            );
+            std::process::exit(1);
         }
         run_rewrite(
             args.input,
@@ -1703,6 +1817,23 @@ fn run_command(command: Commands) -> CliResult<()> {
                     }
                 }
             }
+            // `rewrite --copy-encryption-from`: open donor, validate, stash.
+            // Same full_rewrite promotion as --encrypt.
+            if let Some(ref donor_path) = cmd.copy_encryption_from {
+                match build_copy_encryption_source(
+                    donor_path,
+                    cmd.encryption_file_password.as_deref(),
+                ) {
+                    Ok(src) => {
+                        options.copy_encryption = Some(src);
+                        options.full_rewrite = true;
+                    }
+                    Err(e) => {
+                        eprintln!("flpdf: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
@@ -1736,10 +1867,12 @@ fn run_command(command: Commands) -> CliResult<()> {
                     || cmd.remove_restrictions
                     || cmd.decrypt
                     || !cmd.encrypt.is_empty()
+                    || cmd.copy_encryption_from.is_some()
                 {
                     eprintln!(
                         "flpdf: --normalize-content / --coalesce-contents / \
-                         --remove-restrictions / --decrypt / --encrypt are \
+                         --remove-restrictions / --decrypt / --encrypt / \
+                         --copy-encryption-from are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
                          the page operation"
@@ -1848,6 +1981,135 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
     // Clean — exit 0.
     println!("PDF check succeeded");
     Ok(())
+}
+
+/// Open a donor PDF at `path` (with optional `password`) and extract the
+/// information needed to copy its encryption to a new output file
+/// (flpdf-9hc.4.11 `--copy-encryption-from`).
+///
+/// Returns a [`CopyEncryptionSource`] ready to be stored in
+/// [`WriteOptions::copy_encryption`] or an error string suitable for printing
+/// to stderr before `exit(2)`.
+///
+/// Only V=4 AES-128 donors are accepted.  Other encryption schemes are
+/// rejected with a "not yet supported (flpdf-9hc.4.9 follow-up)" message.
+fn build_copy_encryption_source(
+    path: &std::path::Path,
+    password: Option<&str>,
+) -> CliResult<CopyEncryptionSource> {
+    let file = File::open(path)
+        .map_err(|e| format!("--copy-encryption-from: cannot open {:?}: {e}", path))?;
+    let reader = BufReader::new(file);
+
+    let pw_bytes: Vec<u8> = password.unwrap_or("").as_bytes().to_vec();
+    let opts = PdfOpenOptions {
+        password: pw_bytes,
+        repair: true,
+        ..PdfOpenOptions::default()
+    };
+    let mut donor = Pdf::open_with_options(reader, opts)
+        .map_err(|e| format!("--copy-encryption-from: failed to open {:?}: {e}", path))?;
+
+    // Validate the donor is encrypted.
+    let info = donor
+        .encryption_info()
+        .map_err(|e| format!("--copy-encryption-from: failed to read encryption info: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "--copy-encryption-from: donor {:?} is not encrypted",
+                path
+            )
+        })?;
+
+    // Walking-skeleton scope: only V=4 AES-128 (StmF=AESV2 / StrF=AESV2).
+    // Note: encryption_info uses qpdf_name() which returns "AESv2" (lowercase v).
+    let is_v4_aes128 = info.v == 4
+        && info.length_bits == 128
+        && info.stream_method == "AESv2"
+        && info.string_method == "AESv2";
+    if !is_v4_aes128 {
+        return Err(format!(
+            "--copy-encryption-from: donor {:?} uses V={} length={} \
+             stream={} string={} — not yet supported \
+             (flpdf-9hc.4.9 follow-up; only V=4 AES-128 donors are accepted)",
+            path, info.v, info.length_bits, info.stream_method, info.string_method,
+        )
+        .into());
+    }
+
+    // Recover the donor's file key.  The error message guides the user to
+    // supply the correct password via --encryption-file-password.
+    let file_key: Vec<u8> = donor
+        .encryption_file_key()
+        .ok_or_else(|| {
+            format!(
+                "--copy-encryption-from: failed to recover donor file key for {:?} \
+                 (wrong --encryption-file-password?)",
+                path
+            )
+        })?
+        .to_vec();
+
+    // Extract the /Encrypt ObjectRef from the donor trailer, then resolve it.
+    // Pull the ref while holding the trailer borrow, then drop that borrow
+    // before calling resolve() which needs &mut self.
+    let encrypt_ref = donor
+        .trailer()
+        .get_ref("Encrypt")
+        .ok_or_else(|| {
+            format!(
+                "--copy-encryption-from: donor {:?} has no /Encrypt in trailer",
+                path
+            )
+        })?;
+
+    let encrypt_obj = donor
+        .resolve(encrypt_ref)
+        .map_err(|e| {
+            format!(
+                "--copy-encryption-from: failed to resolve /Encrypt in {:?}: {e}",
+                path
+            )
+        })?;
+
+    let encrypt_dict = match encrypt_obj {
+        Object::Dictionary(d) => d,
+        other => {
+            return Err(format!(
+                "--copy-encryption-from: /Encrypt in {:?} is not a dictionary (got {:?})",
+                path, other
+            )
+            .into())
+        }
+    };
+
+    // Extract /ID[0] from the donor trailer.
+    let id0: Vec<u8> = match donor.trailer().get("ID") {
+        Some(Object::Array(arr)) => match arr.first() {
+            Some(Object::String(bytes)) => bytes.clone(),
+            _ => {
+                return Err(format!(
+                    "--copy-encryption-from: donor {:?} /ID[0] is not a string",
+                    path
+                )
+                .into())
+            }
+        },
+        _ => {
+            return Err(format!(
+                "--copy-encryption-from: donor {:?} has no /ID array in trailer",
+                path
+            )
+            .into())
+        }
+    };
+
+    Ok(CopyEncryptionSource {
+        encrypt_dict,
+        file_key,
+        id0,
+        object_key_alg: ObjectKeyAlg::Aes,
+    })
 }
 
 /// Parse the qpdf-shaped `--encrypt USER-PW OWNER-PW KEY-LEN [sub-flags]`
