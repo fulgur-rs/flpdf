@@ -68,6 +68,7 @@ pub mod page_split;
 pub mod page_tree_rebuild;
 pub mod pages;
 pub mod parser;
+pub mod permissions;
 pub mod qdf_fix;
 pub mod reader;
 pub mod resources;
@@ -119,6 +120,7 @@ pub use page_rotate::{
 pub use page_split::{digit_width, split_output_path, split_pages};
 pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
+pub use permissions::{PermissionsConfig, PrintPermission};
 pub use qdf_fix::fix_qdf;
 pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};
 pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
