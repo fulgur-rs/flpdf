@@ -1193,20 +1193,25 @@ pub(crate) struct V5R6EncryptParams<'a> {
 /// from a CSPRNG and tests can pin every byte to a fixed value for
 /// reproducibility — V=5 R=6 has no path to byte-identical output with
 /// qpdf without controlling every random input.
-pub(crate) struct V5R6Secrets<'a> {
+///
+/// Fields are owned (not `&'a`) because every field is a small `Copy`
+/// array — pass-by-value avoids dragging a lifetime parameter through
+/// the call sites without changing the cost (32+8+8+8+8+4 = 68 bytes).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct V5R6Secrets {
     /// 32-byte file encryption key (the "FEK"). Random per spec.
-    pub file_key: &'a [u8; 32],
+    pub file_key: [u8; 32],
     /// 8-byte validation salt for the user password (`/U[32..40]`).
-    pub user_validation_salt: &'a [u8; 8],
+    pub user_validation_salt: [u8; 8],
     /// 8-byte key-derivation salt for the user password (`/U[40..48]`).
-    pub user_key_salt: &'a [u8; 8],
+    pub user_key_salt: [u8; 8],
     /// 8-byte validation salt for the owner password (`/O[32..40]`).
-    pub owner_validation_salt: &'a [u8; 8],
+    pub owner_validation_salt: [u8; 8],
     /// 8-byte key-derivation salt for the owner password (`/O[40..48]`).
-    pub owner_key_salt: &'a [u8; 8],
+    pub owner_key_salt: [u8; 8],
     /// 4 spec-arbitrary bytes appended to the `/Perms` plaintext block
     /// (bytes 12..16, after the `'adb'` magic).
-    pub perms_random_tail: &'a [u8; 4],
+    pub perms_random_tail: [u8; 4],
 }
 
 /// Construct the `/Encrypt` dictionary for V=5 R=6 (AES-256, ISO 32000-2)
@@ -1227,31 +1232,31 @@ pub(crate) struct V5R6Secrets<'a> {
 /// per the V=5 R=6 spec.
 pub(crate) fn build_v5_r6_encrypt_dict(
     params: &V5R6EncryptParams<'_>,
-    secrets: &V5R6Secrets<'_>,
+    secrets: &V5R6Secrets,
 ) -> Dictionary {
     // Algorithm 8: /U + /UE.
     let (u_entry, ue_entry) = compute_u_ue_r6(
         params.user_password,
-        secrets.file_key,
-        secrets.user_validation_salt,
-        secrets.user_key_salt,
+        &secrets.file_key,
+        &secrets.user_validation_salt,
+        &secrets.user_key_salt,
     );
 
     // Algorithm 9: /O + /OE (uses /U as extra).
     let (o_entry, oe_entry) = compute_o_oe_r6(
         params.owner_password,
         &u_entry,
-        secrets.file_key,
-        secrets.owner_validation_salt,
-        secrets.owner_key_salt,
+        &secrets.file_key,
+        &secrets.owner_validation_salt,
+        &secrets.owner_key_salt,
     );
 
     // Algorithm 10: /Perms.
     let perms = compute_perms_blob(
         params.p,
         params.encrypt_metadata,
-        secrets.perms_random_tail,
-        secrets.file_key,
+        &secrets.perms_random_tail,
+        &secrets.file_key,
     );
 
     // /CF /StdCF entry (CFM AESV3, Length 32).
@@ -3604,12 +3609,12 @@ mod tests {
                     encrypt_metadata,
                 },
                 &V5R6Secrets {
-                    file_key: &s.file_key,
-                    user_validation_salt: &s.user_validation_salt,
-                    user_key_salt: &s.user_key_salt,
-                    owner_validation_salt: &s.owner_validation_salt,
-                    owner_key_salt: &s.owner_key_salt,
-                    perms_random_tail: &s.perms_random_tail,
+                    file_key: s.file_key,
+                    user_validation_salt: s.user_validation_salt,
+                    user_key_salt: s.user_key_salt,
+                    owner_validation_salt: s.owner_validation_salt,
+                    owner_key_salt: s.owner_key_salt,
+                    perms_random_tail: s.perms_random_tail,
                 },
             );
 
@@ -3649,10 +3654,10 @@ mod tests {
             let Some(Object::String(oe)) = dict.get("OE") else {
                 unreachable!()
             };
-            let u48 = hex48(&hex::encode(u));
-            let o48 = hex48(&hex::encode(o));
-            let ue32 = hex32(&hex::encode(ue));
-            let oe32 = hex32(&hex::encode(oe));
+            let u48: [u8; 48] = u.as_slice().try_into().unwrap();
+            let o48: [u8; 48] = o.as_slice().try_into().unwrap();
+            let ue32: [u8; 32] = ue.as_slice().try_into().unwrap();
+            let oe32: [u8; 32] = oe.as_slice().try_into().unwrap();
             let inputs = StandardHandlerR5Inputs {
                 u: &u48,
                 o: &o48,
@@ -3697,12 +3702,12 @@ mod tests {
                 encrypt_metadata: true,
             },
             &V5R6Secrets {
-                file_key: &s.file_key,
-                user_validation_salt: &s.user_validation_salt,
-                user_key_salt: &s.user_key_salt,
-                owner_validation_salt: &s.owner_validation_salt,
-                owner_key_salt: &s.owner_key_salt,
-                perms_random_tail: &s.perms_random_tail,
+                file_key: s.file_key,
+                user_validation_salt: s.user_validation_salt,
+                user_key_salt: s.user_key_salt,
+                owner_validation_salt: s.owner_validation_salt,
+                owner_key_salt: s.owner_key_salt,
+                perms_random_tail: s.perms_random_tail,
             },
         );
 
@@ -3718,10 +3723,10 @@ mod tests {
         let Some(Object::String(oe)) = dict.get("OE") else {
             unreachable!()
         };
-        let u48 = hex48(&hex::encode(u));
-        let o48 = hex48(&hex::encode(o));
-        let ue32 = hex32(&hex::encode(ue));
-        let oe32 = hex32(&hex::encode(oe));
+        let u48: [u8; 48] = u.as_slice().try_into().unwrap();
+        let o48: [u8; 48] = o.as_slice().try_into().unwrap();
+        let ue32: [u8; 32] = ue.as_slice().try_into().unwrap();
+        let oe32: [u8; 32] = oe.as_slice().try_into().unwrap();
         let inputs = StandardHandlerR5Inputs {
             u: &u48,
             o: &o48,
