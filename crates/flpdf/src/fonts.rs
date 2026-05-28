@@ -70,17 +70,15 @@ fn walk_font_resources<R: Read + Seek>(
 
     let node_type = dict
         .get("Type")
-        .and_then(|value| match value {
-            Object::Name(value) => Some(value.clone()),
-            _ => None,
-        })
+        .and_then(Object::as_name)
+        .map(ToOwned::to_owned)
         .unwrap_or_default();
 
     if node_type.as_slice() == b"Pages" {
-        if let Some(Object::Array(kids)) = dict.get("Kids") {
+        if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
             for kid in kids {
-                if let Object::Reference(reference) = kid {
-                    walk_font_resources(pdf, *reference, seen, fonts, depth + 1, max_depth)?;
+                if let Some(reference) = kid.as_ref_id() {
+                    walk_font_resources(pdf, reference, seen, fonts, depth + 1, max_depth)?;
                 }
             }
         }
@@ -100,11 +98,15 @@ fn collect_page_fonts<R: Read + Seek>(
     fonts: &mut BTreeMap<Vec<u8>, Object>,
 ) -> Result<()> {
     let resources = match page.get("Resources") {
-        Some(Object::Dictionary(resources)) => Some(resources.clone()),
-        Some(Object::Reference(reference)) => match pdf.resolve(*reference)? {
-            Object::Dictionary(resources) => Some(resources),
-            _ => None,
-        },
+        Some(resources) => {
+            if let Some(resources) = resources.as_dict() {
+                Some(resources.clone())
+            } else if let Some(reference) = resources.as_ref_id() {
+                pdf.resolve(reference)?.into_dict()
+            } else {
+                None
+            }
+        }
         _ => None,
     };
 
@@ -113,11 +115,15 @@ fn collect_page_fonts<R: Read + Seek>(
     };
 
     let fonts_dict = match resources.get("Font") {
-        Some(Object::Dictionary(fonts_dict)) => Some(fonts_dict.clone()),
-        Some(Object::Reference(reference)) => match pdf.resolve(*reference)? {
-            Object::Dictionary(fonts_dict) => Some(fonts_dict),
-            _ => None,
-        },
+        Some(fonts_dict) => {
+            if let Some(fonts_dict) = fonts_dict.as_dict() {
+                Some(fonts_dict.clone())
+            } else if let Some(reference) = fonts_dict.as_ref_id() {
+                pdf.resolve(reference)?.into_dict()
+            } else {
+                None
+            }
+        }
         _ => None,
     };
 

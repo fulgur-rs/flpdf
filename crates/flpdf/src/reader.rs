@@ -1273,18 +1273,14 @@ fn explicit_crypt_mode(
     encryption: &EncryptionState,
     decode_params: Option<&Object>,
 ) -> Result<EncryptionMode> {
-    let Some(Object::Dictionary(params)) = decode_params else {
+    let Some(params) = decode_params.and_then(Object::as_dict) else {
         return Ok(EncryptionMode::Identity);
     };
     let name: &[u8] = match params.get("Name") {
         None => return Ok(EncryptionMode::Identity),
-        Some(Object::Name(name)) => name.as_slice(),
-        Some(_) => {
-            return Err(EncryptedError::Malformed {
-                reason: "/Crypt /DecodeParms /Name is not a name".into(),
-            }
-            .into())
-        }
+        Some(object) => object.as_name().ok_or_else(|| EncryptedError::Malformed {
+            reason: "/Crypt /DecodeParms /Name is not a name".into(),
+        })?,
     };
     if name == b"Identity" {
         return Ok(EncryptionMode::Identity);
@@ -1299,16 +1295,20 @@ fn explicit_crypt_mode(
 
 fn stream_has_explicit_crypt_filter(dict: &Dictionary) -> bool {
     match dict.get("Filter") {
-        Some(Object::Name(name)) => name == b"Crypt",
-        Some(Object::Array(filters)) => filters
-            .iter()
-            .any(|filter| matches!(filter, Object::Name(name) if name == b"Crypt")),
-        _ => false,
+        Some(filter) if filter.as_name() == Some(b"Crypt".as_slice()) => true,
+        Some(filter) => filter.as_array().is_some_and(|filters| {
+            filters
+                .iter()
+                .any(|filter| filter.as_name() == Some(b"Crypt".as_slice()))
+        }),
+        None => false,
     }
 }
 
 fn is_metadata_stream(dict: &Dictionary) -> bool {
-    matches!(dict.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"Metadata")
+    dict.get("Type")
+        .and_then(Object::as_name)
+        .is_some_and(|name| name == b"Metadata")
 }
 
 fn aes256_file_key(file_key: &[u8]) -> Result<[u8; 32]> {
@@ -1639,22 +1639,27 @@ fn r5_or_r6_mode_for_selector(
 fn crypt_filter_selector(encrypt: &Dictionary, key: &str) -> Result<Option<String>> {
     match encrypt.get(key) {
         None => Ok(None),
-        Some(Object::Name(name)) => Ok(Some(String::from_utf8_lossy(name).to_string())),
-        Some(_) => Err(EncryptedError::Malformed {
-            reason: format!("/{key} entry is not a name"),
-        }
-        .into()),
+        Some(value) => value
+            .as_name()
+            .map(|name| String::from_utf8_lossy(name).to_string())
+            .map(Some)
+            .ok_or_else(|| {
+                EncryptedError::Malformed {
+                    reason: format!("/{key} entry is not a name"),
+                }
+                .into()
+            }),
     }
 }
 
 fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Option<String>> {
-    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+    let Some(cf) = encrypt.get("CF").and_then(Object::as_dict) else {
         return Err(EncryptedError::Malformed {
             reason: format!("/CF entry '{name}' not found"),
         }
         .into());
     };
-    let Some(Object::Dictionary(filter)) = cf.get(name) else {
+    let Some(filter) = cf.get(name).and_then(Object::as_dict) else {
         return Err(EncryptedError::Malformed {
             reason: format!("/CF entry '{name}' not found"),
         }
@@ -1662,11 +1667,16 @@ fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Opti
     };
     match filter.get("CFM") {
         None => Ok(None),
-        Some(Object::Name(cfm)) => Ok(Some(String::from_utf8_lossy(cfm).to_string())),
-        Some(_) => Err(EncryptedError::Malformed {
-            reason: format!("/CF/{name}/CFM entry is not a name"),
-        }
-        .into()),
+        Some(value) => value
+            .as_name()
+            .map(|cfm| String::from_utf8_lossy(cfm).to_string())
+            .map(Some)
+            .ok_or_else(|| {
+                EncryptedError::Malformed {
+                    reason: format!("/CF/{name}/CFM entry is not a name"),
+                }
+                .into()
+            }),
     }
 }
 
@@ -1675,11 +1685,11 @@ fn crypt_filter_modes(
     revision: i64,
 ) -> Result<BTreeMap<Vec<u8>, EncryptionMode>> {
     let mut modes = BTreeMap::new();
-    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+    let Some(cf) = encrypt.get("CF").and_then(Object::as_dict) else {
         return Ok(modes);
     };
     for (name, value) in cf.iter() {
-        let Object::Dictionary(filter) = value else {
+        let Some(filter) = value.as_dict() else {
             return Err(EncryptedError::Malformed {
                 reason: format!(
                     "/CF entry '{}' is not a dictionary",
