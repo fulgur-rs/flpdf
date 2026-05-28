@@ -1253,6 +1253,23 @@ fn main() {
         // Top-level page-operation path (qpdf-shaped invocation:
         // `flpdf in.pdf --pages . 1-3 -- out.pdf`). Mirrors the `rewrite`
         // subcommand's page-op dispatch below.
+        //
+        // The page-op pipeline does not thread `WriteOptions.encrypt`
+        // through to the page-extraction / page-rewrite paths, so
+        // silently honoring `--encrypt` here would emit plaintext output
+        // even though the user asked for encryption. Reject upfront with
+        // the same shape `rewrite --encrypt --pages …` already uses
+        // (mirrors the existing `--decrypt` / `--remove-restrictions`
+        // rejection in the subcommand surface). Wiring encryption
+        // through the page-op pipeline is a flpdf-9hc.4.9 follow-up.
+        if !args.encrypt.is_empty() {
+            eprintln!(
+                "flpdf: --encrypt is not applied in the \
+                 --pages/--rotate/--split-pages/--collate pipeline; \
+                 rerun without --encrypt or without the page operation"
+            );
+            std::process::exit(1);
+        }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
         options.no_original_object_ids = args.no_original_object_ids;
@@ -1699,14 +1716,18 @@ fn run_command(command: Commands) -> CliResult<()> {
                 // rejecting upfront surfaces the unsupported combination
                 // instead of leaving the user wondering whether decryption
                 // happened.
-                if normalize_content || coalesce_contents || cmd.remove_restrictions || cmd.decrypt
+                if normalize_content
+                    || coalesce_contents
+                    || cmd.remove_restrictions
+                    || cmd.decrypt
+                    || !cmd.encrypt.is_empty()
                 {
                     eprintln!(
                         "flpdf: --normalize-content / --coalesce-contents / \
-                         --remove-restrictions / --decrypt are not applied \
-                         in the --pages/--rotate/--split-pages/--collate \
-                         pipeline; rerun without them or without the page \
-                         operation"
+                         --remove-restrictions / --decrypt / --encrypt are \
+                         not applied in the --pages/--rotate/--split-pages/\
+                         --collate pipeline; rerun without them or without \
+                         the page operation"
                     );
                     std::process::exit(1);
                 }

@@ -337,6 +337,68 @@ fn encrypt_conflicts_with_check_inspection_path() {
         .stderr(predicates::str::contains("cannot be used"));
 }
 
+/// `--encrypt` combined with page operations (`--pages`, `--rotate`,
+/// `--split-pages`, `--collate`) must be rejected upfront: the page-op
+/// pipeline does not thread `WriteOptions.encrypt` through to its
+/// extraction/rewrite paths, so silently honoring `--encrypt` here would
+/// produce plaintext output despite the user's request. Mirrors the
+/// existing `--decrypt` / `--remove-restrictions` rejection in the same
+/// dispatch.
+#[test]
+fn encrypt_is_rejected_when_combined_with_page_operations_top_level() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--use-aes=y",
+            "--",
+            "--pages",
+            ".",
+            "1-z",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--encrypt"))
+        .stderr(predicates::str::contains("--pages"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn encrypt_is_rejected_when_combined_with_page_operations_subcommand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--use-aes=y",
+            "--",
+            "--pages",
+            ".",
+            "1-z",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--encrypt"))
+        .stderr(predicates::str::contains("--pages"));
+    assert!(!output.exists());
+}
+
 #[test]
 fn encrypt_conflicts_with_decrypt_flag() {
     let tmp = tempfile::tempdir().unwrap();
