@@ -1438,6 +1438,184 @@ pub(crate) fn per_object_key(file_key: &[u8], obj: u32, gen: u32, alg: ObjectKey
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Writer side — String / stream encryption passes
+// (flpdf-9hc.4.5 strings, flpdf-9hc.4.6 stream payloads)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Cipher material for ENCRYPTING string objects and stream payloads.
+///
+/// Mirror of [`StringCipher`] but for the write direction. The AES variants
+/// intentionally do NOT carry an IV — IVs MUST be unique per encryption call
+/// because reusing an IV with the same AES-CBC key leaks information about
+/// plaintext XORs (a well-known CBC weakness). Callers supply IVs via the
+/// `iv_gen` closure in [`encrypt_strings_in_object`] or the explicit `iv`
+/// parameter on [`encrypt_cipher_bytes`].
+///
+/// For V<5, the per-object key from [`per_object_key`] is the key material.
+/// For V=5, the file key itself or a selected `/CF` key is used directly.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StringEncryptCipher<'a> {
+    /// No-op crypt filter — bytes pass through unchanged.
+    Identity,
+    /// RC4 (V=1, V=2, V=4 `/CFM /V2`) with an already-derived per-object key.
+    /// IV is unused (RC4 is a stream cipher with no IV).
+    Rc4 { key: &'a [u8] },
+    /// AES-128-CBC (V=4 `/CFM /AESV2`) with an already-derived per-object key.
+    /// Output is `IV ‖ AES-CBC(plaintext, key, IV)` with PKCS#7 padding.
+    Aes128 { key: &'a [u8; 16] },
+    /// AES-256-CBC (V=5 `/CFM /AESV3`) with the file key.
+    /// Output is `IV ‖ AES-CBC(plaintext, key, IV)` with PKCS#7 padding.
+    Aes256 { key: &'a [u8; 32] },
+}
+
+/// Encrypt a single byte buffer in place — the writer-side inverse of
+/// [`decrypt_cipher_bytes`].
+///
+/// Behavior by cipher:
+///
+/// - `Identity`: no-op.
+/// - `Rc4`: RC4-encrypts `bytes` in place; the buffer length is unchanged.
+///   `iv` is ignored.
+/// - `Aes128` / `Aes256`: PKCS#7-pads `bytes` to a 16-byte block boundary,
+///   AES-CBC-encrypts under `key` with `iv`, then sets `bytes` to
+///   `iv ‖ ciphertext`. The output is always at least 32 bytes (16-byte IV
+///   + at least one 16-byte ciphertext block).
+///
+/// The caller is responsible for supplying a FRESH `iv` per AES call —
+/// reusing an IV with the same key under AES-CBC is a known weakness. For
+/// non-AES ciphers `iv` is unused, so passing a stale `iv` is harmless.
+pub(crate) fn encrypt_cipher_bytes(
+    bytes: &mut Vec<u8>,
+    cipher: StringEncryptCipher<'_>,
+    iv: &[u8; 16],
+) -> Result<()> {
+    match cipher {
+        StringEncryptCipher::Identity => Ok(()),
+        StringEncryptCipher::Rc4 { key } => rc4(key, bytes).map_err(Into::into),
+        StringEncryptCipher::Aes128 { key } => {
+            *bytes = aes128_cbc_encrypt_with_iv(key, iv, bytes);
+            Ok(())
+        }
+        StringEncryptCipher::Aes256 { key } => {
+            *bytes = aes256_cbc_encrypt_with_iv(key, iv, bytes);
+            Ok(())
+        }
+    }
+}
+
+fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    // `encrypt_padded_mut::<Pkcs7>` always appends at least one byte of
+    // padding (a full block of `0x10` when plaintext is block-aligned), so
+    // the worst-case ciphertext length is `plaintext.len() + 16`.
+    let pt_len = plaintext.len();
+    let mut buf = Vec::with_capacity(16 + pt_len + 16);
+    buf.extend_from_slice(iv);
+    buf.extend_from_slice(plaintext);
+    buf.resize(16 + pt_len + 16, 0);
+    let enc = <Encryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
+    let ciphertext = enc
+        .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
+        .expect("Pkcs7 encrypt cannot fail with sufficient buffer");
+    let ct_len = ciphertext.len();
+    buf.truncate(16 + ct_len);
+    buf
+}
+
+fn aes256_cbc_encrypt_with_iv(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    let pt_len = plaintext.len();
+    let mut buf = Vec::with_capacity(16 + pt_len + 16);
+    buf.extend_from_slice(iv);
+    buf.extend_from_slice(plaintext);
+    buf.resize(16 + pt_len + 16, 0);
+    let enc = <Encryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
+    let ciphertext = enc
+        .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
+        .expect("Pkcs7 encrypt cannot fail with sufficient buffer");
+    let ct_len = ciphertext.len();
+    buf.truncate(16 + ct_len);
+    buf
+}
+
+/// Encrypt every string contained in a resolved object graph, in place —
+/// the writer-side mirror of [`decrypt_strings_in_object`].
+///
+/// Traverses arrays / dictionaries / stream dictionaries, encrypting each
+/// `Object::String` with `cipher`. Stream PAYLOAD bytes are intentionally
+/// left untouched — they are encrypted separately by the caller via
+/// [`encrypt_cipher_bytes`] (the stream-encryption pass of flpdf-9hc.4.6)
+/// so that the caller controls the per-stream IV and the `/Metadata`
+/// exemption (skip the call entirely or pass `StringEncryptCipher::Identity`).
+///
+/// If `object_ref == encrypt_ref`, the function is a no-op: the `/Encrypt`
+/// dictionary itself stays plaintext per the Standard handler spec.
+///
+/// `iv_gen` is invoked once per AES-cipher string encrypted (and never for
+/// `Identity` / `Rc4` ciphers). It MUST yield a fresh, never-reused IV on
+/// each invocation; reusing an IV with the same AES-CBC key under any of
+/// the cipher variants is a well-known CBC weakness.
+pub(crate) fn encrypt_strings_in_object<F>(
+    object_ref: ObjectRef,
+    object: &mut Object,
+    cipher: StringEncryptCipher<'_>,
+    encrypt_ref: Option<ObjectRef>,
+    iv_gen: &mut F,
+) -> Result<()>
+where
+    F: FnMut() -> [u8; 16],
+{
+    if Some(object_ref) == encrypt_ref {
+        return Ok(());
+    }
+    encrypt_strings_in_value(object, cipher, iv_gen)
+}
+
+fn encrypt_strings_in_value<F>(
+    object: &mut Object,
+    cipher: StringEncryptCipher<'_>,
+    iv_gen: &mut F,
+) -> Result<()>
+where
+    F: FnMut() -> [u8; 16],
+{
+    match object {
+        Object::String(bytes) => {
+            // Only allocate an IV for cipher variants that consume one.
+            let iv = match cipher {
+                StringEncryptCipher::Aes128 { .. } | StringEncryptCipher::Aes256 { .. } => iv_gen(),
+                StringEncryptCipher::Identity | StringEncryptCipher::Rc4 { .. } => [0u8; 16],
+            };
+            encrypt_cipher_bytes(bytes, cipher, &iv)
+        }
+        Object::Array(values) => {
+            for value in values {
+                encrypt_strings_in_value(value, cipher, iv_gen)?;
+            }
+            Ok(())
+        }
+        Object::Dictionary(dict) => {
+            for value in dict.values_mut() {
+                encrypt_strings_in_value(value, cipher, iv_gen)?;
+            }
+            Ok(())
+        }
+        Object::Stream(stream) => {
+            // Walk the stream dictionary only — stream payload bytes are
+            // handled separately by the stream-encryption pass.
+            for value in stream.dict.values_mut() {
+                encrypt_strings_in_value(value, cipher, iv_gen)?;
+            }
+            Ok(())
+        }
+        Object::Null
+        | Object::Boolean(_)
+        | Object::Integer(_)
+        | Object::Real(_)
+        | Object::Name(_)
+        | Object::Reference(_) => Ok(()),
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -3737,5 +3915,303 @@ mod tests {
         let owner_key = check_owner_password_r6(&owner_pw, &inputs).unwrap();
         assert_eq!(user_key, s.file_key.to_vec());
         assert_eq!(owner_key, s.file_key.to_vec());
+    }
+
+    // ── Writer side — string / stream encryption passes ─────────────────────
+    //   (flpdf-9hc.4.5 strings, flpdf-9hc.4.6 stream payloads)
+    //
+    // Round-trip strategy: every test that produces ciphertext feeds the
+    // result back through `decrypt_cipher_bytes` / `decrypt_strings_in_object`
+    // (the production reader path) and asserts the original plaintext is
+    // recovered. This validates against an independent code path rather than
+    // our own inverse.
+
+    /// Deterministic IV generator for tests — yields `[seed, seed, …]` and
+    /// increments the seed by 1 each call, so each IV is unique within a
+    /// test (CBC IV-reuse is the failure mode we want to avoid even when
+    /// pinning randomness for reproducibility).
+    struct CounterIvGen(u8);
+    impl CounterIvGen {
+        fn new(seed: u8) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> [u8; 16] {
+            let iv = [self.0; 16];
+            self.0 = self.0.wrapping_add(1);
+            iv
+        }
+    }
+
+    #[test]
+    fn encrypt_cipher_bytes_rc4_round_trips_via_decrypt() {
+        let key = b"per-object-key-rc4-128";
+        let plaintext = b"Hello, RC4 world.".to_vec();
+
+        let mut buf = plaintext.clone();
+        encrypt_cipher_bytes(
+            &mut buf,
+            StringEncryptCipher::Rc4 { key: &key[..] },
+            &[0u8; 16], // unused for RC4
+        )
+        .unwrap();
+        assert_ne!(buf, plaintext, "RC4 ciphertext must differ from plaintext");
+        assert_eq!(buf.len(), plaintext.len(), "RC4 length is preserved");
+
+        decrypt_cipher_bytes(&mut buf, StringCipher::Rc4 { key: &key[..] }).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
+    #[test]
+    fn encrypt_cipher_bytes_aes128_round_trips_via_decrypt_with_iv_prefix() {
+        let key = [0x42u8; 16];
+        let iv = [0x99u8; 16];
+        let plaintext = b"AES-128 secret data".to_vec();
+
+        let mut buf = plaintext.clone();
+        encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes128 { key: &key }, &iv).unwrap();
+        // Output format: IV (16) || ciphertext (≥16, padded to block).
+        assert_eq!(&buf[..16], &iv, "encrypt_cipher_bytes must prepend the IV");
+        assert!(
+            buf.len() >= 32 && (buf.len() - 16).is_multiple_of(16),
+            "AES ciphertext after IV must be non-zero multiple of 16, got len={}",
+            buf.len()
+        );
+
+        decrypt_cipher_bytes(&mut buf, StringCipher::Aes128 { key: &key }).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
+    #[test]
+    fn encrypt_cipher_bytes_aes256_round_trips_via_decrypt_with_iv_prefix() {
+        let key = [0x77u8; 32];
+        let iv = [0x33u8; 16];
+        let plaintext = b"AES-256 V=5 R=6 payload, multi-block.....".to_vec();
+
+        let mut buf = plaintext.clone();
+        encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes256 { key: &key }, &iv).unwrap();
+        assert_eq!(&buf[..16], &iv);
+
+        decrypt_cipher_bytes(&mut buf, StringCipher::Aes256 { key: &key }).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
+    #[test]
+    fn encrypt_cipher_bytes_identity_is_noop() {
+        let mut buf = b"keep me as-is".to_vec();
+        let original = buf.clone();
+        encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Identity, &[0u8; 16]).unwrap();
+        assert_eq!(buf, original);
+    }
+
+    /// Empty plaintext under AES-CBC + PKCS#7 produces a single 16-byte
+    /// padding-only block. Verify the output is `IV ‖ 16 bytes` and that
+    /// it round-trips back to an empty buffer.
+    #[test]
+    fn encrypt_cipher_bytes_aes_handles_empty_plaintext() {
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let mut buf: Vec<u8> = Vec::new();
+        encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes128 { key: &key }, &iv).unwrap();
+        assert_eq!(buf.len(), 32, "IV (16) + one padding-only block (16)");
+        assert_eq!(&buf[..16], &iv);
+
+        decrypt_cipher_bytes(&mut buf, StringCipher::Aes128 { key: &key }).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    /// Block-aligned plaintext under AES-CBC + PKCS#7 grows by exactly one
+    /// full padding block (16 bytes). Verify the length math and round-trip.
+    #[test]
+    fn encrypt_cipher_bytes_aes_block_aligned_plaintext_grows_by_one_block() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let plaintext = vec![0xAAu8; 16];
+        let mut buf = plaintext.clone();
+        encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes128 { key: &key }, &iv).unwrap();
+        assert_eq!(
+            buf.len(),
+            16 + 16 + 16,
+            "IV + plaintext block + padding block"
+        );
+
+        decrypt_cipher_bytes(&mut buf, StringCipher::Aes128 { key: &key }).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
+    /// Walker: every string in a nested object graph round-trips via the
+    /// reader walker, and the stream payload bytes are untouched (per
+    /// docstring: stream payload encryption is the caller's responsibility).
+    #[test]
+    fn encrypt_strings_in_object_round_trips_via_decrypt_walker() {
+        let key = [0xCCu8; 16];
+        let mut iv_gen = CounterIvGen::new(1);
+
+        let mut inner_dict = Dictionary::new();
+        inner_dict.insert("Title", Object::String(b"inner string".to_vec()));
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Author", Object::String(b"stream dict string".to_vec()));
+        let original = Object::Array(vec![
+            Object::String(b"top-level string".to_vec()),
+            Object::Dictionary(inner_dict.clone()),
+            Object::Stream(Stream::new(
+                stream_dict.clone(),
+                b"stream payload stays raw".to_vec(),
+            )),
+        ]);
+
+        let mut encrypted = original.clone();
+        encrypt_strings_in_object(
+            ObjectRef::new(7, 0),
+            &mut encrypted,
+            StringEncryptCipher::Aes128 { key: &key },
+            None,
+            &mut || iv_gen.next(),
+        )
+        .unwrap();
+
+        // Stream payload bytes must be untouched.
+        let Object::Array(enc_values) = &encrypted else {
+            unreachable!()
+        };
+        let Object::Stream(enc_stream) = &enc_values[2] else {
+            unreachable!()
+        };
+        assert_eq!(enc_stream.data, b"stream payload stays raw");
+
+        // Round-trip via reader walker.
+        decrypt_strings_in_object(
+            ObjectRef::new(7, 0),
+            &mut encrypted,
+            StringCipher::Aes128 { key: &key },
+            None,
+        )
+        .unwrap();
+        assert_eq!(encrypted, original);
+    }
+
+    /// `/Encrypt` subtree must stay plaintext: when the walker encounters
+    /// an object whose ref matches `encrypt_ref`, it must skip encryption
+    /// entirely (mirror of the decrypt walker's contract).
+    #[test]
+    fn encrypt_strings_in_object_skips_encrypt_dictionary_subtree() {
+        let key = b"per-object";
+        let mut dict = Dictionary::new();
+        dict.insert("O", Object::String(b"owner-entry plaintext".to_vec()));
+        let mut object = Object::Dictionary(dict);
+        let snapshot = object.clone();
+
+        encrypt_strings_in_object(
+            ObjectRef::new(5, 0),
+            &mut object,
+            StringEncryptCipher::Rc4 { key: &key[..] },
+            Some(ObjectRef::new(5, 0)),
+            &mut || [0u8; 16],
+        )
+        .unwrap();
+
+        assert_eq!(object, snapshot, "/Encrypt subtree must remain plaintext");
+    }
+
+    /// IV-uniqueness regression: the walker must call `iv_gen` once per
+    /// AES string. With a counter generator, two adjacent AES-encrypted
+    /// strings of identical plaintext produce different ciphertexts (the
+    /// IV is prepended, and the CBC chaining diverges from byte 17 onward).
+    /// If IV reuse were ever silently introduced, the two ciphertexts
+    /// would be byte-identical from the IV through the padded ciphertext.
+    #[test]
+    fn encrypt_strings_in_object_uses_fresh_iv_per_aes_string() {
+        let key = [0x42u8; 16];
+        let mut iv_gen = CounterIvGen::new(10);
+
+        let mut object = Object::Array(vec![
+            Object::String(b"same plaintext".to_vec()),
+            Object::String(b"same plaintext".to_vec()),
+        ]);
+
+        encrypt_strings_in_object(
+            ObjectRef::new(1, 0),
+            &mut object,
+            StringEncryptCipher::Aes128 { key: &key },
+            None,
+            &mut || iv_gen.next(),
+        )
+        .unwrap();
+
+        let Object::Array(vs) = &object else {
+            unreachable!()
+        };
+        let Object::String(c0) = &vs[0] else {
+            unreachable!()
+        };
+        let Object::String(c1) = &vs[1] else {
+            unreachable!()
+        };
+        assert_ne!(
+            c0, c1,
+            "identical plaintexts must NOT encrypt to identical bytes"
+        );
+        assert_ne!(&c0[..16], &c1[..16], "IVs must differ across calls");
+    }
+
+    /// RC4 walker call: the closure must NOT be invoked (RC4 has no IV).
+    /// Regression guard against accidental wasted entropy consumption for
+    /// production CSPRNG-based callers.
+    #[test]
+    fn encrypt_strings_in_object_does_not_call_iv_gen_for_rc4() {
+        let key = b"rc4-key";
+        let mut object = Object::Array(vec![
+            Object::String(b"a".to_vec()),
+            Object::String(b"b".to_vec()),
+            Object::String(b"c".to_vec()),
+        ]);
+        let mut call_count: usize = 0;
+        encrypt_strings_in_object(
+            ObjectRef::new(1, 0),
+            &mut object,
+            StringEncryptCipher::Rc4 { key: &key[..] },
+            None,
+            &mut || {
+                call_count += 1;
+                [0u8; 16]
+            },
+        )
+        .unwrap();
+        assert_eq!(call_count, 0, "RC4 walker must not consume IVs");
+    }
+
+    /// Stream payload round-trip (flpdf-9hc.4.6): `encrypt_cipher_bytes`
+    /// also serves stream payloads (single-buffer API; the caller controls
+    /// per-stream IV uniqueness and the `/Metadata` exemption by choosing
+    /// whether to call this at all). Verified for both V=4 ciphers and V=5.
+    #[test]
+    fn encrypt_cipher_bytes_round_trips_stream_payloads_for_all_aes_variants() {
+        let payload = b"\x78\x9c\x03\x00\x00\x00\x00\x01"; // mock compressed bytes
+        let iv = [0x55u8; 16];
+
+        for cipher_kind in ["rc4", "aes128", "aes256"] {
+            let mut buf = payload.to_vec();
+            match cipher_kind {
+                "rc4" => {
+                    let key = b"rc4-stream-key";
+                    encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Rc4 { key: &key[..] }, &iv)
+                        .unwrap();
+                    decrypt_cipher_bytes(&mut buf, StringCipher::Rc4 { key: &key[..] }).unwrap();
+                }
+                "aes128" => {
+                    let key = [0x11u8; 16];
+                    encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes128 { key: &key }, &iv)
+                        .unwrap();
+                    decrypt_cipher_bytes(&mut buf, StringCipher::Aes128 { key: &key }).unwrap();
+                }
+                "aes256" => {
+                    let key = [0x33u8; 32];
+                    encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes256 { key: &key }, &iv)
+                        .unwrap();
+                    decrypt_cipher_bytes(&mut buf, StringCipher::Aes256 { key: &key }).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(buf, payload, "stream payload round-trip for {cipher_kind}");
+        }
     }
 }
