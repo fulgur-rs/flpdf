@@ -175,7 +175,7 @@ struct Cli {
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
-              "decrypt", "encrypt",
+              "decrypt", "encrypt", "copy_encryption_from",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf",
