@@ -174,6 +174,19 @@ pub struct WriteOptions {
     /// Mirrors `qpdf --static-id` and is intended for byte-identical testing.
     pub static_id: bool,
 
+    /// Force every AES CBC IV to `0x00 × 16` instead of a cryptographically
+    /// random value.
+    ///
+    /// **TESTING ONLY — NOT for production.**  When `true`, both stream-level
+    /// and string-level AES encryption (AES-128 CBC and future AES-256 CBC)
+    /// use an all-zero IV, making the ciphertext deterministic and enabling
+    /// byte-identical output tests.  Without this flag (the default `false`)
+    /// every encryption call generates a fresh random IV via the OS CSPRNG.
+    ///
+    /// Mirrors `qpdf --static-aes-iv`.  Must never be set in production code;
+    /// deterministic IVs make AES CBC completely insecure.
+    pub static_aes_iv: bool,
+
     /// Enforce a minimum PDF version in the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.  Only
@@ -1544,6 +1557,10 @@ struct EncryptionContext {
     /// The output trailer's `/ID` array MUST start with these same bytes —
     /// readers re-derive the file key from `/ID[0]` to validate the password.
     id0: Vec<u8>,
+    /// When `true`, all AES CBC IVs are forced to `[0u8; 16]` instead of
+    /// being drawn from the OS CSPRNG.  Testing only — mirrors
+    /// [`WriteOptions::static_aes_iv`].
+    static_aes_iv: bool,
 }
 
 fn build_encryption_context<R: Read + Seek>(
@@ -1593,6 +1610,7 @@ fn build_encryption_context<R: Read + Seek>(
         object_key_alg,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0,
+        static_aes_iv: options.static_aes_iv,
     })
 }
 
@@ -1675,10 +1693,14 @@ fn encrypt_strings_in_object_for_writer(
     );
 
     let mut iv_gen = || {
-        let mut iv = [0u8; 16];
-        getrandom::getrandom(&mut iv)
-            .expect("OS CSPRNG (getrandom) must be available for AES IV generation");
-        iv
+        if ctx.static_aes_iv {
+            [0u8; 16]
+        } else {
+            let mut iv = [0u8; 16];
+            getrandom::getrandom(&mut iv)
+                .expect("OS CSPRNG (getrandom) must be available for AES IV generation");
+            iv
+        }
     };
 
     match ctx.object_key_alg {
@@ -1732,7 +1754,7 @@ fn encrypt_stream_payload_for_writer(
     );
 
     let mut iv = [0u8; 16];
-    if matches!(ctx.object_key_alg, ObjectKeyAlg::Aes) {
+    if matches!(ctx.object_key_alg, ObjectKeyAlg::Aes) && !ctx.static_aes_iv {
         // Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
         // entropy in a chroot at boot) as `Unsupported` instead of panicking.
         // This site returns `Result`, so propagation is straightforward; the
@@ -3255,6 +3277,84 @@ mod tests {
         assert!(
             container_str.contains("endobj"),
             "container object must be terminated with endobj"
+        );
+    }
+
+    // ── static_aes_iv tests (flpdf-9hc.4.13) ─────────────────────────────────
+
+    /// Build an encrypted PDF with `static_aes_iv = true` and verify that
+    /// every AES IV (the first 16 bytes of each ciphertext block) is all-zero.
+    ///
+    /// We also set `static_id = true` so that the file key — derived from
+    /// `/ID[0]` — is deterministic; without that the file key itself changes
+    /// between runs and the stream IV bytes would vary regardless.
+    #[test]
+    fn static_aes_iv_forces_all_zero_ivs_for_streams_and_strings() {
+        use std::io::Cursor;
+
+        let minimal_pdf = include_bytes!("../../../tests/fixtures/minimal.pdf");
+        let input = minimal_pdf.to_vec();
+
+        let mut pdf = Pdf::open(Cursor::new(input)).expect("open minimal.pdf");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            static_aes_iv: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("encrypted write");
+
+        // The output must be deterministic: running again with the same options
+        // must produce byte-identical bytes.
+        let mut pdf2 = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+        ))
+        .unwrap();
+        let mut out2 = Vec::new();
+        write_pdf_with_options(&mut pdf2, &mut out2, &options).expect("encrypted write 2");
+        assert_eq!(
+            out, out2,
+            "static_id + static_aes_iv must produce byte-identical output on two runs"
+        );
+    }
+
+    /// Without `static_aes_iv`, two encryptions of the same file produce
+    /// different bytes because `/ID[1]` (and AES IVs on any content) are
+    /// freshly random each run.  We use `static_id = false` so the trailer
+    /// `/ID` already differs; the assertion captures the random-IV property
+    /// at the level that is observable from the outside.
+    #[test]
+    fn without_static_aes_iv_two_runs_differ() {
+        use std::io::Cursor;
+
+        let input = include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec();
+
+        let encrypt_once = || {
+            let mut pdf = Pdf::open(Cursor::new(input.clone())).unwrap();
+            let mut out = Vec::new();
+            // static_id = false (default): /ID[1] is random → output differs
+            let options = WriteOptions {
+                full_rewrite: true,
+                encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                    b"user".to_vec(),
+                    b"owner".to_vec(),
+                )),
+                ..WriteOptions::default()
+            };
+            write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+            out
+        };
+
+        let out1 = encrypt_once();
+        let out2 = encrypt_once();
+        assert_ne!(
+            out1, out2,
+            "without static_aes_iv + static_id the two encrypted outputs must differ (random /ID[1])"
         );
     }
 }

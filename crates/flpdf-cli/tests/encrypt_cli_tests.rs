@@ -420,3 +420,161 @@ fn encrypt_conflicts_with_decrypt_flag() {
         .failure()
         .stderr(predicates::str::contains("cannot be used"));
 }
+
+// ── --static-aes-iv tests (flpdf-9hc.4.13) ───────────────────────────────────
+
+/// `--static-id --static-aes-iv --encrypt …` must produce byte-identical
+/// output on two consecutive runs (deterministic encryption).
+#[test]
+fn static_aes_iv_with_static_id_produces_deterministic_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out1 = tmp.path().join("encrypted1.pdf");
+    let out2 = tmp.path().join("encrypted2.pdf");
+    let input = fixture(UNENCRYPTED_FIXTURE);
+
+    for output in [&out1, &out2] {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--static-id",
+                "--static-aes-iv",
+                "--encrypt",
+                "user",
+                "owner",
+                "128",
+                "--use-aes=y",
+                "--",
+            ])
+            .arg(&input)
+            .arg(output)
+            .assert()
+            .success();
+    }
+
+    let bytes1 = std::fs::read(&out1).unwrap();
+    let bytes2 = std::fs::read(&out2).unwrap();
+    assert_eq!(
+        bytes1, bytes2,
+        "--static-id --static-aes-iv must produce byte-identical output on two runs"
+    );
+
+    // Confirm it is really encrypted (not a plaintext passthrough).
+    assert!(
+        bytes1.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "output must carry /Encrypt"
+    );
+}
+
+/// Without `--static-aes-iv` (but with `--static-id` to pin `/ID`),
+/// two encryptions of the same file produce different bytes because
+/// AES IVs are freshly random each run.
+#[test]
+fn without_static_aes_iv_two_runs_produce_different_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out1 = tmp.path().join("encrypted1.pdf");
+    let out2 = tmp.path().join("encrypted2.pdf");
+    let input = fixture(ONE_PAGE_FIXTURE); // has streams, so IVs are emitted
+
+    for output in [&out1, &out2] {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--static-id",
+                "--encrypt",
+                "user",
+                "owner",
+                "128",
+                "--use-aes=y",
+                "--",
+            ])
+            .arg(&input)
+            .arg(output)
+            .assert()
+            .success();
+    }
+
+    let bytes1 = std::fs::read(&out1).unwrap();
+    let bytes2 = std::fs::read(&out2).unwrap();
+    assert_ne!(
+        bytes1, bytes2,
+        "without --static-aes-iv, two encrypted runs with streams must differ (random IVs)"
+    );
+}
+
+/// qpdf can decrypt the `--static-aes-iv` output: the deterministic IV
+/// does not break the AES-CBC ciphertext structure.
+#[test]
+fn static_aes_iv_output_decrypts_cleanly_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let encrypted = tmp.path().join("encrypted.pdf");
+    let decrypted = tmp.path().join("decrypted.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--encrypt",
+            "user",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&encrypted)
+        .assert()
+        .success();
+
+    let decrypt = std::process::Command::new("qpdf")
+        .arg("--password=user")
+        .arg("--decrypt")
+        .arg(&encrypted)
+        .arg(&decrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "qpdf --decrypt failed on --static-aes-iv output: {}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+}
+
+/// `rewrite` subcommand surface also accepts `--static-aes-iv`.
+#[test]
+fn rewrite_subcommand_static_aes_iv_produces_deterministic_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out1 = tmp.path().join("encrypted1.pdf");
+    let out2 = tmp.path().join("encrypted2.pdf");
+    let input = fixture(UNENCRYPTED_FIXTURE);
+
+    for output in [&out1, &out2] {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "rewrite",
+                "--static-id",
+                "--static-aes-iv",
+                "--encrypt",
+                "user",
+                "owner",
+                "128",
+                "--use-aes=y",
+                "--",
+            ])
+            .arg(&input)
+            .arg(output)
+            .assert()
+            .success();
+    }
+
+    let bytes1 = std::fs::read(&out1).unwrap();
+    let bytes2 = std::fs::read(&out2).unwrap();
+    assert_eq!(
+        bytes1, bytes2,
+        "rewrite --static-id --static-aes-iv must produce byte-identical output"
+    );
+}
