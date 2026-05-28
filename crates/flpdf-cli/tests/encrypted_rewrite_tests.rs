@@ -220,6 +220,191 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
         .stdout(predicates::str::contains("PDF check succeeded"));
 }
 
+// ---------------------------------------------------------------------------
+// flpdf-9hc.4.10: `--decrypt`
+//
+// `--decrypt` is the silent qpdf-compatible alias of `--remove-restrictions`
+// on the current rewrite path: both flags drop /Encrypt entirely, and on
+// flpdf's plaintext-by-default writer that's a no-op vs. the implicit
+// behavior. The flag exists so that qtest cases (`unrecognized: --decrypt`,
+// 4 cases) parse and so that the eventual `--encrypt` flag (flpdf-9hc.4.9)
+// has a documented inverse. These tests pin the silence + no-op semantics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decrypt_on_encrypted_input_produces_plaintext_silently_at_top_level() {
+    // Top-level alias surface: `flpdf --decrypt --password ... in out`.
+    let input = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("decrypted-top.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--decrypt", "--password=user-v4-aes"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        // qpdf parity: --decrypt is silent. In particular it must NOT emit
+        // the --remove-restrictions diagnostic, otherwise behaviorally
+        // indistinguishable scripts would see different output.
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC).not());
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "--decrypt output must not contain /Encrypt"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("show-encryption")
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("File is not encrypted"));
+}
+
+#[test]
+fn decrypt_on_encrypted_input_produces_plaintext_silently_at_subcommand() {
+    // Rewrite subcommand surface: `flpdf rewrite --decrypt --password ...`.
+    let input = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("decrypted-sub.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--decrypt", "--password=user-v4-aes"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC).not());
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "--decrypt output must not contain /Encrypt"
+    );
+}
+
+#[test]
+fn decrypt_on_unencrypted_input_is_a_silent_noop_rewrite() {
+    // qpdf `--decrypt` on plaintext input exits 0 silently — match that.
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("noop-decrypt.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--decrypt"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC).not());
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("check")
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("PDF check succeeded"));
+}
+
+#[test]
+fn decrypt_does_not_bypass_authentication() {
+    // Encrypted input without a password must be rejected exactly as a
+    // plain `rewrite` would: --decrypt must not bypass authentication.
+    let input = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+
+    let plain_out = tmp.path().join("plain.pdf");
+    let plain = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(&input)
+        .arg(&plain_out)
+        .assert()
+        .failure();
+    let plain_code = plain.get_output().status.code();
+
+    let flag_out = tmp.path().join("flag.pdf");
+    let flagged = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--decrypt"])
+        .arg(&input)
+        .arg(&flag_out)
+        .assert()
+        .failure();
+
+    assert_eq!(
+        flagged.get_output().status.code(),
+        plain_code,
+        "--decrypt must reject auth-requiring input identically to plain rewrite"
+    );
+    assert!(
+        !flag_out.exists(),
+        "no output must be produced when authentication fails"
+    );
+}
+
+/// `--decrypt` and `--remove-restrictions` together must not conflict —
+/// they are documented as semantically overlapping on the current rewrite
+/// path. Passing both should succeed and the `--remove-restrictions`
+/// diagnostic must still fire (since it gates only on its own flag, not on
+/// the absence of `--decrypt`).
+#[test]
+fn decrypt_combined_with_remove_restrictions_keeps_diagnostic() {
+    let input = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("decrypt-and-rm-restrictions.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--decrypt",
+            "--remove-restrictions",
+            "--password=user-v4-aes",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        // The remove-restrictions diagnostic is gated on its own flag, so it
+        // must still fire when both flags are passed.
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC));
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "combined --decrypt --remove-restrictions output must not contain /Encrypt"
+    );
+}
+
+#[test]
+fn decrypt_conflicts_with_inspection_subcommands() {
+    // The conflicts_with_all on the top-level --decrypt must reject
+    // combinations with --check (and the rest of the inspection group) as
+    // usage errors. Without this, `flpdf --check --decrypt in out` would
+    // silently take the inspection path and ignore the flag (and OUTPUT).
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("conflict.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", "--decrypt"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .failure()
+        // clap emits an "argument cannot be used with" diagnostic on conflicts.
+        .stderr(predicates::str::contains("cannot be used"));
+}
+
 fn ensure_qpdf_or_skip() -> bool {
     let available = ShellCommand::new("qpdf")
         .arg("--version")
