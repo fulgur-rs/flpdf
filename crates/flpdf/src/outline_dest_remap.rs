@@ -322,8 +322,7 @@ fn prune_name_tree<R: Read + Seek>(
 
     if has_kids {
         // Intermediate node: /Kids is an array of child node refs.
-        let kids_val = node.get("Kids").cloned();
-        if let Some(kids) = kids_val.and_then(Object::into_array) {
+        if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
             let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
 
             let mut surviving_kids: Vec<ObjectRef> = Vec::new();
@@ -401,7 +400,7 @@ fn prune_name_tree_node_dict<R: Read + Seek>(
         }
         return Ok((d, false));
     }
-    if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
+    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
         let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
         let mut surviving_kids: Vec<ObjectRef> = Vec::new();
         for child_ref in child_refs {
@@ -1814,7 +1813,7 @@ mod tests {
         let Some(dd) = dest.as_dict() else {
             panic!("dict-form dest expected, got {dest:?}");
         };
-        let Some(Object::Array(arr)) = dd.get("D") else {
+        let Some(arr) = dd.get("D").and_then(Object::as_array) else {
             panic!("/D array expected");
         };
         assert_eq!(arr.first(), Some(&Object::Reference(new_p1)));
