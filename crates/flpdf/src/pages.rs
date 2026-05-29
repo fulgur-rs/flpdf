@@ -44,19 +44,7 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Vec<ObjectRef>> {
-    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let catalog = pdf.resolve(catalog_ref)?;
-    let Some(catalog) = catalog.into_dict() else {
-        return Err(Error::Unsupported(format!(
-            "document catalog {catalog_ref} is not a dictionary"
-        )));
-    };
-    let pages_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
-
-    let mut seen = BTreeSet::new();
-    let mut pages = Vec::new();
-    walk_page_tree(pdf, pages_ref, &mut seen, &mut pages, 0, max_depth)?;
-    Ok(pages)
+    PageWalk::with_max_depth(pdf, max_depth)?.collect()
 }
 
 /// Return the decoded content-stream bytes for a single `Page` object.
@@ -501,53 +489,138 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
     }
 }
 
-fn walk_page_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: ObjectRef,
-    seen: &mut BTreeSet<ObjectRef>,
-    pages: &mut Vec<ObjectRef>,
-    depth: usize,
+/// An iterator over every leaf `Page` object-reference in the document's `/Pages`
+/// tree, yielding refs in document order (ISO 32000-1 §7.7.3.2).
+///
+/// Each node is visited at most once (tracked via a `BTreeSet`) so cycles in
+/// malformed documents are silently skipped. On the first resolve failure or
+/// depth-limit breach the iterator emits `Some(Err(...))` and is then fused
+/// — all subsequent calls return `None`.
+///
+/// # Construction
+///
+/// Use [`PageWalk::new`] or [`PageWalk::with_max_depth`].
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{pages::PageWalk, Pdf};
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// for page_ref in PageWalk::new(&mut pdf)? {
+///     let page_ref = page_ref?;
+///     println!("page: {page_ref}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct PageWalk<'a, R: Read + Seek> {
+    pdf: &'a mut Pdf<R>,
+    /// Stack of `(node_ref, depth)` yet to be visited.
+    stack: Vec<(ObjectRef, usize)>,
+    seen: BTreeSet<ObjectRef>,
     max_depth: usize,
-) -> Result<()> {
-    if depth >= max_depth {
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {max_depth} at {node}"
-        )));
+    /// Set to `true` after yielding `Err`; causes all subsequent calls to return `None`.
+    done: bool,
+}
+
+impl<'a, R: Read + Seek> PageWalk<'a, R> {
+    /// Create a `PageWalk` using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
+    ///
+    /// Returns [`Error::Missing`] if the catalog or `/Pages` entry is absent.
+    /// Returns [`Error::Unsupported`] if the catalog is not a dictionary.
+    pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
+        Self::with_max_depth(pdf, DEFAULT_MAX_PAGE_TREE_DEPTH)
     }
 
-    if !seen.insert(node) {
-        return Ok(());
-    }
-
-    let node_obj = pdf.resolve(node)?;
-    let Some(dict) = node_obj.into_dict() else {
-        return Ok(());
-    };
-
-    let node_type = dict
-        .get("Type")
-        .and_then(|value| match value {
-            Object::Name(value) => Some(value.clone()),
-            _ => None,
+    /// Create a `PageWalk` with a caller-supplied recursion limit.
+    pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
+        let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+        let catalog = pdf.resolve(catalog_ref)?;
+        let Some(catalog) = catalog.into_dict() else {
+            return Err(Error::Unsupported(format!(
+                "document catalog {catalog_ref} is not a dictionary"
+            )));
+        };
+        let pages_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
+        Ok(PageWalk {
+            pdf,
+            stack: vec![(pages_ref, 0)],
+            seen: BTreeSet::new(),
+            max_depth,
+            done: false,
         })
-        .unwrap_or_default();
+    }
+}
 
-    if node_type.as_slice() == b"Pages" {
-        if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-            for kid in kids {
-                if let Object::Reference(reference) = kid {
-                    walk_page_tree(pdf, *reference, seen, pages, depth + 1, max_depth)?;
-                }
-            }
+impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
+    type Item = Result<ObjectRef>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
         }
-        return Ok(());
-    }
 
-    if node_type.as_slice() == b"Page" {
-        pages.push(node);
-    }
+        loop {
+            let (node, depth) = self.stack.pop()?;
 
-    Ok(())
+            if depth >= self.max_depth {
+                self.done = true;
+                return Some(Err(Error::Unsupported(format!(
+                    "page tree depth exceeds maximum of {} at {}",
+                    self.max_depth, node
+                ))));
+            }
+
+            if !self.seen.insert(node) {
+                continue; // cycle guard: already visited
+            }
+
+            let node_obj = match self.pdf.resolve(node) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+
+            let Some(dict) = node_obj.into_dict() else {
+                continue; // non-dictionary: skip silently
+            };
+
+            let node_type = dict
+                .get("Type")
+                .and_then(|value| match value {
+                    Object::Name(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            if node_type.as_slice() == b"Pages" {
+                if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
+                    let kid_refs: Vec<ObjectRef> = kids
+                        .iter()
+                        .filter_map(|k| match k {
+                            Object::Reference(r) => Some(*r),
+                            _ => None,
+                        })
+                        .collect();
+                    // Push in reverse order so that the first kid is popped first.
+                    for kid in kid_refs.into_iter().rev() {
+                        self.stack.push((kid, depth + 1));
+                    }
+                }
+                continue;
+            }
+
+            if node_type.as_slice() == b"Page" {
+                return Some(Ok(node));
+            }
+
+            // Unknown or absent /Type: skip silently.
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1120,5 +1193,267 @@ mod tests {
             result.is_none(),
             "expected Ok(None) when /Parent is null and no /Resources"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PageWalk tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal valid PDF from a list of (object_number, body_literal) pairs.
+    /// `catalog_ref` is the object number of the /Catalog object.
+    fn pdf_from_objects(catalog_ref: u32, objects: &[(u32, &str)]) -> Vec<u8> {
+        let mut data: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<(u32, u64)> = Vec::new();
+        for (num, body) in objects {
+            let off = data.len() as u64;
+            offsets.push((*num, off));
+            data.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = data.len() as u64;
+        let max_num = offsets.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let total = max_num as usize + 1;
+        let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+        for i in 1..=max_num {
+            if let Some((_, off)) = offsets.iter().find(|(n, _)| *n == i) {
+                xref.push_str(&format!("{off:010} 00000 n \n"));
+            } else {
+                xref.push_str("0000000000 65535 f \n");
+            }
+        }
+        data.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {total} /Root {catalog_ref} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        data.extend_from_slice(trailer.as_bytes());
+        data
+    }
+
+    #[test]
+    fn page_walk_single_page_yields_one_ref() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(refs, vec![ObjectRef::new(3, 0)]);
+    }
+
+    #[test]
+    fn page_walk_sibling_order_is_document_order() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(
+            refs,
+            vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)],
+            "pages must be yielded in document order (3 before 4)"
+        );
+    }
+
+    #[test]
+    fn page_walk_nested_tree_document_order() {
+        // Tree: Pages(2) -> [Pages(3), Page(6)]
+        //       Pages(3) -> [Page(4), Page(5)]
+        // Expected yield order: 4, 5, 6
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 3 >>"),
+                (3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>"),
+                (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+                (5, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+                (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                ObjectRef::new(4, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(6, 0),
+            ],
+            "pages must be yielded in document order across nested Pages nodes"
+        );
+    }
+
+    #[test]
+    fn page_walk_cycle_does_not_crash() {
+        // Cycle: Pages(2) -> [Pages(3)], Pages(3) -> [Pages(2)].
+        // seen-set breaks the cycle; no pages exist so result is Ok([]).
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 0 >>"),
+                (3, "<< /Type /Pages /Kids [2 0 R] /Count 0 >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let result: Result<Vec<ObjectRef>> = PageWalk::new(&mut pdf).unwrap().collect();
+        assert_eq!(result.unwrap(), vec![]);
+    }
+
+    #[test]
+    fn page_walk_depth_limit_returns_err() {
+        // max_depth=1: the Pages root is at depth 0; its kid is pushed at depth 1
+        // which equals max_depth, so popping it triggers a depth-limit error.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let result: Result<Vec<ObjectRef>> =
+            PageWalk::with_max_depth(&mut pdf, 1).unwrap().collect();
+        match result {
+            Err(Error::Unsupported(_)) => {}
+            other => panic!("expected Err(Unsupported) for depth limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn page_walk_fused_after_depth_err() {
+        // After yielding Err the iterator must return None (fused).
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let mut walk = PageWalk::with_max_depth(&mut pdf, 1).unwrap();
+        let first = walk.next();
+        assert!(
+            matches!(first, Some(Err(Error::Unsupported(_)))),
+            "first item should be Err(Unsupported)"
+        );
+        assert!(walk.next().is_none(), "iterator must be fused after Err");
+    }
+
+    #[test]
+    fn page_walk_pages_node_without_kids_is_skipped() {
+        // A Pages node with no /Kids entry: silently produces no pages.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Count 0 >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn page_walk_non_ref_kid_is_ignored() {
+        // Non-Reference element in /Kids must be silently ignored.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Patch the Pages node to include an Integer kid alongside the real Page ref.
+        let mut pages_dict = Dictionary::new();
+        pages_dict.insert("Type", Object::Name(b"Pages".to_vec()));
+        pages_dict.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Integer(999), // non-Reference: must be ignored
+                Object::Reference(ObjectRef::new(3, 0)),
+            ]),
+        );
+        pages_dict.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages_dict));
+
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(refs, vec![ObjectRef::new(3, 0)]);
+    }
+
+    #[test]
+    fn page_walk_unknown_type_node_is_skipped() {
+        // A node with unknown /Type in the Kids list is silently skipped.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 1 >>"),
+                (3, "<< /Type /Widget /Parent 2 0 R >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(refs, vec![ObjectRef::new(4, 0)], "Widget node must be skipped");
+    }
+
+    #[test]
+    fn page_walk_matches_page_refs() {
+        // Regression: PageWalk and page_refs must produce identical results.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 3 >>"),
+                (3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>"),
+                (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+                (5, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+                (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let bytes2 = bytes.clone();
+        let mut pdf1 = Pdf::open(Cursor::new(bytes)).unwrap();
+        let mut pdf2 = Pdf::open(Cursor::new(bytes2)).unwrap();
+
+        let from_page_refs = page_refs(&mut pdf1).unwrap();
+        let from_walk: Vec<ObjectRef> = PageWalk::new(&mut pdf2)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(from_page_refs, from_walk);
     }
 }
