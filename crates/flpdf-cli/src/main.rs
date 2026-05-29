@@ -23,8 +23,8 @@ use flpdf::{
     resources::remove_unreferenced_resources,
     write_pdf_with_options, CompressStreams, CopyEncryptionSource, Dictionary, EncryptMethod,
     EncryptParams, NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode,
-    PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources, Severity, Stream,
-    StreamDataMode, WriteOptions,
+    PasswordMode, Pdf, PdfOpenOptions, PermissionsConfig, PrintPermission,
+    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -2106,8 +2106,23 @@ fn build_copy_encryption_source(
 ///
 /// RC4 outputs (40-bit, or 128-bit without AES) are weak and require
 /// `allow_weak_crypto` (the top-level `--allow-weak-crypto` flag), mirroring
-/// qpdf's checkConfiguration. Permission sub-flags, `--force-R5`, and
-/// `--cleartext-metadata` are still rejected (flpdf-9hc.4.9 follow-ups).
+/// qpdf's checkConfiguration.
+///
+/// Permission sub-flags (`--print`, `--modify`, `--extract`, `--annotate`,
+/// `--form`, `--assemble`, `--accessibility`) use the R>=3 grammar and are
+/// applied left-to-right onto a [`PermissionsConfig`] (matching qpdf's
+/// ordering). They are accepted for 128/256-bit only; on 40-bit (R=2) they are
+/// rejected (the R=2 `/P` encoding differs — flpdf-9hc.4.9.5 follow-up).
+/// `--force-R5` and `--cleartext-metadata` are still rejected
+/// (flpdf-9hc.4.9.6 / follow-ups).
+fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
+    match val {
+        "y" => Ok(true),
+        "n" => Ok(false),
+        other => Err(format!("{flag} must be y or n (got {other:?})").into()),
+    }
+}
+
 fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResult<EncryptParams> {
     if tokens.len() < 3 {
         return Err(format!(
@@ -2136,6 +2151,13 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
     // "insecure" combination; the gate itself lives in the KEY-LEN=256 arm
     // below (flpdf-9hc.4.14, mirroring qpdf's checkConfiguration).
     let mut allow_insecure = false;
+    // Permission sub-flags (R>=3 grammar, flpdf-9hc.4.9.5). qpdf applies them
+    // LEFT-TO-RIGHT, so mutate `perms` in place as each flag is seen rather
+    // than collecting and applying in a fixed order (which would break the
+    // observable ordering quirk, e.g. `--modify=none --annotate=y`). Permission
+    // flags are R>=3 only (128/256); on 40-bit they are rejected below.
+    let mut perms = PermissionsConfig::default();
+    let mut perm_flag_seen = false;
     for tok in &tokens[3..] {
         let (flag, val) = tok.split_once('=').unwrap_or((tok.as_str(), ""));
         match flag {
@@ -2168,26 +2190,77 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                 }
                 allow_insecure = true;
             }
-            "--print"
-            | "--modify"
-            | "--extract"
-            | "--annotate"
-            | "--form"
-            | "--assemble"
-            | "--accessibility"
-            | "--force-R5"
-            | "--cleartext-metadata" => {
+            // Permission sub-flags (R>=3 grammar). Mutate `perms` in place so
+            // the left-to-right ordering matches qpdf. Bit mapping verified
+            // empirically against `qpdf --show-encryption`.
+            "--print" => {
+                perm_flag_seen = true;
+                perms.print = match val {
+                    "full" => PrintPermission::High,
+                    "low" => PrintPermission::Low,
+                    "none" => PrintPermission::None,
+                    other => {
+                        return Err(
+                            format!("--print must be full, low, or none (got {other:?})").into(),
+                        );
+                    }
+                };
+            }
+            "--modify" => {
+                perm_flag_seen = true;
+                // Cumulative ladder (qpdf): all => other+annot+forms+assembly,
+                // annotate => annot+forms+assembly, form => forms+assembly,
+                // assembly => assembly, none => nothing.
+                let (other_, annot, forms, asm) = match val {
+                    "all" => (true, true, true, true),
+                    "annotate" => (false, true, true, true),
+                    "form" => (false, false, true, true),
+                    "assembly" => (false, false, false, true),
+                    "none" => (false, false, false, false),
+                    other => {
+                        return Err(format!(
+                            "--modify must be all, annotate, form, assembly, or none (got {other:?})"
+                        )
+                        .into());
+                    }
+                };
+                perms.modify_contents = other_;
+                perms.annotate = annot;
+                perms.fill_forms = forms;
+                perms.assemble = asm;
+            }
+            "--extract" => {
+                perm_flag_seen = true;
+                perms.extract = parse_perm_yn(flag, val)?;
+            }
+            "--annotate" => {
+                perm_flag_seen = true;
+                perms.annotate = parse_perm_yn(flag, val)?;
+            }
+            "--form" => {
+                perm_flag_seen = true;
+                perms.fill_forms = parse_perm_yn(flag, val)?;
+            }
+            "--assemble" => {
+                perm_flag_seen = true;
+                perms.assemble = parse_perm_yn(flag, val)?;
+            }
+            "--accessibility" => {
+                perm_flag_seen = true;
+                perms.accessibility = parse_perm_yn(flag, val)?;
+            }
+            "--force-R5" | "--cleartext-metadata" => {
                 return Err(format!(
                     "encryption sub-flag {flag:?} is not yet supported in this release; \
-                     follow-up work tracked on flpdf-9hc.4.9 (typed PermissionsConfig + \
-                     CLI flag wiring)"
+                     follow-up work tracked on flpdf-9hc.4.9"
                 )
                 .into());
             }
             other => {
                 return Err(format!(
                     "unknown --encrypt sub-flag {other:?}; supported in this release: \
-                     --use-aes=y|n, --force-V4, --allow-insecure"
+                     --use-aes=y|n, --force-V4, --allow-insecure, --print, --modify, \
+                     --extract, --annotate, --form, --assemble, --accessibility"
                 )
                 .into());
             }
@@ -2200,10 +2273,12 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
     // `--encrypt … 40 --use-aes=y` would quietly write RC4-40 while the user
     // expected AES (a security-relevant mismatch).
     match key_len {
-        40 if use_aes.is_some() || force_v4 || allow_insecure => {
+        40 if use_aes.is_some() || force_v4 || allow_insecure || perm_flag_seen => {
             return Err(
-                "--encrypt KEY-LEN=40 does not accept --use-aes, --force-V4, or \
-                        --allow-insecure (40-bit is V=1 RC4-40)"
+                "--encrypt KEY-LEN=40 (V=1 RC4-40, R=2) does not accept --use-aes, \
+                 --force-V4, --allow-insecure, or permission sub-flags; the R>=3 \
+                 permission grammar needs a 128- or 256-bit key (40-bit permission \
+                 flags are flpdf-9hc.4.9.5 follow-up)"
                     .into(),
             );
         }
@@ -2242,19 +2317,32 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
             user_pw,
             owner_pw,
         )),
-        128 => match use_aes {
-            Some(true) => Ok(EncryptParams::v4_aes128(user_pw, owner_pw)),
-            // qpdf's 128-bit default is RC4; `--force-V4` selects the V=4
-            // /CFM V2 variant, otherwise V=2 R=3.
-            Some(false) | None => {
-                let method = if force_v4 {
-                    EncryptMethod::V4Rc4128
-                } else {
-                    EncryptMethod::V2Rc4128
-                };
-                guard_weak(EncryptParams::rc4(method, user_pw, owner_pw))
+        128 => {
+            let mut params = match use_aes {
+                Some(true) => EncryptParams::v4_aes128(user_pw, owner_pw),
+                // qpdf's 128-bit default is RC4; `--force-V4` selects the V=4
+                // /CFM V2 variant, otherwise V=2 R=3.
+                Some(false) | None => {
+                    let method = if force_v4 {
+                        EncryptMethod::V4Rc4128
+                    } else {
+                        EncryptMethod::V2Rc4128
+                    };
+                    EncryptParams::rc4(method, user_pw, owner_pw)
+                }
+            };
+            params.permissions = perms;
+            // Accessibility (bit 10) is unconditionally permitted for R>3;
+            // qpdf ignores `--accessibility=n` there. V=4 is R=4, so force it
+            // on; V=2 (R=3) honors the flag.
+            if matches!(
+                params.method,
+                EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128
+            ) {
+                params.permissions.accessibility = true;
             }
-        },
+            guard_weak(params)
+        }
         256 => {
             // V=5 R=6 AES-256 — always AES, so `--use-aes` is irrelevant.
             // Insecure-combination gate (flpdf-9hc.4.14, matching qpdf's
@@ -2271,7 +2359,12 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                         .into(),
                 );
             }
-            Ok(EncryptParams::v5_r6(user_pw, owner_pw))
+            let mut params = EncryptParams::v5_r6(user_pw, owner_pw);
+            params.permissions = perms;
+            // V=5 is R=6 (>3): accessibility is unconditionally permitted, so
+            // qpdf ignores `--accessibility=n`. Match that.
+            params.permissions.accessibility = true;
+            Ok(params)
         }
         _ => unreachable!("key_len validated to 40/128/256 above"),
     }
