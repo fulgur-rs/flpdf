@@ -2026,11 +2026,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
 
-    // ── flpdf-9hc.4.9 / 4.11 walking-skeleton encryption preflight ─────────
-    // The encrypted-output path (both --encrypt and --copy-encryption-from)
-    // piggybacks on the simple full-rewrite case: classic xref Table form, no
-    // ObjStm batches, no QDF.  Reject incompatible flag combinations upfront
-    // with a clear diagnostic rather than silently producing a corrupt file.
+    // ── encryption preflight (flpdf-9hc.4.9 / 4.11 / 4.16 / 4.17) ─────────
+    // --encrypt supports xref-stream form and ObjStm containers (flpdf-9hc.4.16
+    // / 4.17).  --copy-encryption-from still forces classic xref Table (ObjStm
+    // on the copy path is not yet tested).  Reject incompatible flag
+    // combinations upfront with a clear diagnostic.
     //
     // Invariant: at most ONE of encrypt / copy_encryption is set.  The CLI
     // enforces this via conflicts_with; guard here too so a library caller
@@ -2105,11 +2105,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         version = "1.5".to_string();
     }
 
-    // /V-based PDF header floor. The encrypted path uses a classic xref *table*
-    // (not a stream), so the xref-stream bump above never fires for it — apply
-    // the floor explicitly so e.g. a 1.4 input encrypted as V=4 does not emit a
-    // 1.4 header carrying /V 4 (a spec violation). /V 2 ⇒ 1.4, /V 4 ⇒ 1.5,
-    // /V 5 ⇒ 1.7; /V 1 (R=2) needs only 1.1.
+    // /V-based PDF header floor.  When the source uses a classic xref table and
+    // no ObjStm batches are produced, the xref-stream bump above (lines
+    // 2102-2106) does not fire.  Apply the /V floor explicitly so a 1.4 input
+    // encrypted as V=4 does not emit a 1.4 header carrying /V 4 (a spec
+    // violation).  /V 2 ⇒ 1.4, /V 4 ⇒ 1.5, /V 5 ⇒ 1.7; /V 1 (R=2) needs
+    // only 1.1.
     if let Some(params) = options.encrypt.as_ref() {
         use crate::encrypt_setup::EncryptMethod;
         let floor = match params.method {
