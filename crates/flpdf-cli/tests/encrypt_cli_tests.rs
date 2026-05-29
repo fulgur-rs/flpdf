@@ -1114,6 +1114,31 @@ fn rewrite_subcommand_copy_encryption_from_succeeds() {
     );
 }
 
+/// `--copy-encryption-from` (a V=4 AES-128 donor) applied to a low-version
+/// input must floor the output PDF header to 1.5 — the output carries /V 4, so
+/// a 1.3 header would be a spec violation. (one-page.pdf is %PDF-1.3.)
+#[test]
+fn copy_encryption_floors_pdf_header_to_1_5() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "user-pw", "owner-pw");
+    let out = tmp.path().join("copied.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--copy-encryption-from")
+        .arg(&donor)
+        .args(["--encryption-file-password", "user-pw", "--"])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&out)
+        .assert()
+        .success();
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF-1.5"),
+        "copy-encryption (V=4 donor) must floor the header to 1.5, got {:?}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(12)])
+    );
+}
+
 /// `--copy-encryption-from` applied to a plaintext donor is rejected with a
 /// clear "not encrypted" diagnostic.
 #[test]
