@@ -2274,7 +2274,8 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                 return Err(format!(
                     "unknown --encrypt sub-flag {other:?}; supported in this release: \
                      --use-aes=y|n, --force-V4, --allow-insecure, --print, --modify, \
-                     --extract, --annotate, --form, --assemble, --accessibility"
+                     --extract, --annotate, --form, --assemble, --accessibility, \
+                     --cleartext-metadata"
                 )
                 .into());
             }
