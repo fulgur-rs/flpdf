@@ -2194,6 +2194,33 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
         }
     }
 
+    // Enforce qpdf's per-KEY-LEN option tables: `--use-aes` / `--force-V4` are
+    // 128-only and `--allow-insecure` is 256-only. Reject incompatible flags as
+    // a usage error rather than silently ignoring them — otherwise
+    // `--encrypt … 40 --use-aes=y` would quietly write RC4-40 while the user
+    // expected AES (a security-relevant mismatch).
+    match key_len {
+        40 if use_aes.is_some() || force_v4 || allow_insecure => {
+            return Err(
+                "--encrypt KEY-LEN=40 does not accept --use-aes, --force-V4, or \
+                        --allow-insecure (40-bit is V=1 RC4-40)"
+                    .into(),
+            );
+        }
+        128 if allow_insecure => {
+            return Err(
+                "--encrypt KEY-LEN=128 does not accept --allow-insecure (256-bit only)".into(),
+            );
+        }
+        256 if use_aes.is_some() || force_v4 => {
+            return Err(
+                "--encrypt KEY-LEN=256 does not accept --use-aes or --force-V4 (128-bit only)"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+
     // RC4 outputs are weak; qpdf refuses to write them without
     // --allow-weak-crypto, so apply the same gate here.
     let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {

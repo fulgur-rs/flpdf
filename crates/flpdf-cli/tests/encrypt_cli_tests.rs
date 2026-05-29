@@ -564,6 +564,44 @@ fn encrypt_128_force_v4_no_aes_is_v4_rc4() {
     );
 }
 
+/// Sub-flags incompatible with the chosen KEY-LEN are hard usage errors (qpdf
+/// parity: `--use-aes`/`--force-V4` are 128-only, `--allow-insecure` is
+/// 256-only). They must NOT be silently ignored — otherwise e.g.
+/// `--encrypt … 40 --use-aes=y` would write RC4 while the user expected AES.
+#[test]
+fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
+    // (args-after-`--encrypt` excluding the `--` terminator, expected substring)
+    let cases: &[(&[&str], &str)] = &[
+        (&["u", "o", "40", "--use-aes=y"], "KEY-LEN=40"),
+        (&["u", "o", "40", "--force-V4"], "KEY-LEN=40"),
+        (&["u", "o", "40", "--allow-insecure"], "KEY-LEN=40"),
+        (&["u", "o", "256", "--use-aes=y"], "KEY-LEN=256"),
+        (&["u", "o", "256", "--force-V4"], "KEY-LEN=256"),
+        (&["u", "", "128", "--allow-insecure"], "KEY-LEN=128"),
+    ];
+    for (enc_args, needle) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("nope.pdf");
+        let mut cmd = Command::cargo_bin("flpdf").unwrap();
+        // --allow-weak-crypto so the rejection is about the incompatible flag,
+        // not the weak-crypto gate (which would also fire for 40).
+        cmd.arg("--allow-weak-crypto").arg("--encrypt");
+        for a in *enc_args {
+            cmd.arg(a);
+        }
+        cmd.arg("--")
+            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(&output)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(*needle));
+        assert!(
+            !output.exists(),
+            "no output for incompatible combo {enc_args:?}"
+        );
+    }
+}
+
 #[test]
 fn encrypt_permission_sub_flags_are_rejected_with_followup_pointer() {
     let tmp = tempfile::tempdir().unwrap();
