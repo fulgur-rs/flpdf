@@ -1419,3 +1419,114 @@ fn encrypt_with_generate_object_streams_round_trips_via_qpdf() {
         String::from_utf8_lossy(&check_result.stderr)
     );
 }
+
+/// flpdf-9hc.4.17: xref-stream ソース + --object-streams=disable + --encrypt
+///
+/// source がすでに xref stream 形式を持つ場合、ObjStm を無効化して暗号化しても
+/// xref stream 形式が保持され、qpdf で復号できること。
+///
+/// これは 4.16/4.17 で実装された「--encrypt は classic xref table を強制しない」
+/// 動作を、ObjStm バッチが空の場合（preserve 元の xref form）について検証する。
+#[test]
+fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Step 1: xref stream ソースを生成（--object-streams=generate）
+    let xref_stream_source = tmp.path().join("xref_stream_source.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--full-rewrite",
+            "--object-streams=generate",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&xref_stream_source)
+        .assert()
+        .success();
+
+    // Step 2: ObjStm を無効化して暗号化（4.17 固有パス: plan.batches が空、source form を継承）
+    let encrypted = tmp.path().join("encrypted_xref_stream.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--full-rewrite",
+            "--object-streams=disable",
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&xref_stream_source)
+        .arg(&encrypted)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&encrypted).unwrap();
+
+    // xref stream 形式が保持されていること（classic "xref\n" キーワードではなく /Type /XRef が使われる）
+    assert!(
+        bytes.windows(b"/XRef".len()).any(|w| w == b"/XRef"),
+        "output must use xref stream form (/Type /XRef), not a classic xref table"
+    );
+
+    // ObjStm が存在しないこと（disable モードなので）
+    assert!(
+        !bytes.windows(b"/ObjStm".len()).any(|w| w == b"/ObjStm"),
+        "output must not contain ObjStm containers when --object-streams=disable"
+    );
+
+    // /Encrypt が存在すること
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "output must carry /Encrypt"
+    );
+
+    // qpdf がユーザーパスワードで認証できること
+    let check = std::process::Command::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--show-encryption")
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --show-encryption failed:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("R = 4"), "qpdf must report R=4: {stdout}");
+
+    // qpdf --decrypt で完全に復号できること
+    let decrypted = tmp.path().join("decrypted_xref_stream.pdf");
+    let decrypt_result = std::process::Command::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--decrypt")
+        .arg("--static-id")
+        .arg(&encrypted)
+        .arg(&decrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt_result.status.success(),
+        "qpdf --decrypt failed:\n{}",
+        String::from_utf8_lossy(&decrypt_result.stderr)
+    );
+
+    let check_result = std::process::Command::new("qpdf")
+        .arg("--check")
+        .arg(&decrypted)
+        .output()
+        .unwrap();
+    assert!(
+        check_result.status.success(),
+        "qpdf --check on decrypted PDF failed:\n{}",
+        String::from_utf8_lossy(&check_result.stderr)
+    );
+}
