@@ -2075,6 +2075,24 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         version = "1.5".to_string();
     }
 
+    // /V-based PDF header floor. The encrypted path uses a classic xref *table*
+    // (not a stream), so the xref-stream bump above never fires for it — apply
+    // the floor explicitly so e.g. a 1.4 input encrypted as V=4 does not emit a
+    // 1.4 header carrying /V 4 (a spec violation). /V 2 ⇒ 1.4, /V 4 ⇒ 1.5,
+    // /V 5 ⇒ 1.7; /V 1 (R=2) needs only 1.1.
+    if let Some(params) = options.encrypt.as_ref() {
+        use crate::encrypt_setup::EncryptMethod;
+        let floor = match params.method {
+            EncryptMethod::V1Rc440 => (1, 1),
+            EncryptMethod::V2Rc4128 => (1, 4),
+            EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128 => (1, 5),
+            EncryptMethod::V5R6Aes256 => (1, 7),
+        };
+        if parse_pdf_version(&version).is_none_or(|v| v < floor) {
+            version = format!("{}.{}", floor.0, floor.1);
+        }
+    }
+
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     let mut object_refs = pdf.object_refs();
     object_refs.sort_by_key(|r| (r.number, r.generation));
@@ -3752,6 +3770,40 @@ mod tests {
                     other => panic!("obj 4 must be a stream, got {other:?}"),
                 }
             }
+        }
+    }
+
+    /// V=4 encryption (/V 4, AES-128 or RC4-128) requires a PDF header >= 1.5.
+    /// The encrypted path uses a classic xref table, so the writer must floor
+    /// the header explicitly — a 1.4 input must not emit a 1.4 header with /V 4.
+    #[test]
+    fn v4_encryption_floors_pdf_header_to_1_5() {
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use std::io::Cursor;
+
+        let fixture = build_partition_fixture();
+        assert!(
+            fixture.starts_with(b"%PDF-1.4"),
+            "fixture must start at %PDF-1.4 for this test to be meaningful"
+        );
+
+        for params in [
+            EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()),
+            EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u".to_vec(), b"o".to_vec()),
+        ] {
+            let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
+            let mut out = Vec::new();
+            let options = WriteOptions {
+                full_rewrite: true,
+                encrypt: Some(params),
+                ..WriteOptions::default()
+            };
+            write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=4 encrypted write");
+            assert!(
+                out.starts_with(b"%PDF-1.5"),
+                "V=4 encryption must floor the header to 1.5, got {:?}",
+                String::from_utf8_lossy(&out[..out.len().min(12)])
+            );
         }
     }
 }
