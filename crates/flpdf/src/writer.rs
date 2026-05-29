@@ -1606,7 +1606,8 @@ fn build_encryption_context<R: Read + Seek>(
 ) -> Result<EncryptionContext> {
     use crate::encrypt_setup::EncryptMethod;
     use crate::security::standard::{
-        build_v4_encrypt_dict, ObjectKeyAlg, V4CryptMethod, V4EncryptParams,
+        build_v1_v2_encrypt_dict, build_v4_encrypt_dict, ObjectKeyAlg, V1V2EncryptParams,
+        V4CryptMethod, V4EncryptParams,
     };
 
     // Resolve /ID[0] BEFORE deriving the file key. Algorithm 2 uses /ID[0]
@@ -1642,6 +1643,48 @@ fn build_encryption_context<R: Read + Seek>(
             };
             let dict = build_v5_r6_encrypt_dict(&v5, &secrets);
             (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
+        }
+        EncryptMethod::V1Rc440 => {
+            // V=1 R=2 RC4-40. /EncryptMetadata is a V>=4 concept, so it is not
+            // emitted here (V1V2EncryptParams has no such field).
+            let v12 = V1V2EncryptParams {
+                v: 1,
+                r: 2,
+                length_bits: 40,
+                user_password: &params.user_password,
+                owner_password: &params.owner_password,
+                p: params.permissions.to_p_bits(),
+                id0: &id0,
+            };
+            let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+        }
+        EncryptMethod::V2Rc4128 => {
+            // V=2 R=3 RC4-128 (qpdf's default for `--encrypt … 128`).
+            let v12 = V1V2EncryptParams {
+                v: 2,
+                r: 3,
+                length_bits: 128,
+                user_password: &params.user_password,
+                owner_password: &params.owner_password,
+                p: params.permissions.to_p_bits(),
+                id0: &id0,
+            };
+            let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+        }
+        EncryptMethod::V4Rc4128 => {
+            // V=4 R=4 with /CFM V2 (RC4-128 crypt filter), e.g. `--force-V4`.
+            let v4 = V4EncryptParams {
+                method: V4CryptMethod::Rc4,
+                user_password: &params.user_password,
+                owner_password: &params.owner_password,
+                p: params.permissions.to_p_bits(),
+                id0: &id0,
+                encrypt_metadata: params.encrypt_metadata,
+            };
+            let (dict, key) = build_v4_encrypt_dict(&v4)?;
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
         }
     };
 
@@ -3640,6 +3683,74 @@ mod tests {
                     "V=5 R=6 stream must round-trip via reader for {label:?}"
                 ),
                 other => panic!("obj 4 must be a stream, got {other:?}"),
+            }
+        }
+    }
+
+    /// flpdf-9hc.4.9.1/.2/.3: each RC4 writer method (V=1 RC4-40, V=2 RC4-128,
+    /// V=4 RC4-128) round-trips. Encrypt a string+stream fixture, then re-open
+    /// with flpdf under EACH password and confirm `/Title` and the stream
+    /// decrypt to plaintext. The reader gates RC4 behind weak-crypto, so the
+    /// re-open sets `allow_weak_crypto = true`.
+    #[test]
+    fn rc4_methods_round_trip_string_and_stream_via_reader() {
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::PdfOpenOptions;
+        use std::io::Cursor;
+
+        let fixture = build_string_and_stream_fixture();
+        for method in [
+            EncryptMethod::V1Rc440,
+            EncryptMethod::V2Rc4128,
+            EncryptMethod::V4Rc4128,
+        ] {
+            let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
+            let mut out = Vec::new();
+            let options = WriteOptions {
+                full_rewrite: true,
+                // Keep the stream uncompressed so the decrypted payload equals
+                // the original bytes.
+                compress_streams: CompressStreams::No,
+                encrypt: Some(EncryptParams::rc4(
+                    method,
+                    b"user-pw".to_vec(),
+                    b"owner-pw".to_vec(),
+                )),
+                ..WriteOptions::default()
+            };
+            write_pdf_with_options(&mut pdf, &mut out, &options)
+                .unwrap_or_else(|e| panic!("{method:?} encrypted write failed: {e}"));
+
+            for pw in [b"user-pw".as_slice(), b"owner-pw".as_slice()] {
+                let label = format!("{method:?}/{}", String::from_utf8_lossy(pw));
+                let mut rt = Pdf::open_with_options(
+                    Cursor::new(out.clone()),
+                    PdfOpenOptions {
+                        password: pw.to_vec(),
+                        allow_weak_crypto: true,
+                        ..PdfOpenOptions::default()
+                    },
+                )
+                .unwrap_or_else(|e| panic!("re-open {label} failed: {e}"));
+
+                let obj3 = rt.resolve(ObjectRef::new(3, 0)).expect("resolve obj 3");
+                let dict = match obj3 {
+                    Object::Dictionary(d) => d,
+                    other => panic!("obj 3 must be a dict, got {other:?}"),
+                };
+                match dict.get("Title") {
+                    Some(Object::String(s)) => {
+                        assert_eq!(s.as_slice(), b"TopSecretTitle", "{label} string round-trip")
+                    }
+                    other => panic!("/Title must be a string, got {other:?}"),
+                }
+                let obj4 = rt.resolve(ObjectRef::new(4, 0)).expect("resolve obj 4");
+                match obj4 {
+                    Object::Stream(s) => {
+                        assert_eq!(s.data.as_slice(), b"hello", "{label} stream round-trip")
+                    }
+                    other => panic!("obj 4 must be a stream, got {other:?}"),
+                }
             }
         }
     }
