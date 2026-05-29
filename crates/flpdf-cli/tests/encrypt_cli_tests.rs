@@ -357,6 +357,78 @@ fn encrypt_key_len_256_is_accepted_as_v5_r6() {
     );
 }
 
+/// flpdf-9hc.4.14: a non-empty user password with an EMPTY owner password
+/// under a 256-bit key is insecure (anyone can open the file as owner), so it
+/// is rejected unless `--allow-insecure` is given — matching qpdf's
+/// checkConfiguration. No output is written.
+#[test]
+fn encrypt_v5_r6_empty_owner_nonempty_user_requires_allow_insecure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "", "256", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("insecure"))
+        .stderr(predicates::str::contains("--allow-insecure"));
+    assert!(!output.exists(), "no output must be written when rejected");
+}
+
+/// With `--allow-insecure` (in the sub-flag segment, before `--`) the same
+/// empty-owner V=5 R=6 encryption succeeds and qpdf opens it with the user
+/// password, reporting R=6.
+#[test]
+fn encrypt_v5_r6_empty_owner_with_allow_insecure_succeeds_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("insecure.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "", "256", "--allow-insecure", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --show-encryption failed: stderr={}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 6") && stdout.contains("Supplied password is user password"),
+        "qpdf must report R=6 + user-password match for the --allow-insecure output: {stdout}"
+    );
+}
+
+/// The insecure gate only fires for the empty-owner case: a 256-bit
+/// encryption with BOTH passwords non-empty succeeds without `--allow-insecure`.
+#[test]
+fn encrypt_v5_r6_both_passwords_no_allow_insecure_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("secure.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "owner-pw", "256", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+    assert!(output.exists(), "both-password 256 encryption must succeed");
+}
+
 #[test]
 fn encrypt_128_without_use_aes_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();

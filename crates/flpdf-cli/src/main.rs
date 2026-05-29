@@ -2139,6 +2139,10 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
     // other sub-flag is rejected with a clear message so users do not get a
     // silent shrug when they pass `--print=none` and expect it to work.
     let mut use_aes: Option<bool> = None;
+    // `--allow-insecure` opts into the V=5 R=6 empty-owner + non-empty-user
+    // "insecure" combination; the gate itself lives in the KEY-LEN=256 branch
+    // below (flpdf-9hc.4.14, mirroring qpdf's checkConfiguration).
+    let mut allow_insecure = false;
     for tok in &tokens[3..] {
         let (flag, val) = tok.split_once('=').unwrap_or((tok.as_str(), ""));
         match flag {
@@ -2151,6 +2155,9 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
                     }
                 });
             }
+            // Accepted everywhere but only meaningful for KEY-LEN=256; qpdf
+            // likewise ignores it for 40/128-bit. No value (`--allow-insecure`).
+            "--allow-insecure" => allow_insecure = true,
             "--print"
             | "--modify"
             | "--extract"
@@ -2160,7 +2167,6 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
             | "--accessibility"
             | "--force-V4"
             | "--force-R5"
-            | "--allow-insecure"
             | "--cleartext-metadata" => {
                 return Err(format!(
                     "encryption sub-flag {flag:?} is not yet supported in this release; \
@@ -2179,11 +2185,23 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
     }
 
     // KEY-LEN=256 is V=5 R=6 AES-256. It is always AES, so `--use-aes` (a
-    // 128-only V=2-vs-V=4 selector) is irrelevant and ignored here. Permission
-    // sub-flags and `--allow-insecure` were rejected by the loop above; the
-    // empty-owner + non-empty-user "insecure" combination guard is the
-    // follow-up flpdf-9hc.4.14, so the owner password passes through verbatim.
+    // 128-only V=2-vs-V=4 selector) is irrelevant and ignored here.
     if key_len == 256 {
+        // Insecure-combination gate (flpdf-9hc.4.14), matching qpdf's
+        // checkConfiguration: a non-empty user password with an EMPTY owner
+        // password under a 256-bit key lets anyone open the file without the
+        // owner password, so the owner restrictions are meaningless. Require
+        // explicit opt-in via `--allow-insecure` (placed in the sub-flag
+        // segment, before the `--`).
+        if owner_pw.is_empty() && !user_pw.is_empty() && !allow_insecure {
+            return Err(
+                "A PDF with a non-empty user password and an empty owner password \
+                 encrypted with a 256-bit key is insecure as it can be opened without \
+                 a password. If you really want to do this, you must also give the \
+                 --allow-insecure option before the -- that follows --encrypt."
+                    .into(),
+            );
+        }
         return Ok(EncryptParams::v5_r6(user_pw, owner_pw));
     }
 
