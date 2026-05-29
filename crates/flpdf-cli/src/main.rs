@@ -2158,6 +2158,10 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
     // flags are R>=3 only (128/256); on 40-bit they are rejected below.
     let mut perms = PermissionsConfig::default();
     let mut perm_flag_seen = false;
+    // `--cleartext-metadata` leaves the /Metadata XMP stream unencrypted
+    // (flpdf-9hc.4.9.6). Honored for V=4/V=5 only (the V=1/V=2 dict builder has
+    // no /EncryptMetadata); rejected for 40-bit / 128-without-AES below.
+    let mut cleartext_metadata = false;
     for tok in &tokens[3..] {
         let (flag, val) = tok.split_once('=').unwrap_or((tok.as_str(), ""));
         match flag {
@@ -2249,7 +2253,17 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                 perm_flag_seen = true;
                 perms.accessibility = parse_perm_yn(flag, val)?;
             }
-            "--force-R5" | "--cleartext-metadata" => {
+            // Value-less; honored for V=4/V=5 (gated in the dispatch below).
+            "--cleartext-metadata" => {
+                if tok.contains('=') {
+                    return Err(format!(
+                        "--cleartext-metadata does not take a value (got {tok:?})"
+                    )
+                    .into());
+                }
+                cleartext_metadata = true;
+            }
+            "--force-R5" => {
                 return Err(format!(
                     "encryption sub-flag {flag:?} is not yet supported in this release; \
                      follow-up work tracked on flpdf-9hc.4.9"
@@ -2310,6 +2324,20 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
         Ok(params)
     };
 
+    // --cleartext-metadata needs /EncryptMetadata, a V>=4 concept; the V=1/V=2
+    // dict builder cannot emit it. Reject it before dispatch when the chosen
+    // method would be V=1 (40-bit) or V=2 (128 without AES / --force-V4).
+    if cleartext_metadata {
+        let is_v4_or_v5 = key_len == 256 || (key_len == 128 && (use_aes == Some(true) || force_v4));
+        if !is_v4_or_v5 {
+            return Err(
+                "--cleartext-metadata requires V=4 or V=5 (256-bit, or 128-bit with \
+                 --use-aes=y or --force-V4); V=1/V=2 have no /EncryptMetadata"
+                    .into(),
+            );
+        }
+    }
+
     match key_len {
         // KEY-LEN=40 is always V=1 RC4-40; --use-aes / --force-V4 do not apply.
         40 => guard_weak(EncryptParams::rc4(
@@ -2341,6 +2369,11 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
             ) {
                 params.permissions.accessibility = true;
             }
+            // cleartext_metadata was validated to imply V=4 here (the guard
+            // above rejects it for the V=2 default).
+            if cleartext_metadata {
+                params.encrypt_metadata = false;
+            }
             guard_weak(params)
         }
         256 => {
@@ -2364,6 +2397,9 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
             // V=5 is R=6 (>3): accessibility is unconditionally permitted, so
             // qpdf ignores `--accessibility=n`. Match that.
             params.permissions.accessibility = true;
+            if cleartext_metadata {
+                params.encrypt_metadata = false;
+            }
             Ok(params)
         }
         _ => unreachable!("key_len validated to 40/128/256 above"),

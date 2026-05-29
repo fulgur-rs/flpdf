@@ -1596,6 +1596,28 @@ struct EncryptionContext {
     /// being drawn from the OS CSPRNG.  Testing only — mirrors
     /// [`WriteOptions::static_aes_iv`].
     static_aes_iv: bool,
+    /// Whether the `/Metadata` stream is encrypted alongside the rest of the
+    /// document (mirrors [`EncryptParams::encrypt_metadata`]). When `false`
+    /// (qpdf `--cleartext-metadata`, V=4/V=5 only), the `/Metadata` stream in
+    /// [`metadata_ref`](Self::metadata_ref) is left in the clear and tagged
+    /// with `/Crypt /Identity` instead of being run through the cipher.
+    encrypt_metadata: bool,
+    /// Indirect reference of the document `/Catalog`'s `/Metadata` stream, when
+    /// one exists AND `encrypt_metadata` is `false`. Used by the emission loop
+    /// to exempt exactly that object from encryption. `None` whenever metadata
+    /// is encrypted (the common case) or the document has no `/Metadata`.
+    metadata_ref: Option<ObjectRef>,
+}
+
+/// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
+/// Used to exempt the XMP metadata stream from encryption under
+/// `--cleartext-metadata` (flpdf-9hc.4.9.6).
+fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
+    let root = pdf.root_ref()?;
+    match pdf.resolve(root).ok()? {
+        Object::Dictionary(dict) => dict.get_ref("Metadata"),
+        _ => None,
+    }
 }
 
 fn build_encryption_context<R: Read + Seek>(
@@ -1603,6 +1625,7 @@ fn build_encryption_context<R: Read + Seek>(
     options: &WriteOptions,
     params: &crate::encrypt_setup::EncryptParams,
     existing_max: u32,
+    metadata_ref: Option<ObjectRef>,
 ) -> Result<EncryptionContext> {
     use crate::encrypt_setup::EncryptMethod;
     use crate::security::standard::{
@@ -1705,6 +1728,14 @@ fn build_encryption_context<R: Read + Seek>(
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0,
         static_aes_iv: options.static_aes_iv,
+        encrypt_metadata: params.encrypt_metadata,
+        // Only exempt the /Metadata stream when cleartext metadata was actually
+        // requested (the caller passes None when encrypt_metadata is true).
+        metadata_ref: if params.encrypt_metadata {
+            None
+        } else {
+            metadata_ref
+        },
     })
 }
 
@@ -1761,6 +1792,11 @@ fn build_copy_encryption_context(
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
+        // --copy-encryption-from re-encrypts every stream with the donor's
+        // scheme; cleartext-metadata exemption for the copy path is out of
+        // scope here (flpdf-9hc.4.9.6 covers the --encrypt path).
+        encrypt_metadata: true,
+        metadata_ref: None,
     })
 }
 
@@ -2137,12 +2173,26 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // - The /Encrypt object's number is allocated above all existing objects
     //   and ObjStm containers — known here because we've forced
     //   object_streams=disable for the encrypted path (no containers exist).
+    // Resolve the /Catalog's /Metadata stream ref up front (needs &mut pdf) so
+    // the encryption context can exempt exactly that object under
+    // `--cleartext-metadata` (encrypt_metadata=false). Only needed for the
+    // --encrypt path requesting cleartext metadata.
+    let metadata_ref = if options
+        .encrypt
+        .as_ref()
+        .is_some_and(|p| !p.encrypt_metadata)
+    {
+        resolve_metadata_stream_ref(pdf)
+    } else {
+        None
+    };
     let encrypt_ctx: Option<EncryptionContext> = if let Some(ref params) = options.encrypt {
         Some(build_encryption_context(
             pdf,
             options,
             params,
             existing_max,
+            metadata_ref,
         )?)
     } else if let Some(ref src) = options.copy_encryption {
         Some(build_copy_encryption_context(src, options, existing_max)?)
@@ -2322,7 +2372,18 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             if let Some(ctx) = &encrypt_ctx {
                 if *object_ref != ctx.encrypt_ref {
                     if let Object::Stream(ref mut s) = reencoded {
-                        encrypt_stream_payload_for_writer(*object_ref, s, ctx)?;
+                        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*object_ref) {
+                            // --cleartext-metadata: leave the /Metadata XMP
+                            // stream in the clear and prepend /Crypt /Identity so
+                            // readers know not to decrypt it (flpdf-9hc.4.9.6).
+                            // /Length stays as the un-encrypted byte count.
+                            crate::security::standard::prepend_crypt_filter_to_stream_dict(
+                                &mut s.dict,
+                                b"Identity",
+                            );
+                        } else {
+                            encrypt_stream_payload_for_writer(*object_ref, s, ctx)?;
+                        }
                     }
                 }
             }
@@ -3812,5 +3873,102 @@ mod tests {
                 String::from_utf8_lossy(&out[..out.len().min(12)])
             );
         }
+    }
+
+    /// A minimal PDF whose `/Catalog` references a `/Metadata` XMP stream
+    /// (obj 4), carrying a recognizable marker.
+    fn build_metadata_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries: Vec<(u32, u16, usize)> = Vec::new();
+
+        entries.push((1, 0, bytes.len()));
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n",
+        );
+        entries.push((2, 0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        entries.push((3, 0, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n<< /Subtype /Marker /Value 1 >>\nendobj\n");
+
+        entries.push((4, 0, bytes.len()));
+        let xmp: &[u8] =
+            b"<?xpacket?><x:xmpmeta>SECRET-XMP-MARKER</x:xmpmeta><?xpacket end=\"w\"?>";
+        bytes.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
+                xmp.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(xmp);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (_num, generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    /// flpdf-9hc.4.9.6: with `encrypt_metadata = false` the `/Catalog`'s
+    /// `/Metadata` stream is left UNENCRYPTED (its bytes survive in the clear)
+    /// and tagged `/Crypt`, and the `/Encrypt` dict carries `/EncryptMetadata
+    /// false` — whereas the default (`encrypt_metadata = true`) ciphers it.
+    #[test]
+    fn cleartext_metadata_exempts_metadata_stream_from_encryption() {
+        use std::io::Cursor;
+
+        const MARKER: &[u8] = b"SECRET-XMP-MARKER";
+        let fixture = build_metadata_fixture();
+        let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+
+        let encrypt = |encrypt_metadata: bool| -> Vec<u8> {
+            let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
+            let mut out = Vec::new();
+            let mut params =
+                crate::encrypt_setup::EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec());
+            params.encrypt_metadata = encrypt_metadata;
+            let options = WriteOptions {
+                full_rewrite: true,
+                // No compression so cleartext metadata is a literal substring.
+                compress_streams: CompressStreams::No,
+                encrypt: Some(params),
+                ..WriteOptions::default()
+            };
+            write_pdf_with_options(&mut pdf, &mut out, &options).expect("encrypted write");
+            out
+        };
+
+        // Default: /Metadata is encrypted, so the marker does not appear.
+        let enc = encrypt(true);
+        assert!(
+            !contains(&enc, MARKER),
+            "default encrypt must cipher the /Metadata stream"
+        );
+
+        // --cleartext-metadata: the XMP marker survives in the clear, the dict
+        // emits /EncryptMetadata false, and the stream is tagged /Crypt.
+        let ct = encrypt(false);
+        assert!(
+            contains(&ct, MARKER),
+            "cleartext metadata must leave the XMP stream unencrypted"
+        );
+        assert!(
+            contains(&ct, b"/EncryptMetadata false"),
+            "the /Encrypt dict must carry /EncryptMetadata false"
+        );
+        assert!(
+            contains(&ct, b"/Crypt"),
+            "the exempt /Metadata stream must be tagged with a /Crypt filter"
+        );
     }
 }

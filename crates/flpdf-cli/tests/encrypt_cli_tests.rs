@@ -698,6 +698,83 @@ fn encrypt_permission_sub_flags_match_qpdf() {
     }
 }
 
+/// flpdf-9hc.4.9.6: `--cleartext-metadata` is accepted for V=4/V=5 (the dict
+/// emits `/EncryptMetadata false`) and rejected for V=1/V=2 (40-bit, or 128
+/// without AES) which have no `/EncryptMetadata` concept.
+#[test]
+fn encrypt_cleartext_metadata_accept_reject_matrix() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Accepted for 256 (V=5): output carries /EncryptMetadata false.
+    let ok = tmp.path().join("ct256.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "u", "o", "256", "--cleartext-metadata", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&ok)
+        .assert()
+        .success();
+    let bytes = std::fs::read(&ok).unwrap();
+    assert!(
+        bytes
+            .windows(b"/EncryptMetadata false".len())
+            .any(|w| w == b"/EncryptMetadata false"),
+        "256 --cleartext-metadata must emit /EncryptMetadata false"
+    );
+
+    // Accepted for 128 --use-aes=y (V=4).
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--use-aes=y",
+            "--cleartext-metadata",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(tmp.path().join("ct128aes.pdf"))
+        .assert()
+        .success();
+
+    // Rejected for 40-bit (V=1) and 128 without AES (V=2).
+    for args in [
+        vec![
+            "--allow-weak-crypto",
+            "--encrypt",
+            "u",
+            "o",
+            "40",
+            "--cleartext-metadata",
+            "--",
+        ],
+        vec![
+            "--allow-weak-crypto",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--cleartext-metadata",
+            "--",
+        ],
+    ] {
+        let nope = tmp.path().join("nope.pdf");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(&args)
+            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(&nope)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "--cleartext-metadata requires V=4 or V=5",
+            ));
+        assert!(!nope.exists(), "no output for rejected combo {args:?}");
+    }
+}
+
 #[test]
 fn encrypt_invalid_key_len_value_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
