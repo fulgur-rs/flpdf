@@ -2105,12 +2105,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         version = "1.5".to_string();
     }
 
-    // /V-based PDF header floor.  When the source uses a classic xref table and
-    // no ObjStm batches are produced, the xref-stream bump above (lines
-    // 2102-2106) does not fire.  Apply the /V floor explicitly so a 1.4 input
-    // encrypted as V=4 does not emit a 1.4 header carrying /V 4 (a spec
-    // violation).  /V 2 ⇒ 1.4, /V 4 ⇒ 1.5, /V 5 ⇒ 1.7; /V 1 (R=2) needs
-    // only 1.1.
+    // /V-based PDF header floor.  This fires independently of xref form: even
+    // when the xref-stream bump above (lines 2102-2106) has already raised the
+    // header to 1.5, a V=5/R=6 output still needs this floor to push from 1.5
+    // to 1.7.  For a classic-table source with no ObjStm batches the bump does
+    // not fire at all, making this floor the only mechanism that prevents e.g.
+    // a 1.4 input encrypted as V=4 from emitting a spec-violating 1.4 header.
+    // /V 1 (R=2) ⇒ 1.1, /V 2 ⇒ 1.4, /V 4 ⇒ 1.5, /V 5 ⇒ 1.7.
     if let Some(params) = options.encrypt.as_ref() {
         use crate::encrypt_setup::EncryptMethod;
         let floor = match params.method {
