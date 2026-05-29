@@ -2157,13 +2157,15 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
             }
             // Accepted everywhere but only meaningful for KEY-LEN=256; qpdf
             // likewise ignores it for 40/128-bit. It is a value-less flag:
-            // reject `--allow-insecure=<anything>` so a user who writes
-            // `--allow-insecure=false` (expecting to OPT OUT) does not silently
-            // enable the insecure path.
+            // reject any `--allow-insecure=...` form (including the empty
+            // `--allow-insecure=`) so a user who writes `--allow-insecure=false`
+            // (expecting to OPT OUT) — or a generated empty value — cannot
+            // silently enable the insecure path. Gate on whether `=` was
+            // present at all, not on whether the value is non-empty.
             "--allow-insecure" => {
-                if !val.is_empty() {
+                if tok.contains('=') {
                     return Err(
-                        format!("--allow-insecure does not take a value (got {val:?})").into(),
+                        format!("--allow-insecure does not take a value (got {tok:?})").into(),
                     );
                 }
                 allow_insecure = true;
