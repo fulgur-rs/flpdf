@@ -612,15 +612,6 @@ fn encrypt_permission_sub_flags_match_qpdf() {
     if !ensure_qpdf_or_skip() {
         return;
     }
-    let combos: &[&[&str]] = &[
-        &["--modify=none"],
-        &["--modify=annotate"],
-        &["--print=low", "--extract=n"],
-        &["--modify=none", "--annotate=y"], // order-sensitive: annotate re-enabled
-        &["--annotate=y", "--modify=none"], // reversed: modify clears it
-        &["--print=none", "--modify=none", "--extract=n"], // owner-only-style lockdown
-        &["--accessibility=n"],             // ignored at R>3 (must still match qpdf)
-    ];
 
     // qpdf --show-encryption permission lines (sorted), the cross-impl oracle.
     fn perm_lines(p: &Path) -> Vec<String> {
@@ -641,40 +632,69 @@ fn encrypt_permission_sub_flags_match_qpdf() {
         v
     }
 
+    // (label, top-level prefix args, --encrypt key-len + cipher selector args).
+    // Each profile exercises a distinct revision branch: 256 = R=6, 128-aes =
+    // V=4 R=4, 128-rc4 = V=2 R=3. RC4 profiles need --allow-weak-crypto for
+    // BOTH flpdf and qpdf to write.
+    let profiles: &[(&str, &[&str], &[&str])] = &[
+        ("256-r6", &[], &["--encrypt", "u", "o", "256"]),
+        (
+            "128-aes-r4",
+            &[],
+            &["--encrypt", "u", "o", "128", "--use-aes=y"],
+        ),
+        (
+            "128-rc4-r3",
+            &["--allow-weak-crypto"],
+            &["--encrypt", "u", "o", "128"],
+        ),
+    ];
+    let combos: &[&[&str]] = &[
+        &["--modify=none"],
+        &["--modify=annotate"],
+        &["--print=low", "--extract=n"],
+        &["--modify=none", "--annotate=y"], // order-sensitive: annotate re-enabled
+        &["--annotate=y", "--modify=none"], // reversed: modify clears it
+        &["--print=none", "--modify=none", "--extract=n"], // owner-only-style lockdown
+        &["--accessibility=n"],             // ignored at R>3, honored at R=3 — both must match qpdf
+    ];
+
     let tmp = tempfile::tempdir().unwrap();
-    for combo in combos {
-        let flpdf_out = tmp.path().join("flpdf.pdf");
-        let qpdf_out = tmp.path().join("qpdf.pdf");
+    for (label, prefix, enc_base) in profiles {
+        for combo in combos {
+            let flpdf_out = tmp.path().join("flpdf.pdf");
+            let qpdf_out = tmp.path().join("qpdf.pdf");
 
-        let mut c = Command::cargo_bin("flpdf").unwrap();
-        c.args(["--encrypt", "u", "o", "256"]);
-        for a in *combo {
-            c.arg(a);
+            let mut c = Command::cargo_bin("flpdf").unwrap();
+            c.args(*prefix).args(*enc_base);
+            for a in *combo {
+                c.arg(a);
+            }
+            c.arg("--")
+                .arg(fixture(ONE_PAGE_FIXTURE))
+                .arg(&flpdf_out)
+                .assert()
+                .success();
+
+            let mut q = ShellCommand::new("qpdf");
+            q.args(*prefix).args(*enc_base);
+            for a in *combo {
+                q.arg(a);
+            }
+            let st = q
+                .arg("--")
+                .arg(fixture(ONE_PAGE_FIXTURE))
+                .arg(&qpdf_out)
+                .status()
+                .unwrap();
+            assert!(st.success(), "qpdf encrypt failed for {label} {combo:?}");
+
+            assert_eq!(
+                perm_lines(&flpdf_out),
+                perm_lines(&qpdf_out),
+                "/P permissions differ from qpdf for {label} {combo:?}"
+            );
         }
-        c.arg("--")
-            .arg(fixture(ONE_PAGE_FIXTURE))
-            .arg(&flpdf_out)
-            .assert()
-            .success();
-
-        let mut q = ShellCommand::new("qpdf");
-        q.args(["--encrypt", "u", "o", "256"]);
-        for a in *combo {
-            q.arg(a);
-        }
-        let st = q
-            .arg("--")
-            .arg(fixture(ONE_PAGE_FIXTURE))
-            .arg(&qpdf_out)
-            .status()
-            .unwrap();
-        assert!(st.success(), "qpdf encrypt failed for {combo:?}");
-
-        assert_eq!(
-            perm_lines(&flpdf_out),
-            perm_lines(&qpdf_out),
-            "/P permissions differ from qpdf for {combo:?}"
-        );
     }
 }
 
