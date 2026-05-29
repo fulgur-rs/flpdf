@@ -127,10 +127,23 @@ fn flpdf_encrypt_matrix_decrypts_cleanly_via_qpdf() {
             "{label}: qpdf --decrypt failed: {}",
             String::from_utf8_lossy(&d.stderr)
         );
-        let bytes = std::fs::read(&dec).unwrap();
+        // Structurally confirm the decrypted output is plaintext (a byte-search
+        // for "/Encrypt" could false-positive on content/metadata): qpdf
+        // reports it as unencrypted.
+        let show_dec = ShellCommand::new("qpdf")
+            .arg("--show-encryption")
+            .arg(&dec)
+            .output()
+            .unwrap();
         assert!(
-            !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
-            "{label}: qpdf-decrypted plaintext must not carry /Encrypt"
+            show_dec.status.success(),
+            "{label}: qpdf --show-encryption on decrypted output failed: {}",
+            String::from_utf8_lossy(&show_dec.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&show_dec.stdout).contains("File is not encrypted"),
+            "{label}: qpdf-decrypted output must be plaintext, got: {}",
+            String::from_utf8_lossy(&show_dec.stdout)
         );
     }
 }
@@ -166,9 +179,19 @@ fn flpdf_encrypt_empty_user_password_decrypts_via_qpdf() {
         "qpdf --decrypt with an empty user password failed: {}",
         String::from_utf8_lossy(&d.stderr)
     );
-    let bytes = std::fs::read(&dec).unwrap();
+    let show_dec = ShellCommand::new("qpdf")
+        .arg("--show-encryption")
+        .arg(&dec)
+        .output()
+        .unwrap();
     assert!(
-        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
-        "decrypted empty-user output must not carry /Encrypt"
+        show_dec.status.success(),
+        "qpdf --show-encryption on decrypted empty-user output failed: {}",
+        String::from_utf8_lossy(&show_dec.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&show_dec.stdout).contains("File is not encrypted"),
+        "decrypted empty-user output must be plaintext, got: {}",
+        String::from_utf8_lossy(&show_dec.stdout)
     );
 }
