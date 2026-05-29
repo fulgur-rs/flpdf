@@ -2156,8 +2156,18 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
                 });
             }
             // Accepted everywhere but only meaningful for KEY-LEN=256; qpdf
-            // likewise ignores it for 40/128-bit. No value (`--allow-insecure`).
-            "--allow-insecure" => allow_insecure = true,
+            // likewise ignores it for 40/128-bit. It is a value-less flag:
+            // reject `--allow-insecure=<anything>` so a user who writes
+            // `--allow-insecure=false` (expecting to OPT OUT) does not silently
+            // enable the insecure path.
+            "--allow-insecure" => {
+                if !val.is_empty() {
+                    return Err(
+                        format!("--allow-insecure does not take a value (got {val:?})").into(),
+                    );
+                }
+                allow_insecure = true;
+            }
             "--print"
             | "--modify"
             | "--extract"
