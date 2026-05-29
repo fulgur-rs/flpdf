@@ -2129,14 +2129,7 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
             );
         }
         128 => { /* V=2 RC4-128 or V=4 (AES/RC4) — narrowed below by --use-aes */ }
-        256 => {
-            return Err(
-                "--encrypt KEY-LEN=256 (V=5 R=6 AES-256) is not yet supported in this release; \
-                 dict builder is shipped (flpdf-9hc.4.3) but the writer pipeline only \
-                 covers V=4 AES-128 in the walking skeleton (flpdf-9hc.4.9 follow-up)"
-                    .into(),
-            );
-        }
+        256 => { /* V=5 R=6 AES-256 — built after sub-flag parsing below */ }
         other => {
             return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {other})").into());
         }
@@ -2183,6 +2176,15 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
                 .into());
             }
         }
+    }
+
+    // KEY-LEN=256 is V=5 R=6 AES-256. It is always AES, so `--use-aes` (a
+    // 128-only V=2-vs-V=4 selector) is irrelevant and ignored here. Permission
+    // sub-flags and `--allow-insecure` were rejected by the loop above; the
+    // empty-owner + non-empty-user "insecure" combination guard is the
+    // follow-up flpdf-9hc.4.14, so the owner password passes through verbatim.
+    if key_len == 256 {
+        return Ok(EncryptParams::v5_r6(user_pw, owner_pw));
     }
 
     // KEY-LEN=128 + missing/`--use-aes=n` would be qpdf-default V=2 RC4-128

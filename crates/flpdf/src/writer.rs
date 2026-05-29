@@ -1559,14 +1559,31 @@ mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above 
 /// [`WriteOptions::encrypt`] is set. Built once at the top of
 /// [`write_pdf_full_rewrite`] via [`build_encryption_context`] and consumed
 /// by the per-object emission loop + the trailer-build step.
+/// How the writer derives per-object string/stream encryption key material.
+///
+/// Mirrors the reader's per-object dispatch (`EncryptionMode`): V<5 handlers
+/// derive a per-object key via Algorithm 1, while V=5 uses the 32-byte file
+/// key directly with AES-256 (no per-object derivation).
+#[derive(Debug, Clone, Copy)]
+enum WriteCipher {
+    /// V=1/V=2/V=4: per-object key via Algorithm 1, then RC4 or AES-128
+    /// (the [`ObjectKeyAlg`](crate::security::standard::ObjectKeyAlg) selects
+    /// the `sAlT` salt and the resulting cipher).
+    PerObject(crate::security::standard::ObjectKeyAlg),
+    /// V=5 R=5/R=6: the 32-byte file key is used directly with AES-256-CBC.
+    /// There is no Algorithm-1 per-object derivation.
+    FileKeyAes256,
+}
+
 struct EncryptionContext {
     /// Built `/Encrypt` dictionary (from a 4.1/4.2/4.3 builder).
     encrypt_dict: Dictionary,
-    /// File encryption key derived from passwords + `/ID[0]` (Algorithm 2).
+    /// File encryption key derived from passwords + `/ID[0]` (Algorithm 2),
+    /// or — for V=5 — the random 32-byte file key (FEK).
     file_key: Vec<u8>,
-    /// Per-object key derivation variant for Algorithm 1
-    /// (`Aes` adds the `sAlT` salt; `Rc4` does not).
-    object_key_alg: crate::security::standard::ObjectKeyAlg,
+    /// How per-object string/stream key material is derived (V<5 per-object
+    /// vs V=5 file-key-direct).
+    cipher: WriteCipher,
     /// Indirect reference of the freshly-allocated `/Encrypt` object. The
     /// emission loop skips this ref so the `/Encrypt` dict itself stays
     /// plaintext (PDF 1.7 §7.6.1).
@@ -1597,7 +1614,7 @@ fn build_encryption_context<R: Read + Seek>(
     // re-derive the file key from the password.
     let id0 = resolve_id0_for_encryption(pdf, options);
 
-    let (encrypt_dict, file_key, object_key_alg) = match params.method {
+    let (encrypt_dict, file_key, cipher) = match params.method {
         EncryptMethod::V4Aes128 => {
             let v4 = V4EncryptParams {
                 method: V4CryptMethod::Aes,
@@ -1608,7 +1625,23 @@ fn build_encryption_context<R: Read + Seek>(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let (dict, key) = build_v4_encrypt_dict(&v4)?;
-            (dict, key, ObjectKeyAlg::Aes)
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Aes))
+        }
+        EncryptMethod::V5R6Aes256 => {
+            use crate::security::standard::{build_v5_r6_encrypt_dict, V5R6EncryptParams};
+            // V=5 R=6 needs 68 bytes of fresh secret material (file key + four
+            // 8-byte salts + 4-byte /Perms tail). Unlike V<5, /ID[0] does NOT
+            // feed the key derivation — the file key is a standalone CSPRNG
+            // value, so V=5 output is never byte-identical across runs.
+            let secrets = generate_v5r6_secrets()?;
+            let v5 = V5R6EncryptParams {
+                user_password: &params.user_password,
+                owner_password: &params.owner_password,
+                p: params.permissions.to_p_bits(),
+                encrypt_metadata: params.encrypt_metadata,
+            };
+            let dict = build_v5_r6_encrypt_dict(&v5, &secrets);
+            (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
         }
     };
 
@@ -1625,11 +1658,39 @@ fn build_encryption_context<R: Read + Seek>(
     Ok(EncryptionContext {
         encrypt_dict,
         file_key,
-        object_key_alg,
+        cipher,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0,
         static_aes_iv: options.static_aes_iv,
     })
+}
+
+/// Generate the fresh CSPRNG secret material V=5 R=6 encryption needs: the
+/// 32-byte file key, four 8-byte password salts, and the 4-byte `/Perms`
+/// tail. OS-RNG failure is surfaced as [`crate::Error::Unsupported`] rather
+/// than panicking (mirrors the AES-IV generation in the stream pass).
+fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
+    let mut buf = [0u8; 68];
+    getrandom::getrandom(&mut buf).map_err(|e| {
+        crate::Error::Unsupported(format!(
+            "OS CSPRNG (getrandom) unavailable for V=5 R=6 secret generation: {e}"
+        ))
+    })?;
+    let mut secrets = crate::security::standard::V5R6Secrets {
+        file_key: [0u8; 32],
+        user_validation_salt: [0u8; 8],
+        user_key_salt: [0u8; 8],
+        owner_validation_salt: [0u8; 8],
+        owner_key_salt: [0u8; 8],
+        perms_random_tail: [0u8; 4],
+    };
+    secrets.file_key.copy_from_slice(&buf[0..32]);
+    secrets.user_validation_salt.copy_from_slice(&buf[32..40]);
+    secrets.user_key_salt.copy_from_slice(&buf[40..48]);
+    secrets.owner_validation_salt.copy_from_slice(&buf[48..56]);
+    secrets.owner_key_salt.copy_from_slice(&buf[56..64]);
+    secrets.perms_random_tail.copy_from_slice(&buf[64..68]);
+    Ok(secrets)
 }
 
 /// Build an [`EncryptionContext`] from a donor [`CopyEncryptionSource`]
@@ -1656,7 +1717,9 @@ fn build_copy_encryption_context(
     Ok(EncryptionContext {
         encrypt_dict: src.encrypt_dict.clone(),
         file_key: src.file_key.clone(),
-        object_key_alg: src.object_key_alg,
+        // --copy-encryption-from only supports V=4 AES-128 donors today, so the
+        // donor's per-object key alg maps straight onto the per-object cipher.
+        cipher: WriteCipher::PerObject(src.object_key_alg),
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
@@ -1734,13 +1797,6 @@ fn encrypt_strings_in_object_for_writer(
         encrypt_strings_in_object, per_object_key, ObjectKeyAlg, StringEncryptCipher,
     };
 
-    let per_obj_key = per_object_key(
-        &ctx.file_key,
-        object_ref.number,
-        u32::from(object_ref.generation),
-        ctx.object_key_alg,
-    );
-
     let mut iv_gen = || {
         if ctx.static_aes_iv {
             [0u8; 16]
@@ -1752,26 +1808,51 @@ fn encrypt_strings_in_object_for_writer(
         }
     };
 
-    match ctx.object_key_alg {
-        ObjectKeyAlg::Aes => {
-            // V=4 AES per-object key is 16 bytes (min(n + 5, 16) with n=16 → 16).
-            let key_bytes: [u8; 16] = per_obj_key
-                .as_slice()
-                .try_into()
-                .expect("V=4 AES per-object key is exactly 16 bytes");
-            let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
-            encrypt_strings_in_object(
-                object_ref,
-                object,
-                cipher,
-                Some(ctx.encrypt_ref),
-                &mut iv_gen,
-            )
+    match ctx.cipher {
+        WriteCipher::PerObject(alg) => {
+            let per_obj_key = per_object_key(
+                &ctx.file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                alg,
+            );
+            match alg {
+                ObjectKeyAlg::Aes => {
+                    // V=4 AES per-object key is 16 bytes (min(n + 5, 16) with n=16 → 16).
+                    let key_bytes: [u8; 16] = per_obj_key
+                        .as_slice()
+                        .try_into()
+                        .expect("V=4 AES per-object key is exactly 16 bytes");
+                    let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
+                    encrypt_strings_in_object(
+                        object_ref,
+                        object,
+                        cipher,
+                        Some(ctx.encrypt_ref),
+                        &mut iv_gen,
+                    )
+                }
+                ObjectKeyAlg::Rc4 => {
+                    let cipher = StringEncryptCipher::Rc4 {
+                        key: per_obj_key.as_slice(),
+                    };
+                    encrypt_strings_in_object(
+                        object_ref,
+                        object,
+                        cipher,
+                        Some(ctx.encrypt_ref),
+                        &mut iv_gen,
+                    )
+                }
+            }
         }
-        ObjectKeyAlg::Rc4 => {
-            let cipher = StringEncryptCipher::Rc4 {
-                key: per_obj_key.as_slice(),
-            };
+        WriteCipher::FileKeyAes256 => {
+            // V=5: the 32-byte file key is the object key directly (no
+            // Algorithm-1 derivation), used with AES-256-CBC.
+            let key_bytes: [u8; 32] = ctx.file_key.as_slice().try_into().map_err(|_| {
+                crate::Error::Unsupported("V=5 AES-256 file key is not 32 bytes".to_string())
+            })?;
+            let cipher = StringEncryptCipher::Aes256 { key: &key_bytes };
             encrypt_strings_in_object(
                 object_ref,
                 object,
@@ -1795,22 +1876,15 @@ fn encrypt_stream_payload_for_writer(
         encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
     };
 
-    let per_obj_key = per_object_key(
-        &ctx.file_key,
-        object_ref.number,
-        u32::from(object_ref.generation),
-        ctx.object_key_alg,
+    // AES (V=4 AESV2 or V=5 AESV3) prefixes a random 16-byte CBC IV; RC4 does
+    // not. Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
+    // entropy in a chroot at boot) as `Unsupported` instead of panicking.
+    let needs_aes_iv = matches!(
+        ctx.cipher,
+        WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
     );
-
     let mut iv = [0u8; 16];
-    if matches!(ctx.object_key_alg, ObjectKeyAlg::Aes) && !ctx.static_aes_iv {
-        // Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
-        // entropy in a chroot at boot) as `Unsupported` instead of panicking.
-        // This site returns `Result`, so propagation is straightforward; the
-        // string-encryption walker counterpart in
-        // `encrypt_strings_in_object_for_writer` goes through a `FnMut`
-        // closure that cannot today propagate the error — that path is
-        // tracked separately (see flpdf-9hc.4.9 follow-up).
+    if needs_aes_iv && !ctx.static_aes_iv {
         getrandom::getrandom(&mut iv).map_err(|e| {
             crate::Error::Unsupported(format!(
                 "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
@@ -1818,19 +1892,37 @@ fn encrypt_stream_payload_for_writer(
         })?;
     }
 
-    match ctx.object_key_alg {
-        ObjectKeyAlg::Aes => {
-            let key_bytes: [u8; 16] = per_obj_key
-                .as_slice()
-                .try_into()
-                .expect("V=4 AES per-object key is exactly 16 bytes");
-            let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
-            encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
+    match ctx.cipher {
+        WriteCipher::PerObject(alg) => {
+            let per_obj_key = per_object_key(
+                &ctx.file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                alg,
+            );
+            match alg {
+                ObjectKeyAlg::Aes => {
+                    let key_bytes: [u8; 16] = per_obj_key
+                        .as_slice()
+                        .try_into()
+                        .expect("V=4 AES per-object key is exactly 16 bytes");
+                    let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
+                    encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
+                }
+                ObjectKeyAlg::Rc4 => {
+                    let cipher = StringEncryptCipher::Rc4 {
+                        key: per_obj_key.as_slice(),
+                    };
+                    encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
+                }
+            }
         }
-        ObjectKeyAlg::Rc4 => {
-            let cipher = StringEncryptCipher::Rc4 {
-                key: per_obj_key.as_slice(),
-            };
+        WriteCipher::FileKeyAes256 => {
+            // V=5: the 32-byte file key is used directly with AES-256-CBC.
+            let key_bytes: [u8; 32] = ctx.file_key.as_slice().try_into().map_err(|_| {
+                crate::Error::Unsupported("V=5 AES-256 file key is not 32 bytes".to_string())
+            })?;
+            let cipher = StringEncryptCipher::Aes256 { key: &key_bytes };
             encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
         }
     }
@@ -3448,5 +3540,112 @@ mod tests {
             out1, out2,
             "without static_aes_iv + static_id the two encrypted outputs must differ (random /ID[1])"
         );
+    }
+
+    /// A minimal PDF carrying BOTH an `Object::String` (obj 3 `/Title`) and a
+    /// content stream (obj 4 `hello`), so an encrypt round-trip exercises the
+    /// string AND stream encryption passes — not just one. `/Info` references
+    /// obj 3 so it is a live object.
+    fn build_string_and_stream_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries: Vec<(u32, u16, usize)> = Vec::new();
+
+        entries.push((1, 0, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        entries.push((2, 0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+        entries.push((3, 0, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n<< /Title (TopSecretTitle) >>\nendobj\n");
+
+        entries.push((4, 0, bytes.len()));
+        let stream_data = b"hello";
+        bytes.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", stream_data.len()).as_bytes(),
+        );
+        bytes.extend_from_slice(stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (_num, generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    /// flpdf-9hc.4.9.4: encrypt with V=5 R=6 AES-256, then re-open with flpdf
+    /// using EACH password and confirm the string AND stream decrypt back to
+    /// their original plaintext. This exercises the V=5 file-key-direct
+    /// AES-256 string pass and stream pass via the reader. V=5 has random
+    /// salts + FEK, so there is no byte-identical determinism to assert — this
+    /// password round-trip is the correctness gate.
+    #[test]
+    fn v5_r6_encrypt_round_trips_string_and_stream_via_reader() {
+        use crate::PdfOpenOptions;
+        use std::io::Cursor;
+
+        let fixture = build_string_and_stream_fixture();
+        let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            // Keep the stream uncompressed so the decrypted payload is exactly
+            // the original bytes (no filter round-trip to account for).
+            compress_streams: CompressStreams::No,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                b"user-pw".to_vec(),
+                b"owner-pw".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=5 R=6 encrypted write");
+
+        for pw in [b"user-pw".as_slice(), b"owner-pw".as_slice()] {
+            let label = String::from_utf8_lossy(pw).into_owned();
+            let mut rt = Pdf::open_with_options(
+                Cursor::new(out.clone()),
+                PdfOpenOptions {
+                    password: pw.to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("re-open of V=5 output with {label:?} failed: {e}"));
+
+            // String pass: obj 3 /Title must decrypt to the original plaintext.
+            let obj3 = rt.resolve(ObjectRef::new(3, 0)).expect("resolve obj 3");
+            let dict = match obj3 {
+                Object::Dictionary(d) => d,
+                other => panic!("obj 3 must be a dictionary, got {other:?}"),
+            };
+            match dict.get("Title") {
+                Some(Object::String(s)) => assert_eq!(
+                    s.as_slice(),
+                    b"TopSecretTitle",
+                    "V=5 R=6 string must round-trip via reader for {label:?}"
+                ),
+                other => panic!("/Title must be a string, got {other:?}"),
+            }
+
+            // Stream pass: obj 4 payload must decrypt to the original "hello".
+            let obj4 = rt.resolve(ObjectRef::new(4, 0)).expect("resolve obj 4");
+            match obj4 {
+                Object::Stream(s) => assert_eq!(
+                    s.data.as_slice(),
+                    b"hello",
+                    "V=5 R=6 stream must round-trip via reader for {label:?}"
+                ),
+                other => panic!("obj 4 must be a stream, got {other:?}"),
+            }
+        }
     }
 }

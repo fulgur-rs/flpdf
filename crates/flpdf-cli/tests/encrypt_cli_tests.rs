@@ -1,5 +1,6 @@
-//! CLI tests for the writer-side `--encrypt` flag (flpdf-9hc.4.9 walking
-//! skeleton: V=4 AES-128 only).
+//! CLI tests for the writer-side `--encrypt` flag (flpdf-9hc.4.9): V=4
+//! AES-128 (KEY-LEN 128 `--use-aes=y`) and V=5 R=6 AES-256 (KEY-LEN 256,
+//! flpdf-9hc.4.9.4).
 //!
 //! Strategy: invoke `flpdf --encrypt …` on a plaintext fixture, then verify
 //! the resulting encrypted PDF round-trips through qpdf's reader (the
@@ -134,6 +135,96 @@ fn rewrite_subcommand_encrypt_v4_aes_128_round_trips_via_qpdf() {
     );
 }
 
+/// `flpdf --encrypt USER OWNER 256 -- IN OUT` produces a V=5 R=6 AES-256
+/// document that qpdf authenticates with BOTH the user and owner passwords —
+/// the cross-implementation gate for flpdf-9hc.4.9.4. qpdf recovering the user
+/// password from `/O` via the owner password proves `/O` `/OE` are correct.
+#[test]
+fn top_level_encrypt_v5_r6_aes256_round_trips_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("encrypted-v5.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "owner-pw", "256", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "encrypted output must carry /Encrypt"
+    );
+
+    // qpdf authenticates the user password and reports R=6 (V=5 AES-256).
+    let user = ShellCommand::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        user.status.success(),
+        "qpdf --show-encryption (user) failed: stderr={}",
+        String::from_utf8_lossy(&user.stderr)
+    );
+    let user_out = String::from_utf8_lossy(&user.stdout);
+    assert!(
+        user_out.contains("R = 6") && user_out.contains("Supplied password is user password"),
+        "qpdf must report R=6 + user-password match: {user_out}"
+    );
+
+    // The owner password also authenticates against the same output.
+    let owner = ShellCommand::new("qpdf")
+        .arg("--password=owner-pw")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(owner.status.success());
+    let owner_out = String::from_utf8_lossy(&owner.stdout);
+    assert!(
+        owner_out.contains("Supplied password is owner password"),
+        "qpdf must accept the owner password: {owner_out}"
+    );
+}
+
+/// flpdf's own `show-encryption` reports the V=5 R=6 AES-256 scheme for a
+/// `--encrypt … 256` output. No qpdf dependency — pins flpdf's self-view.
+#[test]
+fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("encrypted-v5.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "owner-pw", "256", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let show = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["show-encryption"])
+        .arg(&output)
+        .arg("--password=user-pw")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
+    for needle in ["V = 5", "Length = 256", "R = 6", "AESv3"] {
+        assert!(
+            stdout.contains(needle),
+            "flpdf show-encryption must report {needle:?} for V=5 R=6 output: {stdout}"
+        );
+    }
+}
+
 /// Owner password also authenticates against the same output.
 #[test]
 fn encrypt_owner_password_authenticates_via_qpdf() {
@@ -242,19 +333,28 @@ fn encrypt_key_len_40_is_rejected_with_v1_diagnostic() {
 }
 
 #[test]
-fn encrypt_key_len_256_is_rejected_with_v5_r6_diagnostic() {
+fn encrypt_key_len_256_is_accepted_as_v5_r6() {
+    // KEY-LEN=256 used to be rejected ("not yet supported"); flpdf-9hc.4.9.4
+    // wires the V=5 R=6 AES-256 writer dispatch, so it now succeeds and emits
+    // an encrypted document.
     let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
+    let output = tmp.path().join("ok.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--encrypt", "u", "o", "256", "--"])
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("KEY-LEN=256"))
-        .stderr(predicates::str::contains("V=5 R=6"));
-    assert!(!output.exists());
+        .success();
+    assert!(
+        output.exists(),
+        "256 encryption must produce an output file"
+    );
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "V=5 R=6 output must carry /Encrypt"
+    );
 }
 
 #[test]
