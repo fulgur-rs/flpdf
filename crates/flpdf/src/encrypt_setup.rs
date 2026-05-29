@@ -1,5 +1,4 @@
-//! User-facing encryption parameters for the writer side
-//! (flpdf-9hc.4.9 — walking skeleton: V=4 AES-128 only).
+//! User-facing encryption parameters for the writer side (flpdf-9hc.4.9).
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API
 //! arguments) and pass it through [`crate::WriteOptions::encrypt`]; the
@@ -8,13 +7,14 @@
 //! object, encrypting every string and stream payload at emission time,
 //! and exempting `/Metadata` when `encrypt_metadata == false`.
 //!
-//! # Algorithm coverage in this PR
+//! # Algorithm coverage
 //!
-//! Only `V=4 R=4 Length=128 /CFM AESV2` is wired through end to end. The
-//! other Standard handler revisions (V=1, V=2, V=5 R=6, V=4 RC4) have
-//! their dictionary builders shipped already (PRs #219 / #220 / #221)
-//! but no writer integration yet; future PRs in flpdf-9hc.4.9 follow-up
-//! work add dispatch into the same writer pipeline.
+//! Wired through end to end: `V=4 R=4 Length=128 /CFM AESV2` (AES-128,
+//! flpdf-9hc.4.9) and `V=5 R=6 Length=256 /CFM AESV3` (AES-256,
+//! flpdf-9hc.4.9.4). The remaining Standard handler revisions (V=1, V=2,
+//! V=4 RC4) have their dictionary builders shipped already (PRs #219 /
+//! #220) but no writer integration yet; the corresponding flpdf-9hc.4.9
+//! follow-ups (flpdf-9hc.4.9.1/.2/.3) add dispatch into the same pipeline.
 //!
 //! # Randomness
 //!
@@ -42,6 +42,10 @@ pub enum EncryptMethod {
     /// V=4 R=4 Length=128 with `/CFM AESV2` (AES-128 CBC). Default for
     /// `qpdf --encrypt … 128 --use-aes=y --`.
     V4Aes128,
+    /// V=5 R=6 Length=256 with `/CFM AESV3` (AES-256 CBC, ISO 32000-2).
+    /// Selected by `qpdf --encrypt … 256 --`. The 32-byte file key is used
+    /// directly for every object (no Algorithm-1 per-object derivation).
+    V5R6Aes256,
 }
 
 /// User-facing encryption parameters for the writer.
@@ -86,6 +90,22 @@ impl EncryptParams {
     ) -> Self {
         Self {
             method: EncryptMethod::V4Aes128,
+            user_password: user_password.into(),
+            owner_password: owner_password.into(),
+            permissions: PermissionsConfig::default(),
+            encrypt_metadata: true,
+        }
+    }
+
+    /// Convenience constructor for the V=5 R=6 AES-256 case with the default
+    /// "all permissions granted" permission set and `encrypt_metadata = true`.
+    ///
+    /// Unlike V<5 there is no empty-owner fallback to the user password — the
+    /// owner password is passed through verbatim (the empty-owner +
+    /// non-empty-user "insecure" combination guard is flpdf-9hc.4.14).
+    pub fn v5_r6(user_password: impl Into<Vec<u8>>, owner_password: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: EncryptMethod::V5R6Aes256,
             user_password: user_password.into(),
             owner_password: owner_password.into(),
             permissions: PermissionsConfig::default(),
