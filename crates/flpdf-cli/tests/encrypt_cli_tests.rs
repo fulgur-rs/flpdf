@@ -1470,10 +1470,18 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
 
     let bytes = std::fs::read(&encrypted).unwrap();
 
-    // xref stream 形式が保持されていること（classic "xref\n" キーワードではなく /Type /XRef が使われる）
+    // xref stream 形式が保持されていること（positive: /Type /XRef が存在する）
     assert!(
         bytes.windows(b"/XRef".len()).any(|w| w == b"/XRef"),
         "output must use xref stream form (/Type /XRef), not a classic xref table"
+    );
+    // classic xref table が出力されていないこと（negative: "\nxref\n" が存在しない）
+    // "startxref\n" は classic table でも xref stream でも現れるため使えない。
+    // "\nxref\n" は classic table の xref セクション開始を示すキーワードで
+    // xref stream 形式では現れない。
+    assert!(
+        !bytes.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "output must not contain a classic xref table (\\nxref\\n keyword found)"
     );
 
     // ObjStm が存在しないこと（disable モードなので）
