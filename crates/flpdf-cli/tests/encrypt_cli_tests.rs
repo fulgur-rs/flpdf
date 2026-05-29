@@ -1438,11 +1438,7 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
     let xref_stream_source = tmp.path().join("xref_stream_source.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "rewrite",
-            "--full-rewrite",
-            "--object-streams=generate",
-        ])
+        .args(["rewrite", "--full-rewrite", "--object-streams=generate"])
         .arg(fixture(ONE_PAGE_FIXTURE))
         .arg(&xref_stream_source)
         .assert()
