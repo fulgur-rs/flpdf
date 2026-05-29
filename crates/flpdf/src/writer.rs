@@ -350,9 +350,6 @@ pub struct WriteOptions {
     ///   path cannot rewrite source object bytes).
     /// - `qdf` must be `false` (QDF mode emits plaintext for human
     ///   inspection; the combination is rejected with `Unsupported`).
-    /// - `object_streams` is implicitly forced to
-    ///   [`ObjectStreamMode::Disable`] (ObjStm containers encrypt as a
-    ///   single blob, not per-member, requiring a separate code path).
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
 
     /// Copy the `/Encrypt` dictionary verbatim from a donor PDF and re-use its
@@ -1711,10 +1708,9 @@ fn build_encryption_context<R: Read + Seek>(
         }
     };
 
-    // Allocate the /Encrypt object number above all existing objects. The
-    // encrypted path forces object_streams=disable (so no container numbers
-    // sit between existing_max and our allocation) and forbids QDF length
-    // holders, so existing_max + 1 is a safe slot.
+    // `existing_max` here is the highest already-allocated number (original
+    // objects plus any ObjStm container slots reserved by the caller).
+    // Adding 1 gives a safe slot that cannot collide with any emitted object.
     let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
         crate::Error::Unsupported(
             "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
@@ -2055,12 +2051,14 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     }
 
     // ── Step 1: run the ObjStm planner ───────────────────────────────────────
-    // For the encrypted path, force ObjStm off — ObjStm containers encrypt as
-    // a single blob per PDF 1.7 §7.5.7, not per-member, which needs its own
-    // code path (flpdf-9hc.4.9 follow-up). Override the caller's
-    // object_streams setting with Disable when encryption is active.
+    // For --encrypt: ObjStm containers encrypt as a single blob per PDF 1.7
+    // §7.5.7; the container stream is encrypted via encrypt_stream_payload_for_writer
+    // (Step 5 below). Per-member string encryption is skipped because members
+    // are not emitted in the main loop.
+    // For --copy-encryption-from: keep ObjStm off (the copy path doesn't yet
+    // allocate container numbers above the /Encrypt slot).
     let planner_options;
-    let planner_config = if encrypting {
+    let planner_config = if options.copy_encryption.is_some() {
         planner_options = WriteOptions {
             object_streams: ObjectStreamMode::Disable,
             ..options.clone()
@@ -2091,13 +2089,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         effective_xref_form = XrefForm::Table;
     }
 
-    // flpdf-9hc.4.9 / 4.11 walking skeleton: force classic xref Table form
-    // for the encrypted path (both --encrypt and --copy-encryption-from).
-    // Xref streams can carry /Encrypt in their dict, but the emission path
-    // doesn't yet exclude the xref stream's own bytes from encryption —
-    // needs its own handling. Table form is what qpdf emits for default
-    // `--encrypt …` output so this matches user expectation.
-    if encrypting {
+    // --copy-encryption-from: keep xref Table (its /Encrypt slot is at
+    // existing_max+1 with no containers; xref stream support is a follow-up).
+    if options.copy_encryption.is_some() {
         effective_xref_form = XrefForm::Table;
     }
 
@@ -2166,17 +2160,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         }
     }
 
-    // ── flpdf-9hc.4.9 / 4.11 walking-skeleton encryption context ───────────
-    // Built ONCE up front (not inside the emission loop) so:
-    // - /ID[0] is decided before any object is encrypted (Algorithm 2 derives
-    //   the file key from /ID[0]; the trailer must carry the SAME bytes).
-    // - The /Encrypt object's number is allocated above all existing objects
-    //   and ObjStm containers — known here because we've forced
-    //   object_streams=disable for the encrypted path (no containers exist).
-    // Resolve the /Catalog's /Metadata stream ref up front (needs &mut pdf) so
-    // the encryption context can exempt exactly that object under
-    // `--cleartext-metadata` (encrypt_metadata=false). Only needed for the
-    // --encrypt path requesting cleartext metadata.
+    // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
+    // Built ONCE up front so /ID[0] is decided before any object is encrypted.
+    // For --encrypt: /Encrypt is allocated above existing objects AND any ObjStm
+    // container numbers (existing_max+1..existing_max+N), so base_for_encrypt+1
+    // is the safe slot (flpdf-9hc.4.16).
+    // For --copy-encryption-from: ObjStm is forced off, so existing_max+1 is safe.
+    // Resolve /Metadata stream ref up front for --cleartext-metadata support.
     let metadata_ref = if options
         .encrypt
         .as_ref()
@@ -2187,11 +2177,21 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         None
     };
     let encrypt_ctx: Option<EncryptionContext> = if let Some(ref params) = options.encrypt {
+        let containers_len = u32::try_from(plan.batches.len()).map_err(|_| {
+            crate::Error::Unsupported(
+                "full-rewrite encrypt: ObjStm batch count overflows u32".to_string(),
+            )
+        })?;
+        let base_for_encrypt = existing_max.checked_add(containers_len).ok_or_else(|| {
+            crate::Error::Unsupported(
+                "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
+            )
+        })?;
         Some(build_encryption_context(
             pdf,
             options,
             params,
-            existing_max,
+            base_for_encrypt,
             metadata_ref,
         )?)
     } else if let Some(ref src) = options.copy_encryption {
@@ -2478,7 +2478,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_ref = container_refs[batch_idx];
         let body = object_streams::emit_objstm_body(pdf, batch)?;
-        let stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+        let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+        // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
+        // Member objects' strings are NOT individually encrypted; the container
+        // stream's encryption covers them all.
+        if let Some(ctx) = &encrypt_ctx {
+            encrypt_stream_payload_for_writer(container_ref, &mut stream, ctx)?;
+        }
 
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
@@ -2672,9 +2678,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
             let mut xref_dict = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut xref_dict);
-            if pdf.is_encrypted() {
-                xref_dict.remove("Encrypt");
-            }
             // The trailer may carry filter keys from the input's xref stream
             // (e.g. /Filter /FlateDecode). We're emitting freshly built bytes
             // via `Stream::new`, so any stale filter declaration would make
@@ -2727,11 +2730,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                     crate::Error::Unsupported("xref stream /Length does not fit i64".to_string())
                 })?),
             );
-            if options.static_id {
-                apply_static_id(&mut xref_dict);
-            } else {
-                apply_random_id(&mut xref_dict);
-            }
+            apply_encrypt_trailer_entries(&mut xref_dict, pdf, options, encrypt_ctx.as_ref());
 
             let xref_stream = crate::Stream::new(xref_dict, stream_data);
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());

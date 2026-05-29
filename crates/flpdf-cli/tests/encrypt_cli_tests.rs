@@ -1334,3 +1334,88 @@ fn copy_encryption_from_wrong_password_is_rejected() {
         .stderr(predicates::str::contains("--copy-encryption-from"));
     assert!(!out.exists());
 }
+
+/// --encrypt + --object-streams=generate の組み合わせ:
+/// ObjStm コンテナを含む暗号化 PDF を出力し qpdf が復号できること。
+#[test]
+fn encrypt_with_generate_object_streams_round_trips_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("encrypted_objstm.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--object-streams=generate",
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    // ObjStm コンテナが存在すること
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.windows(b"/ObjStm".len()).any(|w| w == b"/ObjStm"),
+        "output must contain at least one /ObjStm container"
+    );
+
+    // /Encrypt が存在すること
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "output must carry /Encrypt"
+    );
+
+    // qpdf がユーザーパスワードで復号できること
+    let check = std::process::Command::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --show-encryption failed:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.contains("R = 4"), "qpdf must report R=4: {stdout}");
+
+    // ObjStm コンテナが実際に正しく復号できることを qpdf --decrypt で確認する。
+    // qpdf --check を直接暗号化 PDF に実行すると assertion エラーになるケースがあるため
+    // (qpdf 11.x の known issue)、decrypt → check の 2 ステップで行う。
+    let decrypted = tmp.path().join("decrypted_from_objstm.pdf");
+    let decrypt_result = std::process::Command::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--decrypt")
+        .arg("--static-id")
+        .arg(&output)
+        .arg(&decrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt_result.status.success(),
+        "qpdf --decrypt failed:\n{}",
+        String::from_utf8_lossy(&decrypt_result.stderr)
+    );
+
+    let check_result = std::process::Command::new("qpdf")
+        .arg("--check")
+        .arg(&decrypted)
+        .output()
+        .unwrap();
+    assert!(
+        check_result.status.success(),
+        "qpdf --check on decrypted PDF failed:\n{}",
+        String::from_utf8_lossy(&check_result.stderr)
+    );
+}
