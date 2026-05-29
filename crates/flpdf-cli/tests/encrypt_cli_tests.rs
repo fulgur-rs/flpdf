@@ -602,27 +602,80 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
     }
 }
 
+/// flpdf-9hc.4.9.5: the R>=3 `--encrypt` permission sub-flags must produce the
+/// SAME /P permissions as qpdf for identical flags — including the
+/// order-sensitive `--modify`/individual-flag interaction and an owner-only
+/// restriction. Compares `qpdf --show-encryption` permission lines for
+/// flpdf-encrypted vs qpdf-encrypted output (256-bit, R=6).
 #[test]
-fn encrypt_permission_sub_flags_are_rejected_with_followup_pointer() {
+fn encrypt_permission_sub_flags_match_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let combos: &[&[&str]] = &[
+        &["--modify=none"],
+        &["--modify=annotate"],
+        &["--print=low", "--extract=n"],
+        &["--modify=none", "--annotate=y"], // order-sensitive: annotate re-enabled
+        &["--annotate=y", "--modify=none"], // reversed: modify clears it
+        &["--print=none", "--modify=none", "--extract=n"], // owner-only-style lockdown
+        &["--accessibility=n"],             // ignored at R>3 (must still match qpdf)
+    ];
+
+    // qpdf --show-encryption permission lines (sorted), the cross-impl oracle.
+    fn perm_lines(p: &Path) -> Vec<String> {
+        let out = ShellCommand::new("qpdf")
+            .arg("--password=u")
+            .arg("--show-encryption")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut v: Vec<String> = s
+            .lines()
+            .filter(|l| l.ends_with("allowed"))
+            .map(|l| l.to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
     let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--encrypt",
-            "u",
-            "o",
-            "128",
-            "--use-aes=y",
-            "--print=none",
-            "--",
-        ])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
-        .arg(&output)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("not yet supported"))
-        .stderr(predicates::str::contains("flpdf-9hc.4.9"));
+    for combo in combos {
+        let flpdf_out = tmp.path().join("flpdf.pdf");
+        let qpdf_out = tmp.path().join("qpdf.pdf");
+
+        let mut c = Command::cargo_bin("flpdf").unwrap();
+        c.args(["--encrypt", "u", "o", "256"]);
+        for a in *combo {
+            c.arg(a);
+        }
+        c.arg("--")
+            .arg(fixture(ONE_PAGE_FIXTURE))
+            .arg(&flpdf_out)
+            .assert()
+            .success();
+
+        let mut q = ShellCommand::new("qpdf");
+        q.args(["--encrypt", "u", "o", "256"]);
+        for a in *combo {
+            q.arg(a);
+        }
+        let st = q
+            .arg("--")
+            .arg(fixture(ONE_PAGE_FIXTURE))
+            .arg(&qpdf_out)
+            .status()
+            .unwrap();
+        assert!(st.success(), "qpdf encrypt failed for {combo:?}");
+
+        assert_eq!(
+            perm_lines(&flpdf_out),
+            perm_lines(&qpdf_out),
+            "/P permissions differ from qpdf for {combo:?}"
+        );
+    }
 }
 
 #[test]
