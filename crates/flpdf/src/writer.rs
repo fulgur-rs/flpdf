@@ -1676,21 +1676,16 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
             "OS CSPRNG (getrandom) unavailable for V=5 R=6 secret generation: {e}"
         ))
     })?;
-    let mut secrets = crate::security::standard::V5R6Secrets {
-        file_key: [0u8; 32],
-        user_validation_salt: [0u8; 8],
-        user_key_salt: [0u8; 8],
-        owner_validation_salt: [0u8; 8],
-        owner_key_salt: [0u8; 8],
-        perms_random_tail: [0u8; 4],
-    };
-    secrets.file_key.copy_from_slice(&buf[0..32]);
-    secrets.user_validation_salt.copy_from_slice(&buf[32..40]);
-    secrets.user_key_salt.copy_from_slice(&buf[40..48]);
-    secrets.owner_validation_salt.copy_from_slice(&buf[48..56]);
-    secrets.owner_key_salt.copy_from_slice(&buf[56..64]);
-    secrets.perms_random_tail.copy_from_slice(&buf[64..68]);
-    Ok(secrets)
+    // Each range is a fixed, exact-length slice of `buf`, so the array
+    // conversions are infallible by construction.
+    Ok(crate::security::standard::V5R6Secrets {
+        file_key: buf[0..32].try_into().unwrap(),
+        user_validation_salt: buf[32..40].try_into().unwrap(),
+        user_key_salt: buf[40..48].try_into().unwrap(),
+        owner_validation_salt: buf[48..56].try_into().unwrap(),
+        owner_key_salt: buf[56..64].try_into().unwrap(),
+        perms_random_tail: buf[64..68].try_into().unwrap(),
+    })
 }
 
 /// Build an [`EncryptionContext`] from a donor [`CopyEncryptionSource`]
