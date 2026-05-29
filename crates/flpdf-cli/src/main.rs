@@ -21,9 +21,10 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version,
     resources::remove_unreferenced_resources,
-    write_pdf_with_options, CompressStreams, CopyEncryptionSource, Dictionary, EncryptParams,
-    NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PasswordMode, Pdf,
-    PdfOpenOptions, RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
+    write_pdf_with_options, CompressStreams, CopyEncryptionSource, Dictionary, EncryptMethod,
+    EncryptParams, NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode,
+    PasswordMode, Pdf, PdfOpenOptions, RemoveUnreferencedResources, Severity, Stream,
+    StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -1446,6 +1447,7 @@ fn main() {
             &args.encrypt,
             args.copy_encryption_from.as_deref(),
             args.encryption_file_password.as_deref(),
+            args.password.allow_weak_crypto,
         );
         run_rewrite(
             args.input,
@@ -1776,6 +1778,7 @@ fn run_command(command: Commands) -> CliResult<()> {
                 &cmd.encrypt,
                 cmd.copy_encryption_from.as_deref(),
                 cmd.encryption_file_password.as_deref(),
+                cmd.password.allow_weak_crypto,
             );
             let normalize_content = cmd.normalize_content == CliYesNo::Yes;
             let coalesce_contents = cmd.coalesce_contents;
@@ -1939,9 +1942,10 @@ fn apply_encryption_options(
     encrypt: &[String],
     copy_encryption_from: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
+    allow_weak_crypto: bool,
 ) {
     if !encrypt.is_empty() {
-        match parse_encrypt_segment(encrypt) {
+        match parse_encrypt_segment(encrypt, allow_weak_crypto) {
             Ok(params) => {
                 options.encrypt = Some(params);
                 options.full_rewrite = true;
@@ -2092,17 +2096,19 @@ fn build_copy_encryption_source(
 /// + `num_args = 3..` segment; it does not include the trailing `--` itself
 ///   (clap consumes it as the terminator).
 ///
-/// Walking-skeleton acceptance matrix (flpdf-9hc.4.9):
+/// KEY-LEN → method (matching qpdf):
+/// - `40` → V=1 R=2 RC4-40 (weak).
+/// - `128` + `--use-aes=y` → V=4 R=4 AES-128.
+/// - `128` + (`--use-aes=n` or omitted) + `--force-V4` → V=4 R=4 RC4-128 (weak).
+/// - `128` + (`--use-aes=n` or omitted) without `--force-V4` → V=2 R=3 RC4-128
+///   (qpdf's default, weak).
+/// - `256` → V=5 R=6 AES-256 (`--allow-insecure` gates the empty-owner case).
 ///
-/// - **KEY-LEN**: only `128` is supported. `40` / `256` are rejected with
-///   a "not yet supported" diagnostic naming the responsible algorithm
-///   variant (V=1, V=5 R=6) so users can find the tracking issue.
-/// - **`--use-aes=y`**: REQUIRED. Without it, `--encrypt … 128` would mean
-///   V=2 RC4-128 per qpdf default, which has no writer dispatch yet.
-/// - **`--use-aes=n` / other sub-flags** (`--print`, `--modify`,
-///   `--extract`, `--annotate`, `--form`, `--assemble`, `--force-V4`,
-///   `--force-R5`): rejected, follow-up work tracked on flpdf-9hc.4.9.
-fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
+/// RC4 outputs (40-bit, or 128-bit without AES) are weak and require
+/// `allow_weak_crypto` (the top-level `--allow-weak-crypto` flag), mirroring
+/// qpdf's checkConfiguration. Permission sub-flags, `--force-R5`, and
+/// `--cleartext-metadata` are still rejected (flpdf-9hc.4.9 follow-ups).
+fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResult<EncryptParams> {
     if tokens.len() < 3 {
         return Err(format!(
             "--encrypt requires USER-PW OWNER-PW KEY-LEN (got {} arg(s))",
@@ -2118,29 +2124,16 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
             tokens[2]
         )
     })?;
-
-    match key_len {
-        40 => {
-            return Err(
-                "--encrypt KEY-LEN=40 (V=1 RC4-40) is not yet supported in this release; \
-                 dict builder is shipped (flpdf-9hc.4.1) but the writer pipeline only \
-                 covers V=4 AES-128 in the walking skeleton (flpdf-9hc.4.9 follow-up)"
-                    .into(),
-            );
-        }
-        128 => { /* V=2 RC4-128 or V=4 (AES/RC4) — narrowed below by --use-aes */ }
-        256 => { /* V=5 R=6 AES-256 — built after sub-flag parsing below */ }
-        other => {
-            return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {other})").into());
-        }
+    if !matches!(key_len, 40 | 128 | 256) {
+        return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {key_len})").into());
     }
 
-    // Parse sub-flags. Walking skeleton only honours `--use-aes=y`; every
-    // other sub-flag is rejected with a clear message so users do not get a
-    // silent shrug when they pass `--print=none` and expect it to work.
+    // Parse sub-flags. Unsupported ones are rejected with a clear message so
+    // users do not get a silent shrug when they pass `--print=none`.
     let mut use_aes: Option<bool> = None;
+    let mut force_v4 = false;
     // `--allow-insecure` opts into the V=5 R=6 empty-owner + non-empty-user
-    // "insecure" combination; the gate itself lives in the KEY-LEN=256 branch
+    // "insecure" combination; the gate itself lives in the KEY-LEN=256 arm
     // below (flpdf-9hc.4.14, mirroring qpdf's checkConfiguration).
     let mut allow_insecure = false;
     for tok in &tokens[3..] {
@@ -2155,13 +2148,18 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
                     }
                 });
             }
-            // Accepted everywhere but only meaningful for KEY-LEN=256; qpdf
-            // likewise ignores it for 40/128-bit. It is a value-less flag:
-            // reject any `--allow-insecure=...` form (including the empty
-            // `--allow-insecure=`) so a user who writes `--allow-insecure=false`
-            // (expecting to OPT OUT) — or a generated empty value — cannot
-            // silently enable the insecure path. Gate on whether `=` was
-            // present at all, not on whether the value is non-empty.
+            // `--force-V4` forces the V=4 handler; combined with RC4 (i.e. no
+            // `--use-aes=y`) it selects the V=4 /CFM V2 (RC4-128) variant.
+            // Value-less flag.
+            "--force-V4" => {
+                if tok.contains('=') {
+                    return Err(format!("--force-V4 does not take a value (got {tok:?})").into());
+                }
+                force_v4 = true;
+            }
+            // Value-less; see the KEY-LEN=256 arm. Reject any `=` form so an
+            // opt-out typo (`--allow-insecure=false`) or a generated empty value
+            // (`--allow-insecure=`) cannot silently enable the insecure path.
             "--allow-insecure" => {
                 if tok.contains('=') {
                     return Err(
@@ -2177,7 +2175,6 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
             | "--form"
             | "--assemble"
             | "--accessibility"
-            | "--force-V4"
             | "--force-R5"
             | "--cleartext-metadata" => {
                 return Err(format!(
@@ -2189,50 +2186,67 @@ fn parse_encrypt_segment(tokens: &[String]) -> CliResult<EncryptParams> {
             }
             other => {
                 return Err(format!(
-                    "unknown --encrypt sub-flag {other:?}; supported in this release: --use-aes=y"
+                    "unknown --encrypt sub-flag {other:?}; supported in this release: \
+                     --use-aes=y|n, --force-V4, --allow-insecure"
                 )
                 .into());
             }
         }
     }
 
-    // KEY-LEN=256 is V=5 R=6 AES-256. It is always AES, so `--use-aes` (a
-    // 128-only V=2-vs-V=4 selector) is irrelevant and ignored here.
-    if key_len == 256 {
-        // Insecure-combination gate (flpdf-9hc.4.14), matching qpdf's
-        // checkConfiguration: a non-empty user password with an EMPTY owner
-        // password under a 256-bit key lets anyone open the file without the
-        // owner password, so the owner restrictions are meaningless. Require
-        // explicit opt-in via `--allow-insecure` (placed in the sub-flag
-        // segment, before the `--`).
-        if owner_pw.is_empty() && !user_pw.is_empty() && !allow_insecure {
+    // RC4 outputs are weak; qpdf refuses to write them without
+    // --allow-weak-crypto, so apply the same gate here.
+    let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {
+        if params.is_weak_rc4() && !allow_weak_crypto {
             return Err(
-                "A PDF with a non-empty user password and an empty owner password \
-                 encrypted with a 256-bit key is insecure as it can be opened without \
-                 a password. If you really want to do this, you must also give the \
-                 --allow-insecure option before the -- that follows --encrypt."
+                "refusing to write a file with RC4, a weak cryptographic algorithm. \
+                 Please use 256-bit keys for better security. Pass --allow-weak-crypto \
+                 to enable writing insecure files."
                     .into(),
             );
         }
-        return Ok(EncryptParams::v5_r6(user_pw, owner_pw));
-    }
+        Ok(params)
+    };
 
-    // KEY-LEN=128 + missing/`--use-aes=n` would be qpdf-default V=2 RC4-128
-    // which has no writer dispatch yet (covered by the dict builder in #219
-    // but the integration is the follow-up). Require explicit AES selection.
-    match use_aes {
-        Some(true) => Ok(EncryptParams::v4_aes128(user_pw, owner_pw)),
-        Some(false) => Err(
-            "--encrypt … 128 --use-aes=n (V=2 / V=4 RC4-128) is not yet supported; \
-             the walking skeleton only wires V=4 AES-128. Use --use-aes=y."
-                .into(),
-        ),
-        None => Err(
-            "--encrypt … 128 without --use-aes defaults to V=2 RC4-128 per qpdf, \
-             which is not yet wired through the writer. Pass --use-aes=y to opt \
-             into V=4 AES-128 (the only mode supported in this release)."
-                .into(),
-        ),
+    match key_len {
+        // KEY-LEN=40 is always V=1 RC4-40; --use-aes / --force-V4 do not apply.
+        40 => guard_weak(EncryptParams::rc4(
+            EncryptMethod::V1Rc440,
+            user_pw,
+            owner_pw,
+        )),
+        128 => match use_aes {
+            Some(true) => Ok(EncryptParams::v4_aes128(user_pw, owner_pw)),
+            // qpdf's 128-bit default is RC4; `--force-V4` selects the V=4
+            // /CFM V2 variant, otherwise V=2 R=3.
+            Some(false) | None => {
+                let method = if force_v4 {
+                    EncryptMethod::V4Rc4128
+                } else {
+                    EncryptMethod::V2Rc4128
+                };
+                guard_weak(EncryptParams::rc4(method, user_pw, owner_pw))
+            }
+        },
+        256 => {
+            // V=5 R=6 AES-256 — always AES, so `--use-aes` is irrelevant.
+            // Insecure-combination gate (flpdf-9hc.4.14, matching qpdf's
+            // checkConfiguration): a non-empty user password with an EMPTY
+            // owner password under a 256-bit key lets anyone open the file
+            // without the owner password, so the owner restrictions are
+            // meaningless. Require explicit `--allow-insecure`.
+            if owner_pw.is_empty() && !user_pw.is_empty() && !allow_insecure {
+                return Err(
+                    "A PDF with a non-empty user password and an empty owner password \
+                     encrypted with a 256-bit key is insecure as it can be opened without \
+                     a password. If you really want to do this, you must also give the \
+                     --allow-insecure option before the -- that follows --encrypt."
+                        .into(),
+                );
+            }
+            Ok(EncryptParams::v5_r6(user_pw, owner_pw))
+        }
+        _ => unreachable!("key_len validated to 40/128/256 above"),
     }
 }
 

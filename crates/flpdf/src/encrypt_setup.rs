@@ -46,6 +46,15 @@ pub enum EncryptMethod {
     /// Selected by `qpdf --encrypt … 256 --`. The 32-byte file key is used
     /// directly for every object (no Algorithm-1 per-object derivation).
     V5R6Aes256,
+    /// V=1 R=2 Length=40 RC4-40. Selected by `qpdf --encrypt … 40 --`.
+    /// Weak crypto — gated behind `--allow-weak-crypto` at the CLI.
+    V1Rc440,
+    /// V=2 R=3 Length=128 RC4-128. qpdf's default for `--encrypt … 128 --`
+    /// without `--use-aes=y`. Weak crypto.
+    V2Rc4128,
+    /// V=4 R=4 Length=128 with `/CFM V2` (RC4-128 crypt filter). Selected by
+    /// `qpdf --encrypt … 128 --force-V4 --` without `--use-aes=y`. Weak crypto.
+    V4Rc4128,
 }
 
 /// User-facing encryption parameters for the writer.
@@ -111,6 +120,40 @@ impl EncryptParams {
             permissions: PermissionsConfig::default(),
             encrypt_metadata: true,
         }
+    }
+
+    /// Convenience constructor for an RC4 method (V=1 RC4-40, V=2 RC4-128, or
+    /// V=4 RC4-128) with the default "all permissions granted" set. RC4 has no
+    /// `/EncryptMetadata` concept for V=1/V=2 (the field is ignored there);
+    /// `encrypt_metadata = true` is kept for the V=4 RC4 case.
+    pub fn rc4(
+        method: EncryptMethod,
+        user_password: impl Into<Vec<u8>>,
+        owner_password: impl Into<Vec<u8>>,
+    ) -> Self {
+        debug_assert!(
+            matches!(
+                method,
+                EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 | EncryptMethod::V4Rc4128
+            ),
+            "EncryptParams::rc4 requires an RC4 method"
+        );
+        Self {
+            method,
+            user_password: user_password.into(),
+            owner_password: owner_password.into(),
+            permissions: PermissionsConfig::default(),
+            encrypt_metadata: true,
+        }
+    }
+
+    /// True when this method uses RC4 (a weak cipher gated behind
+    /// `--allow-weak-crypto` at the CLI): V=1, V=2, or V=4 with `/CFM V2`.
+    pub fn is_weak_rc4(&self) -> bool {
+        matches!(
+            self.method,
+            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 | EncryptMethod::V4Rc4128
+        )
     }
 }
 

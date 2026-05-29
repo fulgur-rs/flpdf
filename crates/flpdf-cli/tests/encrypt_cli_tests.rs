@@ -316,8 +316,10 @@ fn encrypt_round_trip_on_one_page_decrypts_cleanly_via_qpdf() {
 // `parse_encrypt_segment` accept matrix don't silently change error messages
 // that users may grep for.
 
+/// KEY-LEN=40 is V=1 RC4-40 — weak crypto. flpdf-9hc.4.9.1 wires the writer
+/// dispatch, but (like qpdf) refuses to write RC4 without --allow-weak-crypto.
 #[test]
-fn encrypt_key_len_40_is_rejected_with_v1_diagnostic() {
+fn encrypt_key_len_40_v1_rc4_requires_allow_weak_crypto() {
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("nope.pdf");
     Command::cargo_bin("flpdf")
@@ -327,9 +329,34 @@ fn encrypt_key_len_40_is_rejected_with_v1_diagnostic() {
         .arg(&output)
         .assert()
         .failure()
-        .stderr(predicates::str::contains("KEY-LEN=40"))
-        .stderr(predicates::str::contains("V=1"));
-    assert!(!output.exists());
+        .stderr(predicates::str::contains("RC4"))
+        .stderr(predicates::str::contains("--allow-weak-crypto"));
+    assert!(!output.exists(), "no output without --allow-weak-crypto");
+
+    // With --allow-weak-crypto it succeeds and qpdf reports R=2 (V=1 RC4-40).
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let ok = tmp.path().join("v1.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--allow-weak-crypto", "--encrypt", "u", "o", "40", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&ok)
+        .assert()
+        .success();
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=u")
+        .arg("--show-encryption")
+        .arg(&ok)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 2") && stdout.contains("Supplied password is user password"),
+        "qpdf must report R=2 + user-password match for V=1 RC4-40: {stdout}"
+    );
 }
 
 #[test]
@@ -455,8 +482,11 @@ fn encrypt_allow_insecure_rejects_a_value() {
     }
 }
 
+/// KEY-LEN=128 without `--use-aes=y` is qpdf's default V=2 R=3 RC4-128 — weak
+/// crypto (flpdf-9hc.4.9.2). Refused without --allow-weak-crypto; with it,
+/// qpdf reports R=3.
 #[test]
-fn encrypt_128_without_use_aes_is_rejected() {
+fn encrypt_128_no_aes_is_v2_rc4_gated_by_weak_crypto() {
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("nope.pdf");
     Command::cargo_bin("flpdf")
@@ -466,22 +496,72 @@ fn encrypt_128_without_use_aes_is_rejected() {
         .arg(&output)
         .assert()
         .failure()
-        .stderr(predicates::str::contains("--use-aes=y"));
-    assert!(!output.exists());
-}
+        .stderr(predicates::str::contains("RC4"))
+        .stderr(predicates::str::contains("--allow-weak-crypto"));
+    assert!(!output.exists(), "no output without --allow-weak-crypto");
 
-#[test]
-fn encrypt_use_aes_n_is_rejected() {
-    let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let ok = tmp.path().join("v2.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--encrypt", "u", "o", "128", "--use-aes=n", "--"])
+        .args(["--allow-weak-crypto", "--encrypt", "u", "o", "128", "--"])
         .arg(fixture(UNENCRYPTED_FIXTURE))
-        .arg(&output)
+        .arg(&ok)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("RC4"));
+        .success();
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=u")
+        .arg("--show-encryption")
+        .arg(&ok)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 3") && stdout.contains("Supplied password is user password"),
+        "qpdf must report R=3 for V=2 RC4-128: {stdout}"
+    );
+}
+
+/// `--encrypt … 128 --force-V4` without `--use-aes=y` selects the V=4 R=4
+/// /CFM V2 (RC4-128) variant — weak crypto (flpdf-9hc.4.9.3). With
+/// --allow-weak-crypto, qpdf reports R=4.
+#[test]
+fn encrypt_128_force_v4_no_aes_is_v4_rc4() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ok = tmp.path().join("v4rc4.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--allow-weak-crypto",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--force-V4",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&ok)
+        .assert()
+        .success();
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=u")
+        .arg("--show-encryption")
+        .arg(&ok)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 4") && stdout.contains("Supplied password is user password"),
+        "qpdf must report R=4 for V=4 RC4-128: {stdout}"
+    );
 }
 
 #[test]
