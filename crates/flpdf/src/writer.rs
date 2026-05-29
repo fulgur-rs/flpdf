@@ -2091,6 +2091,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         if parse_pdf_version(&version).is_none_or(|v| v < floor) {
             version = format!("{}.{}", floor.0, floor.1);
         }
+    } else if options.copy_encryption.is_some() {
+        // --copy-encryption-from only supports V=4 AES-128 donors today, which
+        // carry /V 4 and therefore require the same >= 1.5 header floor as the
+        // --encrypt V=4 path. (encrypt / copy_encryption are mutually exclusive.)
+        if parse_pdf_version(&version).is_none_or(|v| v < (1, 5)) {
+            version = "1.5".to_string();
+        }
     }
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
