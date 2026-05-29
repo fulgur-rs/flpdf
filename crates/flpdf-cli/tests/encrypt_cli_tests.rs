@@ -429,31 +429,30 @@ fn encrypt_v5_r6_both_passwords_no_allow_insecure_succeeds() {
     assert!(output.exists(), "both-password 256 encryption must succeed");
 }
 
-/// `--allow-insecure` is a value-less flag. `--allow-insecure=false` (a user
-/// trying to OPT OUT) must be rejected, not silently treated as enabling the
-/// insecure path — so the empty-owner gate still fires and no file is written.
+/// `--allow-insecure` is a value-less flag. Any `=` form — `--allow-insecure=false`
+/// (a user trying to OPT OUT) or the empty `--allow-insecure=` (a typo / a
+/// generated empty value) — must be rejected, not silently treated as enabling
+/// the insecure path, so the empty-owner gate still fires and no file is written.
 #[test]
 fn encrypt_allow_insecure_rejects_a_value() {
-    let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--encrypt",
-            "user-pw",
-            "",
-            "256",
-            "--allow-insecure=false",
-            "--",
-        ])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
-        .arg(&output)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "--allow-insecure does not take a value",
-        ));
-    assert!(!output.exists(), "no output must be written when rejected");
+    for form in ["--allow-insecure=false", "--allow-insecure="] {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("nope.pdf");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--encrypt", "user-pw", "", "256", form, "--"])
+            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(&output)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "--allow-insecure does not take a value",
+            ));
+        assert!(
+            !output.exists(),
+            "no output must be written when {form:?} is rejected"
+        );
+    }
 }
 
 #[test]
