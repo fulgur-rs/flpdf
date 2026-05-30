@@ -684,8 +684,8 @@ fn partition_objstm_eligible<R: Read + Seek>(
     let mut packable = Vec::new();
     let mut plain = Vec::new();
     for &r in touched {
-        let obj = pdf.resolve(r)?;
-        if object_streams::is_eligible_for_objstm(r, &obj, &ctx) {
+        let obj = pdf.resolve_borrowed(r)?;
+        if object_streams::is_eligible_for_objstm(r, obj, &ctx) {
             packable.push(r);
         } else {
             plain.push(r);
@@ -708,8 +708,8 @@ fn write_incremental_objects<R: Read + Seek>(
     let mut updated_offsets = BTreeMap::new();
 
     for object_ref in touched_object_refs {
-        let object = pdf.resolve(*object_ref)?;
-        let Some(offset) = write_object(bytes, *object_ref, &object)? else {
+        let object = pdf.resolve_borrowed(*object_ref)?;
+        let Some(offset) = write_object(bytes, *object_ref, object)? else {
             continue;
         };
         updated_offsets.insert(object_ref.number, (object_ref.generation, offset));
@@ -1611,7 +1611,7 @@ struct EncryptionContext {
 /// `--cleartext-metadata` (flpdf-9hc.4.9.6).
 fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
-    match pdf.resolve(root).ok()? {
+    match pdf.resolve_borrowed(root).ok()? {
         Object::Dictionary(dict) => dict.get_ref("Metadata"),
         _ => None,
     }
@@ -2234,7 +2234,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             {
                 continue;
             }
-            if let Ok(Object::Stream(s)) = pdf.resolve(*object_ref) {
+            if let Ok(Object::Stream(s)) = pdf.resolve_borrowed(*object_ref) {
                 if let Some(Object::Reference(r)) = s.dict.get("Length") {
                     existing_holders.insert(r.number);
                 }
@@ -3237,15 +3237,15 @@ mod tests {
         // Sanity-check the fixture is wired correctly before exercising the
         // helper: each object must resolve to the expected variant.
         assert!(
-            matches!(pdf.resolve(plain_dict).unwrap(), Object::Dictionary(_)),
+            matches!(pdf.resolve_borrowed(plain_dict).unwrap(), Object::Dictionary(_)),
             "obj 3 must resolve as a plain dictionary"
         );
         assert!(
-            matches!(pdf.resolve(stream_ref).unwrap(), Object::Stream(_)),
+            matches!(pdf.resolve_borrowed(stream_ref).unwrap(), Object::Stream(_)),
             "obj 4 must resolve as a stream"
         );
         assert!(
-            matches!(pdf.resolve(gen1_ref).unwrap(), Object::Dictionary(_)),
+            matches!(pdf.resolve_borrowed(gen1_ref).unwrap(), Object::Dictionary(_)),
             "obj 5 (gen 1) must resolve as a plain dictionary"
         );
 
@@ -3514,11 +3514,11 @@ mod tests {
         let m0 = ObjectRef::new(2, 0); // Pages
         let m1 = ObjectRef::new(3, 0); // neutral plain dict
         assert!(
-            matches!(pdf.resolve(m0).unwrap(), Object::Dictionary(_)),
+            matches!(pdf.resolve_borrowed(m0).unwrap(), Object::Dictionary(_)),
             "obj 2 must resolve from the xref stream as a plain dictionary"
         );
         assert!(
-            matches!(pdf.resolve(m1).unwrap(), Object::Dictionary(_)),
+            matches!(pdf.resolve_borrowed(m1).unwrap(), Object::Dictionary(_)),
             "obj 3 must resolve from the xref stream as a plain dictionary"
         );
 
