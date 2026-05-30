@@ -6,3 +6,4 @@
 .beads/issues.jsonl
 target/
 .worktrees/
+.claude/worktrees/
