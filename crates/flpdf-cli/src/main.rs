@@ -2113,8 +2113,8 @@ fn build_copy_encryption_source(
 /// applied left-to-right onto a [`PermissionsConfig`] (matching qpdf's
 /// ordering). They are accepted for 128/256-bit only; on 40-bit (R=2) they are
 /// rejected (the R=2 `/P` encoding differs — flpdf-9hc.4.9.5 follow-up).
-/// `--force-R5` and `--cleartext-metadata` are still rejected
-/// (flpdf-9hc.4.9.6 / follow-ups).
+/// `--cleartext-metadata` is still rejected for V=1/V=2 (40-bit or 128-bit
+/// without AES/--force-V4); `--force-R5` is accepted for 256-bit only.
 fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
     match val {
         "y" => Ok(true),
@@ -2147,6 +2147,7 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
     // users do not get a silent shrug when they pass `--print=none`.
     let mut use_aes: Option<bool> = None;
     let mut force_v4 = false;
+    let mut force_r5 = false;
     // `--allow-insecure` opts into the V=5 R=6 empty-owner + non-empty-user
     // "insecure" combination; the gate itself lives in the KEY-LEN=256 arm
     // below (flpdf-9hc.4.14, mirroring qpdf's checkConfiguration).
@@ -2264,16 +2265,17 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                 cleartext_metadata = true;
             }
             "--force-R5" => {
-                return Err(format!(
-                    "encryption sub-flag {flag:?} is not yet supported in this release; \
-                     follow-up work tracked on flpdf-9hc.4.9"
-                )
-                .into());
+                if tok.contains('=') {
+                    return Err(
+                        format!("--force-R5 does not take a value (got {tok:?})").into()
+                    );
+                }
+                force_r5 = true;
             }
             other => {
                 return Err(format!(
                     "unknown --encrypt sub-flag {other:?}; supported in this release: \
-                     --use-aes=y|n, --force-V4, --allow-insecure, --print, --modify, \
+                     --use-aes=y|n, --force-V4, --force-R5, --allow-insecure, --print, --modify, \
                      --extract, --annotate, --form, --assemble, --accessibility, \
                      --cleartext-metadata"
                 )
@@ -2288,18 +2290,18 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
     // `--encrypt … 40 --use-aes=y` would quietly write RC4-40 while the user
     // expected AES (a security-relevant mismatch).
     match key_len {
-        40 if use_aes.is_some() || force_v4 || allow_insecure || perm_flag_seen => {
+        40 if use_aes.is_some() || force_v4 || force_r5 || allow_insecure || perm_flag_seen => {
             return Err(
                 "--encrypt KEY-LEN=40 (V=1 RC4-40, R=2) does not accept --use-aes, \
-                 --force-V4, --allow-insecure, or permission sub-flags; the R>=3 \
+                 --force-V4, --force-R5, --allow-insecure, or permission sub-flags; the R>=3 \
                  permission grammar needs a 128- or 256-bit key (40-bit permission \
                  flags are flpdf-9hc.4.9.5 follow-up)"
                     .into(),
             );
         }
-        128 if allow_insecure => {
+        128 if allow_insecure || force_r5 => {
             return Err(
-                "--encrypt KEY-LEN=128 does not accept --allow-insecure (256-bit only)".into(),
+                "--encrypt KEY-LEN=128 does not accept --allow-insecure or --force-R5 (256-bit only)".into(),
             );
         }
         256 if use_aes.is_some() || force_v4 => {
@@ -2393,7 +2395,11 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                         .into(),
                 );
             }
-            let mut params = EncryptParams::v5_r6(user_pw, owner_pw);
+            let mut params = if force_r5 {
+                EncryptParams::v5_r5(user_pw, owner_pw)
+            } else {
+                EncryptParams::v5_r6(user_pw, owner_pw)
+            };
             params.permissions = perms;
             // V=5 is R=6 (>3): accessibility is unconditionally permitted, so
             // qpdf ignores `--accessibility=n`. Match that.

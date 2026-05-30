@@ -1664,6 +1664,18 @@ fn build_encryption_context<R: Read + Seek>(
             let dict = build_v5_r6_encrypt_dict(&v5, &secrets);
             (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
         }
+        EncryptMethod::V5R5Aes256 => {
+            use crate::security::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
+            let secrets = generate_v5r5_secrets()?;
+            let v5 = V5R6EncryptParams {
+                user_password: &params.user_password,
+                owner_password: &params.owner_password,
+                p: params.permissions.to_p_bits(),
+                encrypt_metadata: params.encrypt_metadata,
+            };
+            let dict = build_v5_r5_encrypt_dict(&v5, &secrets);
+            (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
+        }
         EncryptMethod::V1Rc440 => {
             // V=1 R=2 RC4-40. /EncryptMetadata is a V>=4 concept, so it is not
             // emitted here (V1V2EncryptParams has no such field).
@@ -1749,6 +1761,23 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
     // Each range is a fixed, exact-length slice of `buf`, so the array
     // conversions are infallible by construction.
     Ok(crate::security::standard::V5R6Secrets {
+        file_key: buf[0..32].try_into().unwrap(),
+        user_validation_salt: buf[32..40].try_into().unwrap(),
+        user_key_salt: buf[40..48].try_into().unwrap(),
+        owner_validation_salt: buf[48..56].try_into().unwrap(),
+        owner_key_salt: buf[56..64].try_into().unwrap(),
+        perms_random_tail: buf[64..68].try_into().unwrap(),
+    })
+}
+
+fn generate_v5r5_secrets() -> Result<crate::security::standard::V5R5Secrets> {
+    let mut buf = [0u8; 68];
+    getrandom::getrandom(&mut buf).map_err(|e| {
+        crate::Error::Unsupported(format!(
+            "OS CSPRNG (getrandom) unavailable for V=5 R=5 secret generation: {e}"
+        ))
+    })?;
+    Ok(crate::security::standard::V5R5Secrets {
         file_key: buf[0..32].try_into().unwrap(),
         user_validation_salt: buf[32..40].try_into().unwrap(),
         user_key_salt: buf[40..48].try_into().unwrap(),
@@ -2118,7 +2147,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             EncryptMethod::V1Rc440 => (1, 1),
             EncryptMethod::V2Rc4128 => (1, 4),
             EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128 => (1, 5),
-            EncryptMethod::V5R6Aes256 => (1, 7),
+            EncryptMethod::V5R6Aes256 | EncryptMethod::V5R5Aes256 => (1, 7),
         };
         if parse_pdf_version(&version).is_none_or(|v| v < floor) {
             version = format!("{}.{}", floor.0, floor.1);
@@ -3768,6 +3797,71 @@ mod tests {
                     s.data.as_slice(),
                     b"hello",
                     "V=5 R=6 stream must round-trip via reader for {label:?}"
+                ),
+                other => panic!("obj 4 must be a stream, got {other:?}"),
+            }
+        }
+    }
+
+    /// flpdf-9hc.4.15: encrypt with V=5 R=5 (--force-R5), then re-open with flpdf
+    /// using the user password and verify strings and streams round-trip.
+    #[test]
+    fn v5_r5_encrypt_round_trips_string_and_stream_via_reader() {
+        use crate::PdfOpenOptions;
+        use std::io::Cursor;
+
+        let fixture = build_string_and_stream_fixture();
+        let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            // Keep the stream uncompressed so the decrypted payload is exactly
+            // the original bytes (no filter round-trip to account for).
+            compress_streams: CompressStreams::No,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r5(
+                b"user-pw".to_vec(),
+                b"owner-pw".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=5 R=5 encrypted write");
+
+        for pw in [b"user-pw".as_slice(), b"owner-pw".as_slice()] {
+            let label = String::from_utf8_lossy(pw).into_owned();
+            let mut rt = Pdf::open_with_options(
+                Cursor::new(out.clone()),
+                PdfOpenOptions {
+                    password: pw.to_vec(),
+                    // R=5 is flagged as weak crypto by the reader (deprecated
+                    // pre-ISO revision); allow it explicitly in this writer test.
+                    allow_weak_crypto: true,
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("re-open of V=5 R=5 output with {label:?} failed: {e}"));
+
+            // String pass: obj 3 /Title must decrypt to the original plaintext.
+            let obj3 = rt.resolve(ObjectRef::new(3, 0)).expect("resolve obj 3");
+            let dict = match obj3 {
+                Object::Dictionary(d) => d,
+                other => panic!("obj 3 must be a dictionary, got {other:?}"),
+            };
+            match dict.get("Title") {
+                Some(Object::String(s)) => assert_eq!(
+                    s.as_slice(),
+                    b"TopSecretTitle",
+                    "V=5 R=5 string must round-trip via reader for {label:?}"
+                ),
+                other => panic!("/Title must be a string, got {other:?}"),
+            }
+
+            // Stream pass: obj 4 payload must decrypt to the original "hello".
+            let obj4 = rt.resolve(ObjectRef::new(4, 0)).expect("resolve obj 4");
+            match obj4 {
+                Object::Stream(s) => assert_eq!(
+                    s.data.as_slice(),
+                    b"hello",
+                    "V=5 R=5 stream must round-trip via reader for {label:?}"
                 ),
                 other => panic!("obj 4 must be a stream, got {other:?}"),
             }
