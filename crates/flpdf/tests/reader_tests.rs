@@ -120,6 +120,60 @@ fn resolve_borrowed_resolves_missing_reference_to_null() {
 }
 
 #[test]
+fn resolve_borrowed_resolves_compressed_entry_from_xref_stream() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(compressed_entry_pdf())).unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(2, 0)).unwrap();
+
+    assert_eq!(object, &Object::Integer(42));
+}
+
+#[test]
+fn resolve_borrowed_returns_null_for_mismatched_indirect_object() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let bad_offset = bytes.len();
+    bytes.extend_from_slice(b"9 0 obj\ntrue\nendobj\n");
+    let root_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{bad_offset:010} 00000 n \n{root_offset:010} 00000 n \ntrailer\n<< /Size 3 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(1, 0)).unwrap();
+
+    assert_eq!(object, &Object::Null);
+}
+
+#[test]
+fn resolve_borrowed_returns_null_for_compressed_entry_with_missing_parent_stream() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        compressed_entry_with_missing_parent_pdf(),
+    ))
+    .unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(2, 0)).unwrap();
+
+    assert_eq!(object, &Object::Null);
+}
+
+#[test]
+fn resolve_borrowed_returns_null_for_compressed_entry_with_non_stream_parent() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        compressed_entry_with_non_stream_parent_pdf(),
+    ))
+    .unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(2, 0)).unwrap();
+
+    assert_eq!(object, &Object::Null);
+}
+
+#[test]
 fn open_with_options_rejects_r5_by_default() {
     let err = match Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
@@ -1514,6 +1568,94 @@ fn resolves_compressed_entry_declared_in_extended_object_stream() {
         pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
         Object::Integer(99)
     );
+}
+
+fn compressed_entry_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(&catalog);
+
+    let obj3_offset = bytes.len();
+    let obj_stream_body = b"2 0 42";
+    let obj3 = format!(
+        "3 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+        obj_stream_body.len()
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&obj3);
+    bytes.extend_from_slice(obj_stream_body);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj3_offset as u32, 0);
+
+    let xref_stream_object = format!(
+        "4 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+        xref_entries.len()
+    )
+    .into_bytes();
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(&xref_stream_object);
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn compressed_entry_with_missing_parent_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+
+    let xref_stream_object = format!(
+        "4 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+        xref_entries.len()
+    )
+    .into_bytes();
+    let startxref = bytes.len();
+    bytes.extend_from_slice(&xref_stream_object);
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn compressed_entry_with_non_stream_parent_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let obj3_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Type /NotObjStm >>\nendobj\n");
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj3_offset as u32, 0);
+
+    let xref_stream_object = format!(
+        "4 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+        xref_entries.len()
+    )
+    .into_bytes();
+    let startxref = bytes.len();
+    bytes.extend_from_slice(&xref_stream_object);
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+    bytes
 }
 
 fn objstm_extends_chain_pdf() -> Vec<u8> {
