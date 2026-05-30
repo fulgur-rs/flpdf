@@ -1288,6 +1288,129 @@ pub(crate) fn build_v5_r6_encrypt_dict(
     dict
 }
 
+/// Spec-random secret material consumed by [`build_v5_r5_encrypt_dict`].
+///
+/// Identical to [`V5R6Secrets`] — R=5 also emits `/Perms` (Algorithm 10)
+/// because qpdf 11.x requires it for all V=5 documents, R=5 and R=6 alike.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct V5R5Secrets {
+    pub file_key: [u8; 32],
+    pub user_validation_salt: [u8; 8],
+    pub user_key_salt: [u8; 8],
+    pub owner_validation_salt: [u8; 8],
+    pub owner_key_salt: [u8; 8],
+    /// 4 spec-arbitrary bytes appended to the `/Perms` plaintext block before
+    /// AES-256-ECB encryption (Algorithm 10). Required because qpdf 11.x
+    /// validates `/Perms` presence for all V=5 documents.
+    pub perms_random_tail: [u8; 4],
+}
+
+/// Compute the V=5 R=5 `/U` and `/UE` entries using SHA-256 (not Algorithm 2.B).
+///
+/// Identical to [`compute_u_ue_r6`] except the hash function is
+/// [`r5_salted_hash`] — the deprecated simpler SHA-256 path.
+pub(crate) fn compute_u_ue_r5(
+    user_password: &[u8],
+    file_key: &[u8; 32],
+    validation_salt: &[u8; 8],
+    key_salt: &[u8; 8],
+) -> ([u8; 48], [u8; 32]) {
+    let validation_hash = r5_salted_hash(user_password, validation_salt, &[]);
+    let aes_key = r5_salted_hash(user_password, key_salt, &[]);
+    let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+
+    let mut u_entry = [0u8; 48];
+    u_entry[0..32].copy_from_slice(&validation_hash);
+    u_entry[32..40].copy_from_slice(validation_salt);
+    u_entry[40..48].copy_from_slice(key_salt);
+    (u_entry, ue_entry)
+}
+
+/// Compute the V=5 R=5 `/O` and `/OE` entries using SHA-256 (not Algorithm 2.B).
+///
+/// Mirrors [`compute_u_ue_r5`] using `owner_password` and appending the 48-byte
+/// `/U` entry as the extra hash input for the owner path.
+pub(crate) fn compute_o_oe_r5(
+    owner_password: &[u8],
+    user_entry: &[u8; 48],
+    file_key: &[u8; 32],
+    validation_salt: &[u8; 8],
+    key_salt: &[u8; 8],
+) -> ([u8; 48], [u8; 32]) {
+    let validation_hash = r5_salted_hash(owner_password, validation_salt, user_entry);
+    let aes_key = r5_salted_hash(owner_password, key_salt, user_entry);
+    let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+
+    let mut o_entry = [0u8; 48];
+    o_entry[0..32].copy_from_slice(&validation_hash);
+    o_entry[32..40].copy_from_slice(validation_salt);
+    o_entry[40..48].copy_from_slice(key_salt);
+    (o_entry, oe_entry)
+}
+
+/// Construct the `/Encrypt` dictionary for V=5 R=5 (deprecated pre-ISO 32000-2
+/// AES-256) from passwords, permissions, and pre-generated secrets.
+///
+/// Like [`build_v5_r6_encrypt_dict`] but:
+/// - Uses R=5 SHA-256 password hashes (not Algorithm 2.B).
+/// - Emits `/R 5` instead of `/R 6`.
+/// - Still emits `/Perms` (Algorithm 10) — qpdf 11.x requires it for all V=5
+///   documents regardless of revision.
+pub(crate) fn build_v5_r5_encrypt_dict(
+    params: &V5R6EncryptParams<'_>,
+    secrets: &V5R5Secrets,
+) -> Dictionary {
+    let (u_entry, ue_entry) = compute_u_ue_r5(
+        params.user_password,
+        &secrets.file_key,
+        &secrets.user_validation_salt,
+        &secrets.user_key_salt,
+    );
+
+    let (o_entry, oe_entry) = compute_o_oe_r5(
+        params.owner_password,
+        &u_entry,
+        &secrets.file_key,
+        &secrets.owner_validation_salt,
+        &secrets.owner_key_salt,
+    );
+
+    let mut std_cf = Dictionary::new();
+    std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
+    std_cf.insert("CFM", Object::Name(b"AESV3".to_vec()));
+    std_cf.insert("Length", Object::Integer(32));
+
+    let mut cf = Dictionary::new();
+    cf.insert("StdCF", Object::Dictionary(std_cf));
+
+    // Algorithm 10: /Perms — required by qpdf 11.x for all V=5 documents.
+    let perms = compute_perms_blob(
+        params.p,
+        params.encrypt_metadata,
+        &secrets.perms_random_tail,
+        &secrets.file_key,
+    );
+
+    let mut dict = Dictionary::new();
+    dict.insert("CF", Object::Dictionary(cf));
+    dict.insert("Filter", Object::Name(b"Standard".to_vec()));
+    dict.insert("Length", Object::Integer(256));
+    dict.insert("O", Object::String(o_entry.to_vec()));
+    dict.insert("OE", Object::String(oe_entry.to_vec()));
+    dict.insert("P", Object::Integer(i64::from(params.p)));
+    dict.insert("Perms", Object::String(perms.to_vec()));
+    dict.insert("R", Object::Integer(5));
+    dict.insert("StmF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("StrF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("U", Object::String(u_entry.to_vec()));
+    dict.insert("UE", Object::String(ue_entry.to_vec()));
+    dict.insert("V", Object::Integer(5));
+    if !params.encrypt_metadata {
+        dict.insert("EncryptMetadata", Object::Boolean(false));
+    }
+    dict
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Algorithm 1 — Per-object key derivation (V=1/V=2/V=4)
 // ────────────────────────────────────────────────────────────────────────────

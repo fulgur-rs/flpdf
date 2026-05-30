@@ -10,11 +10,13 @@
 //! # Algorithm coverage
 //!
 //! Wired through end to end: `V=4 R=4 Length=128 /CFM AESV2` (AES-128,
-//! flpdf-9hc.4.9) and `V=5 R=6 Length=256 /CFM AESV3` (AES-256,
-//! flpdf-9hc.4.9.4). The remaining Standard handler revisions (V=1, V=2,
-//! V=4 RC4) have their dictionary builders shipped already (PRs #219 /
-//! #220) but no writer integration yet; the corresponding flpdf-9hc.4.9
-//! follow-ups (flpdf-9hc.4.9.1/.2/.3) add dispatch into the same pipeline.
+//! flpdf-9hc.4.9), `V=5 R=6 Length=256 /CFM AESV3` (AES-256,
+//! flpdf-9hc.4.9.4), and `V=5 R=5 Length=256 /CFM AESV3` (deprecated
+//! pre-ISO 32000-2 AES-256, flpdf-9hc.4.15). The remaining Standard handler
+//! revisions (V=1, V=2, V=4 RC4) have their dictionary builders shipped
+//! already (PRs #219 / #220) but no writer integration yet; the corresponding
+//! flpdf-9hc.4.9 follow-ups (flpdf-9hc.4.9.1/.2/.3) add dispatch into the
+//! same pipeline.
 //!
 //! # Randomness
 //!
@@ -46,6 +48,10 @@ pub enum EncryptMethod {
     /// Selected by `qpdf --encrypt … 256 --`. The 32-byte file key is used
     /// directly for every object (no Algorithm-1 per-object derivation).
     V5R6Aes256,
+    /// V=5 R=5 Length=256 with `/CFM AESV3` (AES-256 CBC, pre-ISO 32000-2, deprecated).
+    /// Selected by `qpdf --encrypt … 256 --force-R5 --`. The 32-byte file key is used
+    /// directly. Deprecated in favour of R=6; discouraged by qpdf itself.
+    V5R5Aes256,
     /// V=1 R=2 Length=40 RC4-40. Selected by `qpdf --encrypt … 40 --`.
     /// Weak crypto — gated behind `--allow-weak-crypto` at the CLI.
     V1Rc440,
@@ -115,6 +121,19 @@ impl EncryptParams {
     pub fn v5_r6(user_password: impl Into<Vec<u8>>, owner_password: impl Into<Vec<u8>>) -> Self {
         Self {
             method: EncryptMethod::V5R6Aes256,
+            user_password: user_password.into(),
+            owner_password: owner_password.into(),
+            permissions: PermissionsConfig::default(),
+            encrypt_metadata: true,
+        }
+    }
+
+    /// Convenience constructor for the V=5 R=5 AES-256 case (deprecated pre-ISO 32000-2).
+    /// Selected by `--force-R5`. Same password / permissions / metadata semantics as
+    /// `v5_r6` — only the revision and hash algorithm differ.
+    pub fn v5_r5(user_password: impl Into<Vec<u8>>, owner_password: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: EncryptMethod::V5R5Aes256,
             user_password: user_password.into(),
             owner_password: owner_password.into(),
             permissions: PermissionsConfig::default(),

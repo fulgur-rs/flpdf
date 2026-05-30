@@ -1335,6 +1335,138 @@ fn copy_encryption_from_wrong_password_is_rejected() {
     assert!(!out.exists());
 }
 
+// ── --force-R5 tests (flpdf-9hc.4.15) ──────────────────────────────────────
+
+/// `--force-R5` produces V=5 R=5 AES-256 output as reported by flpdf's own
+/// `show-encryption` — no qpdf dependency, pins flpdf's self-view.
+#[test]
+fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("r5.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "owner-pw", "256", "--force-R5", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let show = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["show-encryption", "--allow-weak-crypto", "--password=user-pw"])
+        .arg(&output)
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
+    for needle in ["V = 5", "R = 5", "Length = 256", "AESv3"] {
+        assert!(
+            stdout.contains(needle),
+            "flpdf show-encryption must report {needle:?} for --force-R5 output: {stdout}"
+        );
+    }
+    // Explicitly verify R=6 is NOT reported
+    assert!(
+        !stdout.contains("R = 6"),
+        "flpdf show-encryption must NOT report R=6 for --force-R5 output: {stdout}"
+    );
+}
+
+/// `--force-R5` is a 256-bit-only flag; KEY-LEN=128 must be rejected with a
+/// diagnostic that names the offending flag.
+#[test]
+fn encrypt_force_r5_rejected_for_128_bit() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "u", "o", "128", "--force-R5", "--"])
+        .arg("/dev/null")
+        .arg("/dev/null")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--force-R5"));
+}
+
+/// `--force-R5` is a 256-bit-only flag; KEY-LEN=40 must be rejected with a
+/// diagnostic that names the offending flag.
+#[test]
+fn encrypt_force_r5_rejected_for_40_bit() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--allow-weak-crypto", "--encrypt", "u", "o", "40", "--force-R5", "--"])
+        .arg("/dev/null")
+        .arg("/dev/null")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--force-R5"));
+}
+
+/// `--force-R5=value` is rejected: the flag takes no value.
+#[test]
+fn encrypt_force_r5_rejects_value_form() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "u", "o", "256", "--force-R5=y", "--"])
+        .arg("/dev/null")
+        .arg("/dev/null")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not take a value"));
+}
+
+/// `--force-R5` produces V=5 R=5 AES-256 output that qpdf authenticates with
+/// both user and owner passwords (cross-implementation gate for
+/// flpdf-9hc.4.15).
+#[test]
+fn encrypt_force_r5_round_trips_via_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("r5-qpdf.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "owner-pw", "256", "--force-R5", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    // qpdf should recognise R=5 (needs --allow-weak-crypto since R=5 is deprecated)
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--allow-weak-crypto")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --show-encryption failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 5") && stdout.contains("Supplied password is user password"),
+        "qpdf must report R=5 + user password match: {stdout}"
+    );
+
+    // Owner password also authenticates
+    let owner_check = ShellCommand::new("qpdf")
+        .arg("--password=owner-pw")
+        .arg("--allow-weak-crypto")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(owner_check.status.success());
+    let owner_out = String::from_utf8_lossy(&owner_check.stdout);
+    assert!(
+        owner_out.contains("Supplied password is owner password"),
+        "qpdf must accept the owner password: {owner_out}"
+    );
+}
+
 /// --encrypt + --object-streams=generate の組み合わせ:
 /// ObjStm コンテナを含む暗号化 PDF を出力し qpdf が復号できること。
 #[test]
