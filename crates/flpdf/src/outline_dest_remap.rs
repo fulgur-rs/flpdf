@@ -98,8 +98,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(()), // No catalog, nothing to do.
     };
-    let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Some(catalog) = catalog_obj.into_dict() else {
+    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
+    let Some(catalog) = catalog_obj.as_dict() else {
         return Ok(());
     };
 
@@ -117,8 +117,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         DirectInCatalog,
     }
     let (names_loc, mut names_dict) = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => (Some(NamesLoc::Indirect(r)), d),
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+            Object::Dictionary(d) => (Some(NamesLoc::Indirect(r)), d.clone()),
             _ => (None, crate::Dictionary::default()),
         },
         Some(Object::Dictionary(d)) => (Some(NamesLoc::DirectInCatalog), d),
@@ -162,8 +162,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         match names_loc {
             NamesLoc::Indirect(r) => {
                 if names_now_empty {
-                    let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                    if let Some(mut cat) = catalog_obj3.into_dict() {
+                    let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
+                    if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
                         cat.remove("Names");
                         pdf.set_object(catalog_ref, Object::Dictionary(cat));
                     }
@@ -172,8 +172,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
                 }
             }
             NamesLoc::DirectInCatalog => {
-                let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                if let Some(mut cat) = catalog_obj3.into_dict() {
+                let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
+                if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
                     if names_now_empty {
                         cat.remove("Names");
                     } else {
@@ -186,8 +186,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     }
 
     // 2b. Legacy /Catalog /Dests dictionary (PDF 1.1 style)
-    let catalog_obj2 = pdf.resolve(catalog_ref)?;
-    let Some(catalog2) = catalog_obj2.into_dict() else {
+    let catalog_obj2 = pdf.resolve_borrowed(catalog_ref)?;
+    let Some(catalog2) = catalog_obj2.as_dict() else {
         return Ok(());
     };
     match catalog2.get("Dests").cloned() {
@@ -197,8 +197,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         Some(Object::Dictionary(dests)) => {
             // Legacy /Dests held as a direct dictionary on the catalog.
             let new_dests = prune_dests_dict(pdf, dests, &surviving, &mut surviving_names)?;
-            let catalog_obj3 = pdf.resolve(catalog_ref)?;
-            if let Some(mut cat) = catalog_obj3.into_dict() {
+            let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
+            if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
                 cat.insert("Dests", Object::Dictionary(new_dests));
                 pdf.set_object(catalog_ref, Object::Dictionary(cat));
             }
@@ -208,8 +208,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
     // --- Step 3: Remap / drop the outline tree ----------------------------
     if let Some(outlines_obj_ref) = outlines_ref {
-        let outline_root_obj = pdf.resolve(outlines_obj_ref)?;
-        if let Some(outline_root) = outline_root_obj.into_dict() {
+        let outline_root_obj = pdf.resolve_borrowed(outlines_obj_ref)?;
+        if let Some(outline_root) = outline_root_obj.as_dict() {
             if let Some(first_ref) = outline_root.get_ref("First") {
                 // Walk the top-level items, collecting which to keep/drop.
                 let mut kept: Vec<ObjectRef> = Vec::new();
@@ -228,8 +228,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
                 if kept.is_empty() {
                     // All top-level items dropped → remove /Outlines from catalog.
-                    let catalog_obj3 = pdf.resolve(catalog_ref)?;
-                    if let Some(mut cat) = catalog_obj3.into_dict() {
+                    let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
+                    if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
                         cat.remove("Outlines");
                         pdf.set_object(catalog_ref, Object::Dictionary(cat));
                     }
@@ -239,8 +239,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
                     // Recount visible descendants for the outline root.
                     let new_count = count_visible_descendants(pdf, &kept, max_depth)?;
-                    let outline_root_obj2 = pdf.resolve(outlines_obj_ref)?;
-                    if let Some(mut root_dict) = outline_root_obj2.into_dict() {
+                    let outline_root_obj2 = pdf.resolve_borrowed(outlines_obj_ref)?;
+                    if let Some(mut root_dict) = outline_root_obj2.as_dict().cloned() {
                         // Preserve sign: root /Count is always positive (not closed),
                         // but we re-set it anyway to be safe.
                         root_dict.insert("Count", Object::Integer(new_count));
@@ -287,8 +287,8 @@ fn prune_name_tree<R: Read + Seek>(
         // Cycle: this node was already processed — treat as empty.
         return Ok(true);
     }
-    let node_obj = pdf.resolve(node_ref)?;
-    let Some(node) = node_obj.into_dict() else {
+    let node_obj = pdf.resolve_borrowed(node_ref)?;
+    let Some(node) = node_obj.as_dict() else {
         return Ok(true); // Malformed node — treat as empty.
     };
 
@@ -304,8 +304,8 @@ fn prune_name_tree<R: Read + Seek>(
                 return Ok(true); // Node is now empty.
             }
             // Rebuild the node with the filtered /Names and updated /Limits.
-            let node_obj2 = pdf.resolve(node_ref)?;
-            if let Some(mut d) = node_obj2.into_dict() {
+            let node_obj2 = pdf.resolve_borrowed(node_ref)?;
+            if let Some(mut d) = node_obj2.as_dict().cloned() {
                 let limits = compute_limits(&filtered);
                 d.insert("Names", Object::Array(filtered));
                 if let Some(lim) = limits {
@@ -346,8 +346,8 @@ fn prune_name_tree<R: Read + Seek>(
             }
 
             // Rebuild node with surviving kids and recomputed /Limits.
-            let node_obj2 = pdf.resolve(node_ref)?;
-            if let Some(mut d) = node_obj2.into_dict() {
+            let node_obj2 = pdf.resolve_borrowed(node_ref)?;
+            if let Some(mut d) = node_obj2.as_dict().cloned() {
                 d.insert(
                     "Kids",
                     Object::Array(
@@ -506,8 +506,8 @@ fn prune_legacy_dests<R: Read + Seek>(
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     surviving_names: &mut BTreeSet<Vec<u8>>,
 ) -> Result<()> {
-    let dests_obj = pdf.resolve(dests_ref)?;
-    let Some(dests) = dests_obj.into_dict() else {
+    let dests_obj = pdf.resolve_borrowed(dests_ref)?;
+    let Some(dests) = dests_obj.as_dict().cloned() else {
         return Ok(());
     };
     let new_dests = prune_dests_dict(pdf, dests, surviving, surviving_names)?;
@@ -588,8 +588,8 @@ fn collect_siblings<R: Read + Seek>(
             break; // Cycle guard.
         }
 
-        let item_obj = pdf.resolve(item_ref)?;
-        let Some(item) = item_obj.into_dict() else {
+        let item_obj = pdf.resolve_borrowed(item_ref)?;
+        let Some(item) = item_obj.as_dict() else {
             break; // Malformed — stop this chain.
         };
 
@@ -619,8 +619,8 @@ fn collect_siblings<R: Read + Seek>(
 
                 if child_kept.is_empty() {
                     // All children dropped: update parent to remove First/Last/Count.
-                    let item_obj2 = pdf.resolve(item_ref)?;
-                    if let Some(mut d) = item_obj2.into_dict() {
+                    let item_obj2 = pdf.resolve_borrowed(item_ref)?;
+                    if let Some(mut d) = item_obj2.as_dict().cloned() {
                         d.remove("First");
                         d.remove("Last");
                         // With no children, the item has zero descendants, so
@@ -635,8 +635,8 @@ fn collect_siblings<R: Read + Seek>(
                     // Some children survived: stitch them, update item.
                     stitch_siblings(pdf, &child_kept, item_ref)?;
                     let visible = count_visible_descendants(pdf, &child_kept, max_depth)?;
-                    let item_obj2 = pdf.resolve(item_ref)?;
-                    if let Some(mut d) = item_obj2.into_dict() {
+                    let item_obj2 = pdf.resolve_borrowed(item_ref)?;
+                    if let Some(mut d) = item_obj2.as_dict().cloned() {
                         let count_sign = match d.get("Count") {
                             Some(Object::Integer(n)) if *n < 0 => -1i64,
                             _ => 1i64,
@@ -692,14 +692,16 @@ fn drop_subtree<R: Read + Seek>(
         if !dropped.insert(item_ref) {
             break;
         }
-        let item_obj = pdf.resolve(item_ref)?;
-        let Some(item) = item_obj.into_dict() else {
+        let item_obj = pdf.resolve_borrowed(item_ref)?;
+        let Some(item) = item_obj.as_dict() else {
             break;
         };
-        if let Some(child_first) = item.get_ref("First") {
+        let child_first = item.get_ref("First");
+        let next_ref = item.get_ref("Next");
+        if let Some(child_first) = child_first {
             drop_subtree(pdf, child_first, dropped, depth + 1, max_depth)?;
         }
-        current = item.get_ref("Next");
+        current = next_ref;
     }
     Ok(())
 }
@@ -712,8 +714,8 @@ fn stitch_siblings<R: Read + Seek>(
     parent_ref: ObjectRef,
 ) -> Result<()> {
     for (i, &item_ref) in kept.iter().enumerate() {
-        let item_obj = pdf.resolve(item_ref)?;
-        let Some(mut d) = item_obj.into_dict() else {
+        let item_obj = pdf.resolve_borrowed(item_ref)?;
+        let Some(mut d) = item_obj.as_dict().cloned() else {
             continue;
         };
         d.insert("Parent", Object::Reference(parent_ref));
@@ -753,8 +755,8 @@ fn count_visible_in_chain<R: Read + Seek>(
     }
     let mut count = items.len() as i64;
     for &item_ref in items {
-        let item_obj = pdf.resolve(item_ref)?;
-        let Some(d) = item_obj.into_dict() else {
+        let item_obj = pdf.resolve_borrowed(item_ref)?;
+        let Some(d) = item_obj.as_dict() else {
             continue;
         };
         // If the item's /Count is positive (open), add its visible descendants.
@@ -820,7 +822,7 @@ fn resolve_ref_chain<R: Read + Seek>(
         match cur {
             Object::Reference(r) => {
                 last_ref = Some(r);
-                cur = pdf.resolve(r)?;
+                cur = pdf.resolve_borrowed(r)?.clone();
             }
             _ => break,
         }
@@ -860,8 +862,8 @@ fn remap_item_dest<R: Read + Seek>(
     item_ref: ObjectRef,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
-    let item_obj = pdf.resolve(item_ref)?;
-    let Some(mut d) = item_obj.into_dict() else {
+    let item_obj = pdf.resolve_borrowed(item_ref)?;
+    let Some(mut d) = item_obj.as_dict().cloned() else {
         return Ok(());
     };
 
@@ -949,7 +951,7 @@ fn remap_dest_value_depth<R: Read + Seek>(
         // Indirect: resolve, recurse, and if the referenced object changed,
         // rewrite it in place. The caller keeps pointing at the same ref.
         Object::Reference(dr) => {
-            let concrete = pdf.resolve(*dr)?;
+            let concrete = pdf.resolve_borrowed(*dr)?.clone();
             if let Some(updated) = remap_dest_value_depth(pdf, &concrete, surviving, depth - 1)? {
                 pdf.set_object(*dr, updated);
             }
@@ -1006,7 +1008,7 @@ fn dest_page_ref_resolved_depth<R: Read + Seek>(
     }
     match dest {
         Object::Reference(r) => {
-            let c = pdf.resolve(*r)?;
+            let c = pdf.resolve_borrowed(*r)?.clone();
             dest_page_ref_resolved_depth(pdf, &c, depth - 1)
         }
         Object::Array(arr) => Ok(match arr.first() {
@@ -1044,10 +1046,7 @@ fn merge_node_limits<R: Read + Seek>(
     if kids.is_empty() {
         return Ok(None);
     }
-    let first_kid_obj = pdf.resolve(kids[0])?;
-    let last_kid_obj = pdf.resolve(*kids.last().expect("non-empty"))?;
-
-    let first_min = if let Some(d) = first_kid_obj.as_dict() {
+    let first_min = if let Some(d) = pdf.resolve_borrowed(kids[0])?.as_dict() {
         if let Some(lim) = d.get("Limits").and_then(Object::as_array) {
             lim.first().cloned()
         } else {
@@ -1057,7 +1056,10 @@ fn merge_node_limits<R: Read + Seek>(
         None
     };
 
-    let last_max = if let Some(d) = last_kid_obj.as_dict() {
+    let last_max = if let Some(d) = pdf
+        .resolve_borrowed(*kids.last().expect("non-empty"))?
+        .as_dict()
+    {
         if let Some(lim) = d.get("Limits").and_then(Object::as_array) {
             lim.last().cloned()
         } else {

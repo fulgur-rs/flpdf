@@ -83,8 +83,8 @@ pub fn page_content_bytes<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Vec<u8>> {
     // Resolve the page object itself.
-    let page_obj = pdf.resolve(page_ref)?;
-    let Some(page_dict) = page_obj.into_dict() else {
+    let page_obj = pdf.resolve_borrowed(page_ref)?;
+    let Some(page_dict) = page_obj.as_dict() else {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot extract /Contents"
         )));
@@ -149,9 +149,9 @@ fn collect_content_streams<R: Read + Seek>(
 
         // Indirect reference — must resolve to a stream.
         Object::Reference(r) => {
-            let resolved = pdf.resolve(*r)?;
+            let resolved = pdf.resolve_borrowed(*r)?;
             match resolved {
-                Object::Stream(s) => Ok(vec![s]),
+                Object::Stream(s) => Ok(vec![s.clone()]),
                 _ => Err(Error::Unsupported(format!(
                     "/Contents reference {r} on page {page_ref} does not resolve to a stream"
                 ))),
@@ -164,9 +164,9 @@ fn collect_content_streams<R: Read + Seek>(
             for elem in elems {
                 match elem {
                     Object::Reference(r) => {
-                        let resolved = pdf.resolve(*r)?;
+                        let resolved = pdf.resolve_borrowed(*r)?;
                         match resolved {
-                            Object::Stream(s) => streams.push(s),
+                            Object::Stream(s) => streams.push(s.clone()),
                             _ => {
                                 return Err(Error::Unsupported(format!(
                                     "/Contents array element {r} on page {page_ref} does not resolve to a stream"
@@ -248,8 +248,8 @@ fn collect_content_streams<R: Read + Seek>(
 /// ```
 pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<()> {
     // ── 1. Resolve the page dictionary ────────────────────────────────────────
-    let page_obj = pdf.resolve(page_ref)?;
-    let Some(page_dict) = page_obj.into_dict() else {
+    let page_obj = pdf.resolve_borrowed(page_ref)?;
+    let Some(page_dict) = page_obj.as_dict() else {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot coalesce /Contents"
         )));
@@ -299,9 +299,9 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     for (i, elem) in refs.iter().enumerate() {
         let stream: Stream = match elem {
             Object::Reference(r) => {
-                let resolved = pdf.resolve(*r)?;
+                let resolved = pdf.resolve_borrowed(*r)?;
                 match resolved {
-                    Object::Stream(s) => s,
+                    Object::Stream(s) => s.clone(),
                     _ => {
                         return Err(Error::Unsupported(format!(
                             "/Contents array element {r} on page {page_ref} does not resolve to a stream"
@@ -368,8 +368,8 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     pdf.set_object(new_stream_ref, Object::Stream(new_stream));
 
     // ── 6. Re-resolve the page dictionary (it may have been evicted) and patch /Contents ─
-    let page_obj2 = pdf.resolve(page_ref)?;
-    let Some(mut new_page_dict) = page_obj2.into_dict() else {
+    let page_obj2 = pdf.resolve_borrowed(page_ref)?;
+    let Some(mut new_page_dict) = page_obj2.as_dict().cloned() else {
         return Err(Error::Unsupported(format!(
             "object {page_ref} unexpectedly not a dictionary after coalesce"
         )));
@@ -438,24 +438,27 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
             return Ok(None);
         }
 
-        let node_obj = pdf.resolve(current)?;
-        let Some(dict) = node_obj.into_dict() else {
+        let node_obj = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node_obj.as_dict() else {
             // Not a dictionary — cannot walk further.
             return Ok(None);
         };
 
+        let resources_val = dict.get("Resources").cloned();
+        let parent_val = dict.get("Parent").cloned();
+
         // Check for /Resources on this node. Per PDF §7.3.9, a null value is
         // equivalent to the key being absent — so Object::Null (and references
         // that resolve to null) fall through to the /Parent chain.
-        if let Some(resources_val) = dict.get("Resources").cloned() {
+        if let Some(resources_val) = resources_val {
             match resources_val {
                 Object::Null => {}
                 Object::Dictionary(d) => return Ok(Some(d)),
                 Object::Reference(r) => {
-                    let resolved = pdf.resolve(r)?;
+                    let resolved = pdf.resolve_borrowed(r)?;
                     match resolved {
                         Object::Null => {}
-                        Object::Dictionary(d) => return Ok(Some(d)),
+                        Object::Dictionary(d) => return Ok(Some(d.clone())),
                         _ => {
                             return Err(Error::Unsupported(format!(
                                 "/Resources reference {r} on node {current} does not resolve to a dictionary"
@@ -473,7 +476,7 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
 
         // No /Resources here — try the /Parent. A null /Parent is equivalent
         // to no /Parent at all (PDF §7.3.9), so stop walking in either case.
-        let parent_val = match dict.get("Parent").cloned() {
+        let parent_val = match parent_val {
             Some(Object::Null) | None => return Ok(None),
             Some(v) => v,
         };
@@ -537,8 +540,8 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// Create a `PageWalk` with a caller-supplied recursion limit.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
         let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let catalog = pdf.resolve(catalog_ref)?;
-        let Some(catalog) = catalog.into_dict() else {
+        let catalog = pdf.resolve_borrowed(catalog_ref)?;
+        let Some(catalog) = catalog.as_dict() else {
             return Err(Error::Unsupported(format!(
                 "document catalog {catalog_ref} is not a dictionary"
             )));
@@ -577,7 +580,7 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
                 continue; // cycle guard: already visited
             }
 
-            let node_obj = match self.pdf.resolve(node) {
+            let node_obj = match self.pdf.resolve_borrowed(node) {
                 Ok(o) => o,
                 Err(e) => {
                     self.done = true;
@@ -585,7 +588,7 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
                 }
             };
 
-            let Some(dict) = node_obj.into_dict() else {
+            let Some(dict) = node_obj.as_dict() else {
                 continue; // non-dictionary: skip silently
             };
 

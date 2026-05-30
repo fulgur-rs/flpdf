@@ -283,13 +283,13 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     for (i, loc) in page_res_loc.iter().enumerate() {
         // Resolve this page's top-level /Resources dict (if any).
         let res_dict_opt: Option<Dictionary> = match loc {
-            ResourcesLoc::Indirect(r) => match pdf.resolve(*r) {
-                Ok(Object::Dictionary(d)) => Some(d),
+            ResourcesLoc::Indirect(r) => match pdf.resolve_borrowed(*r) {
+                Ok(Object::Dictionary(d)) => Some(d.clone()),
                 _ => None,
             },
             ResourcesLoc::PageInline => {
                 // Read the inline dict from the page object.
-                match pdf.resolve(page_refs[i]) {
+                match pdf.resolve_borrowed(page_refs[i]) {
                     Ok(Object::Dictionary(page_dict)) => {
                         match page_dict.get("Resources").cloned() {
                             Some(Object::Dictionary(d)) => Some(d),
@@ -299,7 +299,7 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
                     _ => None,
                 }
             }
-            ResourcesLoc::AncestorInline(a) => match pdf.resolve(*a) {
+            ResourcesLoc::AncestorInline(a) => match pdf.resolve_borrowed(*a) {
                 Ok(Object::Dictionary(anc_dict)) => match anc_dict.get("Resources").cloned() {
                     Some(Object::Dictionary(d)) => Some(d),
                     _ => None,
@@ -412,8 +412,8 @@ fn resources_location<R: Read + Seek>(
         }
         depth += 1;
 
-        let node_obj = pdf.resolve(current)?;
-        let Some(dict) = node_obj.into_dict() else {
+        let node_obj = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node_obj.as_dict() else {
             return Ok(ResourcesLoc::None);
         };
 
@@ -646,7 +646,7 @@ fn recurse_form_xobject<R: Read + Seek>(
     let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject").cloned())
     {
         Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
-        Some(Object::Reference(cat_ref)) => match pdf.resolve(cat_ref)? {
+        Some(Object::Reference(cat_ref)) => match pdf.resolve_borrowed(cat_ref)? {
             Object::Dictionary(xobj_dict) => xobj_dict.get(xobject_name).cloned(),
             _ => None,
         },
@@ -668,9 +668,9 @@ fn recurse_form_xobject<R: Read + Seek>(
     // Resolve to a Stream, handling both indirect references and direct streams.
     let stream: crate::object::Stream = match xobj_val {
         Object::Reference(xobj_ref) => {
-            let obj = pdf.resolve(xobj_ref)?;
+            let obj = pdf.resolve_borrowed(xobj_ref)?;
             match obj {
-                Object::Stream(s) => s,
+                Object::Stream(s) => s.clone(),
                 _ => return Ok(()),
             }
         }
@@ -729,8 +729,8 @@ fn recurse_form_xobject<R: Read + Seek>(
         // Resolve the Form's own /Resources dict (may be direct or indirect).
         let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
             Some(Object::Dictionary(d)) => Some(d),
-            Some(Object::Reference(r)) => match pdf.resolve(r)? {
-                Object::Dictionary(d) => Some(d),
+            Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+                Object::Dictionary(d) => Some(d.clone()),
                 _ => None, // broken ref → treat as empty own scope
             },
             _ => None,
@@ -772,8 +772,8 @@ fn prune_resources_object<R: Read + Seek>(
     cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
-    let obj = pdf.resolve(res_ref)?;
-    let Some(mut res_dict) = obj.into_dict() else {
+    let obj = pdf.resolve_borrowed(res_ref)?;
+    let Some(mut res_dict) = obj.as_dict().cloned() else {
         return Ok(()); // not a dict — nothing to prune
     };
 
@@ -791,8 +791,8 @@ fn prune_inline_resources<R: Read + Seek>(
     cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
-    let page_obj = pdf.resolve(page_ref)?;
-    let Some(mut page_dict) = page_obj.into_dict() else {
+    let page_obj = pdf.resolve_borrowed(page_ref)?;
+    let Some(mut page_dict) = page_obj.as_dict().cloned() else {
         return Err(Error::Unsupported(format!(
             "page {page_ref} resolved to non-dictionary"
         )));
@@ -823,8 +823,8 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
     cat_ref_map: &BTreeMap<CatRefKey, CatRefInfo>,
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
-    let ancestor_obj = pdf.resolve(ancestor_ref)?;
-    let Some(mut ancestor_dict) = ancestor_obj.into_dict() else {
+    let ancestor_obj = pdf.resolve_borrowed(ancestor_ref)?;
+    let Some(mut ancestor_dict) = ancestor_obj.as_dict().cloned() else {
         return Ok(()); // not a dict — nothing to prune
     };
 
@@ -919,8 +919,8 @@ fn apply_pruning<R: Read + Seek>(
 
                     // Yes (or Auto with group_count == 1): prune using the
                     // global union, not just the per-group `used`.
-                    let resolved = pdf.resolve(cat_ref)?;
-                    let Some(mut cat_dict) = resolved.into_dict() else {
+                    let resolved = pdf.resolve_borrowed(cat_ref)?;
+                    let Some(mut cat_dict) = resolved.as_dict().cloned() else {
                         continue; // not a dict — skip safely
                     };
 
@@ -950,8 +950,8 @@ fn apply_pruning<R: Read + Seek>(
                     // Auto-skipped and no used-names were collected). Fall back
                     // to the legacy per-group path which leaves the dict untouched
                     // when used_names is empty — a safe conservative choice.
-                    let resolved = pdf.resolve(cat_ref)?;
-                    let Some(mut cat_dict) = resolved.into_dict() else {
+                    let resolved = pdf.resolve_borrowed(cat_ref)?;
+                    let Some(mut cat_dict) = resolved.as_dict().cloned() else {
                         continue;
                     };
 
