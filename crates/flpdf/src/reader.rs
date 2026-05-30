@@ -818,14 +818,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// freed, or compressed-but-broken entries return [`Object::Null`] rather than an
     /// error, matching the behavior the PDF spec mandates for missing objects (§7.3.10).
     pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
-        if self.resolve_to_cache(object_ref)? {
-            return Ok(self
-                .resolved_cached_object(object_ref)
-                .expect("resolved object must be cached")
-                .clone());
-        }
-
-        Ok(Object::Null)
+        Ok(self.resolve_borrowed(object_ref)?.clone())
     }
 
     /// Resolve `object_ref` and borrow the cached concrete value.
@@ -836,19 +829,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// other objects through the same reader.
     pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
         if self.resolve_to_cache(object_ref)? {
-            return Ok(self
-                .resolved_cached_object(object_ref)
-                .expect("resolved object must be cached"));
+            if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
+                return Ok(object);
+            }
         }
 
         Ok(&NULL_OBJECT)
-    }
-
-    fn resolved_cached_object(&self, object_ref: ObjectRef) -> Option<&Object> {
-        match self.cache.entry(object_ref) {
-            Some(CacheEntry::Resolved(object)) => Some(object),
-            _ => None,
-        }
     }
 
     fn resolve_to_cache(&mut self, object_ref: ObjectRef) -> Result<bool> {
@@ -858,7 +844,6 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         match entry.cloned() {
-            Some(CacheEntry::Resolved(_)) => unreachable!("resolved entries returned above"),
             Some(CacheEntry::Unresolved { offset }) => {
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut bytes = Vec::new();
@@ -953,8 +938,13 @@ impl<R: Read + Seek> Pdf<R> {
             Some(CacheEntry::Compressed { stream, index }) => {
                 self.resolve_compressed_entry(object_ref, stream, index)
             }
-            Some(CacheEntry::Missing | CacheEntry::Deleted) | None => Ok(false),
-            Some(CacheEntry::Reserved) => Ok(false),
+            Some(
+                CacheEntry::Resolved(_)
+                | CacheEntry::Missing
+                | CacheEntry::Deleted
+                | CacheEntry::Reserved,
+            )
+            | None => Ok(false),
         }
     }
 
@@ -980,9 +970,13 @@ impl<R: Read + Seek> Pdf<R> {
                 self.cache.set_resolved(stream_ref, object.clone());
                 object
             }
-            Some(CacheEntry::Compressed { .. }) => return Ok(false),
-            Some(CacheEntry::Missing | CacheEntry::Deleted) | None => return Ok(false),
-            Some(CacheEntry::Reserved) => return Ok(false),
+            Some(
+                CacheEntry::Compressed { .. }
+                | CacheEntry::Missing
+                | CacheEntry::Deleted
+                | CacheEntry::Reserved,
+            )
+            | None => return Ok(false),
         };
 
         let Some(stream_object) = stream_object.into_stream() else {

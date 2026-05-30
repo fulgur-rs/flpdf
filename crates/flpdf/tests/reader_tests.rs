@@ -178,6 +178,30 @@ fn resolve_borrowed_returns_null_for_compressed_entry_with_non_stream_parent() {
 }
 
 #[test]
+fn resolve_borrowed_returns_null_for_compressed_entry_with_compressed_parent() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        compressed_entry_with_compressed_parent_pdf(),
+    ))
+    .unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(2, 0)).unwrap();
+
+    assert_eq!(object, &Object::Null);
+}
+
+#[test]
+fn resolve_borrowed_returns_null_for_compressed_entry_with_mismatched_parent_ref() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        compressed_entry_with_mismatched_parent_ref_pdf(),
+    ))
+    .unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(2, 0)).unwrap();
+
+    assert_eq!(object, &Object::Null);
+}
+
+#[test]
 fn open_with_options_rejects_r5_by_default() {
     let err = match Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
@@ -1648,6 +1672,63 @@ fn compressed_entry_with_non_stream_parent_pdf() -> Vec<u8> {
     append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
     append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
     append_xref_stream_entry(&mut xref_entries, 1, obj3_offset as u32, 0);
+
+    let xref_stream_object = format!(
+        "4 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
+        xref_entries.len()
+    )
+    .into_bytes();
+    let startxref = bytes.len();
+    bytes.extend_from_slice(&xref_stream_object);
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn compressed_entry_with_compressed_parent_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let obj4_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"4 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n",
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj4_offset as u32, 0);
+
+    let xref_stream_object = format!(
+        "5 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 3 1] /Index [0 5] /Length {} >>\nstream\n",
+        xref_entries.len()
+    )
+    .into_bytes();
+    let startxref = bytes.len();
+    bytes.extend_from_slice(&xref_stream_object);
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn compressed_entry_with_mismatched_parent_ref_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let bad_parent_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"9 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 >>\nstream\n2 0 42\nendstream\nendobj\n",
+    );
+
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, bad_parent_offset as u32, 0);
 
     let xref_stream_object = format!(
         "4 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 3 1] /Index [0 4] /Length {} >>\nstream\n",
