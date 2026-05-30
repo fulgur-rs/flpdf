@@ -1292,18 +1292,7 @@ pub(crate) fn build_v5_r6_encrypt_dict(
 ///
 /// Identical to [`V5R6Secrets`] — R=5 also emits `/Perms` (Algorithm 10)
 /// because qpdf 11.x requires it for all V=5 documents, R=5 and R=6 alike.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct V5R5Secrets {
-    pub file_key: [u8; 32],
-    pub user_validation_salt: [u8; 8],
-    pub user_key_salt: [u8; 8],
-    pub owner_validation_salt: [u8; 8],
-    pub owner_key_salt: [u8; 8],
-    /// 4 spec-arbitrary bytes appended to the `/Perms` plaintext block before
-    /// AES-256-ECB encryption (Algorithm 10). Required because qpdf 11.x
-    /// validates `/Perms` presence for all V=5 documents.
-    pub perms_random_tail: [u8; 4],
-}
+pub(crate) type V5R5Secrets = V5R6Secrets;
 
 /// Compute the V=5 R=5 `/U` and `/UE` entries using SHA-256 (not Algorithm 2.B).
 ///
