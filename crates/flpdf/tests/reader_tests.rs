@@ -86,7 +86,7 @@ fn resolves_indirect_object_on_access() {
 
 #[test]
 fn resolve_borrowed_returns_reference_to_cached_object() {
-    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let file = File::open(minimal_fixture_path()).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
     let first_ptr = {
@@ -111,12 +111,16 @@ fn resolve_borrowed_returns_reference_to_cached_object() {
 
 #[test]
 fn resolve_borrowed_resolves_missing_reference_to_null() {
-    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let file = File::open(minimal_fixture_path()).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
     let object = pdf.resolve_borrowed(ObjectRef::new(999, 0)).unwrap();
 
     assert_eq!(object, &Object::Null);
+}
+
+fn minimal_fixture_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf")
 }
 
 #[test]
