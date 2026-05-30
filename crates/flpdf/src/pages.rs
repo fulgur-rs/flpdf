@@ -592,29 +592,24 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
             let node_type = dict
                 .get("Type")
                 .and_then(|value| match value {
-                    Object::Name(value) => Some(value.clone()),
+                    Object::Name(value) => Some(value.as_slice()),
                     _ => None,
                 })
-                .unwrap_or_default();
+                .unwrap_or(&[]);
 
-            if node_type.as_slice() == b"Pages" {
+            if node_type == b"Pages" {
                 if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-                    let kid_refs: Vec<ObjectRef> = kids
-                        .iter()
-                        .filter_map(|k| match k {
-                            Object::Reference(r) => Some(*r),
-                            _ => None,
-                        })
-                        .collect();
                     // Push in reverse order so that the first kid is popped first.
-                    for kid in kid_refs.into_iter().rev() {
-                        self.stack.push((kid, depth + 1));
+                    for kid in kids.iter().rev() {
+                        if let Object::Reference(r) = kid {
+                            self.stack.push((*r, depth + 1));
+                        }
                     }
                 }
                 continue;
             }
 
-            if node_type.as_slice() == b"Page" {
+            if node_type == b"Page" {
                 return Some(Ok(node));
             }
 
@@ -1279,7 +1274,10 @@ mod tests {
             &[
                 (1, "<< /Type /Catalog /Pages 2 0 R >>"),
                 (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 3 >>"),
-                (3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>"),
+                (
+                    3,
+                    "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>",
+                ),
                 (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
                 (5, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
                 (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
@@ -1428,7 +1426,11 @@ mod tests {
             .unwrap()
             .collect::<Result<_>>()
             .unwrap();
-        assert_eq!(refs, vec![ObjectRef::new(4, 0)], "Widget node must be skipped");
+        assert_eq!(
+            refs,
+            vec![ObjectRef::new(4, 0)],
+            "Widget node must be skipped"
+        );
     }
 
     #[test]
@@ -1439,7 +1441,10 @@ mod tests {
             &[
                 (1, "<< /Type /Catalog /Pages 2 0 R >>"),
                 (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 3 >>"),
-                (3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>"),
+                (
+                    3,
+                    "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>",
+                ),
                 (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
                 (5, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
                 (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
