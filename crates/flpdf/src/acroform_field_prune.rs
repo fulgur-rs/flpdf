@@ -777,6 +777,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn indirect_arrays_are_resolved_while_pruning_fields_annots_and_kids() {
+        let objects: Vec<(u32, &[u8])> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields 12 0 R /DA (/Helvetica 12 Tf 0 g) >> >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, b"<< /Type /Page /Parent 2 0 R /Annots 13 0 R >>"),
+            (4, b"<< /Type /Page /Parent 2 0 R /Annots [10 0 R] >>"),
+            (8, b"<< /FT /Tx /T (FieldB) /Kids 14 0 R >>"),
+            (
+                9,
+                b"<< /Type /Annot /Subtype /Widget /Parent 8 0 R /P 3 0 R /Rect [10 600 200 620] >>",
+            ),
+            (
+                10,
+                b"<< /Type /Annot /Subtype /Widget /Parent 8 0 R /P 4 0 R /Rect [10 500 200 520] >>",
+            ),
+            (12, b"[8 0 R]"),
+            (13, b"[9 0 R]"),
+            (14, b"[9 0 R 10 0 R]"),
+        ];
+        let mut pdf = open(build_pdf(&objects));
+        let sel = [ObjectRef::new(3, 0)];
+        let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        let fields = acroform_fields(&mut pdf);
+        assert_eq!(fields, vec![ObjectRef::new(8, 0)]);
+        let b1 = dict_of(&mut pdf, ObjectRef::new(9, 0));
+        assert_eq!(b1.get("P"), Some(&Object::Reference(ObjectRef::new(3, 0))));
+        let b2 = dict_of(&mut pdf, ObjectRef::new(10, 0));
+        assert!(
+            b2.get("P").is_none(),
+            "dropped-page widget /P must be stripped"
+        );
+    }
+
     /// Empty /Fields after pruning → /AcroForm removed from catalog.
     #[test]
     fn empty_fields_removes_acroform_from_catalog() {

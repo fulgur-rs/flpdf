@@ -8,7 +8,7 @@
 
 use flpdf::{
     encode_utf16be, format_pdf_date, md5_checksum, FileParamDates, FileSpec, FileSpecBuilder,
-    ObjectRef, Pdf,
+    Object, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -78,6 +78,23 @@ fn build_attachment_pdf(filespec_extras: &str, ef_params: &str, payload: &[u8]) 
     let trailer = format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     out.extend_from_slice(trailer.as_bytes());
     out
+}
+
+#[test]
+fn embedded_file_resolves_indirect_ef_dictionary() {
+    let mut pdf = open(build_attachment_pdf("", "", b"payload"));
+    let Object::Dictionary(mut fs_dict) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dict");
+    };
+    let ef_dict = fs_dict.get("EF").cloned().expect("/EF dict");
+    pdf.set_object(ObjectRef::new(7, 0), ef_dict);
+    fs_dict.insert("EF", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(fs_dict));
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+
+    assert_eq!(ef.payload().unwrap(), b"payload");
 }
 
 // ── Helper: open PDF from bytes ───────────────────────────────────────────────
