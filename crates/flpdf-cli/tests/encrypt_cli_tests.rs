@@ -1346,7 +1346,14 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--encrypt", "user-pw", "owner-pw", "256", "--force-R5", "--"])
+        .args([
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "256",
+            "--force-R5",
+            "--",
+        ])
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&output)
         .assert()
@@ -1354,7 +1361,11 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
 
     let show = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["show-encryption", "--allow-weak-crypto", "--password=user-pw"])
+        .args([
+            "show-encryption",
+            "--allow-weak-crypto",
+            "--password=user-pw",
+        ])
         .arg(&output)
         .assert()
         .success();
@@ -1376,11 +1387,13 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
 /// diagnostic that names the offending flag.
 #[test]
 fn encrypt_force_r5_rejected_for_128_bit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--encrypt", "u", "o", "128", "--force-R5", "--"])
-        .arg("/dev/null")
-        .arg("/dev/null")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
         .assert()
         .failure()
         .stderr(predicates::str::contains("--force-R5"));
@@ -1390,11 +1403,21 @@ fn encrypt_force_r5_rejected_for_128_bit() {
 /// diagnostic that names the offending flag.
 #[test]
 fn encrypt_force_r5_rejected_for_40_bit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--allow-weak-crypto", "--encrypt", "u", "o", "40", "--force-R5", "--"])
-        .arg("/dev/null")
-        .arg("/dev/null")
+        .args([
+            "--allow-weak-crypto",
+            "--encrypt",
+            "u",
+            "o",
+            "40",
+            "--force-R5",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
         .assert()
         .failure()
         .stderr(predicates::str::contains("--force-R5"));
@@ -1403,11 +1426,13 @@ fn encrypt_force_r5_rejected_for_40_bit() {
 /// `--force-R5=value` is rejected: the flag takes no value.
 #[test]
 fn encrypt_force_r5_rejects_value_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--encrypt", "u", "o", "256", "--force-R5=y", "--"])
-        .arg("/dev/null")
-        .arg("/dev/null")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
         .assert()
         .failure()
         .stderr(predicates::str::contains("does not take a value"));
@@ -1426,7 +1451,14 @@ fn encrypt_force_r5_round_trips_via_qpdf() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--encrypt", "user-pw", "owner-pw", "256", "--force-R5", "--"])
+        .args([
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "256",
+            "--force-R5",
+            "--",
+        ])
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&output)
         .assert()

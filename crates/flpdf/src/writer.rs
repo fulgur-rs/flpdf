@@ -1666,7 +1666,7 @@ fn build_encryption_context<R: Read + Seek>(
         }
         EncryptMethod::V5R5Aes256 => {
             use crate::security::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
-            let secrets = generate_v5r5_secrets()?;
+            let secrets = generate_v5r6_secrets()?;
             let v5 = V5R6EncryptParams {
                 user_password: &params.user_password,
                 owner_password: &params.owner_password,
@@ -1761,23 +1761,6 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
     // Each range is a fixed, exact-length slice of `buf`, so the array
     // conversions are infallible by construction.
     Ok(crate::security::standard::V5R6Secrets {
-        file_key: buf[0..32].try_into().unwrap(),
-        user_validation_salt: buf[32..40].try_into().unwrap(),
-        user_key_salt: buf[40..48].try_into().unwrap(),
-        owner_validation_salt: buf[48..56].try_into().unwrap(),
-        owner_key_salt: buf[56..64].try_into().unwrap(),
-        perms_random_tail: buf[64..68].try_into().unwrap(),
-    })
-}
-
-fn generate_v5r5_secrets() -> Result<crate::security::standard::V5R5Secrets> {
-    let mut buf = [0u8; 68];
-    getrandom::getrandom(&mut buf).map_err(|e| {
-        crate::Error::Unsupported(format!(
-            "OS CSPRNG (getrandom) unavailable for V=5 R=5 secret generation: {e}"
-        ))
-    })?;
-    Ok(crate::security::standard::V5R5Secrets {
         file_key: buf[0..32].try_into().unwrap(),
         user_validation_salt: buf[32..40].try_into().unwrap(),
         user_key_salt: buf[40..48].try_into().unwrap(),

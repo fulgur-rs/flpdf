@@ -2266,9 +2266,7 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
             }
             "--force-R5" => {
                 if tok.contains('=') {
-                    return Err(
-                        format!("--force-R5 does not take a value (got {tok:?})").into()
-                    );
+                    return Err(format!("--force-R5 does not take a value (got {tok:?})").into());
                 }
                 force_r5 = true;
             }
