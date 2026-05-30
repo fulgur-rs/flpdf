@@ -151,24 +151,27 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
             return Ok(0);
         }
 
-        let node_obj = pdf.resolve(current)?;
+        let node_obj = pdf.resolve_borrowed(current)?;
         let Object::Dictionary(dict) = node_obj else {
             // Not a dictionary — cannot walk further; use default.
             return Ok(0);
         };
 
+        let rotate_val = dict.get("Rotate").cloned();
+        let parent_val = dict.get("Parent").cloned();
+
         // Check for /Rotate on this node.
         // Per ISO 32000-1 §7.3.9, a null value is equivalent to absent.
-        if let Some(rotate_val) = dict.get("Rotate").cloned() {
+        if let Some(rotate_val) = rotate_val {
             match rotate_val {
                 // null → treat as absent; continue walking.
                 Object::Null => {}
                 Object::Integer(n) => return Ok(normalize_rotate_i64(n)),
                 Object::Reference(r) => {
-                    let resolved = pdf.resolve(r)?;
+                    let resolved = pdf.resolve_borrowed(r)?;
                     match resolved {
                         Object::Null => {}
-                        Object::Integer(n) => return Ok(normalize_rotate_i64(n)),
+                        Object::Integer(n) => return Ok(normalize_rotate_i64(*n)),
                         _ => {
                             return Err(Error::Unsupported(format!(
                                 "/Rotate reference {r} on node {current} does not resolve to an integer"
@@ -185,7 +188,7 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
         }
 
         // No /Rotate here — try the /Parent.
-        let parent_val = match dict.get("Parent").cloned() {
+        let parent_val = match parent_val {
             Some(Object::Null) | None => return Ok(0), // no parent, use default
             Some(v) => v,
         };
@@ -234,8 +237,8 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
         // 3. Re-resolve the page dictionary (it may have changed if there are
         //    multiple pages sharing a parent — re-resolution is safe because
         //    Pdf::resolve goes through the cache).
-        let page_obj = pdf.resolve(page_ref)?;
-        let Object::Dictionary(mut page_dict) = page_obj else {
+        let page_obj = pdf.resolve_borrowed(page_ref)?;
+        let Object::Dictionary(mut page_dict) = page_obj.clone() else {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"
             )));
@@ -505,7 +508,7 @@ mod tests {
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
         // The leaf should now carry /Rotate 180 explicitly.
-        let obj = pdf.resolve(page_ref).unwrap();
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -524,7 +527,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve(page_ref).unwrap();
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -543,7 +546,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve(page_ref).unwrap();
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -564,7 +567,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve(page_ref).unwrap();
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -586,7 +589,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve(page_ref).unwrap();
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -606,7 +609,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve(page_ref).unwrap();
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -625,7 +628,7 @@ mod tests {
         apply_rotate_to_pages(&mut pdf, &[], &op).unwrap();
 
         // Page should still be 90.
-        let obj = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+        let obj = pdf.resolve_borrowed(ObjectRef::new(3, 0)).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -652,7 +655,7 @@ mod tests {
         );
 
         // The /Pages node must remain untouched (no /Rotate written).
-        let obj = pdf.resolve(pages_ref).unwrap();
+        let obj = pdf.resolve_borrowed(pages_ref).unwrap();
         let Object::Dictionary(dict) = obj else {
             panic!("not a dict")
         };
@@ -689,7 +692,7 @@ mod tests {
         let page_refs = pages::page_refs(&mut pdf2).unwrap();
         assert_eq!(page_refs.len(), 1);
 
-        let obj2 = pdf2.resolve(page_refs[0]).unwrap();
+        let obj2 = pdf2.resolve_borrowed(page_refs[0]).unwrap();
         let Object::Dictionary(dict2) = obj2 else {
             panic!("not a dict after round-trip")
         };
@@ -721,7 +724,7 @@ mod tests {
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
         let page_refs2 = pages::page_refs(&mut pdf2).unwrap();
 
-        let obj2 = pdf2.resolve(page_refs2[0]).unwrap();
+        let obj2 = pdf2.resolve_borrowed(page_refs2[0]).unwrap();
         let Object::Dictionary(dict2) = obj2 else {
             panic!("not a dict")
         };
@@ -804,13 +807,13 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page1, page2], &op).unwrap();
 
-        let obj1 = pdf.resolve(page1).unwrap();
+        let obj1 = pdf.resolve_borrowed(page1).unwrap();
         let Object::Dictionary(dict1) = obj1 else {
             panic!("not a dict")
         };
         assert_eq!(dict1.get("Rotate"), Some(&Object::Integer(180)), "page 1");
 
-        let obj2 = pdf.resolve(page2).unwrap();
+        let obj2 = pdf.resolve_borrowed(page2).unwrap();
         let Object::Dictionary(dict2) = obj2 else {
             panic!("not a dict")
         };

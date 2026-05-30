@@ -187,16 +187,15 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filespec_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
-    let fs_obj = pdf.resolve(filespec_ref)?;
-    let Some(fs_dict) = fs_obj.into_dict() else {
+    let Some(fs_dict) = pdf.resolve_borrowed(filespec_ref)?.as_dict() else {
         return Ok(None);
     };
     let ef_dict: Dictionary = match fs_dict.get("EF") {
         Some(Object::Dictionary(d)) => d.clone(),
         Some(Object::Reference(r)) => {
             let r = *r;
-            match pdf.resolve(r)? {
-                Object::Dictionary(d) => d,
+            match pdf.resolve_borrowed(r)? {
+                Object::Dictionary(d) => d.clone(),
                 _ => return Ok(None),
             }
         }
@@ -265,8 +264,7 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     dict_ref: ObjectRef,
     target_ref: ObjectRef,
 ) -> Result<()> {
-    let obj = pdf.resolve(dict_ref)?;
-    let Some(mut dict) = obj.into_dict() else {
+    let Some(mut dict) = pdf.resolve_borrowed(dict_ref)?.as_dict().cloned() else {
         return Ok(());
     };
 
@@ -280,8 +278,8 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     // object `r` (which must be patched, not just the parent dict).
     let (array_ref, af_array): (Option<ObjectRef>, Vec<Object>) = match af_value {
         Object::Array(arr) => (None, arr),
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => (Some(r), arr),
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Array(arr) => (Some(r), arr.clone()),
             _ => return Ok(()),
         },
         _ => return Ok(()),
@@ -391,19 +389,23 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(vec![]),
     };
-    let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Some(catalog) = catalog_obj.into_dict() else {
+    let names_value = match pdf.resolve_borrowed(catalog_ref)?.as_dict() {
+        Some(catalog) => catalog.get("Names").cloned(),
+        None => return Ok(vec![]),
+    };
+
+    let Some(names_value) = names_value else {
         return Ok(vec![]);
     };
 
     // ── Step 2: resolve /Names dictionary ────────────────────────────────────
     // /Names may be an indirect reference or a direct inline dictionary.
-    let names_dict = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => d,
+    let names_dict = match names_value {
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Dictionary(d) => d.clone(),
             _ => return Ok(vec![]),
         },
-        Some(Object::Dictionary(d)) => d,
+        Object::Dictionary(d) => d,
         _ => return Ok(vec![]),
     };
 
@@ -450,8 +452,7 @@ fn collect_name_tree<R: Read + Seek>(
         return Ok(());
     }
 
-    let node_obj = pdf.resolve(node_ref)?;
-    let Some(node) = node_obj.into_dict() else {
+    let Some(node) = pdf.resolve_borrowed(node_ref)?.as_dict().cloned() else {
         // Malformed node — skip.
         return Ok(());
     };
@@ -532,13 +533,13 @@ pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(vec![]),
     };
-    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref)? else {
+    let Some(catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict() else {
         return Ok(vec![]);
     };
 
     let names_dict = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => d,
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+            Object::Dictionary(d) => d.clone(),
             _ => return Ok(vec![]),
         },
         Some(Object::Dictionary(d)) => d,
@@ -576,7 +577,7 @@ fn collect_name_tree_raw<R: Read + Seek>(
     if !visited.insert(node_ref) {
         return Ok(()); // Cycle — skip silently.
     }
-    let Object::Dictionary(node) = pdf.resolve(node_ref)? else {
+    let Some(node) = pdf.resolve_borrowed(node_ref)?.as_dict().cloned() else {
         return Ok(()); // Malformed node — skip.
     };
     collect_name_tree_dict_raw(pdf, node, out, visited, depth, max_depth)
@@ -708,8 +709,7 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(()),
     };
-    let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Some(mut catalog) = catalog_obj.into_dict() else {
+    let Some(mut catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
         return Ok(());
     };
 
@@ -730,8 +730,8 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     if entries.is_empty() {
         // Retrieve (or create empty) /Names dict and drop /EmbeddedFiles from it.
         let names_dict_opt = match catalog.get("Names").cloned() {
-            Some(Object::Reference(r)) => match pdf.resolve(r)? {
-                Object::Dictionary(d) => Some((Some(r), d)),
+            Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+                Object::Dictionary(d) => Some((Some(r), d.clone())),
                 _ => None,
             },
             Some(Object::Dictionary(d)) => Some((None, d)),
@@ -799,8 +799,8 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     // Resolve or create the /Names dict.  We always store it as an indirect
     // object and point /EmbeddedFiles to the tree root indirectly.
     let (names_ref, mut names_dict) = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => (r, d),
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+            Object::Dictionary(d) => (r, d.clone()),
             _ => {
                 let r2 = alloc();
                 (r2, Dictionary::new())
@@ -954,7 +954,11 @@ mod tests {
         let fs_ref = FileSpecBuilder::new("trans.txt", b"payload")
             .build(&mut pdf)
             .expect("build filespec");
-        let Object::Dictionary(mut fs_dict) = pdf.resolve(fs_ref).expect("resolve filespec") else {
+        let Object::Dictionary(mut fs_dict) = pdf
+            .resolve_borrowed(fs_ref)
+            .expect("resolve filespec")
+            .clone()
+        else {
             panic!("expected filespec dict");
         };
         fs_dict.insert("CI", Object::Reference(sidecar_ref));
@@ -1035,7 +1039,10 @@ mod tests {
         pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
 
         let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        let Object::Dictionary(mut catalog) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .clone()
         else {
             panic!("expected catalog dict");
         };
@@ -1063,7 +1070,9 @@ mod tests {
         );
 
         // Catalog /AF must be gone (its only entry was the removed filespec).
-        let Object::Dictionary(catalog2) = pdf.resolve(catalog_ref).expect("resolve catalog after")
+        let Object::Dictionary(catalog2) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog after")
         else {
             panic!("expected catalog dict");
         };
@@ -1100,7 +1109,10 @@ mod tests {
         pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
 
         let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        let Object::Dictionary(mut catalog) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .clone()
         else {
             panic!("expected catalog dict");
         };
@@ -1110,7 +1122,11 @@ mod tests {
         let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
         assert_eq!(page_refs.len(), 1, "fixture has one page");
         let page_ref = page_refs[0];
-        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref).expect("resolve page") else {
+        let Object::Dictionary(mut page_dict) = pdf
+            .resolve_borrowed(page_ref)
+            .expect("resolve page")
+            .clone()
+        else {
             panic!("expected page dict");
         };
         page_dict.insert("AF", Object::Reference(af_array_ref));
@@ -1124,7 +1140,7 @@ mod tests {
         // The shared array object must still resolve for every parent (not
         // deleted on the first), and be emptied of the removed filespec.
         let Object::Array(af_after) = pdf
-            .resolve(af_array_ref)
+            .resolve_borrowed(af_array_ref)
             .expect("shared indirect /AF array must still resolve (not deleted)")
         else {
             panic!("expected /AF array object");
@@ -1143,7 +1159,8 @@ mod tests {
 
         // Catalog /AF dropped (emptied); page /AF may remain but, if present,
         // must point at the still-resolvable array (no dangling ref).
-        let Object::Dictionary(page_after) = pdf.resolve(page_ref).expect("resolve page after")
+        let Object::Dictionary(page_after) =
+            pdf.resolve_borrowed(page_ref).expect("resolve page after")
         else {
             panic!("expected page dict");
         };
@@ -1153,7 +1170,7 @@ mod tests {
                 "page /AF must still point at the surviving shared array"
             );
             assert!(
-                pdf.resolve(r).is_ok(),
+                pdf.resolve_borrowed(r).is_ok(),
                 "page /AF reference must resolve (not dangling)"
             );
         }
@@ -1201,7 +1218,10 @@ mod tests {
         // Hang it off the catalog's /Dests so it is reachable from the catalog
         // (a legitimate live name tree, not a dead ghost).
         let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        let Object::Dictionary(mut catalog) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .clone()
         else {
             panic!("expected catalog dict");
         };
@@ -1220,7 +1240,9 @@ mod tests {
         );
 
         // The /Dests reference itself must remain intact.
-        let Object::Dictionary(leaf) = pdf.resolve(dests_leaf_ref).expect("resolve dests leaf")
+        let Object::Dictionary(leaf) = pdf
+            .resolve_borrowed(dests_leaf_ref)
+            .expect("resolve dests leaf")
         else {
             panic!("expected dests leaf dict");
         };
@@ -1261,14 +1283,21 @@ mod tests {
         // Make the stream dictionary back-reference the filespec (pathological
         // but legal) and have a live, catalog-reachable object reference the
         // stream so conservative GC must preserve it.
-        let Object::Stream(mut stream) = pdf.resolve(stream_ref).expect("resolve stream") else {
+        let Object::Stream(mut stream) = pdf
+            .resolve_borrowed(stream_ref)
+            .expect("resolve stream")
+            .clone()
+        else {
             panic!("expected stream object");
         };
         stream.dict.insert("RelatedFS", Object::Reference(fs_ref));
         pdf.set_object(stream_ref, Object::Stream(stream));
 
         let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        let Object::Dictionary(mut catalog) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .clone()
         else {
             panic!("expected catalog dict");
         };
@@ -1361,7 +1390,7 @@ mod tests {
             .expect("build filespec");
 
         // The builder points /EF /F and /EF /UF at one stream; capture it.
-        let Object::Dictionary(fs_dict) = pdf.resolve(fs_ref).expect("resolve fs") else {
+        let Object::Dictionary(fs_dict) = pdf.resolve_borrowed(fs_ref).expect("resolve fs") else {
             panic!("expected filespec dict");
         };
         let Some(Object::Dictionary(mut ef)) = fs_dict.get("EF").cloned() else {
@@ -1390,7 +1419,9 @@ mod tests {
             }),
         );
         ef.insert("UF", Object::Reference(stream_uf));
-        let Object::Dictionary(mut fs_dict_mut) = pdf.resolve(fs_ref).expect("resolve fs") else {
+        let Object::Dictionary(mut fs_dict_mut) =
+            pdf.resolve_borrowed(fs_ref).expect("resolve fs").clone()
+        else {
             panic!("expected filespec dict");
         };
         fs_dict_mut.insert("EF", Object::Dictionary(ef));
@@ -1440,7 +1471,10 @@ mod tests {
         pdf.set_object(sharer_ref, Object::Dictionary(sharer));
 
         let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).expect("resolve catalog")
+        let Object::Dictionary(mut catalog) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .clone()
         else {
             panic!("expected catalog dict");
         };
@@ -1463,7 +1497,9 @@ mod tests {
             live.contains(&af_array_ref),
             "empty indirect /AF array (target absent) must NOT be deleted"
         );
-        let Object::Dictionary(catalog2) = pdf.resolve(catalog_ref).expect("resolve catalog after")
+        let Object::Dictionary(catalog2) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog after")
         else {
             panic!("expected catalog dict");
         };
@@ -1506,8 +1542,12 @@ mod tests {
 
         // Add /AF to catalog pointing at fs_ref.
         let catalog_ref = pdf.root_ref().expect("root");
-        let catalog_obj = pdf.resolve(catalog_ref).expect("resolve catalog");
-        let Some(mut catalog) = catalog_obj.into_dict() else {
+        let Some(mut catalog) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .cloned()
+        else {
             panic!("expected catalog dict");
         };
         catalog.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
@@ -1517,8 +1557,12 @@ mod tests {
         let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
         assert_eq!(page_refs.len(), 1, "fixture has one page");
         let page_ref = page_refs[0];
-        let page_obj = pdf.resolve(page_ref).expect("resolve page");
-        let Some(mut page_dict) = page_obj.into_dict() else {
+        let Some(mut page_dict) = pdf
+            .resolve_borrowed(page_ref)
+            .expect("resolve page")
+            .as_dict()
+            .cloned()
+        else {
             panic!("expected page dict");
         };
         page_dict.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
@@ -1529,8 +1573,11 @@ mod tests {
         assert!(removed);
 
         // /AF on catalog must be gone.
-        let catalog_obj2 = pdf.resolve(catalog_ref).expect("resolve catalog after");
-        let Some(catalog2) = catalog_obj2.into_dict() else {
+        let Some(catalog2) = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog after")
+            .as_dict()
+        else {
             panic!("expected catalog dict");
         };
         assert!(
@@ -1539,8 +1586,11 @@ mod tests {
         );
 
         // /AF on page must be gone.
-        let page_obj2 = pdf.resolve(page_ref).expect("resolve page after");
-        let Some(page_dict2) = page_obj2.into_dict() else {
+        let Some(page_dict2) = pdf
+            .resolve_borrowed(page_ref)
+            .expect("resolve page after")
+            .as_dict()
+        else {
             panic!("expected page dict");
         };
         assert!(

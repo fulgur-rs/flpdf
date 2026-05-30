@@ -153,9 +153,9 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     let first_obj_ref =
         find_first_object_ref(file_bytes).ok_or(LinearizationCheckError::NotLinearized)?;
     let first_obj = pdf
-        .resolve(first_obj_ref)
+        .resolve_borrowed(first_obj_ref)
         .map_err(LinearizationCheckError::from)?;
-    let Some(param_dict) = first_obj.into_dict() else {
+    let Some(param_dict) = first_obj.as_dict().cloned() else {
         return Err(LinearizationCheckError::NotLinearized);
     };
 
@@ -201,7 +201,9 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         message: format!("/O ({o_num}) does not fit in u32 — invalid object number"),
     })?;
     let o_ref = ObjectRef::new(o_num_u32, 0);
-    let o_object = pdf.resolve(o_ref).map_err(LinearizationCheckError::from)?;
+    let o_object = pdf
+        .resolve_borrowed(o_ref)
+        .map_err(LinearizationCheckError::from)?;
     match &o_object {
         Object::Dictionary(d) => {
             if let Some(Object::Name(type_name)) = d.get("Type") {
@@ -351,7 +353,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         // producers), and a cross-reference stream with gen != 0 is
         // spec-legal — hardcoding 0 would mis-resolve and spuriously reject it.
         let xref_obj = pdf
-            .resolve(ObjectRef::new(xref_obj_num, xref_obj_gen))
+            .resolve_borrowed(ObjectRef::new(xref_obj_num, xref_obj_gen))
             .map_err(LinearizationCheckError::from)?;
         let is_xref_stream = matches!(
             &xref_obj,
@@ -492,7 +494,7 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
     let hint_obj = pdf
-        .resolve(hint_ref)
+        .resolve_borrowed(hint_ref)
         .map_err(LinearizationCheckError::from)?;
 
     match hint_obj {
