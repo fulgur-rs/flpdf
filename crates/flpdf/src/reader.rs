@@ -640,8 +640,8 @@ impl<R: Read + Seek> Pdf<R> {
         match self.trailer().get("Encrypt").cloned() {
             None => Ok(None),
             Some(Object::Dictionary(dict)) => Ok(Some(dict)),
-            Some(Object::Reference(object_ref)) => match self.resolve(object_ref)? {
-                Object::Dictionary(dict) => Ok(Some(dict)),
+            Some(Object::Reference(object_ref)) => match self.resolve_borrowed(object_ref)? {
+                Object::Dictionary(dict) => Ok(Some(dict.clone())),
                 _ => Err(EncryptedError::Malformed {
                     reason: "/Encrypt object is not a dictionary".into(),
                 }
@@ -795,8 +795,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// This resolves object `(1, 0)` and inspects its `/Linearized` entry.
     pub fn linearized_hint_ref(&mut self) -> Result<Option<ObjectRef>> {
         let candidate = ObjectRef::new(1, 0);
-        let object = self.resolve(candidate)?;
-        let Some(dict) = object.into_dict() else {
+        let object = self.resolve_borrowed(candidate)?;
+        let Some(dict) = object.as_dict() else {
             return Ok(None);
         };
 
@@ -871,9 +871,9 @@ impl<R: Read + Seek> Pdf<R> {
                         // resolution error is likewise non-fatal: fall back
                         // rather than failing the whole stream.
                         self.cache.set_reserved(object_ref);
-                        if let Ok(Object::Integer(n)) = self.resolve(isl.holder) {
+                        if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
                             if let (Ok(n), Object::Stream(stream)) =
-                                (usize::try_from(n), &mut object)
+                                (usize::try_from(*n), &mut object)
                             {
                                 let auth_end = isl.data_start.saturating_add(n);
                                 // Only override with the authoritative length
@@ -1042,8 +1042,8 @@ impl<R: Read + Seek> Pdf<R> {
         stream_ref: ObjectRef,
         target_index: u32,
     ) -> Result<(ObjectRef, u32)> {
-        let stream_object = self.resolve(stream_ref)?;
-        let Some(stream_object) = stream_object.into_stream() else {
+        let stream_object = self.resolve_borrowed(stream_ref)?;
+        let Some(stream_object) = stream_object.as_stream().cloned() else {
             return Err(Error::parse(0, "compressed parent is not an object stream"));
         };
         let (parent_ref, parent_index, _) =
@@ -1096,8 +1096,8 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         if let Some(parent_ref) = stream_object.dict.get_ref("Extends") {
-            let parent_object = self.resolve(parent_ref)?;
-            let Some(parent_stream) = parent_object.into_stream() else {
+            let parent_object = self.resolve_borrowed(parent_ref)?;
+            let Some(parent_stream) = parent_object.as_stream().cloned() else {
                 return Err(Error::parse(0, "object stream /Extends is not a stream"));
             };
             self.collect_object_stream_chain(parent_ref, &parent_stream, streams, seen)?;

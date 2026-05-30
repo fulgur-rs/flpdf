@@ -1583,7 +1583,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         // the input here would risk the file being swapped mid-run, so the
         // JSON body and the side files could capture different snapshots.
         for oref in wanted_refs {
-            let obj = pdf.resolve(oref)?;
+            let obj = pdf.resolve_borrowed(oref)?;
             if let Object::Stream(stream) = obj {
                 // Side-file name must match the JSON `datafile` value;
                 // both come from the same helper to avoid divergence.
@@ -2042,7 +2042,7 @@ fn build_copy_encryption_source(
         )
     })?;
 
-    let encrypt_obj = donor.resolve(encrypt_ref).map_err(|e| {
+    let encrypt_obj = donor.resolve_borrowed(encrypt_ref).map_err(|e| {
         format!(
             "--copy-encryption-from: failed to resolve /Encrypt in {:?}: {e}",
             path
@@ -2050,7 +2050,7 @@ fn build_copy_encryption_source(
     })?;
 
     let encrypt_dict = match encrypt_obj {
-        Object::Dictionary(d) => d,
+        Object::Dictionary(d) => d.clone(),
         other => {
             return Err(format!(
                 "--copy-encryption-from: /Encrypt in {:?} is not a dictionary (got {:?})",
@@ -2974,7 +2974,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     page_ref: ObjectRef,
 ) -> CliResult<()> {
     // Resolve the page dictionary to find its /Contents value.
-    let page_obj = pdf.resolve(page_ref)?;
+    let page_obj = pdf.resolve_borrowed(page_ref)?;
     let Object::Dictionary(page_dict) = page_obj else {
         return Ok(()); // Not a page dict — skip silently.
     };
@@ -3015,7 +3015,7 @@ fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
 ) -> CliResult<()> {
-    let resolved = pdf.resolve(stream_ref)?;
+    let resolved = pdf.resolve_borrowed(stream_ref)?;
     let Object::Stream(stream) = resolved else {
         return Ok(()); // Not a stream — skip.
     };
@@ -3093,7 +3093,7 @@ fn run_dump_object(
     let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
-    let object = pdf.resolve(object_ref)?;
+    let object = pdf.resolve_borrowed(object_ref)?;
 
     if matches!(object, Object::Null) {
         return Err(format!(
@@ -3112,7 +3112,7 @@ fn run_dump_object(
 fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     let object_ref = ObjectRef::parse(&cmd.object_ref)?;
     let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
-    let object = pdf.resolve(object_ref)?;
+    let object = pdf.resolve_borrowed(object_ref)?;
 
     if matches!(object, Object::Null) {
         return Err(format!(
@@ -3131,7 +3131,7 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     };
 
     let bytes = if cmd.raw {
-        stream.data
+        stream.data.clone()
     } else {
         filters::decode_stream_data(&stream.dict, &stream.data)?
     };
@@ -3152,7 +3152,7 @@ fn run_show_info(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) 
         .trailer()
         .get_ref("Info")
         .ok_or("document info dictionary not found")?;
-    let info = pdf.resolve(info_ref)?;
+    let info = pdf.resolve_borrowed(info_ref)?;
 
     let Object::Dictionary(dict) = info else {
         return Err(format!("info object {} is not a dictionary", info_ref).into());
@@ -3174,8 +3174,8 @@ fn run_show_catalog(
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve(catalog_ref)?;
-    println!("Catalog: {}", object_to_pdf(&catalog));
+    let catalog = pdf.resolve_borrowed(catalog_ref)?;
+    println!("Catalog: {}", object_to_pdf(catalog));
     Ok(())
 }
 
@@ -3187,7 +3187,7 @@ fn run_show_metadata(
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve(catalog_ref)?;
+    let catalog = pdf.resolve_borrowed(catalog_ref)?;
 
     let Object::Dictionary(catalog) = catalog else {
         return Err(format!("document catalog {} is not a dictionary", catalog_ref).into());
@@ -3195,7 +3195,7 @@ fn run_show_metadata(
 
     match catalog.get_ref("Metadata") {
         Some(metadata_ref) => {
-            let metadata = pdf.resolve(metadata_ref)?;
+            let metadata = pdf.resolve_borrowed(metadata_ref)?;
             match metadata {
                 Object::Stream(stream) => {
                     let kind = stream
@@ -3227,7 +3227,7 @@ fn run_show_metadata(
                 }
                 other => {
                     println!("Metadata: non-stream {}", metadata_ref);
-                    println!("  type: {}", object_to_pdf(&other));
+                    println!("  type: {}", object_to_pdf(other));
                 }
             }
         }
@@ -3320,7 +3320,7 @@ fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs)
     let mut pdf = open_pdf(&input, repair, password)?;
     let page_refs = pages::page_refs(&mut pdf)?;
     for (index, page_ref) in page_refs.iter().enumerate() {
-        let page = pdf.resolve(*page_ref)?;
+        let page = pdf.resolve_borrowed(*page_ref)?;
         let Object::Dictionary(dict) = page else {
             continue;
         };
