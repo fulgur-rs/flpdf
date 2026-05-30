@@ -15,6 +15,8 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
+static NULL_OBJECT: Object = Object::Null;
+
 /// Lazily parsed PDF document handle.
 ///
 /// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
@@ -816,8 +818,46 @@ impl<R: Read + Seek> Pdf<R> {
     /// freed, or compressed-but-broken entries return [`Object::Null`] rather than an
     /// error, matching the behavior the PDF spec mandates for missing objects (§7.3.10).
     pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        if self.resolve_to_cache(object_ref)? {
+            return Ok(self
+                .resolved_cached_object(object_ref)
+                .expect("resolved object must be cached")
+                .clone());
+        }
+
+        Ok(Object::Null)
+    }
+
+    /// Resolve `object_ref` and borrow the cached concrete value.
+    ///
+    /// This has the same resolution behavior as [`Pdf::resolve`] but avoids cloning
+    /// the resolved [`Object`]. The returned reference is tied to the mutable borrow
+    /// of this [`Pdf`], so callers must finish using it before resolving or mutating
+    /// other objects through the same reader.
+    pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
+        if self.resolve_to_cache(object_ref)? {
+            return Ok(self
+                .resolved_cached_object(object_ref)
+                .expect("resolved object must be cached"));
+        }
+
+        Ok(&NULL_OBJECT)
+    }
+
+    fn resolved_cached_object(&self, object_ref: ObjectRef) -> Option<&Object> {
+        match self.cache.entry(object_ref) {
+            Some(CacheEntry::Resolved(object)) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn resolve_to_cache(&mut self, object_ref: ObjectRef) -> Result<bool> {
+        if matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_))) {
+            return Ok(true);
+        }
+
         match self.cache.entry(object_ref).cloned() {
-            Some(CacheEntry::Resolved(object)) => Ok(object),
+            Some(CacheEntry::Resolved(_)) => unreachable!("resolved entries returned above"),
             Some(CacheEntry::Unresolved { offset }) => {
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut bytes = Vec::new();
@@ -825,7 +865,7 @@ impl<R: Read + Seek> Pdf<R> {
                 let (parsed_ref, mut object, indirect_len) =
                     parse_indirect_object_detailed(&bytes)?;
                 if parsed_ref != object_ref {
-                    return Ok(Object::Null);
+                    return Ok(false);
                 }
                 // flpdf-9hc.27: when the stream's /Length is an indirect
                 // reference, the parser fell back to endstream-scan (it has no
@@ -906,14 +946,14 @@ impl<R: Read + Seek> Pdf<R> {
                     }
                 }
                 let object = self.decrypt_resolved_object(object_ref, object)?;
-                self.cache.set_resolved(object_ref, object.clone());
-                Ok(object)
+                self.cache.set_resolved(object_ref, object);
+                Ok(true)
             }
             Some(CacheEntry::Compressed { stream, index }) => {
                 self.resolve_compressed_entry(object_ref, stream, index)
             }
-            Some(CacheEntry::Missing | CacheEntry::Deleted) | None => Ok(Object::Null),
-            Some(CacheEntry::Reserved) => Ok(Object::Null),
+            Some(CacheEntry::Missing | CacheEntry::Deleted) | None => Ok(false),
+            Some(CacheEntry::Reserved) => Ok(false),
         }
     }
 
@@ -922,7 +962,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         stream: u32,
         index: u32,
-    ) -> Result<Object> {
+    ) -> Result<bool> {
         let stream_ref = ObjectRef::new(stream, 0);
         let stream_object = match self.cache.entry(stream_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => object,
@@ -932,20 +972,20 @@ impl<R: Read + Seek> Pdf<R> {
                 self.reader.read_to_end(&mut bytes)?;
                 let (parsed_ref, object) = parse_indirect_object(&bytes)?;
                 if parsed_ref != stream_ref {
-                    return Ok(Object::Null);
+                    return Ok(false);
                 }
 
                 let object = self.decrypt_resolved_object(stream_ref, object)?;
                 self.cache.set_resolved(stream_ref, object.clone());
                 object
             }
-            Some(CacheEntry::Compressed { .. }) => return Ok(Object::Null),
-            Some(CacheEntry::Missing | CacheEntry::Deleted) | None => return Ok(Object::Null),
-            Some(CacheEntry::Reserved) => return Ok(Object::Null),
+            Some(CacheEntry::Compressed { .. }) => return Ok(false),
+            Some(CacheEntry::Missing | CacheEntry::Deleted) | None => return Ok(false),
+            Some(CacheEntry::Reserved) => return Ok(false),
         };
 
         let Some(stream_object) = stream_object.into_stream() else {
-            return Ok(Object::Null);
+            return Ok(false);
         };
 
         let (parent_ref, parent_index, object) =
@@ -953,8 +993,8 @@ impl<R: Read + Seek> Pdf<R> {
         let object = self.decrypt_resolved_object(object_ref, object)?;
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
-        self.cache.set_resolved(object_ref, object.clone());
-        Ok(object)
+        self.cache.set_resolved(object_ref, object);
+        Ok(true)
     }
 
     fn decrypt_resolved_object(&self, object_ref: ObjectRef, mut object: Object) -> Result<Object> {

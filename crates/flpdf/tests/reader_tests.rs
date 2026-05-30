@@ -85,6 +85,41 @@ fn resolves_indirect_object_on_access() {
 }
 
 #[test]
+fn resolve_borrowed_returns_reference_to_cached_object() {
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    let first_ptr = {
+        let root = pdf.resolve_borrowed(ObjectRef::new(1, 0)).unwrap();
+        let Object::Dictionary(dict) = root else {
+            panic!("expected catalog dictionary")
+        };
+
+        assert_eq!(dict.get_ref("Pages"), Some(ObjectRef::new(2, 0)));
+        root as *const Object
+    };
+
+    assert_eq!(pdf.resolved_count(), 1);
+
+    let second_ptr = {
+        let root = pdf.resolve_borrowed(ObjectRef::new(1, 0)).unwrap();
+        root as *const Object
+    };
+
+    assert_eq!(first_ptr, second_ptr);
+}
+
+#[test]
+fn resolve_borrowed_resolves_missing_reference_to_null() {
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    let object = pdf.resolve_borrowed(ObjectRef::new(999, 0)).unwrap();
+
+    assert_eq!(object, &Object::Null);
+}
+
+#[test]
 fn open_with_options_rejects_r5_by_default() {
     let err = match Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
