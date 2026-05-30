@@ -196,7 +196,7 @@ pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Se
     let mut excluded = BTreeSet::new();
     let refs: Vec<ObjectRef> = pdf.object_refs();
     for r in refs {
-        let obj = pdf.resolve(r)?;
+        let obj = pdf.resolve_borrowed(r)?;
         if let Some(s) = obj.as_stream() {
             if dict_type_is(&s.dict, b"ObjStm") {
                 if let Some(Object::Reference(len_ref)) = s.dict.get("Length") {
@@ -241,8 +241,8 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
             if length_exclusions.contains(&obj_ref) {
                 continue;
             }
-            let obj = pdf.resolve(obj_ref)?;
-            if is_eligible_for_objstm(obj_ref, &obj, ctx) {
+            let obj = pdf.resolve_borrowed(obj_ref)?;
+            if is_eligible_for_objstm(obj_ref, obj, ctx) {
                 eligible.push(obj_ref);
             }
         }
@@ -294,8 +294,8 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         if length_exclusions.contains(&obj_ref) {
             continue;
         }
-        let obj = pdf.resolve(obj_ref)?;
-        if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
+        let obj = pdf.resolve_borrowed(obj_ref)?;
+        if !is_eligible_for_objstm(obj_ref, obj, ctx) {
             continue;
         }
         current_batch.push(obj_ref);
