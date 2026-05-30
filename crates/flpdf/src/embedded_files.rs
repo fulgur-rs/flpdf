@@ -971,6 +971,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_embedded_file_stream_ref_accepts_indirect_ef_dict() {
+        let mut pdf = open_minimal();
+        let fs_ref = FileSpecBuilder::new("indirect-ef.txt", b"payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        let Object::Dictionary(mut fs_dict) = pdf.resolve(fs_ref).expect("resolve filespec") else {
+            panic!("expected filespec dict");
+        };
+        let Object::Dictionary(ef_dict) = fs_dict.get("EF").cloned().expect("/EF") else {
+            panic!("expected /EF dict");
+        };
+        let ef_ref = ObjectRef::new(fs_ref.number + 100, 0);
+        pdf.set_object(ef_ref, Object::Dictionary(ef_dict));
+        fs_dict.insert("EF", Object::Reference(ef_ref));
+        pdf.set_object(fs_ref, Object::Dictionary(fs_dict));
+
+        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+            .expect("resolve stream")
+            .expect("stream ref");
+
+        assert!(pdf.object_refs().contains(&stream_ref));
+    }
+
     // ── Test: removed filespec and stream are no longer live ─────────────────
 
     #[test]

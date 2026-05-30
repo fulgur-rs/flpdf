@@ -249,6 +249,16 @@ fn rotate_inherits_from_parent() {
 }
 
 #[test]
+fn rotate_inherits_indirect_integer_from_parent() {
+    let rotate = (4u32, b"4 0 obj\n270\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/Rotate 4 0 R /MediaBox [0 0 612 792]", "", &[rotate]);
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    assert_eq!(helper.rotate().unwrap(), 270);
+}
+
+#[test]
 fn rotate_defaults_to_zero_when_absent() {
     let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "");
     let mut pdf = open(bytes);
@@ -324,6 +334,26 @@ fn get_annotations_returns_refs() {
     assert_eq!(annots[1], ObjectRef::new(5, 0));
 }
 
+#[test]
+fn get_annotations_resolves_indirect_array() {
+    let annot4 = (
+        4u32,
+        b"4 0 obj\n<< /Type /Annot /Subtype /Text >>\nendobj\n".to_vec(),
+    );
+    let annot_array = (5u32, b"5 0 obj\n[4 0 R]\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Annots 5 0 R",
+        &[annot4, annot_array],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let annots = helper.get_annotations().unwrap();
+
+    assert_eq!(annots, vec![ObjectRef::new(4, 0)]);
+}
+
 // ---------------------------------------------------------------------------
 // media_box() — inheritable
 // ---------------------------------------------------------------------------
@@ -347,6 +377,18 @@ fn media_box_inherited_from_parent() {
     let mb = helper.media_box().unwrap();
     let mb = mb.expect("expected inherited /MediaBox");
     assert_eq!(mb, PageBox::new(0.0, 0.0, 595.0, 842.0));
+}
+
+#[test]
+fn media_box_inherits_indirect_array_from_parent() {
+    let rect = (4u32, b"4 0 obj\n[0 0 400 500]\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox 4 0 R", "", &[rect]);
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let mb = helper.media_box().unwrap().expect("expected /MediaBox");
+
+    assert_eq!(mb, PageBox::new(0.0, 0.0, 400.0, 500.0));
 }
 
 #[test]
@@ -405,6 +447,18 @@ fn bleed_box_explicit_on_leaf() {
     let bb = helper.bleed_box().unwrap().expect("expected /BleedBox");
     assert_eq!(bb.llx, 5.0);
     assert_eq!(bb.lly, 5.0);
+}
+
+#[test]
+fn bleed_box_resolves_indirect_leaf_array() {
+    let rect = (4u32, b"4 0 obj\n[5 6 607 787]\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 612 792]", "/BleedBox 4 0 R", &[rect]);
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let bb = helper.bleed_box().unwrap().expect("expected /BleedBox");
+
+    assert_eq!(bb, PageBox::new(5.0, 6.0, 607.0, 787.0));
 }
 
 #[test]

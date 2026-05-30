@@ -121,6 +121,32 @@ fn annotation_rect_reals() {
 }
 
 #[test]
+fn annotation_rect_resolves_indirect_array() {
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>".to_vec(),
+        ),
+        (4, b"<< /Type /Annot /Subtype /Text /Rect 5 0 R >>".to_vec()),
+        (5, b"[ 10 20 200 50 ]".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+
+    let rect = annot.rect().expect("rect()").expect("should have rect");
+
+    assert_eq!(rect.llx, 10.0);
+    assert_eq!(rect.lly, 20.0);
+    assert_eq!(rect.urx, 200.0);
+    assert_eq!(rect.ury, 50.0);
+}
+
+#[test]
 fn annotation_rect_absent_returns_none() {
     let bytes = build_annotation_pdf("/Subtype /Text");
     let mut pdf = open(bytes);
