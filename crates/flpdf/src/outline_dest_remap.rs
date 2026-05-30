@@ -822,7 +822,7 @@ fn resolve_ref_chain<R: Read + Seek>(
         match cur {
             Object::Reference(r) => {
                 last_ref = Some(r);
-                cur = pdf.resolve_borrowed(r)?.clone();
+                cur = pdf.resolve(r)?;
             }
             _ => break,
         }
@@ -951,7 +951,7 @@ fn remap_dest_value_depth<R: Read + Seek>(
         // Indirect: resolve, recurse, and if the referenced object changed,
         // rewrite it in place. The caller keeps pointing at the same ref.
         Object::Reference(dr) => {
-            let concrete = pdf.resolve_borrowed(*dr)?.clone();
+            let concrete = pdf.resolve(*dr)?;
             if let Some(updated) = remap_dest_value_depth(pdf, &concrete, surviving, depth - 1)? {
                 pdf.set_object(*dr, updated);
             }

@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Inventory And Baseline
+## Task 1: Inventory And Baseline
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-05-30-resolve-borrowed-call-sites.md`

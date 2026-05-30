@@ -154,7 +154,7 @@ fn compute_closure<R: Read + Seek>(
         }
         order.push(current);
 
-        let obj = pdf.resolve_borrowed(current)?.clone();
+        let obj = pdf.resolve(current)?;
 
         // Determine whether this is a Pages node (intermediate page-tree node)
         // or a Page leaf node.
@@ -1078,7 +1078,7 @@ impl LinearizationPlan {
                     continue;
                 }
                 let obj = pdf.resolve_borrowed(obj_ref)?;
-                if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
+                if !is_eligible_for_objstm(obj_ref, obj, ctx) {
                     continue;
                 }
                 if part3_set.contains(&obj_ref) {
@@ -1142,7 +1142,7 @@ impl LinearizationPlan {
                 continue;
             }
             let obj = pdf.resolve_borrowed(obj_ref)?;
-            if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
+            if !is_eligible_for_objstm(obj_ref, obj, ctx) {
                 continue;
             }
             current_batch.push(obj_ref);
@@ -2579,7 +2579,7 @@ mod tests {
         for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
             let obj = pdf.resolve_borrowed(*r).unwrap();
             assert!(
-                is_eligible_for_objstm(*r, &obj, &ctx),
+                is_eligible_for_objstm(*r, obj, &ctx),
                 "batched object {r} must be eligible for ObjStm"
             );
         }

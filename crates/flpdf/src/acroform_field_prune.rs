@@ -728,7 +728,7 @@ mod tests {
         // Pre-condition: strip /P from FieldA (7) and B1 (9) to confirm the
         // update is driven by our code, not just a pre-existing correct value.
         for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
-            let Object::Dictionary(mut d) = pdf.resolve_borrowed(r).unwrap().clone() else {
+            let Object::Dictionary(mut d) = pdf.resolve(r).unwrap() else {
                 panic!("expected dict for {r}");
             };
             d.remove("P");

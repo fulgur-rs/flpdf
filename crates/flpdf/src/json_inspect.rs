@@ -924,10 +924,7 @@ fn walk_pagelabels<R: Read + Seek>(
             if !seen.insert(kid_ref) {
                 continue; // cycle — skip
             }
-            let child = pdf
-                .resolve_borrowed(kid_ref)
-                .map_err(ConvertError::from)?
-                .clone();
+            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
             walk_pagelabels(pdf, child, entries, seen, depth + 1, max_depth)?;
         }
     }

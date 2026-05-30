@@ -243,7 +243,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         let inherited_cropbox = resolve_inherited_raw(pdf, src, "CropBox", max_depth)?;
 
         // Fetch the leaf dictionary.
-        let Object::Dictionary(mut leaf) = pdf.resolve_borrowed(src)?.clone() else {
+        let Object::Dictionary(mut leaf) = pdf.resolve(src)? else {
             return Err(Error::Unsupported(format!(
                 "selected object {src} is not a dictionary (expected /Page)"
             )));
