@@ -954,11 +954,7 @@ mod tests {
         let fs_ref = FileSpecBuilder::new("trans.txt", b"payload")
             .build(&mut pdf)
             .expect("build filespec");
-        let Object::Dictionary(mut fs_dict) = pdf
-            .resolve_borrowed(fs_ref)
-            .expect("resolve filespec")
-            .clone()
-        else {
+        let Object::Dictionary(mut fs_dict) = pdf.resolve(fs_ref).expect("resolve filespec") else {
             panic!("expected filespec dict");
         };
         fs_dict.insert("CI", Object::Reference(sidecar_ref));

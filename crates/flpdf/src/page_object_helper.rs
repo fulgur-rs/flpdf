@@ -637,7 +637,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                         match resolved {
                             Object::Null => {}
                             Object::Array(arr) => {
-                                return parse_rect_array(&arr, key).map(Some);
+                                return parse_rect_array(arr, key).map(Some);
                             }
                             _ => {
                                 return Err(Error::Unsupported(format!(
@@ -694,7 +694,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 let resolved = self.pdf.resolve_borrowed(r)?;
                 match resolved {
                     Object::Null => Ok(None),
-                    Object::Array(arr) => parse_rect_array(&arr, key).map(Some),
+                    Object::Array(arr) => parse_rect_array(arr, key).map(Some),
                     _ => Err(Error::Unsupported(format!(
                         "/{} reference {r} on page {} does not resolve to an array",
                         String::from_utf8_lossy(key),

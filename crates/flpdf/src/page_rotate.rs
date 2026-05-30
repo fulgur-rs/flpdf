@@ -237,8 +237,8 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
         // 3. Re-resolve the page dictionary (it may have changed if there are
         //    multiple pages sharing a parent — re-resolution is safe because
         //    Pdf::resolve goes through the cache).
-        let page_obj = pdf.resolve_borrowed(page_ref)?;
-        let Object::Dictionary(mut page_dict) = page_obj.clone() else {
+        let page_obj = pdf.resolve(page_ref)?;
+        let Object::Dictionary(mut page_dict) = page_obj else {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"
             )));
