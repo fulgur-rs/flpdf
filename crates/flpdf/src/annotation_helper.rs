@@ -111,8 +111,8 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
 
     /// Resolve the annotation dictionary.
     fn resolve_dict(&mut self) -> Result<Dictionary> {
-        match self.pdf.resolve(self.annot_ref)? {
-            Object::Dictionary(d) => Ok(d),
+        match self.pdf.resolve_borrowed(self.annot_ref)? {
+            Object::Dictionary(d) => Ok(d.clone()),
             _ => Err(Error::Unsupported(format!(
                 "annotation object {} is not a dictionary",
                 self.annot_ref
@@ -488,8 +488,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 return Ok(None); // cycle detected
             }
 
-            let node_obj = self.pdf.resolve(current)?;
-            let Some(dict) = node_obj.into_dict() else {
+            let node_obj = self.pdf.resolve_borrowed(current)?;
+            let Some(dict) = node_obj.as_dict() else {
                 return Err(Error::Unsupported(format!(
                     "field tree node {current} is not a dictionary"
                 )));
@@ -535,8 +535,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 return Ok(None);
             }
 
-            let node_obj = self.pdf.resolve(current)?;
-            let Some(dict) = node_obj.into_dict() else {
+            let node_obj = self.pdf.resolve_borrowed(current)?;
+            let Some(dict) = node_obj.as_dict() else {
                 return Err(Error::Unsupported(format!(
                     "field tree node {current} is not a dictionary"
                 )));
@@ -580,8 +580,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 return Ok(None);
             }
 
-            let node_obj = self.pdf.resolve(current)?;
-            let Some(dict) = node_obj.into_dict() else {
+            let node_obj = self.pdf.resolve_borrowed(current)?;
+            let Some(dict) = node_obj.as_dict() else {
                 return Err(Error::Unsupported(format!(
                     "field tree node {current} is not a dictionary"
                 )));
@@ -619,8 +619,8 @@ fn resolve_to_array<R: Read + Seek>(
 ) -> Result<Vec<Object>> {
     match val {
         Object::Array(arr) => Ok(arr),
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => Ok(arr),
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Array(arr) => Ok(arr.clone()),
             _ => Err(Error::Unsupported(format!(
                 "/{key} reference {r} on object {origin} does not resolve to an array"
             ))),
@@ -643,8 +643,8 @@ fn resolve_optional_dict<R: Read + Seek>(
     match val {
         None | Some(Object::Null) => Ok(None),
         Some(Object::Dictionary(d)) => Ok(Some(d)),
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => Ok(Some(d)),
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+            Object::Dictionary(d) => Ok(Some(d.clone())),
             Object::Null => Ok(None),
             _ => Err(Error::Unsupported(format!(
                 "/{key} reference {r} on object {origin} does not resolve to a dictionary"

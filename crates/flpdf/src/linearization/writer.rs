@@ -263,7 +263,7 @@ fn build_objstm_container_object<R: Read + Seek>(
 ) -> Result<Object> {
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
-        let object = pdf.resolve(orig)?;
+        let object = pdf.resolve_borrowed(orig)?;
         let renumbered = renumber_object(&object, renumber)?;
         resolved.push((new_ref, renumbered));
     }
@@ -1029,7 +1029,7 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve(*original_ref)?;
+        let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(&object, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
@@ -1052,7 +1052,7 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve(*original_ref)?;
+        let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(&object, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
@@ -1086,7 +1086,7 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve(*original_ref)?;
+        let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(&object, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);

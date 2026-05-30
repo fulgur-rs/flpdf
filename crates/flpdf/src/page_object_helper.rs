@@ -186,7 +186,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// dictionary) cannot be misread as a page and return plausible but
     /// incorrect inherited/default metadata.
     fn ensure_leaf_page(&mut self) -> Result<()> {
-        let obj = self.pdf.resolve(self.page_ref)?;
+        let obj = self.pdf.resolve_borrowed(self.page_ref)?;
         match obj {
             Object::Dictionary(ref d) if matches!(d.get("Type"), Some(Object::Name(n)) if n == b"Page") => {
                 Ok(())
@@ -362,7 +362,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```
     pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
         self.ensure_leaf_page()?;
-        let page_obj = self.pdf.resolve(self.page_ref)?;
+        let page_obj = self.pdf.resolve_borrowed(self.page_ref)?;
         let Object::Dictionary(page_dict) = page_obj else {
             return Err(Error::Unsupported(format!(
                 "object {} is not a dictionary, cannot read /Annots",
@@ -380,9 +380,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let annots_array = match annots_val {
             Object::Array(arr) => arr,
             Object::Reference(r) => {
-                let resolved = self.pdf.resolve(r)?;
+                let resolved = self.pdf.resolve_borrowed(r)?;
                 match resolved {
-                    Object::Array(arr) => arr,
+                    Object::Array(arr) => arr.clone(),
                     _ => {
                         return Err(Error::Unsupported(format!(
                             "/Annots reference {r} on page {} does not resolve to an array",
@@ -618,19 +618,22 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 return Ok(None);
             }
 
-            let node_obj = self.pdf.resolve(current)?;
+            let node_obj = self.pdf.resolve_borrowed(current)?;
             let Object::Dictionary(dict) = node_obj else {
                 return Ok(None);
             };
 
-            if let Some(val) = dict.get(key).cloned() {
+            let val = dict.get(key).cloned();
+            let parent_val = dict.get("Parent").cloned();
+
+            if let Some(val) = val {
                 match val {
                     Object::Null => {}
                     Object::Array(arr) => {
                         return parse_rect_array(&arr, key).map(Some);
                     }
                     Object::Reference(r) => {
-                        let resolved = self.pdf.resolve(r)?;
+                        let resolved = self.pdf.resolve_borrowed(r)?;
                         match resolved {
                             Object::Null => {}
                             Object::Array(arr) => {
@@ -654,7 +657,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             }
 
             // Not found here — climb to /Parent.
-            let parent_val = match dict.get("Parent").cloned() {
+            let parent_val = match parent_val {
                 Some(Object::Null) | None => return Ok(None),
                 Some(v) => v,
             };
@@ -674,7 +677,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Used for `/BleedBox`, `/TrimBox`, and `/ArtBox` which are defined only
     /// on the leaf and default to `/CropBox` per ISO 32000-1 §14.11.2.
     fn leaf_box(&mut self, key: &[u8]) -> Result<Option<PageBox>> {
-        let page_obj = self.pdf.resolve(self.page_ref)?;
+        let page_obj = self.pdf.resolve_borrowed(self.page_ref)?;
         let Object::Dictionary(dict) = page_obj else {
             return Ok(None);
         };
@@ -688,7 +691,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         match val {
             Object::Array(arr) => parse_rect_array(&arr, key).map(Some),
             Object::Reference(r) => {
-                let resolved = self.pdf.resolve(r)?;
+                let resolved = self.pdf.resolve_borrowed(r)?;
                 match resolved {
                     Object::Null => Ok(None),
                     Object::Array(arr) => parse_rect_array(&arr, key).map(Some),

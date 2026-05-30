@@ -116,8 +116,8 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             Some(Object::Dictionary(d)) => Some(d.clone()),
             Some(Object::Reference(r)) => {
                 let r = *r;
-                match pdf.resolve(r)? {
-                    Object::Dictionary(d) => Some(d),
+                match pdf.resolve_borrowed(r)? {
+                    Object::Dictionary(d) => Some(d.clone()),
                     _ => None,
                 }
             }
@@ -265,8 +265,8 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Resolve the `/Filespec` dictionary, returning an error when the
     /// object does not exist or is not a dictionary.
     fn resolve_dict(&mut self) -> Result<Dictionary> {
-        match self.pdf.resolve(self.filespec_ref)? {
-            Object::Dictionary(d) => Ok(d),
+        match self.pdf.resolve_borrowed(self.filespec_ref)? {
+            Object::Dictionary(d) => Ok(d.clone()),
             _ => Err(Error::Unsupported(format!(
                 "expected /Filespec dictionary at {}, got a non-dictionary object",
                 self.filespec_ref
@@ -378,8 +378,8 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             Some(Object::Dictionary(d)) => d.clone(),
             Some(Object::Reference(r)) => {
                 let r = *r;
-                match self.pdf.resolve(r)? {
-                    Object::Dictionary(d) => d,
+                match self.pdf.resolve_borrowed(r)? {
+                    Object::Dictionary(d) => d.clone(),
                     _ => return Ok(None),
                 }
             }
@@ -396,8 +396,8 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             .collect();
 
         for ef_ref in candidates {
-            if let Object::Stream(stream) = self.pdf.resolve(ef_ref)? {
-                return EmbeddedFileStream::new(stream, self.pdf).map(Some);
+            if let Object::Stream(stream) = self.pdf.resolve_borrowed(ef_ref)? {
+                return EmbeddedFileStream::new(stream.clone(), self.pdf).map(Some);
             }
         }
 
@@ -1018,7 +1018,7 @@ fn sanitize_imported_object<R: Read + Seek>(
                 // Cycle / repeated reference — cannot safely inline again.
                 return Ok(false);
             }
-            let resolved = match source.resolve(r) {
+            let resolved = match source.resolve_borrowed(r) {
                 Ok(o) => o,
                 Err(_) => {
                     visited.remove(&r);
@@ -1028,7 +1028,8 @@ fn sanitize_imported_object<R: Read + Seek>(
             let keep = match resolved {
                 // Non-inlineable: a stream or a chained reference.
                 Object::Stream(_) | Object::Reference(_) => false,
-                mut inner => {
+                inner => {
+                    let mut inner = inner.clone();
                     let ok = sanitize_imported_object(
                         source,
                         &mut inner,
@@ -1162,8 +1163,8 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
     for (key, value) in entries {
         // ── Step 1: resolve filespec dictionary ───────────────────────────────
         let fs_dict: Dictionary = match value {
-            Object::Reference(r) => match source.resolve(r) {
-                Ok(Object::Dictionary(d)) => d,
+            Object::Reference(r) => match source.resolve_borrowed(r) {
+                Ok(Object::Dictionary(d)) => d.clone(),
                 _ => continue, // skip: cannot resolve filespec
             },
             Object::Dictionary(d) => d,
@@ -1175,8 +1176,8 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
             Some(Object::Dictionary(d)) => d.clone(),
             Some(Object::Reference(r)) => {
                 let r = *r;
-                match source.resolve(r) {
-                    Ok(Object::Dictionary(d)) => d,
+                match source.resolve_borrowed(r) {
+                    Ok(Object::Dictionary(d)) => d.clone(),
                     _ => continue, // skip: cannot resolve /EF
                 }
             }
@@ -1191,8 +1192,8 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
             for k in &["UF", "F", "Unix", "Mac", "DOS"] {
                 if let Some(Object::Reference(r)) = ef_dict.get(k) {
                     let r = *r;
-                    if let Ok(Object::Stream(s)) = source.resolve(r) {
-                        found = Some(s);
+                    if let Ok(Object::Stream(s)) = source.resolve_borrowed(r) {
+                        found = Some(s.clone());
                         break;
                     }
                 }
@@ -1350,8 +1351,11 @@ mod tests {
         pdf: &mut Pdf<Cursor<Vec<u8>>>,
         fs_ref: ObjectRef,
     ) -> crate::object::Stream {
-        let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
-        let Some(fs_dict) = fs_obj.into_dict() else {
+        let Some(fs_dict) = pdf
+            .resolve_borrowed(fs_ref)
+            .expect("resolve filespec")
+            .as_dict()
+        else {
             panic!("expected dictionary");
         };
         let ef_sub = match fs_dict.get("EF") {
@@ -1362,8 +1366,8 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             _ => panic!("missing /EF /F ref"),
         };
-        match pdf.resolve(stream_ref).expect("resolve stream") {
-            Object::Stream(s) => s,
+        match pdf.resolve_borrowed(stream_ref).expect("resolve stream") {
+            Object::Stream(s) => s.clone(),
             _ => panic!("expected stream"),
         }
     }
@@ -1490,8 +1494,11 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
 
-        let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
-        let Some(fs_dict) = fs_obj.into_dict() else {
+        let Some(fs_dict) = pdf
+            .resolve_borrowed(fs_ref)
+            .expect("resolve filespec")
+            .as_dict()
+        else {
             panic!("expected dictionary");
         };
         let f = match fs_dict.get("F") {
@@ -1516,8 +1523,11 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
 
-        let fs_obj = pdf.resolve(fs_ref).expect("resolve filespec");
-        let Some(fs_dict) = fs_obj.into_dict() else {
+        let Some(fs_dict) = pdf
+            .resolve_borrowed(fs_ref)
+            .expect("resolve filespec")
+            .as_dict()
+        else {
             panic!("expected dictionary");
         };
         let f = match fs_dict.get("F") {
@@ -1666,8 +1676,7 @@ mod tests {
 
         let fs_ref = add_attachment_from_path(&mut pdf, b"report.pdf", &file_path).expect("attach");
 
-        let fs_obj = pdf.resolve(fs_ref).expect("resolve");
-        let Some(fs_dict) = fs_obj.into_dict() else {
+        let Some(fs_dict) = pdf.resolve_borrowed(fs_ref).expect("resolve").as_dict() else {
             panic!("expected dict");
         };
         let f = match fs_dict.get("F") {
@@ -1710,8 +1719,7 @@ mod tests {
         let fs_ref = add_attachment_from_path(&mut pdf, "レポート.pdf".as_bytes(), &file_path)
             .expect("attach non-ASCII basename");
 
-        let fs_obj = pdf.resolve(fs_ref).expect("resolve");
-        let Some(fs_dict) = fs_obj.into_dict() else {
+        let Some(fs_dict) = pdf.resolve_borrowed(fs_ref).expect("resolve").as_dict() else {
             panic!("expected dict");
         };
         let f = match fs_dict.get("F") {
@@ -2155,7 +2163,9 @@ mod tests {
 
         // The target filespec dict must hold no foreign refs except the /EF
         // entries (which point at the freshly-allocated target stream).
-        let Object::Dictionary(tgt_fs) = target.resolve(tgt_fs_ref).expect("resolve tgt fs") else {
+        let Object::Dictionary(tgt_fs) =
+            target.resolve_borrowed(tgt_fs_ref).expect("resolve tgt fs")
+        else {
             panic!("filespec not a dict");
         };
         for (k, v) in tgt_fs.iter() {

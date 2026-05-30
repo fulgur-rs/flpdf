@@ -522,8 +522,8 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
 
     for oref in all_refs {
         let key = format!("obj:{} {} R", oref.number, oref.generation);
-        let obj = pdf.resolve(oref)?;
-        let json_val = match &obj {
+        let obj = pdf.resolve_borrowed(oref)?;
+        let json_val = match obj {
             Object::Stream(stream) => {
                 // Stream: emit according to stream_mode.
                 let dict_json = dict_to_json(&stream.dict)?;
@@ -680,16 +680,14 @@ fn collect_content_refs<R: Read + Seek>(
             // Resolve to see whether the indirect object is a Stream (in
             // which case this ref itself is the content) or an Array of
             // Stream refs (in which case we recurse to flatten).
-            let resolved = pdf.resolve(*r).map_err(ConvertError::from)?;
-            match resolved {
-                Object::Stream(_) => Ok(vec![ref_string(r)]),
-                Object::Array(_) => {
-                    // Recurse so a nested indirect array is also unwrapped.
-                    collect_content_refs(pdf, &resolved)
-                }
+            let resolved_array = match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
+                Object::Stream(_) => return Ok(vec![ref_string(r)]),
+                Object::Array(arr) => Object::Array(arr.clone()),
                 // /Contents pointing at anything else (Null, missing) → empty.
-                _ => Ok(vec![]),
-            }
+                _ => return Ok(vec![]),
+            };
+            // Recurse so a nested indirect array is also unwrapped.
+            collect_content_refs(pdf, &resolved_array)
         }
         Object::Array(elems) => {
             let mut refs = Vec::with_capacity(elems.len());
@@ -727,9 +725,9 @@ fn collect_image_refs<R: Read + Seek>(
     let xobject_dict = match resources.get("XObject") {
         Some(Object::Dictionary(d)) => d.clone(),
         Some(Object::Reference(r)) => {
-            let resolved = pdf.resolve(*r).map_err(ConvertError::from)?;
+            let resolved = pdf.resolve_borrowed(*r).map_err(ConvertError::from)?;
             match resolved {
-                Object::Dictionary(d) => d,
+                Object::Dictionary(d) => d.clone(),
                 _ => return Ok(vec![]),
             }
         }
@@ -745,7 +743,7 @@ fn collect_image_refs<R: Read + Seek>(
             // Direct inline stream — no ref string available, skip.
             _ => continue,
         };
-        let resolved = pdf.resolve(xobj_ref).map_err(ConvertError::from)?;
+        let resolved = pdf.resolve_borrowed(xobj_ref).map_err(ConvertError::from)?;
         if let Some(stream) = resolved.as_stream() {
             if let Some(Object::Name(subtype)) = stream.dict.get("Subtype") {
                 if subtype.as_slice() == b"Image" {
@@ -781,8 +779,8 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue
         let object_str = format!("{} {} R", page_ref.number, page_ref.generation);
 
         // Resolve the page dict to extract /Contents.
-        let page_obj = pdf.resolve(page_ref).map_err(ConvertError::from)?;
-        let contents_obj = match &page_obj {
+        let page_obj = pdf.resolve_borrowed(page_ref).map_err(ConvertError::from)?;
+        let contents_obj = match page_obj {
             Object::Dictionary(d) => d.get("Contents").cloned(),
             _ => None,
         };
@@ -902,10 +900,12 @@ fn walk_pagelabels<R: Read + Seek>(
             // Label value may be a direct Dictionary or an indirect Reference.
             let label_dict = match label_obj {
                 Object::Dictionary(d) => d.clone(),
-                Object::Reference(r) => match pdf.resolve(*r).map_err(ConvertError::from)? {
-                    Object::Dictionary(d) => d,
-                    _ => continue,
-                },
+                Object::Reference(r) => {
+                    match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
+                        Object::Dictionary(d) => d.clone(),
+                        _ => continue,
+                    }
+                }
                 _ => continue,
             };
             entries.push((idx, label_dict));
@@ -924,7 +924,10 @@ fn walk_pagelabels<R: Read + Seek>(
             if !seen.insert(kid_ref) {
                 continue; // cycle — skip
             }
-            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
+            let child = pdf
+                .resolve_borrowed(kid_ref)
+                .map_err(ConvertError::from)?
+                .clone();
             walk_pagelabels(pdf, child, entries, seen, depth + 1, max_depth)?;
         }
     }
@@ -952,7 +955,9 @@ pub fn build_pagelabels_section<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(JsonValue::Array(vec![])),
     };
-    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .map_err(ConvertError::from)?;
     let catalog_dict = match catalog {
         Object::Dictionary(d) => d,
         _ => return Ok(JsonValue::Array(vec![])),
@@ -966,7 +971,7 @@ pub fn build_pagelabels_section<R: Read + Seek>(
 
     // Resolve indirect reference if needed.
     let root_node = match pagelabels_val {
-        Object::Reference(r) => pdf.resolve(r).map_err(ConvertError::from)?,
+        Object::Reference(r) => pdf.resolve_borrowed(r).map_err(ConvertError::from)?.clone(),
         other => other,
     };
 
@@ -1015,9 +1020,9 @@ fn outline_entry_to_json<R: Read + Seek>(
     depth: usize,
     max_depth: usize,
 ) -> Result<JsonValue, ConvertError> {
-    let item_obj = pdf.resolve(item_ref).map_err(ConvertError::from)?;
+    let item_obj = pdf.resolve_borrowed(item_ref).map_err(ConvertError::from)?;
     let item_dict = match item_obj {
-        Object::Dictionary(d) => d,
+        Object::Dictionary(d) => d.clone(),
         _ => {
             // Not a dictionary — return a minimal entry with empty kids.
             let object_str = format!("{} {} R", item_ref.number, item_ref.generation);
@@ -1126,7 +1131,7 @@ fn collect_outline_chain<R: Read + Seek>(
 
         // Advance to the next sibling — must re-resolve to get /Next
         // (outline_entry_to_json consumed the object).
-        let item_obj = pdf.resolve(item_ref).map_err(ConvertError::from)?;
+        let item_obj = pdf.resolve_borrowed(item_ref).map_err(ConvertError::from)?;
         current = match &item_obj {
             Object::Dictionary(d) => match d.get("Next") {
                 Some(Object::Reference(r)) => Some(*r),
@@ -1161,7 +1166,9 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
         Some(r) => r,
         None => return Ok(JsonValue::Array(vec![])),
     };
-    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .map_err(ConvertError::from)?;
     let catalog_dict = match catalog {
         Object::Dictionary(d) => d,
         _ => return Ok(JsonValue::Array(vec![])),
@@ -1175,8 +1182,8 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
 
     // Resolve indirect reference if needed.
     let outlines_dict = match outlines_val {
-        Object::Reference(r) => match pdf.resolve(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d,
+        Object::Reference(r) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => d.clone(),
             _ => return Ok(JsonValue::Array(vec![])),
         },
         Object::Dictionary(d) => d,
@@ -1224,9 +1231,11 @@ fn walk_acroform_fields<R: Read + Seek>(
         return Ok(()); // cycle guard
     }
 
-    let field_obj = pdf.resolve(field_ref).map_err(ConvertError::from)?;
+    let field_obj = pdf
+        .resolve_borrowed(field_ref)
+        .map_err(ConvertError::from)?;
     let field_dict = match field_obj {
-        Object::Dictionary(d) => d,
+        Object::Dictionary(d) => d.clone(),
         _ => return Ok(()), // non-dictionary field — skip
     };
 
@@ -1312,8 +1321,8 @@ fn walk_acroform_fields<R: Read + Seek>(
     // chain when it lives in its own object.
     let kids = match field_dict.get("Kids").cloned() {
         Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match pdf.resolve(r).map_err(ConvertError::from)? {
-            Object::Array(arr) => arr,
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
+            Object::Array(arr) => arr.clone(),
             _ => vec![],
         },
         _ => vec![],
@@ -1336,8 +1345,8 @@ fn walk_acroform_fields<R: Read + Seek>(
             Object::Reference(r) => *r,
             _ => continue,
         };
-        let kid_obj = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
-        let Object::Dictionary(d) = &kid_obj else {
+        let kid_obj = pdf.resolve_borrowed(kid_ref).map_err(ConvertError::from)?;
+        let Object::Dictionary(d) = kid_obj else {
             continue;
         };
         let is_widget_subtype = matches!(
@@ -1432,7 +1441,7 @@ fn inherited_field_value<R: Read + Seek>(
         if !seen.insert(pr) {
             break;
         }
-        match pdf.resolve(pr).map_err(ConvertError::from)? {
+        match pdf.resolve_borrowed(pr).map_err(ConvertError::from)? {
             Object::Dictionary(pd) => {
                 if let Some(v) = pd.get(key).cloned() {
                     return Ok(Some(v));
@@ -1471,7 +1480,9 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
             ]))
         }
     };
-    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
+    let catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .map_err(ConvertError::from)?;
     let catalog_dict = match catalog {
         Object::Dictionary(d) => d,
         _ => {
@@ -1497,8 +1508,8 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
 
     // Resolve indirect reference if needed.
     let acroform_dict = match acroform_val {
-        Object::Reference(r) => match pdf.resolve(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d,
+        Object::Reference(r) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => d.clone(),
             _ => {
                 return Ok(JsonValue::Object(vec![
                     ("fields".to_string(), JsonValue::Array(vec![])),
@@ -1529,8 +1540,8 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
     // don't surface as an empty list.
     let fields_array = match acroform_dict.get("Fields").cloned() {
         Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match pdf.resolve(r).map_err(ConvertError::from)? {
-            Object::Array(arr) => arr,
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
+            Object::Array(arr) => arr.clone(),
             _ => vec![],
         },
         _ => vec![],
@@ -1768,7 +1779,10 @@ fn walk_embedded_files_name_tree<R: Read + Seek>(
             if !seen.insert(kid_ref) {
                 continue; // cycle guard
             }
-            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
+            let child = pdf
+                .resolve_borrowed(kid_ref)
+                .map_err(ConvertError::from)?
+                .clone();
             walk_embedded_files_name_tree(pdf, child, entries, seen, depth + 1, max_depth)?;
         }
     }
@@ -1786,9 +1800,11 @@ fn filespec_to_json<R: Read + Seek>(
 ) -> Result<JsonValue, ConvertError> {
     let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
 
-    let filespec_obj = pdf.resolve(filespec_ref).map_err(ConvertError::from)?;
+    let filespec_obj = pdf
+        .resolve_borrowed(filespec_ref)
+        .map_err(ConvertError::from)?;
     let filespec_dict = match filespec_obj {
-        Object::Dictionary(d) => d,
+        Object::Dictionary(d) => d.clone(),
         _ => {
             // Malformed filespec — return a minimal entry
             return Ok(JsonValue::Object(vec![
@@ -1861,8 +1877,8 @@ fn filespec_dict_to_json<R: Read + Seek>(
     // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
     let ef_dict = match filespec_dict.get("EF") {
         Some(Object::Dictionary(d)) => Some(d.clone()),
-        Some(Object::Reference(r)) => match pdf.resolve(*r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => Some(d),
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => Some(d.clone()),
             _ => None,
         },
         _ => None,
@@ -1900,14 +1916,16 @@ fn filespec_dict_to_json<R: Read + Seek>(
                 _ => continue,
             };
 
-            let stream_obj = pdf.resolve(stream_ref).map_err(ConvertError::from)?;
-            let stream = match stream_obj {
-                Object::Stream(s) => s,
+            let stream_obj = pdf
+                .resolve_borrowed(stream_ref)
+                .map_err(ConvertError::from)?;
+            let stream_dict = match stream_obj {
+                Object::Stream(s) => s.dict.clone(),
                 _ => continue,
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream.dict.get("Subtype") {
+            let mimetype = match stream_dict.get("Subtype") {
                 Some(Object::Name(bytes)) => {
                     let s = String::from_utf8_lossy(bytes).into_owned();
                     JsonValue::String(s)
@@ -1916,12 +1934,14 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             // /Params sub-dict
-            let params_dict = match stream.dict.get("Params") {
+            let params_dict = match stream_dict.get("Params") {
                 Some(Object::Dictionary(d)) => Some(d.clone()),
-                Some(Object::Reference(r)) => match pdf.resolve(*r).map_err(ConvertError::from)? {
-                    Object::Dictionary(d) => Some(d),
-                    _ => None,
-                },
+                Some(Object::Reference(r)) => {
+                    match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
+                        Object::Dictionary(d) => Some(d.clone()),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
 
@@ -2003,17 +2023,19 @@ pub fn build_attachments_section<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(JsonValue::Object(vec![])),
     };
-    let catalog = pdf.resolve(catalog_ref).map_err(ConvertError::from)?;
-    let catalog_dict = match catalog {
-        Object::Dictionary(d) => d,
+    let catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .map_err(ConvertError::from)?;
+    let names_val = match catalog {
+        Object::Dictionary(d) => d.get("Names").cloned(),
         _ => return Ok(JsonValue::Object(vec![])),
     };
 
     // /Names dictionary from catalog
-    let names_dict = match catalog_dict.get("Names") {
+    let names_dict = match names_val {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => match pdf.resolve(*r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d,
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => d.clone(),
             _ => return Ok(JsonValue::Object(vec![])),
         },
         _ => return Ok(JsonValue::Object(vec![])),
@@ -2022,7 +2044,10 @@ pub fn build_attachments_section<R: Read + Seek>(
     // /EmbeddedFiles name tree root
     let ef_root = match names_dict.get("EmbeddedFiles") {
         Some(Object::Dictionary(d)) => Object::Dictionary(d.clone()),
-        Some(Object::Reference(r)) => pdf.resolve(*r).map_err(ConvertError::from)?,
+        Some(Object::Reference(r)) => pdf
+            .resolve_borrowed(*r)
+            .map_err(ConvertError::from)?
+            .clone(),
         _ => return Ok(JsonValue::Object(vec![])),
     };
 
@@ -2181,8 +2206,8 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
     let encrypt_dict: Option<Dictionary> = match pdf.trailer().get("Encrypt").cloned() {
         None => None,
         Some(Object::Dictionary(d)) => Some(d),
-        Some(Object::Reference(r)) => match pdf.resolve(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => Some(d),
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
+            Object::Dictionary(d) => Some(d.clone()),
             _ => None,
         },
         _ => None,
@@ -3644,8 +3669,8 @@ mod tests {
     // Helper: build a synthetic catalog with a /PageLabels entry.
     fn patch_pagelabels(pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>, pagelabels: Object) {
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d,
+        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d.clone(),
             _ => panic!("catalog is not a Dictionary"),
         };
         catalog.insert("PageLabels", pagelabels);
@@ -4004,8 +4029,8 @@ mod tests {
     ) {
         // Wire catalog → outline root.
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d,
+        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d.clone(),
             _ => panic!("catalog is not a Dictionary"),
         };
         catalog.insert("Outlines", Object::Reference(outline_root_ref));
@@ -4443,8 +4468,8 @@ mod tests {
         acroform: Dictionary,
     ) {
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d,
+        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d.clone(),
             _ => panic!("catalog is not a Dictionary"),
         };
         catalog.insert("AcroForm", Object::Reference(acroform_ref));
@@ -5301,8 +5326,8 @@ mod tests {
 
         // Patch the catalog
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d,
+        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
+            Object::Dictionary(d) => d.clone(),
             _ => panic!("catalog is not a Dictionary"),
         };
         catalog.insert("Names", Object::Reference(names_ref));
@@ -5737,8 +5762,8 @@ mod tests {
         pdf.set_object(names_ref, Object::Dictionary(names_dict));
 
         let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = match pdf.resolve(catalog_ref).unwrap() {
-            Object::Dictionary(d) => d,
+        let mut catalog = match pdf.resolve_borrowed(catalog_ref).unwrap() {
+            Object::Dictionary(d) => d.clone(),
             _ => panic!(),
         };
         catalog.insert("Names", Object::Reference(names_ref));
@@ -6448,8 +6473,8 @@ mod tests {
 
         // First, capture the raw bytes of obj:7 to verify round-trip.
         let oref = crate::ObjectRef::new(7, 0);
-        let obj7_raw = pdf.resolve(oref).expect("resolve obj:7");
-        let raw_bytes = match &obj7_raw {
+        let obj7_raw = pdf.resolve_borrowed(oref).expect("resolve obj:7");
+        let raw_bytes = match obj7_raw {
             Object::Stream(s) => s.data.clone(),
             other => panic!("obj:7 is not a Stream: {other:?}"),
         };

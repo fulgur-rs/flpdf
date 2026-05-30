@@ -131,7 +131,7 @@ fn resolve_inherited_raw<R: Read + Seek>(
             return Ok(None);
         }
 
-        let Object::Dictionary(dict) = pdf.resolve(current)? else {
+        let Object::Dictionary(dict) = pdf.resolve_borrowed(current)? else {
             return Ok(None);
         };
 
@@ -212,7 +212,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // Locate the root /Pages object; keep its ObjectRef stable so the
     // catalog's /Pages reference never needs patching.
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref)? else {
+    let Object::Dictionary(catalog) = pdf.resolve_borrowed(catalog_ref)? else {
         return Err(Error::Unsupported(format!(
             "document catalog {catalog_ref} is not a dictionary"
         )));
@@ -243,7 +243,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         let inherited_cropbox = resolve_inherited_raw(pdf, src, "CropBox", max_depth)?;
 
         // Fetch the leaf dictionary.
-        let Object::Dictionary(mut leaf) = pdf.resolve(src)? else {
+        let Object::Dictionary(mut leaf) = pdf.resolve_borrowed(src)?.clone() else {
             return Err(Error::Unsupported(format!(
                 "selected object {src} is not a dictionary (expected /Page)"
             )));
@@ -316,7 +316,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
 
     // Rewrite the root /Pages node: flat /Kids in selection order, /Count =
     // selection length, /Type /Pages. Other root entries are preserved.
-    let Object::Dictionary(mut root_dict) = pdf.resolve(pages_root_ref)? else {
+    let Object::Dictionary(mut root_dict) = pdf.resolve_borrowed(pages_root_ref)?.clone() else {
         return Err(Error::Unsupported(format!(
             "document /Pages root {pages_root_ref} is not a dictionary"
         )));
@@ -413,8 +413,8 @@ mod tests {
     }
 
     fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
-        match pdf.resolve(r).unwrap() {
-            Object::Dictionary(d) => d,
+        match pdf.resolve_borrowed(r).unwrap() {
+            Object::Dictionary(d) => d.clone(),
             other => panic!("{r} is not a dictionary: {other:?}"),
         }
     }

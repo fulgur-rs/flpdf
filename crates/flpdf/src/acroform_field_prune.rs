@@ -125,15 +125,15 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         None => return Ok(()), // No catalog.
     };
 
-    let catalog_obj = pdf.resolve(catalog_ref)?;
-    let Some(catalog) = catalog_obj.into_dict() else {
+    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
+    let Some(catalog) = catalog_obj.as_dict() else {
         return Ok(());
     };
 
     // /AcroForm may be a direct dict or an indirect reference.
     let (acroform_ref, acroform_dict) = match catalog.get("AcroForm").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => (Some(r), d),
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+            Object::Dictionary(d) => (Some(r), d.clone()),
             _ => return Ok(()),
         },
         Some(Object::Dictionary(d)) => (None, d),
@@ -147,8 +147,8 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     };
     let fields_arr: Vec<Object> = match fields_val {
         Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => arr,
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Array(arr) => arr.clone(),
             _ => return Ok(()),
         },
         _ => return Ok(()),
@@ -215,8 +215,8 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     if kept_fields.is_empty() {
         // All fields dropped → remove /AcroForm from catalog entirely,
         // matching qpdf's observed behaviour.
-        let catalog_obj2 = pdf.resolve(catalog_ref)?;
-        if let Some(mut cat) = catalog_obj2.into_dict() {
+        let catalog_obj2 = pdf.resolve_borrowed(catalog_ref)?;
+        if let Some(mut cat) = catalog_obj2.as_dict().cloned() {
             cat.remove("AcroForm");
             pdf.set_object(catalog_ref, Object::Dictionary(cat));
         }
@@ -233,8 +233,8 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
             None => {
                 // /AcroForm was a direct dictionary on the catalog — write it
                 // back into the catalog.
-                let catalog_obj2 = pdf.resolve(catalog_ref)?;
-                if let Some(mut cat) = catalog_obj2.into_dict() {
+                let catalog_obj2 = pdf.resolve_borrowed(catalog_ref)?;
+                if let Some(mut cat) = catalog_obj2.as_dict().cloned() {
                     cat.insert("AcroForm", Object::Dictionary(new_acroform));
                     pdf.set_object(catalog_ref, Object::Dictionary(cat));
                 }
@@ -259,8 +259,8 @@ fn collect_page_widgets<R: Read + Seek>(
     page_ref: ObjectRef,
     widget_to_page: &mut BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
-    let page_obj = pdf.resolve(page_ref)?;
-    let Some(page_dict) = page_obj.into_dict() else {
+    let page_obj = pdf.resolve_borrowed(page_ref)?;
+    let Some(page_dict) = page_obj.as_dict() else {
         return Ok(());
     };
 
@@ -271,8 +271,8 @@ fn collect_page_widgets<R: Read + Seek>(
 
     let annots_arr: Vec<Object> = match annots_val {
         Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => arr,
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Array(arr) => arr.clone(),
             _ => return Ok(()),
         },
         _ => return Ok(()),
@@ -284,8 +284,8 @@ fn collect_page_widgets<R: Read + Seek>(
             _ => continue,
         };
 
-        let annot_obj = pdf.resolve(annot_ref)?;
-        let Some(annot_dict) = annot_obj.into_dict() else {
+        let annot_obj = pdf.resolve_borrowed(annot_ref)?;
+        let Some(annot_dict) = annot_obj.as_dict() else {
             continue;
         };
 
@@ -335,8 +335,8 @@ fn field_has_retained_widget<R: Read + Seek>(
         return Ok(true);
     }
 
-    let field_obj = pdf.resolve(field_ref)?;
-    let Some(field_dict) = field_obj.into_dict() else {
+    let field_obj = pdf.resolve_borrowed(field_ref)?;
+    let Some(field_dict) = field_obj.as_dict() else {
         return Ok(false);
     };
 
@@ -348,8 +348,8 @@ fn field_has_retained_widget<R: Read + Seek>(
 
     let kids_arr: Vec<Object> = match kids_val {
         Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => arr,
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Array(arr) => arr.clone(),
             _ => return Ok(false),
         },
         _ => return Ok(false),
@@ -384,8 +384,8 @@ fn update_widget_page_ref<R: Read + Seek>(
     widget_ref: ObjectRef,
     new_page_ref: ObjectRef,
 ) -> Result<()> {
-    let widget_obj = pdf.resolve(widget_ref)?;
-    if let Some(mut dict) = widget_obj.into_dict() {
+    let widget_obj = pdf.resolve_borrowed(widget_ref)?;
+    if let Some(mut dict) = widget_obj.as_dict().cloned() {
         dict.insert("P", Object::Reference(new_page_ref));
         pdf.set_object(widget_ref, Object::Dictionary(dict));
     }
@@ -416,8 +416,8 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
         return Ok(()); // Cycle guard.
     }
 
-    let field_obj = pdf.resolve(field_ref)?;
-    let Some(field_dict) = field_obj.into_dict() else {
+    let field_obj = pdf.resolve_borrowed(field_ref)?;
+    let Some(field_dict) = field_obj.as_dict() else {
         return Ok(());
     };
 
@@ -436,8 +436,8 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
 
     let kids_arr: Vec<Object> = match kids_val {
         Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => arr,
+        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
+            Object::Array(arr) => arr.clone(),
             _ => return Ok(()),
         },
         _ => return Ok(()),
@@ -450,8 +450,8 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
         };
 
         // Resolve the kid to check if it is a widget dict.
-        let kid_obj = pdf.resolve(kid_ref)?;
-        let Some(kid_dict) = kid_obj.into_dict() else {
+        let kid_obj = pdf.resolve_borrowed(kid_ref)?;
+        let Some(kid_dict) = kid_obj.as_dict() else {
             continue;
         };
 
@@ -463,8 +463,8 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
         if is_widget {
             if !widget_to_page.contains_key(&kid_ref) {
                 // Widget on a dropped page — remove stale /P.
-                let kid_obj2 = pdf.resolve(kid_ref)?;
-                if let Some(mut d) = kid_obj2.into_dict() {
+                let kid_obj2 = pdf.resolve_borrowed(kid_ref)?;
+                if let Some(mut d) = kid_obj2.as_dict().cloned() {
                     d.remove("P");
                     pdf.set_object(kid_ref, Object::Dictionary(d));
                 }
@@ -629,8 +629,8 @@ mod tests {
     }
 
     fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
-        match pdf.resolve(r).unwrap() {
-            Object::Dictionary(d) => d,
+        match pdf.resolve_borrowed(r).unwrap() {
+            Object::Dictionary(d) => d.clone(),
             other => panic!("{r} is not a dictionary: {other:?}"),
         }
     }
@@ -644,8 +644,8 @@ mod tests {
         };
         let acro_dict = match acro_val {
             Object::Dictionary(d) => d,
-            Object::Reference(r) => match pdf.resolve(r).unwrap() {
-                Object::Dictionary(d) => d,
+            Object::Reference(r) => match pdf.resolve_borrowed(r).unwrap() {
+                Object::Dictionary(d) => d.clone(),
                 _ => return vec![],
             },
             _ => return vec![],
@@ -728,7 +728,7 @@ mod tests {
         // Pre-condition: strip /P from FieldA (7) and B1 (9) to confirm the
         // update is driven by our code, not just a pre-existing correct value.
         for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
-            let Object::Dictionary(mut d) = pdf.resolve(r).unwrap() else {
+            let Object::Dictionary(mut d) = pdf.resolve_borrowed(r).unwrap().clone() else {
                 panic!("expected dict for {r}");
             };
             d.remove("P");

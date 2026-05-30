@@ -3237,7 +3237,10 @@ mod tests {
         // Sanity-check the fixture is wired correctly before exercising the
         // helper: each object must resolve to the expected variant.
         assert!(
-            matches!(pdf.resolve_borrowed(plain_dict).unwrap(), Object::Dictionary(_)),
+            matches!(
+                pdf.resolve_borrowed(plain_dict).unwrap(),
+                Object::Dictionary(_)
+            ),
             "obj 3 must resolve as a plain dictionary"
         );
         assert!(
@@ -3245,7 +3248,10 @@ mod tests {
             "obj 4 must resolve as a stream"
         );
         assert!(
-            matches!(pdf.resolve_borrowed(gen1_ref).unwrap(), Object::Dictionary(_)),
+            matches!(
+                pdf.resolve_borrowed(gen1_ref).unwrap(),
+                Object::Dictionary(_)
+            ),
             "obj 5 (gen 1) must resolve as a plain dictionary"
         );
 

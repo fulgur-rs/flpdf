@@ -41,14 +41,14 @@ pub fn outline_items_with_max_depth<R: Read + Seek>(
     let Some(catalog_ref) = pdf.root_ref() else {
         return Ok(Vec::new());
     };
-    let catalog = pdf.resolve(catalog_ref)?;
+    let catalog = pdf.resolve_borrowed(catalog_ref)?;
     let Object::Dictionary(catalog) = catalog else {
         return Ok(Vec::new());
     };
     let Some(outlines_ref) = catalog.get_ref("Outlines") else {
         return Ok(Vec::new());
     };
-    let outline_root = pdf.resolve(outlines_ref)?;
+    let outline_root = pdf.resolve_borrowed(outlines_ref)?;
     let Object::Dictionary(outline_root) = outline_root else {
         return Ok(Vec::new());
     };
@@ -82,22 +82,26 @@ fn walk_outline<R: Read + Seek>(
             break;
         }
 
-        let current_obj = pdf.resolve(current_ref)?;
+        let current_obj = pdf.resolve_borrowed(current_ref)?;
         let Object::Dictionary(dict) = current_obj else {
             break;
         };
 
+        let title = read_outline_title(dict.get("Title"));
+        let first = dict.get_ref("First");
+        let next = dict.get_ref("Next");
+
         items.push(OutlineItem {
             object_ref: current_ref,
             depth,
-            title: read_outline_title(dict.get("Title")),
+            title,
         });
 
-        if let Some(first) = dict.get_ref("First") {
+        if let Some(first) = first {
             walk_outline(pdf, first, depth + 1, visited, items, max_depth)?;
         }
 
-        current = dict.get_ref("Next");
+        current = next;
     }
 
     Ok(())

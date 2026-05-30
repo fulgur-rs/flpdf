@@ -196,13 +196,13 @@ fn collect_reachable<R: Read + Seek>(
         }
 
         // Resolve the object; skip on error (conservative — keeps the object).
-        let obj = match pdf.resolve(current) {
+        let obj = match pdf.resolve_borrowed(current) {
             Ok(o) => o,
             Err(_) => continue,
         };
 
         // Walk all ObjectRefs contained in the resolved object.
-        walk_refs(&obj, &mut queue);
+        walk_refs(obj, &mut queue);
     }
 
     Ok(visited)
@@ -615,7 +615,7 @@ mod tests {
         );
 
         // Name-level: page1's materialized inline /Resources should have F1 but not F2.
-        let page1 = match pdf.resolve(ObjectRef::new(4, 0)).unwrap() {
+        let page1 = match pdf.resolve_borrowed(ObjectRef::new(4, 0)).unwrap() {
             Object::Dictionary(d) => d,
             other => panic!("page1 not a dict: {other:?}"),
         };

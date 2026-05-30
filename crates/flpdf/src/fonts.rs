@@ -31,7 +31,7 @@ pub fn font_entries_with_max_depth<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<BTreeMap<Vec<u8>, Object>> {
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let catalog = pdf.resolve(catalog_ref)?;
+    let catalog = pdf.resolve_borrowed(catalog_ref)?;
     let Object::Dictionary(catalog) = catalog else {
         return Err(Error::Unsupported(format!(
             "document catalog {catalog_ref} is not a dictionary"
@@ -63,7 +63,7 @@ fn walk_font_resources<R: Read + Seek>(
         return Ok(());
     }
 
-    let node_obj = pdf.resolve(node)?;
+    let node_obj = pdf.resolve_borrowed(node)?;
     let Object::Dictionary(dict) = node_obj else {
         return Ok(());
     };
@@ -75,18 +75,20 @@ fn walk_font_resources<R: Read + Seek>(
         .unwrap_or_default();
 
     if node_type.as_slice() == b"Pages" {
-        if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-            for kid in kids {
-                if let Some(reference) = kid.as_ref_id() {
-                    walk_font_resources(pdf, reference, seen, fonts, depth + 1, max_depth)?;
-                }
-            }
+        let kid_refs: Vec<ObjectRef> = dict
+            .get("Kids")
+            .and_then(Object::as_array)
+            .map(|kids| kids.iter().filter_map(Object::as_ref_id).collect())
+            .unwrap_or_default();
+        for reference in kid_refs {
+            walk_font_resources(pdf, reference, seen, fonts, depth + 1, max_depth)?;
         }
         return Ok(());
     }
 
     if node_type.as_slice() == b"Page" {
-        collect_page_fonts(pdf, &dict, fonts)?;
+        let page_dict = dict.clone();
+        collect_page_fonts(pdf, &page_dict, fonts)?;
     }
 
     Ok(())
@@ -102,7 +104,7 @@ fn collect_page_fonts<R: Read + Seek>(
             if let Some(resources) = resources.as_dict() {
                 Some(resources.clone())
             } else if let Some(reference) = resources.as_ref_id() {
-                pdf.resolve(reference)?.into_dict()
+                pdf.resolve_borrowed(reference)?.as_dict().cloned()
             } else {
                 None
             }
@@ -119,7 +121,7 @@ fn collect_page_fonts<R: Read + Seek>(
             if let Some(fonts_dict) = fonts_dict.as_dict() {
                 Some(fonts_dict.clone())
             } else if let Some(reference) = fonts_dict.as_ref_id() {
-                pdf.resolve(reference)?.into_dict()
+                pdf.resolve_borrowed(reference)?.as_dict().cloned()
             } else {
                 None
             }
@@ -134,8 +136,8 @@ fn collect_page_fonts<R: Read + Seek>(
     for (font_name, value) in fonts_dict.iter() {
         match value {
             Object::Reference(font_ref) => {
-                if let Ok(font_obj) = pdf.resolve(*font_ref) {
-                    fonts.insert(font_name.to_vec(), font_obj);
+                if let Ok(font_obj) = pdf.resolve_borrowed(*font_ref) {
+                    fonts.insert(font_name.to_vec(), font_obj.clone());
                 }
             }
             Object::Dictionary(font_dict) => {

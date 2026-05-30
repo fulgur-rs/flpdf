@@ -154,7 +154,7 @@ fn compute_closure<R: Read + Seek>(
         }
         order.push(current);
 
-        let obj = pdf.resolve(current)?;
+        let obj = pdf.resolve_borrowed(current)?.clone();
 
         // Determine whether this is a Pages node (intermediate page-tree node)
         // or a Page leaf node.
@@ -199,8 +199,8 @@ fn compute_closure<R: Read + Seek>(
                             // Resolve the parent. Genuine resolve failures
                             // (I/O or parse errors) propagate via `?` instead
                             // of silently degrading the closure — mirroring
-                            // the main BFS loop's `pdf.resolve(current)?`.
-                            let parent_dict = match pdf.resolve(parent_ref)? {
+                            // the main BFS loop's `pdf.resolve_borrowed(current)?`.
+                            let parent_dict = match pdf.resolve_borrowed(parent_ref)? {
                                 Object::Dictionary(dict) => dict,
                                 // A /Parent that indirects through a plain
                                 // reference object: follow the chain so the
@@ -208,7 +208,7 @@ fn compute_closure<R: Read + Seek>(
                                 // the main BFS loop does via collect_direct_refs.
                                 // seen_parents bounds any reference cycle.
                                 Object::Reference(r) => {
-                                    to_visit.push(r);
+                                    to_visit.push(*r);
                                     continue;
                                 }
                                 // Any other non-dictionary parent (a free or
@@ -390,7 +390,7 @@ impl LinearizationPlan {
         let root_ref = pdf.root_ref();
         let info_ref = pdf.trailer().get_ref("Info");
         let pages_tree_ref = root_ref
-            .and_then(|r| pdf.resolve(r).ok())
+            .and_then(|r| pdf.resolve_borrowed(r).ok())
             .and_then(|obj| match obj {
                 Object::Dictionary(d) => d.get_ref("Pages"),
                 _ => None,
@@ -1077,7 +1077,7 @@ impl LinearizationPlan {
                 if length_exclusions.contains(&obj_ref) {
                     continue;
                 }
-                let obj = pdf.resolve(obj_ref)?;
+                let obj = pdf.resolve_borrowed(obj_ref)?;
                 if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
                     continue;
                 }
@@ -1141,7 +1141,7 @@ impl LinearizationPlan {
             if length_exclusions.contains(&obj_ref) {
                 continue;
             }
-            let obj = pdf.resolve(obj_ref)?;
+            let obj = pdf.resolve_borrowed(obj_ref)?;
             if !is_eligible_for_objstm(obj_ref, &obj, ctx) {
                 continue;
             }
@@ -2577,7 +2577,7 @@ mod tests {
         use crate::writer::object_streams::{eligibility_context, is_eligible_for_objstm};
         let ctx = eligibility_context(&mut pdf).unwrap();
         for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
-            let obj = pdf.resolve(*r).unwrap();
+            let obj = pdf.resolve_borrowed(*r).unwrap();
             assert!(
                 is_eligible_for_objstm(*r, &obj, &ctx),
                 "batched object {r} must be eligible for ObjStm"
