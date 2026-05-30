@@ -852,11 +852,12 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn resolve_to_cache(&mut self, object_ref: ObjectRef) -> Result<bool> {
-        if matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_))) {
+        let entry = self.cache.entry(object_ref);
+        if matches!(entry, Some(CacheEntry::Resolved(_))) {
             return Ok(true);
         }
 
-        match self.cache.entry(object_ref).cloned() {
+        match entry.cloned() {
             Some(CacheEntry::Resolved(_)) => unreachable!("resolved entries returned above"),
             Some(CacheEntry::Unresolved { offset }) => {
                 self.reader.seek(SeekFrom::Start(offset))?;
