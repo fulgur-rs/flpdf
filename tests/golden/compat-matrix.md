@@ -34,7 +34,7 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 |---|---|---|---|---|---|
 | one-page.pdf | plain | de1930f4a42047f3 | diverge | diverge | diverge |
 | one-page.pdf | static-id | de1930f4a42047f3 | diverge | diverge | match |
-| one-page.pdf | linearize | 1ed88d139b691814 | diverge | diverge | diverge |
+| one-page.pdf | linearize | 380eba033401e7f2 | diverge | diverge | diverge |
 | two-page.pdf | plain | 595b45e80feb4965 | diverge | diverge | diverge |
 | two-page.pdf | static-id | 595b45e80feb4965 | diverge | diverge | match |
 | two-page.pdf | linearize | d2052c388c33e232 | diverge | diverge | diverge |
