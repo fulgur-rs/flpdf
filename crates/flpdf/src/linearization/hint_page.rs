@@ -332,10 +332,17 @@ impl PageOffsetHintTable {
         let greatest_shared_count = shared_counts.iter().copied().max().unwrap_or(0);
 
         // ------------------------------------------------------------------
-        // Step 3: compute the greatest shared object identifier (0-based index
-        // into the shared hint table, matching qpdf's checkHPageOffset semantics).
+        // Step 3: compute bits needed to encode shared object identifiers.
+        //
+        // qpdf computes nbits_per_shared_object as nbits(nshared_total) — the
+        // number of bits needed to represent the COUNT of shared objects, not
+        // the maximum 0-based index (which would be count - 1).  This matches
+        // qpdf's writeHPageOffset / readHPageOffset behavior: for N shared
+        // objects, qpdf allocates bits_needed(N) bits, one more than strictly
+        // required to encode indices 0..N-1.  We match qpdf byte-for-byte by
+        // using the count here.
         // ------------------------------------------------------------------
-        let greatest_shared_id = plan.shared_hints.len().saturating_sub(1) as u64;
+        let shared_hint_count = plan.shared_hints.len() as u64;
 
         // ------------------------------------------------------------------
         // Step 4: build the header.
@@ -370,7 +377,7 @@ impl PageOffsetHintTable {
             least_content_length: 0,      // placeholder — back-patched by writer
             bits_content_length_delta: 0, // placeholder — back-patched by writer
             bits_shared_object_count: bits_needed(greatest_shared_count as u64),
-            bits_shared_object_id: bits_needed(greatest_shared_id),
+            bits_shared_object_id: bits_needed(shared_hint_count),
             bits_numerator: 0, // numerators are all 0 (qpdf default), so 0 bits needed
             denominator: 4,    // qpdf default; spec says implementation-defined
         };
@@ -700,11 +707,11 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let table = PageOffsetHintTable::from_plan(&plan, &renumber);
 
-        // shared_hints has 4 entries (indices 0..3).
-        // greatest shared id = 4 - 1 = 3 → bits_needed(3) = 2
-        // Per qpdf's checkHPageOffset, shared_identifiers are 0-based indices
-        // into the shared object hint table, not new object numbers.
-        assert_eq!(table.header.bits_shared_object_id, 2);
+        // shared_hints has 4 entries.
+        // qpdf computes nbits_per_shared_object = nbits(nshared_total) = nbits(4) = 3,
+        // using the COUNT of shared objects (not the max 0-based index 3 = nbits 2).
+        // We match qpdf's byte-exact behavior by using bits_needed(count).
+        assert_eq!(table.header.bits_shared_object_id, 3);
     }
 
     #[test]
@@ -783,5 +790,40 @@ mod tests {
             assert_eq!(entry.content_stream_offset, 0);
             assert_eq!(entry.content_stream_length, 0);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // bits_shared_object_id: count-based (qpdf-matching) formula
+    //
+    // qpdf computes nbits_per_shared_object = nbits(nshared_total), using the
+    // COUNT of shared objects rather than the max 0-based index (count - 1).
+    // For N shared hints the count gives bits_needed(N); max_id gives
+    // bits_needed(N-1), which is one bit fewer for all N where N is a power
+    // of 2 or one more than a power of 2.
+    //
+    // These tests pin the qpdf-matching count-based formula for each
+    // boundary case.  Verified against qpdf --show-linearization output.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bits_shared_object_id_zero_shared_hints() {
+        // 0 shared hints → bits_needed(0) = 0 (same for both count and max_id)
+        let plan = single_page_plan();
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = PageOffsetHintTable::from_plan(&plan, &renumber);
+        assert_eq!(table.header.bits_shared_object_id, 0);
+    }
+
+    #[test]
+    fn bits_shared_object_id_four_shared_hints_matches_qpdf() {
+        // 4 shared hints:
+        //   count-based (qpdf): bits_needed(4) = 3
+        //   max_id-based:       bits_needed(3) = 2   ← wrong
+        // Verified: qpdf --show-linearization reports nbits_shared_identifier=3
+        // for a two-page.pdf fixture with 4 shared objects.
+        let plan = two_page_plan_with_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = PageOffsetHintTable::from_plan(&plan, &renumber);
+        assert_eq!(table.header.bits_shared_object_id, 3);
     }
 }
