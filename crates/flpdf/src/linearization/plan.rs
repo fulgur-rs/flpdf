@@ -634,8 +634,13 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 8: build shared_hints
         // ----------------------------------------------------------------
-        // The Shared Object Hint Table must cover ALL objects referenced by
-        // two or more pages, not just those in the first-page closure.
+        // The Shared Object Hint Table covers ALL objects in the first-page
+        // section (Part 2 + Part 3) plus any Part-4 shared objects.
+        //
+        // qpdf always lists all objects in the first-page section in the SO
+        // hint table, even for single-page PDFs where no objects are truly
+        // shared across pages.  We match this behaviour unconditionally:
+        // shared_hints is always non-empty whenever part2_objects is non-empty.
         //
         // Layout of shared_hints (in file order):
         //   [part2 entries]  - first-page section private objects (page 0 owns
@@ -646,47 +651,39 @@ impl LinearizationPlan {
         //   [part4_shared]   - Part-4 shared objects (after /E; owned by no
         //                      page via physical position; referencing_pages lists
         //                      ALL pages that reference them)
-        //
-        // When there are no shared objects at all (part3 empty AND
-        // part4_other_pages_shared empty), shared_hints stays empty.
-        let has_any_shared = !part3_objects.is_empty() || !part4_other_pages_shared.is_empty();
-        let shared_hints: Vec<SharedObjectHintEntry> = if !has_any_shared {
-            Vec::new()
-        } else {
-            let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
+        let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
+            object_ref: obj_ref,
+            referencing_pages: vec![],
+        });
+        let part3_entries = part3_objects.iter().map(|&obj_ref| {
+            let pages: Vec<u32> = shared_page_indices
+                .get(&obj_ref)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            // Do NOT add page 0: Part-3 shared objects are in the first-page
+            // section, so page 0 implicitly owns them by physical layout.
+            SharedObjectHintEntry {
                 object_ref: obj_ref,
-                referencing_pages: vec![],
-            });
-            let part3_entries = part3_objects.iter().map(|&obj_ref| {
-                let pages: Vec<u32> = shared_page_indices
-                    .get(&obj_ref)
-                    .map(|s| s.iter().copied().collect())
-                    .unwrap_or_default();
-                // Do NOT add page 0: Part-3 shared objects are in the first-page
-                // section, so page 0 implicitly owns them by physical layout.
-                SharedObjectHintEntry {
-                    object_ref: obj_ref,
-                    referencing_pages: pages,
-                }
-            });
-            // Part-4 shared objects: referenced by ≥ 2 pages but NOT in the
-            // first-page closure.  These live after /E (not physically owned
-            // by any page via layout), so ALL referencing pages are listed.
-            let part4_shared_entries = part4_other_pages_shared.iter().map(|&obj_ref| {
-                let pages: Vec<u32> = all_referenced_pages
-                    .get(&obj_ref)
-                    .map(|s| s.iter().copied().collect())
-                    .unwrap_or_default();
-                SharedObjectHintEntry {
-                    object_ref: obj_ref,
-                    referencing_pages: pages,
-                }
-            });
-            part2_entries
-                .chain(part3_entries)
-                .chain(part4_shared_entries)
-                .collect()
-        };
+                referencing_pages: pages,
+            }
+        });
+        // Part-4 shared objects: referenced by ≥ 2 pages but NOT in the
+        // first-page closure.  These live after /E (not physically owned
+        // by any page via layout), so ALL referencing pages are listed.
+        let part4_shared_entries = part4_other_pages_shared.iter().map(|&obj_ref| {
+            let pages: Vec<u32> = all_referenced_pages
+                .get(&obj_ref)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            SharedObjectHintEntry {
+                object_ref: obj_ref,
+                referencing_pages: pages,
+            }
+        });
+        let shared_hints: Vec<SharedObjectHintEntry> = part2_entries
+            .chain(part3_entries)
+            .chain(part4_shared_entries)
+            .collect();
 
         Ok(Self {
             part1_objects: Vec::new(),
@@ -1418,8 +1415,25 @@ mod tests {
         // Part 1 stays empty (populated by a later subtask).
         assert!(plan.part1_objects.is_empty());
 
-        // shared_hints must be empty when Part 3 is empty.
-        assert!(plan.shared_hints.is_empty());
+        // qpdf always populates shared_hints with all first-page section
+        // objects (Part 2 + Part 3), even for single-page PDFs.
+        // shared_hints = part2_objects (Part 3 is empty for single-page).
+        assert_eq!(
+            plan.shared_hints.len(),
+            plan.part2_objects.len(),
+            "shared_hints must contain all part2 objects for single-page PDF"
+        );
+        for hint in &plan.shared_hints {
+            assert!(
+                plan.part2_objects.contains(&hint.object_ref),
+                "single-page shared_hint {:?} must be a Part-2 object",
+                hint.object_ref
+            );
+            assert!(
+                hint.referencing_pages.is_empty(),
+                "Part-2 shared hint must have empty referencing_pages (page 0 owns by layout)"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
