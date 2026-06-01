@@ -582,7 +582,7 @@ fn json_stream_data_file_side_file_holds_decoded_content() {
     .assert()
     .success();
 
-    let side_file = format!("{prefix}-004");
+    let side_file = format!("{prefix}-4");
     let written = std::fs::read(&side_file).expect("side file must exist");
     assert_eq!(
         written, content,
