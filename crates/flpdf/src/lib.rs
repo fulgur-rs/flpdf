@@ -58,6 +58,7 @@ pub mod linearization;
 pub mod object;
 pub mod outline;
 pub mod outline_dest_remap;
+pub mod page_closure;
 pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
