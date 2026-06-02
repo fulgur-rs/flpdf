@@ -338,14 +338,16 @@ fn closure_includes_content_stream() {
 // Cross-page annotation guard (/Type /Page guard in BFS loop)
 // ---------------------------------------------------------------------------
 
-/// Build a two-page PDF where page 1 has a GoTo annotation referencing page 2.
+/// Build a two-page PDF where page 1 has a GoTo annotation referencing page 2,
+/// and page 2 owns a unique font (6 0 R) that must NOT leak into page 1's closure.
 ///
 /// Object layout:
 ///   1 0 R  Catalog
 ///   2 0 R  Pages
 ///   3 0 R  Page 1 (/Annots [4 0 R])
 ///   4 0 R  Annotation (/Dest [5 0 R /XYZ 0 0 0]) — destination = page 2
-///   5 0 R  Page 2
+///   5 0 R  Page 2 (/Resources with font 6 0 R)
+///   6 0 R  Font owned exclusively by page 2
 fn build_pdf_with_cross_page_annotation() -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
 
@@ -369,24 +371,32 @@ fn build_pdf_with_cross_page_annotation() -> Vec<u8> {
     );
 
     let off5 = out.len() as u64;
+    // Page 2 owns a unique font (6 0 R) — must NOT leak into page 1's closure.
     out.extend_from_slice(
-        b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F2 6 0 R >> >> >>\nendobj\n",
+    );
+
+    let off6 = out.len() as u64;
+    out.extend_from_slice(
+        b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n",
     );
 
     let xref_start = out.len() as u64;
     out.extend_from_slice(
         format!(
-            "xref\n0 6\n\
+            "xref\n0 7\n\
              0000000000 65535 f \n\
              {off1:010} 00000 n \n\
              {off2:010} 00000 n \n\
              {off3:010} 00000 n \n\
              {off4:010} 00000 n \n\
-             {off5:010} 00000 n \n"
+             {off5:010} 00000 n \n\
+             {off6:010} 00000 n \n"
         )
         .as_bytes(),
     );
-    let trailer = format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+    let trailer = format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     out.extend_from_slice(trailer.as_bytes());
     out
 }
@@ -399,6 +409,7 @@ fn cross_page_annotation_does_not_pull_in_sibling_content() {
     let page1_ref = page_refs[0];
     let page2_ref = page_refs[1];
     let annot_ref = ObjectRef::new(4, 0);
+    let page2_font_ref = ObjectRef::new(6, 0);
 
     let closure = page_closure::page_object_closure(&mut pdf, page1_ref).unwrap();
 
@@ -407,20 +418,15 @@ fn cross_page_annotation_does_not_pull_in_sibling_content() {
         closure.contains(&annot_ref),
         "closure must include the annotation object"
     );
-    // Page 2 is reachable via the annotation's /Dest but must NOT have its
-    // content traversed — the /Type /Page guard prevents that.
-    // page2_ref itself may be in visited (it was encountered), but its content
-    // (resources, streams, etc.) must not expand the closure beyond page 2 itself.
-    // Specifically, page 2 has no extra objects, so just verify page 1's resources
-    // are isolated by checking that we didn't accidentally traverse page 2's tree.
+    // Page 2's private font must NOT leak into page 1's closure.
+    // The /Type /Page guard stops traversal when page 2 is encountered via the
+    // annotation's /Dest, so page 2's /Resources (and font 6 0 R) are never
+    // visited.  This is the key invariant the guard enforces.
     assert!(
-        !closure.contains(&page_refs[0]) || closure.contains(&page1_ref),
-        "page 1 must be in its own closure"
+        !closure.contains(&page2_font_ref),
+        "page 2's private font must not leak into page 1's closure via annotation /Dest"
     );
-    // The key invariant: page 2's /Parent back-link does not cause
-    // page 1's closure to explode. This is guaranteed if page 2 is
-    // encountered but not traversed (the guard fires on line 71).
-    let _ = page2_ref; // page2 may or may not be in closure depending on annotation traversal
+    let _ = page2_ref;
 }
 
 // ---------------------------------------------------------------------------
