@@ -11,8 +11,7 @@ use flpdf::{
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
         format_json_side_file_path, stream_payload_for_decode_level, DecodeLevel, JsonKey,
-        JsonObjectSelector,
-        StreamDataMode as JsonStreamDataMode,
+        JsonObjectSelector, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
