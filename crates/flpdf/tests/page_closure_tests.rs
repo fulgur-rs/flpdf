@@ -22,7 +22,9 @@ fn build_minimal_pdf() -> Vec<u8> {
     out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
 
     let off3 = out.len() as u64;
-    out.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
 
     let xref_start = out.len() as u64;
     out.extend_from_slice(
@@ -49,7 +51,10 @@ fn closure_contains_page_ref_itself() {
 
     let closure = page_closure::page_object_closure(&mut pdf, page_ref).unwrap();
 
-    assert!(closure.contains(&page_ref), "closure must contain the page ref itself");
+    assert!(
+        closure.contains(&page_ref),
+        "closure must contain the page ref itself"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -95,8 +100,7 @@ fn build_pdf_with_font() -> Vec<u8> {
         )
         .as_bytes(),
     );
-    let trailer =
-        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+    let trailer = format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     out.extend_from_slice(trailer.as_bytes());
     out
 }
@@ -111,7 +115,10 @@ fn closure_includes_font_resource() {
 
     let closure = page_closure::page_object_closure(&mut pdf, page_ref).unwrap();
 
-    assert!(closure.contains(&font_ref), "closure must include font object 4 0 R");
+    assert!(
+        closure.contains(&font_ref),
+        "closure must include font object 4 0 R"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -133,9 +140,7 @@ fn build_two_page_pdf_shared_font() -> Vec<u8> {
     out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
     let off2 = out.len() as u64;
-    out.extend_from_slice(
-        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
-    );
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n");
 
     let off3 = out.len() as u64;
     out.extend_from_slice(
@@ -167,8 +172,7 @@ fn build_two_page_pdf_shared_font() -> Vec<u8> {
         )
         .as_bytes(),
     );
-    let trailer =
-        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+    let trailer = format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     out.extend_from_slice(trailer.as_bytes());
     out
 }
@@ -183,11 +187,23 @@ fn shared_object_appears_in_both_page_closures() {
     let closure_p1 = page_closure::page_object_closure(&mut pdf, page_refs[0]).unwrap();
     let closure_p2 = page_closure::page_object_closure(&mut pdf, page_refs[1]).unwrap();
 
-    assert!(closure_p1.contains(&font_ref), "page 1 closure must contain shared font");
-    assert!(closure_p2.contains(&font_ref), "page 2 closure must contain shared font");
+    assert!(
+        closure_p1.contains(&font_ref),
+        "page 1 closure must contain shared font"
+    );
+    assert!(
+        closure_p2.contains(&font_ref),
+        "page 2 closure must contain shared font"
+    );
     // Page 1 must not contain page 2's ref and vice-versa.
-    assert!(!closure_p1.contains(&page_refs[1]), "page 1 closure must not contain page 2 ref");
-    assert!(!closure_p2.contains(&page_refs[0]), "page 2 closure must not contain page 1 ref");
+    assert!(
+        !closure_p1.contains(&page_refs[1]),
+        "page 1 closure must not contain page 2 ref"
+    );
+    assert!(
+        !closure_p2.contains(&page_refs[0]),
+        "page 2 closure must not contain page 1 ref"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -237,8 +253,7 @@ fn build_pdf_with_cycle() -> Vec<u8> {
         )
         .as_bytes(),
     );
-    let trailer =
-        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+    let trailer = format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
     out.extend_from_slice(trailer.as_bytes());
     out
 }
