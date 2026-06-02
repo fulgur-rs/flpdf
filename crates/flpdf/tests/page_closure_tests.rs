@@ -271,3 +271,101 @@ fn cycle_does_not_loop_forever() {
     assert!(closure.contains(&ObjectRef::new(4, 0)));
     assert!(closure.contains(&ObjectRef::new(5, 0)));
 }
+
+// ---------------------------------------------------------------------------
+// Inherited resources
+// ---------------------------------------------------------------------------
+
+/// Build a two-page PDF where /Resources is on the parent /Pages node (inherited),
+/// not on the individual page dicts.
+///
+/// Object layout:
+///   1 0 R  Catalog
+///   2 0 R  Pages  (has /Resources with font 5 0 R — inherited by both pages)
+///   3 0 R  Page 1 (no /Resources of its own)
+///   4 0 R  Page 2 (no /Resources of its own)
+///   5 0 R  Font (inherited)
+fn build_pdf_with_inherited_resources() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+
+    let off1 = out.len() as u64;
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let off2 = out.len() as u64;
+    out.extend_from_slice(
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 \
+          /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+    );
+
+    let off3 = out.len() as u64;
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+
+    let off4 = out.len() as u64;
+    out.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+
+    let off5 = out.len() as u64;
+    out.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(
+        format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    let trailer = format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+    out.extend_from_slice(trailer.as_bytes());
+    out
+}
+
+#[test]
+fn closure_includes_inherited_resources() {
+    let data = build_pdf_with_inherited_resources();
+    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let page_refs = pages::page_refs(&mut pdf).unwrap();
+    let font_ref = ObjectRef::new(5, 0);
+    let pages_ref = ObjectRef::new(2, 0);
+
+    let closure_p1 = page_closure::page_object_closure(&mut pdf, page_refs[0]).unwrap();
+    let closure_p2 = page_closure::page_object_closure(&mut pdf, page_refs[1]).unwrap();
+
+    // The /Pages node (which carries /Resources) must be in both closures.
+    assert!(
+        closure_p1.contains(&pages_ref),
+        "page 1 closure must contain the /Pages node (inherited resources live there)"
+    );
+    assert!(
+        closure_p2.contains(&pages_ref),
+        "page 2 closure must contain the /Pages node"
+    );
+    // The font itself (transitively reachable via /Pages → /Resources) must be included.
+    assert!(
+        closure_p1.contains(&font_ref),
+        "page 1 closure must contain inherited font 5 0 R"
+    );
+    assert!(
+        closure_p2.contains(&font_ref),
+        "page 2 closure must contain inherited font 5 0 R"
+    );
+    // Sibling pages must not appear in each other's closures.
+    assert!(
+        !closure_p1.contains(&page_refs[1]),
+        "page 1 closure must not contain page 2 ref"
+    );
+    assert!(
+        !closure_p2.contains(&page_refs[0]),
+        "page 2 closure must not contain page 1 ref"
+    );
+}

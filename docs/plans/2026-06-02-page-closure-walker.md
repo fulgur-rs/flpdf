@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Create the test file with a failing test for the basic single-page case
+## Task 1: Create the test file with a failing test for the basic single-page case
 
 **Files:**
 - Create: `crates/flpdf/tests/page_closure_tests.rs`
@@ -96,7 +96,7 @@ Expected: compile error — `page_closure` module not found.
 
 ---
 
-### Task 2: Create the module skeleton so the test compiles but logic is unimplemented
+## Task 2: Create the module skeleton so the test compiles but logic is unimplemented
 
 **Files:**
 - Create: `crates/flpdf/src/page_closure.rs`
@@ -176,7 +176,7 @@ Expected: test runs and fails with "not implemented".
 
 ---
 
-### Task 3: Implement `collect_refs_in_object` helper and the BFS loop
+## Task 3: Implement `collect_refs_in_object` helper and the BFS loop
 
 **Files:**
 - Modify: `crates/flpdf/src/page_closure.rs`
@@ -296,7 +296,7 @@ Expected: `test closure_contains_page_ref_itself ... ok`
 
 ---
 
-### Task 4: Test that the closure is non-trivial (includes referenced objects)
+## Task 4: Test that the closure is non-trivial (includes referenced objects)
 
 **Files:**
 - Modify: `crates/flpdf/tests/page_closure_tests.rs`
@@ -375,7 +375,7 @@ Expected: `test closure_includes_font_resource ... ok`
 
 ---
 
-### Task 5: Test that shared objects appear in both pages' closures on a multi-page PDF
+## Task 5: Test that shared objects appear in both pages' closures on a multi-page PDF
 
 **Files:**
 - Modify: `crates/flpdf/tests/page_closure_tests.rs`
@@ -468,7 +468,7 @@ Expected: `test shared_object_appears_in_both_page_closures ... ok`
 
 ---
 
-### Task 6: Test that cycles do not loop forever
+## Task 6: Test that cycles do not loop forever
 
 **Files:**
 - Modify: `crates/flpdf/tests/page_closure_tests.rs`
@@ -552,7 +552,7 @@ Expected: all 4 tests pass.
 
 ---
 
-### Task 7: Run the full test suite and commit
+## Task 7: Run the full test suite and commit
 
 **Step 1: Run all tests**
 
