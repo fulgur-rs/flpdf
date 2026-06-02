@@ -34,3 +34,7 @@ default = []
 # matches qpdf's compress2() at level 6 byte-for-byte. Used by bytes-identical
 # tests only — production builds stay Pure Rust (miniz_oxide).
 qpdf-zlib-compat = ["flate2/zlib"]
+
+[[test]]
+name = "page_closure_tests"
+path = "tests/page_closure_tests.rs"
