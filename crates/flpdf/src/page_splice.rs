@@ -55,9 +55,7 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
 
     let remaining = page_count - remove.len() + insert.len();
     if remaining == 0 {
-        return Err(Error::Missing(
-            "splice would result in an empty document",
-        ));
+        return Err(Error::Missing("splice would result in an empty document"));
     }
 
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
@@ -162,11 +160,7 @@ fn splice_subtree<R: Read + Seek>(
         let kids: Vec<ObjectRef> = dict
             .get("Kids")
             .and_then(Object::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Object::as_ref_id)
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(Object::as_ref_id).collect())
             .unwrap_or_default();
 
         let old_count = dict
@@ -250,10 +244,9 @@ fn splice_subtree<R: Read + Seek>(
 
     // Write back the modified node.
     let new_count = (old_count as i64 + net_delta) as usize;
-    let mut dict = pdf
-        .resolve(node_ref)?
-        .into_dict()
-        .ok_or_else(|| Error::Unsupported(format!("{node_ref} is not a dictionary (re-resolve)")))?;
+    let mut dict = pdf.resolve(node_ref)?.into_dict().ok_or_else(|| {
+        Error::Unsupported(format!("{node_ref} is not a dictionary (re-resolve)"))
+    })?;
     dict.insert("Count", Object::Integer(new_count as i64));
     dict.insert(
         "Kids",
@@ -285,13 +278,39 @@ mod tests {
     fn build_flat_pdf() -> Vec<u8> {
         let parts: &[(u32, &str)] = &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            (
-                2,
-                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
-            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
             (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
             (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ];
+        build_pdf(parts)
+    }
+
+    /// Build a 2-level PDF with 4 pages:
+    ///   1 0 R  Catalog
+    ///   2 0 R  Pages root  /Kids [3 6] /Count 4
+    ///   3 0 R  Pages left  /Kids [4 5] /Count 2  /Parent 2 0 R
+    ///   4 0 R  Page A      /Parent 3 0 R
+    ///   5 0 R  Page B      /Parent 3 0 R
+    ///   6 0 R  Pages right /Kids [7 8] /Count 2  /Parent 2 0 R
+    ///   7 0 R  Page C      /Parent 6 0 R
+    ///   8 0 R  Page D      /Parent 6 0 R
+    fn build_nested_pdf() -> Vec<u8> {
+        let parts: &[(u32, &str)] = &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 4 >>"),
+            (
+                3,
+                "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 5 0 R] /Count 2 >>",
+            ),
+            (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                6,
+                "<< /Type /Pages /Parent 2 0 R /Kids [7 0 R 8 0 R] /Count 2 >>",
+            ),
+            (7, "<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] >>"),
         ];
         build_pdf(parts)
     }
@@ -313,10 +332,8 @@ mod tests {
             );
         }
         out.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-            )
-            .as_bytes(),
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
         );
         out
     }
@@ -353,7 +370,7 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0], ObjectRef::new(4, 0)); // B
         assert_eq!(pages[1], ObjectRef::new(5, 0)); // C
-        // Root /Pages /Count should be 2.
+                                                    // Root /Pages /Count should be 2.
         let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
         assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
     }
@@ -479,24 +496,120 @@ mod tests {
     fn replace_middle_page_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object(new_page, Object::Dictionary({
-            let mut d = crate::Dictionary::new();
-            d.insert("Type", Object::Name(b"Page".to_vec()));
-            d.insert("MediaBox", Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ]));
-            d
-        }));
+        pdf.set_object(
+            new_page,
+            Object::Dictionary({
+                let mut d = crate::Dictionary::new();
+                d.insert("Type", Object::Name(b"Page".to_vec()));
+                d.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                d
+            }),
+        );
         // Replace page B (index 1) with new_page.
         splice_pages(&mut pdf, 1..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 3);
         assert_eq!(pages[0], ObjectRef::new(3, 0)); // A
-        assert_eq!(pages[1], new_page);             // X
+        assert_eq!(pages[1], new_page); // X
         assert_eq!(pages[2], ObjectRef::new(5, 0)); // C
-        // Count stays 3.
+                                                    // Count stays 3.
         let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
         assert_eq!(root.get("Count"), Some(&Object::Integer(3)));
+    }
+
+    /// Remove page B (index 1, in left subtree) from the nested tree.
+    /// CRITICAL: intermediate nodes (3 0 R left, 6 0 R right) must STILL EXIST
+    /// with their /Count updated. This is the key difference from rebuild_page_tree.
+    #[test]
+    fn nested_remove_updates_intermediate_count() {
+        let mut pdf = open(build_nested_pdf());
+        splice_pages(&mut pdf, 1..2, &[]).unwrap(); // remove B
+                                                    // Page order: A C D
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0], ObjectRef::new(4, 0)); // A
+        assert_eq!(pages[1], ObjectRef::new(7, 0)); // C
+        assert_eq!(pages[2], ObjectRef::new(8, 0)); // D
+                                                    // Root /Count = 3
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(3)));
+        // Left intermediate node /Count = 1 (only A remains)
+        let left = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        assert_eq!(left.get("Count"), Some(&Object::Integer(1)));
+        // Right intermediate node /Count = 2 (unchanged)
+        let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
+        assert_eq!(right.get("Count"), Some(&Object::Integer(2)));
+    }
+
+    /// Remove pages B and C (indices 1 and 2), which span both left and right subtrees.
+    #[test]
+    fn nested_remove_spanning_subtrees() {
+        let mut pdf = open(build_nested_pdf());
+        splice_pages(&mut pdf, 1..3, &[]).unwrap(); // remove B (left) and C (right)
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], ObjectRef::new(4, 0)); // A
+        assert_eq!(pages[1], ObjectRef::new(8, 0)); // D
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        // Left subtree: only A remains → /Count = 1
+        let left = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        assert_eq!(left.get("Count"), Some(&Object::Integer(1)));
+        // Right subtree: only D remains → /Count = 1
+        let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
+        assert_eq!(right.get("Count"), Some(&Object::Integer(1)));
+    }
+
+    /// Insert a new page at index 2 (between B and C, at the boundary of left and right subtrees).
+    /// The new page should be inserted into the right subtree (as its first kid).
+    #[test]
+    fn nested_insert_at_subtree_boundary() {
+        let mut pdf = open(build_nested_pdf());
+        let new_page = ObjectRef::new(9, 0);
+        pdf.set_object(
+            new_page,
+            Object::Dictionary({
+                let mut d = crate::Dictionary::new();
+                d.insert("Type", Object::Name(b"Page".to_vec()));
+                d.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                d
+            }),
+        );
+        splice_pages(&mut pdf, 2..2, &[new_page]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 5);
+        assert_eq!(pages[0], ObjectRef::new(4, 0)); // A
+        assert_eq!(pages[1], ObjectRef::new(5, 0)); // B
+        assert_eq!(pages[2], new_page); // X
+        assert_eq!(pages[3], ObjectRef::new(7, 0)); // C
+        assert_eq!(pages[4], ObjectRef::new(8, 0)); // D
+                                                    // Root /Count = 5
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(5)));
+        // new_page's /Parent should point at an ancestor /Pages node.
+        let d = dict_of(&mut pdf, new_page);
+        let parent = d.get_ref("Parent").expect("/Parent must be set");
+        // Parent must be a /Pages node in the tree
+        let parent_dict = dict_of(&mut pdf, parent);
+        assert_eq!(
+            parent_dict.get("Type").and_then(Object::as_name),
+            Some(b"Pages".as_ref())
+        );
     }
 }
