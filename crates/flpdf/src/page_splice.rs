@@ -134,6 +134,7 @@ fn set_page_parent<R: Read + Seek>(
 /// `base` is the document-order index of the first leaf page in this subtree.
 /// `insert_done` is shared across all recursive calls; it flips to `true` when
 /// the inserted pages have been placed exactly once.
+#[allow(clippy::too_many_arguments)]
 fn splice_subtree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
