@@ -596,10 +596,7 @@ mod tests {
         // Root /Kids should only contain right subtree (6 0 R).
         let kids = root.get("Kids").and_then(Object::as_array).unwrap();
         assert_eq!(kids.len(), 1);
-        assert_eq!(
-            kids[0].as_ref_id(),
-            Some(ObjectRef::new(6, 0))
-        );
+        assert_eq!(kids[0].as_ref_id(), Some(ObjectRef::new(6, 0)));
         assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
     }
 
