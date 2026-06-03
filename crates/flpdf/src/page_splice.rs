@@ -568,6 +568,41 @@ mod tests {
         assert_eq!(right.get("Count"), Some(&Object::Integer(1)));
     }
 
+    #[test]
+    fn error_remove_end_out_of_bounds() {
+        let mut pdf = open(build_flat_pdf()); // 3 pages
+        let err = splice_pages(&mut pdf, 0..4, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn error_empty_result_document() {
+        let mut pdf = open(build_flat_pdf()); // 3 pages
+        let err = splice_pages(&mut pdf, 0..3, &[]).unwrap_err();
+        assert!(matches!(err, Error::Missing(_)), "got {err:?}");
+    }
+
+    /// Remove all pages in the left subtree (A and B, indices 0..2).
+    /// The now-empty left intermediate node must be dropped from root /Kids.
+    #[test]
+    fn empty_intermediate_node_is_dropped() {
+        let mut pdf = open(build_nested_pdf()); // A B C D
+        splice_pages(&mut pdf, 0..2, &[]).unwrap(); // remove A, B
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], ObjectRef::new(7, 0)); // C
+        assert_eq!(pages[1], ObjectRef::new(8, 0)); // D
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        // Root /Kids should only contain right subtree (6 0 R).
+        let kids = root.get("Kids").and_then(Object::as_array).unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(
+            kids[0].as_ref_id(),
+            Some(ObjectRef::new(6, 0))
+        );
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+    }
+
     /// Insert a new page at index 2 (between B and C, at the boundary of left and right subtrees).
     /// The new page should be inserted into the right subtree (as its first kid).
     #[test]
