@@ -59,6 +59,7 @@ pub mod object;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod page_closure;
+pub mod page_splice;
 pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
@@ -121,6 +122,7 @@ pub use page_rotate::{
     resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
 pub use page_split::{digit_width, split_output_path, split_pages};
+pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
 pub use permissions::{PermissionsConfig, PrintPermission};
