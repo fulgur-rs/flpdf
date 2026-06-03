@@ -39,6 +39,13 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
     insert: &[ObjectRef],
     max_depth: usize,
 ) -> Result<()> {
+    if remove.start > remove.end {
+        return Err(Error::Unsupported(format!(
+            "splice: invalid range {}..{} (start > end)",
+            remove.start, remove.end
+        )));
+    }
+
     // No-op guard.
     if remove.is_empty() && insert.is_empty() {
         return Ok(());
@@ -100,7 +107,10 @@ fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node_ref: ObjectRef) -> Resul
         .ok_or_else(|| Error::Unsupported(format!("node {node_ref} is not a dictionary")))?;
     match dict.get("Type").and_then(Object::as_name) {
         Some(b"Pages") => match dict.get("Count").and_then(Object::as_integer) {
-            Some(n) => Ok(n as usize),
+            Some(n) if n >= 0 => Ok(n as usize),
+            Some(n) => Err(Error::Unsupported(format!(
+                "/Pages node {node_ref} has negative /Count {n}"
+            ))),
             None => Err(Error::Unsupported(format!(
                 "/Pages node {node_ref} has no /Count"
             ))),
@@ -163,11 +173,16 @@ fn splice_subtree<R: Read + Seek>(
             .map(|arr| arr.iter().filter_map(Object::as_ref_id).collect())
             .unwrap_or_default();
 
-        let old_count = dict
+        let old_count_raw = dict
             .get("Count")
             .and_then(Object::as_integer)
-            .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_ref} has no /Count")))?
-            as usize;
+            .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_ref} has no /Count")))?;
+        if old_count_raw < 0 {
+            return Err(Error::Unsupported(format!(
+                "/Pages node {node_ref} has negative /Count {old_count_raw}"
+            )));
+        }
+        let old_count = old_count_raw as usize;
 
         (kids, old_count)
     };
@@ -243,11 +258,16 @@ fn splice_subtree<R: Read + Seek>(
     }
 
     // Write back the modified node.
-    let new_count = (old_count as i64 + net_delta) as usize;
+    let new_count = old_count as i64 + net_delta;
+    if new_count < 0 {
+        return Err(Error::Unsupported(format!(
+            "splice: negative page count {new_count} for node {node_ref}"
+        )));
+    }
     let mut dict = pdf.resolve(node_ref)?.into_dict().ok_or_else(|| {
         Error::Unsupported(format!("{node_ref} is not a dictionary (re-resolve)"))
     })?;
-    dict.insert("Count", Object::Integer(new_count as i64));
+    dict.insert("Count", Object::Integer(new_count));
     dict.insert(
         "Kids",
         Object::Array(new_kids.iter().map(|&r| Object::Reference(r)).collect()),
