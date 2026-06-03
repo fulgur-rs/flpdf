@@ -273,9 +273,194 @@ mod tests {
     use super::*;
     use crate::pages::page_refs;
     use crate::Pdf;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
 
-    // Placeholder — tests added in later tasks.
+    /// Build a flat 3-page PDF:
+    ///   1 0 R  Catalog → 2 0 R
+    ///   2 0 R  Pages   /Kids [3 4 5] /Count 3
+    ///   3 0 R  Page A  /Parent 2 0 R
+    ///   4 0 R  Page B  /Parent 2 0 R
+    ///   5 0 R  Page C  /Parent 2 0 R
+    fn build_flat_pdf() -> Vec<u8> {
+        let parts: &[(u32, &str)] = &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ];
+        build_pdf(parts)
+    }
+
+    fn build_pdf(parts: &[(u32, &str)]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.5\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+        for (n, s) in parts {
+            offs.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+        let max_obj = parts.iter().map(|(n, _)| n).max().copied().unwrap_or(0);
+        let total = max_obj + 1;
+        let xref_start = out.len() as u64;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(
+                format!("{:010} 00000 n \n", offs.get(&i).copied().unwrap_or(0)).as_bytes(),
+            );
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
+    }
+
+    fn page_list(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<ObjectRef> {
+        page_refs(pdf).expect("page_refs failed")
+    }
+
+    fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
+        pdf.resolve(r)
+            .unwrap()
+            .into_dict()
+            .expect("not a dictionary")
+    }
+
     #[test]
-    fn placeholder() {}
+    fn noop_returns_ok_and_does_not_mutate() {
+        let mut pdf = open(build_flat_pdf());
+        let before = page_list(&mut pdf);
+        splice_pages(&mut pdf, 0..0, &[]).unwrap();
+        let after = page_list(&mut pdf);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn remove_first_page_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        splice_pages(&mut pdf, 0..1, &[]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], ObjectRef::new(4, 0)); // B
+        assert_eq!(pages[1], ObjectRef::new(5, 0)); // C
+        // Root /Pages /Count should be 2.
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+    }
+
+    #[test]
+    fn remove_last_page_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        splice_pages(&mut pdf, 2..3, &[]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], ObjectRef::new(3, 0)); // A
+        assert_eq!(pages[1], ObjectRef::new(4, 0)); // B
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+    }
+
+    #[test]
+    fn insert_at_start_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        let new_page = ObjectRef::new(6, 0);
+        pdf.set_object(
+            new_page,
+            Object::Dictionary({
+                let mut d = crate::Dictionary::new();
+                d.insert("Type", Object::Name(b"Page".to_vec()));
+                d.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                d
+            }),
+        );
+        splice_pages(&mut pdf, 0..0, &[new_page]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[0], new_page);
+        assert_eq!(pages[1], ObjectRef::new(3, 0));
+        // /Parent of new_page must point at root /Pages (2 0 R).
+        let d = dict_of(&mut pdf, new_page);
+        assert_eq!(d.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
+        // /Count = 4
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(4)));
+    }
+
+    #[test]
+    fn insert_at_end_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        let new_page = ObjectRef::new(6, 0);
+        pdf.set_object(
+            new_page,
+            Object::Dictionary({
+                let mut d = crate::Dictionary::new();
+                d.insert("Type", Object::Name(b"Page".to_vec()));
+                d.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                d
+            }),
+        );
+        splice_pages(&mut pdf, 3..3, &[new_page]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[3], new_page);
+        let d = dict_of(&mut pdf, new_page);
+        assert_eq!(d.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
+    }
+
+    #[test]
+    fn insert_in_middle_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        let new_page = ObjectRef::new(6, 0);
+        pdf.set_object(
+            new_page,
+            Object::Dictionary({
+                let mut d = crate::Dictionary::new();
+                d.insert("Type", Object::Name(b"Page".to_vec()));
+                d.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                d
+            }),
+        );
+        // Insert after page B (between index 1 and 2)
+        splice_pages(&mut pdf, 2..2, &[new_page]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[0], ObjectRef::new(3, 0)); // A
+        assert_eq!(pages[1], ObjectRef::new(4, 0)); // B
+        assert_eq!(pages[2], new_page); // X
+        assert_eq!(pages[3], ObjectRef::new(5, 0)); // C
+    }
 }
