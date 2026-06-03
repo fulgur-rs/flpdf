@@ -463,4 +463,40 @@ mod tests {
         assert_eq!(pages[2], new_page); // X
         assert_eq!(pages[3], ObjectRef::new(5, 0)); // C
     }
+
+    #[test]
+    fn remove_range_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        splice_pages(&mut pdf, 0..2, &[]).unwrap(); // remove A, B
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0], ObjectRef::new(5, 0)); // C only
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(1)));
+    }
+
+    #[test]
+    fn replace_middle_page_flat_tree() {
+        let mut pdf = open(build_flat_pdf());
+        let new_page = ObjectRef::new(6, 0);
+        pdf.set_object(new_page, Object::Dictionary({
+            let mut d = crate::Dictionary::new();
+            d.insert("Type", Object::Name(b"Page".to_vec()));
+            d.insert("MediaBox", Object::Array(vec![
+                Object::Integer(0), Object::Integer(0),
+                Object::Integer(612), Object::Integer(792),
+            ]));
+            d
+        }));
+        // Replace page B (index 1) with new_page.
+        splice_pages(&mut pdf, 1..2, &[new_page]).unwrap();
+        let pages = page_list(&mut pdf);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0], ObjectRef::new(3, 0)); // A
+        assert_eq!(pages[1], new_page);             // X
+        assert_eq!(pages[2], ObjectRef::new(5, 0)); // C
+        // Count stays 3.
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(3)));
+    }
 }
