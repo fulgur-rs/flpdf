@@ -10,6 +10,8 @@
 
 ---
 
+## Implementation Tasks
+
 ### Task 1: スケルトンファイルの作成
 
 **Files:**
@@ -633,7 +635,7 @@ git commit -m "test(page_splice): range-remove and replace"
 
 **Step 1: 多段階ツリービルダーを追加**
 
-```
+```text
 Root (2 0 R)    [Count=4]
   Left  (3 0 R) [Count=2] → Page A (4 0 R), Page B (5 0 R)
   Right (6 0 R) [Count=2] → Page C (7 0 R), Page D (8 0 R)
