@@ -117,7 +117,10 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
         return Ok(Vec::new());
     };
 
-    let fields = resolve_array(pdf, acroform_dict.get("Fields").cloned())?;
+    let Some(fields_obj) = acroform_dict.get("Fields").cloned() else {
+        return Ok(Vec::new());
+    };
+    let fields = resolve_array(pdf, fields_obj)?;
     let mut output = Vec::new();
     let mut seen = BTreeSet::new();
     for field in fields {
@@ -245,7 +248,9 @@ fn collect_signature_rewrite_info<R: Read + Seek>(
         let root = pdf.resolve(root_ref)?;
         if let Object::Dictionary(catalog) = root {
             if let Some(acroform) = catalog.get("AcroForm").cloned() {
-                info.acroform_ref = Some(acroform_ref(root_ref, &acroform));
+                let (acroform_ref, acroform_dict) = resolve_acroform(pdf, root_ref, acroform)?;
+                info.acroform_ref = Some(acroform_ref);
+                collect_acroform_signatures(pdf, &acroform_dict, &mut info)?;
             }
 
             for key in ["Perms", "DSS"] {
@@ -256,21 +261,86 @@ fn collect_signature_rewrite_info<R: Read + Seek>(
         }
     }
 
-    for signature in signatures(pdf)? {
-        info.signed_object_refs.insert(signature.field_ref);
-        if let Some(signature_ref) = signature.signature_ref {
-            info.signed_object_refs.insert(signature_ref);
-        }
-    }
-
     Ok(info)
 }
 
-fn acroform_ref(root_ref: ObjectRef, acroform: &Object) -> ObjectRef {
+fn resolve_acroform<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    root_ref: ObjectRef,
+    acroform: Object,
+) -> Result<(ObjectRef, Dictionary)> {
     match acroform {
-        Object::Reference(acroform_ref) => *acroform_ref,
-        _ => root_ref,
+        Object::Reference(acroform_ref) => {
+            let object = pdf.resolve(acroform_ref)?;
+            match object {
+                Object::Dictionary(dict) => Ok((acroform_ref, dict)),
+                _ => Ok((acroform_ref, Dictionary::new())),
+            }
+        }
+        Object::Dictionary(dict) => Ok((root_ref, dict)),
+        _ => Ok((root_ref, Dictionary::new())),
     }
+}
+
+fn collect_acroform_signatures<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    acroform: &Dictionary,
+    info: &mut SignatureRewriteInfo,
+) -> Result<()> {
+    let Some(fields) = acroform.get("Fields").cloned() else {
+        return Ok(());
+    };
+    for field in resolve_array(pdf, fields)? {
+        if let Object::Reference(field_ref) = field {
+            walk_signature_rewrite_field(pdf, field_ref, None, 0, info)?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_signature_rewrite_field<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    inherited_ft: Option<Vec<u8>>,
+    depth: usize,
+    info: &mut SignatureRewriteInfo,
+) -> Result<()> {
+    if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "signature field-tree depth limit {DEFAULT_MAX_SIGNATURE_FIELD_DEPTH} exceeded at {field_ref}"
+        )));
+    }
+
+    let Object::Dictionary(dict) = pdf.resolve(field_ref)? else {
+        return Ok(());
+    };
+
+    let field_type = dict
+        .get("FT")
+        .and_then(Object::as_name)
+        .map(|name| name.to_vec())
+        .or(inherited_ft);
+
+    if field_type.as_deref() == Some(b"Sig") {
+        info.signed_object_refs.insert(field_ref);
+        if let Some(value) = dict.get("V").cloned() {
+            collect_signature_value(pdf, value, info)?;
+        }
+    }
+
+    if dict.get("ByteRange").is_some() {
+        info.signed_object_refs.insert(field_ref);
+    }
+
+    if let Some(kids) = dict.get("Kids").cloned() {
+        for kid in resolve_array(pdf, kids)? {
+            if let Object::Reference(kid_ref) = kid {
+                walk_signature_rewrite_field(pdf, kid_ref, field_type.clone(), depth + 1, info)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_known_signature_value<R: Read + Seek>(
@@ -303,13 +373,30 @@ fn collect_known_signature_value<R: Read + Seek>(
                 collect_known_signature_value(pdf, item, info, depth + 1)?;
             }
         }
-        Object::Stream(stream) => {
-            if stream.dict.get("ByteRange").is_some() {
-                for (_, value) in stream.dict.iter() {
-                    collect_known_signature_value(pdf, value.clone(), info, depth + 1)?;
-                }
+        Object::Stream(stream) if stream.dict.get("ByteRange").is_some() => {
+            for (_, value) in stream.dict.iter() {
+                collect_known_signature_value(pdf, value.clone(), info, depth + 1)?;
             }
         }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn collect_signature_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Object,
+    info: &mut SignatureRewriteInfo,
+) -> Result<()> {
+    match value {
+        Object::Reference(sig_ref) => {
+            let object = pdf.resolve(sig_ref)?;
+            if object_has_byte_range(&object) {
+                info.signed_object_refs.insert(sig_ref);
+            }
+        }
+        object if object_has_byte_range(&object) => {}
         _ => {}
     }
 
@@ -346,7 +433,10 @@ fn walk_signature_field<R: Read + Seek>(
         return Ok(());
     }
 
-    for kid in resolve_array(pdf, field_dict.get("Kids").cloned())? {
+    let Some(kids_obj) = field_dict.get("Kids").cloned() else {
+        return Ok(());
+    };
+    for kid in resolve_array(pdf, kids_obj)? {
         let Object::Reference(kid_ref) = kid else {
             continue;
         };
@@ -418,11 +508,11 @@ fn resolve_dictionary<R: Read + Seek>(
     }
 }
 
-fn resolve_array<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Vec<Object>> {
+fn resolve_array<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Vec<Object>> {
     match value {
-        Some(Object::Array(values)) => Ok(values),
-        Some(Object::Reference(object_ref)) => match pdf.resolve_borrowed(object_ref)? {
-            Object::Array(values) => Ok(values.clone()),
+        Object::Array(values) => Ok(values),
+        Object::Reference(object_ref) => match pdf.resolve(object_ref)? {
+            Object::Array(values) => Ok(values),
             _ => Ok(Vec::new()),
         },
         _ => Ok(Vec::new()),

@@ -147,9 +147,12 @@ fn write_options_wrapper_uses_full_rewrite_flag() {
 }
 
 #[test]
-fn byte_range_dictionary_is_treated_as_signed_object_even_without_acroform() {
+fn catalog_perms_byte_range_dictionary_is_treated_as_signed_object_without_acroform() {
     let objects: Vec<(u32, &[u8])> = vec![
-        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 8 0 R >> >>",
+        ),
         (
             2,
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
@@ -169,4 +172,27 @@ fn byte_range_dictionary_is_treated_as_signed_object_even_without_acroform() {
     assert!(impact.has_signatures);
     assert!(impact.signed_object_refs.contains(&ObjectRef::new(8, 0)));
     assert!(impact.invalidates_signatures);
+}
+
+#[test]
+fn unreferenced_byte_range_dictionary_is_not_found_by_eager_scan() {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (
+            8,
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+    ];
+    let mut pdf = open(build_pdf(&objects));
+
+    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::Incremental).unwrap();
+
+    assert!(!impact.has_signatures);
+    assert!(impact.signed_object_refs.is_empty());
+    assert!(!impact.invalidates_signatures);
 }
