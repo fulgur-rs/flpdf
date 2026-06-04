@@ -80,9 +80,13 @@ fn signed_acroform_pdf_with_indirect_signature_entries() -> Vec<u8> {
     ])
 }
 
+fn open(bytes: Vec<u8>) -> Pdf<std::io::Cursor<Vec<u8>>> {
+    Pdf::open_mem_owned(bytes).expect("PDF should parse")
+}
+
 #[test]
 fn signatures_returns_signed_sig_fields() {
-    let mut pdf = Pdf::open_mem_owned(signed_acroform_pdf()).expect("PDF should parse");
+    let mut pdf = open(signed_acroform_pdf());
 
     let signatures = pdf.signatures().expect("signature scan should succeed");
 
@@ -102,8 +106,7 @@ fn signatures_returns_signed_sig_fields() {
 
 #[test]
 fn signatures_resolves_indirect_field_and_signature_entries() {
-    let mut pdf = Pdf::open_mem_owned(signed_acroform_pdf_with_indirect_signature_entries())
-        .expect("PDF should parse");
+    let mut pdf = open(signed_acroform_pdf_with_indirect_signature_entries());
 
     let signatures = pdf.signatures().expect("signature scan should succeed");
 
@@ -118,4 +121,172 @@ fn signatures_resolves_indirect_field_and_signature_entries() {
     assert_eq!(sig.location.as_deref(), Some("Tokyo"));
     assert_eq!(sig.contact_info.as_deref(), Some("alice@example.test"));
     assert_eq!(sig.certificate.as_deref(), Some(&[1, 2, 3][..]));
+}
+
+#[test]
+fn signatures_returns_empty_for_missing_or_malformed_acroform_shapes() {
+    let cases = [
+        build_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+        ]),
+        build_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, b"42"),
+        ]),
+        build_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, b"<< /Fields [null 5 0 R] >>"),
+            (5, b"42"),
+        ]),
+    ];
+
+    for bytes in cases {
+        let mut pdf = open(bytes);
+        assert!(pdf
+            .signatures()
+            .expect("signature scan should succeed")
+            .is_empty());
+    }
+}
+
+#[test]
+fn signatures_walks_nested_fields_and_handles_cycles() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R 8 0 R] >>"),
+        (5, b"<< /T (Root) /Kids [6 0 R null 7 0 R] >>"),
+        (6, b"<< /FT /Sig /T (Child) /Parent 5 0 R /V 9 0 R >>"),
+        (7, b"null"),
+        (8, b"<< /T (Cycle) /Kids [8 0 R] >>"),
+        (9, b"<< /Type /Sig /ByteRange [0 1 2 3] >>"),
+    ]));
+
+    let signatures = pdf.signatures().expect("signature scan should succeed");
+
+    assert_eq!(signatures.len(), 1);
+    assert_eq!(signatures[0].field_name, "Root.Child");
+}
+
+#[test]
+fn signatures_honors_explicit_depth_limit() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R] >>"),
+        (5, b"<< /T (Root) /Kids [6 0 R] >>"),
+        (6, b"<< /FT /Sig /T (Child) /Parent 5 0 R /V 7 0 R >>"),
+        (7, b"<< /Type /Sig /ByteRange [0 1 2 3] >>"),
+    ]));
+
+    let signatures = flpdf::signatures::signatures_with_max_depth(&mut pdf, 0)
+        .expect("signature scan should succeed");
+
+    assert!(signatures.is_empty());
+}
+
+#[test]
+fn signatures_uses_inherited_signature_field_values() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R] >>"),
+        (5, b"<< /T (Parent) /FT /Sig /V 7 0 R /Kids [6 0 R] >>"),
+        (6, b"<< /T (Child) /Parent 5 0 R >>"),
+        (7, b"<< /Type /Sig /ByteRange [0 1 2 3] >>"),
+    ]));
+
+    let signatures = pdf.signatures().expect("signature scan should succeed");
+
+    assert_eq!(signatures.len(), 2);
+    assert_eq!(signatures[0].field_name, "Parent");
+    assert_eq!(signatures[1].field_name, "Parent.Child");
+}
+
+#[test]
+fn unsigned_or_incomplete_signature_fields_are_ignored() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R 6 0 R 7 0 R] >>"),
+        (5, b"<< /FT /Sig /T (NoValue) >>"),
+        (6, b"<< /FT /Sig /T (BadValue) /V 42 >>"),
+        (7, b"<< /FT /Sig /T (NoByteRange) /V 8 0 R >>"),
+        (8, b"<< /Type /Sig /Name (Alice) >>"),
+    ]));
+
+    assert!(pdf
+        .signatures()
+        .expect("signature scan should succeed")
+        .is_empty());
+}
+
+#[test]
+fn invalid_byte_ranges_return_parse_errors() {
+    let invalid_ranges: [&[u8]; 5] = [b"42", b"8 0 R", b"[0 1 2]", b"[0 1 2 (bad)]", b"[0 1 2 -3]"];
+
+    for byte_range in invalid_ranges {
+        let body = format!(
+            "<< /Type /Sig /ByteRange {} >>",
+            std::str::from_utf8(byte_range).unwrap()
+        );
+        let mut objects: Vec<(u32, Vec<u8>)> = vec![
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Fields [5 0 R] >>".to_vec()),
+            (5, b"<< /FT /Sig /T (Broken) /V 6 0 R >>".to_vec()),
+            (6, body.into_bytes()),
+            (7, b"42".to_vec()),
+        ];
+        objects.sort_by_key(|(number, _)| *number);
+        let borrowed: Vec<(u32, &[u8])> = objects
+            .iter()
+            .map(|(number, body)| (*number, body.as_slice()))
+            .collect();
+        let mut pdf = open(build_pdf(&borrowed));
+
+        let err = pdf.signatures().expect_err("invalid ByteRange should fail");
+        assert!(
+            err.to_string().contains("invalid signature /ByteRange"),
+            "unexpected error: {err}"
+        );
+    }
 }
