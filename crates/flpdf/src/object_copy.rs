@@ -85,15 +85,10 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     // silent wraparound.
     let mut map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
     for (offset, &src_ref) in refs.iter().enumerate() {
-        let number = u32::try_from(offset)
-            .ok()
-            .and_then(|o| base.checked_add(o))
-            .ok_or_else(|| {
-                Error::Unsupported(
-                    "cross-document copy exhausted the u32 object-number space".to_string(),
-                )
-            })?;
-        map.insert(src_ref, ObjectRef::new(number, 0));
+        map.insert(
+            src_ref,
+            ObjectRef::new(alloc_target_number(base, offset)?, 0),
+        );
     }
 
     // Resolve each source object, rewrite its references in place, and store it.
@@ -140,5 +135,36 @@ fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
 fn rewrite_dict(dict: &mut Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) {
     for value in dict.values_mut() {
         rewrite_refs(value, map);
+    }
+}
+
+/// Compute the target object number for the `offset`-th member of the copy set,
+/// counting up from `base`.  Returns [`Err`] when the allocation would overflow
+/// the `u32` object-number space rather than wrapping or panicking.
+fn alloc_target_number(base: u32, offset: usize) -> Result<u32> {
+    u32::try_from(offset)
+        .ok()
+        .and_then(|o| base.checked_add(o))
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "cross-document copy exhausted the u32 object-number space".to_string(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::alloc_target_number;
+
+    #[test]
+    fn alloc_target_number_counts_up_from_base() {
+        assert_eq!(alloc_target_number(5, 0).unwrap(), 5);
+        assert_eq!(alloc_target_number(5, 3).unwrap(), 8);
+    }
+
+    #[test]
+    fn alloc_target_number_errors_on_overflow() {
+        assert!(alloc_target_number(u32::MAX, 1).is_err());
+        assert!(alloc_target_number(u32::MAX - 2, 5).is_err());
     }
 }

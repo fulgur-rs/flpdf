@@ -126,6 +126,49 @@ fn copies_chain_with_fresh_numbers() {
 }
 
 // ---------------------------------------------------------------------------
+// Array-valued references are remapped element-wise
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remaps_references_inside_arrays() {
+    // Object 4 holds an array of two references (5 and 6).
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /A /Kids [5 0 R 6 0 R] >>"),
+            (5, "<< /Type /B >>"),
+            (6, "<< /Type /C >>"),
+        ],
+        1,
+    );
+    let tgt = build_target_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut target = Pdf::open_mem(&tgt).unwrap();
+
+    let refs = refset(&[
+        ObjectRef::new(4, 0),
+        ObjectRef::new(5, 0),
+        ObjectRef::new(6, 0),
+    ]);
+    let map = copy_objects(&mut source, &mut target, &refs).unwrap();
+
+    let a = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
+    let Object::Dictionary(a_dict) = &a else {
+        panic!("expected dictionary, got {a:?}");
+    };
+    assert_eq!(
+        a_dict.get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(map[&ObjectRef::new(5, 0)]),
+            Object::Reference(map[&ObjectRef::new(6, 0)]),
+        ])),
+        "array elements must be remapped element-wise"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Task 2: reference cycle preservation
 // ---------------------------------------------------------------------------
 
