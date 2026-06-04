@@ -80,7 +80,7 @@ fn copies_chain_with_fresh_numbers() {
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /A /Next 5 0 R >>"),
+            (4, "<< /Type /A /Next 5 0 R /Foo 42 >>"),
             (5, "<< /Type /B /Next 6 0 R >>"),
             (6, "<< /Type /C >>"),
         ],
@@ -105,10 +105,17 @@ fn copies_chain_with_fresh_numbers() {
         assert!(t.number > 3, "fresh target number, got {}", t.number);
     }
 
-    // A's copy references map[5]; B's copy references map[6].
+    // A's copy resolves identically to the source view modulo renumber:
+    // non-reference content (/Type, /Foo) preserved, references remapped.
     let a = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
-    assert!(
-        object_contains(&a, &Object::Reference(map[&ObjectRef::new(5, 0)])),
+    let Object::Dictionary(a_dict) = &a else {
+        panic!("expected dictionary, got {a:?}");
+    };
+    assert_eq!(a_dict.get("Type"), Some(&Object::Name(b"A".to_vec())));
+    assert_eq!(a_dict.get("Foo"), Some(&Object::Integer(42)));
+    assert_eq!(
+        a_dict.get("Next"),
+        Some(&Object::Reference(map[&ObjectRef::new(5, 0)])),
         "A's copy must reference the remapped B"
     );
     let b = target.resolve(map[&ObjectRef::new(5, 0)]).unwrap();
