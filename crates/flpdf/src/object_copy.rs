@@ -67,7 +67,7 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     refs: &BTreeSet<ObjectRef>,
 ) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
     // Next free target object number: one past the current maximum.
-    let mut next = target
+    let base = target
         .object_refs()
         .iter()
         .map(|r| r.number)
@@ -79,9 +79,8 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     // sorted order (BTreeSet) for deterministic output.  Building the complete
     // map before rewriting is what makes cycles safe.
     let mut map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
-    for &src_ref in refs {
-        map.insert(src_ref, ObjectRef::new(next, 0));
-        next += 1;
+    for (offset, &src_ref) in refs.iter().enumerate() {
+        map.insert(src_ref, ObjectRef::new(base + offset as u32, 0));
     }
 
     // Resolve each source object, rewrite its references, and store the copy.
@@ -103,13 +102,12 @@ fn rewrite_refs(obj: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
             Some(&t) => Object::Reference(t),
             None => Object::Null,
         },
-        Object::Array(items) => {
-            Object::Array(items.iter().map(|i| rewrite_refs(i, map)).collect())
-        }
+        Object::Array(items) => Object::Array(items.iter().map(|i| rewrite_refs(i, map)).collect()),
         Object::Dictionary(dict) => Object::Dictionary(rewrite_dict(dict, map)),
-        Object::Stream(stream) => {
-            Object::Stream(Stream::new(rewrite_dict(&stream.dict, map), stream.data.clone()))
-        }
+        Object::Stream(stream) => Object::Stream(Stream::new(
+            rewrite_dict(&stream.dict, map),
+            stream.data.clone(),
+        )),
         Object::Null
         | Object::Boolean(_)
         | Object::Integer(_)
