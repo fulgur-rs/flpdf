@@ -616,3 +616,120 @@ fn is_pdf_name_delimiter(byte: u8) -> bool {
             b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(entries: &[(&str, Object)]) -> Dictionary {
+        let mut dict = Dictionary::new();
+        for (key, value) in entries {
+            dict.insert(*key, value.clone());
+        }
+        dict
+    }
+
+    #[test]
+    fn merge_acroform_dr_keeps_existing_when_source_is_not_a_dictionary() {
+        let target_dr = Object::Dictionary(dict(&[(
+            "Font",
+            Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
+        )]));
+        let mut acroform = dict(&[("DR", target_dr.clone())]);
+
+        let renames = merge_acroform_dr(&mut acroform, Object::Name(b"Bad".to_vec()));
+
+        assert!(renames.is_empty());
+        assert_eq!(acroform.get("DR"), Some(&target_dr));
+    }
+
+    #[test]
+    fn merge_acroform_dr_preserves_non_dictionary_target() {
+        let existing = Object::Name(b"Bad".to_vec());
+        let mut acroform = dict(&[("DR", existing.clone())]);
+        let source_dr = Object::Dictionary(dict(&[(
+            "Font",
+            Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
+        )]));
+
+        let renames = merge_acroform_dr(&mut acroform, source_dr);
+
+        assert!(renames.is_empty());
+        assert_eq!(acroform.get("DR"), Some(&existing));
+    }
+
+    #[test]
+    fn merge_acroform_dr_inserts_source_when_target_is_missing_or_null() {
+        for initial in [None, Some(Object::Null)] {
+            let mut acroform = Dictionary::new();
+            if let Some(value) = initial {
+                acroform.insert("DR", value);
+            }
+            let source_dr = Object::Dictionary(dict(&[(
+                "Font",
+                Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
+            )]));
+
+            let renames = merge_acroform_dr(&mut acroform, source_dr.clone());
+
+            assert!(renames.is_empty());
+            assert_eq!(acroform.get("DR"), Some(&source_dr));
+        }
+    }
+
+    #[test]
+    fn merge_resource_dicts_keeps_target_non_dictionary_categories() {
+        let target = dict(&[("Font", Object::Name(b"Existing".to_vec()))]);
+        let source = dict(&[(
+            "Font",
+            Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
+        )]);
+
+        let (merged, renames) = merge_resource_dicts(target, source);
+
+        assert!(renames.is_empty());
+        assert_eq!(
+            merged.get("Font"),
+            Some(&Object::Name(b"Existing".to_vec()))
+        );
+    }
+
+    #[test]
+    fn merge_resource_category_skips_non_font_conflicts() {
+        let target = dict(&[("Img", Object::Integer(1))]);
+        let source = dict(&[("Img", Object::Integer(2))]);
+
+        let (merged, renames) = merge_resource_category(target, &source, false);
+
+        assert!(renames.is_empty());
+        assert_eq!(merged.get("Img"), Some(&Object::Integer(1)));
+    }
+
+    #[test]
+    fn unique_resource_name_uses_numeric_suffix_after_first_conflict() {
+        let existing = dict(&[
+            ("Helv_flpdf", Object::Integer(1)),
+            ("Helv_flpdf2", Object::Integer(2)),
+        ]);
+
+        assert_eq!(unique_resource_name(b"Helv", &existing), b"Helv_flpdf3");
+    }
+
+    #[test]
+    fn rewrite_da_resource_names_handles_non_strings_and_unmapped_names() {
+        let mut renames = BTreeMap::new();
+        renames.insert(b"Helv".to_vec(), b"Helv_flpdf".to_vec());
+
+        assert_eq!(
+            rewrite_da_resource_names(Object::Name(b"DA".to_vec()), &renames),
+            Object::Name(b"DA".to_vec())
+        );
+        assert_eq!(
+            rewrite_da_resource_names(
+                Object::String(b"/Other 9 Tf /Helv2 10 Tf".to_vec()),
+                &renames
+            ),
+            Object::String(b"/Other 9 Tf /Helv2 10 Tf".to_vec())
+        );
+    }
+}
