@@ -140,6 +140,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 _ => {}
             }
         }
+        materialize_acroform_dr(&mut acroform, self.pdf)?;
         let font_renames = match source_dr {
             Some(dr) => merge_acroform_dr(&mut acroform, resolve_dictionary_object(self.pdf, dr)?),
             None => BTreeMap::new(),
@@ -448,6 +449,17 @@ fn resolve_dictionary_object<R: Read + Seek>(pdf: &mut Pdf<R>, obj: Object) -> R
         },
         other => Ok(other),
     }
+}
+
+fn materialize_acroform_dr<R: Read + Seek>(
+    acroform: &mut Dictionary,
+    pdf: &mut Pdf<R>,
+) -> Result<()> {
+    let Some(dr) = acroform.get("DR").cloned() else {
+        return Ok(());
+    };
+    acroform.insert("DR", resolve_dictionary_object(pdf, dr)?);
+    Ok(())
 }
 
 fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
