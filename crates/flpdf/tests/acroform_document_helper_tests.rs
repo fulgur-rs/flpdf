@@ -36,9 +36,13 @@ fn form_pdf() -> Vec<u8> {
             (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Fields [5 0 R] /DA (/Helv 10 Tf 0 g) >>"),
+            (
+                4,
+                "<< /Fields [5 0 R] /DA (/Helv 10 Tf 0 g) /DR << /Font << /Helv 7 0 R >> >> >>",
+            ),
             (5, "<< /T (parent) /FT /Tx /Kids [6 0 R] >>"),
             (6, "<< /T (child) /Parent 5 0 R /V (before) >>"),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
         ],
         1,
     )
@@ -50,6 +54,23 @@ fn empty_pdf() -> Vec<u8> {
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+fn parent_da_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] /DA (/Doc 10 Tf 0 g) >>"),
+            (
+                5,
+                "<< /T (parent) /FT /Tx /DA (/Parent 11 Tf 1 0 0 rg) /Kids [6 0 R] >>",
+            ),
+            (6, "<< /T (child) /Parent 5 0 R /V (value) >>"),
         ],
         1,
     )
@@ -114,6 +135,60 @@ fn default_appearance_is_set_and_inherited_to_fields() {
 }
 
 #[test]
+fn fix_appearance_inheritance_respects_parent_field_da() {
+    let bytes = parent_da_pdf();
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+    pdf.acroform().fix_appearance_inheritance().unwrap();
+
+    let child = pdf.resolve(ObjectRef::new(6, 0)).unwrap();
+    let Object::Dictionary(child_dict) = child else {
+        panic!("child field should be a dictionary");
+    };
+    assert_eq!(
+        child_dict.get("DA"),
+        Some(&Object::String(b"/Parent 11 Tf 1 0 0 rg".to_vec()))
+    );
+}
+
+#[test]
+fn fields_errors_when_field_tree_depth_limit_is_exceeded() {
+    let mut objects = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (4, "<< /Fields [5 0 R] >>".to_string()),
+    ];
+    for object_number in 5..=106 {
+        let kid = object_number + 1;
+        objects.push((
+            object_number,
+            format!("<< /T (f{object_number}) /Kids [{kid} 0 R] >>"),
+        ));
+    }
+    objects.push((107, "<< /T (leaf) >>".to_string()));
+    let borrowed: Vec<(u32, &str)> = objects
+        .iter()
+        .map(|(object_number, body)| (*object_number, body.as_str()))
+        .collect();
+    let bytes = build_pdf(&borrowed, 1);
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+    let err = pdf.acroform().fields().unwrap_err();
+
+    assert!(
+        matches!(err, flpdf::Error::Unsupported(_)),
+        "expected depth-limit Unsupported error, got {err:?}"
+    );
+}
+
+#[test]
 fn copy_fields_from_appends_copied_fields_to_target_acroform() {
     let source_bytes = form_pdf();
     let target_bytes = empty_pdf();
@@ -132,4 +207,53 @@ fn copy_fields_from_appends_copied_fields_to_target_acroform() {
 
     let value = target.acroform().field_value(fields[1]).unwrap();
     assert_eq!(value, Some(Object::String(b"before".to_vec())));
+}
+
+#[test]
+fn copy_fields_from_copies_acroform_da_and_dr_defaults() {
+    let source_bytes = form_pdf();
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    target.acroform().copy_fields_from(&mut source).unwrap();
+
+    let catalog = target.resolve(ObjectRef::new(1, 0)).unwrap();
+    let Object::Dictionary(catalog_dict) = catalog else {
+        panic!("catalog should be a dictionary");
+    };
+    let acroform_ref = catalog_dict
+        .get_ref("AcroForm")
+        .expect("target catalog should reference AcroForm");
+    let acroform = target.resolve(acroform_ref).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("AcroForm should be a dictionary");
+    };
+
+    assert_eq!(
+        acroform_dict.get("DA"),
+        Some(&Object::String(b"/Helv 10 Tf 0 g".to_vec()))
+    );
+    let Object::Dictionary(dr) = acroform_dict.get("DR").expect("copied /DR") else {
+        panic!("/DR should be a direct dictionary");
+    };
+    let Object::Dictionary(fonts) = dr.get("Font").expect("/DR/Font") else {
+        panic!("/DR/Font should be a dictionary");
+    };
+    let Object::Reference(font_ref) = fonts.get("Helv").expect("/DR/Font/Helv") else {
+        panic!("Helv font should be remapped as a reference");
+    };
+    assert!(
+        font_ref.number > 3,
+        "copied font should use a fresh target object number"
+    );
+
+    let font = target.resolve(*font_ref).unwrap();
+    let Object::Dictionary(font_dict) = font else {
+        panic!("copied font should be a dictionary");
+    };
+    assert_eq!(
+        font_dict.get("BaseFont"),
+        Some(&Object::Name(b"Helvetica".to_vec()))
+    );
 }

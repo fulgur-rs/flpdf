@@ -7,9 +7,13 @@
 
 use crate::{
     copy_objects, Dictionary, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf, Result,
+    DEFAULT_MAX_ACROFORM_DEPTH,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
+
+type AcroFormInheritedEntries = Vec<(Vec<u8>, Object)>;
+type FieldCopySet = BTreeSet<ObjectRef>;
 
 /// High-level helper for a document's `/AcroForm`.
 ///
@@ -84,12 +88,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(da) = acroform.get("DA").cloned() else {
             return Ok(());
         };
+        let Some(fields) = resolve_array_value(self.pdf, acroform.get("Fields").cloned())? else {
+            return Ok(());
+        };
 
-        for field_ref in self.fields()? {
-            let mut field = self.resolve_field_dict(field_ref)?;
-            if field.get("DA").is_none() {
-                field.insert("DA", da.clone());
-                self.pdf.set_object(field_ref, Object::Dictionary(field));
+        let mut seen = BTreeSet::new();
+        for item in fields {
+            if let Object::Reference(field_ref) = item {
+                self.fix_field_appearance_inheritance(field_ref, &da, &mut seen, 0)?;
             }
         }
         Ok(())
@@ -102,7 +108,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         &mut self,
         source: &mut Pdf<RS>,
     ) -> Result<Vec<ObjectRef>> {
-        let (top_fields, copy_set) = source_field_copy_set(source)?;
+        let (top_fields, inherited_entries, copy_set) = source_field_copy_set(source)?;
         if top_fields.is_empty() {
             return Ok(Vec::new());
         }
@@ -119,6 +125,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.unwrap_or_default();
         fields.extend(copied_top.iter().copied().map(Object::Reference));
         acroform.insert("Fields", Object::Array(fields));
+        for (key, value) in inherited_entries {
+            if acroform.get(&key).is_none() {
+                acroform.insert(key, remap_refs_in_object(value, &map));
+            }
+        }
         self.pdf
             .set_object(acroform_ref, Object::Dictionary(acroform));
 
@@ -203,6 +214,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         seen: &mut BTreeSet<ObjectRef>,
         out: &mut Vec<ObjectRef>,
     ) -> Result<()> {
+        self.walk_field_tree_rec(field_ref, seen, out, 0)
+    }
+
+    fn walk_field_tree_rec(
+        &mut self,
+        field_ref: ObjectRef,
+        seen: &mut BTreeSet<ObjectRef>,
+        out: &mut Vec<ObjectRef>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+            )));
+        }
         if !seen.insert(field_ref) {
             return Ok(());
         }
@@ -214,7 +240,45 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         for kid in kids {
             if let Object::Reference(kid_ref) = kid {
-                self.walk_field_tree(kid_ref, seen, out)?;
+                self.walk_field_tree_rec(kid_ref, seen, out, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fix_field_appearance_inheritance(
+        &mut self,
+        field_ref: ObjectRef,
+        inherited_da: &Object,
+        seen: &mut BTreeSet<ObjectRef>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+            )));
+        }
+        if !seen.insert(field_ref) {
+            return Ok(());
+        }
+
+        let mut field = self.resolve_field_dict(field_ref)?;
+        let current_da = match field.get("DA").cloned() {
+            Some(da) => da,
+            None => {
+                field.insert("DA", inherited_da.clone());
+                self.pdf
+                    .set_object(field_ref, Object::Dictionary(field.clone()));
+                inherited_da.clone()
+            }
+        };
+
+        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
+            return Ok(());
+        };
+        for kid in kids {
+            if let Object::Reference(kid_ref) = kid {
+                self.fix_field_appearance_inheritance(kid_ref, &current_da, seen, depth + 1)?;
             }
         }
         Ok(())
@@ -230,15 +294,19 @@ impl<R: Read + Seek> Pdf<R> {
 
 fn source_field_copy_set<RS: Read + Seek>(
     source: &mut Pdf<RS>,
-) -> Result<(Vec<ObjectRef>, BTreeSet<ObjectRef>)> {
+) -> Result<(Vec<ObjectRef>, AcroFormInheritedEntries, FieldCopySet)> {
     let mut helper = AcroFormDocumentHelper::new(source);
     let top_fields = helper.top_level_fields()?;
+    let inherited_entries = helper.acroform_inherited_entries()?;
     let mut copy_set = BTreeSet::new();
     let mut seen = BTreeSet::new();
     for field_ref in &top_fields {
         collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen)?;
     }
-    Ok((top_fields, copy_set))
+    for (_, value) in &inherited_entries {
+        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen)?;
+    }
+    Ok((top_fields, inherited_entries, copy_set))
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
@@ -254,6 +322,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .filter_map(|item| match item {
                 Object::Reference(field_ref) => Some(field_ref),
                 _ => None,
+            })
+            .collect())
+    }
+
+    fn acroform_inherited_entries(&mut self) -> Result<Vec<(Vec<u8>, Object)>> {
+        let Some(acroform) = self.acroform_dict()? else {
+            return Ok(Vec::new());
+        };
+        Ok([b"DA".as_slice(), b"DR".as_slice()]
+            .into_iter()
+            .filter_map(|key| {
+                acroform
+                    .get(key)
+                    .cloned()
+                    .map(|value| (key.to_vec(), value))
             })
             .collect())
     }
@@ -328,4 +411,39 @@ fn resolve_array_value<R: Read + Seek>(
         },
         Some(_) => Ok(None),
     }
+}
+
+fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
+    match obj {
+        Object::Reference(object_ref) => map
+            .get(&object_ref)
+            .copied()
+            .map(Object::Reference)
+            .unwrap_or(Object::Null),
+        Object::Array(items) => Object::Array(
+            items
+                .into_iter()
+                .map(|item| remap_refs_in_object(item, map))
+                .collect(),
+        ),
+        Object::Dictionary(dict) => Object::Dictionary(remap_refs_in_dict(dict, map)),
+        Object::Stream(mut stream) => {
+            stream.dict = remap_refs_in_dict(stream.dict, map);
+            Object::Stream(stream)
+        }
+        Object::Null
+        | Object::Boolean(_)
+        | Object::Integer(_)
+        | Object::Real(_)
+        | Object::Name(_)
+        | Object::String(_) => obj,
+    }
+}
+
+fn remap_refs_in_dict(dict: Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) -> Dictionary {
+    let mut out = Dictionary::new();
+    for (key, value) in dict.iter() {
+        out.insert(key, remap_refs_in_object(value.clone(), map));
+    }
+    out
 }
