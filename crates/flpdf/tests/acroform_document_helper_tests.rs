@@ -59,6 +59,22 @@ fn empty_pdf() -> Vec<u8> {
     )
 }
 
+fn target_form_defaults_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Fields [] /DA (/Other 8 Tf 1 0 0 rg) /DR << /Font << /Other 5 0 R >> >> >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+        ],
+        1,
+    )
+}
+
 fn parent_da_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -256,4 +272,43 @@ fn copy_fields_from_copies_acroform_da_and_dr_defaults() {
         font_dict.get("BaseFont"),
         Some(&Object::Name(b"Helvetica".to_vec()))
     );
+}
+
+#[test]
+fn copy_fields_from_materializes_source_defaults_when_target_has_defaults() {
+    let source_bytes = form_pdf();
+    let target_bytes = target_form_defaults_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+
+    let top = target.resolve(copied[0]).unwrap();
+    let Object::Dictionary(top_dict) = top else {
+        panic!("copied top field should be a dictionary");
+    };
+    assert_eq!(
+        top_dict.get("DA"),
+        Some(&Object::String(b"/Helv 10 Tf 0 g".to_vec())),
+        "copied field should inherit source, not target, AcroForm /DA"
+    );
+
+    let acroform = target.resolve(ObjectRef::new(4, 0)).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("target AcroForm should be a dictionary");
+    };
+    assert_eq!(
+        acroform_dict.get("DA"),
+        Some(&Object::String(b"/Other 8 Tf 1 0 0 rg".to_vec())),
+        "target AcroForm /DA should remain unchanged"
+    );
+
+    let Object::Dictionary(dr) = acroform_dict.get("DR").expect("target /DR") else {
+        panic!("/DR should be a dictionary");
+    };
+    let Object::Dictionary(fonts) = dr.get("Font").expect("/DR/Font") else {
+        panic!("/DR/Font should be a dictionary");
+    };
+    assert!(fonts.get("Other").is_some(), "target font should remain");
+    assert!(fonts.get("Helv").is_some(), "source font should be merged");
 }

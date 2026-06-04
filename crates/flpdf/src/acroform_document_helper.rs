@@ -125,13 +125,32 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.unwrap_or_default();
         fields.extend(copied_top.iter().copied().map(Object::Reference));
         acroform.insert("Fields", Object::Array(fields));
+
+        let mut source_da = None;
         for (key, value) in inherited_entries {
-            if acroform.get(&key).is_none() {
-                acroform.insert(key, remap_refs_in_object(value, &map));
+            let mapped = remap_refs_in_object(value, &map);
+            match key.as_slice() {
+                b"DA" => {
+                    source_da = Some(mapped.clone());
+                    if acroform.get("DA").is_none() {
+                        acroform.insert("DA", mapped);
+                    }
+                }
+                b"DR" => {
+                    merge_acroform_dr(&mut acroform, mapped);
+                }
+                _ => {}
             }
         }
         self.pdf
             .set_object(acroform_ref, Object::Dictionary(acroform));
+
+        if let Some(da) = source_da {
+            let mut seen = BTreeSet::new();
+            for copied_ref in &copied_top {
+                self.fix_field_appearance_inheritance(*copied_ref, &da, &mut seen, 0)?;
+            }
+        }
 
         Ok(copied_top)
     }
@@ -446,4 +465,46 @@ fn remap_refs_in_dict(dict: Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) ->
         out.insert(key, remap_refs_in_object(value.clone(), map));
     }
     out
+}
+
+fn merge_acroform_dr(acroform: &mut Dictionary, source_dr: Object) {
+    match acroform.remove("DR") {
+        None | Some(Object::Null) => acroform.insert("DR", source_dr),
+        Some(Object::Dictionary(target_dr)) => {
+            if let Object::Dictionary(source_dr) = source_dr {
+                acroform.insert(
+                    "DR",
+                    Object::Dictionary(merge_resource_dicts(target_dr, source_dr)),
+                );
+            } else {
+                acroform.insert("DR", Object::Dictionary(target_dr));
+            }
+        }
+        Some(existing) => acroform.insert("DR", existing),
+    }
+}
+
+fn merge_resource_dicts(mut target: Dictionary, source: Dictionary) -> Dictionary {
+    for (category, source_value) in source.iter() {
+        match (target.remove(category), source_value) {
+            (None, _) => target.insert(category, source_value.clone()),
+            (Some(Object::Dictionary(target_category)), Object::Dictionary(source_category)) => {
+                target.insert(
+                    category,
+                    Object::Dictionary(merge_resource_category(target_category, source_category)),
+                );
+            }
+            (Some(existing), _) => target.insert(category, existing),
+        }
+    }
+    target
+}
+
+fn merge_resource_category(mut target: Dictionary, source: &Dictionary) -> Dictionary {
+    for (name, value) in source.iter() {
+        if target.get(name).is_none() {
+            target.insert(name, value.clone());
+        }
+    }
+    target
 }
