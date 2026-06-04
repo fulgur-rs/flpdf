@@ -89,7 +89,7 @@ fn walk_field<R: Read + Seek>(
     };
     let field_dict = field_dict.clone();
 
-    let field_name = join_field_name(parent_name, text_entry(&field_dict, "T"));
+    let field_name = join_field_name(parent_name, text_entry(pdf, &field_dict, "T")?);
     if inherited_name(pdf, &field_dict, "FT")?.as_deref() == Some(b"Sig") {
         if let Some(info) = signature_info_for_field(pdf, field_ref, &field_name, &field_dict)? {
             output.push(info);
@@ -148,13 +148,13 @@ fn signature_info_for_field<R: Read + Seek>(
         signature_ref,
         field_name: field_name.to_string(),
         byte_range,
-        sub_filter: name_entry(&signature_dict, "SubFilter"),
-        signer_name: text_entry(&signature_dict, "Name"),
-        signing_time: text_entry(&signature_dict, "M"),
-        reason: text_entry(&signature_dict, "Reason"),
-        location: text_entry(&signature_dict, "Location"),
-        contact_info: text_entry(&signature_dict, "ContactInfo"),
-        certificate: certificate_entry(&signature_dict),
+        sub_filter: name_entry(pdf, &signature_dict, "SubFilter")?,
+        signer_name: text_entry(pdf, &signature_dict, "Name")?,
+        signing_time: text_entry(pdf, &signature_dict, "M")?,
+        reason: text_entry(pdf, &signature_dict, "Reason")?,
+        location: text_entry(pdf, &signature_dict, "Location")?,
+        contact_info: text_entry(pdf, &signature_dict, "ContactInfo")?,
+        certificate: certificate_entry(pdf, &signature_dict)?,
     }))
 }
 
@@ -218,6 +218,10 @@ fn inherited_name<R: Read + Seek>(
 ) -> Result<Option<Vec<u8>>> {
     match inherited_field_value(pdf, field_dict, key)? {
         Some(Object::Name(name)) => Ok(Some(name)),
+        Some(Object::Reference(object_ref)) => match pdf.resolve_borrowed(object_ref)? {
+            Object::Name(name) => Ok(Some(name.clone())),
+            _ => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -278,29 +282,63 @@ fn is_pure_widget(dict: &Dictionary) -> bool {
     is_widget && !has_field_entries
 }
 
-fn name_entry(dict: &Dictionary, key: &str) -> Option<String> {
+fn resolve_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+    key: &str,
+) -> Result<Option<Object>> {
     match dict.get(key) {
-        Some(Object::Name(name)) => Some(String::from_utf8_lossy(name).into_owned()),
-        _ => None,
+        Some(Object::Reference(object_ref)) => Ok(Some(pdf.resolve(*object_ref)?)),
+        Some(object) => Ok(Some(object.clone())),
+        None => Ok(None),
     }
 }
 
-fn text_entry(dict: &Dictionary, key: &str) -> Option<String> {
-    match dict.get(key) {
-        Some(Object::String(bytes)) => Some(
-            decode_pdf_text_string(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into()),
-        ),
-        _ => None,
+fn name_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+    key: &str,
+) -> Result<Option<String>> {
+    match resolve_entry(pdf, dict, key)? {
+        Some(Object::Name(name)) => Ok(Some(String::from_utf8_lossy(&name).into_owned())),
+        _ => Ok(None),
     }
 }
 
-fn certificate_entry(dict: &Dictionary) -> Option<Vec<u8>> {
-    match dict.get("Cert") {
-        Some(Object::String(bytes)) => Some(bytes.clone()),
-        Some(Object::Array(values)) => values.iter().find_map(|value| match value {
-            Object::String(bytes) => Some(bytes.clone()),
-            _ => None,
-        }),
-        _ => None,
+fn text_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+    key: &str,
+) -> Result<Option<String>> {
+    match resolve_entry(pdf, dict, key)? {
+        Some(Object::String(bytes)) => Ok(Some(
+            decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into()),
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn certificate_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+) -> Result<Option<Vec<u8>>> {
+    match resolve_entry(pdf, dict, "Cert")? {
+        Some(Object::String(bytes)) => Ok(Some(bytes)),
+        Some(Object::Array(values)) => {
+            for value in values {
+                match value {
+                    Object::String(bytes) => return Ok(Some(bytes)),
+                    Object::Reference(object_ref) => {
+                        if let Object::String(bytes) = pdf.resolve(object_ref)? {
+                            return Ok(Some(bytes));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
     }
 }
