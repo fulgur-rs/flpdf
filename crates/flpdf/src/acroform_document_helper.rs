@@ -140,9 +140,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 _ => {}
             }
         }
-        let font_renames = source_dr
-            .map(|dr| merge_acroform_dr(&mut acroform, dr))
-            .unwrap_or_default();
+        let font_renames = match source_dr {
+            Some(dr) => merge_acroform_dr(&mut acroform, resolve_dictionary_object(self.pdf, dr)?),
+            None => BTreeMap::new(),
+        };
         let source_da = source_da.map(|da| rewrite_da_resource_names(da, &font_renames));
         if let Some(da) = source_da.clone() {
             if acroform.get("DA").is_none() {
@@ -436,6 +437,16 @@ fn resolve_array_value<R: Read + Seek>(
             _ => Ok(None),
         },
         Some(_) => Ok(None),
+    }
+}
+
+fn resolve_dictionary_object<R: Read + Seek>(pdf: &mut Pdf<R>, obj: Object) -> Result<Object> {
+    match obj {
+        Object::Reference(object_ref) => match pdf.resolve_borrowed(object_ref)? {
+            Object::Dictionary(dict) => Ok(Object::Dictionary(dict.clone())),
+            _ => Ok(Object::Reference(object_ref)),
+        },
+        other => Ok(other),
     }
 }
 
