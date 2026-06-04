@@ -75,6 +75,22 @@ fn target_form_defaults_pdf() -> Vec<u8> {
     )
 }
 
+fn target_conflicting_font_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Fields [] /DA (/Helv 8 Tf 1 0 0 rg) /DR << /Font << /Helv 5 0 R >> >> >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+        ],
+        1,
+    )
+}
+
 fn parent_da_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -311,4 +327,57 @@ fn copy_fields_from_materializes_source_defaults_when_target_has_defaults() {
     };
     assert!(fonts.get("Other").is_some(), "target font should remain");
     assert!(fonts.get("Helv").is_some(), "source font should be merged");
+}
+
+#[test]
+fn copy_fields_from_renames_conflicting_default_font_resources() {
+    let source_bytes = form_pdf();
+    let target_bytes = target_conflicting_font_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+
+    let top = target.resolve(copied[0]).unwrap();
+    let Object::Dictionary(top_dict) = top else {
+        panic!("copied top field should be a dictionary");
+    };
+    let da = top_dict
+        .get("DA")
+        .and_then(Object::as_string)
+        .expect("copied field should have materialized /DA");
+    assert!(
+        da.starts_with(b"/Helv_flpdf"),
+        "conflicting source font should be renamed in copied /DA, got {}",
+        String::from_utf8_lossy(da)
+    );
+
+    let acroform = target.resolve(ObjectRef::new(4, 0)).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("target AcroForm should be a dictionary");
+    };
+    let Object::Dictionary(dr) = acroform_dict.get("DR").expect("target /DR") else {
+        panic!("/DR should be a dictionary");
+    };
+    let Object::Dictionary(fonts) = dr.get("Font").expect("/DR/Font") else {
+        panic!("/DR/Font should be a dictionary");
+    };
+    assert_eq!(
+        fonts.get("Helv"),
+        Some(&Object::Reference(ObjectRef::new(5, 0))),
+        "target /Helv font should remain intact"
+    );
+    let renamed_ref = fonts
+        .iter()
+        .find_map(|(name, value)| (name.starts_with(b"Helv_flpdf")).then(|| value.as_ref_id()))
+        .flatten()
+        .expect("renamed source font should be present");
+    let renamed_font = target.resolve(renamed_ref).unwrap();
+    let Object::Dictionary(font_dict) = renamed_font else {
+        panic!("renamed source font should be a dictionary");
+    };
+    assert_eq!(
+        font_dict.get("BaseFont"),
+        Some(&Object::Name(b"Helvetica".to_vec()))
+    );
 }
