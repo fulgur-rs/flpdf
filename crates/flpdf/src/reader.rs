@@ -374,6 +374,15 @@ impl<R: Read + Seek> Pdf<R> {
         }))
     }
 
+    /// Return all signed AcroForm signature fields in document field order.
+    ///
+    /// This walks `/Catalog /AcroForm /Fields`, descends through field `/Kids`,
+    /// and returns only `/FT /Sig` fields whose `/V` signature dictionary has a
+    /// valid four-integer `/ByteRange`.
+    pub fn signatures(&mut self) -> Result<Vec<crate::SignatureInfo>> {
+        crate::signatures::signatures(self)
+    }
+
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
         let loaded = if options.repair {
             load_xref_and_trailer_with_repair(&mut reader, options.repair)?
