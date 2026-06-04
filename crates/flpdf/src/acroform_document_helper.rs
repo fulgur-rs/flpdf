@@ -127,19 +127,26 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         acroform.insert("Fields", Object::Array(fields));
 
         let mut source_da = None;
+        let mut source_dr = None;
         for (key, value) in inherited_entries {
             let mapped = remap_refs_in_object(value, &map);
             match key.as_slice() {
                 b"DA" => {
-                    source_da = Some(mapped.clone());
-                    if acroform.get("DA").is_none() {
-                        acroform.insert("DA", mapped);
-                    }
+                    source_da = Some(mapped);
                 }
                 b"DR" => {
-                    merge_acroform_dr(&mut acroform, mapped);
+                    source_dr = Some(mapped);
                 }
                 _ => {}
+            }
+        }
+        let font_renames = source_dr
+            .map(|dr| merge_acroform_dr(&mut acroform, dr))
+            .unwrap_or_default();
+        let source_da = source_da.map(|da| rewrite_da_resource_names(da, &font_renames));
+        if let Some(da) = source_da.clone() {
+            if acroform.get("DA").is_none() {
+                acroform.insert("DA", da);
             }
         }
         self.pdf
@@ -467,44 +474,122 @@ fn remap_refs_in_dict(dict: Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) ->
     out
 }
 
-fn merge_acroform_dr(acroform: &mut Dictionary, source_dr: Object) {
+fn merge_acroform_dr(acroform: &mut Dictionary, source_dr: Object) -> BTreeMap<Vec<u8>, Vec<u8>> {
     match acroform.remove("DR") {
-        None | Some(Object::Null) => acroform.insert("DR", source_dr),
+        None | Some(Object::Null) => {
+            acroform.insert("DR", source_dr);
+            BTreeMap::new()
+        }
         Some(Object::Dictionary(target_dr)) => {
             if let Object::Dictionary(source_dr) = source_dr {
-                acroform.insert(
-                    "DR",
-                    Object::Dictionary(merge_resource_dicts(target_dr, source_dr)),
-                );
+                let (merged, renames) = merge_resource_dicts(target_dr, source_dr);
+                acroform.insert("DR", Object::Dictionary(merged));
+                renames
             } else {
                 acroform.insert("DR", Object::Dictionary(target_dr));
+                BTreeMap::new()
             }
         }
-        Some(existing) => acroform.insert("DR", existing),
+        Some(existing) => {
+            acroform.insert("DR", existing);
+            BTreeMap::new()
+        }
     }
 }
 
-fn merge_resource_dicts(mut target: Dictionary, source: Dictionary) -> Dictionary {
+fn merge_resource_dicts(
+    mut target: Dictionary,
+    source: Dictionary,
+) -> (Dictionary, BTreeMap<Vec<u8>, Vec<u8>>) {
+    let mut font_renames = BTreeMap::new();
     for (category, source_value) in source.iter() {
         match (target.remove(category), source_value) {
             (None, _) => target.insert(category, source_value.clone()),
             (Some(Object::Dictionary(target_category)), Object::Dictionary(source_category)) => {
-                target.insert(
-                    category,
-                    Object::Dictionary(merge_resource_category(target_category, source_category)),
-                );
+                let (merged, renames) =
+                    merge_resource_category(target_category, source_category, category == b"Font");
+                if category == b"Font" {
+                    font_renames.extend(renames);
+                }
+                target.insert(category, Object::Dictionary(merged));
             }
             (Some(existing), _) => target.insert(category, existing),
         }
     }
-    target
+    (target, font_renames)
 }
 
-fn merge_resource_category(mut target: Dictionary, source: &Dictionary) -> Dictionary {
+fn merge_resource_category(
+    mut target: Dictionary,
+    source: &Dictionary,
+    rename_conflicts: bool,
+) -> (Dictionary, BTreeMap<Vec<u8>, Vec<u8>>) {
+    let mut renames = BTreeMap::new();
     for (name, value) in source.iter() {
-        if target.get(name).is_none() {
-            target.insert(name, value.clone());
+        match target.get(name) {
+            None => target.insert(name, value.clone()),
+            Some(existing) if existing == value => {}
+            Some(_) if rename_conflicts => {
+                let renamed = unique_resource_name(name, &target);
+                target.insert(&renamed, value.clone());
+                renames.insert(name.to_vec(), renamed);
+            }
+            Some(_) => {}
         }
     }
-    target
+    (target, renames)
+}
+
+fn unique_resource_name(base: &[u8], existing: &Dictionary) -> Vec<u8> {
+    let mut candidate = [base, b"_flpdf"].concat();
+    let mut suffix = 2u32;
+    while existing.get(&candidate).is_some() {
+        candidate = [base, b"_flpdf", suffix.to_string().as_bytes()].concat();
+        suffix += 1;
+    }
+    candidate
+}
+
+fn rewrite_da_resource_names(da: Object, renames: &BTreeMap<Vec<u8>, Vec<u8>>) -> Object {
+    if renames.is_empty() {
+        return da;
+    }
+    match da {
+        Object::String(bytes) => Object::String(rewrite_pdf_name_tokens(&bytes, renames)),
+        other => other,
+    }
+}
+
+fn rewrite_pdf_name_tokens(bytes: &[u8], renames: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'/' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && !is_pdf_name_delimiter(bytes[end]) {
+            end += 1;
+        }
+        out.push(b'/');
+        if let Some(renamed) = renames.get(&bytes[start..end]) {
+            out.extend_from_slice(renamed);
+        } else {
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        i = end;
+    }
+    out
+}
+
+fn is_pdf_name_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
 }
