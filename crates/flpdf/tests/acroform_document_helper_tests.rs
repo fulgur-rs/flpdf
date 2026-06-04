@@ -75,6 +75,83 @@ fn empty_pdf() -> Vec<u8> {
     )
 }
 
+fn direct_acroform_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+fn malformed_acroform_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm /Bad >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+fn malformed_fields_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields /Bad /DA (/Doc 10 Tf 0 g) >>"),
+        ],
+        1,
+    )
+}
+
+fn no_default_appearance_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [/Ignored 5 0 R] >>"),
+            (5, "<< /T (field) /FT /Tx >>"),
+        ],
+        1,
+    )
+}
+
+fn indirect_malformed_fields_pdf(fields: &str) -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields 5 0 R /DA (/Doc 10 Tf 0 g) >>"),
+            (5, fields),
+        ],
+        1,
+    )
+}
+
+fn source_without_defaults_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] >>"),
+            (5, "<< /T (parent) /FT /Tx /Kids [6 0 R /Ignored] >>"),
+            (6, "<< /T (child) /Parent 5 0 R /V (before) >>"),
+        ],
+        1,
+    )
+}
+
 fn target_form_defaults_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -149,6 +226,54 @@ fn fields_walks_acroform_field_tree() {
 }
 
 #[test]
+fn missing_or_malformed_acroform_shapes_are_noops() {
+    let empty_bytes = empty_pdf();
+    let mut empty = Pdf::open_mem(&empty_bytes).unwrap();
+    assert!(empty.acroform().fields().unwrap().is_empty());
+    empty.acroform().fix_appearance_inheritance().unwrap();
+
+    let malformed_bytes = malformed_acroform_pdf();
+    let mut malformed = Pdf::open_mem(&malformed_bytes).unwrap();
+    assert!(malformed.acroform().fields().unwrap().is_empty());
+    malformed.acroform().fix_appearance_inheritance().unwrap();
+}
+
+#[test]
+fn malformed_fields_are_ignored_for_listing_and_appearance_fixup() {
+    let bytes = malformed_fields_pdf();
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+    assert!(pdf.acroform().fields().unwrap().is_empty());
+    pdf.acroform().fix_appearance_inheritance().unwrap();
+}
+
+#[test]
+fn missing_default_appearance_is_noop_but_fields_still_walk() {
+    let bytes = no_default_appearance_pdf();
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+    assert_eq!(pdf.acroform().fields().unwrap(), vec![ObjectRef::new(5, 0)]);
+    pdf.acroform().fix_appearance_inheritance().unwrap();
+
+    let field = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
+    let Object::Dictionary(field_dict) = field else {
+        panic!("field should be a dictionary");
+    };
+    assert!(field_dict.get("DA").is_none());
+}
+
+#[test]
+fn indirect_malformed_fields_are_ignored() {
+    for fields in ["null", "/Bad"] {
+        let bytes = indirect_malformed_fields_pdf(fields);
+        let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+        assert!(pdf.acroform().fields().unwrap().is_empty());
+        pdf.acroform().fix_appearance_inheritance().unwrap();
+    }
+}
+
+#[test]
 fn field_value_get_set_uses_live_document() {
     let bytes = form_pdf();
     let mut pdf = Pdf::open_mem(&bytes).unwrap();
@@ -168,6 +293,32 @@ fn field_value_get_set_uses_live_document() {
     assert_eq!(
         acroform.field_value(ObjectRef::new(6, 0)).unwrap(),
         Some(Object::String(b"after".to_vec()))
+    );
+}
+
+#[test]
+fn default_appearance_materializes_direct_catalog_acroform() {
+    let bytes = direct_acroform_pdf();
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let da = b"/Helv 12 Tf 0 g".to_vec();
+
+    pdf.acroform().set_default_appearance(da.clone()).unwrap();
+
+    let catalog = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let Object::Dictionary(catalog_dict) = catalog else {
+        panic!("catalog should be a dictionary");
+    };
+    let acroform_ref = catalog_dict
+        .get_ref("AcroForm")
+        .expect("direct AcroForm should be materialized as an indirect object");
+    let acroform = pdf.resolve(acroform_ref).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("AcroForm should be a dictionary");
+    };
+    assert_eq!(acroform_dict.get("DA"), Some(&Object::String(da)));
+    assert_eq!(
+        acroform_dict.get("Fields"),
+        Some(&Object::Array(Vec::new()))
     );
 }
 
@@ -269,6 +420,52 @@ fn copy_fields_from_appends_copied_fields_to_target_acroform() {
 
     let value = target.acroform().field_value(fields[1]).unwrap();
     assert_eq!(value, Some(Object::String(b"before".to_vec())));
+}
+
+#[test]
+fn copy_fields_from_empty_or_defaultless_source_preserves_target_defaults() {
+    let empty_source_bytes = empty_pdf();
+    let target_bytes = target_form_defaults_pdf();
+    let mut empty_source = Pdf::open_mem(&empty_source_bytes).unwrap();
+    let mut empty_target = Pdf::open_mem(&target_bytes).unwrap();
+
+    assert!(empty_target
+        .acroform()
+        .copy_fields_from(&mut empty_source)
+        .unwrap()
+        .is_empty());
+
+    let source_bytes = source_without_defaults_pdf();
+    let target_bytes = target_form_defaults_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+
+    assert_eq!(copied.len(), 1);
+    let fields = target.acroform().fields().unwrap();
+    assert_eq!(
+        fields.len(),
+        2,
+        "non-reference kids should be ignored while copied fields remain reachable"
+    );
+
+    let acroform = target.resolve(ObjectRef::new(4, 0)).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("target AcroForm should be a dictionary");
+    };
+    assert_eq!(
+        acroform_dict.get("DA"),
+        Some(&Object::String(b"/Other 8 Tf 1 0 0 rg".to_vec()))
+    );
+    let top = target.resolve(copied[0]).unwrap();
+    let Object::Dictionary(top_dict) = top else {
+        panic!("copied top field should be a dictionary");
+    };
+    assert!(
+        top_dict.get("DA").is_none(),
+        "source without /DA should not materialize target defaults onto copied fields"
+    );
 }
 
 #[test]
