@@ -115,10 +115,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let acroform_ref = self.ensure_acroform_ref()?;
         let mut acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
-        let mut fields = match resolve_array_value(self.pdf, acroform.get("Fields").cloned())? {
-            Some(values) => values,
-            None => Vec::new(),
-        };
+        let mut fields =
+            resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.unwrap_or_default();
         fields.extend(copied_top.iter().copied().map(Object::Reference));
         acroform.insert("Fields", Object::Array(fields));
         self.pdf
