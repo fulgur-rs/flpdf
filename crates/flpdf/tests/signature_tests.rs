@@ -49,6 +49,37 @@ fn signed_acroform_pdf() -> Vec<u8> {
     ])
 }
 
+fn signed_acroform_pdf_with_indirect_signature_entries() -> Vec<u8> {
+    build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R] >>"),
+        (
+            5,
+            b"<< /FT 8 0 R /T 9 0 R /V 6 0 R /Kids [7 0 R] >>",
+        ),
+        (
+            6,
+            b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter 10 0 R /ByteRange 11 0 R /Name 12 0 R /M 13 0 R /Reason 14 0 R /Location 15 0 R /ContactInfo 16 0 R /Cert [17 0 R] >>",
+        ),
+        (7, b"<< /Subtype /Widget /Parent 5 0 R >>"),
+        (8, b"/Sig"),
+        (9, b"(Indirect Approval)"),
+        (10, b"/adbe.pkcs7.detached"),
+        (11, b"[0 42 128 256]"),
+        (12, b"(Alice)"),
+        (13, b"(D:20260604000000Z)"),
+        (14, b"(approved)"),
+        (15, b"(Tokyo)"),
+        (16, b"(alice@example.test)"),
+        (17, b"<010203>"),
+    ])
+}
+
 #[test]
 fn signatures_returns_signed_sig_fields() {
     let mut pdf = Pdf::open_mem_owned(signed_acroform_pdf()).expect("PDF should parse");
@@ -65,6 +96,26 @@ fn signatures_returns_signed_sig_fields() {
     assert_eq!(sig.signer_name.as_deref(), Some("Alice"));
     assert_eq!(sig.signing_time.as_deref(), Some("D:20260604000000Z"));
     assert_eq!(sig.reason.as_deref(), Some("approved"));
+    assert_eq!(sig.contact_info.as_deref(), Some("alice@example.test"));
+    assert_eq!(sig.certificate.as_deref(), Some(&[1, 2, 3][..]));
+}
+
+#[test]
+fn signatures_resolves_indirect_field_and_signature_entries() {
+    let mut pdf = Pdf::open_mem_owned(signed_acroform_pdf_with_indirect_signature_entries())
+        .expect("PDF should parse");
+
+    let signatures = pdf.signatures().expect("signature scan should succeed");
+
+    assert_eq!(signatures.len(), 1);
+    let sig = &signatures[0];
+    assert_eq!(sig.field_name, "Indirect Approval");
+    assert_eq!(sig.byte_range, [0, 42, 128, 256]);
+    assert_eq!(sig.sub_filter.as_deref(), Some("adbe.pkcs7.detached"));
+    assert_eq!(sig.signer_name.as_deref(), Some("Alice"));
+    assert_eq!(sig.signing_time.as_deref(), Some("D:20260604000000Z"));
+    assert_eq!(sig.reason.as_deref(), Some("approved"));
+    assert_eq!(sig.location.as_deref(), Some("Tokyo"));
     assert_eq!(sig.contact_info.as_deref(), Some("alice@example.test"));
     assert_eq!(sig.certificate.as_deref(), Some(&[1, 2, 3][..]));
 }
