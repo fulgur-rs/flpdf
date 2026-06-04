@@ -448,7 +448,8 @@ fn write_pdf_emits_only_touched_objects() {
 
     let source = bytes;
     let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
-    let _ = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let object = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    pdf.set_object(ObjectRef::new(1, 0), object);
 
     let mut output = Vec::new();
     write_pdf(&mut pdf, &mut output).unwrap();
@@ -1458,6 +1459,7 @@ fn write_pdf_rewrites_null_object_revision() {
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
     let null_object = pdf.resolve(ObjectRef::new(2, 0)).unwrap();
     assert_eq!(null_object, Object::Null);
+    pdf.set_object(ObjectRef::new(2, 0), null_object);
 
     let mut output = Vec::new();
     write_pdf(&mut pdf, &mut output).unwrap();

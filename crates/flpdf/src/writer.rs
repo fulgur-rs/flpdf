@@ -649,7 +649,7 @@ fn collect_touched_object_refs<R: Read + Seek>(
         deleted.insert(object_ref);
     }
 
-    for object_ref in pdf.resolved_object_refs() {
+    for object_ref in pdf.dirty_object_refs() {
         if deleted.contains(&object_ref) {
             continue;
         }

@@ -1,7 +1,12 @@
-//! Digital signature field inspection helpers.
+//! Digital signature helpers.
+//!
+//! This module has two layers:
+//! - read-only AcroForm signature field inspection via [`signatures`];
+//! - rewrite-impact checks for whether a writer mode would invalidate existing
+//!   signed `/ByteRange`s.
 
 use crate::json_inspect::decode_pdf_text_string;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, WriteOptions};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -35,6 +40,59 @@ pub struct SignatureInfo {
     pub certificate: Option<Vec<u8>>,
 }
 
+/// Writer mode used for digital-signature preservation checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureWriteMode {
+    /// Append an incremental update section after the original bytes.
+    Incremental,
+    /// Re-emit the whole document, changing signed byte positions.
+    FullRewrite,
+}
+
+impl SignatureWriteMode {
+    fn from_options(options: &WriteOptions) -> Self {
+        if options.full_rewrite {
+            Self::FullRewrite
+        } else {
+            Self::Incremental
+        }
+    }
+}
+
+/// Why a rewrite is considered safe or unsafe for existing signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureRewriteReason {
+    /// No signature fields or `/ByteRange` signature dictionaries were found.
+    NoSignatures,
+    /// A full rewrite changes object byte positions, invalidating signed ranges.
+    FullRewrite,
+    /// Incremental update touches the document `/AcroForm` dictionary.
+    IncrementalTouchesAcroForm,
+    /// Incremental update touches a signature field or `/ByteRange` dictionary.
+    IncrementalTouchesSignedObject,
+    /// Incremental update appends only unrelated objects.
+    IncrementalPreservesSignedByteRanges,
+}
+
+/// Result of checking whether a write would preserve existing signatures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureRewriteImpact {
+    /// Whether the source document contains signature evidence.
+    pub has_signatures: bool,
+    /// Whether the requested write mode would invalidate existing signatures.
+    pub invalidates_signatures: bool,
+    /// Decision reason.
+    pub reason: SignatureRewriteReason,
+    /// The first touched object that caused an invalidating decision, if any.
+    pub first_invalidating_ref: Option<ObjectRef>,
+    /// Signature fields and signature dictionaries discovered in the source.
+    pub signed_object_refs: Vec<ObjectRef>,
+    /// Dirty object refs that an incremental write would append/rewrite.
+    pub touched_object_refs: Vec<ObjectRef>,
+    /// The object that contains `/AcroForm`, when `/AcroForm` exists.
+    pub acroform_ref: Option<ObjectRef>,
+}
+
 /// Return all signed AcroForm signature fields in document field order.
 pub fn signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<SignatureInfo>> {
     signatures_with_max_depth(pdf, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH)
@@ -64,13 +122,201 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
     let mut seen = BTreeSet::new();
     for field in fields {
         if let Object::Reference(field_ref) = field {
-            walk_field(pdf, field_ref, "", &mut output, &mut seen, 0, max_depth)?;
+            walk_signature_field(pdf, field_ref, "", &mut output, &mut seen, 0, max_depth)?;
         }
     }
     Ok(output)
 }
 
-fn walk_field<R: Read + Seek>(
+/// Return `true` when writing `pdf` with `options` would invalidate signatures.
+///
+/// This is a convenience predicate over [`signature_rewrite_impact`]. It maps
+/// `WriteOptions::full_rewrite = true` to full rewrite and the default writer
+/// path to incremental update.
+pub fn would_rewrite_invalidate_signatures<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriteOptions,
+) -> Result<bool> {
+    Ok(
+        signature_rewrite_impact(pdf, SignatureWriteMode::from_options(options))?
+            .invalidates_signatures,
+    )
+}
+
+/// Compute whether a rewrite mode preserves existing signed byte ranges.
+///
+/// qpdf-compatible decision logic:
+/// - unsigned inputs are never reported as signature-invalidating;
+/// - full rewrite invalidates any existing signature because object offsets and
+///   serialized bytes move;
+/// - incremental update preserves signatures when it appends unrelated changes;
+/// - incremental update invalidates signatures when it rewrites `/AcroForm` or
+///   a signature field/signature dictionary.
+pub fn signature_rewrite_impact<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    mode: SignatureWriteMode,
+) -> Result<SignatureRewriteImpact> {
+    let touched_object_refs = pdf.dirty_object_refs();
+    let touched: BTreeSet<ObjectRef> = touched_object_refs.iter().copied().collect();
+    let rewrite_info = collect_signature_rewrite_info(pdf)?;
+    let has_signatures = !rewrite_info.signed_object_refs.is_empty();
+
+    let mut signed_object_refs: Vec<ObjectRef> =
+        rewrite_info.signed_object_refs.iter().copied().collect();
+    signed_object_refs.sort();
+
+    if !has_signatures {
+        return Ok(SignatureRewriteImpact {
+            has_signatures: false,
+            invalidates_signatures: false,
+            reason: SignatureRewriteReason::NoSignatures,
+            first_invalidating_ref: None,
+            signed_object_refs,
+            touched_object_refs,
+            acroform_ref: rewrite_info.acroform_ref,
+        });
+    }
+
+    if mode == SignatureWriteMode::FullRewrite {
+        return Ok(SignatureRewriteImpact {
+            has_signatures: true,
+            invalidates_signatures: true,
+            reason: SignatureRewriteReason::FullRewrite,
+            first_invalidating_ref: None,
+            signed_object_refs,
+            touched_object_refs,
+            acroform_ref: rewrite_info.acroform_ref,
+        });
+    }
+
+    if let Some(acroform_ref) = rewrite_info.acroform_ref {
+        if touched.contains(&acroform_ref) {
+            return Ok(SignatureRewriteImpact {
+                has_signatures: true,
+                invalidates_signatures: true,
+                reason: SignatureRewriteReason::IncrementalTouchesAcroForm,
+                first_invalidating_ref: Some(acroform_ref),
+                signed_object_refs,
+                touched_object_refs,
+                acroform_ref: Some(acroform_ref),
+            });
+        }
+    }
+
+    if let Some(object_ref) = signed_object_refs
+        .iter()
+        .copied()
+        .find(|object_ref| touched.contains(object_ref))
+    {
+        return Ok(SignatureRewriteImpact {
+            has_signatures: true,
+            invalidates_signatures: true,
+            reason: SignatureRewriteReason::IncrementalTouchesSignedObject,
+            first_invalidating_ref: Some(object_ref),
+            signed_object_refs,
+            touched_object_refs,
+            acroform_ref: rewrite_info.acroform_ref,
+        });
+    }
+
+    Ok(SignatureRewriteImpact {
+        has_signatures: true,
+        invalidates_signatures: false,
+        reason: SignatureRewriteReason::IncrementalPreservesSignedByteRanges,
+        first_invalidating_ref: None,
+        signed_object_refs,
+        touched_object_refs,
+        acroform_ref: rewrite_info.acroform_ref,
+    })
+}
+
+#[derive(Debug, Default)]
+struct SignatureRewriteInfo {
+    acroform_ref: Option<ObjectRef>,
+    signed_object_refs: BTreeSet<ObjectRef>,
+}
+
+fn collect_signature_rewrite_info<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<SignatureRewriteInfo> {
+    let mut info = SignatureRewriteInfo::default();
+
+    if let Some(root_ref) = pdf.root_ref() {
+        let root = pdf.resolve(root_ref)?;
+        if let Object::Dictionary(catalog) = root {
+            if let Some(acroform) = catalog.get("AcroForm").cloned() {
+                info.acroform_ref = Some(acroform_ref(root_ref, &acroform));
+            }
+
+            for key in ["Perms", "DSS"] {
+                if let Some(value) = catalog.get(key).cloned() {
+                    collect_known_signature_value(pdf, value, &mut info, 0)?;
+                }
+            }
+        }
+    }
+
+    for signature in signatures(pdf)? {
+        info.signed_object_refs.insert(signature.field_ref);
+        if let Some(signature_ref) = signature.signature_ref {
+            info.signed_object_refs.insert(signature_ref);
+        }
+    }
+
+    Ok(info)
+}
+
+fn acroform_ref(root_ref: ObjectRef, acroform: &Object) -> ObjectRef {
+    match acroform {
+        Object::Reference(acroform_ref) => *acroform_ref,
+        _ => root_ref,
+    }
+}
+
+fn collect_known_signature_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Object,
+    info: &mut SignatureRewriteInfo,
+    depth: usize,
+) -> Result<()> {
+    if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "signature known-container depth limit {DEFAULT_MAX_SIGNATURE_FIELD_DEPTH} exceeded"
+        )));
+    }
+
+    match value {
+        Object::Reference(object_ref) => {
+            let object = pdf.resolve(object_ref)?;
+            if object_has_byte_range(&object) {
+                info.signed_object_refs.insert(object_ref);
+            }
+            collect_known_signature_value(pdf, object, info, depth + 1)?;
+        }
+        Object::Dictionary(dict) => {
+            for (_, value) in dict.iter() {
+                collect_known_signature_value(pdf, value.clone(), info, depth + 1)?;
+            }
+        }
+        Object::Array(items) => {
+            for item in items {
+                collect_known_signature_value(pdf, item, info, depth + 1)?;
+            }
+        }
+        Object::Stream(stream) => {
+            if stream.dict.get("ByteRange").is_some() {
+                for (_, value) in stream.dict.iter() {
+                    collect_known_signature_value(pdf, value.clone(), info, depth + 1)?;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn walk_signature_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
     parent_name: &str,
@@ -111,7 +357,7 @@ fn walk_field<R: Read + Seek>(
         if is_pure_widget(kid_dict) {
             continue;
         }
-        walk_field(
+        walk_signature_field(
             pdf,
             kid_ref,
             &field_name,
@@ -340,5 +586,13 @@ fn certificate_entry<R: Read + Seek>(
             Ok(None)
         }
         _ => Ok(None),
+    }
+}
+
+fn object_has_byte_range(object: &Object) -> bool {
+    match object {
+        Object::Dictionary(dict) => dict.get("ByteRange").is_some(),
+        Object::Stream(stream) => stream.dict.get("ByteRange").is_some(),
+        _ => false,
     }
 }
