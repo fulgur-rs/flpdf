@@ -76,6 +76,7 @@ pub mod reader;
 pub mod resources;
 pub mod rotate_spec;
 pub(crate) mod run_length;
+pub mod signatures;
 pub mod subset_prune;
 pub mod writer;
 pub mod xref;
@@ -130,6 +131,7 @@ pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
 pub use security::standard::ObjectKeyAlg;
+pub use signatures::{SignatureInfo, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH};
 pub use subset_prune::prune_after_subset;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
