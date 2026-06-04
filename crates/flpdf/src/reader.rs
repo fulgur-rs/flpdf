@@ -54,6 +54,7 @@ pub struct Pdf<R: Read + Seek> {
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
+    dirty_object_refs: BTreeSet<ObjectRef>,
     encryption: Option<EncryptionState>,
 }
 
@@ -426,6 +427,7 @@ impl<R: Read + Seek> Pdf<R> {
             compressed_member_parents: BTreeMap::new(),
             source_xref_offsets,
             source_xref_entries,
+            dirty_object_refs: BTreeSet::new(),
             encryption: None,
         };
         pdf.authenticate_if_encrypted(&options)?;
@@ -716,6 +718,7 @@ impl<R: Read + Seek> Pdf<R> {
                 .insert(object_ref, (parent_ref, parent_index));
         }
         self.cache.set_resolved(object_ref, object);
+        self.dirty_object_refs.insert(object_ref);
     }
 
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
@@ -728,6 +731,7 @@ impl<R: Read + Seek> Pdf<R> {
             return;
         }
         self.cache.set_deleted(object_ref);
+        self.dirty_object_refs.insert(object_ref);
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
@@ -743,22 +747,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.resolved_count()
     }
 
-    pub(crate) fn resolved_object_refs(&self) -> Vec<ObjectRef> {
-        self.cache
-            .entries()
-            .iter()
-            .filter_map(|(object_ref, entry)| {
-                if matches!(entry, crate::cache::CacheEntry::Resolved(_)) {
-                    Some(*object_ref)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     pub(crate) fn deleted_object_refs(&self) -> Vec<ObjectRef> {
         self.cache.deleted_refs()
+    }
+
+    pub(crate) fn dirty_object_refs(&self) -> Vec<ObjectRef> {
+        self.dirty_object_refs.iter().copied().collect()
     }
 
     /// Every object reference known from the cross-reference table, including objects

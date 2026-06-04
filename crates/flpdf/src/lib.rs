@@ -135,7 +135,11 @@ pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
 pub use security::standard::ObjectKeyAlg;
-pub use signatures::{SignatureInfo, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH};
+pub use signatures::{
+    signature_rewrite_impact, signatures, signatures_with_max_depth,
+    would_rewrite_invalidate_signatures, SignatureInfo, SignatureRewriteImpact,
+    SignatureRewriteReason, SignatureWriteMode, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+};
 pub use subset_prune::prune_after_subset;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
