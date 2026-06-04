@@ -28,8 +28,8 @@
 //! Each call uses a fresh map, so copying the same source set twice produces
 //! independent, non-shared target copies.
 
-use crate::object::{Dictionary, Stream};
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::object::Dictionary;
+use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -42,8 +42,11 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// Returns [`Err`] if [`Pdf::resolve`] fails for any ref in `refs` (e.g. a
-/// corrupt or missing xref entry).
+/// Returns [`Err`] only if [`Pdf::resolve`] itself fails for a ref in `refs`
+/// (an I/O or parse error), or if the target object-number space would overflow
+/// `u32`.  Refs that are unknown, freed, or otherwise unresolvable do **not**
+/// error: [`Pdf::resolve`] yields [`Object::Null`] for them, so they are simply
+/// copied as `Null`.
 ///
 /// # Examples
 ///
@@ -77,51 +80,65 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
 
     // Pre-allocate a fresh target number for every ref in the set, iterating in
     // sorted order (BTreeSet) for deterministic output.  Building the complete
-    // map before rewriting is what makes cycles safe.
+    // map before rewriting is what makes cycles safe.  Allocation is bounded by
+    // the `u32` object-number space; exhaustion is an error rather than a
+    // silent wraparound.
     let mut map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
     for (offset, &src_ref) in refs.iter().enumerate() {
-        map.insert(src_ref, ObjectRef::new(base + offset as u32, 0));
+        let number = u32::try_from(offset)
+            .ok()
+            .and_then(|o| base.checked_add(o))
+            .ok_or_else(|| {
+                Error::Unsupported(
+                    "cross-document copy exhausted the u32 object-number space".to_string(),
+                )
+            })?;
+        map.insert(src_ref, ObjectRef::new(number, 0));
     }
 
-    // Resolve each source object, rewrite its references, and store the copy.
+    // Resolve each source object, rewrite its references in place, and store it.
+    // `resolve` already returns an owned `Object`, so rewriting in place avoids
+    // a second deep clone of (potentially large) stream payloads.
     for &src_ref in refs {
-        let obj = source.resolve(src_ref)?;
-        let rewritten = rewrite_refs(&obj, &map);
-        target.set_object(map[&src_ref], rewritten);
+        let mut obj = source.resolve(src_ref)?;
+        rewrite_refs(&mut obj, &map);
+        target.set_object(map[&src_ref], obj);
     }
 
     Ok(map)
 }
 
-/// Deep-rewrite every [`Object::Reference`] in `obj`: refs present in `map` are
-/// remapped, refs outside `map` become [`Object::Null`].  Stream bytes are
-/// carried verbatim; scalars are returned unchanged.
-fn rewrite_refs(obj: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
+/// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
+/// `map` are remapped, refs outside `map` become [`Object::Null`].  Stream byte
+/// payloads are left untouched (never cloned); scalars are unchanged.
+fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
     match obj {
-        Object::Reference(r) => match map.get(r) {
-            Some(&t) => Object::Reference(t),
-            None => Object::Null,
-        },
-        Object::Array(items) => Object::Array(items.iter().map(|i| rewrite_refs(i, map)).collect()),
-        Object::Dictionary(dict) => Object::Dictionary(rewrite_dict(dict, map)),
-        Object::Stream(stream) => Object::Stream(Stream::new(
-            rewrite_dict(&stream.dict, map),
-            stream.data.clone(),
-        )),
+        Object::Reference(r) => {
+            let replacement = match map.get(r) {
+                Some(&t) => Object::Reference(t),
+                None => Object::Null,
+            };
+            *obj = replacement;
+        }
+        Object::Array(items) => {
+            for item in items.iter_mut() {
+                rewrite_refs(item, map);
+            }
+        }
+        Object::Dictionary(dict) => rewrite_dict(dict, map),
+        Object::Stream(stream) => rewrite_dict(&mut stream.dict, map),
         Object::Null
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
         | Object::Name(_)
-        | Object::String(_) => obj.clone(),
+        | Object::String(_) => {}
     }
 }
 
-/// Rewrite every value of `dict` via [`rewrite_refs`], preserving keys.
-fn rewrite_dict(dict: &Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) -> Dictionary {
-    let mut out = Dictionary::new();
-    for (key, value) in dict.iter() {
-        out.insert(key, rewrite_refs(value, map));
+/// Rewrite every value of `dict` via [`rewrite_refs`] in place, preserving keys.
+fn rewrite_dict(dict: &mut Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) {
+    for value in dict.values_mut() {
+        rewrite_refs(value, map);
     }
-    out
 }
