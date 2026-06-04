@@ -56,6 +56,7 @@ pub mod json;
 pub mod json_inspect;
 pub mod linearization;
 pub mod object;
+pub mod object_copy;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod page_closure;
@@ -110,6 +111,7 @@ pub use filespec_helper::{
     EmbeddedFileStream, FileParamDates, FileSpec, FileSpecBuilder,
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
+pub use object_copy::copy_objects;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use page_collate::collate;
