@@ -1,9 +1,11 @@
 //! Digital signature helpers.
 //!
-//! This module has two layers:
+//! This module has three layers:
 //! - read-only AcroForm signature field inspection via [`signatures`];
 //! - rewrite-impact checks for whether a writer mode would invalidate existing
-//!   signed `/ByteRange`s.
+//!   signed `/ByteRange`s;
+//! - `/AcroForm /SigFlags` primitives ([`acroform_sig_flags`], [`clear_sig_flags`])
+//!   that read, surface, and clear the SignaturesExist/AppendOnly bits.
 
 use crate::json_inspect::decode_pdf_text_string;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, WriteOptions};
@@ -12,6 +14,12 @@ use std::io::{Read, Seek};
 
 /// Maximum recursion depth for AcroForm signature field traversal.
 pub const DEFAULT_MAX_SIGNATURE_FIELD_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+
+/// `/AcroForm /SigFlags` bit 1: the document contains at least one signature field.
+pub const SIG_FLAGS_SIGNATURES_EXIST: u32 = 1;
+/// `/AcroForm /SigFlags` bit 2 (append-only): the document must only be modified
+/// via incremental updates so existing signatures stay valid.
+pub const SIG_FLAGS_APPEND_ONLY: u32 = 2;
 
 /// Read-only information about a signed AcroForm signature field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +99,31 @@ pub struct SignatureRewriteImpact {
     pub touched_object_refs: Vec<ObjectRef>,
     /// The object that contains `/AcroForm`, when `/AcroForm` exists.
     pub acroform_ref: Option<ObjectRef>,
+    /// The `/AcroForm /SigFlags` bitfield, when present.
+    ///
+    /// Bit 1 ([`SIG_FLAGS_SIGNATURES_EXIST`]) and bit 2
+    /// ([`SIG_FLAGS_APPEND_ONLY`]) are interpreted by [`Self::signatures_exist`]
+    /// and [`Self::append_only`]. The flag itself does not change the
+    /// `invalidates_signatures` decision; an enforcement layer reads
+    /// [`Self::append_only`] to require append-only (incremental) mode.
+    pub sig_flags: Option<u32>,
+}
+
+impl SignatureRewriteImpact {
+    /// Whether `/SigFlags` has the SignaturesExist bit set.
+    pub fn signatures_exist(&self) -> bool {
+        self.sig_flags
+            .is_some_and(|flags| flags & SIG_FLAGS_SIGNATURES_EXIST != 0)
+    }
+
+    /// Whether `/SigFlags` has the AppendOnly bit set.
+    ///
+    /// When set, the document declares that it must only be modified via
+    /// incremental updates; a full rewrite would violate the append-only policy.
+    pub fn append_only(&self) -> bool {
+        self.sig_flags
+            .is_some_and(|flags| flags & SIG_FLAGS_APPEND_ONLY != 0)
+    }
 }
 
 /// Return all signed AcroForm signature fields in document field order.
@@ -146,6 +179,97 @@ pub fn would_rewrite_invalidate_signatures<R: Read + Seek>(
     )
 }
 
+/// Read the document `/AcroForm /SigFlags` bitfield, if present.
+///
+/// Returns `None` when there is no `/AcroForm`, no `/SigFlags`, or the value is
+/// not a non-negative integer that fits in `u32`. An indirect `/SigFlags`
+/// reference (vanishingly rare for a scalar flag) is treated as absent.
+pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32>> {
+    match catalog_acroform_dict(pdf)? {
+        Some(acroform_dict) => Ok(sig_flags_from_acroform_dict(&acroform_dict)),
+        None => Ok(None),
+    }
+}
+
+/// Clear the signature-related bits of `/AcroForm /SigFlags`.
+///
+/// Masks off [`SIG_FLAGS_SIGNATURES_EXIST`] and [`SIG_FLAGS_APPEND_ONLY`] and
+/// writes the masked integer back (e.g. `/SigFlags 3` becomes `/SigFlags 0`),
+/// marking the containing object dirty. Returns `true` when a bit was actually
+/// cleared. Used by the opt-in signature-stripping path; it does not by itself
+/// remove signature fields or `/V` dictionaries.
+pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
+        return Ok(false);
+    };
+    let Some(acroform) = catalog.get("AcroForm").cloned() else {
+        return Ok(false);
+    };
+
+    match acroform {
+        Object::Reference(acroform_ref) => {
+            let Object::Dictionary(mut dict) = pdf.resolve(acroform_ref)? else {
+                return Ok(false);
+            };
+            if !clear_sig_flags_in_dict(&mut dict) {
+                return Ok(false);
+            }
+            pdf.set_object(acroform_ref, Object::Dictionary(dict));
+            Ok(true)
+        }
+        Object::Dictionary(mut dict) => {
+            if !clear_sig_flags_in_dict(&mut dict) {
+                return Ok(false);
+            }
+            catalog.insert("AcroForm", Object::Dictionary(dict));
+            pdf.set_object(root_ref, Object::Dictionary(catalog));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Resolve the catalog `/AcroForm` to its dictionary, following one indirect
+/// reference. Returns `None` when absent or not a dictionary.
+fn catalog_acroform_dict<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Dictionary>> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(None);
+    };
+    let Object::Dictionary(catalog) = pdf.resolve(root_ref)? else {
+        return Ok(None);
+    };
+    let Some(acroform) = catalog.get("AcroForm").cloned() else {
+        return Ok(None);
+    };
+    resolve_dictionary(pdf, acroform)
+}
+
+/// Extract `/SigFlags` as a `u32` bitfield from an already-resolved `/AcroForm`
+/// dictionary. Non-integer or out-of-range values read as absent.
+fn sig_flags_from_acroform_dict(acroform: &Dictionary) -> Option<u32> {
+    match acroform.get("SigFlags") {
+        Some(Object::Integer(n)) => u32::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+/// Mask off the signature bits of `/SigFlags` in place. Returns `true` if the
+/// value changed.
+fn clear_sig_flags_in_dict(acroform: &mut Dictionary) -> bool {
+    let Some(flags) = sig_flags_from_acroform_dict(acroform) else {
+        return false;
+    };
+    let cleared = flags & !(SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY);
+    if cleared == flags {
+        return false;
+    }
+    acroform.insert("SigFlags", Object::Integer(i64::from(cleared)));
+    true
+}
+
 /// Compute whether a rewrite mode preserves existing signed byte ranges.
 ///
 /// qpdf-compatible decision logic:
@@ -177,6 +301,7 @@ pub fn signature_rewrite_impact<R: Read + Seek>(
             signed_object_refs,
             touched_object_refs,
             acroform_ref: rewrite_info.acroform_ref,
+            sig_flags: rewrite_info.sig_flags,
         });
     }
 
@@ -189,6 +314,7 @@ pub fn signature_rewrite_impact<R: Read + Seek>(
             signed_object_refs,
             touched_object_refs,
             acroform_ref: rewrite_info.acroform_ref,
+            sig_flags: rewrite_info.sig_flags,
         });
     }
 
@@ -202,6 +328,7 @@ pub fn signature_rewrite_impact<R: Read + Seek>(
                 signed_object_refs,
                 touched_object_refs,
                 acroform_ref: Some(acroform_ref),
+                sig_flags: rewrite_info.sig_flags,
             });
         }
     }
@@ -219,6 +346,7 @@ pub fn signature_rewrite_impact<R: Read + Seek>(
             signed_object_refs,
             touched_object_refs,
             acroform_ref: rewrite_info.acroform_ref,
+            sig_flags: rewrite_info.sig_flags,
         });
     }
 
@@ -230,6 +358,7 @@ pub fn signature_rewrite_impact<R: Read + Seek>(
         signed_object_refs,
         touched_object_refs,
         acroform_ref: rewrite_info.acroform_ref,
+        sig_flags: rewrite_info.sig_flags,
     })
 }
 
@@ -237,6 +366,7 @@ pub fn signature_rewrite_impact<R: Read + Seek>(
 struct SignatureRewriteInfo {
     acroform_ref: Option<ObjectRef>,
     signed_object_refs: BTreeSet<ObjectRef>,
+    sig_flags: Option<u32>,
 }
 
 fn collect_signature_rewrite_info<R: Read + Seek>(
@@ -250,6 +380,7 @@ fn collect_signature_rewrite_info<R: Read + Seek>(
             if let Some(acroform) = catalog.get("AcroForm").cloned() {
                 let (acroform_ref, acroform_dict) = resolve_acroform(pdf, root_ref, acroform)?;
                 info.acroform_ref = Some(acroform_ref);
+                info.sig_flags = sig_flags_from_acroform_dict(&acroform_dict);
                 collect_acroform_signatures(pdf, &acroform_dict, &mut info)?;
             }
 

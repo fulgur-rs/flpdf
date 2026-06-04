@@ -138,9 +138,10 @@ pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
 pub use security::standard::ObjectKeyAlg;
 pub use signatures::{
-    signature_rewrite_impact, signatures, signatures_with_max_depth,
-    would_rewrite_invalidate_signatures, SignatureInfo, SignatureRewriteImpact,
-    SignatureRewriteReason, SignatureWriteMode, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+    acroform_sig_flags, clear_sig_flags, signature_rewrite_impact, signatures,
+    signatures_with_max_depth, would_rewrite_invalidate_signatures, SignatureInfo,
+    SignatureRewriteImpact, SignatureRewriteReason, SignatureWriteMode,
+    DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 pub use subset_prune::prune_after_subset;
 pub use writer::{
