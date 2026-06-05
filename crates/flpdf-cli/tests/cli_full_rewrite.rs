@@ -143,7 +143,11 @@ fn full_rewrite_of_signed_pdf_prints_actionable_diagnostic() {
     ))
     .stderr(predicate::str::contains("Signed"))
     .stderr(predicate::str::contains("--remove-restrictions"))
-    .stderr(predicate::str::contains("incremental rewrite"));
+    .stderr(predicate::str::contains("incremental rewrite"))
+    // The dedicated Error::Signed CLI mapping prints the diagnostic message
+    // directly, without the redundant "signed PDF:" Display prefix that the
+    // generic error fallback would otherwise add.
+    .stderr(predicate::str::contains("signed PDF: refusing").not());
 }
 
 #[test]
@@ -193,4 +197,44 @@ fn remove_restrictions_allows_signed_linearized_rewrite() {
 
     assert!(output.exists());
     assert!(std::fs::metadata(&output).unwrap().len() > 0);
+}
+
+#[test]
+fn incremental_rewrite_of_signed_pdf_succeeds_without_warning() {
+    // AC (flpdf-9hc.22.7): the incremental-update path preserves signed byte
+    // ranges, so a signed input is neither refused nor stripped — it succeeds
+    // silently. `--remove-unreferenced-resources=no` is the documented way to
+    // stay on the incremental path (a plain `rewrite` defaults to `auto`, which
+    // forces the full rewrite that *would* refuse). No --remove-restrictions, so
+    // no signatures are removed and no warning is emitted.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, build_signed_acroform_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--remove-unreferenced-resources=no",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("refusing full rewrite").not())
+    .stderr(predicate::str::contains("removed signatures").not())
+    .stderr(predicate::str::contains("invalidated").not());
+
+    // The incremental path appends to the source bytes verbatim, so the original
+    // signature dictionary (and its signed /ByteRange) survives untouched.
+    let bytes = std::fs::read(&output).unwrap();
+    let haystack = String::from_utf8_lossy(&bytes);
+    assert!(
+        haystack.contains("/ByteRange"),
+        "incremental rewrite must preserve the signed /ByteRange"
+    );
+    assert!(
+        haystack.contains("/SubFilter /adbe.pkcs7.detached"),
+        "incremental rewrite must preserve the signature dictionary"
+    );
 }
