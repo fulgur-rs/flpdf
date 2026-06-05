@@ -530,13 +530,37 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
     Ok(())
 }
 
-/// Transform every annotation's `/Rect` on this page by `m`. (Task 5 fills the
-/// body; this no-op stub keeps the build green meanwhile.)
+/// Transform every annotation's `/Rect` on this page by `m`. Reads `/Annots`
+/// from `page_dict`; each entry is an indirect reference to an annotation dict.
+///
+/// CAVEAT: `/QuadPoints` and the appearance `/AP` `/Matrix` are intentionally
+/// left untouched (see [`flatten_rotation_on_pages`]).
 fn flatten_annotation_rects<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    _page_dict: &Dictionary,
-    _m: Mat,
+    pdf: &mut Pdf<R>,
+    page_dict: &Dictionary,
+    m: Mat,
 ) -> Result<()> {
+    let Some(Object::Array(annots)) = page_dict.get("Annots").cloned() else {
+        return Ok(());
+    };
+    for entry in annots {
+        let Object::Reference(annot_ref) = entry else {
+            continue;
+        };
+        let Object::Dictionary(mut ad) = pdf.resolve(annot_ref)? else {
+            continue;
+        };
+        if let Some(rect_obj) = ad.get("Rect").cloned() {
+            let resolved = match rect_obj {
+                Object::Reference(r) => pdf.resolve(r)?,
+                other => other,
+            };
+            if let Some(b) = object_to_pagebox(&resolved) {
+                ad.insert("Rect", pagebox_to_object(transform_box(m, b)));
+                pdf.set_object(annot_ref, Object::Dictionary(ad));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1353,6 +1377,40 @@ mod tests {
         };
         let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
         assert_eq!((mb.urx, mb.ury), (200.0, 300.0));
+    }
+
+    /// 1-page PDF with one annotation (`/Rect rect`) on a rotated page.
+    fn build_single_page_with_annot(mb: &str, rotate: i32, rect: &str) -> Vec<u8> {
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R /Rotate {rotate} /Annots [5 0 R] >>"
+        );
+        assemble_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, page),
+            (4, content_obj_body("BT (x) Tj ET")),
+            (
+                5,
+                format!("<< /Type /Annot /Subtype /Text /Rect {rect} >>"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn flatten_transforms_annotation_rect() {
+        let bytes = build_single_page_with_annot("[0 0 200 300]", 90, "[10 20 60 40]");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        let annot = ObjectRef::new(5, 0);
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+
+        // 90deg map (x,y)->(y, 200 - x): corners (10,20),(60,40) ->
+        // (20,190),(40,140) -> bbox [20 140 40 190].
+        let Object::Dictionary(ad) = pdf.resolve(annot).unwrap() else {
+            panic!("not a dict")
+        };
+        let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
+        assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
     #[test]
