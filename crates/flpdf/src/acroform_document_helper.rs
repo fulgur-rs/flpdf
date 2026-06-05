@@ -6,8 +6,8 @@
 //! [`crate::copy_objects`] for cross-document field copying.
 
 use crate::{
-    copy_objects, Dictionary, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf, Result,
-    DEFAULT_MAX_ACROFORM_DEPTH,
+    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, FormFieldObjectHelper,
+    Object, ObjectRef, Pdf, Result, DEFAULT_MAX_ACROFORM_DEPTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -511,7 +511,7 @@ impl FieldInheritance {
         let partial_name = field
             .get("T")
             .and_then(Object::as_string)
-            .map(|name| String::from_utf8_lossy(name).into_owned());
+            .map(decode_field_name);
         let full_name = match (self.full_name.is_empty(), partial_name.as_deref()) {
             (_, None) => self.full_name.clone(),
             (true, Some(name)) => name.to_string(),
@@ -568,11 +568,17 @@ fn is_pure_widget_annotation(field: &Dictionary) -> bool {
         || field.get("V").is_some()
         || field.get("DV").is_some()
         || field.get("Ff").is_some()
+        || field.get("TU").is_some()
+        || field.get("TM").is_some()
         || field.get("DA").is_some()
         || field.get("Q").is_some()
         || field.get("MaxLen").is_some();
 
     is_widget && !has_field_entries
+}
+
+fn decode_field_name(name: &[u8]) -> String {
+    decode_pdf_text_string(name).unwrap_or_else(|| String::from_utf8_lossy(name).into_owned())
 }
 
 fn source_field_copy_set<RS: Read + Seek>(

@@ -299,7 +299,10 @@ fn field_info_widget_kids_pdf() -> Vec<u8> {
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
             (4, "<< /Fields [5 0 R] >>"),
-            (5, "<< /T (field) /FT /Tx /Kids [6 0 R 7 0 R] >>"),
+            (
+                5,
+                "<< /T (field) /FT /Tx /Kids [6 0 R 7 0 R 8 0 R 9 0 R] >>",
+            ),
             (
                 6,
                 "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /Rect [0 0 10 10] >>",
@@ -308,6 +311,28 @@ fn field_info_widget_kids_pdf() -> Vec<u8> {
                 7,
                 "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /T (merged) /V (yes) >>",
             ),
+            (
+                8,
+                "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /TU (tooltip) >>",
+            ),
+            (
+                9,
+                "<< /Type /Annot /Subtype /Widget /Parent 5 0 R /TM (mapping) >>",
+            ),
+        ],
+        1,
+    )
+}
+
+fn unicode_field_names_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] >>"),
+            (5, "<< /T <FEFF89AA> /FT /Tx /Kids [6 0 R] >>"),
+            (6, "<< /T <FEFF5B50> /Parent 5 0 R /V (value) >>"),
         ],
         1,
     )
@@ -380,10 +405,30 @@ fn field_infos_skip_pure_widget_kids_but_keep_merged_widget_fields() {
             .iter()
             .map(|field| field.object_ref)
             .collect::<Vec<_>>(),
-        vec![ObjectRef::new(5, 0), ObjectRef::new(7, 0)]
+        vec![
+            ObjectRef::new(5, 0),
+            ObjectRef::new(7, 0),
+            ObjectRef::new(8, 0),
+            ObjectRef::new(9, 0),
+        ]
     );
     assert_eq!(fields[1].full_name, "field.merged");
     assert_eq!(fields[1].value, Some(Object::String(b"yes".to_vec())));
+    assert_eq!(fields[2].full_name, "field");
+    assert_eq!(fields[3].full_name, "field");
+}
+
+#[test]
+fn field_infos_decode_utf16be_field_name_paths() {
+    let bytes = unicode_field_names_pdf();
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+    let fields = pdf.acroform().field_infos().unwrap();
+
+    assert_eq!(fields[0].partial_name, Some(vec![0xFE, 0xFF, 0x89, 0xAA]));
+    assert_eq!(fields[0].full_name, "親");
+    assert_eq!(fields[1].partial_name, Some(vec![0xFE, 0xFF, 0x5B, 0x50]));
+    assert_eq!(fields[1].full_name, "親.子");
 }
 
 #[test]
