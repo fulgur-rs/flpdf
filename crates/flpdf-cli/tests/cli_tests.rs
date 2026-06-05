@@ -195,6 +195,12 @@ fn rewrite_remove_restrictions_strips_signatures_and_warns() {
         !output_bytes.windows(3).any(|window| window == b"/V "),
         "signature field /V entries must be removed"
     );
+    assert!(
+        !output_bytes
+            .windows(b"/ByteRange".len())
+            .any(|window| window == b"/ByteRange"),
+        "orphaned signature dictionaries must be removed"
+    );
 }
 
 #[test]
@@ -225,6 +231,12 @@ fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
     assert!(
         !output_bytes.windows(3).any(|window| window == b"/V "),
         "linearized signature field /V entries must be removed"
+    );
+    assert!(
+        !output_bytes
+            .windows(b"/ByteRange".len())
+            .any(|window| window == b"/ByteRange"),
+        "linearized output must remove orphaned signature dictionaries"
     );
 }
 

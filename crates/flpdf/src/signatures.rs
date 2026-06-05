@@ -481,8 +481,13 @@ fn strip_signature_values_from_field<R: Read + Seek>(
     let field_type = inherited_name(pdf, &dict, "FT")?.or(inherited_type);
     let kids_obj = dict.get("Kids").cloned();
 
+    let signature_value_ref = dict.get("V").and_then(Object::as_ref_id);
+
     if field_type.as_deref() == Some(b"Sig") && dict.remove("V").is_some() {
         pdf.set_object(field_ref, Object::Dictionary(dict));
+        if let Some(signature_ref) = signature_value_ref {
+            pdf.delete_object(signature_ref);
+        }
         *changed = true;
         if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
             return Ok(());
