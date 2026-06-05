@@ -682,6 +682,46 @@ fn fields_errors_when_field_tree_depth_limit_is_exceeded() {
 }
 
 #[test]
+fn copy_fields_from_errors_when_reference_chain_depth_limit_is_exceeded() {
+    // Non-cyclic chain reachable from AcroForm /Fields via an arbitrary key (/X),
+    // long enough to exceed DEFAULT_MAX_ACROFORM_DEPTH. The chain is acyclic so the
+    // `seen` cycle guard never fires; only the new depth limit can stop the recursion.
+    let mut objects = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (4, "<< /Fields [5 0 R] >>".to_string()),
+        (5, "<< /T (parent) /FT /Tx /X 6 0 R >>".to_string()),
+    ];
+    for object_number in 6..=106 {
+        let next = object_number + 1;
+        objects.push((object_number, format!("<< /X {next} 0 R >>")));
+    }
+    objects.push((107, "<< /Leaf true >>".to_string()));
+    let borrowed: Vec<(u32, &str)> = objects
+        .iter()
+        .map(|(object_number, body)| (*object_number, body.as_str()))
+        .collect();
+    let source_bytes = build_pdf(&borrowed, 1);
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let err = target.acroform().copy_fields_from(&mut source).unwrap_err();
+
+    assert!(
+        matches!(err, flpdf::Error::Unsupported(_)),
+        "expected depth-limit Unsupported error, got {err:?}"
+    );
+}
+
+#[test]
 fn copy_fields_from_appends_copied_fields_to_target_acroform() {
     let source_bytes = form_pdf();
     let target_bytes = empty_pdf();
