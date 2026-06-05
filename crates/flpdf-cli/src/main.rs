@@ -7,6 +7,10 @@ use flpdf::{
     subset_prune::prune_after_subset, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
+    acroform_sig_flags, clear_sig_flags, strip_signature_values, SIG_FLAGS_APPEND_ONLY,
+    SIG_FLAGS_SIGNATURES_EXIST,
+};
+use flpdf::{
     check_reader_with_options, filters, fonts,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
@@ -2483,9 +2487,23 @@ fn run_rewrite(
         // below drops /Encrypt, so this must be sampled while the in-memory
         // model still reflects the input.
         let was_encrypted = pdf.is_encrypted();
+        let had_signatures = if remove_restrictions {
+            let has_signed_fields = !pdf.signatures()?.is_empty();
+            let has_sig_flags = acroform_sig_flags(&mut pdf)?.is_some_and(|flags| {
+                flags & (SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY) != 0
+            });
+            has_signed_fields || has_sig_flags
+        } else {
+            false
+        };
         let mut options = options;
         if was_encrypted {
             options.full_rewrite = true;
+        }
+        if had_signatures {
+            options.full_rewrite = true;
+            clear_sig_flags(&mut pdf)?;
+            strip_signature_values(&mut pdf)?;
         }
 
         // ── Content mutation pass ─────────────────────────────────────────────
@@ -2568,6 +2586,9 @@ fn run_rewrite(
 
         if remove_restrictions && was_encrypted {
             eprintln!("flpdf: removed restrictions (encryption and advisory permissions stripped)");
+        }
+        if had_signatures {
+            eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
         }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,

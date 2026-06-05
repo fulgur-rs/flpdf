@@ -218,6 +218,30 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     Ok(true)
 }
 
+/// Remove signature values (`/V`) from AcroForm signature fields.
+///
+/// The field dictionaries themselves are preserved so widgets and field names
+/// remain in place, but signed fields no longer point at a signature
+/// dictionary. Returns `true` when at least one field value was removed.
+pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some((_, acroform)) = resolve_catalog_acroform(pdf)? else {
+        return Ok(false);
+    };
+    let Some(fields_obj) = acroform.get("Fields").cloned() else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    let mut seen = BTreeSet::new();
+    for field in resolve_array(pdf, fields_obj)? {
+        let Object::Reference(field_ref) = field else {
+            continue;
+        };
+        strip_signature_values_from_field(pdf, field_ref, None, 0, &mut seen, &mut changed)?;
+    }
+    Ok(changed)
+}
+
 /// Where the catalog `/AcroForm` dictionary lives, so an updated copy can be
 /// written back to the correct object.
 enum AcroformHome {
@@ -435,6 +459,63 @@ fn collect_acroform_signatures<R: Read + Seek>(
             walk_signature_rewrite_field(pdf, field_ref, None, 0, info)?;
         }
     }
+    Ok(())
+}
+
+fn strip_signature_values_from_field<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    inherited_type: Option<Vec<u8>>,
+    depth: usize,
+    seen: &mut BTreeSet<ObjectRef>,
+    changed: &mut bool,
+) -> Result<()> {
+    if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH || !seen.insert(field_ref) {
+        return Ok(());
+    }
+
+    let Object::Dictionary(mut dict) = pdf.resolve(field_ref)? else {
+        return Ok(());
+    };
+
+    let field_type = dict
+        .get("FT")
+        .and_then(Object::as_name)
+        .map(<[u8]>::to_vec)
+        .or(inherited_type);
+    if field_type.as_deref() == Some(b"Sig") && dict.remove("V").is_some() {
+        pdf.set_object(field_ref, Object::Dictionary(dict.clone()));
+        *changed = true;
+    }
+
+    if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
+        return Ok(());
+    }
+
+    let Some(kids_obj) = dict.get("Kids").cloned() else {
+        return Ok(());
+    };
+    for kid in resolve_array(pdf, kids_obj)? {
+        let Object::Reference(kid_ref) = kid else {
+            continue;
+        };
+        let kid_obj = pdf.resolve_borrowed(kid_ref)?;
+        let Object::Dictionary(kid_dict) = kid_obj else {
+            continue;
+        };
+        if is_pure_widget(kid_dict) {
+            continue;
+        }
+        strip_signature_values_from_field(
+            pdf,
+            kid_ref,
+            field_type.clone(),
+            depth + 1,
+            seen,
+            changed,
+        )?;
+    }
+
     Ok(())
 }
 

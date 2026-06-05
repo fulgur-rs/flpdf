@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use flpdf::{filespec_helper::encode_utf16be, Object, Pdf};
+use flpdf::{acroform_sig_flags, filespec_helper::encode_utf16be, Object, Pdf};
 use predicates::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
@@ -164,6 +164,37 @@ fn rewrite_fixture_creates_output() {
 
     assert!(output.exists());
     assert!(std::fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
+fn rewrite_remove_restrictions_strips_signatures_and_warns() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("unsigned.pdf");
+    std::fs::write(&input, signed_acroform_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signatures are now invalidated"));
+
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+    assert!(
+        pdf.signatures().unwrap().is_empty(),
+        "--remove-restrictions output must not report signed fields"
+    );
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !output_bytes.windows(3).any(|window| window == b"/V "),
+        "signature field /V entries must be removed"
+    );
 }
 
 #[test]
@@ -1054,6 +1085,35 @@ fn corrupt_xref_pdf() -> Vec<u8> {
     }
 
     corrupted
+}
+
+fn signed_acroform_pdf() -> Vec<u8> {
+    let objects: Vec<&[u8]> = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        b"4 0 obj\n<< /Fields [5 0 R] /SigFlags 3 >>\nendobj\n",
+        b"5 0 obj\n<< /FT /Sig /T (Approval) /V 6 0 R /Rect [0 0 0 0] >>\nendobj\n",
+        b"6 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>\nendobj\n",
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let xref_start = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    bytes
 }
 
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
