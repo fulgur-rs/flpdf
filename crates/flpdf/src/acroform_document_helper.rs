@@ -95,7 +95,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut seen = BTreeSet::new();
         for item in fields {
             if let Object::Reference(field_ref) = item {
-                self.fix_field_appearance_inheritance(field_ref, &da, &mut seen, 0)?;
+                self.fix_field_appearance_inheritance(
+                    field_ref,
+                    &da,
+                    &BTreeMap::new(),
+                    &mut seen,
+                    0,
+                )?;
             }
         }
         Ok(())
@@ -142,7 +148,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
         materialize_acroform_dr(&mut acroform, self.pdf)?;
         let font_renames = match source_dr {
-            Some(dr) => merge_acroform_dr(&mut acroform, resolve_dictionary_object(self.pdf, dr)?),
+            Some(dr) => {
+                let dr = resolve_dictionary_object(self.pdf, dr)?;
+                let dr = materialize_resource_categories_in_object(self.pdf, dr)?;
+                merge_acroform_dr(&mut acroform, dr)
+            }
             None => BTreeMap::new(),
         };
         let source_da = source_da.map(|da| rewrite_da_resource_names(da, &font_renames));
@@ -157,7 +167,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if let Some(da) = source_da {
             let mut seen = BTreeSet::new();
             for copied_ref in &copied_top {
-                self.fix_field_appearance_inheritance(*copied_ref, &da, &mut seen, 0)?;
+                self.fix_field_appearance_inheritance(
+                    *copied_ref,
+                    &da,
+                    &font_renames,
+                    &mut seen,
+                    0,
+                )?;
+            }
+        } else if !font_renames.is_empty() {
+            let mut seen = BTreeSet::new();
+            for copied_ref in &copied_top {
+                self.rewrite_field_da_resource_names(*copied_ref, &font_renames, &mut seen, 0)?;
             }
         }
 
@@ -278,6 +299,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         &mut self,
         field_ref: ObjectRef,
         inherited_da: &Object,
+        font_renames: &BTreeMap<Vec<u8>, Vec<u8>>,
         seen: &mut BTreeSet<ObjectRef>,
         depth: usize,
     ) -> Result<()> {
@@ -292,7 +314,15 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let mut field = self.resolve_field_dict(field_ref)?;
         let current_da = match field.get("DA").cloned() {
-            Some(da) => da,
+            Some(da) => {
+                let rewritten = rewrite_da_resource_names(da, font_renames);
+                if field.get("DA") != Some(&rewritten) {
+                    field.insert("DA", rewritten.clone());
+                    self.pdf
+                        .set_object(field_ref, Object::Dictionary(field.clone()));
+                }
+                rewritten
+            }
             None => {
                 field.insert("DA", inherited_da.clone());
                 self.pdf
@@ -306,7 +336,50 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         for kid in kids {
             if let Object::Reference(kid_ref) = kid {
-                self.fix_field_appearance_inheritance(kid_ref, &current_da, seen, depth + 1)?;
+                self.fix_field_appearance_inheritance(
+                    kid_ref,
+                    &current_da,
+                    font_renames,
+                    seen,
+                    depth + 1,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_field_da_resource_names(
+        &mut self,
+        field_ref: ObjectRef,
+        font_renames: &BTreeMap<Vec<u8>, Vec<u8>>,
+        seen: &mut BTreeSet<ObjectRef>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+            )));
+        }
+        if !seen.insert(field_ref) {
+            return Ok(());
+        }
+
+        let mut field = self.resolve_field_dict(field_ref)?;
+        if let Some(da) = field.get("DA").cloned() {
+            let rewritten = rewrite_da_resource_names(da, font_renames);
+            if field.get("DA") != Some(&rewritten) {
+                field.insert("DA", rewritten);
+                self.pdf
+                    .set_object(field_ref, Object::Dictionary(field.clone()));
+            }
+        }
+
+        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
+            return Ok(());
+        };
+        for kid in kids {
+            if let Object::Reference(kid_ref) = kid {
+                self.rewrite_field_da_resource_names(kid_ref, font_renames, seen, depth + 1)?;
             }
         }
         Ok(())
@@ -458,7 +531,8 @@ fn materialize_acroform_dr<R: Read + Seek>(
     let Some(dr) = acroform.get("DR").cloned() else {
         return Ok(());
     };
-    acroform.insert("DR", resolve_dictionary_object(pdf, dr)?);
+    let dr = resolve_dictionary_object(pdf, dr)?;
+    acroform.insert("DR", materialize_resource_categories_in_object(pdf, dr)?);
     Ok(())
 }
 
@@ -518,6 +592,33 @@ fn merge_acroform_dr(acroform: &mut Dictionary, source_dr: Object) -> BTreeMap<V
             BTreeMap::new()
         }
     }
+}
+
+fn materialize_resource_categories_in_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dr: Object,
+) -> Result<Object> {
+    match dr {
+        Object::Dictionary(mut dict) => {
+            materialize_resource_categories(&mut dict, pdf)?;
+            Ok(Object::Dictionary(dict))
+        }
+        other => Ok(other),
+    }
+}
+
+fn materialize_resource_categories<R: Read + Seek>(
+    dr: &mut Dictionary,
+    pdf: &mut Pdf<R>,
+) -> Result<()> {
+    let categories: Vec<Vec<u8>> = dr.iter().map(|(key, _)| key.to_vec()).collect();
+    for category in categories {
+        let Some(value) = dr.get(&category).cloned() else {
+            continue;
+        };
+        dr.insert(&category, resolve_dictionary_object(pdf, value)?);
+    }
+    Ok(())
 }
 
 fn merge_resource_dicts(

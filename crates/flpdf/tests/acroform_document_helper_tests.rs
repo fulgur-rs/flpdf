@@ -64,6 +64,43 @@ fn form_indirect_dr_pdf() -> Vec<u8> {
     )
 }
 
+fn form_indirect_dr_category_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Fields [5 0 R] /DA (/Helv 10 Tf 0 g) /DR << /Font 8 0 R >> >>",
+            ),
+            (5, "<< /T (parent) /FT /Tx /Kids [6 0 R] >>"),
+            (6, "<< /T (child) /Parent 5 0 R /V (before) >>"),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (8, "<< /Helv 7 0 R >>"),
+        ],
+        1,
+    )
+}
+
+fn form_direct_field_da_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] /DR << /Font << /Helv 7 0 R >> >> >>"),
+            (
+                5,
+                "<< /T (parent) /FT /Tx /DA (/Helv 11 Tf 0 g) /Kids [6 0 R] >>",
+            ),
+            (6, "<< /T (child) /Parent 5 0 R /V (before) >>"),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ],
+        1,
+    )
+}
+
 fn empty_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -177,6 +214,23 @@ fn target_indirect_dr_pdf() -> Vec<u8> {
             (4, "<< /Fields [] /DA (/Other 8 Tf 1 0 0 rg) /DR 6 0 R >>"),
             (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
             (6, "<< /Font << /Other 5 0 R >> >>"),
+        ],
+        1,
+    )
+}
+
+fn target_indirect_dr_category_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Fields [] /DA (/Other 8 Tf 1 0 0 rg) /DR << /Font 6 0 R >> >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+            (6, "<< /Other 5 0 R >>"),
         ],
         1,
     )
@@ -593,6 +647,32 @@ fn copy_fields_from_merges_indirect_source_default_resources() {
 }
 
 #[test]
+fn copy_fields_from_merges_indirect_default_resource_categories() {
+    let source_bytes = form_indirect_dr_category_pdf();
+    let target_bytes = target_indirect_dr_category_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    target.acroform().copy_fields_from(&mut source).unwrap();
+
+    let acroform = target.resolve(ObjectRef::new(4, 0)).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("target AcroForm should be a dictionary");
+    };
+    let Object::Dictionary(dr) = acroform_dict.get("DR").expect("target /DR") else {
+        panic!("/DR should be a dictionary");
+    };
+    let Object::Dictionary(fonts) = dr.get("Font").expect("/DR/Font") else {
+        panic!("/DR/Font should be materialized as a dictionary");
+    };
+    assert!(fonts.get("Other").is_some(), "target font should remain");
+    assert!(
+        fonts.get("Helv").is_some(),
+        "source font from indirect /DR/Font should be merged"
+    );
+}
+
+#[test]
 fn copy_fields_from_merges_into_indirect_target_default_resources() {
     let source_bytes = form_pdf();
     let target_bytes = target_indirect_dr_pdf();
@@ -678,5 +758,29 @@ fn copy_fields_from_renames_conflicting_default_font_resources() {
     assert_eq!(
         font_dict.get("BaseFont"),
         Some(&Object::Name(b"Helvetica".to_vec()))
+    );
+}
+
+#[test]
+fn copy_fields_from_renames_conflicting_direct_field_da_resources() {
+    let source_bytes = form_direct_field_da_pdf();
+    let target_bytes = target_conflicting_font_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+
+    let top = target.resolve(copied[0]).unwrap();
+    let Object::Dictionary(top_dict) = top else {
+        panic!("copied top field should be a dictionary");
+    };
+    let da = top_dict
+        .get("DA")
+        .and_then(Object::as_string)
+        .expect("copied field should keep direct /DA");
+    assert!(
+        da.starts_with(b"/Helv_flpdf"),
+        "conflicting direct field /DA should be renamed, got {}",
+        String::from_utf8_lossy(da)
     );
 }
