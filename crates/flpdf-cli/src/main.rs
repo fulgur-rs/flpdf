@@ -7,6 +7,10 @@ use flpdf::{
     subset_prune::prune_after_subset, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
+    acroform_sig_flags, clear_sig_flags, strip_signature_values, SIG_FLAGS_APPEND_ONLY,
+    SIG_FLAGS_SIGNATURES_EXIST,
+};
+use flpdf::{
     check_reader_with_options, filters, fonts,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
@@ -31,7 +35,7 @@ use flpdf::{
     insert_embedded_file, list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
 };
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::PathBuf;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -2469,26 +2473,55 @@ fn run_rewrite(
         // Re-open the PDF so `write_linearized` can seek/read objects independently.
         let mut pdf2 = open_pdf(&input, repair, password)?;
         reject_encrypted_write(&pdf2)?;
+        let had_signatures = if remove_restrictions {
+            pdf_has_signature_evidence(&mut pdf2)?
+        } else {
+            false
+        };
+        let mut options = options;
+        if had_signatures {
+            options.full_rewrite = true;
+            clear_sig_flags(&mut pdf2)?;
+            strip_signature_values(&mut pdf2)?;
+        }
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
 
         std::fs::write(&output, &doc.bytes)?;
+        if had_signatures {
+            eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
+        }
         // The linearize branch rejects encrypted input outright via
         // reject_encrypted_write above, so an encrypted (restricted) input
-        // never reaches here; on unencrypted input there is nothing to
-        // de-restrict. Per qpdf-lenient behaviour the diagnostic is omitted.
+        // never reaches here; on unsigned unencrypted input there is nothing
+        // to de-restrict. Per qpdf-lenient behaviour that diagnostic is
+        // omitted.
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
         // Capture encryption state BEFORE the write: the plaintext path
         // below drops /Encrypt, so this must be sampled while the in-memory
         // model still reflects the input.
         let was_encrypted = pdf.is_encrypted();
+        let had_signatures = if remove_restrictions {
+            pdf_has_signature_evidence(&mut pdf)?
+        } else {
+            false
+        };
         let mut options = options;
         if was_encrypted {
             options.full_rewrite = true;
         }
-        if remove_restrictions {
+        if had_signatures {
+            options.full_rewrite = true;
+            // --remove-restrictions intentionally invalidates signatures, so
+            // opt in to the writer's signed full-rewrite path explicitly.
+            // strip_signature_values removes each field's /V but preserves the
+            // /FT /Sig field dictionary, which signature_rewrite_impact still
+            // counts as signed in FullRewrite mode — so without this flag the
+            // writer would refuse with Error::Signed even after stripping.
             options.allow_signed_full_rewrite = true;
+            clear_sig_flags(&mut pdf)?;
+            strip_signature_values(&mut pdf)?;
         }
 
         // ── Content mutation pass ─────────────────────────────────────────────
@@ -2572,12 +2605,21 @@ fn run_rewrite(
         if remove_restrictions && was_encrypted {
             eprintln!("flpdf: removed restrictions (encryption and advisory permissions stripped)");
         }
+        if had_signatures {
+            eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
+        }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
     }
     Ok(())
+}
+
+fn pdf_has_signature_evidence<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<bool> {
+    let has_sig_flags = acroform_sig_flags(pdf)?
+        .is_some_and(|flags| flags & (SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY) != 0);
+    Ok(has_sig_flags || !pdf.signatures()?.is_empty())
 }
 
 // ===========================================================================

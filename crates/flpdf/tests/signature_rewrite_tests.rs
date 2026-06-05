@@ -1,6 +1,7 @@
 use flpdf::{
-    signature_rewrite_impact, would_rewrite_invalidate_signatures, write_pdf_with_options, Error,
-    ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode, WriteOptions,
+    signature_rewrite_impact, signatures, would_rewrite_invalidate_signatures, write_pdf,
+    write_pdf_with_options, Error, ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode,
+    WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -320,4 +321,70 @@ fn unreferenced_byte_range_dictionary_is_not_found_by_eager_scan() {
     assert!(!impact.has_signatures);
     assert!(impact.signed_object_refs.is_empty());
     assert!(!impact.invalidates_signatures);
+}
+
+/// flpdf-9hc.22.4: the incremental write path must preserve every byte covered
+/// by a signature's `/ByteRange`. Incremental update appends a new generation
+/// *after* the original bytes; a signed `/ByteRange` covers only the original
+/// prefix, so a benign incremental change (touching neither `/AcroForm`, the
+/// signature field, nor the signature dictionary) must leave that prefix — and
+/// thus the signature's covered regions — bit-identical.
+///
+/// External validation caveat: this fixture is SYNTHETIC. Its `/Contents` is a
+/// `<00>` placeholder rather than a real PKCS#7 blob, so `pdfsig`/`qpdf`
+/// cryptographic verification is not meaningful on it (pdfsig rejects the
+/// placeholder regardless of byte preservation). The bit-identical prefix and
+/// `/ByteRange` comparisons below ARE the verification for this invariant.
+#[test]
+fn incremental_write_preserves_signed_byte_range_bytes() {
+    let input = build_signed_acroform_pdf();
+    let mut pdf = open(input.clone());
+
+    // Read the signed byte ranges from the source before mutating/writing.
+    let ranges: Vec<[u64; 4]> = signatures(&mut pdf)
+        .unwrap()
+        .iter()
+        .map(|s| s.byte_range)
+        .collect();
+    assert!(!ranges.is_empty(), "fixture must contain a signature");
+
+    // Benign incremental change: re-set the page object (3 0 R), which is
+    // neither the /AcroForm (4), the signed field (5), nor the sig dict (6).
+    // This marks an object touched so the incremental path actually appends a
+    // new generation (otherwise the byte-preservation check would be trivial).
+    let page = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+    pdf.set_object(ObjectRef::new(3, 0), page);
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).unwrap();
+
+    // The incremental path must have appended a new generation, not rewritten.
+    assert!(
+        out.len() > input.len(),
+        "incremental update should append a new generation"
+    );
+
+    // Core invariant: the entire original prefix is preserved verbatim.
+    assert!(
+        out.starts_with(&input),
+        "incremental update must preserve the original source prefix byte-for-byte"
+    );
+
+    // Belt-and-suspenders: every region covered by a signature's /ByteRange is
+    // bit-identical between input and output.
+    for [o1, l1, o2, l2] in ranges {
+        for (start, len) in [(o1, l1), (o2, l2)] {
+            let s = start as usize;
+            let e = s + len as usize;
+            assert!(
+                e <= input.len() && e <= out.len(),
+                "signed /ByteRange region [{s}..{e}] must lie within the document"
+            );
+            assert_eq!(
+                &out[s..e],
+                &input[s..e],
+                "signed /ByteRange region [{s}..{e}] must be byte-identical after incremental write"
+            );
+        }
+    }
 }

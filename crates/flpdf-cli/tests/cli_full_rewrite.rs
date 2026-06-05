@@ -167,3 +167,30 @@ fn remove_restrictions_allows_signed_full_rewrite() {
     assert!(output.exists());
     assert!(std::fs::metadata(&output).unwrap().len() > 0);
 }
+
+#[test]
+fn remove_restrictions_allows_signed_linearized_rewrite() {
+    // Regression for the --linearize path: the destructive opt-in must apply
+    // to the linearize branch too. The branch strips the signatures
+    // (clear_sig_flags + strip_signature_values) before writing, so the
+    // rewrite succeeds and warns instead of being refused.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, build_signed_acroform_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--linearize",
+        "--remove-restrictions",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("removed signatures"));
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(&output).unwrap().len() > 0);
+}
