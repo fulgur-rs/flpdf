@@ -2488,11 +2488,10 @@ fn run_rewrite(
         // model still reflects the input.
         let was_encrypted = pdf.is_encrypted();
         let had_signatures = if remove_restrictions {
-            let has_signed_fields = !pdf.signatures()?.is_empty();
             let has_sig_flags = acroform_sig_flags(&mut pdf)?.is_some_and(|flags| {
                 flags & (SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY) != 0
             });
-            has_signed_fields || has_sig_flags
+            has_sig_flags || !pdf.signatures()?.is_empty()
         } else {
             false
         };
