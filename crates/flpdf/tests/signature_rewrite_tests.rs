@@ -106,6 +106,20 @@ fn full_rewrite_of_signed_pdf_returns_structured_signed_error() {
 }
 
 #[test]
+fn allow_signed_full_rewrite_option_bypasses_refusal() {
+    let mut pdf = open(build_signed_acroform_pdf());
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.allow_signed_full_rewrite = true;
+
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &options)
+        .expect("explicit opt-in should allow destructive signed rewrite");
+
+    assert!(!out.is_empty());
+}
+
+#[test]
 fn full_rewrite_refusal_survives_malformed_signature_details() {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),

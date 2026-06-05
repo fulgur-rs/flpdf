@@ -145,3 +145,25 @@ fn full_rewrite_of_signed_pdf_prints_actionable_diagnostic() {
     .stderr(predicate::str::contains("--remove-restrictions"))
     .stderr(predicate::str::contains("incremental rewrite"));
 }
+
+#[test]
+fn remove_restrictions_allows_signed_full_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, build_signed_acroform_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "rewrite",
+        "--full-rewrite",
+        "--remove-restrictions",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    assert!(output.exists());
+    assert!(std::fs::metadata(&output).unwrap().len() > 0);
+}

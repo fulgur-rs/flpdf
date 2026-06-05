@@ -2487,6 +2487,9 @@ fn run_rewrite(
         if was_encrypted {
             options.full_rewrite = true;
         }
+        if remove_restrictions {
+            options.allow_signed_full_rewrite = true;
+        }
 
         // ── Content mutation pass ─────────────────────────────────────────────
         //
