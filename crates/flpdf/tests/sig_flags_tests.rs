@@ -259,6 +259,10 @@ fn full_rewrite_round_trip_preserves_sig_flags() {
     let mut pdf = open(build_signed_acroform_pdf());
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    // The writer refuses full rewrites of signed PDFs by default
+    // (flpdf-9hc.22.3); this test exercises the SigFlags-preservation path, so
+    // opt in to the destructive rewrite explicitly.
+    options.allow_signed_full_rewrite = true;
 
     let mut out = Vec::new();
     write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();

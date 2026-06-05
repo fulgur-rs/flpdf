@@ -2513,6 +2513,13 @@ fn run_rewrite(
         }
         if had_signatures {
             options.full_rewrite = true;
+            // --remove-restrictions intentionally invalidates signatures, so
+            // opt in to the writer's signed full-rewrite path explicitly.
+            // strip_signature_values removes each field's /V but preserves the
+            // /FT /Sig field dictionary, which signature_rewrite_impact still
+            // counts as signed in FullRewrite mode — so without this flag the
+            // writer would refuse with Error::Signed even after stripping.
+            options.allow_signed_full_rewrite = true;
             clear_sig_flags(&mut pdf)?;
             strip_signature_values(&mut pdf)?;
         }
