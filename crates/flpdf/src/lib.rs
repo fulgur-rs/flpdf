@@ -87,7 +87,7 @@ pub mod xref;
 // Internal security primitives — not part of the public API.
 pub(crate) mod security;
 
-pub use acroform_document_helper::AcroFormDocumentHelper;
+pub use acroform_document_helper::{AcroFormDocumentHelper, AcroFormFieldInfo};
 pub use acroform_field_prune::{
     prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth,
     DEFAULT_MAX_ACROFORM_DEPTH,

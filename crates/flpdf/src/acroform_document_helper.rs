@@ -6,14 +6,54 @@
 //! [`crate::copy_objects`] for cross-document field copying.
 
 use crate::{
-    copy_objects, Dictionary, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf, Result,
-    DEFAULT_MAX_ACROFORM_DEPTH,
+    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, FormFieldObjectHelper,
+    Object, ObjectRef, Pdf, Result, DEFAULT_MAX_ACROFORM_DEPTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 type AcroFormInheritedEntries = Vec<(Vec<u8>, Object)>;
 type FieldCopySet = BTreeSet<ObjectRef>;
+
+/// Effective metadata for one AcroForm field-tree node.
+///
+/// Values are materialized from the current node plus inherited field-tree
+/// state. `/DA`, `/Q`, and `/MaxLen` may inherit from `/AcroForm` defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcroFormFieldInfo {
+    /// The field dictionary object.
+    pub object_ref: ObjectRef,
+    /// Direct `/T` partial name bytes, when present.
+    pub partial_name: Option<Vec<u8>>,
+    /// Dot-joined field name path reconstructed from ancestor `/T` entries.
+    pub full_name: String,
+    /// Effective `/FT` field type.
+    pub field_type: Option<Vec<u8>>,
+    /// Effective `/V` field value.
+    pub value: Option<Object>,
+    /// Effective `/DV` default field value.
+    pub default_value: Option<Object>,
+    /// Effective `/Ff` field flags.
+    pub field_flags: Option<i64>,
+    /// Effective `/DA` default appearance.
+    pub default_appearance: Option<Object>,
+    /// Effective `/Q` quadding value.
+    pub quadding: Option<i64>,
+    /// Effective `/MaxLen` text-field maximum length.
+    pub max_len: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FieldInheritance {
+    full_name: String,
+    field_type: Option<Vec<u8>>,
+    value: Option<Object>,
+    default_value: Option<Object>,
+    field_flags: Option<i64>,
+    default_appearance: Option<Object>,
+    quadding: Option<i64>,
+    max_len: Option<i64>,
+}
 
 /// High-level helper for a document's `/AcroForm`.
 ///
@@ -47,6 +87,40 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         for item in fields {
             if let Object::Reference(field_ref) = item {
                 self.walk_field_tree(field_ref, &mut seen, &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return all field-tree nodes with effective inherited metadata.
+    ///
+    /// Missing `/AcroForm` or missing/malformed `/Fields` returns an empty
+    /// list. Cycles are ignored after the first visit.
+    pub fn field_infos(&mut self) -> Result<Vec<AcroFormFieldInfo>> {
+        let Some(acroform) = self.acroform_dict()? else {
+            return Ok(Vec::new());
+        };
+        let Some(fields) = resolve_array_value(self.pdf, acroform.get("Fields").cloned())? else {
+            return Ok(Vec::new());
+        };
+
+        // `?` is not usable inside a struct literal, so materialize the
+        // AcroForm-default leaves (which may be indirect) into locals first.
+        let default_appearance = deref_leaf(self.pdf, acroform.get("DA").cloned())?;
+        let quadding = inherited_integer(self.pdf, &acroform, "Q")?;
+        let max_len = inherited_integer(self.pdf, &acroform, "MaxLen")?;
+        let inherited = FieldInheritance {
+            default_appearance,
+            quadding,
+            max_len,
+            ..FieldInheritance::default()
+        };
+
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for item in fields {
+            if let Object::Reference(field_ref) = item {
+                self.walk_field_info_tree(field_ref, inherited.clone(), &mut seen, &mut out, 0)?;
             }
         }
         Ok(out)
@@ -295,6 +369,57 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(())
     }
 
+    fn walk_field_info_tree(
+        &mut self,
+        field_ref: ObjectRef,
+        inherited: FieldInheritance,
+        seen: &mut BTreeSet<ObjectRef>,
+        out: &mut Vec<AcroFormFieldInfo>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+            )));
+        }
+        if !seen.insert(field_ref) {
+            return Ok(());
+        }
+
+        let field = self.resolve_field_dict(field_ref)?;
+        if is_pure_widget_annotation(&field) {
+            return Ok(());
+        }
+        let current = inherited.apply(self.pdf, &field)?;
+        let partial_name = deref_leaf(self.pdf, field.get("T").cloned())?
+            .as_ref()
+            .and_then(Object::as_string)
+            .map(|name| name.to_vec());
+
+        out.push(AcroFormFieldInfo {
+            object_ref: field_ref,
+            partial_name,
+            full_name: current.full_name.clone(),
+            field_type: current.field_type.clone(),
+            value: current.value.clone(),
+            default_value: current.default_value.clone(),
+            field_flags: current.field_flags,
+            default_appearance: current.default_appearance.clone(),
+            quadding: current.quadding,
+            max_len: current.max_len,
+        });
+
+        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
+            return Ok(());
+        };
+        for kid in kids {
+            if let Object::Reference(kid_ref) = kid {
+                self.walk_field_info_tree(kid_ref, current.clone(), seen, out, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
     fn fix_field_appearance_inheritance(
         &mut self,
         field_ref: ObjectRef,
@@ -386,11 +511,109 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 }
 
+impl FieldInheritance {
+    fn apply<R: Read + Seek>(&self, pdf: &mut Pdf<R>, field: &Dictionary) -> Result<Self> {
+        let partial_name = deref_leaf(pdf, field.get("T").cloned())?
+            .as_ref()
+            .and_then(Object::as_string)
+            .map(decode_field_name);
+        let full_name = match (self.full_name.is_empty(), partial_name.as_deref()) {
+            (_, None) => self.full_name.clone(),
+            (true, Some(name)) => name.to_string(),
+            (false, Some(name)) => format!("{}.{}", self.full_name, name),
+        };
+
+        Ok(Self {
+            full_name,
+            field_type: inherited_name(pdf, field, "FT")?.or_else(|| self.field_type.clone()),
+            value: inherited_object(pdf, field, "V")?.or_else(|| self.value.clone()),
+            default_value: inherited_object(pdf, field, "DV")?
+                .or_else(|| self.default_value.clone()),
+            field_flags: inherited_integer(pdf, field, "Ff")?.or(self.field_flags),
+            default_appearance: inherited_object(pdf, field, "DA")?
+                .or_else(|| self.default_appearance.clone()),
+            quadding: inherited_integer(pdf, field, "Q")?.or(self.quadding),
+            max_len: inherited_integer(pdf, field, "MaxLen")?.or(self.max_len),
+        })
+    }
+}
+
 impl<R: Read + Seek> Pdf<R> {
     /// Return a high-level AcroForm helper for this document.
     pub fn acroform(&mut self) -> AcroFormDocumentHelper<'_, R> {
         AcroFormDocumentHelper::new(self)
     }
+}
+
+/// Resolve one level of indirection for a metadata leaf value. A resolved
+/// `Object::Null` (freed/unknown ref) is treated as absent to match
+/// `inherited_object`'s existing Null handling. A direct (non-reference)
+/// value passes through unchanged, so this is a no-op for already-materialized
+/// PDFs.
+fn deref_leaf<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Option<Object>> {
+    match value {
+        Some(Object::Reference(object_ref)) => match pdf.resolve(object_ref)? {
+            Object::Null => Ok(None),
+            resolved => Ok(Some(resolved)),
+        },
+        other => Ok(other),
+    }
+}
+
+fn inherited_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: &Dictionary,
+    key: &str,
+) -> Result<Option<Object>> {
+    match deref_leaf(pdf, field.get(key).cloned())? {
+        Some(Object::Null) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
+fn inherited_name<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: &Dictionary,
+    key: &str,
+) -> Result<Option<Vec<u8>>> {
+    Ok(deref_leaf(pdf, field.get(key).cloned())?
+        .as_ref()
+        .and_then(Object::as_name)
+        .map(|name| name.to_vec()))
+}
+
+fn inherited_integer<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: &Dictionary,
+    key: &str,
+) -> Result<Option<i64>> {
+    Ok(deref_leaf(pdf, field.get(key).cloned())?
+        .as_ref()
+        .and_then(Object::as_integer))
+}
+
+fn is_pure_widget_annotation(field: &Dictionary) -> bool {
+    let is_widget = matches!(
+        field.get("Subtype"),
+        Some(Object::Name(name)) if name.as_slice() == b"Widget"
+    );
+    let has_field_entries = field.get("T").is_some()
+        || field.get("FT").is_some()
+        || field.get("Kids").is_some()
+        || field.get("V").is_some()
+        || field.get("DV").is_some()
+        || field.get("Ff").is_some()
+        || field.get("TU").is_some()
+        || field.get("TM").is_some()
+        || field.get("DA").is_some()
+        || field.get("Q").is_some()
+        || field.get("MaxLen").is_some();
+
+    is_widget && !has_field_entries
+}
+
+fn decode_field_name(name: &[u8]) -> String {
+    decode_pdf_text_string(name).unwrap_or_else(|| String::from_utf8_lossy(name).into_owned())
 }
 
 fn source_field_copy_set<RS: Read + Seek>(
