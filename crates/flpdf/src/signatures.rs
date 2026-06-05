@@ -250,10 +250,10 @@ fn catalog_acroform_dict<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Dict
 /// Extract `/SigFlags` as a `u32` bitfield from an already-resolved `/AcroForm`
 /// dictionary. Non-integer or out-of-range values read as absent.
 fn sig_flags_from_acroform_dict(acroform: &Dictionary) -> Option<u32> {
-    match acroform.get("SigFlags") {
-        Some(Object::Integer(n)) => u32::try_from(*n).ok(),
-        _ => None,
-    }
+    acroform
+        .get("SigFlags")
+        .and_then(Object::as_integer)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 /// Mask off the signature bits of `/SigFlags` in place. Returns `true` if the

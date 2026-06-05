@@ -95,6 +95,20 @@ fn build_unsigned_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Catalog with an `/AcroForm` (indirect) that has `/Fields` but no `/SigFlags`.
+fn build_acroform_without_sig_flags_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [] >>"),
+    ];
+    build_pdf(&objects)
+}
+
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
@@ -177,6 +191,20 @@ fn clear_sig_flags_clears_signature_bits() {
 #[test]
 fn clear_sig_flags_is_noop_without_acroform() {
     let mut pdf = open(build_unsigned_pdf());
+
+    assert!(!clear_sig_flags(&mut pdf).unwrap());
+}
+
+#[test]
+fn sig_flags_absent_when_acroform_has_no_sig_flags() {
+    let mut pdf = open(build_acroform_without_sig_flags_pdf());
+
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), None);
+}
+
+#[test]
+fn clear_sig_flags_is_noop_when_acroform_has_no_bits() {
+    let mut pdf = open(build_acroform_without_sig_flags_pdf());
 
     assert!(!clear_sig_flags(&mut pdf).unwrap());
 }
