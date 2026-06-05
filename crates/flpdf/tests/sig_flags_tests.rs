@@ -1,8 +1,8 @@
 //! Tests for /AcroForm /SigFlags reading, preservation, surfacing, and clearing.
 
 use flpdf::{
-    acroform_sig_flags, clear_sig_flags, signature_rewrite_impact, write_pdf,
-    write_pdf_with_options, Object, ObjectRef, Pdf, SignatureWriteMode, WriteOptions,
+    acroform_sig_flags, clear_sig_flags, signature_rewrite_impact, strip_signature_values,
+    write_pdf, write_pdf_with_options, Object, ObjectRef, Pdf, SignatureWriteMode, WriteOptions,
     SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 use std::collections::BTreeMap;
@@ -109,6 +109,56 @@ fn build_acroform_without_sig_flags_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Catalog with an `/AcroForm` dictionary that omits `/Fields`.
+fn build_acroform_without_fields_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /SigFlags 3 >>"),
+    ];
+    build_pdf(&objects)
+}
+
+/// Nested field tree where `/FT /Sig` is inherited from the parent.
+fn build_nested_signature_fields_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [8 0 R] >>"),
+        (4, b"<< /Fields [5 0 R 9 0 R 11] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /FT /Sig /T (Parent) /V 7 0 R /Kids [6 0 R 8 0 R 10 0 R 12] >>",
+        ),
+        (6, b"<< /T (Child) /Parent 5 0 R /V 7 0 R >>"),
+        (
+            7,
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+        (
+            8,
+            b"<< /Type /Annot /Subtype /Widget /Parent 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
+        ),
+        (9, b"<< /FT /Tx /T (Text) /V (keep me) >>"),
+        (10, b"(not a dictionary)"),
+    ];
+    build_pdf(&objects)
+}
+
+fn has_entry(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &str) -> bool {
+    match pdf.resolve(object_ref).unwrap() {
+        Object::Dictionary(dict) => dict.get(key).is_some(),
+        _ => false,
+    }
+}
+
 /// Catalog whose `/AcroForm` indirectly references a non-dictionary object.
 fn build_acroform_indirect_non_dict_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
@@ -213,6 +263,43 @@ fn clear_sig_flags_clears_signature_bits() {
 
     assert!(changed);
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn strip_signature_values_removes_direct_signature_field_value() {
+    let mut pdf = open(build_signed_acroform_pdf());
+
+    let changed = strip_signature_values(&mut pdf).unwrap();
+
+    assert!(changed);
+    assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
+    assert!(pdf.signatures().unwrap().is_empty());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(3));
+}
+
+#[test]
+fn strip_signature_values_removes_inherited_signature_field_value() {
+    let mut pdf = open(build_nested_signature_fields_pdf());
+
+    let changed = strip_signature_values(&mut pdf).unwrap();
+
+    assert!(changed);
+    assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
+    assert!(!has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
+    assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "V"));
+    assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
+fn strip_signature_values_is_noop_without_acroform_fields() {
+    let mut no_acroform = open(build_unsigned_pdf());
+    assert!(!strip_signature_values(&mut no_acroform).unwrap());
+
+    let mut no_fields = open(build_acroform_without_fields_pdf());
+    assert!(!strip_signature_values(&mut no_fields).unwrap());
+
+    let mut empty_fields = open(build_acroform_without_sig_flags_pdf());
+    assert!(!strip_signature_values(&mut empty_fields).unwrap());
 }
 
 #[test]
