@@ -123,8 +123,8 @@ pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_rotate::{
-    apply_rotate_to_pages, compose_rotate, normalize_rotate, resolve_inherited_rotate,
-    resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
+    apply_rotate_to_pages, compose_rotate, flatten_rotation_on_pages, normalize_rotate,
+    resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use page_split::{digit_width, split_output_path, split_pages};

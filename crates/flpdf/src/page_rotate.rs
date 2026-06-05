@@ -16,7 +16,7 @@
 //! when absent at every level is `0` (§7.7.3.3 Table 30).
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-use crate::{Error, Object, ObjectRef, PageBox, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectRef, PageBox, Pdf, Result, Stream};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -438,6 +438,120 @@ fn wrap_content_with_matrix(m: Mat, inner: &[u8]) -> Vec<u8> {
     out.extend_from_slice(inner);
     out.extend_from_slice(b"\nQ\n");
     out
+}
+
+// ---------------------------------------------------------------------------
+// Public API: flatten_rotation_on_pages (flpdf-9hc.9.9)
+// ---------------------------------------------------------------------------
+
+/// Box keys flattened, in a deterministic order.
+const FLATTEN_BOX_KEYS: [&str; 5] = ["MediaBox", "CropBox", "BleedBox", "TrimBox", "ArtBox"];
+
+/// Flatten the effective `/Rotate` of each leaf page into its content stream and
+/// geometry. For each page: resolve the inherited+normalized rotation; if 0, skip.
+/// Otherwise build matrix `M` from the rotation and the effective `/MediaBox`,
+/// wrap the page content with `M`, transform every present box and annotation
+/// `/Rect` with `M`, and materialize `/Rotate = 0` on the leaf. Visual rendering
+/// is unchanged because content and geometry share the single matrix `M`.
+///
+/// # Caveat (held for review)
+///
+/// Annotation `/QuadPoints` and the appearance `/AP` `/Matrix` are **not**
+/// transformed — only `/Rect`. An annotation's appearance orientation may
+/// therefore change. Byte-identity with the source is not preserved: the page
+/// content is rebuilt from its decoded bytes wrapped in a single new stream.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if a target ref is not a leaf `/Type /Page`, or a
+///   rotated page has no resolvable `/MediaBox`.
+/// - Any error from content decoding or object resolution.
+pub fn flatten_rotation_on_pages<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    pages: &[ObjectRef],
+) -> Result<()> {
+    for &page_ref in pages {
+        let rotate = normalize_rotate(resolve_inherited_rotate(pdf, page_ref)?);
+        if rotate == 0 {
+            continue; // nothing to flatten
+        }
+
+        // A sane matrix needs the page's effective MediaBox.
+        let Some(mb) = inherited_present_box(pdf, page_ref, "MediaBox")? else {
+            return Err(Error::Unsupported(format!(
+                "page {page_ref} has no /MediaBox; cannot flatten /Rotate"
+            )));
+        };
+        let m = rotation_matrix(rotate, mb);
+
+        // Wrap the page content with `q M cm ... Q`.
+        let inner = crate::pages::page_content_bytes(pdf, page_ref)?;
+        let new_content = wrap_content_with_matrix(m, &inner);
+
+        // Resolve the leaf page dict; guard that it is a /Type /Page.
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a dictionary, cannot flatten /Rotate"
+            )));
+        };
+        let is_leaf_page = matches!(
+            page_dict.get("Type"),
+            Some(Object::Name(t)) if t.as_slice() == b"Page"
+        );
+        if !is_leaf_page {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a leaf /Page, cannot flatten /Rotate"
+            )));
+        }
+
+        // Allocate a fresh content stream and repoint /Contents at it.
+        let mut sdict = Dictionary::new();
+        sdict.insert("Length", Object::Integer(new_content.len() as i64));
+        let stream_ref = next_object_ref(pdf)?;
+        pdf.set_object(stream_ref, Object::Stream(Stream::new(sdict, new_content)));
+        page_dict.insert("Contents", Object::Reference(stream_ref));
+
+        // Transform every present box; materialize on the leaf. Reads here see the
+        // original boxes because `page_dict` is not written back until the end.
+        for key in FLATTEN_BOX_KEYS {
+            if let Some(b) = inherited_present_box(pdf, page_ref, key)? {
+                page_dict.insert(key, pagebox_to_object(transform_box(m, b)));
+            }
+        }
+
+        // Materialize /Rotate = 0 on the leaf (never inherited).
+        page_dict.insert("Rotate", Object::Integer(0));
+
+        // Transform annotation /Rect rectangles.
+        flatten_annotation_rects(pdf, &page_dict, m)?;
+
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+    }
+    Ok(())
+}
+
+/// Transform every annotation's `/Rect` on this page by `m`. (Task 5 fills the
+/// body; this no-op stub keeps the build green meanwhile.)
+fn flatten_annotation_rects<R: Read + Seek>(
+    _pdf: &mut Pdf<R>,
+    _page_dict: &Dictionary,
+    _m: Mat,
+) -> Result<()> {
+    Ok(())
+}
+
+/// Allocate a fresh indirect-object reference (the new-object idiom used across
+/// the crate): one past the current highest object number.
+fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
+    let n = pdf
+        .object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+    Ok(ObjectRef::new(n, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,5 +1235,138 @@ mod tests {
             panic!("not a dict")
         };
         assert_eq!(dict2.get("Rotate"), Some(&Object::Integer(90)), "page 2");
+    }
+
+    // -----------------------------------------------------------------------
+    // flatten_rotation_on_pages (flpdf-9hc.9.9)
+    // -----------------------------------------------------------------------
+
+    /// Assemble a minimal PDF from `(number, body)` objects numbered 1..=N in
+    /// order. `body` excludes the `N 0 obj` / `endobj` wrapper.
+    fn assemble_pdf(objs: &[(u32, String)]) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::with_capacity(objs.len());
+        for (num, body) in objs {
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body.as_bytes());
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let n = objs.len() as u32 + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {n}\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    fn content_obj_body(content: &str) -> String {
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        )
+    }
+
+    /// 1-page PDF: MediaBox `mb`, optional leaf `/Rotate`, content stream `content`.
+    fn build_single_page_with_content(mb: &str, rotate: Option<i32>, content: &str) -> Vec<u8> {
+        let page = match rotate {
+            Some(r) => format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R /Rotate {r} >>"
+            ),
+            None => {
+                format!("<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R >>")
+            }
+        };
+        assemble_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, page),
+            (4, content_obj_body(content)),
+        ])
+    }
+
+    /// 1-page PDF with `/Rotate` only on the `/Pages` root (inherited by the leaf).
+    fn build_single_page_inherited_rotate(parent_rotate: i32) -> Vec<u8> {
+        assemble_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (
+                2,
+                format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate {parent_rotate} >>"),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 4 0 R >>"
+                    .to_string(),
+            ),
+            (4, content_obj_body("BT (x) Tj ET")),
+        ])
+    }
+
+    #[test]
+    fn flatten_90_swaps_mediabox_zeroes_rotate_and_wraps_content() {
+        let bytes = build_single_page_with_content("[0 0 200 300]", Some(90), "BT (x) Tj ET");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+
+        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+            panic!("not a dict")
+        };
+        assert_eq!(d.get("Rotate"), Some(&Object::Integer(0)));
+        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
+
+        let content = pages::page_content_bytes(&mut pdf, page).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.starts_with("q\n0 -1 1 0 0 200 cm\n"), "{s:?}");
+        assert!(s.contains("BT (x) Tj ET"), "{s:?}");
+
+        // Round-trips through the writer + reparse without error.
+        let mut buf = Vec::new();
+        write_pdf(&mut pdf, &mut buf).unwrap();
+        let mut pdf2 = Pdf::open(Cursor::new(buf)).unwrap();
+        let p2 = pages::page_refs(&mut pdf2).unwrap()[0];
+        let Object::Dictionary(d2) = pdf2.resolve(p2).unwrap() else {
+            panic!("not a dict")
+        };
+        assert_eq!(d2.get("Rotate"), Some(&Object::Integer(0)));
+    }
+
+    #[test]
+    fn flatten_is_noop_when_rotate_zero() {
+        let bytes = build_single_page_with_content("[0 0 200 300]", None, "BT (x) Tj ET");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        let before = pages::page_content_bytes(&mut pdf, page).unwrap();
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+        let after = pages::page_content_bytes(&mut pdf, page).unwrap();
+        assert_eq!(before, after, "content must be untouched when rotate==0");
+        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+            panic!("not a dict")
+        };
+        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        assert_eq!((mb.urx, mb.ury), (200.0, 300.0));
+    }
+
+    #[test]
+    fn flatten_materializes_inherited_rotate() {
+        let bytes = build_single_page_inherited_rotate(270);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+            panic!("not a dict")
+        };
+        assert_eq!(d.get("Rotate"), Some(&Object::Integer(0)));
+        // 270 on a [0 0 200 300] box swaps dims to 300x200.
+        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
     }
 }
