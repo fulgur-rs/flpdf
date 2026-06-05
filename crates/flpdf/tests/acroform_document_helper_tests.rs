@@ -338,6 +338,36 @@ fn unicode_field_names_pdf() -> Vec<u8> {
     )
 }
 
+fn indirect_field_info_values_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Fields [5 0 R] /DA 10 0 R /Q 11 0 R /MaxLen 12 0 R >>",
+            ),
+            (
+                5,
+                "<< /T 13 0 R /FT 14 0 R /DV 15 0 R /Ff 16 0 R /Kids [6 0 R] >>",
+            ),
+            (6, "<< /T 17 0 R /Parent 5 0 R /V 18 0 R /DA 19 0 R >>"),
+            (10, "(/Doc 10 Tf 0 g)"),
+            (11, "1"),
+            (12, "20"),
+            (13, "(parent)"),
+            (14, "/Tx"),
+            (15, "(parent-default)"),
+            (16, "3"),
+            (17, "(child)"),
+            (18, "(child-value)"),
+            (19, "(/Child 11 Tf 1 g)"),
+        ],
+        1,
+    )
+}
+
 #[test]
 fn fields_walks_acroform_field_tree() {
     let bytes = form_pdf();
@@ -429,6 +459,49 @@ fn field_infos_decode_utf16be_field_name_paths() {
     assert_eq!(fields[0].full_name, "親");
     assert_eq!(fields[1].partial_name, Some(vec![0xFE, 0xFF, 0x5B, 0x50]));
     assert_eq!(fields[1].full_name, "親.子");
+}
+
+#[test]
+fn field_infos_materialize_indirect_inherited_values() {
+    let bytes = indirect_field_info_values_pdf();
+    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+
+    let fields = pdf.acroform().field_infos().unwrap();
+
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].partial_name, Some(b"parent".to_vec()));
+    assert_eq!(fields[0].full_name, "parent");
+    assert_eq!(fields[0].field_type, Some(b"Tx".to_vec()));
+    assert_eq!(fields[0].value, None);
+    assert_eq!(
+        fields[0].default_value,
+        Some(Object::String(b"parent-default".to_vec()))
+    );
+    assert_eq!(fields[0].field_flags, Some(3));
+    assert_eq!(
+        fields[0].default_appearance,
+        Some(Object::String(b"/Doc 10 Tf 0 g".to_vec()))
+    );
+    assert_eq!(fields[0].quadding, Some(1));
+    assert_eq!(fields[0].max_len, Some(20));
+
+    assert_eq!(fields[1].partial_name, Some(b"child".to_vec()));
+    assert_eq!(fields[1].full_name, "parent.child");
+    assert_eq!(fields[1].field_type, Some(b"Tx".to_vec()));
+    assert_eq!(
+        fields[1].value,
+        Some(Object::String(b"child-value".to_vec()))
+    );
+    assert_eq!(
+        fields[1].default_value,
+        Some(Object::String(b"parent-default".to_vec()))
+    );
+    assert_eq!(
+        fields[1].default_appearance,
+        Some(Object::String(b"/Child 11 Tf 1 g".to_vec()))
+    );
+    assert_eq!(fields[1].quadding, Some(1));
+    assert_eq!(fields[1].max_len, Some(20));
 }
 
 #[test]

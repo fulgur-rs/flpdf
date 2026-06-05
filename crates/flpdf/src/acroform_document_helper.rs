@@ -104,10 +104,15 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(Vec::new());
         };
 
+        // `?` is not usable inside a struct literal, so materialize the
+        // AcroForm-default leaves (which may be indirect) into locals first.
+        let default_appearance = deref_leaf(self.pdf, acroform.get("DA").cloned())?;
+        let quadding = inherited_integer(self.pdf, &acroform, "Q")?;
+        let max_len = inherited_integer(self.pdf, &acroform, "MaxLen")?;
         let inherited = FieldInheritance {
-            default_appearance: acroform.get("DA").cloned(),
-            quadding: acroform.get("Q").and_then(Object::as_integer),
-            max_len: acroform.get("MaxLen").and_then(Object::as_integer),
+            default_appearance,
+            quadding,
+            max_len,
             ..FieldInheritance::default()
         };
 
@@ -385,9 +390,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if is_pure_widget_annotation(&field) {
             return Ok(());
         }
-        let current = inherited.apply(&field);
-        let partial_name = field
-            .get("T")
+        let current = inherited.apply(self.pdf, &field)?;
+        let partial_name = deref_leaf(self.pdf, field.get("T").cloned())?
+            .as_ref()
             .and_then(Object::as_string)
             .map(|name| name.to_vec());
 
@@ -507,9 +512,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 }
 
 impl FieldInheritance {
-    fn apply(&self, field: &Dictionary) -> Self {
-        let partial_name = field
-            .get("T")
+    fn apply<R: Read + Seek>(&self, pdf: &mut Pdf<R>, field: &Dictionary) -> Result<Self> {
+        let partial_name = deref_leaf(pdf, field.get("T").cloned())?
+            .as_ref()
             .and_then(Object::as_string)
             .map(decode_field_name);
         let full_name = match (self.full_name.is_empty(), partial_name.as_deref()) {
@@ -518,17 +523,18 @@ impl FieldInheritance {
             (false, Some(name)) => format!("{}.{}", self.full_name, name),
         };
 
-        Self {
+        Ok(Self {
             full_name,
-            field_type: inherited_name(field, "FT").or_else(|| self.field_type.clone()),
-            value: inherited_object(field, "V").or_else(|| self.value.clone()),
-            default_value: inherited_object(field, "DV").or_else(|| self.default_value.clone()),
-            field_flags: inherited_integer(field, "Ff").or(self.field_flags),
-            default_appearance: inherited_object(field, "DA")
+            field_type: inherited_name(pdf, field, "FT")?.or_else(|| self.field_type.clone()),
+            value: inherited_object(pdf, field, "V")?.or_else(|| self.value.clone()),
+            default_value: inherited_object(pdf, field, "DV")?
+                .or_else(|| self.default_value.clone()),
+            field_flags: inherited_integer(pdf, field, "Ff")?.or(self.field_flags),
+            default_appearance: inherited_object(pdf, field, "DA")?
                 .or_else(|| self.default_appearance.clone()),
-            quadding: inherited_integer(field, "Q").or(self.quadding),
-            max_len: inherited_integer(field, "MaxLen").or(self.max_len),
-        }
+            quadding: inherited_integer(pdf, field, "Q")?.or(self.quadding),
+            max_len: inherited_integer(pdf, field, "MaxLen")?.or(self.max_len),
+        })
     }
 }
 
@@ -539,22 +545,51 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-fn inherited_object(field: &Dictionary, key: &str) -> Option<Object> {
-    match field.get(key).cloned() {
-        Some(Object::Null) | None => None,
-        Some(value) => Some(value),
+/// Resolve one level of indirection for a metadata leaf value. A resolved
+/// `Object::Null` (freed/unknown ref) is treated as absent to match
+/// `inherited_object`'s existing Null handling. A direct (non-reference)
+/// value passes through unchanged, so this is a no-op for already-materialized
+/// PDFs.
+fn deref_leaf<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Option<Object>> {
+    match value {
+        Some(Object::Reference(object_ref)) => match pdf.resolve(object_ref)? {
+            Object::Null => Ok(None),
+            resolved => Ok(Some(resolved)),
+        },
+        other => Ok(other),
     }
 }
 
-fn inherited_name(field: &Dictionary, key: &str) -> Option<Vec<u8>> {
-    field
-        .get(key)
-        .and_then(Object::as_name)
-        .map(|name| name.to_vec())
+fn inherited_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: &Dictionary,
+    key: &str,
+) -> Result<Option<Object>> {
+    match deref_leaf(pdf, field.get(key).cloned())? {
+        Some(Object::Null) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
 }
 
-fn inherited_integer(field: &Dictionary, key: &str) -> Option<i64> {
-    field.get(key).and_then(Object::as_integer)
+fn inherited_name<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: &Dictionary,
+    key: &str,
+) -> Result<Option<Vec<u8>>> {
+    Ok(deref_leaf(pdf, field.get(key).cloned())?
+        .as_ref()
+        .and_then(Object::as_name)
+        .map(|name| name.to_vec()))
+}
+
+fn inherited_integer<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: &Dictionary,
+    key: &str,
+) -> Result<Option<i64>> {
+    Ok(deref_leaf(pdf, field.get(key).cloned())?
+        .as_ref()
+        .and_then(Object::as_integer))
 }
 
 fn is_pure_widget_annotation(field: &Dictionary) -> bool {
