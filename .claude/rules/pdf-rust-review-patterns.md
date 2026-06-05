@@ -16,8 +16,9 @@
 - `resolve()` / `resolve_borrowed()` の戻り値を、所有が必要だからといって
   即 `.clone()` しない。`resolve()` は**所有 `Object` を返す**ので直接ムーブして使う。
   借用で十分なら `resolve_borrowed()` のまま借用として扱う（クローンすると借用の意図が無効化される）。
-- `Dictionary` から値を取り出すとき、所有が要るなら `get().cloned()` ではなく
-  `remove()` でムーブする。
+- `Dictionary` から値を取り出すとき、`&mut Dictionary` や所有権があり、かつ値の所有が
+  必要な場合は `get().cloned()` ではなく `remove()` でムーブする
+  （共有参照 `&Dictionary` の場合は `remove()` が使えないため `get().cloned()` が不可避かつ適切）。
 - ツリーを書き換えるときは `&Object` を受け取って全体をディープクローンせず、
   `&mut Object` で in-place に書き換える（stream の raw データ複製を避ける）。
 - 条件付きでしか使わないフィールドは、Dictionary 全体をクローンせず
@@ -43,8 +44,10 @@ PDF では任意の値が間接参照で格納されうる。`Object::Name(..)` 
   - 署名 Dict のキー（`/SubFilter`, `/Name`, `/M`, `/Reason`, `/Location`,
     `/ContactInfo`, `/Cert`）
   - `/ByteRange`、配列要素、`/DA` などの継承属性
-- 型を見るときは `Object::Integer` への直接マッチではなく
-  `Object::as_integer().and_then(..)` のようなアクセサ経由にする（堅牢かつ慣用的）。
+- 型を見るときは、事前に resolve されていることを前提とした上で、`Object::Integer` への
+  直接マッチではなく `Object::as_integer().and_then(..)` のようなアクセサ経由にする
+  （堅牢かつ慣用的。ただしアクセサ自体は自動で参照解決を行わず `Object::Reference` には
+  `None` を返すため、事前の `resolve` が必須であることに注意する）。
 - ヘルパー（`name_entry` / `text_entry` / `certificate_entry` 等）は
   `pdf` を受け取り、内部で参照解決してから値を返す設計にする。
 
