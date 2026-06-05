@@ -198,6 +198,37 @@ fn rewrite_remove_restrictions_strips_signatures_and_warns() {
 }
 
 #[test]
+fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("unsigned-linearized.pdf");
+    std::fs::write(&input, signed_acroform_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--linearize", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signatures are now invalidated"));
+
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+    assert!(
+        pdf.signatures().unwrap().is_empty(),
+        "linearized --remove-restrictions output must not report signed fields"
+    );
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !output_bytes.windows(3).any(|window| window == b"/V "),
+        "linearized signature field /V entries must be removed"
+    );
+}
+
+#[test]
 fn rewrite_default_is_qpdf_equivalent_full_rewrite() {
     // flpdf-9hc.12.7 acceptance: a plain `flpdf rewrite IN OUT` (no flags)
     // must match qpdf's documented defaults — qpdf full-rewrites and applies

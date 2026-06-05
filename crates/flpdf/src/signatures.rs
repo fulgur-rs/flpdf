@@ -478,11 +478,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         return Ok(());
     };
 
-    let field_type = dict
-        .get("FT")
-        .and_then(Object::as_name)
-        .map(<[u8]>::to_vec)
-        .or(inherited_type);
+    let field_type = inherited_name(pdf, &dict, "FT")?.or(inherited_type);
     let kids_obj = dict.get("Kids").cloned();
 
     if field_type.as_deref() == Some(b"Sig") && dict.remove("V").is_some() {
