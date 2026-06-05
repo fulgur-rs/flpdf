@@ -28,6 +28,14 @@ pub enum Error {
 
     #[error("encrypted PDF: {0}")]
     Encrypted(#[from] EncryptedError),
+
+    #[error("signed PDF: {message}")]
+    Signed {
+        /// Signature field names that make a destructive rewrite unsafe.
+        fields: Vec<String>,
+        /// Human-readable diagnostic suitable for CLI output.
+        message: String,
+    },
 }
 
 impl Error {

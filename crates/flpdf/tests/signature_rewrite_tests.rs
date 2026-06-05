@@ -1,6 +1,6 @@
 use flpdf::{
-    signature_rewrite_impact, would_rewrite_invalidate_signatures, ObjectRef, Pdf,
-    SignatureRewriteReason, SignatureWriteMode, WriteOptions,
+    signature_rewrite_impact, would_rewrite_invalidate_signatures, write_pdf_with_options, Error,
+    ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode, WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -76,6 +76,71 @@ fn full_rewrite_invalidates_signed_pdf() {
     assert!(impact.has_signatures);
     assert!(impact.invalidates_signatures);
     assert_eq!(impact.reason, SignatureRewriteReason::FullRewrite);
+}
+
+#[test]
+fn full_rewrite_of_signed_pdf_returns_structured_signed_error() {
+    let mut pdf = open(build_signed_acroform_pdf());
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let err = write_pdf_with_options(&mut pdf, Vec::new(), &options)
+        .expect_err("full rewrite should refuse signed PDFs");
+
+    let Error::Signed { fields, message } = err else {
+        panic!("expected Error::Signed, got {err:?}");
+    };
+    assert_eq!(fields, vec!["Signed"]);
+    assert!(
+        message.contains("refusing full rewrite of signed PDF"),
+        "unexpected message: {message}",
+    );
+    assert!(
+        message.contains("--remove-restrictions"),
+        "diagnostic should mention the override flag: {message}",
+    );
+    assert!(
+        message.contains("incremental rewrite"),
+        "diagnostic should suggest incremental rewrite: {message}",
+    );
+}
+
+#[test]
+fn full_rewrite_refusal_survives_malformed_signature_details() {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Broken) /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
+        ),
+        (
+            6,
+            b"<< /Type /Sig /ByteRange [0 /Bad 20 30] /Contents <00> >>",
+        ),
+    ];
+    let mut pdf = open(build_pdf(&objects));
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let err = write_pdf_with_options(&mut pdf, Vec::new(), &options)
+        .expect_err("full rewrite should refuse before destructive output");
+
+    let Error::Signed { fields, message } = err else {
+        panic!("expected Error::Signed, got {err:?}");
+    };
+    assert!(
+        fields
+            .iter()
+            .any(|field| field == "5 0 R" || field == "6 0 R"),
+        "expected object-ref fallback fields, got {fields:?}",
+    );
+    assert!(message.contains("refusing full rewrite of signed PDF"));
 }
 
 #[test]

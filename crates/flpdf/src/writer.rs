@@ -3,6 +3,7 @@ pub(crate) mod object_streams;
 pub use object_streams::ObjectStreamMode;
 
 use crate::parser::Parser;
+use crate::signatures::{signature_rewrite_impact, SignatureWriteMode};
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
@@ -1550,6 +1551,49 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above attached to its function.
 
+fn refuse_signed_full_rewrite<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    let impact = signature_rewrite_impact(pdf, SignatureWriteMode::FullRewrite)?;
+    if !impact.invalidates_signatures {
+        return Ok(());
+    }
+
+    let mut fields: Vec<String> = match pdf.signatures() {
+        Ok(signatures) => signatures
+            .into_iter()
+            .map(|signature| {
+                if signature.field_name.is_empty() {
+                    format!("{}", signature.field_ref)
+                } else {
+                    signature.field_name
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    fields.sort();
+    fields.dedup();
+
+    if fields.is_empty() {
+        fields = impact
+            .signed_object_refs
+            .into_iter()
+            .map(|object_ref| format!("{object_ref}"))
+            .collect();
+    }
+    if fields.is_empty() {
+        fields.push("(unknown signature)".to_string());
+    }
+
+    let field_list = fields.join(", ");
+    let message = format!(
+        "refusing full rewrite of signed PDF because it would invalidate signature field(s): \
+         {field_list}. Use --remove-restrictions to explicitly discard signatures, or use an \
+         incremental rewrite that preserves signed byte ranges."
+    );
+
+    Err(crate::Error::Signed { fields, message })
+}
+
 // ── Encryption context (flpdf-9hc.4.9) ───────────────────────────────────────
 
 /// Per-write encryption state used by the full-rewrite path when
@@ -2035,6 +2079,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
+
+    refuse_signed_full_rewrite(pdf)?;
 
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
 
