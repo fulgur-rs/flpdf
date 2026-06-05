@@ -52,6 +52,32 @@ fn build_signed_acroform_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+fn build_signed_acroform_indirect_ft_pdf() -> Vec<u8> {
+    // Same as build_signed_acroform_pdf, but the field's /FT is stored as an
+    // indirect reference (7 0 R -> /Sig) instead of a direct name. The only
+    // /ByteRange lives in the /V signature dict (obj 6), reachable only once
+    // /FT resolves to /Sig — so detection hinges entirely on resolving /FT.
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /FT 7 0 R /T (Signed) /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
+        ),
+        (
+            6,
+            b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+        (7, b"/Sig"),
+    ];
+    build_pdf(&objects)
+}
+
 fn build_unsigned_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -75,6 +101,23 @@ fn full_rewrite_invalidates_signed_pdf() {
     let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
 
     assert!(impact.has_signatures);
+    assert!(impact.invalidates_signatures);
+    assert_eq!(impact.reason, SignatureRewriteReason::FullRewrite);
+}
+
+#[test]
+fn full_rewrite_invalidates_signed_pdf_with_indirect_ft() {
+    // Regression (flpdf-967): a signature field whose /FT is an indirect
+    // reference must still be detected, so a full rewrite is flagged as
+    // signature-invalidating instead of silently destroying the signature.
+    let mut pdf = open(build_signed_acroform_indirect_ft_pdf());
+
+    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
+
+    assert!(
+        impact.has_signatures,
+        "signature field with indirect /FT must be detected"
+    );
     assert!(impact.invalidates_signatures);
     assert_eq!(impact.reason, SignatureRewriteReason::FullRewrite);
 }
