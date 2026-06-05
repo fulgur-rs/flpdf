@@ -296,6 +296,7 @@ fn strip_signature_values_removes_direct_signature_field_value() {
 
     assert!(changed);
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
+    assert_eq!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null);
     assert!(pdf.signatures().unwrap().is_empty());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(3));
 }
@@ -309,6 +310,7 @@ fn strip_signature_values_removes_inherited_signature_field_value() {
     assert!(changed);
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
     assert!(!has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
+    assert_eq!(pdf.resolve(ObjectRef::new(7, 0)).unwrap(), Object::Null);
     assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "V"));
     assert!(pdf.signatures().unwrap().is_empty());
 }
@@ -321,6 +323,7 @@ fn strip_signature_values_resolves_indirect_field_type() {
 
     assert!(changed);
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
+    assert_eq!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null);
     assert!(pdf.signatures().unwrap().is_empty());
 }
 
