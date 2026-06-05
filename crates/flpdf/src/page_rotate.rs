@@ -407,6 +407,40 @@ fn inherited_present_box<R: Read + Seek>(
 }
 
 // ---------------------------------------------------------------------------
+// Content-stream wrapper builder (flpdf-9hc.9.9)
+// ---------------------------------------------------------------------------
+
+/// Format an f64 matrix operand without a trailing `.0` and without scientific
+/// notation, so `cm` operands stay compact and valid (e.g. 200.0 -> "200").
+fn format_matrix_number(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Wrap `inner` content bytes as `q\n{a b c d e f} cm\n{inner}\nQ\n`.
+/// Whitespace at both seams prevents token merges (e.g. `ET`+`Q` -> `ETQ`).
+fn wrap_content_with_matrix(m: Mat, inner: &[u8]) -> Vec<u8> {
+    let cm = format!(
+        "q\n{} {} {} {} {} {} cm\n",
+        format_matrix_number(m[0]),
+        format_matrix_number(m[1]),
+        format_matrix_number(m[2]),
+        format_matrix_number(m[3]),
+        format_matrix_number(m[4]),
+        format_matrix_number(m[5]),
+    );
+    let mut out = Vec::with_capacity(cm.len() + inner.len() + 3);
+    out.extend_from_slice(cm.as_bytes());
+    out.extend_from_slice(inner);
+    out.extend_from_slice(b"\nQ\n");
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -521,6 +555,30 @@ mod tests {
             None
         );
         assert_eq!(object_to_pagebox(&Object::Integer(0)), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Content wrapper builder (flpdf-9hc.9.9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrap_content_has_safe_seams_and_cm() {
+        let m = [0.0, -1.0, 1.0, 0.0, 0.0, 200.0];
+        let inner = b"BT /F1 12 Tf (hi) Tj ET";
+        let out = wrap_content_with_matrix(m, inner);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("q\n0 -1 1 0 0 200 cm\n"), "prefix: {s:?}");
+        assert!(s.contains("BT /F1 12 Tf (hi) Tj ET"), "{s:?}");
+        // Suffix Q is separated from the preceding token by whitespace (no ET+Q merge).
+        assert!(s.ends_with("ET\nQ\n"), "suffix: {s:?}");
+    }
+
+    #[test]
+    fn format_number_drops_trailing_zeros() {
+        assert_eq!(format_matrix_number(200.0), "200");
+        assert_eq!(format_matrix_number(-1.0), "-1");
+        assert_eq!(format_matrix_number(1.5), "1.5");
+        assert_eq!(format_matrix_number(0.0), "0");
     }
 
     // -----------------------------------------------------------------------
