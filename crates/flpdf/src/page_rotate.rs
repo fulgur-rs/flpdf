@@ -1331,14 +1331,24 @@ mod tests {
 
     /// 1-page PDF: MediaBox `mb`, optional leaf `/Rotate`, content stream `content`.
     fn build_single_page_with_content(mb: &str, rotate: Option<i32>, content: &str) -> Vec<u8> {
-        let page = match rotate {
-            Some(r) => format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R /Rotate {r} >>"
-            ),
-            None => {
-                format!("<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R >>")
-            }
+        build_single_page_with_extra(mb, rotate, content, "")
+    }
+
+    /// As [`build_single_page_with_content`] but with `extra` raw dict entries
+    /// (e.g. `"/CropBox [10 10 190 290]"`) spliced into the leaf page dictionary.
+    fn build_single_page_with_extra(
+        mb: &str,
+        rotate: Option<i32>,
+        content: &str,
+        extra: &str,
+    ) -> Vec<u8> {
+        let rotate_entry = match rotate {
+            Some(r) => format!(" /Rotate {r}"),
+            None => String::new(),
         };
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R{rotate_entry} {extra} >>"
+        );
         assemble_pdf(&[
             (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
@@ -1408,6 +1418,50 @@ mod tests {
         };
         let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
         assert_eq!((mb.urx, mb.ury), (200.0, 300.0));
+    }
+
+    #[test]
+    fn flatten_180_keeps_mediabox_dims_and_zeroes_rotate() {
+        let bytes = build_single_page_with_content("[0 0 200 300]", Some(180), "BT (x) Tj ET");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+
+        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+            panic!("not a dict")
+        };
+        assert_eq!(d.get("Rotate"), Some(&Object::Integer(0)));
+        // 180 maps [0 0 200 300] back onto itself: dims unchanged.
+        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        assert_eq!((mb.llx, mb.lly, mb.urx, mb.ury), (0.0, 0.0, 200.0, 300.0));
+        let content = pages::page_content_bytes(&mut pdf, page).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.starts_with("q\n-1 0 0 -1 200 300 cm\n"), "{s:?}");
+    }
+
+    #[test]
+    fn flatten_transforms_cropbox_present_on_leaf() {
+        // CropBox differs from MediaBox and must be transformed by the same matrix.
+        let bytes = build_single_page_with_extra(
+            "[0 0 200 300]",
+            Some(90),
+            "BT (x) Tj ET",
+            "/CropBox [10 10 190 290]",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+
+        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+            panic!("not a dict")
+        };
+        // 90deg map (x,y)->(y, 200 - x): corners (10,10),(190,290) ->
+        // (10,190),(290,10) -> bbox [10 10 290 190].
+        let cb = object_to_pagebox(d.get("CropBox").unwrap()).unwrap();
+        assert_eq!((cb.llx, cb.lly, cb.urx, cb.ury), (10.0, 10.0, 290.0, 190.0));
+        // And MediaBox is still swapped, independently.
+        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
     }
 
     /// 1-page PDF with one annotation (`/Rect rect`) on a rotated page.
