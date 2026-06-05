@@ -523,6 +523,12 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     };
 
     let mut bytes = pdf.source_bytes()?;
+    // flpdf-9hc.22.4: the incremental path only ever *appends* to the source
+    // bytes, so the original prefix — and therefore any signed `/ByteRange`
+    // region within it — stays bit-identical. Snapshot the untouched source in
+    // debug builds so the invariant is asserted before we hand off the buffer.
+    #[cfg(debug_assertions)]
+    let source_prefix = bytes.clone();
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
@@ -631,6 +637,16 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
         xref_offset,
         options,
     )?;
+
+    // flpdf-9hc.22.4: guard the byte-preservation invariant. The source prefix
+    // (and any signed `/ByteRange` covered by it) must survive verbatim — the
+    // appended trailing `\n` lands *after* it, so `starts_with` is the right
+    // check, not length equality.
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        bytes.starts_with(&source_prefix),
+        "incremental update must preserve the original source prefix byte-for-byte"
+    );
 
     out.write_all(&bytes)?;
     Ok(())
