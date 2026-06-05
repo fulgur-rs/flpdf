@@ -496,6 +496,24 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
     pages: &[ObjectRef],
 ) -> Result<()> {
     for &page_ref in pages {
+        // Validate the target is a leaf /Page *before* the rotate==0 short-circuit,
+        // so an invalid target is never silently accepted just because it happens
+        // to resolve to rotation 0 (consistent error contract).
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a dictionary, cannot flatten /Rotate"
+            )));
+        };
+        let is_leaf_page = matches!(
+            page_dict.get("Type"),
+            Some(Object::Name(t)) if t.as_slice() == b"Page"
+        );
+        if !is_leaf_page {
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a leaf /Page, cannot flatten /Rotate"
+            )));
+        }
+
         let rotate = normalize_rotate(resolve_inherited_rotate(pdf, page_ref)?);
         if rotate == 0 {
             continue; // nothing to flatten
@@ -512,22 +530,6 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
         // Wrap the page content with `q M cm ... Q`.
         let inner = crate::pages::page_content_bytes(pdf, page_ref)?;
         let new_content = wrap_content_with_matrix(m, &inner);
-
-        // Resolve the leaf page dict; guard that it is a /Type /Page.
-        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
-            return Err(Error::Unsupported(format!(
-                "object {page_ref} is not a dictionary, cannot flatten /Rotate"
-            )));
-        };
-        let is_leaf_page = matches!(
-            page_dict.get("Type"),
-            Some(Object::Name(t)) if t.as_slice() == b"Page"
-        );
-        if !is_leaf_page {
-            return Err(Error::Unsupported(format!(
-                "object {page_ref} is not a leaf /Page, cannot flatten /Rotate"
-            )));
-        }
 
         // Allocate a fresh content stream and repoint /Contents at it.
         let mut sdict = Dictionary::new();
@@ -565,7 +567,16 @@ fn flatten_annotation_rects<R: Read + Seek>(
     page_dict: &Dictionary,
     m: Mat,
 ) -> Result<()> {
-    let Some(Object::Array(annots)) = page_dict.get("Annots").cloned() else {
+    // `/Annots` may be a direct array or an indirect reference to one; resolve
+    // the reference before treating it as an array.
+    let Some(annots_obj) = page_dict.get("Annots").cloned() else {
+        return Ok(());
+    };
+    let annots_obj = match annots_obj {
+        Object::Reference(r) => pdf.resolve(r)?,
+        other => other,
+    };
+    let Object::Array(annots) = annots_obj else {
         return Ok(());
     };
     for entry in annots {
@@ -1493,6 +1504,52 @@ mod tests {
         };
         let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
+    }
+
+    /// 1-page PDF whose `/Annots` is an *indirect reference* to the array (obj 6),
+    /// not a direct array. Exercises the reference-resolution path.
+    fn build_single_page_indirect_annots(mb: &str, rotate: i32, rect: &str) -> Vec<u8> {
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox {mb} /Contents 4 0 R /Rotate {rotate} /Annots 6 0 R >>"
+        );
+        assemble_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, page),
+            (4, content_obj_body("BT (x) Tj ET")),
+            (5, format!("<< /Type /Annot /Subtype /Text /Rect {rect} >>")),
+            (6, "[5 0 R]".to_string()),
+        ])
+    }
+
+    #[test]
+    fn flatten_transforms_annotation_rect_via_indirect_annots() {
+        let bytes = build_single_page_indirect_annots("[0 0 200 300]", 90, "[10 20 60 40]");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        let annot = ObjectRef::new(5, 0);
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+
+        // Same mapping as the direct-array case: [10 20 60 40] -> [20 140 40 190].
+        let Object::Dictionary(ad) = pdf.resolve(annot).unwrap() else {
+            panic!("not a dict")
+        };
+        let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
+        assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
+    }
+
+    #[test]
+    fn flatten_rejects_non_leaf_target_even_when_rotate_zero() {
+        // obj 2 is the /Pages tree node (not a leaf /Page); its effective /Rotate
+        // is 0. The leaf guard must still reject it instead of silently passing.
+        let bytes = build_single_page_with_content("[0 0 200 300]", None, "BT (x) Tj ET");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let pages_node = ObjectRef::new(2, 0);
+        let err = flatten_rotation_on_pages(&mut pdf, &[pages_node]).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 
     #[test]
