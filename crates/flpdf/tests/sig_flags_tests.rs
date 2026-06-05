@@ -152,6 +152,29 @@ fn build_nested_signature_fields_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Signature field whose `/FT` value is an indirect name object.
+fn build_indirect_ft_signature_field_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /FT 7 0 R /T (Signed) /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
+        ),
+        (
+            6,
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+        (7, b"/Sig"),
+    ];
+    build_pdf(&objects)
+}
+
 fn has_entry(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &str) -> bool {
     match pdf.resolve(object_ref).unwrap() {
         Object::Dictionary(dict) => dict.get(key).is_some(),
@@ -287,6 +310,17 @@ fn strip_signature_values_removes_inherited_signature_field_value() {
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
     assert!(!has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
     assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "V"));
+    assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
+fn strip_signature_values_resolves_indirect_field_type() {
+    let mut pdf = open(build_indirect_ft_signature_field_pdf());
+
+    let changed = strip_signature_values(&mut pdf).unwrap();
+
+    assert!(changed);
+    assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
     assert!(pdf.signatures().unwrap().is_empty());
 }
 
