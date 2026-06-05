@@ -2,6 +2,14 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Coding Rules
+
+Before writing or reviewing code, consult the review patterns in
+[`.claude/rules/pdf-rust-review-patterns.md`](.claude/rules/pdf-rust-review-patterns.md).
+これは過去のレビュー（Gemini Code Assist）で頻出した4カテゴリの落とし穴
+（不要な`.clone()`、PDF間接参照の解決漏れ、符号なしキャストのオーバーフロー、
+グラフ走査の境界/深さ制御）を予防ルール化したもの。
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
