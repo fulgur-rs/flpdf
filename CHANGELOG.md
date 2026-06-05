@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+* flpdf-9hc.9.9: `/Rotate` flattening — `flatten_rotation_on_pages` bakes a page's
+  effective `/Rotate` into its content via a prepended `cm` matrix, transforms the
+  page boxes (`/MediaBox`, `/CropBox`, `/BleedBox`, `/TrimBox`, `/ArtBox`) and
+  annotation `/Rect` with the same matrix, and clears `/Rotate` to `0`. Visual
+  rendering is unchanged. Caveat (held for review): annotation `/QuadPoints` and
+  `/AP` `/Matrix` are not rotated, and output is not byte-identical to the source.
+
 ## [0.1.4] - 2026-05-30
 
 * flpdf-9hc.12.1: Content stream tokenizer (operators + operands) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/140

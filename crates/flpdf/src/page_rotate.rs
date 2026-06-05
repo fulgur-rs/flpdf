@@ -14,6 +14,25 @@
 //!
 //! ISO 32000-1 §7.7.3.4 lists `/Rotate` as an inheritable page attribute; its default
 //! when absent at every level is `0` (§7.7.3.3 Table 30).
+//!
+//! # `/Rotate` flattening (flpdf-9hc.9.9)
+//!
+//! [`flatten_rotation_on_pages`] *bakes* a page's effective `/Rotate` into its
+//! geometry so the page reads upright with `/Rotate = 0`. A single affine matrix
+//! `M` is prepended to the content stream (`q M cm … Q`) and the **same** `M` is
+//! applied to every present page box (`/MediaBox`, `/CropBox`, `/BleedBox`,
+//! `/TrimBox`, `/ArtBox`) and to each annotation `/Rect`. Because content and
+//! geometry share one matrix, visual rendering is unchanged by construction.
+//!
+//! ## Caveats (held for review)
+//!
+//! - **Annotation appearance is not rotated.** Only `/Rect` is transformed;
+//!   `/QuadPoints` and the appearance `/AP` `/Matrix` are left as-is, so an
+//!   annotation's *appearance* orientation can change.
+//! - **Not byte-identical.** The page content is rebuilt from its decoded bytes
+//!   wrapped in one new stream, so exact byte-parity with the source is not a
+//!   goal. qpdf exposes `flattenRotation` only through its C++ API (no CLI), so
+//!   there is no qpdf oracle; correctness is asserted via invariants in tests.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::{Dictionary, Error, Object, ObjectRef, PageBox, Pdf, Result, Stream};
@@ -330,8 +349,14 @@ fn transform_box(m: Mat, b: PageBox) -> PageBox {
     ];
     let llx = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
     let lly = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
-    let urx = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max);
-    let ury = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max);
+    let urx = corners
+        .iter()
+        .map(|c| c.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let ury = corners
+        .iter()
+        .map(|c| c.1)
+        .fold(f64::NEG_INFINITY, f64::max);
     PageBox::new(llx, lly, urx, ury)
 }
 
@@ -597,7 +622,10 @@ mod tests {
     fn rotation_matrix_origin0_constants() {
         let mb = PageBox::new(0.0, 0.0, 200.0, 300.0); // W=200 H=300
         assert_eq!(rotation_matrix(90, mb), [0.0, -1.0, 1.0, 0.0, 0.0, 200.0]);
-        assert_eq!(rotation_matrix(180, mb), [-1.0, 0.0, 0.0, -1.0, 200.0, 300.0]);
+        assert_eq!(
+            rotation_matrix(180, mb),
+            [-1.0, 0.0, 0.0, -1.0, 200.0, 300.0]
+        );
         assert_eq!(rotation_matrix(270, mb), [0.0, 1.0, -1.0, 0.0, 300.0, 0.0]);
     }
 
@@ -614,7 +642,10 @@ mod tests {
     fn transform_box_swaps_dims_for_90_270() {
         let mb = PageBox::new(0.0, 0.0, 200.0, 300.0);
         let b90 = transform_box(rotation_matrix(90, mb), mb);
-        assert_eq!((b90.llx, b90.lly, b90.urx, b90.ury), (0.0, 0.0, 300.0, 200.0));
+        assert_eq!(
+            (b90.llx, b90.lly, b90.urx, b90.ury),
+            (0.0, 0.0, 300.0, 200.0)
+        );
         let b270 = transform_box(rotation_matrix(270, mb), mb);
         assert_eq!(
             (b270.llx, b270.lly, b270.urx, b270.ury),
@@ -1389,10 +1420,7 @@ mod tests {
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
             (3, page),
             (4, content_obj_body("BT (x) Tj ET")),
-            (
-                5,
-                format!("<< /Type /Annot /Subtype /Text /Rect {rect} >>"),
-            ),
+            (5, format!("<< /Type /Annot /Subtype /Text /Rect {rect} >>")),
         ])
     }
 
