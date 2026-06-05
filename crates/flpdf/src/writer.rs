@@ -525,10 +525,17 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     let mut bytes = pdf.source_bytes()?;
     // flpdf-9hc.22.4: the incremental path only ever *appends* to the source
     // bytes, so the original prefix — and therefore any signed `/ByteRange`
-    // region within it — stays bit-identical. Snapshot the untouched source in
-    // debug builds so the invariant is asserted before we hand off the buffer.
+    // region within it — stays bit-identical. In debug builds capture the
+    // source length and an MD5 digest of it (O(1) memory, instead of an O(N)
+    // clone of a possibly hundreds-of-MB PDF) so the invariant can be asserted
+    // before we hand off the buffer.
     #[cfg(debug_assertions)]
-    let source_prefix = bytes.clone();
+    let (source_len, source_digest) = {
+        use md5::Digest as _;
+        let mut hasher = md5::Md5::new();
+        hasher.update(&bytes);
+        (bytes.len(), hasher.finalize())
+    };
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
@@ -640,13 +647,21 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
 
     // flpdf-9hc.22.4: guard the byte-preservation invariant. The source prefix
     // (and any signed `/ByteRange` covered by it) must survive verbatim — the
-    // appended trailing `\n` lands *after* it, so `starts_with` is the right
-    // check, not length equality.
+    // appended trailing `\n` lands *after* it, so we re-hash exactly the first
+    // `source_len` bytes (not the whole buffer) and compare against the digest
+    // captured up front. `.get(..source_len)` keeps a pathological shrink from
+    // panicking the index, surfacing it as a clean assertion failure instead.
     #[cfg(debug_assertions)]
-    debug_assert!(
-        bytes.starts_with(&source_prefix),
-        "incremental update must preserve the original source prefix byte-for-byte"
-    );
+    {
+        use md5::Digest as _;
+        let mut hasher = md5::Md5::new();
+        hasher.update(bytes.get(..source_len).unwrap_or(&bytes));
+        debug_assert_eq!(
+            hasher.finalize(),
+            source_digest,
+            "incremental update must preserve the original source prefix byte-for-byte"
+        );
+    }
 
     out.write_all(&bytes)?;
     Ok(())
