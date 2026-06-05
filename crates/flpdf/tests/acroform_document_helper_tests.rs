@@ -502,6 +502,7 @@ fn field_infos_materialize_indirect_inherited_values() {
     );
     assert_eq!(fields[1].quadding, Some(1));
     assert_eq!(fields[1].max_len, Some(20));
+    assert_eq!(fields[1].field_flags, Some(3));
 }
 
 #[test]
