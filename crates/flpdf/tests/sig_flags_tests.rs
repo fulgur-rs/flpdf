@@ -109,6 +109,33 @@ fn build_acroform_without_sig_flags_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Catalog whose `/AcroForm` indirectly references a non-dictionary object.
+fn build_acroform_indirect_non_dict_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"[1 2 3]"),
+    ];
+    build_pdf(&objects)
+}
+
+/// Catalog whose `/AcroForm` is neither a reference nor a dictionary.
+fn build_acroform_non_dict_inline_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+    ];
+    build_pdf(&objects)
+}
+
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
@@ -206,6 +233,22 @@ fn sig_flags_absent_when_acroform_has_no_sig_flags() {
 fn clear_sig_flags_is_noop_when_acroform_has_no_bits() {
     let mut pdf = open(build_acroform_without_sig_flags_pdf());
 
+    assert!(!clear_sig_flags(&mut pdf).unwrap());
+}
+
+#[test]
+fn handles_acroform_indirectly_referencing_non_dictionary() {
+    let mut pdf = open(build_acroform_indirect_non_dict_pdf());
+
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), None);
+    assert!(!clear_sig_flags(&mut pdf).unwrap());
+}
+
+#[test]
+fn handles_acroform_that_is_not_a_dictionary() {
+    let mut pdf = open(build_acroform_non_dict_inline_pdf());
+
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), None);
     assert!(!clear_sig_flags(&mut pdf).unwrap());
 }
 

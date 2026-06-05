@@ -185,10 +185,8 @@ pub fn would_rewrite_invalidate_signatures<R: Read + Seek>(
 /// not a non-negative integer that fits in `u32`. An indirect `/SigFlags`
 /// reference (vanishingly rare for a scalar flag) is treated as absent.
 pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32>> {
-    match catalog_acroform_dict(pdf)? {
-        Some(acroform_dict) => Ok(sig_flags_from_acroform_dict(&acroform_dict)),
-        None => Ok(None),
-    }
+    Ok(resolve_catalog_acroform(pdf)?
+        .and_then(|(_, acroform)| sig_flags_from_acroform_dict(&acroform)))
 }
 
 /// Clear the signature-related bits of `/AcroForm /SigFlags`.
@@ -199,42 +197,46 @@ pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32
 /// cleared. Used by the opt-in signature-stripping path; it does not by itself
 /// remove signature fields or `/V` dictionaries.
 pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let Some(root_ref) = pdf.root_ref() else {
+    let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);
     };
-    let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
+    if !clear_sig_flags_in_dict(&mut acroform) {
         return Ok(false);
-    };
-    let Some(acroform) = catalog.get("AcroForm").cloned() else {
-        return Ok(false);
-    };
-
-    match acroform {
-        Object::Reference(acroform_ref) => {
-            let Object::Dictionary(mut dict) = pdf.resolve(acroform_ref)? else {
-                return Ok(false);
-            };
-            if !clear_sig_flags_in_dict(&mut dict) {
-                return Ok(false);
-            }
-            pdf.set_object(acroform_ref, Object::Dictionary(dict));
-            Ok(true)
-        }
-        Object::Dictionary(mut dict) => {
-            if !clear_sig_flags_in_dict(&mut dict) {
-                return Ok(false);
-            }
-            catalog.insert("AcroForm", Object::Dictionary(dict));
-            pdf.set_object(root_ref, Object::Dictionary(catalog));
-            Ok(true)
-        }
-        _ => Ok(false),
     }
+    match home {
+        AcroformHome::Object(acroform_ref) => {
+            pdf.set_object(acroform_ref, Object::Dictionary(acroform));
+        }
+        AcroformHome::Inline {
+            root_ref,
+            mut catalog,
+        } => {
+            catalog.insert("AcroForm", Object::Dictionary(acroform));
+            pdf.set_object(root_ref, Object::Dictionary(catalog));
+        }
+    }
+    Ok(true)
 }
 
-/// Resolve the catalog `/AcroForm` to its dictionary, following one indirect
-/// reference. Returns `None` when absent or not a dictionary.
-fn catalog_acroform_dict<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Dictionary>> {
+/// Where the catalog `/AcroForm` dictionary lives, so an updated copy can be
+/// written back to the correct object.
+enum AcroformHome {
+    /// `/AcroForm` is an indirect object; write the updated dict to this ref.
+    Object(ObjectRef),
+    /// `/AcroForm` is an inline dictionary in the catalog; carries the catalog
+    /// so the entry can be replaced without re-resolving `/Root`.
+    Inline {
+        root_ref: ObjectRef,
+        catalog: Dictionary,
+    },
+}
+
+/// Resolve the catalog `/AcroForm` to its dictionary plus where it lives,
+/// following one indirect reference. Returns `None` when there is no `/Root`
+/// dictionary, no `/AcroForm`, or `/AcroForm` is not a dictionary.
+fn resolve_catalog_acroform<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<Option<(AcroformHome, Dictionary)>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };
@@ -244,7 +246,14 @@ fn catalog_acroform_dict<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Dict
     let Some(acroform) = catalog.get("AcroForm").cloned() else {
         return Ok(None);
     };
-    resolve_dictionary(pdf, acroform)
+    match acroform {
+        Object::Reference(acroform_ref) => match pdf.resolve(acroform_ref)? {
+            Object::Dictionary(dict) => Ok(Some((AcroformHome::Object(acroform_ref), dict))),
+            _ => Ok(None),
+        },
+        Object::Dictionary(dict) => Ok(Some((AcroformHome::Inline { root_ref, catalog }, dict))),
+        _ => Ok(None),
+    }
 }
 
 /// Extract `/SigFlags` as a `u32` bitfield from an already-resolved `/AcroForm`
