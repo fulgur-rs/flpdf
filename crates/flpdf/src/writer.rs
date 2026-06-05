@@ -1595,9 +1595,6 @@ fn refuse_signed_full_rewrite<R: Read + Seek>(
             .map(|object_ref| format!("{object_ref}"))
             .collect();
     }
-    if fields.is_empty() {
-        fields.push("(unknown signature)".to_string());
-    }
 
     let field_list = fields.join(", ");
     let message = format!(

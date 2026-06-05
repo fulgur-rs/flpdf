@@ -169,6 +169,52 @@ fn full_rewrite_without_signatures_does_not_report_invalidation() {
 }
 
 #[test]
+fn full_rewrite_without_signatures_is_not_refused_by_writer() {
+    let mut pdf = open(build_unsigned_pdf());
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &options)
+        .expect("unsigned full rewrite should not trip signed-PDF preflight");
+
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn full_rewrite_refusal_uses_object_ref_for_unnamed_signature_field() {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
+        ),
+        (
+            6,
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+    ];
+    let mut pdf = open(build_pdf(&objects));
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+
+    let err = write_pdf_with_options(&mut pdf, Vec::new(), &options)
+        .expect_err("full rewrite should refuse signed PDFs");
+
+    let Error::Signed { fields, message } = err else {
+        panic!("expected Error::Signed, got {err:?}");
+    };
+    assert_eq!(fields, vec!["5 0 R"]);
+    assert!(message.contains("5 0 R"));
+}
+
+#[test]
 fn incremental_preserves_when_no_signed_or_acroform_objects_are_touched() {
     let mut pdf = open(build_signed_acroform_pdf());
     let page = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
