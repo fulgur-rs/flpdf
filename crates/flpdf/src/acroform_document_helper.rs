@@ -625,10 +625,10 @@ fn source_field_copy_set<RS: Read + Seek>(
     let mut copy_set = BTreeSet::new();
     let mut seen = BTreeSet::new();
     for field_ref in &top_fields {
-        collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen)?;
+        collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen, 0)?;
     }
     for (_, value) in &inherited_entries {
-        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen)?;
+        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen, 0)?;
     }
     Ok((top_fields, inherited_entries, copy_set))
 }
@@ -671,14 +671,25 @@ fn collect_reachable_refs<R: Read + Seek>(
     object_ref: ObjectRef,
     out: &mut BTreeSet<ObjectRef>,
     seen: &mut BTreeSet<ObjectRef>,
+    depth: usize,
 ) -> Result<()> {
+    // The `seen` cycle guard cannot stop a long *acyclic* indirect-reference chain
+    // (obj1 -> obj2 -> ... -> objN), where recursion depth grows with the chain length.
+    // Bound the reference chain to avoid stack overflow on hostile source PDFs. Only the
+    // indirect-reference axis is unbounded; intra-object nesting is already capped by the
+    // parser, so `depth` increments per resolved reference (see `collect_refs_in_object`).
+    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "AcroForm reference chain depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+        )));
+    }
     if !seen.insert(object_ref) {
         return Ok(());
     }
     out.insert(object_ref);
 
     let obj = pdf.resolve(object_ref)?;
-    collect_refs_in_object(pdf, &obj, out, seen)
+    collect_refs_in_object(pdf, &obj, out, seen, depth)
 }
 
 fn collect_refs_in_object<R: Read + Seek>(
@@ -686,17 +697,20 @@ fn collect_refs_in_object<R: Read + Seek>(
     obj: &Object,
     out: &mut BTreeSet<ObjectRef>,
     seen: &mut BTreeSet<ObjectRef>,
+    depth: usize,
 ) -> Result<()> {
     match obj {
-        Object::Reference(object_ref) => collect_reachable_refs(pdf, *object_ref, out, seen),
+        Object::Reference(object_ref) => {
+            collect_reachable_refs(pdf, *object_ref, out, seen, depth + 1)
+        }
         Object::Array(items) => {
             for item in items {
-                collect_refs_in_object(pdf, item, out, seen)?;
+                collect_refs_in_object(pdf, item, out, seen, depth)?;
             }
             Ok(())
         }
-        Object::Dictionary(dict) => collect_refs_in_dict(pdf, dict, out, seen),
-        Object::Stream(stream) => collect_refs_in_dict(pdf, &stream.dict, out, seen),
+        Object::Dictionary(dict) => collect_refs_in_dict(pdf, dict, out, seen, depth),
+        Object::Stream(stream) => collect_refs_in_dict(pdf, &stream.dict, out, seen, depth),
         Object::Null
         | Object::Boolean(_)
         | Object::Integer(_)
@@ -711,12 +725,13 @@ fn collect_refs_in_dict<R: Read + Seek>(
     dict: &Dictionary,
     out: &mut BTreeSet<ObjectRef>,
     seen: &mut BTreeSet<ObjectRef>,
+    depth: usize,
 ) -> Result<()> {
     for (key, value) in dict.iter() {
         if key == b"P" {
             continue;
         }
-        collect_refs_in_object(pdf, value, out, seen)?;
+        collect_refs_in_object(pdf, value, out, seen, depth)?;
     }
     Ok(())
 }

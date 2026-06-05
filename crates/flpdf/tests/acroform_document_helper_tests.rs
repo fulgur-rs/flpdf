@@ -682,6 +682,125 @@ fn fields_errors_when_field_tree_depth_limit_is_exceeded() {
 }
 
 #[test]
+fn copy_fields_from_errors_when_reference_chain_depth_limit_is_exceeded() {
+    // Non-cyclic chain reachable from AcroForm /Fields via an arbitrary key (/X),
+    // long enough to exceed DEFAULT_MAX_ACROFORM_DEPTH. The chain is acyclic so the
+    // `seen` cycle guard never fires; only the new depth limit can stop the recursion.
+    let mut objects = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (4, "<< /Fields [5 0 R] >>".to_string()),
+        (5, "<< /T (parent) /FT /Tx /X 6 0 R >>".to_string()),
+    ];
+    for object_number in 6..=106 {
+        let next = object_number + 1;
+        objects.push((object_number, format!("<< /X {next} 0 R >>")));
+    }
+    objects.push((107, "<< /Leaf true >>".to_string()));
+    let borrowed: Vec<(u32, &str)> = objects
+        .iter()
+        .map(|(object_number, body)| (*object_number, body.as_str()))
+        .collect();
+    let source_bytes = build_pdf(&borrowed, 1);
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let err = target.acroform().copy_fields_from(&mut source).unwrap_err();
+
+    assert!(
+        matches!(err, flpdf::Error::Unsupported(_)),
+        "expected depth-limit Unsupported error, got {err:?}"
+    );
+}
+
+#[test]
+fn copy_fields_from_copies_field_appearance_stream() {
+    // A field reaches an appearance stream (/AP /N -> stream) through a non-/P key, so the
+    // reachable-ref walk must descend into the stream object (the `Object::Stream` arm). The
+    // stream must be carried into the target and stay referenced by the copied field.
+    let source_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] >>"),
+            (5, "<< /T (widget) /FT /Tx /AP << /N 6 0 R >> >>"),
+            (
+                6,
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 5 >>\nstream\nHELLO\nendstream",
+            ),
+        ],
+        1,
+    );
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+    assert_eq!(copied.len(), 1, "the single top-level field is copied");
+
+    let Object::Dictionary(field) = target.resolve(copied[0]).unwrap() else {
+        panic!("copied field should be a dictionary");
+    };
+    let Some(Object::Dictionary(ap)) = field.get("AP").cloned() else {
+        panic!("copied field should retain its /AP dictionary");
+    };
+    let normal_ref = ap
+        .get_ref("N")
+        .expect("/AP /N should reference the copied appearance stream");
+    assert!(
+        matches!(target.resolve(normal_ref).unwrap(), Object::Stream(_)),
+        "the appearance stream should be copied into the target as a stream object"
+    );
+}
+
+#[test]
+fn copy_fields_from_skips_field_p_reference() {
+    // The reachable-ref walk skips the /P key so it never pulls a field's page (and the
+    // sibling page tree) into the copy set. An object reachable *only* via /P is therefore
+    // excluded; copy_objects rewrites the dangling ref to Null, proving the skip fired.
+    let source_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] >>"),
+            (5, "<< /T (widget) /FT /Tx /V (val) /P 6 0 R >>"),
+            (6, "<< /Type /Page /Marker (must-not-be-copied) >>"),
+        ],
+        1,
+    );
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+    assert_eq!(copied.len(), 1, "the single top-level field is copied");
+
+    let Object::Dictionary(field) = target.resolve(copied[0]).unwrap() else {
+        panic!("copied field should be a dictionary");
+    };
+    assert_eq!(
+        field.get("P"),
+        Some(&Object::Null),
+        "the /P-only page must be skipped during collection and left dangling (Null)"
+    );
+    assert_eq!(
+        field.get("V"),
+        Some(&Object::String(b"val".to_vec())),
+        "non-/P entries are still copied"
+    );
+}
+
+#[test]
 fn copy_fields_from_appends_copied_fields_to_target_acroform() {
     let source_bytes = form_pdf();
     let target_bytes = empty_pdf();
