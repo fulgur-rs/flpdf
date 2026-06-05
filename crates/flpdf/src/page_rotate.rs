@@ -16,7 +16,7 @@
 //! when absent at every level is `0` (§7.7.3.3 Table 30).
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-use crate::{Error, Object, ObjectRef, Pdf, Result};
+use crate::{Error, Object, ObjectRef, PageBox, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -268,6 +268,74 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
 }
 
 // ---------------------------------------------------------------------------
+// Affine matrix primitives for /Rotate flattening (flpdf-9hc.9.9)
+// ---------------------------------------------------------------------------
+// Row-vector convention: a point [x y 1] maps to
+//   (a*x + c*y + e, b*x + d*y + f)  for matrix [a b c d e f].
+type Mat = [f64; 6];
+
+/// Apply matrix `m` to point (x, y).
+fn apply_matrix(m: Mat, x: f64, y: f64) -> (f64, f64) {
+    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
+/// Compose A then B for a row vector: result == (p * A) * B.
+fn mat_mul(a: Mat, b: Mat) -> Mat {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+}
+
+/// Pure translation matrix.
+fn translate(tx: f64, ty: f64) -> Mat {
+    [1.0, 0.0, 0.0, 1.0, tx, ty]
+}
+
+/// Origin-0 rotation matrix for a box of width `w`, height `h`. `r` must be one
+/// of {90,180,270}; any other value yields identity (callers normalize first and
+/// skip r==0).
+fn rotate_origin(r: i32, w: f64, h: f64) -> Mat {
+    match r {
+        90 => [0.0, -1.0, 1.0, 0.0, 0.0, w],
+        180 => [-1.0, 0.0, 0.0, -1.0, w, h],
+        270 => [0.0, 1.0, -1.0, 0.0, h, 0.0],
+        _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    }
+}
+
+/// Build the flatten matrix `M` for normalized rotation `r` and the page's
+/// MediaBox: translate the box lower-left to origin, rotate, translate back so
+/// the transformed box's lower-left returns to (llx, lly).
+fn rotation_matrix(r: i32, mb: PageBox) -> Mat {
+    let w = mb.urx - mb.llx;
+    let h = mb.ury - mb.lly;
+    mat_mul(
+        mat_mul(translate(-mb.llx, -mb.lly), rotate_origin(r, w, h)),
+        translate(mb.llx, mb.lly),
+    )
+}
+
+/// Map the 4 corners of `b` through `m` and return their axis-aligned bbox.
+fn transform_box(m: Mat, b: PageBox) -> PageBox {
+    let corners = [
+        apply_matrix(m, b.llx, b.lly),
+        apply_matrix(m, b.urx, b.lly),
+        apply_matrix(m, b.urx, b.ury),
+        apply_matrix(m, b.llx, b.ury),
+    ];
+    let llx = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
+    let lly = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
+    let urx = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max);
+    let ury = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max);
+    PageBox::new(llx, lly, urx, ury)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -277,6 +345,63 @@ mod tests {
     use crate::writer::write_pdf;
     use crate::{pages, Pdf};
     use std::io::Cursor;
+
+    // -----------------------------------------------------------------------
+    // Matrix primitives (flpdf-9hc.9.9 /Rotate flattening)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rotation_matrix_origin0_constants() {
+        let mb = PageBox::new(0.0, 0.0, 200.0, 300.0); // W=200 H=300
+        assert_eq!(rotation_matrix(90, mb), [0.0, -1.0, 1.0, 0.0, 0.0, 200.0]);
+        assert_eq!(rotation_matrix(180, mb), [-1.0, 0.0, 0.0, -1.0, 200.0, 300.0]);
+        assert_eq!(rotation_matrix(270, mb), [0.0, 1.0, -1.0, 0.0, 300.0, 0.0]);
+    }
+
+    #[test]
+    fn apply_matrix_maps_points() {
+        // 90deg: (x,y) -> (y, W - x), W=200
+        let m = [0.0, -1.0, 1.0, 0.0, 0.0, 200.0];
+        assert_eq!(apply_matrix(m, 0.0, 0.0), (0.0, 200.0));
+        assert_eq!(apply_matrix(m, 200.0, 0.0), (0.0, 0.0));
+        assert_eq!(apply_matrix(m, 0.0, 300.0), (300.0, 200.0));
+    }
+
+    #[test]
+    fn transform_box_swaps_dims_for_90_270() {
+        let mb = PageBox::new(0.0, 0.0, 200.0, 300.0);
+        let b90 = transform_box(rotation_matrix(90, mb), mb);
+        assert_eq!((b90.llx, b90.lly, b90.urx, b90.ury), (0.0, 0.0, 300.0, 200.0));
+        let b270 = transform_box(rotation_matrix(270, mb), mb);
+        assert_eq!(
+            (b270.llx, b270.lly, b270.urx, b270.ury),
+            (0.0, 0.0, 300.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn transform_box_keeps_dims_for_180() {
+        let mb = PageBox::new(0.0, 0.0, 200.0, 300.0);
+        let b = transform_box(rotation_matrix(180, mb), mb);
+        assert_eq!((b.llx, b.lly, b.urx, b.ury), (0.0, 0.0, 200.0, 300.0));
+    }
+
+    #[test]
+    fn rotation_matrix_preserves_lower_left_for_nonzero_origin() {
+        // The transformed MediaBox lower-left must land back at the original (llx,lly).
+        let mb = PageBox::new(10.0, 20.0, 210.0, 320.0); // W=200 H=300
+        for r in [90, 180, 270] {
+            let m = rotation_matrix(r, mb);
+            let b = transform_box(m, mb);
+            assert_eq!((b.llx, b.lly), (10.0, 20.0), "rotate {r} lower-left moved");
+            let (w, h) = (b.urx - b.llx, b.ury - b.lly);
+            if r == 180 {
+                assert_eq!((w, h), (200.0, 300.0));
+            } else {
+                assert_eq!((w, h), (300.0, 200.0));
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Pure function tests: normalize_rotate
