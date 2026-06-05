@@ -1481,6 +1481,17 @@ fn main() {
             }
             std::process::exit(exit_err.code.as_i32());
         }
+        // Signed-PDF refusal (default full-rewrite path): emit the actionable
+        // diagnostic directly. `Error::Signed`'s own message already explains
+        // the refusal and names the affected signature field(s), so printing
+        // the `message` field avoids the redundant "signed PDF:" Display prefix
+        // (`flpdf: signed PDF: refusing full rewrite of signed PDF ...`) that
+        // the generic fallback below would produce. Exit 2 matches qpdf's
+        // "error" convention (same code the fallback uses).
+        if let Some(flpdf::Error::Signed { message, .. }) = error.downcast_ref::<flpdf::Error>() {
+            eprintln!("flpdf: {message}");
+            std::process::exit(2);
+        }
         eprintln!("flpdf: {error}");
         std::process::exit(2);
     }
