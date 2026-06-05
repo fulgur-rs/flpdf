@@ -336,6 +336,77 @@ fn transform_box(m: Mat, b: PageBox) -> PageBox {
 }
 
 // ---------------------------------------------------------------------------
+// Box array <-> PageBox + inherited-present-box lookup (flpdf-9hc.9.9)
+// ---------------------------------------------------------------------------
+
+/// Parse a PDF rectangle array `[x1 y1 x2 y2]` (ints or reals) into a `PageBox`,
+/// normalizing so `llx<=urx` and `lly<=ury`. Returns `None` on the wrong shape.
+fn object_to_pagebox(obj: &Object) -> Option<PageBox> {
+    let Object::Array(a) = obj else { return None };
+    if a.len() != 4 {
+        return None;
+    }
+    let mut v = [0.0_f64; 4];
+    for (i, e) in a.iter().enumerate() {
+        v[i] = match e {
+            Object::Integer(n) => *n as f64,
+            Object::Real(r) => *r,
+            _ => return None,
+        };
+    }
+    Some(PageBox::new(
+        v[0].min(v[2]),
+        v[1].min(v[3]),
+        v[0].max(v[2]),
+        v[1].max(v[3]),
+    ))
+}
+
+/// Emit a `PageBox` as a 4-element PDF real array.
+fn pagebox_to_object(b: PageBox) -> Object {
+    Object::Array(vec![
+        Object::Real(b.llx),
+        Object::Real(b.lly),
+        Object::Real(b.urx),
+        Object::Real(b.ury),
+    ])
+}
+
+/// Return the explicit value of box `key` from the leaf page or the nearest
+/// ancestor `/Pages` node that carries it. `None` if absent at every level (so the
+/// box is left untouched — no invented boxes). No defaulting between box types.
+fn inherited_present_box<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    key: &str,
+) -> Result<Option<PageBox>> {
+    let mut current = page_ref;
+    let mut seen = BTreeSet::new();
+    for _ in 0..=DEFAULT_MAX_PAGE_TREE_DEPTH {
+        if !seen.insert(current) {
+            break; // cycle guard
+        }
+        let Object::Dictionary(dict) = pdf.resolve(current)? else {
+            break;
+        };
+        if let Some(obj) = dict.get(key).cloned() {
+            let resolved = match obj {
+                Object::Reference(r) => pdf.resolve(r)?,
+                other => other,
+            };
+            if let Some(b) = object_to_pagebox(&resolved) {
+                return Ok(Some(b));
+            }
+        }
+        match dict.get("Parent") {
+            Some(Object::Reference(p)) => current = *p,
+            _ => break,
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -401,6 +472,55 @@ mod tests {
                 assert_eq!((w, h), (300.0, 200.0));
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Box array <-> PageBox (flpdf-9hc.9.9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pagebox_array_roundtrip() {
+        let b = PageBox::new(10.0, 20.5, 210.0, 320.0);
+        let obj = pagebox_to_object(b);
+        assert_eq!(object_to_pagebox(&obj), Some(b));
+    }
+
+    #[test]
+    fn object_to_pagebox_accepts_ints_and_reals() {
+        let obj = Object::Array(vec![
+            Object::Integer(0),
+            Object::Real(1.5),
+            Object::Integer(200),
+            Object::Integer(300),
+        ]);
+        assert_eq!(
+            object_to_pagebox(&obj),
+            Some(PageBox::new(0.0, 1.5, 200.0, 300.0))
+        );
+    }
+
+    #[test]
+    fn object_to_pagebox_normalizes_corner_order() {
+        // [urx ury llx lly] style input -> normalized so llx<=urx, lly<=ury.
+        let obj = Object::Array(vec![
+            Object::Integer(200),
+            Object::Integer(300),
+            Object::Integer(0),
+            Object::Integer(0),
+        ]);
+        assert_eq!(
+            object_to_pagebox(&obj),
+            Some(PageBox::new(0.0, 0.0, 200.0, 300.0))
+        );
+    }
+
+    #[test]
+    fn object_to_pagebox_rejects_wrong_arity() {
+        assert_eq!(
+            object_to_pagebox(&Object::Array(vec![Object::Integer(0)])),
+            None
+        );
+        assert_eq!(object_to_pagebox(&Object::Integer(0)), None);
     }
 
     // -----------------------------------------------------------------------
