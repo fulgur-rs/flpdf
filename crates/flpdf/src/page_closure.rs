@@ -58,14 +58,14 @@ pub fn page_object_closure<R: Read + Seek>(
     queue.push_back(page_ref);
 
     while let Some(current_ref) = queue.pop_front() {
-        let obj = pdf.resolve(current_ref)?;
+        let obj = pdf.resolve_borrowed(current_ref)?;
 
         // Guard: when we reach a Page or Catalog object other than the
         // starting page (e.g. via a cross-page annotation destination), add
         // it to visited but do not traverse its contents.  This prevents
         // sibling-page resources from being pulled into the closure.
         if current_ref != page_ref {
-            if let Object::Dictionary(dict) = &obj {
+            if let Object::Dictionary(dict) = obj {
                 if let Some(t) = dict.get("Type").and_then(|o| o.as_name()) {
                     if t == b"Page" || t == b"Catalog" {
                         continue;
@@ -75,7 +75,7 @@ pub fn page_object_closure<R: Read + Seek>(
         }
 
         let mut refs_found = Vec::new();
-        collect_refs_in_object(&obj, &mut refs_found);
+        collect_refs_in_object(obj, &mut refs_found);
         for r in refs_found {
             if visited.insert(r) {
                 queue.push_back(r);
