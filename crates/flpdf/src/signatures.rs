@@ -558,11 +558,11 @@ fn walk_signature_rewrite_field<R: Read + Seek>(
         return Ok(());
     };
 
-    let field_type = dict
-        .get("FT")
-        .and_then(Object::as_name)
-        .map(|name| name.to_vec())
-        .or(inherited_ft);
+    // Resolve /FT through inherited_name so an indirect-reference /FT is still
+    // recognised as a signature field (matches walk_signature_field /
+    // strip_signature_values_from_field). inherited_ft remains the top-down
+    // fallback supplied by the parent during the Kids descent.
+    let field_type = inherited_name(pdf, &dict, "FT")?.or(inherited_ft);
 
     if field_type.as_deref() == Some(b"Sig") {
         info.signed_object_refs.insert(field_ref);
