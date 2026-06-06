@@ -508,17 +508,17 @@ fn generate_pushbutton_appearance<R: Read + Seek>(
     bbox_h: f64,
     mk_dict: Option<&Dictionary>,
 ) -> Result<Option<ObjectRef>> {
-    // Extract caption from /MK/CA.  May be a String or an indirect ref to one.
-    let caption_bytes: Vec<u8> = match mk_dict.and_then(|d| d.get("CA").cloned()) {
-        Some(Object::String(s)) => crate::json_inspect::decode_pdf_text_string(&s)
+    // Extract caption from /MK/CA. It may be a String or an indirect reference
+    // to one; resolve the reference first (review pattern #2) so the decode path
+    // is not duplicated across the direct and indirect cases.
+    let caption_obj = match mk_dict.and_then(|d| d.get("CA").cloned()) {
+        Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
+        other => other,
+    };
+    let caption_bytes: Vec<u8> = match caption_obj {
+        Some(Object::String(s)) => decode_pdf_text_string(&s)
             .map(|us| to_winansi_bytes(&us))
             .unwrap_or(s),
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::String(s) => crate::json_inspect::decode_pdf_text_string(&s)
-                .map(|us| to_winansi_bytes(&us))
-                .unwrap_or(s),
-            _ => Vec::new(),
-        },
         _ => Vec::new(),
     };
 
@@ -606,13 +606,15 @@ fn generate_checkbox_radio_appearance<R: Read + Seek>(
     };
 
     // ── 4b. CA glyph from /MK/CA ──────────────────────────────────────────
+    // May be a String or an indirect reference to one; resolve first (review
+    // pattern #2) so the direct and indirect cases share one match arm.
     let default_glyph: &[u8] = if is_radio { b"l" } else { b"4" };
-    let ca_bytes: Vec<u8> = match mk_dict.and_then(|d| d.get("CA").cloned()) {
+    let ca_obj = match mk_dict.and_then(|d| d.get("CA").cloned()) {
+        Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
+        other => other,
+    };
+    let ca_bytes: Vec<u8> = match ca_obj {
         Some(Object::String(s)) => s,
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
-            Object::String(s) => s,
-            _ => default_glyph.to_vec(),
-        },
         _ => default_glyph.to_vec(),
     };
 
@@ -734,11 +736,12 @@ fn install_state_appearances<R: Read + Seek>(
     }
 
     // ── Build /AP << /N << ... >> /D << ... >> >> ─────────────────────────
-    let on_name = String::from_utf8_lossy(on_state_name).into_owned();
-
+    // `Dictionary::insert` takes `impl AsRef<[u8]>`, so pass the raw on-state
+    // name bytes directly — no String::from_utf8_lossy round-trip (which would
+    // both allocate and silently corrupt any non-UTF-8 name bytes).
     let build_state_dict = |on: ObjectRef, off: ObjectRef| -> Dictionary {
         let mut d = Dictionary::new();
-        d.insert(on_name.clone(), Object::Reference(on));
+        d.insert(on_state_name, Object::Reference(on));
         d.insert("Off", Object::Reference(off));
         d
     };
