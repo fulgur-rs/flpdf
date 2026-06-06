@@ -1,10 +1,10 @@
 //! Appearance-stream generators for AcroForm widgets.
 //!
 //! This module builds the `/AP/N` (normal-appearance) Form XObject for
-//! AcroForm widget annotations.  Currently only **Tx (text field)**
-//! appearance streams are implemented; 9.6 (checkbox/radio) and 9.7
-//! (choice-field list) will reuse the shared helpers exported as
-//! `pub(crate)` from this module.
+//! AcroForm widget annotations.  Both **Tx (text field)** and **Btn
+//! (checkbox / radio / pushbutton)** appearance streams are implemented.
+//! Shared helpers are exported as `pub(crate)` for use by future field-type
+//! renderers (Ch list fields, etc.).
 //!
 //! # Observable-equivalence policy
 //!
@@ -23,6 +23,9 @@
 //!   layout is a known unimplemented feature" for callers.
 //! - Only the 14 standard PDF fonts are supported via the embedded metrics
 //!   table.  Unknown fonts fall back to Helvetica.
+//! - **Btn `/MK/BG` background fill and `/MK/BC` border** are not rendered.
+//!   These are best-effort decorations; callers that require them should
+//!   generate the appearance themselves.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -395,6 +398,375 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
     )?;
 
     Ok(Some(xobj_ref))
+}
+
+// ── Btn appearance ────────────────────────────────────────────────────────────
+
+/// Generate and install appearance streams for a Btn (button) widget.
+///
+/// Handles three Btn sub-types determined by `/Ff` bit flags
+/// (ISO 32000-1, Table 226):
+///
+/// - **Pushbutton** (bit 17 set, `0x10000`): renders the `/MK/CA` caption
+///   centred using Helvetica.  Installs a single `/AP/N` Form XObject.
+/// - **Radio** (bit 16 set, `0x8000`, bit 17 clear): renders on/off state
+///   appearances with ZapfDingbats glyph `l` (U+006C, bullet) as the on
+///   indicator.
+/// - **Checkbox** (neither bit set): renders on/off state appearances with
+///   ZapfDingbats glyph `4` (U+0034, check mark ✔) as the on indicator.
+///
+/// Returns `Ok(Some(on_ref))` (the on-state XObject reference) for
+/// checkbox/radio, `Ok(Some(ap_ref))` for pushbutton, and `Ok(None)` when
+/// the widget should be skipped (not a Btn field, degenerate bounding box).
+///
+/// # Observable-equivalence caveat
+///
+/// On/off glyph positioning and caption centering target **observable
+/// equivalence** (same rendered appearance) with standard viewers such as
+/// qpdf / Acrobat.  Byte-identical output is not a goal; whitespace,
+/// operator order, and layout heuristics may differ.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when the field-tree depth limit is
+/// exceeded or an object is structurally invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{generate_button_field_appearance, ObjectRef, Pdf};
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
+/// let widget = ObjectRef::new(10, 0);
+/// if let Some(ap_ref) = generate_button_field_appearance(&mut pdf, widget)? {
+///     println!("button appearance stream written at {ap_ref}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn generate_button_field_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    // ── 1. /FT must be Btn ────────────────────────────────────────────────
+    let ft = resolve_inherited_name(pdf, widget_ref, b"FT")?;
+    if ft.as_deref() != Some(b"Btn") {
+        return Ok(None);
+    }
+
+    // ── 2. /Ff — field flags ──────────────────────────────────────────────
+    // Use i64 directly for bit tests to avoid signed-to-unsigned cast issues
+    // (review-pattern #3).
+    let ff = resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0);
+    let is_pushbutton = ff & 0x10000 != 0; // bit 17 (1-indexed)
+    let is_radio = !is_pushbutton && ff & 0x8000 != 0; // bit 16
+
+    // ── 3. /Rect — bounding box ───────────────────────────────────────────
+    let rect = resolve_rect(pdf, widget_ref)?;
+    let (bbox_w, bbox_h) = match rect {
+        Some(r) => {
+            let w = (r.urx - r.llx).abs();
+            let h = (r.ury - r.lly).abs();
+            if !w.is_finite() || !h.is_finite() || w < 1.0 || h < 1.0 {
+                return Ok(None);
+            }
+            (w, h)
+        }
+        None => return Ok(None),
+    };
+
+    // ── 4. /MK — appearance characteristics (widget-direct, no inherit) ───
+    // Must resolve possible indirect reference before extracting entries
+    // (review-pattern #2).
+    let mk_dict: Option<Dictionary> = {
+        let widget_obj = pdf.resolve_borrowed(widget_ref)?;
+        let mk_val = widget_obj.as_dict().and_then(|d| d.get("MK").cloned());
+        let _ = widget_obj;
+        resolve_to_dict(pdf, mk_val)?
+    };
+
+    if is_pushbutton {
+        generate_pushbutton_appearance(pdf, widget_ref, bbox_w, bbox_h, mk_dict.as_ref())
+    } else {
+        generate_checkbox_radio_appearance(
+            pdf, widget_ref, bbox_w, bbox_h, mk_dict.as_ref(), is_radio,
+        )
+    }
+}
+
+/// Pushbutton appearance: render `/MK/CA` caption centred in the bbox.
+fn generate_pushbutton_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    bbox_w: f64,
+    bbox_h: f64,
+    mk_dict: Option<&Dictionary>,
+) -> Result<Option<ObjectRef>> {
+    // Extract caption from /MK/CA.  May be a String or an indirect ref to one.
+    let caption_bytes: Vec<u8> = match mk_dict.and_then(|d| d.get("CA").cloned()) {
+        Some(Object::String(s)) => {
+            crate::json_inspect::decode_pdf_text_string(&s)
+                .map(|us| to_winansi_bytes(&us))
+                .unwrap_or(s)
+        }
+        Some(Object::Reference(r)) => {
+            match pdf.resolve(r)? {
+                Object::String(s) => crate::json_inspect::decode_pdf_text_string(&s)
+                    .map(|us| to_winansi_bytes(&us))
+                    .unwrap_or(s),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    // Auto font size: fit height with small padding.
+    let font_size = (bbox_h - 4.0).clamp(4.0, 12.0);
+
+    let params = TextAppearanceParams {
+        text_bytes: caption_bytes,
+        font_resource_name: b"Helv".to_vec(),
+        font_size,
+        color: TextColor::Gray(0.0),
+        bbox_w,
+        bbox_h,
+        quadding: 1, // centre
+        multiline: false,
+        std_font: Some(StandardFont::Helvetica),
+    };
+    let content = build_text_appearance_content(&params);
+
+    let font_obj_ref = next_object_ref(pdf)?;
+    let xobj_ref = install_normal_appearance(
+        pdf,
+        widget_ref,
+        content,
+        bbox_w,
+        bbox_h,
+        Some((b"Helv".to_vec(), b"Helvetica".to_vec(), font_obj_ref)),
+    )?;
+
+    Ok(Some(xobj_ref))
+}
+
+/// Checkbox / radio appearance: build on + off XObjects and install as
+/// `/AP` << `/N` << `/<on>` `/<off>` >> `/D` << ... >> >>.
+fn generate_checkbox_radio_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    bbox_w: f64,
+    bbox_h: f64,
+    mk_dict: Option<&Dictionary>,
+    is_radio: bool,
+) -> Result<Option<ObjectRef>> {
+    // ── 4a. Determine on-state name ────────────────────────────────────────
+    // Priority: existing /AP/N dict key other than Off → /AS(Name) → "Yes".
+    // /AP and /AS must be resolved from indirect references (rule #2).
+    let on_state_name: Vec<u8> = {
+        // Read the widget dict once so we can inspect /AP and /AS.
+        let widget_obj = pdf.resolve_borrowed(widget_ref)?;
+        let wdict = widget_obj.as_dict();
+
+        // Try /AP/N dict keys.
+        let ap_val = wdict.and_then(|d| d.get("AP").cloned());
+        let as_val = wdict.and_then(|d| d.get("AS").cloned());
+        let _ = widget_obj;
+
+        // Resolve /AP (may be indirect).
+        let ap_dict = resolve_to_dict(pdf, ap_val)?;
+        let n_dict = if let Some(ap) = ap_dict {
+            let n_val = ap.get("N").cloned();
+            resolve_to_dict(pdf, n_val)?
+        } else {
+            None
+        };
+
+        // Pick first key that is not "Off".
+        let from_ap = n_dict.and_then(|d| {
+            d.iter()
+                .find(|(k, _)| *k != b"Off")
+                .map(|(k, _)| k.to_vec())
+        });
+
+        if let Some(name) = from_ap {
+            name
+        } else {
+            // Resolve /AS (may be indirect ref).
+            let as_resolved = match as_val {
+                Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
+                other => other,
+            };
+            match as_resolved {
+                Some(Object::Name(n)) if n != b"Off" => n,
+                _ => b"Yes".to_vec(),
+            }
+        }
+    };
+
+    // ── 4b. CA glyph from /MK/CA ──────────────────────────────────────────
+    let default_glyph: &[u8] = if is_radio { b"l" } else { b"4" };
+    let ca_bytes: Vec<u8> = match mk_dict.and_then(|d| d.get("CA").cloned()) {
+        Some(Object::String(s)) => s,
+        Some(Object::Reference(r)) => match pdf.resolve(r)? {
+            Object::String(s) => s,
+            _ => default_glyph.to_vec(),
+        },
+        _ => default_glyph.to_vec(),
+    };
+
+    // ── 4c. Build on / off content streams ────────────────────────────────
+    //
+    // Glyph size: fit within min(w, h), clamp to reasonable range.
+    // Approximate ZapfDingbats centering heuristics (observable-equivalence):
+    //   tx ≈ (w - size * 0.7) / 2   (glyph advance width ≈ 70% of em)
+    //   ty ≈ (h - size) / 2 + size * 0.15  (descender / baseline offset)
+    // Exact metrics are not available for ZapfDingbats in this build; the
+    // approximation targets the same visual result as standard viewers.
+    let size = (bbox_w.min(bbox_h) * 0.8).clamp(4.0, 72.0);
+    let tx = ((bbox_w - size * 0.7) / 2.0).max(0.0);
+    let ty = ((bbox_h - size) / 2.0 + size * 0.15).max(0.0);
+
+    let mut on_content = Vec::new();
+    on_content.extend_from_slice(b"q\nBT\n/ZaDb ");
+    on_content.extend_from_slice(fmt_f64(size).as_bytes());
+    on_content.extend_from_slice(b" Tf\n0 g\n");
+    on_content.extend_from_slice(fmt_f64(tx).as_bytes());
+    on_content.push(b' ');
+    on_content.extend_from_slice(fmt_f64(ty).as_bytes());
+    on_content.extend_from_slice(b" Td\n");
+    write_literal_string(&mut on_content, &ca_bytes);
+    on_content.extend_from_slice(b" Tj\nET\nQ\n");
+
+    let off_content: Vec<u8> = b"q Q\n".to_vec();
+
+    // ── 5. Install state appearances ──────────────────────────────────────
+    install_state_appearances(
+        pdf,
+        widget_ref,
+        &on_state_name,
+        on_content,
+        off_content,
+        bbox_w,
+        bbox_h,
+    )
+}
+
+/// Install on + off XObjects as `/AP` << `/N` << ... >> `/D` << ... >> >>
+/// on the widget, and set `/AS /Off` when no `/AS` is present.
+///
+/// **Object allocation order is critical**: each `set_object` call must
+/// immediately follow the matching `next_object_ref` call so that the max
+/// object number advances before the next allocation.  Collecting all refs
+/// up front would yield duplicates because `next_object_ref` reads the
+/// current max with no reservation.
+///
+/// Returns the `ObjectRef` of the on-state XObject.
+fn install_state_appearances<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    on_state_name: &[u8],
+    on_content: Vec<u8>,
+    off_content: Vec<u8>,
+    bbox_w: f64,
+    bbox_h: f64,
+) -> Result<Option<ObjectRef>> {
+    // ── Allocate + install ZapfDingbats font dict ─────────────────────────
+    // ZapfDingbats does NOT use WinAnsiEncoding; the font dict is hand-built
+    // without /Encoding so viewers apply the font's built-in encoding.
+    let font_ref = next_object_ref(pdf)?;
+    {
+        let mut fd = Dictionary::new();
+        fd.insert("Type", Object::Name(b"Font".to_vec()));
+        fd.insert("Subtype", Object::Name(b"Type1".to_vec()));
+        fd.insert("BaseFont", Object::Name(b"ZapfDingbats".to_vec()));
+        pdf.set_object(font_ref, Object::Dictionary(fd));
+    }
+
+    // ── Build /Resources for XObjects ────────────────────────────────────
+    let make_resources = || -> Dictionary {
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("ZaDb", Object::Reference(font_ref));
+        let mut res = Dictionary::new();
+        res.insert("Font", Object::Dictionary(font_dict));
+        res
+    };
+
+    // ── Allocate + install on-state XObject ───────────────────────────────
+    let on_ref = next_object_ref(pdf)?;
+    {
+        let mut sdict = Dictionary::new();
+        sdict.insert("Type", Object::Name(b"XObject".to_vec()));
+        sdict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        sdict.insert("FormType", Object::Integer(1));
+        sdict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(bbox_w),
+                Object::Real(bbox_h),
+            ]),
+        );
+        sdict.insert("Resources", Object::Dictionary(make_resources()));
+        pdf.set_object(on_ref, Object::Stream(Stream::new(sdict, on_content)));
+    }
+
+    // ── Allocate + install off-state XObject ──────────────────────────────
+    let off_ref = next_object_ref(pdf)?;
+    {
+        let mut sdict = Dictionary::new();
+        sdict.insert("Type", Object::Name(b"XObject".to_vec()));
+        sdict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        sdict.insert("FormType", Object::Integer(1));
+        sdict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(bbox_w),
+                Object::Real(bbox_h),
+            ]),
+        );
+        sdict.insert("Resources", Object::Dictionary(make_resources()));
+        pdf.set_object(off_ref, Object::Stream(Stream::new(sdict, off_content)));
+    }
+
+    // ── Build /AP << /N << ... >> /D << ... >> >> ─────────────────────────
+    let on_name = String::from_utf8_lossy(on_state_name).into_owned();
+
+    let build_state_dict = |on: ObjectRef, off: ObjectRef| -> Dictionary {
+        let mut d = Dictionary::new();
+        d.insert(on_name.clone(), Object::Reference(on));
+        d.insert("Off", Object::Reference(off));
+        d
+    };
+
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Dictionary(build_state_dict(on_ref, off_ref)));
+    ap.insert("D", Object::Dictionary(build_state_dict(on_ref, off_ref)));
+
+    // ── Update widget dict ─────────────────────────────────────────────────
+    let widget_obj = pdf.resolve(widget_ref)?;
+    let mut wdict = match widget_obj {
+        Object::Dictionary(d) => d,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "widget object {widget_ref} is not a dictionary"
+            )))
+        }
+    };
+
+    wdict.insert("AP", Object::Dictionary(ap));
+
+    // Set /AS to /Off when not already present (default off display).
+    if wdict.get("AS").is_none() {
+        wdict.insert("AS", Object::Name(b"Off".to_vec()));
+    }
+
+    pdf.set_object(widget_ref, Object::Dictionary(wdict));
+
+    Ok(Some(on_ref))
 }
 
 // ── Private helpers ──────────────────────────────────────────────────────────
@@ -3070,5 +3442,505 @@ mod tests {
             result.unwrap().is_some(),
             "auto-size must produce appearance"
         );
+    }
+
+    // ── Btn appearance tests ─────────────────────────────────────────────────
+
+    use crate::generate_button_field_appearance;
+
+    /// Non-Btn field → generate_button_field_appearance must return None.
+    #[test]
+    fn btn_non_btn_field_returns_none() {
+        // /FT is /Tx — should return None for the Btn generator.
+        let raw = build_tx_no_value_pdf();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Tx field must return None from Btn generator");
+    }
+
+    /// Degenerate rect → None.
+    #[test]
+    fn btn_degenerate_rect_returns_none() {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        let off4 = raw.len() as u64;
+        // Rect with zero width (llx == urx)
+        raw.extend_from_slice(b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk) /Rect [10 10 10 30]>>\nendobj\n");
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "degenerate rect should return None");
+    }
+
+    /// /Ff bit detection: pushbutton (bit 17 = 0x10000).
+    ///
+    /// Pushbutton appearance: the on-state XObject exists as a single /AP/N
+    /// stream (not a dict), and it contains /Helv Tf.
+    #[test]
+    fn btn_pushbutton_ff_bit17_detected() {
+        let ff_pushbutton = 0x10000_i64; // bit 17
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        let off4 = raw.len() as u64;
+        let widget_bytes = format!(
+            "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (pb) \
+             /Ff {} /MK <</CA (OK)>> /Rect [10 10 80 30]>>\nendobj\n",
+            ff_pushbutton
+        );
+        raw.extend_from_slice(widget_bytes.as_bytes());
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate");
+        let xobj_ref = result.expect("pushbutton must produce appearance");
+
+        // /AP/N must be a direct reference (single stream, not a sub-dict).
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(ap_dict) = wdict.get("AP").expect("AP missing").clone() else {
+            panic!("AP not dict")
+        };
+        // For pushbutton install_normal_appearance sets /AP/N as a direct Reference.
+        let n_val = ap_dict.get("N").expect("N missing");
+        assert!(matches!(n_val, Object::Reference(_)), "/AP/N must be a reference for pushbutton");
+
+        // The XObject stream must reference /Helv font.
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream")
+        };
+        let content_str = String::from_utf8_lossy(&stream.data);
+        assert!(content_str.contains("/Helv"), "pushbutton must use Helv font");
+        assert!(content_str.contains("Tf"), "pushbutton must have Tf operator");
+
+        // Caption "OK" must appear in a Tj.
+        let mut found_caption = false;
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"OK" {
+                        found_caption = true;
+                    }
+                }
+            }
+        }
+        assert!(found_caption, "pushbutton Tj must contain caption 'OK'");
+    }
+
+    /// checkbox (no Ff bits): generate_button_field_appearance produces on + off
+    /// state appearances under /AP/N as a sub-dict with /<on> and /Off keys.
+    #[test]
+    fn btn_checkbox_ap_has_on_and_off_states() {
+        let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
+        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate");
+        let on_ref = result.expect("checkbox must produce appearance");
+
+        // /AP/N must be a dict with "Yes" and "Off" keys.
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP missing").clone() else {
+            panic!("AP not dict")
+        };
+
+        let n_val = ap.get("N").expect("N missing");
+        let Object::Dictionary(n_dict) = n_val else {
+            panic!("N is not a dict for checkbox (should be state dict), got: {n_val:?}");
+        };
+
+        let yes_ref = match n_dict.get("Yes").expect("Yes key missing") {
+            Object::Reference(r) => *r,
+            other => panic!("Yes is not a ref: {other:?}"),
+        };
+        let off_ref_n = match n_dict.get("Off").expect("Off key missing") {
+            Object::Reference(r) => *r,
+            other => panic!("Off is not a ref: {other:?}"),
+        };
+
+        // on_ref returned from generate must equal the /Yes ref in /AP/N.
+        assert_eq!(on_ref, yes_ref, "returned on_ref must match /AP/N/Yes ref");
+        assert_ne!(yes_ref, off_ref_n, "on and off refs must differ");
+
+        // /AP/D must also exist with Yes and Off.
+        let d_val = ap.get("D").expect("D missing");
+        let Object::Dictionary(d_dict) = d_val else {
+            panic!("D is not a dict")
+        };
+        assert!(d_dict.get("Yes").is_some(), "/AP/D must have Yes key");
+        assert!(d_dict.get("Off").is_some(), "/AP/D must have Off key");
+
+        // on-state XObject stream must contain /ZaDb Tf and (4) Tj.
+        let Object::Stream(on_stream) = pdf.resolve(on_ref).expect("resolve on xobj") else {
+            panic!("on xobj not stream")
+        };
+        let on_str = String::from_utf8_lossy(&on_stream.data);
+        assert!(on_str.contains("/ZaDb"), "on stream must contain /ZaDb font ref");
+        assert!(on_str.contains("Tf"), "on stream must have Tf operator");
+
+        // Tj operand must be "4" (default checkbox glyph).
+        let mut found_glyph = false;
+        for tok in ContentStreamParser::new(&on_stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"4" {
+                        found_glyph = true;
+                    }
+                }
+            }
+        }
+        assert!(found_glyph, "checkbox on stream Tj must contain glyph '4'");
+
+        // off-state XObject stream must be blank.
+        let Object::Stream(off_stream) = pdf.resolve(off_ref_n).expect("resolve off xobj") else {
+            panic!("off xobj not stream")
+        };
+        // "q Q\n" is the only content; no Tj.
+        let off_str = String::from_utf8_lossy(&off_stream.data);
+        assert!(!off_str.contains("Tj"), "off stream must not contain Tj");
+
+        // /AS must be set to /Off (default off display).
+        assert_eq!(
+            wdict.get("AS"),
+            Some(&Object::Name(b"Off".to_vec())),
+            "/AS must be /Off for a new checkbox"
+        );
+    }
+
+    /// radio (Ff bit 16 = 0x8000): default glyph is 'l' (bullet), not '4'.
+    #[test]
+    fn btn_radio_uses_bullet_glyph() {
+        let ff_radio = 0x8000_i64; // bit 16
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        let off4 = raw.len() as u64;
+        let widget_bytes = format!(
+            "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (rb) \
+             /Ff {} /Rect [10 10 30 30]>>\nendobj\n",
+            ff_radio
+        );
+        raw.extend_from_slice(widget_bytes.as_bytes());
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("radio must produce appearance");
+
+        let Object::Stream(on_stream) = pdf.resolve(on_ref).expect("resolve on") else {
+            panic!("not stream")
+        };
+
+        // Tj must contain 'l' (radio bullet).
+        let mut found = false;
+        for tok in ContentStreamParser::new(&on_stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"l" {
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "radio on stream Tj must contain glyph 'l'");
+    }
+
+    /// on-state name comes from existing /AP/N dict (non-Off key).
+    #[test]
+    fn btn_on_state_name_from_existing_ap_n_dict() {
+        // Widget already has /AP/N << /On 5 0 R /Off 6 0 R >> (pre-existing).
+        // The generator must pick "On" as the on-state name.
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        // Pre-existing /AP/N with "On" and "Off" keys (values are stubs, just refs).
+        let off5 = raw.len() as u64;
+        raw.extend_from_slice(b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 20 20]>>\nstream\nq Q\nendstream\nendobj\n");
+        let off6 = raw.len() as u64;
+        raw.extend_from_slice(b"6 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 20 20]>>\nstream\nq Q\nendstream\nendobj\n");
+        let off4 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk2) \
+              /AP << /N << /On 5 0 R /Off 6 0 R >> >> /Rect [10 10 30 30]>>\nendobj\n"
+        );
+        let xref_start = raw.len() as u64;
+        // 7 objects: 0 free, 1-6.
+        let xref = format!(
+            "xref\n0 7\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n\
+             {off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n{off6:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 7 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("should produce appearance");
+
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+
+        // Must have "On" as the on-state key (picked from pre-existing /AP/N).
+        assert!(n_dict.get("On").is_some(), "/AP/N must have 'On' key (from pre-existing)");
+        assert!(n_dict.get("Off").is_some(), "/AP/N must have 'Off' key");
+        // Must NOT have "Yes" (should have used "On").
+        assert!(n_dict.get("Yes").is_none(), "/AP/N must not have 'Yes' when 'On' was pre-existing");
+    }
+
+    /// on-state name from /AS when no existing /AP/N dict.
+    #[test]
+    fn btn_on_state_name_from_as() {
+        // Widget has /AS /Checked but no /AP.
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        let off4 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk3) \
+              /AS /Checked /Rect [10 10 30 30]>>\nendobj\n"
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("should produce appearance");
+
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+
+        // Must have "Checked" (from /AS).
+        assert!(n_dict.get("Checked").is_some(), "/AP/N must have 'Checked' key from /AS");
+        assert!(n_dict.get("Off").is_some(), "/AP/N must have 'Off' key");
+    }
+
+    /// /MK/CA overrides the default glyph.
+    #[test]
+    fn btn_mk_ca_overrides_default_glyph() {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        let off4 = raw.len() as u64;
+        // /MK/CA is "8" (custom checkmark glyph).
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk4) \
+              /MK <</CA (8)>> /Rect [10 10 30 30]>>\nendobj\n"
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("should produce appearance");
+
+        let Object::Stream(on_stream) = pdf.resolve(on_ref).expect("resolve on") else {
+            panic!("not stream")
+        };
+
+        let mut found_glyph = false;
+        for tok in ContentStreamParser::new(&on_stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"8" {
+                        found_glyph = true;
+                    }
+                }
+            }
+        }
+        assert!(found_glyph, "/MK/CA '8' must appear in Tj, overriding default '4'");
+    }
+
+    /// Object refs for font, on, off must be distinct (no ref collision).
+    #[test]
+    fn btn_checkbox_object_refs_are_distinct() {
+        let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
+        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+
+        let on_ref = match n_dict.get("Yes").expect("Yes") {
+            Object::Reference(r) => *r,
+            other => panic!("Yes not ref: {other:?}"),
+        };
+        let off_ref = match n_dict.get("Off").expect("Off") {
+            Object::Reference(r) => *r,
+            other => panic!("Off not ref: {other:?}"),
+        };
+
+        // Resolve both streams, find /Resources/Font/ZaDb -> font ref.
+        let Object::Stream(on_stream) = pdf.resolve(on_ref).expect("resolve on") else {
+            panic!("on not stream")
+        };
+        let Object::Stream(off_stream) = pdf.resolve(off_ref).expect("resolve off") else {
+            panic!("off not stream")
+        };
+
+        // Extract font ref from /Resources/Font/ZaDb.
+        let get_zadb_ref = |sdict: &Dictionary| -> ObjectRef {
+            let Object::Dictionary(res) = sdict.get("Resources").expect("resources") else {
+                panic!("resources not dict")
+            };
+            let Object::Dictionary(fonts) = res.get("Font").expect("Font") else {
+                panic!("Font not dict")
+            };
+            match fonts.get("ZaDb").expect("ZaDb") {
+                Object::Reference(r) => *r,
+                other => panic!("ZaDb not ref: {other:?}"),
+            }
+        };
+
+        let font_ref_on = get_zadb_ref(&on_stream.dict);
+        let font_ref_off = get_zadb_ref(&off_stream.dict);
+
+        // All three refs must be distinct.
+        assert_ne!(on_ref, off_ref, "on and off refs must differ");
+        assert_ne!(on_ref, font_ref_on, "on ref must differ from font ref");
+        assert_ne!(off_ref, font_ref_on, "off ref must differ from font ref");
+
+        // Both on/off share the same font ref (shared ZapfDingbats dict).
+        assert_eq!(font_ref_on, font_ref_off, "on and off streams must share font ref");
+    }
+
+    /// ZapfDingbats font dict must NOT have /Encoding.
+    #[test]
+    fn btn_zapf_font_dict_has_no_encoding() {
+        let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
+        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+        let on_ref = match n_dict.get("Yes").expect("Yes") {
+            Object::Reference(r) => *r,
+            other => panic!("Yes not ref: {other:?}"),
+        };
+        let Object::Stream(on_stream) = pdf.resolve(on_ref).expect("resolve on") else {
+            panic!("not stream")
+        };
+        let Object::Dictionary(res) = on_stream.dict.get("Resources").expect("resources") else {
+            panic!("not dict")
+        };
+        let Object::Dictionary(fonts) = res.get("Font").expect("Font") else {
+            panic!("not dict")
+        };
+        let font_ref = match fonts.get("ZaDb").expect("ZaDb") {
+            Object::Reference(r) => *r,
+            other => panic!("ZaDb not ref: {other:?}"),
+        };
+        let Object::Dictionary(fdict) = pdf.resolve(font_ref).expect("resolve font") else {
+            panic!("font not dict")
+        };
+        assert!(
+            fdict.get("Encoding").is_none(),
+            "ZapfDingbats font dict must NOT have /Encoding, got: {:?}",
+            fdict.get("Encoding")
+        );
+        assert_eq!(
+            fdict.get("BaseFont"),
+            Some(&Object::Name(b"ZapfDingbats".to_vec())),
+            "font dict BaseFont must be ZapfDingbats"
+        );
+    }
+
+    /// Round-trip: write and re-read the PDF; /AP must survive.
+    #[test]
+    fn btn_checkbox_round_trip() {
+        let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
+        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("write_pdf");
+
+        let mut pdf2 = Pdf::open(Cursor::new(out)).expect("re-parse");
+        let widget_obj = pdf2.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let ap_obj = wdict.get("AP").expect("/AP missing after round-trip");
+        assert!(
+            matches!(ap_obj, Object::Dictionary(_)),
+            "/AP must be a dict after round-trip"
+        );
+
+        // on-state XObject must be re-resolvable.
+        let xobj2 = pdf2.resolve(on_ref).expect("re-resolve on xobj");
+        assert!(matches!(xobj2, Object::Stream(_)), "on xobj must be a stream after round-trip");
     }
 }
