@@ -252,6 +252,49 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             None => Ok((page_idx + 1).to_string()),
         }
     }
+
+    /// qpdf `getLabelsForPageRange` port: collect the label entries needed to
+    /// reproduce the labels of pages `start_idx..=end_idx` if they were
+    /// renumbered to begin at `new_start_idx`. Returns `(new_index, LabelRange)`
+    /// pairs (the first entry plus every explicit entry in the source range),
+    /// renumbered by `new_start_idx - start_idx`. Read-only; intended for
+    /// page-extraction wiring (.14.4).
+    ///
+    /// Unlike qpdf's accumulating signature, this is a single self-contained
+    /// call: the leading entry is always emitted (the result vector starts
+    /// empty, so there is no prior entry to be redundant against). A later
+    /// accumulating consumer can dedupe across calls.
+    pub fn labels_for_page_range(
+        &mut self,
+        start_idx: i64,
+        end_idx: i64,
+        new_start_idx: i64,
+    ) -> Result<Vec<(i64, LabelRange)>> {
+        let ranges = self.ranges()?;
+        // Set of explicit source indices, for hasIndex().
+        let explicit: std::collections::BTreeSet<i64> = ranges.iter().map(|(i, _)| *i).collect();
+
+        // First page label (or fabricated default decimal start = 1 + new_start).
+        let first_label = match self.label_for_page(start_idx)? {
+            Some(r) => r,
+            None => LabelRange {
+                style: LabelStyle::Decimal,
+                prefix: String::new(),
+                start: 1 + new_start_idx,
+            },
+        };
+
+        let mut out = vec![(new_start_idx, first_label)];
+        let idx_offset = new_start_idx - start_idx;
+        for i in (start_idx + 1)..=end_idx {
+            if explicit.contains(&i) {
+                if let Some(lab) = self.label_for_page(i)? {
+                    out.push((i + idx_offset, lab));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Extension constructor mirroring [`Pdf::acroform`].
@@ -369,6 +412,27 @@ mod tests {
             "page before first range"
         );
         assert_eq!(h.label_string_for_page(3).unwrap(), "I");
+    }
+
+    #[test]
+    fn labels_for_page_range_renumbers_and_copies_explicit() {
+        // ranges at 0 (roman) and 5 (decimal). Extract pages 3..=6 to new_start 0.
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            label_dict("r", Some(1), None),
+            Object::Integer(5),
+            label_dict("D", Some(1), None),
+        ]);
+        let mut h = pdf.page_labels();
+        let out = h.labels_for_page_range(3, 6, 0).unwrap();
+        // First page (idx 3) is in the roman range with offset 3 -> start 4.
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1.style, LabelStyle::RomanLower);
+        assert_eq!(out[0].1.start, 4);
+        // Page 5 has an explicit entry -> copied, renumbered to new index 2.
+        assert!(out
+            .iter()
+            .any(|(idx, r)| *idx == 2 && r.style == LabelStyle::Decimal));
     }
 
     #[test]
