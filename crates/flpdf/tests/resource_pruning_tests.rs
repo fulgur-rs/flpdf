@@ -1717,3 +1717,169 @@ fn test_roborev_low_page_inline_group_key_no_collision_with_gen1_indirect() {
         "low2: F3 must be pruned (neither page uses it): {keys:?}"
     );
 }
+
+// ── Graceful degradation: undecodable page /Contents (flpdf-s9s) ─────────────
+//
+// A page whose /Contents cannot be decoded (corrupt FlateDecode, etc.) must not
+// abort `remove_unreferenced_resources`; its resources are conservatively
+// retained — never pruned — matching the Form XObject decode-failure path.
+
+/// Write a stream object carrying a `/Filter`, embedding `body` verbatim so the
+/// declared filter does NOT match the bytes (used to fabricate an undecodable
+/// content stream).
+fn stream_obj_with_filter(num: u32, filter: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!(
+            "{num} 0 obj\n<< /Length {} /Filter {filter} >>\nstream\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out
+}
+
+/// Resolve an indirect /Font sub-dictionary object and return its key names.
+fn font_subdict_keys_by_ref(pdf: &mut Pdf<Cursor<Vec<u8>>>, font_ref: ObjectRef) -> Vec<String> {
+    match pdf
+        .resolve(font_ref)
+        .expect("resolve indirect font sub-dict")
+    {
+        Object::Dictionary(d) => d
+            .iter()
+            .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+            .collect(),
+        _ => vec![],
+    }
+}
+
+// Exercises the `protected_groups` prune-loop skip: a corrupt page sharing a
+// top-level /Resources with a healthy sibling must not have that shared dict
+// pruned to the healthy page's (incomplete) used-name union. Yes mode, because
+// Auto skips shared-resource collection entirely (so the failure never fires).
+#[test]
+fn corrupt_page_content_shared_resources_not_pruned_yes_mode() {
+    // Page A (obj 3): valid content using only /F1, shared /Resources 7 0 R.
+    // Page B (obj 4): corrupt /Contents (FlateDecode garbage), shared 7 0 R.
+    // Shared resources 7 0 R holds /F1 and /F2.
+    let extra = vec![
+        (5u32, stream_obj(5, b"BT /F1 12 Tf (hi) Tj ET")),
+        (
+            6,
+            stream_obj_with_filter(6, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+        (
+            7,
+            obj_bytes(
+                7,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf(
+        &[
+            "/Contents 5 0 R /Resources 7 0 R",
+            "/Contents 6 0 R /Resources 7 0 R",
+        ],
+        &extra,
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    // Must NOT abort despite page B's undecodable /Contents.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must degrade gracefully, not abort");
+
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(7, 0));
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "F1 must be kept: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "F2 must be conservatively retained — page B's content is undecodable so \
+         we cannot prove F2 is unused: {keys:?}"
+    );
+}
+
+// Exercises the `CatRefInfo.protected` flag: a corrupt page and a healthy page
+// have DIFFERENT top-level /Resources but share an indirect category sub-dict
+// (/Font 9 0 R). The healthy page's pruning must not trim the shared sub-dict to
+// its own union, because the corrupt page's usage is unknown. Yes mode.
+#[test]
+fn corrupt_page_content_shared_cat_subdict_not_pruned_yes_mode() {
+    // Page A (obj 3): valid content using /F1, /Resources 7 0 R → /Font 9 0 R.
+    // Page B (obj 4): corrupt /Contents,          /Resources 8 0 R → /Font 9 0 R.
+    // Shared indirect /Font sub-dict 9 0 R holds /F1 and /F2.
+    let extra = vec![
+        (5u32, stream_obj(5, b"BT /F1 12 Tf (hi) Tj ET")),
+        (
+            6,
+            stream_obj_with_filter(6, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+        (7, obj_bytes(7, "<< /Font 9 0 R >>")),
+        (8, obj_bytes(8, "<< /Font 9 0 R >>")),
+        (
+            9,
+            obj_bytes(9, "<< /F1 << /Type /Font >> /F2 << /Type /Font >> >>"),
+        ),
+    ];
+    let pdf_bytes = build_pdf(
+        &[
+            "/Contents 5 0 R /Resources 7 0 R",
+            "/Contents 6 0 R /Resources 8 0 R",
+        ],
+        &extra,
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must degrade gracefully, not abort");
+
+    let keys = font_subdict_keys_by_ref(&mut pdf, ObjectRef::new(9, 0));
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "F1 must be kept: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "F2 must be retained — the shared /Font is also referenced by the corrupt \
+         page B, whose usage is unknown: {keys:?}"
+    );
+}
+
+// The acceptance criterion's headline scenario, verbatim: a single page in the
+// DEFAULT (Auto) mode whose /Contents cannot be decoded. A single page is never
+// "shared", so it bypasses Auto's pre-collection skip and reaches the failing
+// decode — which must degrade gracefully (no abort) and retain the page's
+// resources rather than pruning them to an empty used-name set.
+#[test]
+fn corrupt_page_content_single_page_default_mode_does_not_abort() {
+    let extra = vec![
+        (
+            4u32,
+            stream_obj_with_filter(4, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    // Default mode == Auto, exactly the `rewrite --full-rewrite` default path.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::default())
+        .expect("default-mode prune must degrade gracefully, not abort");
+
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
+        "both fonts must be conservatively retained — the page content is \
+         undecodable so no entry can be proven unused: {keys:?}"
+    );
+}
