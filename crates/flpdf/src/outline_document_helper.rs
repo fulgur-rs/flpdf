@@ -223,8 +223,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 Some(inner) => self.dest_from_value(&inner, depth - 1),
                 None => Ok(None),
             },
-            Object::Name(name) => self.resolve_named_dest(name.clone()),
-            Object::String(name) => self.resolve_named_dest(name.clone()),
+            Object::Name(name) => self.resolve_named_dest(name.clone(), depth),
+            Object::String(name) => self.resolve_named_dest(name.clone(), depth),
             _ => Ok(None),
         }
     }
@@ -234,7 +234,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Tries the modern catalog `/Names`->`/Dests` name tree first (PDF 1.2),
     /// then the legacy catalog `/Dests` dictionary (PDF 1.1). A name-tree or
     /// `/Dests` value may be the dest array directly or a `<< /D array >>` dict.
-    fn resolve_named_dest(&mut self, name: Vec<u8>) -> Result<Option<Dest>> {
+    ///
+    /// `depth` is the remaining indirection/`/D` budget threaded from
+    /// [`Self::dest_from_value`]; the post-lookup value is resolved with
+    /// `depth - 1` so a cyclic named mapping (e.g. legacy `/Dests` `/a -> /b`,
+    /// `/b -> /a`) strictly decreases the budget and terminates at the bound
+    /// instead of overflowing the stack.
+    fn resolve_named_dest(&mut self, name: Vec<u8>, depth: usize) -> Result<Option<Dest>> {
         // 1. Modern: catalog /Names /Dests name tree.
         if let Some(names_ref) = self.catalog_ref("Names")? {
             if let Object::Dictionary(names) = self.pdf.resolve(names_ref)? {
@@ -247,7 +253,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                     )?;
                     for (key, value) in entries {
                         if key == name {
-                            return self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH);
+                            return self.dest_from_value(&value, depth - 1);
                         }
                     }
                 }
@@ -257,7 +263,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if let Some(dests_ref) = self.catalog_ref("Dests")? {
             if let Object::Dictionary(dests) = self.pdf.resolve(dests_ref)? {
                 if let Some(value) = dests.get(&name).cloned() {
-                    return self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH);
+                    return self.dest_from_value(&value, depth - 1);
                 }
             }
         }

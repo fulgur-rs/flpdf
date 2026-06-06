@@ -383,3 +383,30 @@ fn dest_from_named_legacy() {
         .expect("legacy named dest should resolve");
     assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
 }
+
+/// Legacy /Dests with a NAME->NAME cycle: /a -> /b, /b -> /a. Resolution must
+/// terminate at the depth bound and yield no dest (not overflow the stack).
+fn cyclic_named_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Dests 8 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Cyc) /Parent 4 0 R /Dest /a >>"),
+            (8, "<< /a /b /b /a >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn cyclic_named_dest_terminates_as_none() {
+    let mut pdf = Pdf::open(Cursor::new(cyclic_named_dest_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    // The /a -> /b -> /a name cycle bottoms out at the depth bound -> no dest.
+    assert!(roots[0].dest.is_none());
+}
