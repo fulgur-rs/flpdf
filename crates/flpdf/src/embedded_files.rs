@@ -100,8 +100,8 @@ use std::io::{Read, Seek};
 ///    catalog and in every page dictionary.  If a `/AF` array becomes empty
 ///    the `/AF` key itself is deleted; a shared indirect `/AF` array object
 ///    is patched in place, never deleted here (see
-///    [`remove_ref_from_af_in_dict`]).
-/// 4. **Mark-and-sweep GC** ([`crate::subset_prune::sweep_unreachable_objects`]):
+///    `remove_ref_from_af_in_dict`).
+/// 4. **Mark-and-sweep GC** (`crate::subset_prune::sweep_unreachable_objects`):
 ///    every indirect object no longer reachable from `/Root` or the trailer
 ///    is physically deleted. This drops the removed `/Filespec`, *all* its
 ///    `/EF` streams (including a filespec carrying distinct streams under
@@ -356,7 +356,7 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 /// **Semantics:** name-tree values that are *direct* `/Filespec` dictionaries
 /// (rather than indirect references) are intentionally **skipped** — this
 /// reader only surfaces `(key, ObjectRef)` pairs. Writers must not use this as
-/// their rebuild source; see [`collect_embedded_file_pairs_raw`], which
+/// their rebuild source; see `collect_embedded_file_pairs_raw`, which
 /// preserves direct-dict values verbatim so a rebuild never drops them.
 // TODO(flpdf-9hc.10.6): consider exposing direct-dict entries via the public
 // list/show API (e.g. an `Object`-valued variant) once list/show land.

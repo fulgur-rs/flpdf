@@ -66,13 +66,13 @@ pub struct LabelRange {
 impl LabelRange {
     /// Parse a label dictionary (`/S`, `/P`, `/St`). Unrecognised/absent `/S`
     /// → [`LabelStyle::None`]; absent `/St` → 1; `/P` decoded via
-    /// [`crate::json_inspect::decode_pdf_text_string`] with lossy fallback.
+    /// `crate::json_inspect::decode_pdf_text_string` with lossy fallback.
     ///
     /// This does **not** resolve indirect `/S`/`/P`/`/St` values (it has no
     /// `Pdf` handle): an indirect inner value falls through to its default.
     /// Callers reading a live document should go through
     /// [`PageLabelDocumentHelper::ranges`] (which uses the resolving
-    /// [`LabelRange::from_dict_resolved`]); this plain form is for the
+    /// `LabelRange::from_dict_resolved`); this plain form is for the
     /// non-resolving JSON-inspection path.
     pub fn from_dict(dict: &Dictionary) -> Self {
         let style = match dict.get("S") {

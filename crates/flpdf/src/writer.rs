@@ -333,7 +333,7 @@ pub struct WriteOptions {
     /// [`compress_streams`]: WriteOptions::compress_streams
     pub stream_data: Option<StreamDataMode>,
 
-    /// Encrypt the output with the supplied [`EncryptParams`] (qpdf
+    /// Encrypt the output with the supplied [`crate::EncryptParams`] (qpdf
     /// `--encrypt …` equivalent — flpdf-9hc.4.9).
     ///
     /// When set the writer:
@@ -366,7 +366,7 @@ pub struct WriteOptions {
     /// flpdf-9hc.4.11).
     ///
     /// When set the writer bypasses the normal password-derivation path and
-    /// constructs an [`EncryptionContext`] directly from the pre-recovered file
+    /// constructs an `EncryptionContext` directly from the pre-recovered file
     /// key, the donor's `/Encrypt` dict, and the donor's `/ID[0]`.  The output
     /// can therefore be decrypted with the donor's user and owner passwords.
     ///
@@ -2853,7 +2853,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// objects** in the full-rewrite path. The cross-reference stream and
 /// object-stream (ObjStm) containers apply the same `CompressStreams`
 /// policy on their own dedicated branches (the xref-stream branch below
-/// and [`object_streams::wrap_objstm_body`]); they do not flow through
+/// and `object_streams::wrap_objstm_body`); they do not flow through
 /// this function. (`write_qdf` is exempt — it is a debug-dump path that
 /// emits source bytes verbatim by design and does not consult this function.)
 ///
@@ -2951,7 +2951,7 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
 ///
 /// This is the **single choke-point** through which all stream emission in the
 /// full-rewrite writer paths flows.  It mirrors the layout that
-/// [`Object::Stream::write_pdf`] produces, but gives the caller control over
+/// `Object::Stream::write_pdf` produces, but gives the caller control over
 /// the newline before `endstream`.
 ///
 /// # Layout

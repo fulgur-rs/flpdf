@@ -10,10 +10,12 @@
 //! method re-derives the page list from the live document via the existing
 //! infrastructure:
 //!
-//! - [`pages`] / [`iter`] / [`get`] delegate to [`crate::pages::page_refs`].
-//! - [`rotate`] builds a [`RotateOp`] and calls
+//! - [`pages`](PageDocumentHelper::pages) / [`iter`](PageDocumentHelper::iter)
+//!   / [`get`](PageDocumentHelper::get) delegate to [`crate::pages::page_refs`].
+//! - [`rotate`](PageDocumentHelper::rotate) builds a [`RotateOp`] and calls
 //!   [`crate::page_rotate::apply_rotate_to_pages`].
-//! - [`insert`] / [`remove`] splice the ordered page list and call
+//! - [`insert`](PageDocumentHelper::insert) / [`remove`](PageDocumentHelper::remove)
+//!   splice the ordered page list and call
 //!   [`crate::page_tree_rebuild::rebuild_page_tree`].
 //!
 //! # Examples

@@ -1410,7 +1410,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
 /// (`0x73 0x41 0x6C 0x54`) is appended to the MD5 input.  For all RC4 variants
 /// (V=1, V=2, and V=4 `/CFM /V2`) no salt is added.
 ///
-/// Exposed as `pub` so that [`flpdf::CopyEncryptionSource`] (flpdf-9hc.4.11)
+/// Exposed as `pub` so that [`crate::CopyEncryptionSource`] (flpdf-9hc.4.11)
 /// can carry the donor's algorithm selection across the CLI→library boundary
 /// without needing a separate parallel enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
