@@ -91,11 +91,17 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
 
         match operator.as_slice() {
             b"Tf" => {
-                // Operands: /FontName size
-                if let Some(name) = operands.first().and_then(|o| o.as_name()) {
+                // Operands: /FontName size. `Tf` is only meaningful when both
+                // a name and a numeric size are present, so update all three
+                // fields together — a malformed `Tf` (missing/typed operand)
+                // is ignored wholesale rather than partially applied, which
+                // would otherwise yield a font/size pair that never appeared
+                // in the source `/DA`.
+                if let (Some(name), Some(size)) = (
+                    operands.first().and_then(|o| o.as_name()),
+                    operands.get(1).and_then(obj_as_f64),
+                ) {
                     font_name = Some(name.to_vec());
-                }
-                if let Some(size) = operands.get(1).and_then(obj_as_f64) {
                     font_size = size;
                     auto_size = size == 0.0;
                 }
@@ -249,5 +255,16 @@ mod tests {
         assert_eq!(da.font_name, None);
         assert!(da.auto_size);
         assert_eq!(da.color, TextColor::Gray(0.0));
+    }
+
+    #[test]
+    fn malformed_trailing_tf_does_not_partially_overwrite() {
+        // A valid `Tf` followed by a malformed one (`/Bad Tf`, missing the
+        // numeric size) must be ignored wholesale: the earlier valid pair is
+        // preserved rather than producing the never-present (Bad, 12) combo.
+        let da = parse_default_appearance(b"/Helv 12 Tf /Bad Tf");
+        assert_eq!(da.font_name.as_deref(), Some(b"Helv" as &[u8]));
+        assert!(approx_eq(da.font_size, 12.0));
+        assert!(!da.auto_size);
     }
 }
