@@ -236,3 +236,42 @@ fn cyclic_outline_terminates() {
     // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
     assert_eq!(titles, vec!["X", "Y"]);
 }
+
+#[test]
+fn dest_from_explicit_dest_array() {
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    let a1 = &roots[0].children[0]; // A1 has /Dest [3 0 R /Fit]
+    let dest = a1.dest.as_ref().expect("A1 should have a dest");
+    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+    // Nodes without a dest stay None.
+    assert!(roots[1].dest.is_none()); // B
+}
+
+/// Outline item whose destination is a GoTo action: /A << /S /GoTo /D [3 0 R /Fit] >>.
+fn action_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S /GoTo /D [3 0 R /Fit] >> >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn dest_from_goto_action() {
+    let mut pdf = Pdf::open(Cursor::new(action_dest_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    let dest = roots[0]
+        .dest
+        .as_ref()
+        .expect("GoTo action should yield a dest");
+    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+}

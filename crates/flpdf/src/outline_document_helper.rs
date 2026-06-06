@@ -15,6 +15,11 @@ use std::io::{Read, Seek};
 /// walking (1000+ levels, cycle diagnostics) is tracked by flpdf-9hc.14.7.
 pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
 
+/// Indirection/`/D` nesting bound when resolving a destination. Mirrors the
+/// constant in `outline_dest_remap`. Only exists to make malformed/cyclic
+/// `/D` structures terminate instead of overflowing the stack.
+const MAX_DEST_RESOLVE_DEPTH: usize = 64;
+
 /// One materialized node of the outline tree (a bookmark).
 ///
 /// Mirrors qpdf's `QPDFOutlineObjectHelper`. `children` are the resolved
@@ -140,9 +145,12 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             let first = dict.get_ref("First");
             let next = dict.get_ref("Next");
             let count_src = dict.get("Count").cloned();
+            let dest_src = dict.get("Dest").cloned();
+            let action_src = dict.get("A").cloned();
             // `dict` (and thus the &mut self.pdf borrow) is no longer used past
             // this point - owned values only from here on.
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
+            let dest = self.resolve_node_dest(dest_src, action_src)?;
 
             let children = match first {
                 Some(first) => {
@@ -157,12 +165,63 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 title,
                 count,
                 parent,
-                dest: None,
+                dest,
                 children,
             });
             current = next;
         }
         Ok(nodes)
+    }
+
+    /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
+    /// Named/string destinations are resolved in a later task (return `None` here).
+    fn resolve_node_dest(
+        &mut self,
+        dest: Option<Object>,
+        action: Option<Object>,
+    ) -> Result<Option<Dest>> {
+        if let Some(d) = dest {
+            if let Some(found) = self.dest_from_value(&d, MAX_DEST_RESOLVE_DEPTH)? {
+                return Ok(Some(found));
+            }
+        }
+        if let Some(a) = action {
+            let action_obj = match a {
+                Object::Reference(r) => self.pdf.resolve(r)?,
+                other => other,
+            };
+            if let Some(adict) = action_obj.as_dict() {
+                let is_goto = matches!(adict.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+                if is_goto {
+                    if let Some(d) = adict.get("D").cloned() {
+                        if let Some(found) = self.dest_from_value(&d, MAX_DEST_RESOLVE_DEPTH)? {
+                            return Ok(Some(found));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a destination value (array / indirect / dict `/D`) to a [`Dest`].
+    /// Named (`Name`/`String`) destinations return `None` here (a later task adds them).
+    fn dest_from_value(&mut self, value: &Object, depth: usize) -> Result<Option<Dest>> {
+        if depth == 0 {
+            return Ok(None);
+        }
+        match value {
+            Object::Array(arr) => Ok(Some(Dest { array: arr.clone() })),
+            Object::Reference(r) => {
+                let concrete = self.pdf.resolve(*r)?;
+                self.dest_from_value(&concrete, depth - 1)
+            }
+            Object::Dictionary(d) => match d.get("D").cloned() {
+                Some(inner) => self.dest_from_value(&inner, depth - 1),
+                None => Ok(None),
+            },
+            _ => Ok(None), // Name/String named dest — later task
+        }
     }
 
     /// Pre-order iterator over every materialized node (owned). Each yielded
