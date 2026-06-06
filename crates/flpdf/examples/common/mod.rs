@@ -28,7 +28,9 @@ pub fn build_shared_font_pdf(page_count: u32) -> Vec<u8> {
 
     // 2: Pages root
     offsets.insert(2, out.len() as u64);
-    let kids: String = (first_page..=last_page).map(|i| format!("{i} 0 R ")).collect();
+    let kids: String = (first_page..=last_page)
+        .map(|i| format!("{i} 0 R "))
+        .collect();
     out.extend_from_slice(
         format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {page_count} >>\nendobj\n")
             .as_bytes(),

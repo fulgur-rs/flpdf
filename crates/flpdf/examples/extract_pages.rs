@@ -42,6 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(count, 3, "expected 3 extracted pages, got {count}");
     println!("extract_pages: extracted pages 1,3,5 -> output has {count} pages");
 
+    // Close the open file handles before deleting: on Windows, removing a file
+    // that is still open by the process fails with a permission error.
+    drop(pdf);
+    drop(out_pdf);
     let _ = std::fs::remove_file(&src_path);
     let _ = std::fs::remove_file(&out_path);
     Ok(())

@@ -14,8 +14,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 
 use flpdf::{
-    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef,
-    Pdf,
+    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef, Pdf,
 };
 
 /// Resolve a page's `/Resources /Font /F1` indirect reference.
@@ -84,6 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         f_last
     );
 
+    // Close the open file handles before deleting: on Windows, removing a file
+    // that is still open by the process fails with a permission error.
+    drop(a);
+    drop(b);
+    drop(out_pdf);
     for p in [&a_path, &b_path, &out_path] {
         let _ = std::fs::remove_file(p);
     }
