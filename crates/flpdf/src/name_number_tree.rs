@@ -63,6 +63,44 @@ where
     Ok(out)
 }
 
+/// Enumerate a **number** tree rooted at `root` (a `/Kids` root node reference,
+/// or an inline node dictionary), decoding each value via `decode`.
+///
+/// Same semantics as [`read_name_tree`] but with `/Nums` leaves and integer
+/// keys; non-integer keys are skipped.
+///
+/// # Errors
+/// Propagates [`Pdf::resolve`] errors and returns [`crate::Error::Unsupported`]
+/// if a `/Kids` chain reaches `max_depth`.
+pub fn read_number_tree<R, V, F>(
+    pdf: &mut Pdf<R>,
+    root: Object,
+    mut decode: F,
+    max_depth: usize,
+) -> Result<Vec<(i64, V)>>
+where
+    R: Read + Seek,
+    F: FnMut(&mut Pdf<R>, Object) -> Result<Option<V>>,
+{
+    let mut out = Vec::new();
+    let mut visited = BTreeSet::new();
+    walk_tree(
+        pdf,
+        root,
+        "Nums",
+        &|o| match o {
+            Object::Integer(n) => Some(n),
+            _ => None,
+        },
+        &mut decode,
+        &mut out,
+        &mut visited,
+        0,
+        max_depth,
+    )?;
+    Ok(out)
+}
+
 /// Internal generic walker shared by name + number readers.
 ///
 /// `node` is a `Reference` (resolved + cycle-tracked here) or a `Dictionary`.
@@ -277,5 +315,68 @@ mod tests {
             2,
         );
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn read_number_tree_resolves_indirect_dict_value() {
+        let mut pdf = empty_pdf();
+        // Value at ref 50 is a label dict.
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name("D".into()));
+        let label_ref = ObjectRef::new(50, 0);
+        pdf.set_object(label_ref, Object::Dictionary(label));
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Nums",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Reference(label_ref), // indirect value -> resolve
+                Object::Integer(5),
+                Object::Dictionary({
+                    let mut d = Dictionary::new();
+                    d.insert("S", Object::Name("R".into()));
+                    d
+                }),
+            ]),
+        );
+        let out: Vec<(i64, Dictionary)> = read_number_tree(
+            &mut pdf,
+            Object::Dictionary(leaf),
+            |pdf, v| match v {
+                Object::Dictionary(d) => Ok(Some(d)),
+                Object::Reference(r) => Ok(pdf.resolve_borrowed(r)?.as_dict().cloned()),
+                _ => Ok(None),
+            },
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1.get("S"), Some(&Object::Name("D".into())));
+        assert_eq!(out[1].0, 5);
+        assert_eq!(out[1].1.get("S"), Some(&Object::Name("R".into())));
+    }
+
+    #[test]
+    fn read_number_tree_skips_noninteger_key() {
+        let mut pdf = empty_pdf();
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Nums",
+            Object::Array(vec![
+                Object::Name("oops".into()), // non-integer key -> skip pair
+                Object::Integer(1),
+                Object::Integer(7),
+                Object::Integer(2),
+            ]),
+        );
+        let out: Vec<(i64, i64)> = read_number_tree(
+            &mut pdf,
+            Object::Dictionary(leaf),
+            |_, v| Ok(v.as_integer()),
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(out, vec![(7, 2)]);
     }
 }
