@@ -333,8 +333,8 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
     // A negative or out-of-range /Ff is malformed; treat it as "no flags". A
     // bare `as u32` would wrap a negative value to a large unsigned int and
     // could spuriously set the multiline bit (review pattern #3).
-    let ff = u32::try_from(resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0))
-        .unwrap_or(0);
+    let ff =
+        u32::try_from(resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
     let multiline = (ff >> 12) & 1 != 0; // bit 13 (1-indexed) = bit 12 (0-indexed)
 
     // ── 7. Font resolution — DA font name → standard font ─────────────────
@@ -1894,6 +1894,1142 @@ mod tests {
         assert!(
             result.is_some(),
             "indirect /FT /Tx must be resolved so the field is not skipped"
+        );
+    }
+
+    // ── Additional tests: compute_x_offset center / right ───────────────────
+
+    #[test]
+    fn compute_x_offset_center_quadding() {
+        // Q=1 (centre): offset must be > 2.0 for a narrow text, > 2.0 boundary
+        let params = TextAppearanceParams {
+            text_bytes: b"Hi".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 200.0,
+            bbox_h: 20.0,
+            quadding: 1,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helvetica"),
+        };
+        let x = compute_x_offset(&params, &params.text_bytes);
+        // Should be significantly more than 2.0 in a 200pt box
+        assert!(
+            x > 2.0,
+            "center quadding x offset should exceed 2.0, got {x}"
+        );
+        // Should be less than bbox_w / 2 (not too far right)
+        assert!(x < 100.0, "center quadding x should be < 100, got {x}");
+    }
+
+    #[test]
+    fn compute_x_offset_right_quadding() {
+        // Q=2 (right): text is flush-right with a 2pt margin
+        let params = TextAppearanceParams {
+            text_bytes: b"Hi".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 200.0,
+            bbox_h: 20.0,
+            quadding: 2,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helvetica"),
+        };
+        let x = compute_x_offset(&params, &params.text_bytes);
+        // Should be well above 2.0 (right-aligned in 200pt box)
+        assert!(
+            x > 2.0,
+            "right quadding x offset should exceed 2.0, got {x}"
+        );
+        // Should be less than bbox_w - 2 (there must be a right margin)
+        assert!(x < 198.0, "right quadding x should be < 198, got {x}");
+    }
+
+    #[test]
+    fn compute_x_offset_center_no_font_clamps_to_2() {
+        // Q=1 with no std_font → string width is 0 → (bbox_w - 0) / 2
+        let params = TextAppearanceParams {
+            text_bytes: b"Hi".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 0.0, // degenerate bbox → clamped to 2.0
+            bbox_h: 20.0,
+            quadding: 1,
+            multiline: false,
+            std_font: None,
+        };
+        let x = compute_x_offset(&params, &params.text_bytes);
+        // (0.0 - 0.0) / 2 = 0.0 → clamped to 2.0
+        assert!(
+            (x - 2.0).abs() < 0.001,
+            "degenerate centre should clamp to 2.0, got {x}"
+        );
+    }
+
+    #[test]
+    fn compute_x_offset_right_no_font_clamps_to_2() {
+        // Q=2 with no std_font → string width is 0 → bbox_w - 0 - 2
+        // For a wide box this produces bbox_w - 2; for degenerate (0) it clamps
+        let params = TextAppearanceParams {
+            text_bytes: b"Hi".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 0.0, // degenerate → clamped to 2.0
+            bbox_h: 20.0,
+            quadding: 2,
+            multiline: false,
+            std_font: None,
+        };
+        let x = compute_x_offset(&params, &params.text_bytes);
+        assert!(
+            (x - 2.0).abs() < 0.001,
+            "degenerate right should clamp to 2.0, got {x}"
+        );
+    }
+
+    #[test]
+    fn build_text_appearance_center_quadding_has_td() {
+        // Q=1: content stream must include a Td operator for center-aligned text
+        let params = TextAppearanceParams {
+            text_bytes: b"Test".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 200.0,
+            bbox_h: 20.0,
+            quadding: 1,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helvetica"),
+        };
+        let content = build_text_appearance_content(&params);
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains("Td"), "center quadding must emit a Td operator");
+        assert!(s.contains("Tj"), "center quadding must emit a Tj operator");
+    }
+
+    #[test]
+    fn build_text_appearance_right_quadding_has_td() {
+        // Q=2: content stream must include a Td operator for right-aligned text
+        let params = TextAppearanceParams {
+            text_bytes: b"Test".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 200.0,
+            bbox_h: 20.0,
+            quadding: 2,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helvetica"),
+        };
+        let content = build_text_appearance_content(&params);
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains("Td"), "right quadding must emit a Td operator");
+        assert!(s.contains("Tj"), "right quadding must emit a Tj operator");
+    }
+
+    // ── word_wrap edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn word_wrap_zero_max_width_returns_whole_text() {
+        // max_width <= 0.0 → return whole text as one line (early return)
+        let lines = word_wrap(
+            b"Hello World",
+            12.0,
+            0.0,
+            StandardFont::from_base_name(b"Helv"),
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], b"Hello World");
+    }
+
+    #[test]
+    fn word_wrap_negative_max_width_returns_whole_text() {
+        // negative max_width also triggers the early return path
+        let lines = word_wrap(
+            b"Hello World",
+            12.0,
+            -1.0,
+            StandardFont::from_base_name(b"Helv"),
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], b"Hello World");
+    }
+
+    #[test]
+    fn word_wrap_empty_text_returns_one_empty_line() {
+        // An empty text must still produce one empty line
+        let lines = word_wrap(b"", 12.0, 200.0, StandardFont::from_base_name(b"Helv"));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], b"");
+    }
+
+    // ── to_winansi remaining CP1252 characters ───────────────────────────────
+
+    #[test]
+    fn to_winansi_remaining_cp1252_chars() {
+        // Test remaining CP1252 typographic characters not covered by existing tests
+        assert_eq!(to_winansi_bytes("\u{201A}"), b"\x82"); // ‚ Single Low-9 Quote
+        assert_eq!(to_winansi_bytes("\u{0192}"), b"\x83"); // ƒ Latin f with hook
+        assert_eq!(to_winansi_bytes("\u{201E}"), b"\x84"); // „ Double Low-9 Quote
+        assert_eq!(to_winansi_bytes("\u{2020}"), b"\x86"); // † Dagger
+        assert_eq!(to_winansi_bytes("\u{2021}"), b"\x87"); // ‡ Double Dagger
+        assert_eq!(to_winansi_bytes("\u{02C6}"), b"\x88"); // ˆ Circumflex Accent
+        assert_eq!(to_winansi_bytes("\u{2030}"), b"\x89"); // ‰ Per Mille Sign
+        assert_eq!(to_winansi_bytes("\u{0160}"), b"\x8A"); // Š Capital S Caron
+        assert_eq!(to_winansi_bytes("\u{2039}"), b"\x8B"); // ‹ Left Angle Quote
+        assert_eq!(to_winansi_bytes("\u{017D}"), b"\x8E"); // Ž Capital Z Caron
+        assert_eq!(to_winansi_bytes("\u{2018}"), b"\x91"); // ' Left Single Quote
+        assert_eq!(to_winansi_bytes("\u{201D}"), b"\x94"); // " Right Double Quote
+        assert_eq!(to_winansi_bytes("\u{2013}"), b"\x96"); // – En Dash
+        assert_eq!(to_winansi_bytes("\u{02DC}"), b"\x98"); // ˜ Small Tilde
+        assert_eq!(to_winansi_bytes("\u{0161}"), b"\x9A"); // š Small s Caron
+        assert_eq!(to_winansi_bytes("\u{203A}"), b"\x9B"); // › Right Angle Quote
+        assert_eq!(to_winansi_bytes("\u{017E}"), b"\x9E"); // ž Small z Caron
+        assert_eq!(to_winansi_bytes("\u{0178}"), b"\x9F"); // Ÿ Capital Y Dieresis
+    }
+
+    // ── fmt_f64 edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_f64_small_negative_rounds_to_minus_zero() {
+        // -0.00001 rounds to "-0.0000" → strip trailing zeros/dot → "-0"
+        // This is the actual output; the is_empty / "-" guard does not fire here.
+        assert_eq!(fmt_f64(-0.00001), "-0");
+    }
+
+    // ── resolve_rect: indirect /Rect and degenerate cases ───────────────────
+
+    /// PDF with /Rect stored as an indirect reference (obj 5 → array)
+    fn build_pdf_with_indirect_rect() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        // Widget with /Rect as indirect reference
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /DA (/Helv 12 Tf 0 g) /V (text) /Rect 5 0 R>>\nendobj\n",
+        );
+        // The actual rect array
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n[100 700 300 720]\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_rect_follows_indirect_reference() {
+        // /Rect stored as indirect reference must be resolved correctly
+        let raw = build_pdf_with_indirect_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let rect = resolve_rect(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(
+            rect.is_some(),
+            "indirect /Rect must resolve to Some(PageBox)"
+        );
+        let r = rect.unwrap();
+        assert!((r.llx - 100.0).abs() < 0.001);
+        assert!((r.ury - 720.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn generate_appearance_with_indirect_rect() {
+        // generate_text_field_appearance must work when /Rect is indirect
+        let raw = build_pdf_with_indirect_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_some(),
+            "indirect /Rect must not cause None"
+        );
+    }
+
+    /// PDF with /Rect having only 3 elements (degenerate — should return None)
+    fn build_pdf_with_short_rect() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        // /Rect with only 3 elements
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /DA (/Helv 12 Tf 0 g) /V (text) /Rect [100 700 300]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_rect_short_array_returns_none() {
+        let raw = build_pdf_with_short_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let rect = resolve_rect(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(rect.is_none(), "3-element /Rect must return None");
+    }
+
+    #[test]
+    fn generate_appearance_short_rect_returns_none() {
+        // A degenerate /Rect should cause generate to return Ok(None)
+        let raw = build_pdf_with_short_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "short /Rect must cause None");
+    }
+
+    /// PDF with /Rect containing a non-numeric element
+    fn build_pdf_with_nonnumeric_rect() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        // /Rect with non-numeric 3rd element (/Name)
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /DA (/Helv 12 Tf 0 g) /V (text) /Rect [100 700 /Bad 720]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_rect_nonnumeric_element_returns_none() {
+        let raw = build_pdf_with_nonnumeric_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let rect = resolve_rect(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(
+            rect.is_none(),
+            "non-numeric element in /Rect must return None"
+        );
+    }
+
+    // ── resolve_rect: widget is not a dictionary ─────────────────────────────
+
+    #[test]
+    fn resolve_rect_non_dict_object_returns_none() {
+        // Use obj 5 from build_pdf_with_indirect_field_props (value /Tx, a Name)
+        // resolve_rect on a non-dict object must return Ok(None)
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        // obj 5 is /Tx (a Name, not a dict)
+        let rect = resolve_rect(&mut pdf, ObjectRef::new(5, 0)).unwrap();
+        assert!(
+            rect.is_none(),
+            "non-dict object must return None from resolve_rect"
+        );
+    }
+
+    // ── resolve_da: field-level /DA ──────────────────────────────────────────
+
+    /// PDF where the widget itself has a /DA key (not just AcroForm)
+    fn build_pdf_with_field_da() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        // AcroForm with /DA
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with its own /DA (should take precedence over AcroForm /DA)
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /DA (/Courier 10 Tf 0 g) /V (FieldDA) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_da_field_level_takes_precedence() {
+        // When the widget has /DA directly, it must be returned (not AcroForm /DA)
+        let raw = build_pdf_with_field_da();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(da.is_some(), "field-level /DA must be found");
+        let da_bytes = da.unwrap();
+        // Field DA starts with /Courier
+        assert!(
+            da_bytes.starts_with(b"/Courier"),
+            "field /DA should be /Courier, got: {:?}",
+            String::from_utf8_lossy(&da_bytes)
+        );
+    }
+
+    /// PDF where /DA in the widget is an indirect reference
+    fn build_pdf_with_indirect_da() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        // Widget with /DA as an indirect reference (5 0 R)
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /DA 5 0 R /V (IndirectDA) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        // The /DA string
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n(/Times-Roman 10 Tf 0 g)\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_da_indirect_reference() {
+        // /DA as an indirect reference must be resolved
+        let raw = build_pdf_with_indirect_da();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(da.is_some(), "indirect /DA must resolve to Some");
+        let da_bytes = da.unwrap();
+        assert!(
+            da_bytes.contains(&b'T'),
+            "indirect /DA value must include 'T', got: {:?}",
+            String::from_utf8_lossy(&da_bytes)
+        );
+    }
+
+    /// PDF where /AcroForm /DA is stored as an indirect reference
+    fn build_pdf_with_indirect_acroform_da() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        // AcroForm with /DA as indirect ref
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA 5 0 R>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with NO /DA
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (AcroDA) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        // The /DA string
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n(/Helv 12 Tf 0 g)\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_da_acroform_indirect_da() {
+        // /AcroForm /DA stored as indirect reference must be resolved
+        let raw = build_pdf_with_indirect_acroform_da();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(da.is_some(), "AcroForm indirect /DA must resolve to Some");
+    }
+
+    /// PDF with no /DA anywhere — neither field nor AcroForm
+    fn build_pdf_with_no_da() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        // AcroForm without /DA
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>>>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (NoDA) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_da_none_when_no_da_anywhere() {
+        // No /DA in field or AcroForm → must return Ok(None)
+        let raw = build_pdf_with_no_da();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(da.is_none(), "no /DA anywhere must return None");
+    }
+
+    #[test]
+    fn generate_appearance_with_no_da_uses_empty_da() {
+        // generate_text_field_appearance must succeed even without /DA
+        // (falls back to empty string → default params)
+        let raw = build_pdf_with_no_da();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "no /DA must not cause error");
+        assert!(
+            result.unwrap().is_some(),
+            "no /DA must still produce appearance"
+        );
+    }
+
+    // ── /V as indirect reference ─────────────────────────────────────────────
+
+    /// PDF where /V is an indirect reference to a string object
+    fn build_pdf_with_indirect_v() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with /V as indirect reference (5 0 R)
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V 5 0 R /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        // The actual string value
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n(IndirectValue)\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn generate_appearance_with_indirect_v() {
+        // /V stored as indirect reference must be rendered
+        let raw = build_pdf_with_indirect_v();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "indirect /V must not cause error");
+        assert!(
+            result.unwrap().is_some(),
+            "indirect /V must produce appearance"
+        );
+    }
+
+    // ── install_normal_appearance: font_resource = None ──────────────────────
+
+    #[test]
+    fn install_normal_appearance_without_font_resource() {
+        // When font_resource is None, no /Resources/Font is added.
+        let raw = build_minimal_tx_pdf();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let widget_ref = ObjectRef::new(4, 0);
+        let content = b"q Q".to_vec();
+        let result = install_normal_appearance(&mut pdf, widget_ref, content, 200.0, 20.0, None);
+        assert!(result.is_ok(), "install without font resource must succeed");
+        let xobj_ref = result.unwrap();
+        let xobj = pdf.resolve(xobj_ref).unwrap();
+        // Should be a stream without /Resources/Font
+        if let Object::Stream(s) = xobj {
+            assert!(
+                s.dict.get("Resources").is_none(),
+                "no font resource → no /Resources key in xobj"
+            );
+        }
+    }
+
+    // ── install_normal_appearance: existing /AP dict handling ────────────────
+
+    /// PDF where the widget has an existing /AP dictionary
+    fn build_pdf_with_existing_ap() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with existing /AP /N as a reference (obj 5)
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (text) /Rect [10 10 200 30] /AP <</N 5 0 R>>>>\nendobj\n",
+        );
+        // Existing appearance stream (will be replaced)
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+              /BBox [0 0 190 20]>>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn generate_appearance_replaces_existing_ap() {
+        // When widget has existing /AP, generate_text_field_appearance must
+        // replace it with a new appearance (not panic or return None).
+        let raw = build_pdf_with_existing_ap();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "existing /AP must not cause error");
+        assert!(
+            result.unwrap().is_some(),
+            "existing /AP must still produce new appearance"
+        );
+    }
+
+    // ── resolve_inherited_object: /V as indirect reference ──────────────────
+
+    #[test]
+    fn resolve_inherited_object_indirect_reference() {
+        // obj 5 in build_pdf_with_indirect_field_props is `/Tx` (a Name).
+        // resolve_inherited_object on obj 4 for key "V" gives a String directly.
+        // But we can test the Reference arm by using build_pdf_with_indirect_v.
+        let raw = build_pdf_with_indirect_v();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let val = resolve_inherited_object(&mut pdf, ObjectRef::new(4, 0), b"V").unwrap();
+        // /V is 5 0 R (a Reference) → resolve_inherited_object returns the Reference itself
+        // (not the resolved object), so it must be Some(Object::Reference(...))
+        assert!(
+            val.is_some(),
+            "indirect /V must not return None from resolve_inherited_object"
+        );
+    }
+
+    // ── lookup_dr_basefont: no /DR → returns None ────────────────────────────
+
+    #[test]
+    fn lookup_dr_basefont_no_dr_returns_none() {
+        // build_minimal_tx_pdf has /DR <<>> (empty), so lookup must return None
+        // for any resource name that is not a known alias.
+        let raw = build_minimal_tx_pdf();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let sf = lookup_dr_basefont(&mut pdf, ObjectRef::new(4, 0), b"UnknownFont").unwrap();
+        assert!(sf.is_none(), "empty /DR must return None");
+    }
+
+    /// PDF with /DR /Font at the field level (not just AcroForm)
+    fn build_pdf_with_field_dr_font() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        // Catalog has no AcroForm /DR
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/MyFont 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with its own /DR /Font /MyFont → /BaseFont /Courier-Bold
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /DR <</Font <</MyFont <</Type /Font /Subtype /Type1 /BaseFont /Courier-Bold>>>>>> \
+              /V (FieldDR) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn lookup_dr_basefont_field_level_dr() {
+        // /DR /Font at the field level (not AcroForm) must be found
+        let raw = build_pdf_with_field_dr_font();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let sf = lookup_dr_basefont(&mut pdf, ObjectRef::new(4, 0), b"MyFont").unwrap();
+        assert!(
+            sf.is_some(),
+            "field-level /DR /Font must resolve to a StandardFont"
+        );
+        assert_eq!(
+            sf.unwrap(),
+            StandardFont::CourierBold,
+            "must resolve to Courier-Bold"
+        );
+    }
+
+    #[test]
+    fn generate_appearance_field_level_dr_font() {
+        // generate_text_field_appearance with field-level /DR must produce appearance
+        let raw = build_pdf_with_field_dr_font();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_some(),
+            "field-level /DR font must produce appearance"
+        );
+    }
+
+    // ── multiline appearance via generate_text_field_appearance ─────────────
+
+    /// PDF with multiline /Ff (bit 13 set = 4096) and multi-word /V
+    fn build_pdf_multiline_tx() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with /Ff 4096 (multiline) and narrow rect → forces wrap
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /Ff 4096 /V (one two three four) /Rect [10 10 50 100]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn generate_multiline_appearance() {
+        // /Ff 4096 (bit 13) must trigger multiline rendering
+        let raw = build_pdf_multiline_tx();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "multiline /Ff must not cause error");
+        let xobj_ref = result.unwrap();
+        assert!(
+            xobj_ref.is_some(),
+            "multiline field must produce appearance"
+        );
+        let xobj_ref = xobj_ref.unwrap();
+        let obj = pdf.resolve(xobj_ref).unwrap();
+        if let Object::Stream(s) = obj {
+            let content = String::from_utf8_lossy(&s.data);
+            // Must have at least one Td and multiple Tj
+            let td_count = content.matches("Td").count();
+            assert!(
+                td_count >= 1,
+                "multiline must have Td operators, got {td_count}"
+            );
+        }
+    }
+
+    // ── center/right quadding via generate_text_field_appearance ────────────
+
+    /// PDF with /Q 1 (center quadding)
+    fn build_pdf_with_quadding(q: i64) -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        let widget = format!(
+            "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /Q {q} /V (Center) /Rect [10 10 200 30]>>\nendobj\n"
+        );
+        pdf.extend_from_slice(widget.as_bytes());
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn generate_appearance_center_quadding() {
+        let raw = build_pdf_with_quadding(1);
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some(), "Q=1 must produce appearance");
+    }
+
+    #[test]
+    fn generate_appearance_right_quadding() {
+        let raw = build_pdf_with_quadding(2);
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some(), "Q=2 must produce appearance");
+    }
+
+    // ── resolve_da: cycle detection ──────────────────────────────────────────
+
+    /// PDF where widget's /Parent forms a cycle (4→7→4)
+    fn build_pdf_with_parent_cycle() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        // No AcroForm /DA — force fallback to field chain walk where we hit cycle
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        // Widget 4 → Parent 7
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<</Type /Annot /FT /Tx /T (f) /Parent 7 0 R>>\nendobj\n");
+        // Dummy obj 5 and 6 for padding
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n(dummy)\nendobj\n");
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n(dummy)\nendobj\n");
+        // Obj 7 → Parent 4 (creates a cycle 4→7→4)
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(b"7 0 obj\n<</FT /Tx /Parent 4 0 R>>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 8\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n\
+             {off6:010} 00000 n \n\
+             {off7:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 8 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_da_cycle_returns_none() {
+        // A /Parent cycle must be detected and return Ok(None) without looping
+        let raw = build_pdf_with_parent_cycle();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(da.is_none(), "cycle in /Parent chain must return None");
+    }
+
+    #[test]
+    fn resolve_inherited_name_cycle_returns_none() {
+        // resolve_inherited_name must detect cycle and return Ok(None)
+        let raw = build_pdf_with_parent_cycle();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        // Walk from obj 4 for key "DA" — no /DA on either node, cycle detected
+        let result = resolve_inherited_name(&mut pdf, ObjectRef::new(4, 0), b"DA").unwrap();
+        assert!(
+            result.is_none(),
+            "cycle must return None for resolve_inherited_name"
+        );
+    }
+
+    #[test]
+    fn resolve_inherited_object_cycle_returns_none() {
+        let raw = build_pdf_with_parent_cycle();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = resolve_inherited_object(&mut pdf, ObjectRef::new(4, 0), b"DA").unwrap();
+        assert!(
+            result.is_none(),
+            "cycle must return None for resolve_inherited_object"
+        );
+    }
+
+    #[test]
+    fn resolve_inherited_integer_cycle_returns_none() {
+        let raw = build_pdf_with_parent_cycle();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = resolve_inherited_integer(&mut pdf, ObjectRef::new(4, 0), b"Q").unwrap();
+        assert!(
+            result.is_none(),
+            "cycle must return None for resolve_inherited_integer"
+        );
+    }
+
+    // ── resolve_inherited_name/object: not-a-dict node ──────────────────────
+
+    #[test]
+    fn resolve_inherited_name_non_dict_node_errors() {
+        // obj 5 in build_pdf_with_indirect_field_props is /Tx (a Name), not a dict
+        // → resolve_inherited_name should return Err (not a dictionary)
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        // Start walk from obj 5 (not a dict)
+        let result = resolve_inherited_name(&mut pdf, ObjectRef::new(5, 0), b"FT");
+        assert!(
+            result.is_err(),
+            "non-dict node must return Err from resolve_inherited_name"
+        );
+    }
+
+    #[test]
+    fn resolve_inherited_object_non_dict_node_errors() {
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = resolve_inherited_object(&mut pdf, ObjectRef::new(5, 0), b"V");
+        assert!(
+            result.is_err(),
+            "non-dict node must return Err from resolve_inherited_object"
+        );
+    }
+
+    #[test]
+    fn resolve_inherited_integer_non_dict_node_errors() {
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = resolve_inherited_integer(&mut pdf, ObjectRef::new(5, 0), b"Q");
+        assert!(
+            result.is_err(),
+            "non-dict node must return Err from resolve_inherited_integer"
+        );
+    }
+
+    // ── auto-size font: font_size branch ─────────────────────────────────────
+
+    /// PDF with /DA that uses auto-size (font-size 0) to exercise the heuristic branch
+    fn build_pdf_autosize_tx() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        // /DA with font-size 0 → auto-size heuristic
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 0 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (AutoSize) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn generate_appearance_autosize_font() {
+        // /DA font-size 0 → auto_size heuristic branch must execute
+        let raw = build_pdf_autosize_tx();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "auto-size /DA must not cause error");
+        assert!(
+            result.unwrap().is_some(),
+            "auto-size must produce appearance"
         );
     }
 }
