@@ -75,6 +75,14 @@ pub(crate) fn color_ops(color: &TextColor, out: &mut Vec<u8>) {
 /// [`Pdf::set_object`].  The widget dictionary at `widget_ref` is updated with
 /// a new `/AP` entry pointing to the XObject.
 ///
+/// The `font_resource` tuple is `(resource_key, base_font_name, obj_ref)`:
+/// - `resource_key`: the name used as the key in `/Resources/Font` and in the
+///   `Tf` operator (e.g. `b"Helv"` as it appears in the `/DA` string).
+/// - `base_font_name`: the official PDF BaseFont name written into the font
+///   dictionary (e.g. `b"Helvetica"`). This must be a valid standard-14 name
+///   so viewers select the correct built-in metrics.
+/// - `obj_ref`: the pre-allocated [`ObjectRef`] for the font dictionary object.
+///
 /// Returns the [`ObjectRef`] of the newly-created Form XObject.
 pub(crate) fn install_normal_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -82,23 +90,23 @@ pub(crate) fn install_normal_appearance<R: Read + Seek>(
     content: Vec<u8>,
     bbox_w: f64,
     bbox_h: f64,
-    font_resource: Option<(Vec<u8>, ObjectRef)>,
+    font_resource: Option<(Vec<u8>, Vec<u8>, ObjectRef)>,
 ) -> Result<ObjectRef> {
     // Allocate font object first (if needed) so the XObject allocation is
     // sequential and there is no number collision.
-    let font_resource_ref = if let Some((ref name, font_obj_ref)) = font_resource {
-        let mut font_dict = Dictionary::new();
+    let font_resource_ref = if let Some((ref res_key, ref base_name, font_obj_ref)) = font_resource {
         let mut inner_font_dict = Dictionary::new();
         inner_font_dict.insert("Type", Object::Name(b"Font".to_vec()));
         inner_font_dict.insert("Subtype", Object::Name(b"Type1".to_vec()));
-        inner_font_dict.insert("BaseFont", Object::Name(name.clone()));
+        inner_font_dict.insert("BaseFont", Object::Name(base_name.clone()));
         inner_font_dict.insert(
             "Encoding",
             Object::Name(b"WinAnsiEncoding".to_vec()),
         );
         pdf.set_object(font_obj_ref, Object::Dictionary(inner_font_dict));
+        let mut font_dict = Dictionary::new();
         font_dict.insert(
-            String::from_utf8_lossy(name).into_owned(),
+            String::from_utf8_lossy(res_key).into_owned(),
             Object::Reference(font_obj_ref),
         );
         Some(font_dict)
@@ -390,13 +398,15 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
     let content = build_text_appearance_content(&params);
 
     // ── 11. Install ────────────────────────────────────────────────────────
+    // Pass three names: resource key (from /DA, e.g. "Helv"), official
+    // BaseFont name (e.g. "Helvetica"), and the pre-allocated ObjectRef.
     let xobj_ref = install_normal_appearance(
         pdf,
         widget_ref,
         content,
         bbox_w,
         bbox_h,
-        Some((font_resource_name, font_obj_ref)),
+        Some((font_resource_name, base_font_name, font_obj_ref)),
     )?;
 
     Ok(Some(xobj_ref))
@@ -638,15 +648,28 @@ fn resolve_da<R: Read + Seek>(
             break;
         };
 
-        if let Some(val) = dict.get("DA").cloned() {
-            match val {
+        let da_val = dict.get("DA").cloned();
+        let parent_val = dict.get("Parent").cloned();
+        // `node_obj` is a reference (not owned), so its lifetime ends when the
+        // last use of `dict` (through it) is complete.  The two `.cloned()` calls
+        // above copy the values we need; after this point the borrow is gone and
+        // we can call `pdf.resolve` below.
+        let _ = node_obj; // suppress unused-variable lint; borrow already ended
+
+        if let Some(val) = da_val {
+            // /DA may itself be an indirect reference (rule #2 in review patterns).
+            let resolved_val = match val {
+                Object::Reference(r) => pdf.resolve(r)?,
+                other => other,
+            };
+            match resolved_val {
                 Object::Null => {}
                 Object::String(bytes) => return Ok(Some(bytes)),
                 _ => {}
             }
         }
 
-        match dict.get("Parent").cloned() {
+        match parent_val {
             Some(Object::Reference(r)) => {
                 current = r;
                 depth += 1;
@@ -675,13 +698,24 @@ fn resolve_da<R: Read + Seek>(
         _ => None,
     };
 
-    let da = acroform_dict
+    // /AcroForm /DA may also be an indirect reference.
+    let da_raw = acroform_dict
         .as_ref()
         .and_then(|d| d.get("DA"))
-        .and_then(|v| match v {
-            Object::String(bytes) => Some(bytes.clone()),
-            _ => None,
-        });
+        .cloned();
+
+    let da = match da_raw {
+        None | Some(Object::Null) => None,
+        Some(Object::String(bytes)) => Some(bytes),
+        Some(Object::Reference(r)) => {
+            let resolved = pdf.resolve(r)?;
+            match resolved {
+                Object::String(bytes) => Some(bytes),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
 
     Ok(da)
 }
@@ -749,29 +783,35 @@ fn render_singleline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
 }
 
 /// Render a multiline text appearance (simple word-wrap on space boundaries).
+///
+/// `Td` is a *relative* move on the text line matrix.  Each subsequent `Td`
+/// is expressed as a delta `(x_curr − x_prev, −leading)` rather than an
+/// absolute coordinate so that x offsets do not accumulate across lines.
 fn render_multiline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
     let leading = p.font_size * 1.15;
     // Top baseline — allow small top margin.
     let first_y = p.bbox_h - p.font_size - 2.0;
 
     let lines = word_wrap(&p.text_bytes, p.font_size, p.bbox_w, p.std_font);
-    let mut first = true;
+    let mut prev_x = 0.0_f64; // tracks last Td x so we can emit deltas
 
-    for line in &lines {
+    for (i, line) in lines.iter().enumerate() {
         let x = compute_x_offset(p, line);
-        if first {
+        if i == 0 {
+            // First line: absolute position via Td.
             out.extend_from_slice(fmt_f64(x).as_bytes());
             out.push(b' ');
             out.extend_from_slice(fmt_f64(first_y).as_bytes());
             out.extend_from_slice(b" Td\n");
-            first = false;
         } else {
-            // Relative move downward (negative y).
-            out.extend_from_slice(fmt_f64(x).as_bytes());
+            // Subsequent lines: emit delta x and -leading.
+            let dx = x - prev_x;
+            out.extend_from_slice(fmt_f64(dx).as_bytes());
             out.push(b' ');
             out.extend_from_slice(fmt_f64(-leading).as_bytes());
             out.extend_from_slice(b" Td\n");
         }
+        prev_x = x;
         write_literal_string(out, line);
         out.extend_from_slice(b" Tj\n");
     }
@@ -1174,9 +1214,24 @@ mod tests {
             panic!("Font resources is not a dict");
         };
         let font_key = String::from_utf8_lossy(&font_name).into_owned();
-        assert!(
-            font_dict.get(font_key.as_str()).is_some(),
-            "font key '{font_key}' not found in /Resources/Font — mismatch between Tf and resource"
+        let font_obj_entry = font_dict
+            .get(font_key.as_str())
+            .unwrap_or_else(|| panic!("font key '{font_key}' not found in /Resources/Font"));
+
+        // Resolve the font object and verify /BaseFont is the official name,
+        // NOT the alias (e.g. must be "Helvetica", not "Helv").
+        let font_obj_ref = match font_obj_entry {
+            Object::Reference(r) => *r,
+            _ => panic!("font entry is not a reference"),
+        };
+        let font_obj = pdf.resolve(font_obj_ref).expect("resolve font object");
+        let Object::Dictionary(fdict) = font_obj else {
+            panic!("font object is not a dictionary");
+        };
+        assert_eq!(
+            fdict.get("BaseFont"),
+            Some(&Object::Name(b"Helvetica".to_vec())),
+            "/BaseFont must be the official name 'Helvetica', not the alias 'Helv'"
         );
 
         // The Tj operand must decode back to the field value.
@@ -1288,5 +1343,59 @@ mod tests {
         let result = generate_text_field_appearance(&mut pdf, widget_ref)
             .expect("generate should not error");
         assert!(result.is_some(), "should produce appearance via AcroForm /DA fallback");
+    }
+
+    /// Verify that multiline Td x-offsets do not accumulate across lines.
+    ///
+    /// For a left-aligned field (q=0), every line starts at x=2.  The first Td
+    /// must be (2, first_y) and every subsequent Td must have x == 0 (delta
+    /// from 2 to 2) rather than the absolute 2.
+    #[test]
+    fn multiline_td_x_offsets_are_deltas_not_absolute() {
+        // Three words that should land on separate lines at a narrow width (30pt).
+        let params = TextAppearanceParams {
+            text_bytes: b"one two three".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 10.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 30.0,  // narrow — forces each word to its own line
+            bbox_h: 60.0,
+            quadding: 0,   // left-align
+            multiline: true,
+            std_font: StandardFont::from_base_name(b"Helv"),
+        };
+        let content = build_text_appearance_content(&params);
+
+        let mut td_ops: Vec<(f64, f64)> = Vec::new();
+        for tok in ContentStreamParser::new(&content).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator.as_slice() == b"Td" {
+                if let (Some(x_obj), Some(y_obj)) = (operands.first(), operands.get(1)) {
+                    let x = x_obj.as_real().or_else(|| x_obj.as_integer().map(|i| i as f64));
+                    let y = y_obj.as_real().or_else(|| y_obj.as_integer().map(|i| i as f64));
+                    if let (Some(x), Some(y)) = (x, y) {
+                        td_ops.push((x, y));
+                    }
+                }
+            }
+        }
+
+        assert!(td_ops.len() >= 3, "expected at least 3 Td ops for 3 wrapped lines, got {}", td_ops.len());
+
+        // First Td: absolute x (2.0 for left-align), positive first_y.
+        let (x0, y0) = td_ops[0];
+        assert!((x0 - 2.0).abs() < 0.01, "first Td x should be 2.0, got {x0}");
+        assert!(y0 > 0.0, "first Td y should be positive (first_y), got {y0}");
+
+        // Subsequent Td ops: x must be the delta from previous x.
+        // For left-align, prev_x is always 2.0, so delta == 0.
+        for (i, &(x, y)) in td_ops[1..].iter().enumerate() {
+            assert!(
+                x.abs() < 0.01,
+                "Td[{}] x (delta) should be 0.0 for left-align, got {x}",
+                i + 1
+            );
+            assert!(y < 0.0, "Td[{}] y should be negative (down-move), got {y}", i + 1);
+        }
     }
 }
