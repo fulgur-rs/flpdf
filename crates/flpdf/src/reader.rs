@@ -252,6 +252,18 @@ impl<R: Read + Seek> Pdf<R> {
         &self.repair_diagnostics
     }
 
+    /// Record a non-fatal processing warning on this handle.
+    ///
+    /// Used by recoverable code paths (e.g. form-field inheritance walks that hit
+    /// a cyclic / over-deep / non-dictionary `/Parent` chain and fall back rather
+    /// than aborting) so the soft failure is surfaced via [`Pdf::repair_diagnostics`]
+    /// instead of being silently swallowed. Mirrors qpdf, which warns and continues
+    /// on malformed field trees.
+    pub(crate) fn push_warning(&mut self, message: impl Into<String>) {
+        self.repair_diagnostics
+            .push(Diagnostic::warning(message, None));
+    }
+
     /// Whether this document authenticated an `/Encrypt` dictionary while opening.
     pub fn is_encrypted(&self) -> bool {
         self.encryption.is_some()
