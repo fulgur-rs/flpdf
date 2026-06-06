@@ -37,8 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Target A: 2 pages. Source B: 2 pages that share one font object.
     let a_path = common::write_temp("merge-a", &common::build_shared_font_pdf(2))?;
     let b_path = common::write_temp("merge-b", &common::build_shared_font_pdf(2))?;
-    let out_path = std::env::temp_dir()
-        .join(format!("flpdf-ex-{}-merge-out.pdf", std::process::id()));
+    let out_path = common::temp_path("merge-out");
 
     let mut a = Pdf::open(BufReader::new(File::open(&a_path)?))?;
     let mut b = Pdf::open(BufReader::new(File::open(&b_path)?))?;
@@ -57,6 +56,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a_len = page_refs(&mut a)?.len();
     splice_pages(&mut a, a_len..a_len, &copied)?;
 
+    // A plain write keeps existing objects; we only append pages, so the
+    // unreferenced-object pruning of `full_rewrite` (see extract_pages) is unnecessary.
     let out = BufWriter::new(File::create(&out_path)?);
     flpdf::write_pdf(&mut a, out)?;
 
@@ -64,7 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reference a single shared font object.
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
     let out_pages = page_refs(&mut out_pdf)?;
-    assert_eq!(out_pages.len(), 4, "expected 4 pages after merge");
+    assert_eq!(
+        out_pages.len(),
+        4,
+        "expected 4 pages after merge, got {}",
+        out_pages.len()
+    );
 
     let f_last = font_ref_of_page(&mut out_pdf, out_pages[2]).expect("page 3 font");
     let f_last2 = font_ref_of_page(&mut out_pdf, out_pages[3]).expect("page 4 font");

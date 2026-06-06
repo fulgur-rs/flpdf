@@ -18,8 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Source A: 3 pages. Target B: 2 pages. Insert A's pages into B at index 1.
     let a_path = common::write_temp("splice-a", &common::build_shared_font_pdf(3))?;
     let b_path = common::write_temp("splice-b", &common::build_shared_font_pdf(2))?;
-    let out_path = std::env::temp_dir()
-        .join(format!("flpdf-ex-{}-splice-out.pdf", std::process::id()));
+    let out_path = common::temp_path("splice-out");
 
     let mut a = Pdf::open(BufReader::new(File::open(&a_path)?))?;
     let mut b = Pdf::open(BufReader::new(File::open(&b_path)?))?;
@@ -40,6 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = 1usize;
     splice_pages(&mut b, n..n, &copied)?;
 
+    // A plain write keeps existing objects; we only append pages, so the
+    // unreferenced-object pruning of `full_rewrite` (see extract_pages) is unnecessary.
     let out = BufWriter::new(File::create(&out_path)?);
     flpdf::write_pdf(&mut b, out)?;
 

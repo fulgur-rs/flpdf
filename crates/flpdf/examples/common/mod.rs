@@ -68,12 +68,18 @@ pub fn build_shared_font_pdf(page_count: u32) -> Vec<u8> {
     out
 }
 
-/// Write `bytes` to a uniquely-named temp file and return its path.
+/// Build a unique temp-file path for this example run (no file is created).
 ///
 /// Uses the process id to avoid collisions between concurrent example runs.
-pub fn write_temp(tag: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+pub fn temp_path(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("flpdf-ex-{}-{tag}.pdf", std::process::id()));
+    path
+}
+
+/// Write `bytes` to a uniquely-named temp file and return its path.
+pub fn write_temp(tag: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let path = temp_path(tag);
     std::fs::write(&path, bytes)?;
     Ok(path)
 }

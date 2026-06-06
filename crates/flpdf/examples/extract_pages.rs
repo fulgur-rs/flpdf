@@ -13,8 +13,7 @@ use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PagePlan, Pdf, Write
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A 5-page source document (all pages share one font object).
     let src_path = common::write_temp("extract-src", &common::build_shared_font_pdf(5))?;
-    let out_path = std::env::temp_dir()
-        .join(format!("flpdf-ex-{}-extract-out.pdf", std::process::id()));
+    let out_path = common::temp_path("extract-out");
 
     // Open the source for reading.
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
