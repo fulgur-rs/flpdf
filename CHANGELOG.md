@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-06-06
+
+* feat(reader): add borrowed object resolution by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/246
+* Refactor internal resolve call sites to borrow objects by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/247
+* fix(linearization): match qpdf nbits_shared_identifier formula (flpdf-9hc.20.22) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/248
+* fix(linearization): always populate shared_hints to match qpdf (flpdf-vvl) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/249
+* fix(json,cli): apply DecodeLevel to inline/file stream payloads (flpdf-5st) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/207
+* feat(page_closure): per-page transitive object closure walker by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/250
+* feat(page_splice): surgical /Pages /Kids splice with /Count maintenance by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/251
+* Add signature field inspection API by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/252
+* feat(object_copy): cross-document object copier (renumber + cycle handling) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/253
+* [codex] Add signature rewrite impact checks by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/254
+* Add AcroForm document helper by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/255
+* feat(signatures): /AcroForm /SigFlags read, preserve, surface, clear (flpdf-9hc.22.6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/256
+* feat(signatures): assert incremental write preserves signed /ByteRange (flpdf-9hc.22.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/259
+* Strip signatures with remove-restrictions by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/258
+* Refuse full rewrites of signed PDFs by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/257
+* CLI: signed-PDF flag plumbing — Error::Signed mapping + AC matrix (flpdf-9hc.22.7) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/260
+* docs: add Gemini review pattern rules (.claude/rules) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/262
+* fix(signatures): resolve indirect /FT in walk_signature_rewrite_field (flpdf-967) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/264
+* Add AcroForm field metadata traversal by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/261
+* /Rotate flattening (CTM + box transform) (flpdf-9hc.9.9) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/263
+* fix(acroform): bound reference-chain depth in collect_reachable_refs (flpdf-qjx) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/265
+* perf(page_closure): use resolve_borrowed in BFS to avoid full clone (flpdf-do3) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/266
+* feat(name_number_tree): generic name/number tree iteration (flpdf-9hc.18.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/267
+* feat(page_labels): PageLabelDocumentHelper + build_number_tree (flpdf-9hc.18.6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/268
+* docs(flpdf-5h5.8): page-op API rustdoc + runnable examples by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/269
+* test(outline_dest_remap): recursion-guard regression tests (flpdf-ypq) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/270
+* docs(flpdf): fix broken rustdoc intra-doc links under -D warnings (flpdf-q8w) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/271
+
+
+**Full Changelog**: https://github.com/fulgur-rs/flpdf/compare/v0.1.4...v0.1.5
+
 ## [Unreleased]
 
 ### Added
