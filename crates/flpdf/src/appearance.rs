@@ -1622,11 +1622,9 @@ fn generate_combo_appearance<R: Read + Seek>(
     let raw_value = resolve_inherited_object(pdf, widget_ref, b"V")?;
     let text_bytes: Vec<u8> = match raw_value {
         None => Vec::new(),
-        Some(Object::String(bytes)) => {
-            decode_pdf_text_string(&bytes)
-                .map(|s| to_winansi_bytes(&s))
-                .unwrap_or(bytes)
-        }
+        Some(Object::String(bytes)) => decode_pdf_text_string(&bytes)
+            .map(|s| to_winansi_bytes(&s))
+            .unwrap_or(bytes),
         Some(Object::Reference(r)) => {
             let obj = pdf.resolve(r)?;
             match obj {
@@ -1755,10 +1753,7 @@ fn resolve_opt_array<R: Read + Seek>(
 }
 
 /// Resolve a single /Opt element (possibly indirect) to a String byte vec.
-fn resolve_string_elem<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    val: Option<Object>,
-) -> Option<Vec<u8>> {
+fn resolve_string_elem<R: Read + Seek>(pdf: &mut Pdf<R>, val: Option<Object>) -> Option<Vec<u8>> {
     match val? {
         Object::String(s) => Some(s),
         Object::Reference(r) => match pdf.resolve(r).ok()? {
@@ -1799,10 +1794,8 @@ fn generate_list_appearance<R: Read + Seek>(
         };
         match elem {
             Object::Array(pair) => {
-                let exp_raw = resolve_string_elem(pdf, pair.first().cloned())
-                    .unwrap_or_default();
-                let disp_raw = resolve_string_elem(pdf, pair.get(1).cloned())
-                    .unwrap_or_default();
+                let exp_raw = resolve_string_elem(pdf, pair.first().cloned()).unwrap_or_default();
+                let disp_raw = resolve_string_elem(pdf, pair.get(1).cloned()).unwrap_or_default();
                 let export = decode_pdf_text_string(&exp_raw)
                     .map(|s| to_winansi_bytes(&s))
                     .unwrap_or(exp_raw);
@@ -4742,11 +4735,7 @@ mod tests {
     /// `opts_str` is raw PDF array content, e.g. `"(Red) (Green) (Blue)"`.
     /// `sel_i_str` is the raw /I array, e.g. `"[1]"` or empty string for absent.
     /// `sel_v_str` is the raw /V value, e.g. `"(Green)"` or empty.
-    fn build_list_pdf(
-        opts_str: &str,
-        sel_i_str: &str,
-        sel_v_str: &str,
-    ) -> Vec<u8> {
+    fn build_list_pdf(opts_str: &str, sel_i_str: &str, sel_v_str: &str) -> Vec<u8> {
         let mut raw = Vec::<u8>::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
         let off1 = raw.len() as u64;
@@ -4830,7 +4819,8 @@ mod tests {
         );
         raw.extend_from_slice(xref.as_bytes());
         raw.extend_from_slice(
-            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
         );
         raw
     }
@@ -4899,7 +4889,8 @@ mod tests {
         );
         raw.extend_from_slice(xref.as_bytes());
         raw.extend_from_slice(
-            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
         );
         raw
     }
@@ -4929,7 +4920,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_fill, "inherited /I did not produce a selection highlight");
+        assert!(
+            saw_fill,
+            "inherited /I did not produce a selection highlight"
+        );
     }
 
     /// List whose /V is an INDIRECT reference to a multi-select array.
@@ -4966,7 +4960,8 @@ mod tests {
         );
         raw.extend_from_slice(xref.as_bytes());
         raw.extend_from_slice(
-            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
         );
         raw
     }
@@ -4987,7 +4982,10 @@ mod tests {
             .flatten()
             .filter(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"f"))
             .count();
-        assert_eq!(fills, 2, "expected two selection highlights for Red+Blue, got {fills}");
+        assert_eq!(
+            fills, 2,
+            "expected two selection highlights for Red+Blue, got {fills}"
+        );
     }
 
     /// non-Ch field → generate_choice_field_appearance must return None.
@@ -4996,7 +4994,10 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
         let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "Btn field must return None from Ch generator");
+        assert!(
+            result.unwrap().is_none(),
+            "Btn field must return None from Ch generator"
+        );
     }
 
     /// Degenerate rect → None.
@@ -5009,7 +5010,9 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         let off4 = raw.len() as u64;
         // Rect [10 10 10 30] — zero width
         raw.extend_from_slice(b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (f) /Rect [10 10 10 30]>>\nendobj\n");
@@ -5018,11 +5021,17 @@ mod tests {
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "degenerate rect should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "degenerate rect should return None"
+        );
     }
 
     /// Combo with /V "Blue" → single /AP/N stream containing "Blue" in a Tj.
@@ -5031,8 +5040,8 @@ mod tests {
         let ff_combo = 0x20000_i64; // bit 18
         let raw = build_combo_pdf("Blue", ff_combo);
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("generate");
+        let result =
+            generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let xobj_ref = result.expect("combo must produce appearance");
 
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -5041,7 +5050,9 @@ mod tests {
 
         // /AP/N must be a single reference (not a sub-dict).
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
         let Object::Dictionary(ap_dict) = wdict.get("AP").expect("AP").clone() else {
             panic!("AP not dict")
         };
@@ -5053,7 +5064,9 @@ mod tests {
         // Content must have Tj with "Blue".
         let mut found = false;
         for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"Blue" {
@@ -5092,13 +5105,19 @@ mod tests {
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("generate");
+        let result =
+            generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         // Combo always generates (even blank), so this must be Some.
-        assert!(result.is_some(), "combo without /V must still produce blank appearance");
+        assert!(
+            result.is_some(),
+            "combo without /V must still produce blank appearance"
+        );
     }
 
     /// List with /Opt [(Red) (Green) (Blue)] and /I [1] → Green highlighted.
@@ -5106,8 +5125,8 @@ mod tests {
     fn ch_list_selected_index_highlighted() {
         let raw = build_list_pdf("(Red) (Green) (Blue)", "[1]", "");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("generate");
+        let result =
+            generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let xobj_ref = result.expect("list must produce appearance");
 
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -5119,7 +5138,9 @@ mod tests {
         // All three options must appear as Tj operands.
         let mut tj_vals: Vec<Vec<u8>> = Vec::new();
         for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     tj_vals.push(s.clone());
@@ -5141,7 +5162,9 @@ mod tests {
 
         // Highlight rect must appear (rg + re + f) for the selected row.
         assert!(
-            content_str.contains("rg") && content_str.contains("re\n") && content_str.contains("f\n"),
+            content_str.contains("rg")
+                && content_str.contains("re\n")
+                && content_str.contains("f\n"),
             "selected row must have highlight (rg re f), got:\n{content_str}"
         );
 
@@ -5169,10 +5192,7 @@ mod tests {
         let content_str = String::from_utf8_lossy(&stream.data);
 
         // Two `f` operators expected (one per highlighted row).
-        let f_count = content_str
-            .lines()
-            .filter(|l| l.trim() == "f")
-            .count();
+        let f_count = content_str.lines().filter(|l| l.trim() == "f").count();
         assert_eq!(f_count, 2, "two selected rows → two 'f' ops; got {f_count}");
     }
 
@@ -5192,10 +5212,7 @@ mod tests {
         let content_str = String::from_utf8_lossy(&stream.data);
 
         // Exactly one highlight row.
-        let f_count = content_str
-            .lines()
-            .filter(|l| l.trim() == "f")
-            .count();
+        let f_count = content_str.lines().filter(|l| l.trim() == "f").count();
         assert_eq!(f_count, 1, "single /V match → one highlight; got {f_count}");
 
         // Highlight must be before BT.
@@ -5211,11 +5228,7 @@ mod tests {
     fn ch_list_opt_export_display_pair() {
         // /Opt contains [[exportA displayA] [exportB displayB]].
         // We verify the display strings appear in Tj, not export strings.
-        let raw = build_list_pdf(
-            "[(expA)(dispA)] [(expB)(dispB)]",
-            "[0]",
-            "",
-        );
+        let raw = build_list_pdf("[(expA)(dispA)] [(expB)(dispB)]", "[0]", "");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
@@ -5227,7 +5240,9 @@ mod tests {
 
         let mut tj_vals: Vec<Vec<u8>> = Vec::new();
         for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     tj_vals.push(s.clone());
@@ -5277,7 +5292,10 @@ mod tests {
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
@@ -5290,7 +5308,9 @@ mod tests {
 
         let mut found_display = false;
         for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"DisplayX" {
@@ -5299,7 +5319,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_display, "combo must render display string 'DisplayX' from /Opt");
+        assert!(
+            found_display,
+            "combo must render display string 'DisplayX' from /Opt"
+        );
     }
 
     /// Round-trip: write and re-read PDF; /AP survives.
@@ -5316,11 +5339,16 @@ mod tests {
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("re-parse");
         let widget_obj = pdf2.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
         assert!(wdict.get("AP").is_some(), "/AP missing after round-trip");
 
         let xobj2 = pdf2.resolve(xobj_ref).expect("re-resolve xobj");
-        assert!(matches!(xobj2, Object::Stream(_)), "xobj must be stream after round-trip");
+        assert!(
+            matches!(xobj2, Object::Stream(_)),
+            "xobj must be stream after round-trip"
+        );
     }
 
     // ── New tests for previously uncovered production branches ──────────────
