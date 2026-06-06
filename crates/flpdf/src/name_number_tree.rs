@@ -101,6 +101,79 @@ where
     Ok(out)
 }
 
+/// Build a name-tree from a **non-empty, pre-sorted** `(key, value)` slice.
+///
+/// Returns `(root_ref, nodes)` where `nodes` is every `(ObjectRef, Object)` the
+/// caller must store via [`Pdf::set_object`]. The caller owns object numbering
+/// (via `alloc`), the empty-entries case, and all catalog wiring.
+///
+/// Layout (qpdf-aligned, identical to the legacy embedded-files writer):
+/// - `<= LEAF_MAX` entries → a single leaf node (`/Limits` + `/Names`), returned
+///   as the root.
+/// - `> LEAF_MAX` entries → leaves chunked by `div_ceil`, each `/Limits` +
+///   `/Names`, under a root `/Limits` + `/Kids`. Leaves are allocated in order,
+///   the root last.
+///
+/// # Panics (debug)
+/// Debug-asserts `entries` is non-empty.
+pub fn build_name_tree<A>(
+    entries: &[(Vec<u8>, Object)],
+    mut alloc: A,
+) -> (ObjectRef, Vec<(ObjectRef, Object)>)
+where
+    A: FnMut() -> ObjectRef,
+{
+    debug_assert!(
+        !entries.is_empty(),
+        "build_name_tree requires non-empty entries"
+    );
+    let mut nodes: Vec<(ObjectRef, Object)> = Vec::new();
+
+    if entries.len() <= LEAF_MAX {
+        let leaf_ref = alloc();
+        nodes.push((leaf_ref, Object::Dictionary(build_leaf_dict(entries))));
+        return (leaf_ref, nodes);
+    }
+
+    let n_leaves = entries.len().div_ceil(LEAF_MAX);
+    let chunk_size = entries.len().div_ceil(n_leaves);
+    let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
+    for chunk in entries.chunks(chunk_size) {
+        let leaf_ref = alloc();
+        nodes.push((leaf_ref, Object::Dictionary(build_leaf_dict(chunk))));
+        kids.push(Object::Reference(leaf_ref));
+    }
+    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
+    let mut root = Dictionary::new();
+    root.insert(
+        "Limits",
+        Object::Array(vec![Object::String(first), Object::String(last)]),
+    );
+    root.insert("Kids", Object::Array(kids));
+    let root_ref = alloc();
+    nodes.push((root_ref, Object::Dictionary(root)));
+    (root_ref, nodes)
+}
+
+/// Leaf node dict: `/Limits [first last]` + `/Names [k1 v1 ...]`.
+fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
+    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
+    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
+    for (key, val) in entries {
+        pairs.push(Object::String(key.clone()));
+        pairs.push(val.clone());
+    }
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "Limits",
+        Object::Array(vec![Object::String(first), Object::String(last)]),
+    );
+    dict.insert("Names", Object::Array(pairs));
+    dict
+}
+
 /// Internal generic walker shared by name + number readers.
 ///
 /// `node` is a `Reference` (resolved + cycle-tracked here) or a `Dictionary`.
@@ -166,7 +239,14 @@ where
     if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
         for kid in kids.iter().cloned() {
             walk_tree(
-                pdf, kid, leaf_key, parse_key, decode, out, visited, depth + 1,
+                pdf,
+                kid,
+                leaf_key,
+                parse_key,
+                decode,
+                out,
+                visited,
+                depth + 1,
                 max_depth,
             )?;
         }
@@ -378,5 +458,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![(7, 2)]);
+    }
+
+    fn mk_entries(n: usize) -> Vec<(Vec<u8>, Object)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("{i:03}").into_bytes(),
+                    Object::Reference(ObjectRef::new(1000 + i as u32, 0)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_name_tree_single_leaf_no_kids() {
+        let entries = mk_entries(3);
+        let mut next = 0u32;
+        let (root, nodes) = build_name_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(root, nodes[0].0);
+        let Object::Dictionary(d) = &nodes[0].1 else {
+            panic!()
+        };
+        assert!(d.get("Kids").is_none(), "single leaf must not have /Kids");
+        assert!(d.get("Names").is_some());
+        assert!(d.get("Limits").is_some());
+    }
+
+    #[test]
+    fn build_name_tree_multi_leaf_root_kids_alloc_order() {
+        let entries = mk_entries(LEAF_MAX + 1); // 33 -> 2 leaves + root
+        let mut next = 0u32;
+        let (root, nodes) = build_name_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        // Leaves allocated first (1,2), root last (3).
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(root, ObjectRef::new(3, 0), "root allocated last");
+        let Object::Dictionary(root_dict) = &nodes[2].1 else {
+            panic!()
+        };
+        let Some(Object::Array(kids)) = root_dict.get("Kids") else {
+            panic!("root needs /Kids")
+        };
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0], Object::Reference(ObjectRef::new(1, 0)));
+        assert_eq!(kids[1], Object::Reference(ObjectRef::new(2, 0)));
+        // Every node carries /Limits.
+        for (_, n) in &nodes {
+            let Object::Dictionary(d) = n else { panic!() };
+            assert!(d.get("Limits").is_some());
+        }
     }
 }
