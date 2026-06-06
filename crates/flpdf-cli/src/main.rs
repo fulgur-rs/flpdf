@@ -3404,14 +3404,28 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
 
     // For a single passthrough codec (DCTDecode, JBIG2Decode, JPXDecode,
     // CCITTFaxDecode) emit a human-readable marker instead of dumping binary.
-    // Multi-filter chains fall through to the decode path (scope: flpdf-9hc.7.5).
-    if let Some(label) = stream
-        .dict
-        .get("Filter")
-        .and_then(Object::as_name)
-        .and_then(filters::passthrough_codec_label)
-    {
-        println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
+    // The codec may be stored either as a direct name (`/Filter /DCTDecode`) or
+    // as a single-element array (`/Filter [/DCTDecode]`); both are equivalent
+    // per PDF spec. Multi-element filter chains fall through to the decode path
+    // (scope: flpdf-9hc.7.5).
+    let passthrough_label = stream.dict.get("Filter").and_then(|filter| {
+        let name = filter.as_name().or_else(|| match filter.as_array() {
+            Some([single]) => single.as_name(),
+            _ => None,
+        })?;
+        filters::passthrough_codec_label(name)
+    });
+    if let Some(label) = passthrough_label {
+        // These codecs are not decodable. With `--out`, write the raw stored
+        // bytes (the only available representation — e.g. the embedded JPEG for
+        // DCTDecode) and report the marker on stderr. Without `--out`, print the
+        // marker to stdout instead of dumping binary to the terminal.
+        if let Some(path) = cmd.out {
+            std::fs::write(path, &stream.data)?;
+            eprintln!("<binary, {} bytes, codec {}>", stream.data.len(), label);
+        } else {
+            println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
+        }
         return Ok(());
     }
 
