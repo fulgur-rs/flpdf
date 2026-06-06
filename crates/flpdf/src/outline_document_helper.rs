@@ -242,8 +242,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 Some(inner) => self.dest_from_value(&inner, depth - 1),
                 None => Ok(None),
             },
-            Object::Name(name) => self.resolve_named_dest(name.clone(), depth),
-            Object::String(name) => self.resolve_named_dest(name.clone(), depth),
+            Object::Name(name) => self.resolve_named_dest(name, depth),
+            Object::String(name) => self.resolve_named_dest(name, depth),
             _ => Ok(None),
         }
     }
@@ -259,7 +259,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// `depth - 1` so a cyclic named mapping (e.g. legacy `/Dests` `/a -> /b`,
     /// `/b -> /a`) strictly decreases the budget and terminates at the bound
     /// instead of overflowing the stack.
-    fn resolve_named_dest(&mut self, name: Vec<u8>, depth: usize) -> Result<Option<Dest>> {
+    fn resolve_named_dest(&mut self, name: &[u8], depth: usize) -> Result<Option<Dest>> {
         // 1. Modern: catalog /Names /Dests name tree (PDF 1.2+). /Names may be
         //    inline or an indirect ref; catalog_value handles both.
         if let Some(Object::Dictionary(mut names)) = self.catalog_value("Names")? {
@@ -273,7 +273,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 // Re-reads the whole name tree per named hop; acceptable because
                 // each hop strictly decreases `depth` (no visited set needed).
                 for (key, value) in entries {
-                    if key == name {
+                    if key.as_slice() == name {
                         return self.dest_from_value(&value, depth - 1);
                     }
                 }
@@ -281,7 +281,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
         // 2. Legacy: catalog /Dests dict (PDF 1.1).
         if let Some(Object::Dictionary(mut dests)) = self.catalog_value("Dests")? {
-            if let Some(value) = dests.remove(&name) {
+            if let Some(value) = dests.remove(name) {
                 return self.dest_from_value(&value, depth - 1);
             }
         }
@@ -315,7 +315,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     pub fn iter(&mut self) -> Result<impl Iterator<Item = OutlineNode>> {
         let roots = self.get_root()?;
         let mut flat = Vec::new();
-        for node in &roots {
+        for node in roots {
             flatten_preorder(node, &mut flat);
         }
         Ok(flat.into_iter())
@@ -352,18 +352,11 @@ fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Res
     })
 }
 
-/// Push `node` (with `children` cleared) then its descendants, pre-order.
-fn flatten_preorder(node: &OutlineNode, out: &mut Vec<OutlineNode>) {
-    out.push(OutlineNode {
-        object_ref: node.object_ref,
-        depth: node.depth,
-        title: node.title.clone(),
-        count: node.count,
-        parent: node.parent,
-        dest: node.dest.clone(),
-        children: Vec::new(),
-    });
-    for child in &node.children {
+/// Push `node` (with `children` taken/emptied) then its descendants, pre-order.
+fn flatten_preorder(mut node: OutlineNode, out: &mut Vec<OutlineNode>) {
+    let children = std::mem::take(&mut node.children);
+    out.push(node);
+    for child in children {
         flatten_preorder(child, out);
     }
 }
