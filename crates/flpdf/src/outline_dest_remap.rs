@@ -2138,9 +2138,10 @@ mod tests {
     //
     // Audit of every recursive helper in this module:
     //   - drop_subtree, collect_siblings, prune_name_tree: recurse on the
-    //     outline / name tree and are guarded (depth limit + shared visited
-    //     set). The tests below are load-bearing — each one hangs or errors
-    //     for the wrong reason if its guard is removed.
+    //     outline / name tree and are guarded (depth limit + visited tracking:
+    //     shared for drop_subtree/prune_name_tree, per-chain for
+    //     collect_siblings). The tests below are load-bearing — each one hangs
+    //     or errors for the wrong reason if its guard is removed.
     //   - count_visible_in_chain and stitch_siblings are NOT recursive (they
     //     iterate a flat sibling slice and read each item's stored /Count
     //     directly; they never descend), so they need no guard.
