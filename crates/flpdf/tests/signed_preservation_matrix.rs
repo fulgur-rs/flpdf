@@ -440,30 +440,36 @@ fn matrix_incremental_touching_acroform_invalidates() {
 #[test]
 fn matrix_incremental_touching_signature_field_invalidates() {
     for v in variants() {
-        let mut pdf = open(v.bytes);
-        let target = v.sig_field_refs[0];
-        let field = pdf.resolve(target).unwrap();
-        pdf.set_object(target, field);
+        // Verify every signature field independently: for a multi-signature
+        // document, touching the second field must invalidate just as surely as
+        // the first. A fresh parse per field is required because each open()
+        // consumes its source bytes (and we re-touch from a clean baseline).
+        let bytes = v.bytes;
+        for &target in &v.sig_field_refs {
+            let mut pdf = open(bytes.clone());
+            let field = pdf.resolve(target).unwrap();
+            pdf.set_object(target, field);
 
-        let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::Incremental)
-            .unwrap_or_else(|e| panic!("[{}] impact failed: {e:?}", v.name));
+            let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::Incremental)
+                .unwrap_or_else(|e| panic!("[{}] impact failed for {target:?}: {e:?}", v.name));
 
-        assert!(
-            impact.invalidates_signatures,
-            "[{}] touching a signature field must invalidate signatures",
-            v.name
-        );
-        assert_eq!(
-            impact.reason,
-            SignatureRewriteReason::IncrementalTouchesSignedObject,
-            "[{}] unexpected impact reason",
-            v.name
-        );
-        assert_eq!(
-            impact.first_invalidating_ref,
-            Some(target),
-            "[{}] should report the touched signature field as invalidating",
-            v.name
-        );
+            assert!(
+                impact.invalidates_signatures,
+                "[{}] touching signature field {target:?} must invalidate signatures",
+                v.name
+            );
+            assert_eq!(
+                impact.reason,
+                SignatureRewriteReason::IncrementalTouchesSignedObject,
+                "[{}] unexpected impact reason for {target:?}",
+                v.name
+            );
+            assert_eq!(
+                impact.first_invalidating_ref,
+                Some(target),
+                "[{}] should report touched signature field {target:?} as invalidating",
+                v.name
+            );
+        }
     }
 }
