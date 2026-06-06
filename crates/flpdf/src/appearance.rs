@@ -456,9 +456,12 @@ pub fn generate_button_field_appearance<R: Read + Seek>(
     }
 
     // ── 2. /Ff — field flags ──────────────────────────────────────────────
-    // Use i64 directly for bit tests to avoid signed-to-unsigned cast issues
-    // (review-pattern #3).
-    let ff = resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0);
+    // A negative or out-of-range /Ff is malformed; treat it as "no flags".
+    // Testing bits on a raw i64 would let `/Ff -1` (all bits set) read as both
+    // pushbutton and radio, mis-classifying a broken field instead of falling
+    // back to the safe checkbox path (review pattern #3).
+    let ff =
+        u32::try_from(resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
     let is_pushbutton = ff & 0x10000 != 0; // bit 17 (1-indexed)
     let is_radio = !is_pushbutton && ff & 0x8000 != 0; // bit 16
 
@@ -614,7 +617,28 @@ fn generate_checkbox_radio_appearance<R: Read + Seek>(
         other => other,
     };
     let ca_bytes: Vec<u8> = match ca_obj {
-        Some(Object::String(s)) => s,
+        Some(Object::String(s)) => {
+            // /MK/CA is a PDF text string naming a ZapfDingbats glyph, and the
+            // appearance font below is /ZaDb — so the byte(s) directly select the
+            // glyph and must NOT be WinAnsi-remapped the way the pushbutton
+            // caption is. A UTF-16BE wrapper (BOM) must still be decoded, or its
+            // `FE FF` bytes would leak into the Tj as garbage; a plain string is
+            // already the ZapfDingbats code byte(s) and is used verbatim.
+            if s.starts_with(&[0xFE, 0xFF]) {
+                match decode_pdf_text_string(&s) {
+                    Some(text) if !text.is_empty() && text.chars().all(|c| (c as u32) <= 0xFF) => {
+                        text.chars().map(|c| c as u8).collect()
+                    }
+                    // Empty after the BOM, or a char outside the single-byte
+                    // ZapfDingbats code range: no usable glyph → default.
+                    _ => default_glyph.to_vec(),
+                }
+            } else if s.is_empty() {
+                default_glyph.to_vec()
+            } else {
+                s
+            }
+        }
         _ => default_glyph.to_vec(),
     };
 
@@ -2082,6 +2106,101 @@ mod tests {
         let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    /// Build a Btn-widget PDF whose obj-4 dictionary body is supplied verbatim
+    /// (so /Ff and /MK can be varied per test).
+    fn build_btn_pdf_obj4(obj4_body: &str) -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(format!("4 0 obj\n{obj4_body}\nendobj\n").as_bytes());
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Read obj-4's /AP/N on-state XObject content after generation, returning
+    /// the raw content-stream bytes.
+    fn btn_on_state_content(pdf_bytes: Vec<u8>) -> (Object, Vec<u8>) {
+        let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("parse");
+        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+        let ap_n = match pdf.resolve(ObjectRef::new(4, 0)).expect("widget") {
+            Object::Dictionary(w) => match w.get("AP") {
+                Some(Object::Dictionary(ap)) => ap.get("N").cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Object::Stream(on) = pdf.resolve(on_ref).expect("on xobj") else {
+            panic!("on xobj not a stream");
+        };
+        (ap_n.expect("AP/N present"), on.data)
+    }
+
+    #[test]
+    fn btn_negative_ff_falls_back_to_checkbox_not_pushbutton() {
+        // /Ff -1 (all bits set) must NOT be read as pushbutton/radio; treat the
+        // malformed value as no flags and take the safe checkbox path (which
+        // renders a ZapfDingbats glyph and stores a /Yes//Off state dict in /AP/N).
+        let pdf = build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Btn /T (c) /Ff -1 /Rect [10 10 30 30]>>",
+        );
+        let (ap_n, content) = btn_on_state_content(pdf);
+        assert!(
+            matches!(ap_n, Object::Dictionary(_)),
+            "negative /Ff must take the checkbox path (/AP/N is a state dict), got: {ap_n:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&content).contains("/ZaDb"),
+            "checkbox on-state must render in ZapfDingbats"
+        );
+    }
+
+    #[test]
+    fn btn_checkbox_mk_ca_utf16be_is_decoded() {
+        // /MK/CA stored as UTF-16BE (BOM FE FF + "4") must be decoded to the
+        // ZapfDingbats code byte 0x34, not emitted raw (which would leak the BOM
+        // bytes into the ZaDb Tj). A plain string is used verbatim.
+        let pdf = build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Btn /T (c) /MK <</CA <FEFF0034>>> /Rect [10 10 30 30]>>",
+        );
+        let (_ap_n, content) = btn_on_state_content(pdf);
+        let mut tj_bytes: Option<Vec<u8>> = None;
+        for tok in ContentStreamParser::new(&content).flatten() {
+            if let ContentToken::Op { operands, operator } = tok {
+                if operator == b"Tj" {
+                    if let Some(Object::String(s)) = operands.first() {
+                        tj_bytes = Some(s.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            tj_bytes.as_deref(),
+            Some(b"4" as &[u8]),
+            "UTF-16BE /MK/CA must decode to the ZapfDingbats code byte 0x34"
+        );
     }
 
     fn build_tx_no_value_pdf() -> Vec<u8> {
