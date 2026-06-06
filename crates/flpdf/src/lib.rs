@@ -65,6 +65,7 @@ pub mod page_closure;
 pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
+pub mod page_label_document_helper;
 pub mod page_object_helper;
 pub mod page_plan;
 pub mod page_range;
