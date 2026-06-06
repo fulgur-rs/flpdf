@@ -2131,4 +2131,201 @@ mod tests {
             .iter()
             .any(|o| matches!(o, Object::String(b) | Object::Name(b) if b == b"c")));
     }
+
+    // -----------------------------------------------------------------------
+    // Hostile-PDF hardening: bounded recursion / cycle guards on the
+    // outline-tree walkers (flpdf-ypq, roborev #863).
+    //
+    // Audit of every recursive helper in this module:
+    //   - drop_subtree, collect_siblings, prune_name_tree: recurse on the
+    //     outline / name tree and are guarded (depth limit + shared visited
+    //     set). The tests below are load-bearing — each one hangs or errors
+    //     for the wrong reason if its guard is removed.
+    //   - count_visible_in_chain and stitch_siblings are NOT recursive (they
+    //     iterate a flat sibling slice and read each item's stored /Count
+    //     directly; they never descend), so they need no guard.
+    //   - dest resolution (dest_page_ref_resolved / remap_dest_value /
+    //     resolve_ref_chain) is covered by
+    //     `cyclic_indirect_dest_terminates_without_overflow` above.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_subtree_next_cycle_terminates() {
+        // Sibling /Next back-edge cycle: 40 /Next 41, 41 /Next 40. Without the
+        // shared `dropped` visited set the /Next while-loop spins forever.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (40, "<< /Title (a) /Next 41 0 R >>"),
+                (41, "<< /Title (b) /Next 40 0 R >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let mut dropped: BTreeSet<ObjectRef> = BTreeSet::new();
+        drop_subtree(&mut pdf, ObjectRef::new(40, 0), &mut dropped, 0, 100)
+            .expect("cyclic /Next chain must terminate gracefully");
+        assert!(dropped.contains(&ObjectRef::new(40, 0)));
+        assert!(dropped.contains(&ObjectRef::new(41, 0)));
+    }
+
+    #[test]
+    fn drop_subtree_deep_first_chain_hits_depth_limit() {
+        // A /First chain deeper than max_depth must error rather than overflow
+        // the stack. depths entered: 40@0, 41@1, 42@2, 43@3 -> limit (3) fires.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (40, "<< /Title (a) /First 41 0 R >>"),
+                (41, "<< /Title (b) /First 42 0 R >>"),
+                (42, "<< /Title (c) /First 43 0 R >>"),
+                (43, "<< /Title (d) >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let mut dropped: BTreeSet<ObjectRef> = BTreeSet::new();
+        let err = drop_subtree(&mut pdf, ObjectRef::new(40, 0), &mut dropped, 0, 3)
+            .expect_err("depth limit must be enforced");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn collect_siblings_next_cycle_terminates() {
+        // /Next cycle among title-only (always-kept) items. The per-chain
+        // `visited` set must break the loop; otherwise it spins forever.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (40, "<< /Title (a) /Next 41 0 R >>"),
+                (41, "<< /Title (b) /Next 40 0 R >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let surviving_names: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut kept: Vec<ObjectRef> = Vec::new();
+        let mut dropped: BTreeSet<ObjectRef> = BTreeSet::new();
+        collect_siblings(
+            &mut pdf,
+            ObjectRef::new(40, 0),
+            0,
+            100,
+            &surviving,
+            &surviving_names,
+            &mut kept,
+            &mut dropped,
+        )
+        .expect("cyclic /Next chain must terminate gracefully");
+        // Title-only items are kept; the loop stops after each is seen once.
+        assert_eq!(kept, vec![ObjectRef::new(40, 0), ObjectRef::new(41, 0)]);
+    }
+
+    #[test]
+    fn collect_siblings_deep_first_chain_hits_depth_limit() {
+        // Always-kept items chained by /First deeper than max_depth must error.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (40, "<< /Title (a) /First 41 0 R >>"),
+                (41, "<< /Title (b) /First 42 0 R >>"),
+                (42, "<< /Title (c) /First 43 0 R >>"),
+                (43, "<< /Title (d) >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let surviving_names: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut kept: Vec<ObjectRef> = Vec::new();
+        let mut dropped: BTreeSet<ObjectRef> = BTreeSet::new();
+        let err = collect_siblings(
+            &mut pdf,
+            ObjectRef::new(40, 0),
+            0,
+            3,
+            &surviving,
+            &surviving_names,
+            &mut kept,
+            &mut dropped,
+        )
+        .expect_err("depth limit must be enforced");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn prune_name_tree_kids_cycle_terminates() {
+        // /Kids back-edge cycle: node 50 /Kids [51], node 51 /Kids [50]. The
+        // shared `visited` set treats the revisited node as empty instead of
+        // recursing forever.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (50, "<< /Kids [51 0 R] >>"),
+                (51, "<< /Kids [50 0 R] >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let mut surviving_names: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+        let empty = prune_name_tree(
+            &mut pdf,
+            ObjectRef::new(50, 0),
+            &surviving,
+            &mut surviving_names,
+            0,
+            100,
+            &mut visited,
+        )
+        .expect("cyclic /Kids chain must terminate gracefully");
+        // The cycle yields no surviving entries -> node reported empty.
+        assert!(empty);
+        assert!(surviving_names.is_empty());
+    }
+
+    #[test]
+    fn prune_name_tree_deep_kids_chain_hits_depth_limit() {
+        // A /Kids chain deeper than max_depth must error. Depths entered:
+        // 50@0, 51@1, 52@2, 53@3 -> limit (3) fires before node 53 is read.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (50, "<< /Kids [51 0 R] >>"),
+                (51, "<< /Kids [52 0 R] >>"),
+                (52, "<< /Kids [53 0 R] >>"),
+                (53, "<< /Names [(z) [3 0 R /Fit]] >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let mut surviving_names: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+        let err = prune_name_tree(
+            &mut pdf,
+            ObjectRef::new(50, 0),
+            &surviving,
+            &mut surviving_names,
+            0,
+            3,
+            &mut visited,
+        )
+        .expect_err("depth limit must be enforced");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
 }
