@@ -60,8 +60,20 @@ pyhanko sign addsig --field Sig1 \
   pkcs12  # or: pemder --key key.pem --cert cert.pem \
   unsigned.pdf signed.pdf
 
-# 2. Run flpdf incremental update on the signed PDF (must NOT full-rewrite).
-flpdf rewrite signed.pdf out.pdf        # incremental path, no --remove-restrictions
+# 2. Run flpdf's incremental (signature-preserving) update on the signed PDF.
+#    IMPORTANT: a plain `flpdf rewrite IN OUT` defaults to a qpdf-equivalent
+#    FULL rewrite (because --remove-unreferenced-resources defaults to `auto`),
+#    which on a signed input is REFUSED with "refusing full rewrite of signed
+#    PDF" (exit 2). To exercise the incremental path that appends a new
+#    generation and preserves the signed byte ranges, opt out of the mutating
+#    passes so the writer stays incremental:
+flpdf rewrite --remove-unreferenced-resources=no signed.pdf out.pdf
+#   -> exit 0; out.pdf starts with signed.pdf byte-for-byte (new revision
+#      appended), so every signed /ByteRange region is preserved.
+#
+#    (Conversely, `flpdf rewrite signed.pdf out.pdf` is the way to assert the
+#     REFUSAL behaviour: it must exit non-zero and print the signed-PDF
+#     diagnostic — see crates/flpdf-cli/tests/cli_full_rewrite.rs.)
 
 # 3. Verify the signature still validates after flpdf's incremental update.
 pdfsig out.pdf

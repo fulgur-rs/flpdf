@@ -12,12 +12,15 @@
 //!
 //! ## External validation caveat
 //!
-//! These fixtures are SYNTHETIC: their `/Contents` is a `<00>` placeholder
+//! These fixtures are SYNTHETIC: their `/Contents` is a `<00…>` placeholder
 //! rather than a real PKCS#7 blob, so `pdfsig`/`qpdf` *cryptographic*
-//! verification is not meaningful on them. The structural invariants asserted
-//! here — detection accuracy, destructive-rewrite refusal, restriction
-//! stripping, and byte-identical preservation of every `/ByteRange` region
-//! under incremental update — ARE the verification for this matrix. Real
+//! verification is not meaningful on them. Their `/ByteRange` values, however,
+//! are patched to the real offsets that exclude each `/Contents` (see
+//! `build_with_real_byte_ranges`), so detection runs against a structurally
+//! faithful layout. The structural invariants asserted here — detection
+//! accuracy, destructive-rewrite refusal, restriction stripping, and
+//! byte-identical preservation of every `/ByteRange` region under incremental
+//! update — ARE the verification for this matrix. Real
 //! cryptographically-signed fixtures and `pdfsig`-based validation are
 //! documented as a future CI extension in
 //! `docs/signed-pdf-external-validation.md`.
@@ -70,6 +73,98 @@ struct ExpectedSig {
     sub_filter: &'static str,
 }
 
+/// Fixed-width `/ByteRange` placeholder. Four 10-digit zero-padded fields so the
+/// real values can be patched in **length-preservingly** (see
+/// [`build_with_real_byte_ranges`]); 10 digits dwarf any offset in these
+/// few-hundred-byte fixtures.
+const BYTE_RANGE_PLACEHOLDER: &str = "0000000000 0000000000 0000000000 0000000000";
+
+/// Locate every non-overlapping occurrence of `needle` in `haystack`.
+fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while from + needle.len() <= haystack.len() {
+        match haystack[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+        {
+            Some(rel) => {
+                let at = from + rel;
+                hits.push(at);
+                from = at + needle.len();
+            }
+            None => break,
+        }
+    }
+    hits
+}
+
+/// Assemble a signed PDF, then patch each `/ByteRange` placeholder to the real
+/// two-range layout that signature would cover: everything **except** its own
+/// `/Contents <...>` value, i.e. `[0, lt, after, file_len - after]` where `lt`
+/// is the byte offset of the Contents `<` and `after` is one past its `>`.
+///
+/// This makes the fixtures structurally faithful to how `adbe.pkcs7.*`
+/// signatures lay their byte ranges around the signature blob (the `/Contents`
+/// itself stays a synthetic `<00…>` placeholder — these fixtures verify
+/// structure, not cryptography). The detection cell asserts these real ranges,
+/// so a parser that mis-reads a realistic layout fails loudly.
+///
+/// Patches are length-preserving (fixed-width [`BYTE_RANGE_PLACEHOLDER`]), which
+/// keeps every later offset — and thus the i-th-`/ByteRange` ↔ i-th-`/Contents`
+/// pairing — stable for multi-signature fixtures. Returns the bytes plus the
+/// patched ranges in document order, which for these fixtures is field order.
+fn build_with_real_byte_ranges(objects: &[(u32, &[u8])]) -> (Vec<u8>, Vec<[u64; 4]>) {
+    let mut bytes = build_pdf(objects);
+    let file_len = bytes.len() as u64;
+
+    let br_opens = find_all(&bytes, b"/ByteRange [");
+    let contents = find_all(&bytes, b"/Contents <");
+    assert_eq!(
+        br_opens.len(),
+        contents.len(),
+        "each /ByteRange must pair with exactly one /Contents"
+    );
+
+    let mut ranges = Vec::with_capacity(contents.len());
+    let mut patches: Vec<(usize, String)> = Vec::new();
+    for (&br_at, &c_at) in br_opens.iter().zip(&contents) {
+        // `<` is the last byte of the "/Contents <" needle.
+        let lt = c_at + b"/Contents <".len() - 1;
+        let gt = lt
+            + bytes[lt..]
+                .iter()
+                .position(|&c| c == b'>')
+                .expect("Contents must be closed by '>'");
+        let after = (gt + 1) as u64;
+        let range = [0u64, lt as u64, after, file_len - after];
+        ranges.push(range);
+
+        // `[` is the last byte of the "/ByteRange [" needle; the inner span runs
+        // to the matching `]`.
+        let open = br_at + b"/ByteRange [".len() - 1;
+        let close = open
+            + bytes[open..]
+                .iter()
+                .position(|&c| c == b']')
+                .expect("ByteRange must be closed by ']'");
+        let replacement = format!(
+            "{:010} {:010} {:010} {:010}",
+            range[0], range[1], range[2], range[3]
+        );
+        assert_eq!(
+            replacement.len(),
+            close - (open + 1),
+            "ByteRange replacement must be length-preserving"
+        );
+        patches.push((open + 1, replacement));
+    }
+    for (at, replacement) in patches {
+        bytes[at..at + replacement.len()].copy_from_slice(replacement.as_bytes());
+    }
+    (bytes, ranges)
+}
+
 /// One row of the matrix: a fixture variant plus the metadata the operations
 /// need (expected detections and the object refs to touch / inspect).
 struct Variant {
@@ -85,7 +180,10 @@ struct Variant {
     sig_field_refs: Vec<ObjectRef>,
 }
 
-fn build_single_detached() -> Vec<u8> {
+fn build_single_detached() -> (Vec<u8>, Vec<[u64; 4]>) {
+    let sig = format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [{BYTE_RANGE_PLACEHOLDER}] /Contents <0000000000000000> >>"
+    );
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
         (
@@ -98,15 +196,15 @@ fn build_single_detached() -> Vec<u8> {
             5,
             b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig1) /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
         ),
-        (
-            6,
-            b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
-        ),
+        (6, sig.as_bytes()),
     ];
-    build_pdf(&objects)
+    build_with_real_byte_ranges(&objects)
 }
 
-fn build_single_sha1() -> Vec<u8> {
+fn build_single_sha1() -> (Vec<u8>, Vec<[u64; 4]>) {
+    let sig = format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.sha1 /ByteRange [{BYTE_RANGE_PLACEHOLDER}] /Contents <0000000000000000> >>"
+    );
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
         (
@@ -119,17 +217,21 @@ fn build_single_sha1() -> Vec<u8> {
             5,
             b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig1) /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
         ),
-        (
-            6,
-            b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.sha1 /ByteRange [0 10 20 30] /Contents <00> >>",
-        ),
+        (6, sig.as_bytes()),
     ];
-    build_pdf(&objects)
+    build_with_real_byte_ranges(&objects)
 }
 
-/// Two signature fields in one document: a detached and a sha1 signature, each
-/// with a distinct `/ByteRange` so detection is unambiguous per field.
-fn build_multi_sig() -> Vec<u8> {
+/// Two signature fields in one document: a detached and a sha1 signature. Each
+/// `/ByteRange` is patched to exclude only its own `/Contents`, so detection is
+/// unambiguous per field.
+fn build_multi_sig() -> (Vec<u8>, Vec<[u64; 4]>) {
+    let sig1 = format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [{BYTE_RANGE_PLACEHOLDER}] /Contents <0000000000000000> >>"
+    );
+    let sig2 = format!(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.sha1 /ByteRange [{BYTE_RANGE_PLACEHOLDER}] /Contents <0000000000000000> >>"
+    );
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
         (
@@ -142,30 +244,27 @@ fn build_multi_sig() -> Vec<u8> {
             5,
             b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig1) /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
         ),
-        (
-            6,
-            b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
-        ),
+        (6, sig1.as_bytes()),
         (
             7,
             b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig2) /V 8 0 R /P 3 0 R /Rect [0 0 10 10] >>",
         ),
-        (
-            8,
-            b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.sha1 /ByteRange [0 40 50 60] /Contents <00> >>",
-        ),
+        (8, sig2.as_bytes()),
     ];
-    build_pdf(&objects)
+    build_with_real_byte_ranges(&objects)
 }
 
 fn variants() -> Vec<Variant> {
+    let (detached_bytes, detached_ranges) = build_single_detached();
+    let (sha1_bytes, sha1_ranges) = build_single_sha1();
+    let (multi_bytes, multi_ranges) = build_multi_sig();
     vec![
         Variant {
             name: "single_detached",
-            bytes: build_single_detached(),
+            bytes: detached_bytes,
             expected: vec![ExpectedSig {
                 field_name: "Sig1",
-                byte_range: [0, 10, 20, 30],
+                byte_range: detached_ranges[0],
                 sub_filter: "adbe.pkcs7.detached",
             }],
             acroform_ref: ObjectRef::new(4, 0),
@@ -174,10 +273,10 @@ fn variants() -> Vec<Variant> {
         },
         Variant {
             name: "single_sha1",
-            bytes: build_single_sha1(),
+            bytes: sha1_bytes,
             expected: vec![ExpectedSig {
                 field_name: "Sig1",
-                byte_range: [0, 10, 20, 30],
+                byte_range: sha1_ranges[0],
                 sub_filter: "adbe.pkcs7.sha1",
             }],
             acroform_ref: ObjectRef::new(4, 0),
@@ -186,16 +285,16 @@ fn variants() -> Vec<Variant> {
         },
         Variant {
             name: "multi_sig",
-            bytes: build_multi_sig(),
+            bytes: multi_bytes,
             expected: vec![
                 ExpectedSig {
                     field_name: "Sig1",
-                    byte_range: [0, 10, 20, 30],
+                    byte_range: multi_ranges[0],
                     sub_filter: "adbe.pkcs7.detached",
                 },
                 ExpectedSig {
                     field_name: "Sig2",
-                    byte_range: [0, 40, 50, 60],
+                    byte_range: multi_ranges[1],
                     sub_filter: "adbe.pkcs7.sha1",
                 },
             ],
