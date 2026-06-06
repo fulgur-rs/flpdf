@@ -241,44 +241,52 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// `/b -> /a`) strictly decreases the budget and terminates at the bound
     /// instead of overflowing the stack.
     fn resolve_named_dest(&mut self, name: Vec<u8>, depth: usize) -> Result<Option<Dest>> {
-        // 1. Modern: catalog /Names /Dests name tree.
-        if let Some(names_ref) = self.catalog_ref("Names")? {
-            if let Object::Dictionary(names) = self.pdf.resolve(names_ref)? {
-                if let Some(dests_root) = names.get("Dests").cloned() {
-                    let entries = read_name_tree(
-                        self.pdf,
-                        dests_root,
-                        |_pdf, value| Ok(Some(value)),
-                        DEFAULT_MAX_OUTLINE_DEPTH,
-                    )?;
-                    for (key, value) in entries {
-                        if key == name {
-                            return self.dest_from_value(&value, depth - 1);
-                        }
+        // 1. Modern: catalog /Names /Dests name tree (PDF 1.2+). /Names may be
+        //    inline or an indirect ref; catalog_value handles both.
+        if let Some(Object::Dictionary(mut names)) = self.catalog_value("Names")? {
+            if let Some(dests_root) = names.remove("Dests") {
+                let entries = read_name_tree(
+                    self.pdf,
+                    dests_root,
+                    |_pdf, value| Ok(Some(value)),
+                    DEFAULT_MAX_OUTLINE_DEPTH,
+                )?;
+                // Re-reads the whole name tree per named hop; acceptable because
+                // each hop strictly decreases `depth` (no visited set needed).
+                for (key, value) in entries {
+                    if key == name {
+                        return self.dest_from_value(&value, depth - 1);
                     }
                 }
             }
         }
-        // 2. Legacy: catalog /Dests dict.
-        if let Some(dests_ref) = self.catalog_ref("Dests")? {
-            if let Object::Dictionary(dests) = self.pdf.resolve(dests_ref)? {
-                if let Some(value) = dests.get(&name).cloned() {
-                    return self.dest_from_value(&value, depth - 1);
-                }
+        // 2. Legacy: catalog /Dests dict (PDF 1.1).
+        if let Some(Object::Dictionary(mut dests)) = self.catalog_value("Dests")? {
+            if let Some(value) = dests.remove(&name) {
+                return self.dest_from_value(&value, depth - 1);
             }
         }
         Ok(None)
     }
 
-    /// Resolve a catalog key's value to an object ref (only if it is a reference).
-    fn catalog_ref(&mut self, key: &str) -> Result<Option<ObjectRef>> {
+    /// Resolve a catalog key's value to an owned object, following one level of
+    /// indirection. Returns the value whether the catalog stores it as an
+    /// indirect reference or as a direct (inline) object — so an inline
+    /// `/Names`/`/Dests` dictionary is handled as well as the reference form.
+    fn catalog_value(&mut self, key: &str) -> Result<Option<Object>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None);
         };
         let Object::Dictionary(catalog) = self.pdf.resolve_borrowed(catalog_ref)? else {
             return Ok(None);
         };
-        Ok(catalog.get_ref(key))
+        let Some(value) = catalog.get(key).cloned() else {
+            return Ok(None);
+        };
+        match value {
+            Object::Reference(r) => Ok(Some(self.pdf.resolve(r)?)),
+            other => Ok(Some(other)),
+        }
     }
 
     /// Pre-order iterator over every materialized node (owned). Each yielded

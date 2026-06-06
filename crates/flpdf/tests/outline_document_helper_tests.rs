@@ -410,3 +410,36 @@ fn cyclic_named_dest_terminates_as_none() {
     // The /a -> /b -> /a name cycle bottoms out at the depth bound -> no dest.
     assert!(roots[0].dest.is_none());
 }
+
+/// The same dest name exists in BOTH the modern name tree and legacy /Dests.
+/// The modern name-tree entry must win (it is resolved first).
+fn named_dest_collision_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names 8 0 R /Dests 10 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (C) /Parent 4 0 R /Dest (dup) >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(dup) [3 0 R /Fit]] >>"),
+            (10, "<< /dup [2 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn named_dest_modern_wins_over_legacy() {
+    let mut pdf = Pdf::open(Cursor::new(named_dest_collision_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    let dest = roots[0]
+        .dest
+        .as_ref()
+        .expect("collision named dest should resolve");
+    // Modern name-tree entry ([3 0 R ...]) wins over legacy /Dests ([2 0 R ...]).
+    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+}
