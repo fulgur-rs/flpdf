@@ -8,6 +8,32 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::{Read, Write};
 
+/// Return a human-readable codec label if `filter_name` is an image/binary
+/// passthrough codec that flpdf does not decode.
+///
+/// The four codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
+/// are always emitted verbatim by the writer.  Callers (e.g. `show-stream`) can
+/// use this function to distinguish "known-but-passthrough" filters from
+/// genuinely unsupported ones.
+///
+/// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
+/// Returns `None` for any other filter name.
+pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
+    if filter_name == b"DCTDecode" {
+        return Some("DCTDecode");
+    }
+    if filter_name == b"JBIG2Decode" {
+        return Some("JBIG2Decode");
+    }
+    if filter_name == b"JPXDecode" {
+        return Some("JPXDecode");
+    }
+    if filter_name == b"CCITTFaxDecode" {
+        return Some("CCITTFaxDecode");
+    }
+    None
+}
+
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     decode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
@@ -1100,5 +1126,67 @@ mod tests {
         let encoded = encode_stream_data(&dict, &raw).unwrap();
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
         assert_eq!(decoded, raw);
+    }
+
+    // ----- passthrough_codec_label tests (flpdf-9hc.7.4) -----
+
+    #[test]
+    fn passthrough_codec_label_recognizes_all_four_codecs() {
+        assert_eq!(
+            passthrough_codec_label(b"DCTDecode"),
+            Some("DCTDecode"),
+            "DCTDecode must be recognised"
+        );
+        assert_eq!(
+            passthrough_codec_label(b"JBIG2Decode"),
+            Some("JBIG2Decode"),
+            "JBIG2Decode must be recognised"
+        );
+        assert_eq!(
+            passthrough_codec_label(b"JPXDecode"),
+            Some("JPXDecode"),
+            "JPXDecode must be recognised"
+        );
+        assert_eq!(
+            passthrough_codec_label(b"CCITTFaxDecode"),
+            Some("CCITTFaxDecode"),
+            "CCITTFaxDecode must be recognised"
+        );
+    }
+
+    #[test]
+    fn passthrough_codec_label_is_case_sensitive() {
+        // PDF names are case-sensitive; lower-case variants must return None.
+        assert_eq!(
+            passthrough_codec_label(b"dctdecode"),
+            None,
+            "lowercase dctdecode must not match"
+        );
+        assert_eq!(
+            passthrough_codec_label(b"jbig2decode"),
+            None,
+            "lowercase jbig2decode must not match"
+        );
+        assert_eq!(
+            passthrough_codec_label(b"jpxdecode"),
+            None,
+            "lowercase jpxdecode must not match"
+        );
+        assert_eq!(
+            passthrough_codec_label(b"ccittfaxdecode"),
+            None,
+            "lowercase ccittfaxdecode must not match"
+        );
+    }
+
+    #[test]
+    fn passthrough_codec_label_returns_none_for_unknown_filters() {
+        assert_eq!(passthrough_codec_label(b"FlateDecode"), None);
+        assert_eq!(passthrough_codec_label(b"LZWDecode"), None);
+        assert_eq!(passthrough_codec_label(b"ASCII85Decode"), None);
+        assert_eq!(passthrough_codec_label(b"ASCIIHexDecode"), None);
+        assert_eq!(passthrough_codec_label(b"RunLengthDecode"), None);
+        assert_eq!(passthrough_codec_label(b"UnknownFilter"), None);
+        assert_eq!(passthrough_codec_label(b""), None);
     }
 }
