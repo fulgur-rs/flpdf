@@ -1465,4 +1465,37 @@ mod tests {
             "surviving filespec ref must remain alive"
         );
     }
+
+    // ── Test: /Names present but /EmbeddedFiles absent → empty ────────────────
+    //
+    // Covers the `None => Ok(vec![])` branch in both readers when the catalog
+    // has a /Names dictionary that simply does not carry an /EmbeddedFiles key.
+    #[test]
+    fn readers_return_empty_when_names_has_no_embedded_files() {
+        let mut pdf = open_minimal();
+
+        // Attach a /Names dict carrying only an unrelated key (no /EmbeddedFiles).
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        let mut names = Dictionary::new();
+        names.insert("Dests", Object::Dictionary(Dictionary::new()));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        assert!(
+            list_embedded_files(&mut pdf).expect("list").is_empty(),
+            "list_embedded_files must be empty when /EmbeddedFiles is absent"
+        );
+        assert!(
+            collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
+                .expect("raw")
+                .is_empty(),
+            "raw collector must be empty when /EmbeddedFiles is absent"
+        );
+    }
 }

@@ -3746,6 +3746,60 @@ mod tests {
         assert_eq!(lp1[1].1, JsonValue::String("Appx".to_string()));
     }
 
+    // ── 38b. Indirect label value is resolved ────────────────────────────────
+
+    #[test]
+    fn pagelabels_indirect_label_value_resolved() {
+        // A /Nums value that is an indirect reference to a label dict must be
+        // resolved (covers the `Object::Reference` arm of the decode hook).
+        let mut pdf = load_one_page_pdf();
+        let label_ref = crate::ObjectRef::new(900, 0);
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name("D".into()));
+        pdf.set_object(label_ref, Object::Dictionary(label));
+
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![Object::Integer(0), Object::Reference(label_ref)]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        assert!(
+            matches!(&result, JsonValue::Array(arr) if arr.len() == 1),
+            "indirect label value must resolve to one entry, got {result:?}"
+        );
+    }
+
+    // ── 38c. Non-dict label value is skipped ──────────────────────────────────
+
+    #[test]
+    fn pagelabels_non_dict_value_skipped() {
+        // A /Nums value that is neither a dict nor a reference is skipped
+        // (covers the `_ => Ok(None)` arm of the decode hook).
+        let mut pdf = load_one_page_pdf();
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![Object::Integer(0), Object::Integer(42)]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![]),
+            "non-dict label value yields no entries"
+        );
+    }
+
     // ── 39. /S absent → style: null ──────────────────────────────────────────
 
     #[test]
@@ -5270,6 +5324,67 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+    }
+
+    // ── attachments Test 1b: /Names present but no /EmbeddedFiles → empty ─────
+
+    #[test]
+    fn attachments_names_without_embedded_files_returns_empty() {
+        // Covers the `None => return empty` branch when /Names exists but
+        // carries no /EmbeddedFiles key.
+        let mut pdf = load_one_page_pdf();
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        let mut names = Dictionary::new();
+        names.insert("Dests", Object::Dictionary(Dictionary::new()));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+    }
+
+    // ── attachments Test 1c: non-ref/non-dict leaf value is skipped ──────────
+
+    #[test]
+    fn attachments_non_ref_non_dict_value_skipped() {
+        // A name-tree leaf value that is neither a reference nor a dict is
+        // skipped (covers the `_ => None` arm of the attachments decode hook).
+        let mut pdf = load_one_page_pdf();
+        let ef_root_ref = crate::ObjectRef::new(901, 0);
+        let mut ef_root = Dictionary::new();
+        ef_root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"weird".to_vec()), Object::Integer(7)]),
+        );
+        pdf.set_object(ef_root_ref, Object::Dictionary(ef_root));
+
+        let names_ref = crate::ObjectRef::new(902, 0);
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
+        pdf.set_object(names_ref, Object::Dictionary(names));
+
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(
+            result,
+            JsonValue::Object(vec![]),
+            "non-ref/non-dict leaf value must be skipped"
+        );
     }
 
     // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────
