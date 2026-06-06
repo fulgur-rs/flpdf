@@ -15,9 +15,10 @@ pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = 100;
 /// One entry in a document outline (sometimes called a bookmark).
 ///
 /// `depth` is zero for top-level entries and increases for each nested level.
-/// `title` is decoded with [`String::from_utf8_lossy`] for `Object::String` titles,
-/// so binary or non-UTF-8 strings are rendered with replacement characters rather
-/// than producing an error.
+/// `title` is decoded as a PDF text string (UTF-16BE/LE with a byte-order mark,
+/// otherwise PDFDocEncoding), falling back to [`String::from_utf8_lossy`] for bytes
+/// that decode as neither. An indirect `/Title` reference is resolved one level
+/// before decoding; an absent `/Title` yields `"<untitled>"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineItem {
     pub object_ref: ObjectRef,
@@ -87,9 +88,23 @@ fn walk_outline<R: Read + Seek>(
             break;
         };
 
-        let title = read_outline_title(dict.get("Title"));
         let first = dict.get_ref("First");
         let next = dict.get_ref("Next");
+
+        // Decode the title without cloning the `Object` (review rule 1). Direct
+        // titles are decoded in place while `dict` still borrows `pdf`; an indirect
+        // `/Title` only carries out the Copy `ObjectRef` (as `Err`), ending the
+        // shared borrow of `pdf` so it can then be resolved with `&mut pdf`
+        // (review rule 2).
+        let title = match dict.get("Title") {
+            Some(Object::Reference(r)) => Err(*r),
+            Some(other) => Ok(decode_title_object(other)),
+            None => Ok(String::from("<untitled>")),
+        };
+        let title = match title {
+            Ok(title) => title,
+            Err(title_ref) => decode_title_object(&pdf.resolve(title_ref)?),
+        };
 
         items.push(OutlineItem {
             object_ref: current_ref,
@@ -107,14 +122,19 @@ fn walk_outline<R: Read + Seek>(
     Ok(())
 }
 
-fn read_outline_title(value: Option<&Object>) -> String {
-    match value {
-        Some(Object::String(value)) => String::from_utf8_lossy(value).into_owned(),
-        Some(other) => {
+/// Decode an outline entry's `/Title` value (already resolved by the caller, which
+/// handles one level of indirection — review rule 2). `Object::String` titles are
+/// decoded as PDF text strings (UTF-16BE/LE BOM or PDFDocEncoding) with a
+/// `from_utf8_lossy` fallback, so a BOM-prefixed UTF-16 title is no longer rendered
+/// as mojibake. Non-string values fall back to their serialized form.
+fn decode_title_object(obj: &Object) -> String {
+    match obj {
+        Object::String(bytes) => crate::json_inspect::decode_pdf_text_string(bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+        other => {
             let mut bytes = Vec::new();
             other.write_pdf(&mut bytes);
             String::from_utf8_lossy(&bytes).into_owned()
         }
-        None => String::from("<untitled>"),
     }
 }

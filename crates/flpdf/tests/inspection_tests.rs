@@ -42,6 +42,68 @@ fn outline_items_returns_empty_when_outline_missing() {
 }
 
 #[test]
+fn outline_items_resolves_indirect_title() {
+    // /Title stored as an indirect reference (`5 0 R`) must be resolved, not
+    // serialized as the literal "5 0 R".
+    let object4 = b"4 0 obj\n<< /Title 5 0 R /Parent 3 0 R >>\nendobj\n".to_vec();
+    let object5 = b"5 0 obj\n(Chapter One)\nendobj\n".to_vec();
+    let pdf = single_outline_pdf(&[object4, object5]);
+    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
+    let items = outline::outline_items(&mut pdf).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "Chapter One");
+    assert_eq!(items[0].object_ref, ObjectRef::new(4, 0));
+}
+
+#[test]
+fn outline_items_decodes_utf16be_title() {
+    // /Title as a UTF-16BE string with BOM: FE FF 65 E5 = U+65E5 ("日").
+    let object4 = b"4 0 obj\n<< /Title <FEFF65E5> /Parent 3 0 R >>\nendobj\n".to_vec();
+    let pdf = single_outline_pdf(&[object4]);
+    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
+    let items = outline::outline_items(&mut pdf).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "日");
+}
+
+#[test]
+fn outline_items_uses_untitled_when_title_absent() {
+    // An outline item without a /Title must keep yielding "<untitled>".
+    let object4 = b"4 0 obj\n<< /Parent 3 0 R >>\nendobj\n".to_vec();
+    let pdf = single_outline_pdf(&[object4]);
+    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
+    let items = outline::outline_items(&mut pdf).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "<untitled>");
+}
+
+#[test]
+fn outline_items_serializes_non_string_title() {
+    // A `/Title` that is neither a string nor an indirect reference (here an
+    // integer) is not a valid PDF text string; it falls back to its serialized
+    // form rather than erroring.
+    let object4 = b"4 0 obj\n<< /Title 42 /Parent 3 0 R >>\nendobj\n".to_vec();
+    let pdf = single_outline_pdf(&[object4]);
+    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
+    let items = outline::outline_items(&mut pdf).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "42");
+}
+
+/// Build a minimal PDF whose catalog points at an `/Outlines` tree with a single
+/// top-level item (object 4). `tail` supplies object 4 and any objects it refers
+/// to, numbered consecutively from 4.
+fn single_outline_pdf(tail: &[Vec<u8>]) -> Vec<u8> {
+    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >>\nendobj\n".to_vec();
+    let object2 = b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n".to_vec();
+    let object3 =
+        b"3 0 obj\n<< /Type /Outlines /First 4 0 R /Last 4 0 R /Count 1 >>\nendobj\n".to_vec();
+    let mut objects = vec![object1, object2, object3];
+    objects.extend_from_slice(tail);
+    finalize_pdf(&objects)
+}
+
+#[test]
 fn font_entries_collects_indirect_and_named_fonts() {
     let pdf = pdf_with_metadata_outline_and_fonts();
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
