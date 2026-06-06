@@ -1832,10 +1832,9 @@ fn generate_list_appearance<R: Read + Seek>(
     // ── Determine selected indices ─────────────────────────────────────────────
     // /I (integer array) takes priority; missing/invalid → fall back to /V.
     let selected: std::collections::BTreeSet<usize> = {
-        let i_val = {
-            let obj = pdf.resolve_borrowed(widget_ref)?;
-            obj.as_dict().and_then(|d| d.get("I").cloned())
-        };
+        // /I may live on a parent field (like /Opt, /V); walk the inheritance
+        // chain so a /Parent-only widget still highlights the selected rows.
+        let i_val = resolve_inherited_object(pdf, widget_ref, b"I")?;
         let i_arr = resolve_opt_array(pdf, i_val);
 
         if let Some(arr) = i_arr {
@@ -1913,11 +1912,8 @@ fn generate_list_appearance<R: Read + Seek>(
     };
 
     // ── /TI — top index (first visible option) ────────────────────────────────
-    // Non-negative and in-bounds (review-pattern #3).
-    let ti_val = {
-        let obj = pdf.resolve_borrowed(widget_ref)?;
-        obj.as_dict().and_then(|d| d.get("TI").cloned())
-    };
+    // Inherited like /Opt and /I; non-negative and in-bounds (review-pattern #3).
+    let ti_val = resolve_inherited_object(pdf, widget_ref, b"TI")?;
     let ti: usize = match ti_val {
         Some(Object::Reference(r)) => {
             let resolved = pdf.resolve(r)?;
@@ -4880,6 +4876,73 @@ mod tests {
                 && tj_strings.iter().any(|s| s == b"Blue"),
             "inherited /Opt not rendered: {tj_strings:?}"
         );
+    }
+
+    /// Parent field carries /Opt + /I; child widget has only /Parent + /Rect.
+    fn build_inherited_i_list_pdf() -> Vec<u8> {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [5 0 R] /DR <<>> /DA (/Helv 10 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /Parent 5 0 R \
+              /Rect [100 600 300 700]>>\nendobj\n",
+        );
+        let off5 = raw.len() as u64;
+        // Parent: list field with /I [1] (Green selected), no /V.
+        raw.extend_from_slice(
+            b"5 0 obj\n<</FT /Ch /T (list) /Ff 0 /Opt [(Red) (Green) (Blue)] \
+              /I [1] /Kids [4 0 R]>>\nendobj\n",
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n\
+             {off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n\
+             {off4:010} 00000 n \n{off5:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        raw
+    }
+
+    /// Regression: /I inherited from a parent field must drive the selection
+    /// highlight (the child widget has no direct /I or /V).
+    #[test]
+    fn ch_list_inherits_i_from_parent_field() {
+        let mut pdf = Pdf::open(Cursor::new(build_inherited_i_list_pdf())).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Ch widget handled");
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not a stream");
+        };
+        // A highlight rectangle (re … f) must be emitted because a row is
+        // selected via the inherited /I. With no selection there would be no
+        // fill op preceding the text.
+        let mut saw_re = false;
+        let mut saw_fill = false;
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            if let ContentToken::Op { operator, .. } = tok {
+                if operator == b"re" {
+                    saw_re = true;
+                } else if operator == b"f" && saw_re {
+                    saw_fill = true;
+                }
+            }
+        }
+        assert!(saw_fill, "inherited /I did not produce a selection highlight");
     }
 
     /// non-Ch field → generate_choice_field_appearance must return None.
