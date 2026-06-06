@@ -1,9 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-// `Object` / `ObjectRef` are used by later tasks' tests in this file; keep the
-// imports as specified by the implementation plan.
-#[allow(unused_imports)]
-use flpdf::{Object, ObjectRef, Pdf};
+use flpdf::Pdf;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -63,6 +60,19 @@ fn no_outline_pdf() -> Vec<u8> {
     )
 }
 
+/// Catalog with an `/Outlines` dict present but with no `/First` child.
+fn outline_present_but_empty_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /Count 0 >>"),
+        ],
+        1,
+    )
+}
+
 #[test]
 fn has_outlines_true_when_present() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
@@ -72,5 +82,11 @@ fn has_outlines_true_when_present() {
 #[test]
 fn has_outlines_false_when_absent() {
     let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    assert!(!pdf.outline().has_outlines().unwrap());
+}
+
+#[test]
+fn has_outlines_false_when_outline_dict_has_no_first() {
+    let mut pdf = Pdf::open(Cursor::new(outline_present_but_empty_pdf())).unwrap();
     assert!(!pdf.outline().has_outlines().unwrap());
 }
