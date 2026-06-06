@@ -11,7 +11,9 @@ use flpdf::{
     SIG_FLAGS_SIGNATURES_EXIST,
 };
 use flpdf::{
-    check_reader_with_options, filters, fonts,
+    check_reader_with_options, enumerate_document_annotations, filters, flatten_annotations,
+    flatten_rotation_on_pages, fonts, generate_button_field_appearance,
+    generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
         format_json_side_file_path, stream_payload_for_decode_level, DecodeLevel, JsonKey,
@@ -25,10 +27,11 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version,
     resources::remove_unreferenced_resources,
-    write_pdf_with_options, CompressStreams, CopyEncryptionSource, Dictionary, EncryptMethod,
-    EncryptParams, NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode,
-    PasswordMode, Pdf, PdfOpenOptions, PermissionsConfig, PrintPermission,
-    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
+    write_pdf_with_options, AnnotationObjectHelper, CompressStreams, CopyEncryptionSource,
+    Dictionary, EncryptMethod, EncryptParams, FlattenMode, FormFieldObjectHelper,
+    NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PasswordMode, Pdf,
+    PdfOpenOptions, PermissionsConfig, PrintPermission, RemoveUnreferencedResources, Severity,
+    Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -1015,6 +1018,49 @@ struct RewriteCommand {
     #[arg(long = "stream-data", value_enum)]
     stream_data: Option<CliStreamDataMode>,
 
+    /// Flatten annotations into page content (qpdf `--flatten-annotations`).
+    ///
+    /// MODE is `all`, `screen`, or `print`:
+    /// - `all`: bake every visible annotation into the page content stream.
+    /// - `screen`: only annotations that render on screen (not when printed).
+    /// - `print`: only annotations flagged for printing.
+    ///
+    /// Combine with `--generate-appearances` to first synthesize missing
+    /// form-field appearance streams; generation always runs before
+    /// flattening. Requires a full rewrite of the document.
+    #[arg(
+        long = "flatten-annotations",
+        value_enum,
+        value_name = "MODE",
+        help = "Flatten annotations into page content; MODE is all, screen, or print"
+    )]
+    flatten_annotations: Option<CliFlattenMode>,
+
+    /// Generate appearance streams for form fields that lack them
+    /// (qpdf `--generate-appearances`).
+    ///
+    /// Form fields whose widgets have no `/AP` `/N` appearance are rendered
+    /// from their current value (`/V`) and default appearance (`/DA`). Useful
+    /// before `--flatten-annotations` so value-only fields are not dropped.
+    /// Requires a full rewrite of the document.
+    #[arg(
+        long = "generate-appearances",
+        help = "Generate appearance streams for form fields that lack them"
+    )]
+    generate_appearances: bool,
+
+    /// Flatten page rotation by baking `/Rotate` into page content
+    /// (qpdf `--flatten-rotation`).
+    ///
+    /// Removes each page's `/Rotate` entry and rewrites its content,
+    /// `/MediaBox`, and annotation rectangles so the visible orientation is
+    /// unchanged. Requires a full rewrite of the document.
+    #[arg(
+        long = "flatten-rotation",
+        help = "Flatten page rotation by baking /Rotate into content"
+    )]
+    flatten_rotation: bool,
+
     /// qpdf-compatible page-operation flags (--pages / --rotate /
     /// --split-pages / --collate / --empty). See [`PageOpArgs`].
     #[command(flatten)]
@@ -1056,6 +1102,30 @@ impl From<CliStreamDataMode> for StreamDataMode {
             CliStreamDataMode::Preserve => StreamDataMode::Preserve,
             CliStreamDataMode::Uncompress => StreamDataMode::Uncompress,
             CliStreamDataMode::Compress => StreamDataMode::Compress,
+        }
+    }
+}
+
+/// `--flatten-annotations=all|screen|print` (qpdf-compatible).
+///
+/// Selects which annotations are baked into page content by
+/// [`flatten_annotations`]:
+/// - `all`: every visible annotation.
+/// - `screen`: annotations that render on screen but not when printed.
+/// - `print`: annotations flagged for printing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliFlattenMode {
+    All,
+    Screen,
+    Print,
+}
+
+impl From<CliFlattenMode> for FlattenMode {
+    fn from(v: CliFlattenMode) -> Self {
+        match v {
+            CliFlattenMode::All => FlattenMode::All,
+            CliFlattenMode::Screen => FlattenMode::Screen,
+            CliFlattenMode::Print => FlattenMode::Print,
         }
     }
 }
@@ -1325,6 +1395,9 @@ fn main() {
             false,                              // normalize_content
             false,                              // coalesce_contents
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
+            false,                              // generate_appearances (not on top-level surface)
+            None,                               // flatten_annotations (not on top-level surface)
+            false,                              // flatten_rotation (not on top-level surface)
             options,
         );
         if result.is_ok() {
@@ -1464,6 +1537,9 @@ fn main() {
             false,                              // normalize_content
             false,                              // coalesce_contents
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
+            false,                              // generate_appearances (not on top-level surface)
+            None,                               // flatten_annotations (not on top-level surface)
+            false,                              // flatten_rotation (not on top-level surface)
             options,
         )
     };
@@ -1807,6 +1883,24 @@ fn run_command(command: Commands) -> CliResult<()> {
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
 
+            // --flatten-annotations / --generate-appearances / --flatten-rotation
+            // are applied only on run_rewrite's NON-linearize branch (the
+            // content-mutation passes do not exist on the linearize path). Pairing
+            // them with --linearize would silently drop the requested
+            // transformation, so reject the combination loudly instead — the same
+            // shape as the --linearize + page-ops guard below.
+            if cmd.linearize
+                && (cmd.generate_appearances
+                    || cmd.flatten_annotations.is_some()
+                    || cmd.flatten_rotation)
+            {
+                eprintln!(
+                    "flpdf: --linearize cannot be combined with \
+                     --flatten-annotations/--generate-appearances/--flatten-rotation"
+                );
+                std::process::exit(1);
+            }
+
             // Page-operation dispatch (flpdf-9hc.8.12). When --pages is set
             // the extraction pipeline owns the write; otherwise --rotate /
             // --split-pages decorate a plain rewrite. --linearize with page
@@ -1837,11 +1931,15 @@ fn run_command(command: Commands) -> CliResult<()> {
                     || cmd.decrypt
                     || !cmd.encrypt.is_empty()
                     || cmd.copy_encryption_from.is_some()
+                    || cmd.generate_appearances
+                    || cmd.flatten_annotations.is_some()
+                    || cmd.flatten_rotation
                 {
                     eprintln!(
                         "flpdf: --normalize-content / --coalesce-contents / \
                          --remove-restrictions / --decrypt / --encrypt / \
-                         --copy-encryption-from are \
+                         --copy-encryption-from / --flatten-annotations / \
+                         --generate-appearances / --flatten-rotation are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
                          the page operation"
@@ -1895,6 +1993,9 @@ fn run_command(command: Commands) -> CliResult<()> {
                 normalize_content,
                 coalesce_contents,
                 remove_unref,
+                cmd.generate_appearances,
+                cmd.flatten_annotations,
+                cmd.flatten_rotation,
                 options,
             )
         }
@@ -2446,6 +2547,9 @@ fn run_rewrite(
     normalize_content: bool,
     coalesce_contents: bool,
     remove_unref: CliRemoveUnreferencedResources,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
+    flatten_rotation: bool,
     options: WriteOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
@@ -2567,7 +2671,10 @@ fn run_rewrite(
         // `rewrite_default_is_qpdf_equivalent_full_rewrite` CLI test.
         let needs_mutation = coalesce_contents
             || normalize_content
-            || remove_unref != CliRemoveUnreferencedResources::No;
+            || remove_unref != CliRemoveUnreferencedResources::No
+            || generate_appearances
+            || flatten_annotations_mode.is_some()
+            || flatten_rotation;
         if needs_mutation {
             options.full_rewrite = true;
         }
@@ -2610,6 +2717,26 @@ fn run_rewrite(
             remove_unreferenced_resources(&mut pdf, remove_unref.into())?;
         }
 
+        // Step 4: generate missing form-field appearance streams
+        // (--generate-appearances). MUST run before --flatten-annotations so
+        // value-only fields (e.g. a filled text field with no /AP) are baked
+        // into page content instead of being dropped (acceptance ordering:
+        // generate first, flatten second).
+        if generate_appearances {
+            generate_missing_appearances(&mut pdf)?;
+        }
+
+        // Step 5: flatten annotations into page content (--flatten-annotations).
+        if let Some(mode) = flatten_annotations_mode {
+            flatten_annotations(&mut pdf, mode.into())?;
+        }
+
+        // Step 6: flatten page rotation into content (--flatten-rotation).
+        if flatten_rotation {
+            let page_refs = pages::page_refs(&mut pdf)?;
+            flatten_rotation_on_pages(&mut pdf, &page_refs)?;
+        }
+
         let mut out = File::create(output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
 
@@ -2624,6 +2751,70 @@ fn run_rewrite(
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
     }
+    Ok(())
+}
+
+/// Generate `/AP` `/N` appearance streams for widget annotations that lack one
+/// (`--generate-appearances`).
+///
+/// Walks every page's `/Annots`, keeps only Widget annotations whose `/AP` `/N`
+/// is missing, and renders an appearance from the field's `/FT` (`Tx` → text,
+/// `Btn` → button, `Ch` → choice). Widgets that already carry an `/AP` `/N` are
+/// left untouched, matching qpdf which only fills in *missing* appearances.
+///
+/// Review-pattern compliance:
+/// - #2 (indirect references): `/FT` is read via [`FormFieldObjectHelper::field_type`]
+///   and `/AP` via [`AnnotationObjectHelper::appearance`], both of which resolve
+///   references and the inheritable field tree internally.
+/// - #4 (graph traversal): targets are limited to the known `/Annots` positions
+///   surfaced by [`enumerate_document_annotations`] rather than a brute-force
+///   scan of all live objects.
+///
+/// The candidate `ObjectRef`s are collected up front into an owned `Vec` so the
+/// per-widget mutation loop holds a single `&mut pdf` borrow at a time.
+fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
+    // Collect candidate widget refs first (the enumeration borrows `pdf`).
+    let mut candidates: Vec<ObjectRef> = Vec::new();
+    for (_page_ref, annots) in enumerate_document_annotations(pdf)? {
+        for annot in annots {
+            if annot.is_widget {
+                candidates.push(annot.annot_ref);
+            }
+        }
+    }
+
+    for widget_ref in candidates {
+        // Skip widgets that already have a normal appearance (/AP /N). qpdf
+        // only synthesizes appearances for fields that lack them.
+        let has_normal = {
+            let mut helper = AnnotationObjectHelper::new(widget_ref, pdf);
+            helper.appearance()?.is_some_and(|ap| ap.get("N").is_some())
+        };
+        if has_normal {
+            continue;
+        }
+
+        // Dispatch on the inherited /FT (resolved through the field tree). The
+        // generate_* helpers each re-verify /FT and return None on a mismatch,
+        // so this is a fast-path filter that avoids three speculative calls.
+        let field_type = {
+            let mut helper = FormFieldObjectHelper::new(widget_ref, pdf);
+            helper.field_type()?
+        };
+        match field_type.as_deref() {
+            Some(b"Tx") => {
+                generate_text_field_appearance(pdf, widget_ref)?;
+            }
+            Some(b"Btn") => {
+                generate_button_field_appearance(pdf, widget_ref)?;
+            }
+            Some(b"Ch") => {
+                generate_choice_field_appearance(pdf, widget_ref)?;
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
