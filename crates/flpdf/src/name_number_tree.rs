@@ -174,6 +174,75 @@ fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
     dict
 }
 
+/// Build a **number** tree from a **non-empty, pre-sorted** `(key, value)` slice.
+///
+/// Number-tree analogue of [`build_name_tree`]: identical layout (single leaf
+/// `<= LEAF_MAX`, else `div_ceil`-chunked leaves under a `/Limits` + `/Kids`
+/// root, leaves allocated first then the root), but with `/Nums` leaves and
+/// **integer** `/Limits`. Returns `(root_ref, nodes)` for the caller to
+/// [`Pdf::set_object`]; the caller owns numbering, the empty case, and catalog
+/// wiring.
+///
+/// # Panics (debug)
+/// Debug-asserts `entries` is non-empty.
+pub fn build_number_tree<A>(
+    entries: &[(i64, Object)],
+    mut alloc: A,
+) -> (ObjectRef, Vec<(ObjectRef, Object)>)
+where
+    A: FnMut() -> ObjectRef,
+{
+    debug_assert!(
+        !entries.is_empty(),
+        "build_number_tree requires non-empty entries"
+    );
+    let mut nodes: Vec<(ObjectRef, Object)> = Vec::new();
+
+    if entries.len() <= LEAF_MAX {
+        let leaf_ref = alloc();
+        nodes.push((leaf_ref, Object::Dictionary(build_num_leaf_dict(entries))));
+        return (leaf_ref, nodes);
+    }
+
+    let n_leaves = entries.len().div_ceil(LEAF_MAX);
+    let chunk_size = entries.len().div_ceil(n_leaves);
+    let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
+    for chunk in entries.chunks(chunk_size) {
+        let leaf_ref = alloc();
+        nodes.push((leaf_ref, Object::Dictionary(build_num_leaf_dict(chunk))));
+        kids.push(Object::Reference(leaf_ref));
+    }
+    let first = entries.first().map(|(k, _)| *k).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| *k).unwrap_or_default();
+    let mut root = Dictionary::new();
+    root.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
+    );
+    root.insert("Kids", Object::Array(kids));
+    let root_ref = alloc();
+    nodes.push((root_ref, Object::Dictionary(root)));
+    (root_ref, nodes)
+}
+
+/// Leaf node dict: `/Limits [first last]` (integers) + `/Nums [k1 v1 ...]`.
+fn build_num_leaf_dict(entries: &[(i64, Object)]) -> Dictionary {
+    let first = entries.first().map(|(k, _)| *k).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| *k).unwrap_or_default();
+    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
+    for (key, val) in entries {
+        pairs.push(Object::Integer(*key));
+        pairs.push(val.clone());
+    }
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
+    );
+    dict.insert("Nums", Object::Array(pairs));
+    dict
+}
+
 /// Internal generic walker shared by name + number readers.
 ///
 /// `node` is a `Reference` (resolved + cycle-tracked here) or a `Dictionary`.
@@ -705,5 +774,83 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![(5, 99)]);
+    }
+
+    fn mk_num_entries(n: usize) -> Vec<(i64, Object)> {
+        (0..n)
+            .map(|i| {
+                (
+                    i as i64 * 10,
+                    Object::Reference(ObjectRef::new(1000 + i as u32, 0)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_number_tree_single_leaf_no_kids() {
+        let entries = mk_num_entries(3);
+        let mut next = 0u32;
+        let (root, nodes) = build_number_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(root, nodes[0].0);
+        let d = nodes[0].1.as_dict().expect("leaf dict");
+        assert!(d.get("Kids").is_none(), "single leaf must not have /Kids");
+        assert!(d.get("Nums").is_some());
+        // Integer /Limits.
+        let Some(Object::Array(lim)) = d.get("Limits") else {
+            panic!("limits")
+        };
+        assert_eq!(lim[0], Object::Integer(0));
+        assert_eq!(lim[1], Object::Integer(20));
+    }
+
+    #[test]
+    fn build_number_tree_multi_leaf_root_kids_alloc_order() {
+        let entries = mk_num_entries(LEAF_MAX + 1); // 33 -> 2 leaves + root
+        let mut next = 0u32;
+        let (root, nodes) = build_number_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(root, ObjectRef::new(3, 0), "root allocated last");
+        let root_dict = nodes[2].1.as_dict().expect("root dict");
+        let kids = root_dict
+            .get("Kids")
+            .and_then(Object::as_array)
+            .expect("root needs /Kids");
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0], Object::Reference(ObjectRef::new(1, 0)));
+        // Every node carries integer /Limits + a /Nums leaf where applicable.
+        for (_, n) in &nodes {
+            assert!(n.as_dict().expect("dict").get("Limits").is_some());
+        }
+    }
+
+    #[test]
+    fn build_number_tree_round_trips_via_read_number_tree() {
+        let mut pdf = empty_pdf();
+        let entries: Vec<(i64, Object)> =
+            vec![(0, Object::Integer(100)), (5, Object::Integer(200))];
+        let mut next = 500u32;
+        let (root, nodes) = build_number_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        for (r, n) in nodes {
+            pdf.set_object(r, n);
+        }
+        let out: Vec<(i64, i64)> = read_number_tree(
+            &mut pdf,
+            Object::Reference(root),
+            |_, v| Ok(v.as_integer()),
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(out, vec![(0, 100), (5, 200)]);
     }
 }
