@@ -41,7 +41,10 @@ fn outline_pdf() -> Vec<u8> {
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
             (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /First 6 0 R /Last 6 0 R /Next 7 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (A) /Parent 4 0 R /First 6 0 R /Last 6 0 R /Next 7 0 R /Count 1 >>",
+            ),
             (6, "<< /Title (A1) /Parent 5 0 R /Dest [3 0 R /Fit] >>"),
             (7, "<< /Title (B) /Parent 4 0 R /Prev 5 0 R /Count 2 >>"),
         ],
@@ -126,21 +129,29 @@ fn iter_yields_preorder() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
     let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
     assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
+
+    // iter() yields a flattened view: every node has its children cleared.
+    let mut pdf2 = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    assert!(pdf2
+        .outline()
+        .iter()
+        .unwrap()
+        .all(|n| n.children.is_empty()));
 }
 
 #[test]
 fn walk_visits_preorder_with_depth() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let mut seen: Vec<(String, usize)> = Vec::new();
+    let mut seen: Vec<(String, usize, usize)> = Vec::new(); // (title, depth, child_count)
     pdf.outline()
-        .walk(|node, depth| seen.push((node.title.clone(), depth)))
+        .walk(|node, depth| seen.push((node.title.clone(), depth, node.children.len())))
         .unwrap();
     assert_eq!(
         seen,
         vec![
-            ("A".to_string(), 0),
-            ("A1".to_string(), 1),
-            ("B".to_string(), 0),
+            ("A".to_string(), 0, 1), // A has one child (A1) — populated in walk
+            ("A1".to_string(), 1, 0),
+            ("B".to_string(), 0, 0),
         ]
     );
 }
