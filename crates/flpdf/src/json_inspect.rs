@@ -921,71 +921,6 @@ fn label_dict_to_json(dict: &Dictionary) -> JsonValue {
     ])
 }
 
-/// Walk a number-tree node for `/PageLabels`, collecting `(page_index, label_dict)` pairs.
-///
-/// Handles both leaf nodes (`/Nums`) and intermediate nodes (`/Kids`).  When both are
-/// present (spec violation), `/Nums` takes priority.  The `seen` set prevents infinite
-/// loops on cyclic indirect references.
-fn walk_pagelabels<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: Object,
-    entries: &mut Vec<(i64, Dictionary)>,
-    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<(), ConvertError> {
-    if depth > max_depth {
-        return Ok(()); // silently truncate to avoid unbounded recursion
-    }
-
-    let dict = match node {
-        Object::Dictionary(d) => d,
-        _ => return Ok(()), // unexpected node type — skip
-    };
-
-    // /Nums takes priority over /Kids (spec §7.9.7 leaf vs. intermediate).
-    if let Some(nums) = dict.get("Nums").and_then(Object::as_array) {
-        let mut iter = nums.iter();
-        while let (Some(idx_obj), Some(label_obj)) = (iter.next(), iter.next()) {
-            let idx = match idx_obj {
-                Object::Integer(n) => *n,
-                _ => continue, // malformed — skip pair
-            };
-            // Label value may be a direct Dictionary or an indirect Reference.
-            let label_dict = match label_obj {
-                Object::Dictionary(d) => d.clone(),
-                Object::Reference(r) => {
-                    match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-                        Object::Dictionary(d) => d.clone(),
-                        _ => continue,
-                    }
-                }
-                _ => continue,
-            };
-            entries.push((idx, label_dict));
-        }
-        return Ok(());
-    }
-
-    // No /Nums — try /Kids (intermediate node).
-    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        let kids = kids.to_vec();
-        for kid in kids {
-            let kid_ref = match kid {
-                Object::Reference(r) => r,
-                _ => continue,
-            };
-            if !seen.insert(kid_ref) {
-                continue; // cycle — skip
-            }
-            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
-            walk_pagelabels(pdf, child, entries, seen, depth + 1, max_depth)?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Build the qpdf JSON v2 `"pagelabels"` section.
 ///
 /// Returns a [`JsonValue::Array`] where each element is a JSON object with
@@ -1020,22 +955,19 @@ pub fn build_pagelabels_section<R: Read + Seek>(
         None => return Ok(JsonValue::Array(vec![])),
     };
 
-    // Resolve indirect reference if needed.
-    let root_node = match pagelabels_val {
-        Object::Reference(r) => pdf.resolve_borrowed(r).map_err(ConvertError::from)?.clone(),
-        other => other,
-    };
-
-    let mut entries: Vec<(i64, Dictionary)> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    walk_pagelabels(
+    // The generic number-tree walker resolves the root reference itself, so
+    // pass `pagelabels_val` (Reference or Dictionary) straight in.
+    let mut entries: Vec<(i64, Dictionary)> = crate::name_number_tree::read_number_tree(
         pdf,
-        root_node,
-        &mut entries,
-        &mut seen,
-        0,
+        pagelabels_val,
+        |pdf, v| match v {
+            Object::Dictionary(d) => Ok(Some(d)),
+            Object::Reference(r) => Ok(pdf.resolve_borrowed(r)?.as_dict().cloned()),
+            _ => Ok(None),
+        },
         DEFAULT_MAX_PAGE_TREE_DEPTH,
-    )?;
+    )
+    .map_err(ConvertError::from)?;
 
     // Sort by page index (ascending) — spec guarantees ascending order in a
     // well-formed number tree, but we sort defensively.
