@@ -1687,14 +1687,11 @@ fn resolve_combo_display<R: Read + Seek>(
     widget_ref: ObjectRef,
     value: Vec<u8>,
 ) -> Vec<u8> {
-    // /Opt lives directly on the widget/field — no inheritance walk needed.
-    let opt_val = {
-        let obj = match pdf.resolve_borrowed(widget_ref) {
-            Ok(o) => o,
-            Err(_) => return value,
-        };
-        obj.as_dict().and_then(|d| d.get("Opt").cloned())
-    };
+    // /Opt may live on a parent field (child widget carries only /Parent), so
+    // walk the field inheritance chain like /FT, /V, and /DA do.
+    let opt_val = resolve_inherited_object(pdf, widget_ref, b"Opt")
+        .ok()
+        .flatten();
     let opt_arr = match resolve_opt_array(pdf, opt_val) {
         Some(a) => a,
         None => return value,
@@ -1781,12 +1778,10 @@ fn generate_list_appearance<R: Read + Seek>(
     da: &crate::default_appearance::DefaultAppearance,
     font: ChFontInfo,
 ) -> Result<Option<ObjectRef>> {
-    // ── Collect options from /Opt (direct on widget/field, no inheritance) ────
-    // /Opt may be an indirect reference (review-pattern #2).
-    let opt_val = {
-        let obj = pdf.resolve_borrowed(widget_ref)?;
-        obj.as_dict().and_then(|d| d.get("Opt").cloned())
-    };
+    // ── Collect options from /Opt (inherited from a parent field if needed) ──
+    // /Opt may sit on a parent field (child widget carries only /Parent) and may
+    // itself be an indirect reference (review-pattern #2).
+    let opt_val = resolve_inherited_object(pdf, widget_ref, b"Opt")?;
     let opt_arr = resolve_opt_array(pdf, opt_val).unwrap_or_default();
     let n_opts = opt_arr.len();
 
@@ -4813,6 +4808,78 @@ mod tests {
                 .as_bytes(),
         );
         raw
+    }
+
+    /// /Opt on a PARENT field, child widget carries only /Parent.
+    ///
+    ///  1 Catalog  2 Pages  3 Page  4 Widget(/Parent 5)  5 Ch field(/Opt,/V)
+    fn build_inherited_opt_list_pdf() -> Vec<u8> {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [5 0 R] /DR <<>> /DA (/Helv 10 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        // Child widget: only /Parent + /Rect, no /FT, /Opt, /V of its own.
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /Parent 5 0 R \
+              /Rect [100 600 300 700]>>\nendobj\n",
+        );
+        let off5 = raw.len() as u64;
+        // Parent field: carries /FT, /Ff (list), /Opt, /V.
+        raw.extend_from_slice(
+            b"5 0 obj\n<</FT /Ch /T (list) /Ff 0 /Opt [(Red) (Green) (Blue)] \
+              /V (Green) /Kids [4 0 R]>>\nendobj\n",
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n\
+             {off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n\
+             {off4:010} 00000 n \n{off5:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        raw
+    }
+
+    /// Regression: /Opt inherited from a parent field must still populate the
+    /// list appearance (the child widget has no direct /Opt).
+    #[test]
+    fn ch_list_inherits_opt_from_parent_field() {
+        let mut pdf = Pdf::open(Cursor::new(build_inherited_opt_list_pdf())).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Ch widget handled");
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not a stream");
+        };
+        // All three inherited options must be rendered as Tj strings.
+        let mut tj_strings: Vec<Vec<u8>> = Vec::new();
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            if let ContentToken::Op { operands, operator } = tok {
+                if operator == b"Tj" {
+                    if let Some(Object::String(b)) = operands.first() {
+                        tj_strings.push(b.clone());
+                    }
+                }
+            }
+        }
+        assert!(
+            tj_strings.iter().any(|s| s == b"Red")
+                && tj_strings.iter().any(|s| s == b"Green")
+                && tj_strings.iter().any(|s| s == b"Blue"),
+            "inherited /Opt not rendered: {tj_strings:?}"
+        );
     }
 
     /// non-Ch field → generate_choice_field_appearance must return None.
