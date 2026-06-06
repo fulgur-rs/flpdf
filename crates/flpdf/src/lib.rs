@@ -114,7 +114,8 @@ pub use filespec_helper::{
     EmbeddedFileStream, FileParamDates, FileSpec, FileSpecBuilder,
 };
 pub use name_number_tree::{
-    build_name_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
+    build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,
+    LEAF_MAX,
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
@@ -123,6 +124,7 @@ pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_wi
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
+pub use page_label_document_helper::{LabelRange, LabelStyle, PageLabelDocumentHelper};
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
