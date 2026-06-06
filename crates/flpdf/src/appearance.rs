@@ -169,25 +169,6 @@ pub(crate) fn install_normal_appearance<R: Read + Seek>(
     Ok(xobj_ref)
 }
 
-/// Resolve `da_font_name` (a raw name from a `/DA` string, e.g. `b"Helv"`) to
-/// a standard-font triple `(base_font_name_bytes, freshly_allocated_ObjectRef,
-/// StandardFont)`, or `None` when the name is not recognised.
-///
-/// A new [`ObjectRef`] is **allocated but not yet registered** — the caller
-/// (e.g. [`install_normal_appearance`]) writes the font object.  Allocating
-/// here and writing there keeps all allocations sequential.
-pub(crate) fn ensure_standard_font<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    da_font_name: &[u8],
-) -> Result<Option<(Vec<u8>, ObjectRef, StandardFont)>> {
-    let Some(sf) = StandardFont::from_base_name(da_font_name) else {
-        return Ok(None);
-    };
-    let base_name = official_base_name(sf).to_vec();
-    let obj_ref = next_object_ref(pdf)?;
-    Ok(Some((base_name, obj_ref, sf)))
-}
-
 // ── TextAppearanceParams ─────────────────────────────────────────────────────
 
 /// Parameters for the pure text-appearance builder [`build_text_appearance_content`].
@@ -355,18 +336,18 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
     let multiline = (ff >> 12) & 1 != 0; // bit 13 (1-indexed) = bit 12 (0-indexed)
 
     // ── 7. Font resolution — DA font name → standard font ─────────────────
-    let font_name_bytes: &[u8] = da.font_name.as_deref().unwrap_or(b"Helv");
+    // The /DA name may be (a) a direct standard-font alias (e.g. "Helv"), or
+    // (b) a /DR resource key (e.g. "F1") whose /BaseFont is a standard font.
+    // Fall back to Helvetica only when neither resolves.
+    let font_name_bytes: Vec<u8> = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
 
-    // Try DA font name, then alias "Helv" as the hard fallback.
-    let (base_font_name, font_obj_ref, std_font) =
-        if let Some(triple) = ensure_standard_font(pdf, font_name_bytes)? {
-            triple
-        } else {
-            // Unknown font: substitute Helvetica.
-            let (n, r, s) = ensure_standard_font(pdf, b"Helv")?
-                .expect("Helv always resolves to a StandardFont");
-            (n, r, s)
-        };
+    let std_font = match StandardFont::from_base_name(&font_name_bytes) {
+        Some(sf) => sf,
+        None => lookup_dr_basefont(pdf, widget_ref, &font_name_bytes)?
+            .unwrap_or(StandardFont::Helvetica),
+    };
+    let base_font_name = official_base_name(std_font).to_vec();
+    let font_obj_ref = next_object_ref(pdf)?;
 
     // ── 8. Font size (auto-size heuristic) ────────────────────────────────
     let font_size = if da.auto_size {
@@ -379,15 +360,11 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
         da.font_size
     };
 
-    // ── 9. Resource name — use the name from /DA if it resolves, else
-    //       the official base name.
-    let font_resource_name: Vec<u8> = if StandardFont::from_base_name(font_name_bytes).is_some() {
-        // Prefer the name exactly as it appears in /DA so that if the viewer
-        // already knows the resource it can reuse it.
-        font_name_bytes.to_vec()
-    } else {
-        base_font_name.clone()
-    };
+    // ── 9. Resource name — the Tf operator and the synthesized
+    //       /Resources/Font key both use the name exactly as /DA wrote it
+    //       (e.g. "Helv" or "F1"), which we map to the standard font dict
+    //       installed below.
+    let font_resource_name: Vec<u8> = font_name_bytes.clone();
 
     // ── 10. Build content stream ───────────────────────────────────────────
     let params = TextAppearanceParams {
@@ -724,6 +701,103 @@ fn resolve_da<R: Read + Seek>(
     };
 
     Ok(da)
+}
+
+/// Resolve a (possibly indirect) dictionary-valued entry to an owned
+/// [`Dictionary`], returning `None` for absent/null/non-dict values.
+fn resolve_to_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Option<Object>,
+) -> Result<Option<Dictionary>> {
+    match value {
+        None | Some(Object::Null) => Ok(None),
+        Some(Object::Dictionary(d)) => Ok(Some(d)),
+        Some(Object::Reference(r)) => Ok(pdf.resolve(r)?.into_dict()),
+        Some(_) => Ok(None),
+    }
+}
+
+/// Resolve a `/DA` font resource name (e.g. `b"F1"`) to a [`StandardFont`] by
+/// consulting the `/DR` `/Font` resource dictionaries.
+///
+/// `/DA` references a font by the resource key it carries in `/DR` (the field's
+/// own `/DR`, walked up the `/Parent` chain, then the `/AcroForm` `/DR`). The
+/// referenced font's `/BaseFont` may name a standard-14 font even when the
+/// resource key itself (`F1`) is not a recognised alias. Returns the standard
+/// font when `/BaseFont` resolves to one, else `None`.
+///
+/// All intermediate values are resolved through indirect references
+/// (review-pattern #2): `/DR`, `/Font`, the font resource, and `/BaseFont` can
+/// each be stored indirectly.
+fn lookup_dr_basefont<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+    resource_name: &[u8],
+) -> Result<Option<StandardFont>> {
+    // Collect candidate /DR dictionaries: the field /Parent chain first
+    // (most specific), then the document /AcroForm /DR.
+    let mut dr_candidates: Vec<Dictionary> = Vec::new();
+
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = start;
+    let mut depth: usize = 0;
+    loop {
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH || !seen.insert(current) {
+            break;
+        }
+        let node = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node.as_dict() else {
+            break;
+        };
+        let dr_val = dict.get("DR").cloned();
+        let parent_val = dict.get("Parent").cloned();
+        let _ = node;
+        if let Some(dr) = resolve_to_dict(pdf, dr_val)? {
+            dr_candidates.push(dr);
+        }
+        match parent_val {
+            Some(Object::Reference(r)) => {
+                current = r;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+
+    if let Some(root_ref) = pdf.root_ref() {
+        let catalog = pdf.resolve_borrowed(root_ref)?;
+        let acroform_val = catalog.as_dict().and_then(|c| c.get("AcroForm").cloned());
+        let _ = catalog;
+        if let Some(acroform) = resolve_to_dict(pdf, acroform_val)? {
+            let dr_val = acroform.get("DR").cloned();
+            if let Some(dr) = resolve_to_dict(pdf, dr_val)? {
+                dr_candidates.push(dr);
+            }
+        }
+    }
+
+    for dr in dr_candidates {
+        let font_val = dr.get("Font").cloned();
+        let Some(font_dict) = resolve_to_dict(pdf, font_val)? else {
+            continue;
+        };
+        let res_val = font_dict.get(resource_name).cloned();
+        let Some(res) = resolve_to_dict(pdf, res_val)? else {
+            continue;
+        };
+        let base_font = match res.get("BaseFont").cloned() {
+            Some(Object::Name(n)) => Some(n),
+            Some(Object::Reference(r)) => pdf.resolve(r)?.into_name(),
+            _ => None,
+        };
+        if let Some(bf) = base_font {
+            if let Some(sf) = StandardFont::from_base_name(&bf) {
+                return Ok(Some(sf));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Extract the `/Rect` of the widget as a [`PageBox`].
@@ -1351,6 +1425,98 @@ mod tests {
         assert!(
             matches!(xobj2, Object::Stream(_)),
             "re-parsed xobj is not a stream"
+        );
+    }
+
+    /// PDF whose `/DA` references a `/DR` resource key (`/F1`) rather than a
+    /// standard-font alias, where `/F1`'s `/BaseFont` is `/Times-Roman`.
+    ///
+    ///  1 0: Catalog (AcroForm with /DR /Font /F1 5 0 R, /DA (/F1 12 Tf))
+    ///  2 0: Pages   3 0: Page   4 0: Widget (Tx)   5 0: Font (Times-Roman)
+    fn build_dr_font_tx_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <</Font <</F1 5 0 R>>>> /DA (/F1 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+              /V (Hi) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Times-Roman>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn da_font_resolves_via_dr_basefont() {
+        // /DA names /F1 (a /DR key, not a standard alias). The appearance must
+        // resolve /F1 -> /BaseFont /Times-Roman and synthesize a Times-Roman
+        // font dict, while the Tf operator keeps the /DA resource name "F1".
+        let mut pdf = Pdf::open(Cursor::new(build_dr_font_tx_pdf())).expect("parse");
+        let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Tx field handled");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not a stream");
+        };
+
+        // Tf operator must reference the /DA resource name "F1".
+        let mut tf_name: Option<Vec<u8>> = None;
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            if let ContentToken::Op { operands, operator } = tok {
+                if operator == b"Tf" {
+                    tf_name = operands.first().and_then(|o| o.as_name()).map(|n| n.to_vec());
+                }
+            }
+        }
+        assert_eq!(tf_name.as_deref(), Some(b"F1" as &[u8]), "Tf name must stay F1");
+
+        // The synthesized /Resources/Font/F1 must be Times-Roman.
+        let Object::Dictionary(res) = stream.dict.get("Resources").expect("resources") else {
+            panic!("resources not dict");
+        };
+        let Object::Dictionary(fonts) = res.get("Font").expect("font dict") else {
+            panic!("font not dict");
+        };
+        let font_ref = match fonts.get("F1").expect("F1 entry") {
+            Object::Reference(r) => *r,
+            other => panic!("F1 not a ref: {other:?}"),
+        };
+        let Object::Dictionary(fdict) = pdf.resolve(font_ref).expect("resolve font") else {
+            panic!("font obj not dict");
+        };
+        assert_eq!(
+            fdict.get("BaseFont"),
+            Some(&Object::Name(b"Times-Roman".to_vec())),
+            "BaseFont must resolve from /DR to Times-Roman"
         );
     }
 
