@@ -330,7 +330,11 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
     let quadding = resolve_inherited_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
 
     // ── 6. /Ff — field flags (bit 13 = multiline, 0-indexed) ─────────────
-    let ff = resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0) as u32;
+    // A negative or out-of-range /Ff is malformed; treat it as "no flags". A
+    // bare `as u32` would wrap a negative value to a large unsigned int and
+    // could spuriously set the multiline bit (review pattern #3).
+    let ff = u32::try_from(resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0))
+        .unwrap_or(0);
     let multiline = (ff >> 12) & 1 != 0; // bit 13 (1-indexed) = bit 12 (0-indexed)
 
     // ── 7. Font resolution — DA font name → standard font ─────────────────
@@ -925,7 +929,12 @@ fn render_multiline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
     // Top baseline — allow small top margin.
     let first_y = p.bbox_h - p.font_size - 2.0;
 
-    let lines = word_wrap(&p.text_bytes, p.font_size, p.bbox_w, p.std_font);
+    // Text is drawn inset ~2 units from each side (see compute_x_offset and the
+    // left margin used for the first Td), so wrap against the effective drawable
+    // width — `bbox_w - 4.0` — to avoid lines that fit `bbox_w` yet overrun the
+    // right edge. Clamp to non-negative for degenerate boxes.
+    let effective_w = (p.bbox_w - 4.0).max(0.0);
+    let lines = word_wrap(&p.text_bytes, p.font_size, effective_w, p.std_font);
     let mut prev_x = 0.0_f64; // tracks last Td x so we can emit deltas
 
     for (i, line) in lines.iter().enumerate() {
