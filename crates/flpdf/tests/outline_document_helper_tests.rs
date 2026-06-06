@@ -155,3 +155,84 @@ fn walk_visits_preorder_with_depth() {
         ]
     );
 }
+
+/// Build a linear chain of `n` nested outline items (each is the sole child of
+/// the previous). Object numbers: catalog 1, pages 2, page 3, outlines 4,
+/// items 5..5+n. Returns PDF bytes.
+fn deep_outline_pdf(n: u32) -> Vec<u8> {
+    let mut objs: Vec<(u32, String)> = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+    ];
+    // outline root (4) points First/Last at first item (5).
+    objs.push((
+        4,
+        "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>".to_string(),
+    ));
+    for i in 0..n {
+        let num = 5 + i;
+        let parent = if i == 0 { 4 } else { num - 1 };
+        let mut body = format!("<< /Title (L{i}) /Parent {parent} 0 R");
+        if i + 1 < n {
+            let child = num + 1;
+            body.push_str(&format!(" /First {child} 0 R /Last {child} 0 R"));
+        }
+        body.push_str(" >>");
+        objs.push((num, body));
+    }
+    let refs: Vec<(u32, &str)> = objs.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    build_pdf(&refs, 1)
+}
+
+#[test]
+fn deep_outline_walks_to_full_depth() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(30))).unwrap();
+    let count = pdf.outline().iter().unwrap().count();
+    assert_eq!(count, 30);
+    // deepest node is at depth 29
+    let max_depth = pdf
+        .outline()
+        .iter()
+        .unwrap()
+        .map(|n| n.depth)
+        .max()
+        .unwrap();
+    assert_eq!(max_depth, 29);
+}
+
+#[test]
+fn depth_cap_is_enforced() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
+    let err = pdf.outline().get_root_with_max_depth(5);
+    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
+}
+
+/// Outline with a /Next cycle: 5 -> Next 6 -> Next 5 ...
+fn cyclic_outline_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>"),
+            (5, "<< /Title (X) /Parent 4 0 R /Next 6 0 R >>"),
+            (6, "<< /Title (Y) /Parent 4 0 R /Next 5 0 R >>"), // cycle back to 5
+        ],
+        1,
+    )
+}
+
+#[test]
+fn cyclic_outline_terminates() {
+    let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
+    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
+    assert_eq!(titles, vec!["X", "Y"]);
+}
