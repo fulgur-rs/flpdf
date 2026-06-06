@@ -295,6 +295,89 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         }
         Ok(out)
     }
+
+    /// Collect the raw `(index, value Object)` entries of the `/PageLabels` tree
+    /// verbatim (values un-decoded), for rebuild.
+    fn raw_entries(&mut self) -> Result<Vec<(i64, Object)>> {
+        let Some(root) = self.pagelabels_root()? else {
+            return Ok(vec![]);
+        };
+        crate::name_number_tree::read_number_tree(
+            self.pdf,
+            root,
+            |_, v| Ok(Some(v)),
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+    }
+
+    /// Insert or replace the label range whose first page index is
+    /// `first_page_idx`. Rebuilds the `/Nums` tree and points the catalog
+    /// `/PageLabels` at the new (indirect) root.
+    pub fn set_range(&mut self, first_page_idx: i64, range: LabelRange) -> Result<()> {
+        let mut entries = self.raw_entries()?;
+        let value = Object::Dictionary(range.to_dict());
+        match entries.iter_mut().find(|(k, _)| *k == first_page_idx) {
+            Some(e) => e.1 = value,
+            None => {
+                entries.push((first_page_idx, value));
+                entries.sort_by_key(|(k, _)| *k);
+            }
+        }
+        self.rebuild(entries)
+    }
+
+    /// Remove the label range whose first page index is `first_page_idx`.
+    /// Returns `false` if no such range exists. When the last range is removed,
+    /// `/PageLabels` is dropped from the catalog.
+    pub fn remove_range(&mut self, first_page_idx: i64) -> Result<bool> {
+        let mut entries = self.raw_entries()?;
+        let before = entries.len();
+        entries.retain(|(k, _)| *k != first_page_idx);
+        if entries.len() == before {
+            return Ok(false);
+        }
+        self.rebuild(entries)?;
+        Ok(true)
+    }
+
+    /// Rebuild `/PageLabels` from sorted entries and patch the catalog. Empty
+    /// entries → remove `/PageLabels`.
+    fn rebuild(&mut self, entries: Vec<(i64, Object)>) -> Result<()> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(());
+        };
+        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+            return Ok(());
+        };
+
+        if entries.is_empty() {
+            catalog.remove("PageLabels");
+            self.pdf
+                .set_object(catalog_ref, Object::Dictionary(catalog));
+            return Ok(());
+        }
+
+        let mut next_num: u32 = self
+            .pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let mut alloc = move || -> ObjectRef {
+            next_num += 1;
+            ObjectRef::new(next_num, 0)
+        };
+
+        let (root_ref, nodes) = crate::name_number_tree::build_number_tree(&entries, &mut alloc);
+        for (r, node) in nodes {
+            self.pdf.set_object(r, node);
+        }
+        catalog.insert("PageLabels", Object::Reference(root_ref));
+        self.pdf
+            .set_object(catalog_ref, Object::Dictionary(catalog));
+        Ok(())
+    }
 }
 
 /// Extension constructor mirroring [`Pdf::acroform`].
@@ -394,7 +477,7 @@ mod tests {
     #[test]
     fn no_pagelabels_defaults_to_decimal() {
         let mut pdf = pdf_with_pagelabels(vec![]); // empty /Nums -> ranges empty
-        // Remove the (empty) /PageLabels to exercise the absent path too:
+                                                   // Remove the (empty) /PageLabels to exercise the absent path too:
         let mut h = pdf.page_labels();
         assert_eq!(h.label_string_for_page(0).unwrap(), "1");
         assert_eq!(h.label_string_for_page(4).unwrap(), "5");
@@ -403,8 +486,7 @@ mod tests {
 
     #[test]
     fn page_before_first_range_defaults_to_decimal() {
-        let mut pdf =
-            pdf_with_pagelabels(vec![Object::Integer(3), label_dict("R", Some(1), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(3), label_dict("R", Some(1), None)]);
         let mut h = pdf.page_labels();
         assert_eq!(
             h.label_string_for_page(0).unwrap(),
@@ -433,6 +515,81 @@ mod tests {
         assert!(out
             .iter()
             .any(|(idx, r)| *idx == 2 && r.style == LabelStyle::Decimal));
+    }
+
+    #[test]
+    fn set_range_inserts_and_round_trips() {
+        let mut pdf = pdf_with_pagelabels(vec![]); // start with empty /PageLabels root
+        {
+            let mut h = pdf.page_labels();
+            h.set_range(
+                0,
+                LabelRange {
+                    style: LabelStyle::RomanLower,
+                    prefix: String::new(),
+                    start: 1,
+                },
+            )
+            .unwrap();
+            h.set_range(
+                3,
+                LabelRange {
+                    style: LabelStyle::Decimal,
+                    prefix: "A-".into(),
+                    start: 1,
+                },
+            )
+            .unwrap();
+        }
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[0].1.style, LabelStyle::RomanLower);
+        assert_eq!(ranges[1].0, 3);
+        assert_eq!(ranges[1].1.prefix, "A-");
+        assert_eq!(h.label_string_for_page(4).unwrap(), "A-2");
+    }
+
+    #[test]
+    fn set_range_replaces_existing_index() {
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        {
+            let mut h = pdf.page_labels();
+            h.set_range(
+                0,
+                LabelRange {
+                    style: LabelStyle::RomanUpper,
+                    prefix: String::new(),
+                    start: 1,
+                },
+            )
+            .unwrap();
+        }
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].1.style, LabelStyle::RomanUpper);
+    }
+
+    #[test]
+    fn remove_range_drops_entry_and_pagelabels_when_empty() {
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        {
+            let mut h = pdf.page_labels();
+            assert!(h.remove_range(0).unwrap());
+            assert!(!h.remove_range(99).unwrap(), "absent index => false");
+        }
+        let mut h = pdf.page_labels();
+        assert!(
+            !h.has_page_labels().unwrap(),
+            "/PageLabels dropped when empty"
+        );
+        assert_eq!(
+            h.label_string_for_page(0).unwrap(),
+            "1",
+            "defaults after removal"
+        );
     }
 
     #[test]
@@ -478,7 +635,11 @@ mod tests {
             prefix: "Cover".into(),
             start: 1,
         };
-        assert_eq!(none.format(9), "Cover", "None style => prefix only, no number");
+        assert_eq!(
+            none.format(9),
+            "Cover",
+            "None style => prefix only, no number"
+        );
     }
 
     #[test]
