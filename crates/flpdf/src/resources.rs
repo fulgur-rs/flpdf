@@ -45,6 +45,11 @@ struct CatRefInfo {
     /// Groups skipped by Auto (shared top-level) do not contribute used-names,
     /// but they still increment `group_count`, so the ref ends up protected.
     used_union: BTreeSet<Vec<u8>>,
+    /// True if any top-level `/Resources` group pointing to this sub-dict belongs
+    /// to a page whose content stream could not be decoded (flpdf-s9s). Such a
+    /// sub-dict must never be pruned in either mode: the corrupt page's true
+    /// usage is unknown, so we conservatively retain every entry.
+    protected: bool,
 }
 
 /// Canonical identifier for a top-level `/Resources` group.
@@ -64,6 +69,17 @@ enum ResGroupKey {
     AncestorInline(ObjectRef),
     /// `/Resources` is an inline dict on the page dict itself; key is the page's ObjectRef.
     PageInline(ObjectRef),
+}
+
+/// Canonical [`ResGroupKey`] for a page's resources location, or `None` when the
+/// page has no `/Resources` anywhere in its chain (nothing to key on / prune).
+fn res_group_key(loc: &ResourcesLoc, page_ref: ObjectRef) -> Option<ResGroupKey> {
+    match loc {
+        ResourcesLoc::Indirect(r) => Some(ResGroupKey::Indirect(*r)),
+        ResourcesLoc::AncestorInline(a) => Some(ResGroupKey::AncestorInline(*a)),
+        ResourcesLoc::PageInline => Some(ResGroupKey::PageInline(page_ref)),
+        ResourcesLoc::None => None,
+    }
 }
 
 // ── Resource location ─────────────────────────────────────────────────────────
@@ -163,10 +179,14 @@ pub enum RemoveUnreferencedResources {
 ///
 /// # Errors
 ///
-/// Propagates errors from [`Pdf::resolve`], content-stream decoding, or
-/// content-stream tokenisation. Malformed-but-recoverable content is silently
-/// skipped (an error in one page's content stream does not abort the whole
-/// operation, matching qpdf's liberal behaviour).
+/// Propagates errors from page-tree traversal ([`crate::pages::page_refs`]) and
+/// resources-location resolution ([`resources_location`]).
+///
+/// A failure to decode or tokenise an individual page's content stream does NOT
+/// abort the operation: that page is skipped and its resources are
+/// conservatively retained (never pruned), matching qpdf's liberal behaviour and
+/// the graceful degradation already applied to Form XObjects
+/// (see `recurse_form_xobject`).
 pub fn remove_unreferenced_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mode: RemoveUnreferencedResources,
@@ -213,6 +233,13 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     // For pages with PageInline /Resources, store per-page used names keyed by index.
     let mut inline_used: Vec<Option<UsedNames>> = vec![None; page_refs.len()];
 
+    // Resources groups belonging to pages whose content stream could not be
+    // decoded/parsed (flpdf-s9s). Their resources are conservatively retained:
+    // the prune loops skip these groups, and the cat-ref sharing table (step 3b)
+    // marks their indirect category sub-dicts `protected` so cross-group pruning
+    // also leaves them untouched.
+    let mut protected_groups: BTreeSet<ResGroupKey> = BTreeSet::new();
+
     for (i, &page_ref) in page_refs.iter().enumerate() {
         // Determine if this page's resources are shared (for Auto mode skip).
         let is_shared = match &page_res_loc[i] {
@@ -226,8 +253,21 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
             continue;
         }
 
-        // Collect the used names for this page.
-        let used = collect_used_names_for_page(pdf, page_ref)?;
+        // Collect the used names for this page. A failure to decode or tokenise
+        // the page's /Contents (e.g. a corrupt FlateDecode stream in a damaged
+        // PDF) must NOT abort the whole operation — degrade gracefully like the
+        // Form XObject decode-failure path (see `recurse_form_xobject`). Mark the
+        // page's resources group as protected so its resources are conservatively
+        // retained rather than pruned against an incomplete used-name set.
+        let used = match collect_used_names_for_page(pdf, page_ref) {
+            Ok(used) => used,
+            Err(_) => {
+                if let Some(key) = res_group_key(&page_res_loc[i], page_ref) {
+                    protected_groups.insert(key);
+                }
+                continue;
+            }
+        };
 
         match &page_res_loc[i] {
             ResourcesLoc::Indirect(r) => {
@@ -317,12 +357,13 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
         // Use the typed ResGroupKey enum so that PageInline(page_ref) never
         // collides with a real Indirect(ObjectRef) even when the object numbers
         // happen to be identical (roborev low 指摘2).
-        let group_key: ResGroupKey = match loc {
-            ResourcesLoc::Indirect(r) => ResGroupKey::Indirect(*r),
-            ResourcesLoc::AncestorInline(a) => ResGroupKey::AncestorInline(*a),
-            ResourcesLoc::PageInline => ResGroupKey::PageInline(page_refs[i]),
-            ResourcesLoc::None => unreachable!("None loc filtered above by res_dict_opt"),
-        };
+        let group_key: ResGroupKey = res_group_key(loc, page_refs[i])
+            .unwrap_or_else(|| unreachable!("None loc filtered above by res_dict_opt"));
+
+        // Pages whose content failed to decode poison their whole resources group
+        // (flpdf-s9s): every indirect category sub-dict they reference must be
+        // retained, even if some *other* group would otherwise prune it.
+        let group_protected = protected_groups.contains(&group_key);
 
         // What used-names does this group contribute?
         // None if the group was Auto-skipped (shared top-level).
@@ -346,8 +387,10 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
                         .or_insert_with(|| CatRefInfo {
                             group_count: 0,
                             used_union: BTreeSet::new(),
+                            protected: false,
                         });
                     info.group_count += 1;
+                    info.protected |= group_protected;
 
                     // Merge this group's known used-names for this category.
                     if let Some(used_map) = group_used {
@@ -364,16 +407,28 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
     }
 
     // ── 4. Prune: indirect resources objects ──────────────────────────────────
+    // Skip groups poisoned by an undecodable page (flpdf-s9s): in Yes mode a
+    // failed page sharing this dict with a healthy sibling would otherwise see
+    // its resources pruned against the sibling's incomplete used-name union.
     for (res_ref, used) in &ref_used {
+        if protected_groups.contains(&ResGroupKey::Indirect(*res_ref)) {
+            continue;
+        }
         prune_resources_object(pdf, *res_ref, used, &cat_ref_map, mode)?;
     }
 
     // ── 5. Prune: inline (direct) resources embedded in ancestor /Pages nodes ──
     for (ancestor_ref, used) in &ancestor_inline_used {
+        if protected_groups.contains(&ResGroupKey::AncestorInline(*ancestor_ref)) {
+            continue;
+        }
         prune_ancestor_inline_resources(pdf, *ancestor_ref, used, &cat_ref_map, mode)?;
     }
 
     // ── 6. Prune: inline (direct) resources embedded in page dicts ────────────
+    // A poisoned PageInline group never populates `inline_used[i]` (collection
+    // `continue`s on failure), so it is already skipped by the `else { continue }`
+    // below; no explicit `protected_groups` check is needed here.
     for (i, used_opt) in inline_used.iter().enumerate() {
         let Some(used) = used_opt else { continue };
         let page_ref = page_refs[i];
@@ -910,6 +965,12 @@ fn apply_pruning<R: Read + Seek>(
                 let map_key: CatRefKey = (cat_key.to_vec(), cat_ref);
 
                 if let Some(info) = cat_ref_map.get(&map_key) {
+                    if info.protected {
+                        // A page referencing this sub-dict has an undecodable
+                        // content stream (flpdf-s9s): retain every entry in both
+                        // modes, since that page's true usage is unknown.
+                        continue;
+                    }
                     if mode == RemoveUnreferencedResources::Auto && info.group_count > 1 {
                         // Auto: multiple top-level /Resources groups share this
                         // indirect cat sub-dict → protect it, same as top-level
