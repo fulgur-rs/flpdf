@@ -337,7 +337,7 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
 /// This mirrors the threshold used by qpdf's aggressive rebuild policy.  Any
 /// tree with more than this many entries will have two levels (root + leaves);
 /// three levels are never emitted.
-pub const LEAF_MAX: usize = 32;
+pub use crate::name_number_tree::LEAF_MAX;
 
 /// Default maximum depth when descending `/Kids` chains.
 ///
@@ -413,12 +413,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         Some(v) => v,
         None => return Ok(vec![]),
     };
-    crate::name_number_tree::read_name_tree(
-        pdf,
-        ef_value,
-        |_, v| Ok(v.as_ref_id()),
-        max_depth,
-    )
+    crate::name_number_tree::read_name_tree(pdf, ef_value, |_, v| Ok(v.as_ref_id()), max_depth)
 }
 
 // ── Raw collector (writer source of truth) ────────────────────────────────────
@@ -597,39 +592,11 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
         return Ok(());
     }
 
-    // ── Build the name-tree nodes ─────────────────────────────────────────────
-    let tree_root_ref = if entries.len() <= LEAF_MAX {
-        // Single-leaf root.
-        let leaf = build_leaf_dict(&entries);
-        let leaf_ref = alloc();
-        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-        leaf_ref
-    } else {
-        // Multi-leaf: chunk entries evenly, each chunk ≤ LEAF_MAX.
-        let n_leaves = entries.len().div_ceil(LEAF_MAX);
-        let chunk_size = entries.len().div_ceil(n_leaves);
-
-        let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
-        for chunk in entries.chunks(chunk_size) {
-            let leaf = build_leaf_dict(chunk);
-            let leaf_ref = alloc();
-            pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-            kids.push(Object::Reference(leaf_ref));
-        }
-
-        // Root node: /Kids + /Limits
-        let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-        let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
-        let mut root = Dictionary::new();
-        root.insert(
-            "Limits",
-            Object::Array(vec![Object::String(first), Object::String(last)]),
-        );
-        root.insert("Kids", Object::Array(kids));
-        let root_ref = alloc();
-        pdf.set_object(root_ref, Object::Dictionary(root));
-        root_ref
-    };
+    // ── Build the name-tree nodes (shared builder) ────────────────────────────
+    let (tree_root_ref, nodes) = crate::name_number_tree::build_name_tree(&entries, &mut alloc);
+    for (node_ref, node) in nodes {
+        pdf.set_object(node_ref, node);
+    }
 
     // ── Patch the catalog /Names dictionary ───────────────────────────────────
     // Resolve or create the /Names dict.  We always store it as an indirect
@@ -660,35 +627,6 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
     Ok(())
-}
-
-/// Build a leaf name-tree node dictionary from an ordered slice of entries.
-///
-/// The returned dictionary has:
-/// - `/Limits [first_key, last_key]`
-/// - `/Names [key₁, ref₁, key₂, ref₂, …]`
-fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
-    debug_assert!(
-        !entries.is_empty(),
-        "build_leaf_dict called with empty slice"
-    );
-
-    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
-
-    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
-    for (key, val) in entries {
-        pairs.push(Object::String(key.clone()));
-        pairs.push(val.clone());
-    }
-
-    let mut dict = Dictionary::new();
-    dict.insert(
-        "Limits",
-        Object::Array(vec![Object::String(first), Object::String(last)]),
-    );
-    dict.insert("Names", Object::Array(pairs));
-    dict
 }
 
 // ── Tests for remove_attachment ───────────────────────────────────────────────
