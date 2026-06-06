@@ -1698,10 +1698,6 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Walk a name-tree node for `/EmbeddedFiles`, collecting `(name_string, filespec_ref)` pairs.
-///
-/// Both leaf nodes (`/Names`) and intermediate nodes (`/Kids`) are handled.
-/// The `seen` set prevents infinite loops on cyclic references.
 /// Source of a filespec value found in the EmbeddedFiles name tree.
 ///
 /// PDF name tree leaf values can be either an indirect Reference (the common
@@ -1710,67 +1706,6 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
 enum FilespecSource {
     Indirect(crate::ObjectRef),
     Direct(Dictionary),
-}
-
-fn walk_embedded_files_name_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: Object,
-    entries: &mut Vec<(String, FilespecSource)>,
-    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<(), ConvertError> {
-    if depth > max_depth {
-        return Ok(());
-    }
-
-    let dict = match node {
-        Object::Dictionary(d) => d,
-        _ => return Ok(()),
-    };
-
-    // /Names: leaf node with [name1 value1 name2 value2 ...] pairs
-    if let Some(names) = dict.get("Names").and_then(Object::as_array) {
-        let mut iter = names.iter();
-        while let (Some(name_obj), Some(value_obj)) = (iter.next(), iter.next()) {
-            // name is a PDF string (text or byte string)
-            let name_str = match name_obj {
-                Object::String(bytes) => decode_pdf_text_string(bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
-                _ => continue,
-            };
-            // value can be either an indirect reference or a direct filespec
-            // dictionary inlined in the name tree.
-            let source = match value_obj {
-                Object::Reference(r) => FilespecSource::Indirect(*r),
-                Object::Dictionary(d) => FilespecSource::Direct(d.clone()),
-                _ => continue,
-            };
-            entries.push((name_str, source));
-        }
-        return Ok(());
-    }
-
-    // /Kids: intermediate node
-    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        let kids = kids.to_vec();
-        for kid in kids {
-            let kid_ref = match kid {
-                Object::Reference(r) => r,
-                _ => continue,
-            };
-            if !seen.insert(kid_ref) {
-                continue; // cycle guard
-            }
-            let child = pdf
-                .resolve_borrowed(kid_ref)
-                .map_err(ConvertError::from)?
-                .clone();
-            walk_embedded_files_name_tree(pdf, child, entries, seen, depth + 1, max_depth)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Build a JSON entry for one filespec dictionary.
@@ -2034,17 +1969,28 @@ pub fn build_attachments_section<R: Read + Seek>(
         _ => return Ok(JsonValue::Object(vec![])),
     };
 
-    // Walk the name tree to collect (name, filespec_ref) pairs
-    let mut raw_entries: Vec<(String, FilespecSource)> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    walk_embedded_files_name_tree(
+    // Walk the name tree to collect (name, filespec source) pairs via the
+    // shared name-tree reader; decode the raw string key afterwards.
+    let mut raw_entries: Vec<(String, FilespecSource)> = crate::name_number_tree::read_name_tree(
         pdf,
         ef_root,
-        &mut raw_entries,
-        &mut seen,
-        0,
+        |_, v| {
+            Ok(match v {
+                Object::Reference(r) => Some(FilespecSource::Indirect(r)),
+                Object::Dictionary(d) => Some(FilespecSource::Direct(d)),
+                _ => None,
+            })
+        },
         DEFAULT_MAX_PAGE_TREE_DEPTH,
-    )?;
+    )
+    .map_err(ConvertError::from)?
+    .into_iter()
+    .map(|(key_bytes, source)| {
+        let name = decode_pdf_text_string(&key_bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(&key_bytes).into_owned());
+        (name, source)
+    })
+    .collect();
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
