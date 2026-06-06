@@ -46,6 +46,7 @@ pub mod attachment_list;
 pub mod cache;
 pub mod check;
 pub mod content_stream;
+pub mod default_appearance;
 pub mod diagnostics;
 pub mod embedded_files;
 pub mod encrypt_setup;
@@ -101,6 +102,7 @@ pub use check::{check_reader, check_reader_strict, check_reader_with_options, Ch
 pub use content_stream::{
     normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,
 };
+pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use embedded_files::{
     delete_embedded_file, insert_embedded_file, list_embedded_files,
