@@ -2788,7 +2788,13 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
         // only synthesizes appearances for fields that lack them.
         let has_normal = {
             let mut helper = AnnotationObjectHelper::new(widget_ref, pdf);
-            helper.appearance()?.is_some_and(|ap| ap.get("N").is_some())
+            // Treat /AP/N == null the same as absent. The flattening pass
+            // (resolve_ap_n) skips a null /N, so counting it as "has normal"
+            // here would skip generation too — silently dropping the widget's
+            // value from both passes.
+            helper
+                .appearance()?
+                .is_some_and(|ap| ap.get("N").is_some_and(|val| !matches!(val, Object::Null)))
         };
         if has_normal {
             continue;
