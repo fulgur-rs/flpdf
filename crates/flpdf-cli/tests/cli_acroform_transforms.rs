@@ -34,6 +34,7 @@ use std::io::BufReader;
 
 /// Build a minimal PDF from a flat list of object bodies (1-indexed from 1).
 fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    use std::io::Write;
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::with_capacity(objects.len());
     for object in objects {
@@ -41,18 +42,18 @@ fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
         bytes.extend_from_slice(object);
     }
     let start_xref = bytes.len();
-    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    // Write directly into the byte buffer (writeln! to a Vec<u8> is infallible)
+    // instead of allocating an intermediate String per line.
+    let _ = writeln!(&mut bytes, "xref\n0 {}", objects.len() + 1);
     bytes.extend_from_slice(b"0000000000 65535 f \n");
     for &offset in &offsets {
-        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        let _ = writeln!(&mut bytes, "{offset:010} 00000 n ");
     }
-    bytes.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            objects.len() + 1,
-            start_xref
-        )
-        .as_bytes(),
+    let _ = writeln!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+        objects.len() + 1,
+        start_xref
     );
     bytes
 }
