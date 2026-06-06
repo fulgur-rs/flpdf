@@ -114,6 +114,10 @@ where
 ///   `/Names`, under a root `/Limits` + `/Kids`. Leaves are allocated in order,
 ///   the root last.
 ///
+/// The number-tree analogue is [`build_number_tree`]; the two share this exact
+/// chunking/allocation layout and must be kept in sync (only the key encoding
+/// and the `/Names` vs `/Nums` leaf key differ).
+///
 /// # Panics (debug)
 /// Debug-asserts `entries` is non-empty.
 pub fn build_name_tree<A>(
