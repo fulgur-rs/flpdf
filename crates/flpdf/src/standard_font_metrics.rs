@@ -4836,4 +4836,33 @@ mod tests {
             );
         }
     }
+
+    // ── sorted-table invariant (binary search correctness) ─────────────────────
+
+    #[test]
+    fn glyph_tables_are_sorted() {
+        let all_fonts = [
+            StandardFont::Helvetica,
+            StandardFont::HelveticaBold,
+            StandardFont::HelveticaOblique,
+            StandardFont::HelveticaBoldOblique,
+            StandardFont::TimesRoman,
+            StandardFont::TimesBold,
+            StandardFont::TimesItalic,
+            StandardFont::TimesBoldItalic,
+            StandardFont::Courier,
+            StandardFont::CourierBold,
+            StandardFont::CourierOblique,
+            StandardFont::CourierBoldOblique,
+            StandardFont::Symbol,
+            StandardFont::ZapfDingbats,
+        ];
+        for font in all_fonts {
+            let table = font.glyph_table();
+            assert!(
+                table.windows(2).all(|w| w[0].0 < w[1].0),
+                "glyph table for {font:?} is not strictly sorted by glyph name"
+            );
+        }
+    }
 }
