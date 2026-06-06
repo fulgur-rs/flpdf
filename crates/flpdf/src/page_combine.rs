@@ -100,6 +100,15 @@ pub struct CombinedPage {
 ///
 /// The plan stores per-input [`PagePlan`]s so that downstream layers such as
 /// collation (8.6) and page-tree rebuild (8.8) can access them individually.
+///
+/// This type is part of the document page extraction and merge primitives epic
+/// (flpdf-5h5). It builds on the single-document [`PagePlan`] — one per input —
+/// and on the [`PageRange`] selection syntax used to choose pages from each
+/// input.
+///
+/// Runnable page-op demonstrations live in the crate's `examples/` directory;
+/// `examples/extract_pages.rs` shows the related single-document selection path
+/// via [`PagePlan`].
 #[derive(Debug, Clone)]
 pub struct CombinedPlan {
     /// Per-input plans, in input order.
