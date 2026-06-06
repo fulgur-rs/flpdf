@@ -100,7 +100,7 @@ fn get_root_materializes_tree_with_titles_counts_parents() {
     assert_eq!(roots.len(), 2);
     assert_eq!(roots[0].title, "A");
     assert_eq!(roots[0].depth, 0);
-    assert_eq!(roots[0].parent, Some(ObjectRef::new(4, 0)));
+    assert_eq!(roots[0].parent, None); // top-level: /Outlines dict is not an item -> None (qpdf getParent)
     assert_eq!(roots[0].count, 1);
     assert_eq!(roots[1].title, "B");
     assert_eq!(roots[1].count, 2);

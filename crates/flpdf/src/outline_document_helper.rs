@@ -18,8 +18,8 @@ pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = crate::outline::DEFAULT_MAX_OUTLINE
 /// One materialized node of the outline tree (a bookmark).
 ///
 /// Mirrors qpdf's `QPDFOutlineObjectHelper`. `children` are the resolved
-/// `/First`->`/Next` chain; `parent` is the containing item's ref (the
-/// `/Outlines` dict ref for top-level items). `count` is the raw `/Count` value
+/// `/First`->`/Next` chain; `parent` is the owning item's ref (`None` for
+/// top-level items). `count` is the raw `/Count` value
 /// (0 when absent), whose sign indicates open/closed per ISO 32000-1 section
 /// 12.3.3.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,8 +32,7 @@ pub struct OutlineNode {
     pub title: String,
     /// Raw `/Count` value; `0` when absent.
     pub count: i64,
-    /// Parent item ref; the `/Outlines` dict ref for top-level items. `None`
-    /// only if a future caller constructs a node outside the tree.
+    /// Parent item ref; `None` for top-level items.
     pub parent: Option<ObjectRef>,
     /// Resolved destination (set in a later task); `None` until then.
     pub dest: Option<Dest>,
@@ -77,13 +76,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
 
     /// Resolve the catalog `/Outlines` dict's `/First` child ref, if any.
     fn outline_root_first(&mut self) -> Result<Option<ObjectRef>> {
-        Ok(self.outline_root_ref_and_first()?.map(|(_, first)| first))
-    }
-
-    /// Resolve the catalog `/Outlines` dict ref together with its `/First` child
-    /// ref. Returns `None` unless both the `/Outlines` dict and a resolvable
-    /// `/First` exist. The dict ref becomes the `parent` of top-level items.
-    fn outline_root_ref_and_first(&mut self) -> Result<Option<(ObjectRef, ObjectRef)>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None);
         };
@@ -96,7 +88,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Object::Dictionary(root) = self.pdf.resolve_borrowed(outlines_ref)? else {
             return Ok(None);
         };
-        Ok(root.get_ref("First").map(|first| (outlines_ref, first)))
+        Ok(root.get_ref("First"))
     }
 
     /// Materialize and return the top-level outline nodes (qpdf
@@ -109,11 +101,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Like [`get_root`](Self::get_root) with a caller-supplied recursion limit.
     /// Returns [`crate::Error::Unsupported`] if the limit is exceeded.
     pub fn get_root_with_max_depth(&mut self, max_depth: usize) -> Result<Vec<OutlineNode>> {
-        let Some((root_ref, first)) = self.outline_root_ref_and_first()? else {
+        let Some(first) = self.outline_root_first()? else {
             return Ok(Vec::new());
         };
         let mut visited = BTreeSet::new();
-        self.build_siblings(first, 0, Some(root_ref), &mut visited, max_depth)
+        self.build_siblings(first, 0, None, &mut visited, max_depth)
     }
 
     /// Build a `/First`->`/Next` sibling chain into owned nodes.
