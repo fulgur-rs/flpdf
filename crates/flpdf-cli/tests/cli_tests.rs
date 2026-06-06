@@ -3205,6 +3205,66 @@ fn tx_form_pdf_with_ap() -> Vec<u8> {
     ])
 }
 
+/// Single-page AcroForm PDF with one Tx widget whose `/AP` `/N` is explicitly
+/// `null` (must be treated as absent — a real appearance should be generated).
+fn tx_form_pdf_with_null_ap_n() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm \
+          << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+          /V (Hello World) /Rect [100 700 300 720] /P 3 0 R \
+          /AP << /N null >> >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
+/// `--generate-appearances` must treat `/AP << /N null >>` as a *missing*
+/// appearance and synthesize a real one — not skip it (which would leave the
+/// widget value undrawable / droppable on a later flatten pass).
+#[test]
+fn rewrite_generate_appearances_replaces_null_ap_n() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_with_null_ap_n()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let mut helper = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let ap = helper
+        .appearance()
+        .unwrap()
+        .expect("widget should still have an /AP");
+    let n = ap.get("N").cloned();
+    // /N must now be a real (non-null) appearance, and resolve to a stream.
+    assert!(
+        matches!(n, Some(Object::Reference(_)) | Some(Object::Stream(_))),
+        "null /AP/N must be replaced by a real appearance, got {n:?}"
+    );
+    let n_resolved = match n {
+        Some(Object::Reference(r)) => pdf.resolve(r).unwrap(),
+        Some(other) => other,
+        None => panic!("/N missing"),
+    };
+    assert!(
+        matches!(n_resolved, Object::Stream(_)),
+        "/AP/N must resolve to a Form XObject stream"
+    );
+}
+
 /// `/Rotate` on a leaf page is removed (baked into content) by
 /// `--flatten-rotation`; the command exits 0 and produces a valid PDF.
 #[test]
