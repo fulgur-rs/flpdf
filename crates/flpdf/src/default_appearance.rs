@@ -91,46 +91,46 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
 
         match operator.as_slice() {
             b"Tf" => {
-                // Operands: /FontName size. `Tf` is only meaningful when both
-                // a name and a numeric size are present, so update all three
-                // fields together — a malformed `Tf` (missing/typed operand)
-                // is ignored wholesale rather than partially applied, which
-                // would otherwise yield a font/size pair that never appeared
-                // in the source `/DA`.
-                if let (Some(name), Some(size)) = (
-                    operands.first().and_then(|o| o.as_name()),
-                    operands.get(1).and_then(obj_as_f64),
-                ) {
-                    font_name = Some(name.to_vec());
-                    font_size = size;
-                    auto_size = size == 0.0;
+                // Operands: /FontName size. PDF operators consume their operands
+                // from the top of the stack, so read the **last** two operands
+                // (`[.., name, size]`) rather than the first two — any leading
+                // dangling operands (from malformed runs) must not be mistaken
+                // for `Tf`'s arguments. `Tf` is only meaningful when both a name
+                // and a numeric size are present, so update all three fields
+                // together; a malformed `Tf` (missing/typed operand) is ignored
+                // wholesale rather than partially applied.
+                if let [.., name, size] = operands.as_slice() {
+                    if let (Some(name), Some(size)) = (name.as_name(), obj_as_f64(size)) {
+                        font_name = Some(name.to_vec());
+                        font_size = size;
+                        auto_size = size == 0.0;
+                    }
                 }
             }
             b"g" => {
-                // Greyscale: g  (1 operand)
-                if let Some(gray) = operands.first().and_then(obj_as_f64) {
+                // Greyscale: g  (1 operand — top of stack)
+                if let Some(gray) = operands.last().and_then(obj_as_f64) {
                     color = TextColor::Gray(gray);
                 }
             }
             b"rg" => {
-                // Device RGB: r g b  (3 operands)
-                if let (Some(r), Some(g), Some(b)) = (
-                    operands.first().and_then(obj_as_f64),
-                    operands.get(1).and_then(obj_as_f64),
-                    operands.get(2).and_then(obj_as_f64),
-                ) {
-                    color = TextColor::Rgb(r, g, b);
+                // Device RGB: r g b  (3 operands — top of stack)
+                if let [.., r, g, b] = operands.as_slice() {
+                    if let (Some(r), Some(g), Some(b)) =
+                        (obj_as_f64(r), obj_as_f64(g), obj_as_f64(b))
+                    {
+                        color = TextColor::Rgb(r, g, b);
+                    }
                 }
             }
             b"k" => {
-                // Device CMYK: c m y k  (4 operands)
-                if let (Some(c), Some(m), Some(y), Some(k)) = (
-                    operands.first().and_then(obj_as_f64),
-                    operands.get(1).and_then(obj_as_f64),
-                    operands.get(2).and_then(obj_as_f64),
-                    operands.get(3).and_then(obj_as_f64),
-                ) {
-                    color = TextColor::Cmyk(c, m, y, k);
+                // Device CMYK: c m y k  (4 operands — top of stack)
+                if let [.., c, m, y, k] = operands.as_slice() {
+                    if let (Some(c), Some(m), Some(y), Some(k)) =
+                        (obj_as_f64(c), obj_as_f64(m), obj_as_f64(y), obj_as_f64(k))
+                    {
+                        color = TextColor::Cmyk(c, m, y, k);
+                    }
                 }
             }
             _ => {}
@@ -266,5 +266,29 @@ mod tests {
         assert_eq!(da.font_name.as_deref(), Some(b"Helv" as &[u8]));
         assert!(approx_eq(da.font_size, 12.0));
         assert!(!da.auto_size);
+    }
+
+    #[test]
+    fn leading_dangling_operands_use_stack_top() {
+        // PDF operators consume operands from the top of the stack. When extra
+        // leading operands precede an operator (malformed run, unrecognised
+        // sequence), the operator's real arguments are the *last* ones. Reading
+        // from the front would mistake the dangling `99 88` / `7 7` for the
+        // operands and either skip or mis-parse the operator.
+        let da = parse_default_appearance(b"99 88 /Helv 12 Tf 7 7 0.25 g");
+        assert_eq!(da.font_name.as_deref(), Some(b"Helv" as &[u8]));
+        assert!(approx_eq(da.font_size, 12.0));
+        assert!(!da.auto_size);
+        assert_eq!(da.color, TextColor::Gray(0.25));
+    }
+
+    #[test]
+    fn leading_dangling_operands_rgb_and_cmyk_use_stack_top() {
+        // rg / k must also read their 3 / 4 operands from the top of the stack.
+        let rgb = parse_default_appearance(b"42 1.0 0.0 0.0 rg");
+        assert_eq!(rgb.color, TextColor::Rgb(1.0, 0.0, 0.0));
+
+        let cmyk = parse_default_appearance(b"9 9 0.1 0.2 0.3 0.4 k");
+        assert_eq!(cmyk.color, TextColor::Cmyk(0.1, 0.2, 0.3, 0.4));
     }
 }
