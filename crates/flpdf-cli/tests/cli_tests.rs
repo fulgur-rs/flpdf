@@ -1,5 +1,8 @@
 use assert_cmd::Command;
-use flpdf::{acroform_sig_flags, filespec_helper::encode_utf16be, Object, Pdf};
+use flpdf::{
+    acroform_sig_flags, filespec_helper::encode_utf16be, AnnotationObjectHelper, Object, ObjectRef,
+    Pdf,
+};
 use predicates::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
@@ -3114,4 +3117,249 @@ fn no_original_object_ids_conflicts_with_json() {
         .stderr(predicate::str::contains("cannot be used with"))
         .stderr(predicate::str::contains("--json"))
         .stderr(predicate::str::contains("--no-original-object-ids"));
+}
+
+// ===========================================================================
+// flpdf-9hc.9.10: --flatten-annotations / --generate-appearances /
+// --flatten-rotation
+// ===========================================================================
+
+/// Assemble a classic cross-referenced PDF from a list of object bodies.
+///
+/// `objects[i]` is the full `"N 0 obj ... endobj\n"` body for object number
+/// `i + 1`. The /Root is always object 1.
+fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len() as u32);
+        bytes.extend_from_slice(object);
+    }
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for &offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            start_xref
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Single-page PDF rotated 90 degrees (/Rotate on the page).
+fn rotated_page_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Rotate 90 \
+          /MediaBox [0 0 200 100] /Contents 4 0 R >>\nendobj\n"
+            .to_vec(),
+        // /Length is the exact byte count of `BT (hi) Tj ET\n` (14 bytes); the
+        // full-rewrite reparse validates stream lengths strictly.
+        b"4 0 obj\n<< /Length 14 >>\nstream\nBT (hi) Tj ET\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
+/// Single-page AcroForm PDF with one Tx widget that carries `/V` but no `/AP`.
+fn tx_form_pdf_without_ap() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm \
+          << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+          /V (Hello World) /Rect [100 700 300 720] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
+/// Single-page AcroForm PDF with one Tx widget that already has an `/AP` `/N`
+/// Form XObject (so it can be flattened without first generating appearances).
+fn tx_form_pdf_with_ap() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm \
+          << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+          /V (Hello) /Rect [100 700 300 720] /P 3 0 R \
+          /AP << /N 6 0 R >> >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 200 20] \
+          /Length 17 >>\nstream\nBT (Hello) Tj ET\nendstream\nendobj\n"
+            .to_vec(),
+    ])
+}
+
+/// `/Rotate` on a leaf page is removed (baked into content) by
+/// `--flatten-rotation`; the command exits 0 and produces a valid PDF.
+#[test]
+fn rewrite_flatten_rotation_removes_rotate() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("rotated.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, rotated_page_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--flatten-rotation"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let page = pdf.resolve(page_refs[0]).unwrap();
+    let Object::Dictionary(dict) = page else {
+        panic!("page is not a dictionary");
+    };
+    // After flattening, /Rotate is either absent or normalized to 0.
+    let rotate = dict.get("Rotate").and_then(|o| o.as_integer());
+    assert!(
+        rotate.is_none() || rotate == Some(0),
+        "page /Rotate should be absent or 0 after --flatten-rotation, got {rotate:?}"
+    );
+}
+
+/// `--generate-appearances` synthesizes an `/AP` `/N` stream for a Tx widget
+/// that lacks one.
+#[test]
+fn rewrite_generate_appearances_adds_ap_n() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_without_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let widget = ObjectRef::new(4, 0);
+    let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
+    let ap = helper
+        .appearance()
+        .unwrap()
+        .expect("widget should have an /AP after --generate-appearances");
+    assert!(
+        ap.get("N").is_some(),
+        "widget /AP should carry an /N normal appearance"
+    );
+}
+
+/// `--flatten-annotations=all` bakes a widget that already has an `/AP` `/N`
+/// into page content and drops it from `/Annots`.
+#[test]
+fn rewrite_flatten_annotations_all_removes_widget_from_annots() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_with_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--flatten-annotations=all"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    assert!(
+        annots.is_empty(),
+        "flattened widget should be removed from /Annots, found {} annotation(s)",
+        annots.len()
+    );
+}
+
+/// `--generate-appearances` followed by `--flatten-annotations=all` cooperate:
+/// the missing appearance is generated first, then the widget is flattened into
+/// page content and removed from `/Annots`. Without the ordering (generate
+/// before flatten) the value-only widget would have no `/AP` to bake and would
+/// survive in `/Annots`.
+#[test]
+fn rewrite_generate_then_flatten_cooperate() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_without_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--generate-appearances",
+            "--flatten-annotations=all",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    assert!(
+        annots.is_empty(),
+        "widget should be generated-then-flattened away, found {} annotation(s)",
+        annots.len()
+    );
+}
+
+/// An invalid `--flatten-annotations` value is rejected by clap with a non-zero
+/// exit and a diagnostic on stderr.
+#[test]
+fn rewrite_flatten_annotations_rejects_invalid_mode() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--flatten-annotations=bogus",
+            "../../tests/fixtures/minimal.pdf",
+            "/tmp/flpdf-flatten-invalid-out.pdf",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("flatten-annotations"));
+}
+
+/// Combining `--linearize` with the flatten/generate passes is rejected loudly
+/// rather than silently dropping the requested transformation (the passes only
+/// run on the non-linearize rewrite branch).
+#[test]
+fn rewrite_linearize_with_flatten_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("rotated.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, rotated_page_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--linearize", "--flatten-rotation"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--linearize cannot be combined"));
 }
