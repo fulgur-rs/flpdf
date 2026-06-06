@@ -58,6 +58,7 @@ pub mod json_inspect;
 pub mod linearization;
 pub mod object;
 pub mod object_copy;
+pub mod name_number_tree;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod page_closure;
