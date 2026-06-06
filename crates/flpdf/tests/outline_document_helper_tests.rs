@@ -325,3 +325,61 @@ fn cyclic_dest_terminates_as_none() {
     // The cyclic /D bottoms out at the depth bound and resolves to no dest.
     assert!(roots[0].dest.is_none());
 }
+
+/// Modern named dest: outline /Dest (string) resolved via catalog /Names /Dests
+/// name tree. Name tree leaf maps (mydest) -> [3 0 R /Fit].
+fn named_dest_nametree_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names 8 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (N) /Parent 4 0 R /Dest (mydest) >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(mydest) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn dest_from_named_nametree() {
+    let mut pdf = Pdf::open(Cursor::new(named_dest_nametree_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    let dest = roots[0].dest.as_ref().expect("named dest should resolve");
+    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+}
+
+/// Legacy named dest: /Dest is a Name (/mydest) resolved via catalog /Dests
+/// dictionary whose value is << /D [3 0 R /Fit] >>.
+fn named_dest_legacy_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Dests 8 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (L) /Parent 4 0 R /Dest /mydest >>"),
+            (8, "<< /mydest << /D [3 0 R /Fit] >> >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn dest_from_named_legacy() {
+    let mut pdf = Pdf::open(Cursor::new(named_dest_legacy_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    let dest = roots[0]
+        .dest
+        .as_ref()
+        .expect("legacy named dest should resolve");
+    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+}

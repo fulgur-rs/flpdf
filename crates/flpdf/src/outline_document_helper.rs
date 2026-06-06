@@ -6,6 +6,7 @@
 //! [`OutlineNode`]s; navigation (`children`, `parent`, `count`, `dest`) lives on
 //! each node, mirroring `QPDFOutlineObjectHelper`.
 
+use crate::name_number_tree::read_name_tree;
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -206,7 +207,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     }
 
     /// Resolve a destination value (array / indirect / dict `/D`) to a [`Dest`].
-    /// Named (`Name`/`String`) destinations return `None` here (a later task adds them).
+    /// Named (`Name`/`String`) destinations are resolved against the catalog name
+    /// tree / legacy `/Dests` dict via [`Self::resolve_named_dest`].
     fn dest_from_value(&mut self, value: &Object, depth: usize) -> Result<Option<Dest>> {
         if depth == 0 {
             return Ok(None);
@@ -221,8 +223,56 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 Some(inner) => self.dest_from_value(&inner, depth - 1),
                 None => Ok(None),
             },
-            _ => Ok(None), // Name/String named dest — later task
+            Object::Name(name) => self.resolve_named_dest(name.clone()),
+            Object::String(name) => self.resolve_named_dest(name.clone()),
+            _ => Ok(None),
         }
+    }
+
+    /// Resolve a named destination `name` to an explicit [`Dest`].
+    ///
+    /// Tries the modern catalog `/Names`->`/Dests` name tree first (PDF 1.2),
+    /// then the legacy catalog `/Dests` dictionary (PDF 1.1). A name-tree or
+    /// `/Dests` value may be the dest array directly or a `<< /D array >>` dict.
+    fn resolve_named_dest(&mut self, name: Vec<u8>) -> Result<Option<Dest>> {
+        // 1. Modern: catalog /Names /Dests name tree.
+        if let Some(names_ref) = self.catalog_ref("Names")? {
+            if let Object::Dictionary(names) = self.pdf.resolve(names_ref)? {
+                if let Some(dests_root) = names.get("Dests").cloned() {
+                    let entries = read_name_tree(
+                        self.pdf,
+                        dests_root,
+                        |_pdf, value| Ok(Some(value)),
+                        DEFAULT_MAX_OUTLINE_DEPTH,
+                    )?;
+                    for (key, value) in entries {
+                        if key == name {
+                            return self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH);
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Legacy: catalog /Dests dict.
+        if let Some(dests_ref) = self.catalog_ref("Dests")? {
+            if let Object::Dictionary(dests) = self.pdf.resolve(dests_ref)? {
+                if let Some(value) = dests.get(&name).cloned() {
+                    return self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a catalog key's value to an object ref (only if it is a reference).
+    fn catalog_ref(&mut self, key: &str) -> Result<Option<ObjectRef>> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(None);
+        };
+        let Object::Dictionary(catalog) = self.pdf.resolve_borrowed(catalog_ref)? else {
+            return Ok(None);
+        };
+        Ok(catalog.get_ref(key))
     }
 
     /// Pre-order iterator over every materialized node (owned). Each yielded
