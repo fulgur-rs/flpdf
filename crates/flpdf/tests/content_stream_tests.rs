@@ -16,6 +16,7 @@ fn tokens_keep_comments(input: &[u8]) -> Vec<ContentToken> {
         input,
         ContentParseOptions {
             keep_comments: true,
+            ..ContentParseOptions::default()
         },
     )
     .collect::<flpdf::Result<Vec<_>>>()
@@ -257,6 +258,62 @@ fn operands_before_bi_are_a_parse_error() {
     }
     // Iterator fuses after an error.
     assert!(p.next().is_none(), "iterator must fuse after error");
+}
+
+#[test]
+fn default_mode_fuses_on_malformed_token_dropping_later_operators() {
+    // A stray `}` is an unparseable token. In the default (non-recover) mode
+    // the iterator fuses, so the `sub` operator after it is never produced.
+    let ops: Vec<Vec<u8>> = ContentStreamParser::new(b"1 2 add } 3 4 sub")
+        .flatten()
+        .filter_map(|t| match t {
+            ContentToken::Op { operator, .. } => Some(operator),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        vec![b"add".to_vec()],
+        "default mode must fuse after `}}`"
+    );
+}
+
+#[test]
+fn recover_mode_skips_malformed_token_and_continues() {
+    // With recovery enabled, the bad `}` is skipped and scanning continues,
+    // so both operators are produced ("skip malformed, last-wins"). Mirrors
+    // qpdf's allow_bad tokenizer behaviour.
+    let opts = ContentParseOptions {
+        recover_from_errors: true,
+        ..ContentParseOptions::default()
+    };
+    let ops: Vec<Vec<u8>> = ContentStreamParser::with_options(b"1 2 add } 3 4 sub", opts)
+        .flatten()
+        .filter_map(|t| match t {
+            ContentToken::Op { operator, .. } => Some(operator),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ops, vec![b"add".to_vec(), b"sub".to_vec()]);
+}
+
+#[test]
+fn recover_mode_terminates_on_consecutive_garbage() {
+    // A run of unparseable delimiters must not loop forever: each recovery
+    // advances the cursor by at least one byte. The parser still yields the
+    // trailing valid operator.
+    let opts = ContentParseOptions {
+        recover_from_errors: true,
+        ..ContentParseOptions::default()
+    };
+    let ops: Vec<Vec<u8>> = ContentStreamParser::with_options(b"}}}} )))) q", opts)
+        .flatten()
+        .filter_map(|t| match t {
+            ContentToken::Op { operator, .. } => Some(operator),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ops, vec![b"q".to_vec()]);
 }
 
 #[test]

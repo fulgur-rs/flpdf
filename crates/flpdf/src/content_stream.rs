@@ -66,13 +66,30 @@ pub struct ContentParseOptions {
     /// When `true`, `%` comments are emitted as [`ContentToken::Comment`].
     /// When `false` (the default) they are skipped silently.
     pub keep_comments: bool,
+
+    /// When `true`, a malformed token does **not** fuse the iterator: the
+    /// parser skips one byte past the offending position and resumes, so later
+    /// well-formed operators are still produced ("skip malformed, last-wins").
+    /// Operands accumulated before the bad token are preserved.
+    ///
+    /// When `false` (the default) the iterator fuses on the first error, which
+    /// is the safe choice for general content-stream consumers where a bad
+    /// token leaves the operand stack in an unreliable state. Recovery is
+    /// intended for tolerant scanners such as the `/DA` parser, mirroring
+    /// qpdf's `allow_bad` tokenizer behaviour.
+    ///
+    /// Forward progress is guaranteed: each recovered error advances the cursor
+    /// by at least one byte, so the iterator always terminates.
+    pub recover_from_errors: bool,
 }
 
 /// Streaming content-stream tokenizer.
 ///
 /// Implements [`Iterator`] yielding `Result<ContentToken>`. Iteration stops
 /// (returns `None`) at end of input; a malformed token yields `Some(Err(_))`
-/// and the iterator then terminates.
+/// and, unless [`ContentParseOptions::recover_from_errors`] is set, the
+/// iterator then terminates. With recovery enabled the error is still yielded
+/// but the iterator skips past the offending byte and continues.
 pub struct ContentStreamParser<'a> {
     input: &'a [u8],
     pos: usize,
@@ -361,8 +378,19 @@ impl<'a> Iterator for ContentStreamParser<'a> {
             return None;
         }
         let item = self.next_token();
-        if matches!(item, Some(Err(_)) | None) {
-            self.done = true;
+        match item {
+            Some(Err(_)) if self.options.recover_from_errors && self.pos < self.input.len() => {
+                // Best-effort recovery: skip one byte past the offending
+                // position so the next call makes progress, and do NOT fuse.
+                // Operands accumulated before the bad token are kept so a
+                // following operator still sees them. `pos` strictly increases
+                // each error, guaranteeing termination.
+                self.pos += 1;
+            }
+            Some(Err(_)) | None => {
+                self.done = true;
+            }
+            Some(Ok(_)) => {}
         }
         item
     }
