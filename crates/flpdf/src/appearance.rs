@@ -490,7 +490,12 @@ pub fn generate_button_field_appearance<R: Read + Seek>(
         generate_pushbutton_appearance(pdf, widget_ref, bbox_w, bbox_h, mk_dict.as_ref())
     } else {
         generate_checkbox_radio_appearance(
-            pdf, widget_ref, bbox_w, bbox_h, mk_dict.as_ref(), is_radio,
+            pdf,
+            widget_ref,
+            bbox_w,
+            bbox_h,
+            mk_dict.as_ref(),
+            is_radio,
         )
     }
 }
@@ -505,19 +510,15 @@ fn generate_pushbutton_appearance<R: Read + Seek>(
 ) -> Result<Option<ObjectRef>> {
     // Extract caption from /MK/CA.  May be a String or an indirect ref to one.
     let caption_bytes: Vec<u8> = match mk_dict.and_then(|d| d.get("CA").cloned()) {
-        Some(Object::String(s)) => {
-            crate::json_inspect::decode_pdf_text_string(&s)
+        Some(Object::String(s)) => crate::json_inspect::decode_pdf_text_string(&s)
+            .map(|us| to_winansi_bytes(&us))
+            .unwrap_or(s),
+        Some(Object::Reference(r)) => match pdf.resolve(r)? {
+            Object::String(s) => crate::json_inspect::decode_pdf_text_string(&s)
                 .map(|us| to_winansi_bytes(&us))
-                .unwrap_or(s)
-        }
-        Some(Object::Reference(r)) => {
-            match pdf.resolve(r)? {
-                Object::String(s) => crate::json_inspect::decode_pdf_text_string(&s)
-                    .map(|us| to_winansi_bytes(&us))
-                    .unwrap_or(s),
-                _ => Vec::new(),
-            }
-        }
+                .unwrap_or(s),
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     };
 
@@ -3456,7 +3457,10 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "Tx field must return None from Btn generator");
+        assert!(
+            result.unwrap().is_none(),
+            "Tx field must return None from Btn generator"
+        );
     }
 
     /// Degenerate rect → None.
@@ -3469,7 +3473,9 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         let off4 = raw.len() as u64;
         // Rect with zero width (llx == urx)
         raw.extend_from_slice(b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk) /Rect [10 10 10 30]>>\nendobj\n");
@@ -3478,12 +3484,18 @@ mod tests {
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "degenerate rect should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "degenerate rect should return None"
+        );
     }
 
     /// /Ff bit detection: pushbutton (bit 17 = 0x10000).
@@ -3500,7 +3512,9 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         let off4 = raw.len() as u64;
         let widget_bytes = format!(
             "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (pb) \
@@ -3513,35 +3527,51 @@ mod tests {
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("generate");
+        let result =
+            generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let xobj_ref = result.expect("pushbutton must produce appearance");
 
         // /AP/N must be a direct reference (single stream, not a sub-dict).
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
         let Object::Dictionary(ap_dict) = wdict.get("AP").expect("AP missing").clone() else {
             panic!("AP not dict")
         };
         // For pushbutton install_normal_appearance sets /AP/N as a direct Reference.
         let n_val = ap_dict.get("N").expect("N missing");
-        assert!(matches!(n_val, Object::Reference(_)), "/AP/N must be a reference for pushbutton");
+        assert!(
+            matches!(n_val, Object::Reference(_)),
+            "/AP/N must be a reference for pushbutton"
+        );
 
         // The XObject stream must reference /Helv font.
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
             panic!("not stream")
         };
         let content_str = String::from_utf8_lossy(&stream.data);
-        assert!(content_str.contains("/Helv"), "pushbutton must use Helv font");
-        assert!(content_str.contains("Tf"), "pushbutton must have Tf operator");
+        assert!(
+            content_str.contains("/Helv"),
+            "pushbutton must use Helv font"
+        );
+        assert!(
+            content_str.contains("Tf"),
+            "pushbutton must have Tf operator"
+        );
 
         // Caption "OK" must appear in a Tj.
         let mut found_caption = false;
         for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"OK" {
@@ -3558,13 +3588,15 @@ mod tests {
     #[test]
     fn btn_checkbox_ap_has_on_and_off_states() {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("generate");
+        let result =
+            generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let on_ref = result.expect("checkbox must produce appearance");
 
         // /AP/N must be a dict with "Yes" and "Off" keys.
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
 
         let Object::Dictionary(ap) = wdict.get("AP").expect("AP missing").clone() else {
             panic!("AP not dict")
@@ -3601,13 +3633,18 @@ mod tests {
             panic!("on xobj not stream")
         };
         let on_str = String::from_utf8_lossy(&on_stream.data);
-        assert!(on_str.contains("/ZaDb"), "on stream must contain /ZaDb font ref");
+        assert!(
+            on_str.contains("/ZaDb"),
+            "on stream must contain /ZaDb font ref"
+        );
         assert!(on_str.contains("Tf"), "on stream must have Tf operator");
 
         // Tj operand must be "4" (default checkbox glyph).
         let mut found_glyph = false;
         for tok in ContentStreamParser::new(&on_stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"4" {
@@ -3645,7 +3682,9 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         let off4 = raw.len() as u64;
         let widget_bytes = format!(
             "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (rb) \
@@ -3658,7 +3697,10 @@ mod tests {
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
@@ -3672,7 +3714,9 @@ mod tests {
         // Tj must contain 'l' (radio bullet).
         let mut found = false;
         for tok in ContentStreamParser::new(&on_stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"l" {
@@ -3696,7 +3740,9 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         // Pre-existing /AP/N with "On" and "Off" keys (values are stubs, just refs).
         let off5 = raw.len() as u64;
         raw.extend_from_slice(b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 20 20]>>\nstream\nq Q\nendstream\nendobj\n");
@@ -3705,7 +3751,7 @@ mod tests {
         let off4 = raw.len() as u64;
         raw.extend_from_slice(
             b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk2) \
-              /AP << /N << /On 5 0 R /Off 6 0 R >> >> /Rect [10 10 30 30]>>\nendobj\n"
+              /AP << /N << /On 5 0 R /Off 6 0 R >> >> /Rect [10 10 30 30]>>\nendobj\n",
         );
         let xref_start = raw.len() as u64;
         // 7 objects: 0 free, 1-6.
@@ -3714,7 +3760,10 @@ mod tests {
              {off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n{off6:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 7 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 7 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
@@ -3722,15 +3771,27 @@ mod tests {
             .expect("should produce appearance");
 
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
-        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
-        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else {
+            panic!("AP not dict")
+        };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else {
+            panic!("N not dict")
+        };
 
         // Must have "On" as the on-state key (picked from pre-existing /AP/N).
-        assert!(n_dict.get("On").is_some(), "/AP/N must have 'On' key (from pre-existing)");
+        assert!(
+            n_dict.get("On").is_some(),
+            "/AP/N must have 'On' key (from pre-existing)"
+        );
         assert!(n_dict.get("Off").is_some(), "/AP/N must have 'Off' key");
         // Must NOT have "Yes" (should have used "On").
-        assert!(n_dict.get("Yes").is_none(), "/AP/N must not have 'Yes' when 'On' was pre-existing");
+        assert!(
+            n_dict.get("Yes").is_none(),
+            "/AP/N must not have 'Yes' when 'On' was pre-existing"
+        );
     }
 
     /// on-state name from /AS when no existing /AP/N dict.
@@ -3744,18 +3805,23 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         let off4 = raw.len() as u64;
         raw.extend_from_slice(
             b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk3) \
-              /AS /Checked /Rect [10 10 30 30]>>\nendobj\n"
+              /AS /Checked /Rect [10 10 30 30]>>\nendobj\n",
         );
         let xref_start = raw.len() as u64;
         let xref = format!(
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
@@ -3763,12 +3829,21 @@ mod tests {
             .expect("should produce appearance");
 
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
-        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
-        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else {
+            panic!("AP not dict")
+        };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else {
+            panic!("N not dict")
+        };
 
         // Must have "Checked" (from /AS).
-        assert!(n_dict.get("Checked").is_some(), "/AP/N must have 'Checked' key from /AS");
+        assert!(
+            n_dict.get("Checked").is_some(),
+            "/AP/N must have 'Checked' key from /AS"
+        );
         assert!(n_dict.get("Off").is_some(), "/AP/N must have 'Off' key");
     }
 
@@ -3782,19 +3857,24 @@ mod tests {
         let off2 = raw.len() as u64;
         raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = raw.len() as u64;
-        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
         let off4 = raw.len() as u64;
         // /MK/CA is "8" (custom checkmark glyph).
         raw.extend_from_slice(
             b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk4) \
-              /MK <</CA (8)>> /Rect [10 10 30 30]>>\nendobj\n"
+              /MK <</CA (8)>> /Rect [10 10 30 30]>>\nendobj\n",
         );
         let xref_start = raw.len() as u64;
         let xref = format!(
             "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
         );
         raw.extend_from_slice(xref.as_bytes());
-        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
@@ -3807,7 +3887,9 @@ mod tests {
 
         let mut found_glyph = false;
         for tok in ContentStreamParser::new(&on_stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"8" {
@@ -3816,7 +3898,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_glyph, "/MK/CA '8' must appear in Tj, overriding default '4'");
+        assert!(
+            found_glyph,
+            "/MK/CA '8' must appear in Tj, overriding default '4'"
+        );
     }
 
     /// Object refs for font, on, off must be distinct (no ref collision).
@@ -3828,9 +3913,15 @@ mod tests {
             .expect("must produce appearance");
 
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
-        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
-        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else {
+            panic!("AP not dict")
+        };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else {
+            panic!("N not dict")
+        };
 
         let on_ref = match n_dict.get("Yes").expect("Yes") {
             Object::Reference(r) => *r,
@@ -3872,7 +3963,10 @@ mod tests {
         assert_ne!(off_ref, font_ref_on, "off ref must differ from font ref");
 
         // Both on/off share the same font ref (shared ZapfDingbats dict).
-        assert_eq!(font_ref_on, font_ref_off, "on and off streams must share font ref");
+        assert_eq!(
+            font_ref_on, font_ref_off,
+            "on and off streams must share font ref"
+        );
     }
 
     /// ZapfDingbats font dict must NOT have /Encoding.
@@ -3884,9 +3978,15 @@ mod tests {
             .expect("must produce appearance");
 
         let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
-        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else { panic!("AP not dict") };
-        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else { panic!("N not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
+        let Object::Dictionary(ap) = wdict.get("AP").expect("AP").clone() else {
+            panic!("AP not dict")
+        };
+        let Object::Dictionary(n_dict) = ap.get("N").expect("N") else {
+            panic!("N not dict")
+        };
         let on_ref = match n_dict.get("Yes").expect("Yes") {
             Object::Reference(r) => *r,
             other => panic!("Yes not ref: {other:?}"),
@@ -3932,7 +4032,9 @@ mod tests {
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("re-parse");
         let widget_obj = pdf2.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
-        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(wdict) = widget_obj else {
+            panic!("not dict")
+        };
         let ap_obj = wdict.get("AP").expect("/AP missing after round-trip");
         assert!(
             matches!(ap_obj, Object::Dictionary(_)),
@@ -3941,6 +4043,9 @@ mod tests {
 
         // on-state XObject must be re-resolvable.
         let xobj2 = pdf2.resolve(on_ref).expect("re-resolve on xobj");
-        assert!(matches!(xobj2, Object::Stream(_)), "on xobj must be a stream after round-trip");
+        assert!(
+            matches!(xobj2, Object::Stream(_)),
+            "on xobj must be a stream after round-trip"
+        );
     }
 }
