@@ -608,7 +608,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn widget_parent_without_ft_returns_topmost_parent() {
+    fn widget_parent_without_ft_returns_direct_parent() {
         // obj 4: widget (/Parent 5 0 R)
         // obj 5: field-like node, no /FT (generator omitted it)
         let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
@@ -622,7 +622,7 @@ mod tests {
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         let a = &annots[0];
         assert!(a.is_widget);
-        // No /FT anywhere — topmost parent (obj 5) is used
+        // No /FT or /T on the widget — its direct parent (obj 5) is returned
         assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
     }
 
