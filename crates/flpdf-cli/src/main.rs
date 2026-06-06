@@ -3391,12 +3391,31 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
         .into());
     };
 
-    let bytes = if cmd.raw {
-        stream.data.clone()
-    } else {
-        filters::decode_stream_data(&stream.dict, &stream.data)?
-    };
+    if cmd.raw {
+        let bytes = stream.data.clone();
+        if let Some(path) = cmd.out {
+            std::fs::write(path, bytes)?;
+        } else {
+            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().flush()?;
+        }
+        return Ok(());
+    }
 
+    // For a single passthrough codec (DCTDecode, JBIG2Decode, JPXDecode,
+    // CCITTFaxDecode) emit a human-readable marker instead of dumping binary.
+    // Multi-filter chains fall through to the decode path (scope: flpdf-9hc.7.5).
+    if let Some(label) = stream
+        .dict
+        .get("Filter")
+        .and_then(Object::as_name)
+        .and_then(filters::passthrough_codec_label)
+    {
+        println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
+        return Ok(());
+    }
+
+    let bytes = filters::decode_stream_data(&stream.dict, &stream.data)?;
     if let Some(path) = cmd.out {
         std::fs::write(path, bytes)?;
     } else {

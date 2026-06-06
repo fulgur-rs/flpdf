@@ -1392,6 +1392,82 @@ fn qdf_rewrite_is_deterministic() {
     holder_has_no_original_id_comment(&a, s.length_holder);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// (flpdf-9hc.7.4) Passthrough codecs: byte-identical round-trip
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DCTDecode stream must survive a full-rewrite with payload and /Filter intact.
+#[test]
+fn passthrough_dct_stream_is_byte_identical_after_rewrite() {
+    let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xAA, 0xBB, 0xCC, 0xDD];
+
+    let (source, _) = build_minimal_pdf_with_stream(b"DCTDecode", fake_jpeg, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let s = parse_qdf_stream(&output, 3);
+
+    // /Filter must be preserved verbatim.
+    assert!(
+        find_subslice(&s.dict, b"/Filter /DCTDecode").is_some(),
+        "passthrough: /Filter /DCTDecode must be present after full-rewrite"
+    );
+    // Payload must be byte-for-byte identical.
+    assert_eq!(
+        s.payload.as_slice(),
+        fake_jpeg,
+        "passthrough: DCTDecode payload must be byte-identical after full-rewrite"
+    );
+}
+
+/// CCITTFaxDecode stream with /DecodeParms must survive a full-rewrite with
+/// payload, /Filter and /DecodeParms all intact.
+#[test]
+fn passthrough_ccitt_stream_with_decode_parms_is_byte_identical_after_rewrite() {
+    // Fake CCITT bitstream (arbitrary binary bytes).
+    let fake_ccitt: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE, 0xFD];
+
+    // Minimal /DecodeParms for CCITTFaxDecode: K=-1 (Group 4), Columns=8.
+    let (source, _) = build_minimal_pdf_with_stream(
+        b"CCITTFaxDecode",
+        fake_ccitt,
+        Some(" /DecodeParms << /K -1 /Columns 8 >>"),
+    );
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let s = parse_qdf_stream(&output, 3);
+
+    // /Filter must be preserved verbatim.
+    assert!(
+        find_subslice(&s.dict, b"/Filter /CCITTFaxDecode").is_some(),
+        "passthrough: /Filter /CCITTFaxDecode must be present after full-rewrite"
+    );
+    // /DecodeParms must also be preserved.
+    assert!(
+        find_subslice(&s.dict, b"/DecodeParms").is_some(),
+        "passthrough: /DecodeParms must be preserved for CCITTFaxDecode"
+    );
+    // Payload must be byte-for-byte identical.
+    assert_eq!(
+        s.payload.as_slice(),
+        fake_ccitt,
+        "passthrough: CCITTFaxDecode payload must be byte-identical after full-rewrite"
+    );
+}
+
 #[test]
 fn non_qdf_output_keeps_compact_dict_form() {
     // Regression guard: this layer must not change any non-qdf serialization.
