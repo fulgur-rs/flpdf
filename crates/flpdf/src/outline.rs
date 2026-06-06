@@ -15,9 +15,10 @@ pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = 100;
 /// One entry in a document outline (sometimes called a bookmark).
 ///
 /// `depth` is zero for top-level entries and increases for each nested level.
-/// `title` is decoded with [`String::from_utf8_lossy`] for `Object::String` titles,
-/// so binary or non-UTF-8 strings are rendered with replacement characters rather
-/// than producing an error.
+/// `title` is decoded as a PDF text string (UTF-16BE/LE with a byte-order mark,
+/// otherwise PDFDocEncoding), falling back to [`String::from_utf8_lossy`] for bytes
+/// that decode as neither. An indirect `/Title` reference is resolved one level
+/// before decoding; an absent `/Title` yields `"<untitled>"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineItem {
     pub object_ref: ObjectRef,
@@ -87,9 +88,13 @@ fn walk_outline<R: Read + Seek>(
             break;
         };
 
-        let title = read_outline_title(dict.get("Title"));
+        // Extract everything borrowed from `dict` (a `resolve_borrowed` reference
+        // into `pdf`) into owned/Copy locals before resolving the title, which
+        // needs `&mut pdf`. See review rule 2 (resolve indirect `/Title`).
+        let title_src = dict.get("Title").cloned();
         let first = dict.get_ref("First");
         let next = dict.get_ref("Next");
+        let title = read_outline_title(pdf, title_src)?;
 
         items.push(OutlineItem {
             object_ref: current_ref,
@@ -107,14 +112,24 @@ fn walk_outline<R: Read + Seek>(
     Ok(())
 }
 
-fn read_outline_title(value: Option<&Object>) -> String {
-    match value {
-        Some(Object::String(value)) => String::from_utf8_lossy(value).into_owned(),
+/// Decode an outline entry's `/Title`, resolving one level of indirection first
+/// (review rule 2). `Object::String` titles are decoded as PDF text strings
+/// (UTF-16BE/LE BOM or PDFDocEncoding) with a `from_utf8_lossy` fallback, so a
+/// BOM-prefixed UTF-16 title is no longer rendered as mojibake. An absent `/Title`
+/// keeps yielding `"<untitled>"` (depended on by callers).
+fn read_outline_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
+    let resolved = match value {
+        Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
+        other => other,
+    };
+    Ok(match resolved {
+        Some(Object::String(bytes)) => crate::json_inspect::decode_pdf_text_string(&bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
         Some(other) => {
             let mut bytes = Vec::new();
             other.write_pdf(&mut bytes);
             String::from_utf8_lossy(&bytes).into_owned()
         }
         None => String::from("<untitled>"),
-    }
+    })
 }
