@@ -12,7 +12,7 @@
 //! Inheritance resolution (falling back to the `/AcroForm` root `/DA` when a
 //! field-level `/DA` is absent) is the caller's responsibility.
 
-use crate::content_stream::{ContentStreamParser, ContentToken};
+use crate::content_stream::{ContentParseOptions, ContentStreamParser, ContentToken};
 use crate::Object;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -84,7 +84,15 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
     let mut auto_size: bool = true;
     let mut color: TextColor = TextColor::Gray(0.0);
 
-    for token in ContentStreamParser::new(da).flatten() {
+    // Enable error recovery so a malformed token mid-`/DA` does not drop the
+    // operators that follow it. This honours the "skip malformed tokens /
+    // last-wins" contract and mirrors qpdf, whose tokenizer skips bad tokens
+    // (`allow_bad`) and keeps scanning rather than aborting the whole `/DA`.
+    let options = ContentParseOptions {
+        recover_from_errors: true,
+        ..ContentParseOptions::default()
+    };
+    for token in ContentStreamParser::with_options(da, options).flatten() {
         let ContentToken::Op { operands, operator } = token else {
             continue;
         };
@@ -280,6 +288,18 @@ mod tests {
         assert!(approx_eq(da.font_size, 12.0));
         assert!(!da.auto_size);
         assert_eq!(da.color, TextColor::Gray(0.25));
+    }
+
+    #[test]
+    fn malformed_token_midstream_does_not_drop_later_operators() {
+        // A stray `}` is an unparseable token. The shared parser would fuse on
+        // it, but `/DA` parsing enables recovery so later operators still apply
+        // ("skip malformed, last-wins" — matching qpdf's allow_bad scanning).
+        // Here the `rg` colour after the bad token must still take effect.
+        let da = parse_default_appearance(b"/Helv 12 Tf } 1 0 0 rg");
+        assert_eq!(da.font_name.as_deref(), Some(b"Helv" as &[u8]));
+        assert!(approx_eq(da.font_size, 12.0));
+        assert_eq!(da.color, TextColor::Rgb(1.0, 0.0, 0.0));
     }
 
     #[test]
