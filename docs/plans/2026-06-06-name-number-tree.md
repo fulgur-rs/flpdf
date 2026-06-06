@@ -107,7 +107,7 @@ pub const LEAF_MAX: usize = 32;
 /// trailing orphan of an odd-length leaf array are dropped silently.
 ///
 /// # Errors
-/// Propagates [`Pdf::resolve`] errors and returns [`crate::Error::Unsupported`]
+/// Propagates [`Pdf::resolve_borrowed`] errors and returns [`crate::Error::Unsupported`]
 /// if a `/Kids` chain reaches `max_depth`.
 pub fn read_name_tree<R, V, F>(
     pdf: &mut Pdf<R>,
@@ -390,7 +390,7 @@ git commit -m "feat(name_number_tree): generic name-tree reader with decode hook
 /// keys; non-integer keys are skipped.
 ///
 /// # Errors
-/// Propagates [`Pdf::resolve`] errors and returns [`crate::Error::Unsupported`]
+/// Propagates [`Pdf::resolve_borrowed`] errors and returns [`crate::Error::Unsupported`]
 /// if a `/Kids` chain reaches `max_depth`.
 pub fn read_number_tree<R, V, F>(
     pdf: &mut Pdf<R>,

@@ -1959,14 +1959,12 @@ pub fn build_attachments_section<R: Read + Seek>(
         _ => return Ok(JsonValue::Object(vec![])),
     };
 
-    // /EmbeddedFiles name tree root
-    let ef_root = match names_dict.get("EmbeddedFiles") {
-        Some(Object::Dictionary(d)) => Object::Dictionary(d.clone()),
-        Some(Object::Reference(r)) => pdf
-            .resolve_borrowed(*r)
-            .map_err(ConvertError::from)?
-            .clone(),
-        _ => return Ok(JsonValue::Object(vec![])),
+    // /EmbeddedFiles name tree root: keep the original object shape so the
+    // shared walker can resolve an indirect root itself and track its
+    // ObjectRef in the visited set (cycle guard on a self-referential root).
+    let ef_root = match names_dict.get("EmbeddedFiles").cloned() {
+        Some(v) => v,
+        None => return Ok(JsonValue::Object(vec![])),
     };
 
     // Walk the name tree to collect (name, filespec source) pairs via the
