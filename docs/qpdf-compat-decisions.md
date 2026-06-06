@@ -127,6 +127,85 @@ Grouped by area for navigation.
 **Owner:** Mitsuru Hayasaka  
 **Rationale:** The default trailer `/ID` is freshly randomized per save (ISO 32000-1 §14.4): element 1 preserved from a well-formed source `/ID` on re-save, element 2 always fresh. This matches qpdf's *observable* default behaviour (random `/ID`s differ between runs); exact byte parity with qpdf's `/ID` is inherently impossible because both tools randomize independently. Consequence for the byte-identical safety net: `tests/golden/compat-matrix.md`'s `flpdf-sha` fingerprint and `byte-equal` column are now computed with the trailer `/ID` array **elided** — fingerprinting it verbatim would be non-deterministic. This was an intentional golden re-bless; comparator verdicts are unchanged (still `32 diverge + 4 match`), and `plain` vs `static-id` fixtures now share a fingerprint, proving the only inter-mode difference is `/ID`. Deterministic / static `/ID` modes are tracked separately under `.13.3` (deferred) and `.13.4` (--static-id, byte-parity with qpdf's pi-digit constant, accepted). `tests/golden/baseline-static-id.md` is unaffected (no drift).
 
+## AcroForm & annotation transforms (flpdf-9hc.9)
+
+This section documents the deliberate divergences between flpdf and qpdf for
+the appearance-generation and annotation-flattening transforms introduced in
+subepic `flpdf-9hc.9` (subtasks .9.5 through .9.9).  The integration test
+suite (`crates/flpdf-cli/tests/cli_acroform_transforms.rs`) verifies observable
+equivalence for each of the categories below.
+
+### Appearance streams (general) — `.9.5` / `.9.6` / `.9.7`
+
+**Decision:** observable  
+**Applies to:** `flpdf-9hc.9.5` (Tx renderer), `flpdf-9hc.9.6` (Btn renderer),
+`flpdf-9hc.9.7` (Ch renderer)  
+**Rationale:** Appearance-stream generation targets **observable equivalence**:
+the generated `/AP/N` XObject must render the correct value/state in a standard
+viewer, but byte-level or instruction-level identity with qpdf output is not a
+goal.  Specific known divergences:
+
+- **Token order and whitespace**: flpdf emits its own operator sequence
+  (e.g. `BT Tf Td Tj ET`) with LF-separated lines; qpdf may produce a different
+  ordering or spacing.
+- **Auto-size heuristic**: font size is chosen by `(bbox_h − 2.0).clamp(4.0, 12.0)`
+  for single-line fields — an approximation that matches common viewers but not
+  qpdf's exact computation.
+- **Vertical centering and quadding**: centering approximations may differ from
+  qpdf's pixel-level layout.
+- **ZapfDingbats glyph positioning** (Btn checkbox/radio): glyph advance-width
+  approximation (`0.7 × em`) is used for centering; qpdf may use embedded metrics.
+
+**needs-review caveat:** `.9.5`, `.9.6`, `.9.7` are tagged `needs-review`; the
+observable-equivalence policy adopted here supersedes the prior `deferred` state
+pending a formal sign-off.
+
+### Btn widget limitations — `.9.6`
+
+**Decision:** divergent (known limitation)  
+**Applies to:** `flpdf-9hc.9.6`  
+**Rationale:** The following qpdf features are **not implemented** in the Btn
+appearance renderer:
+
+- `/MK/BG` (background fill colour): not rendered.  The appearance background
+  is transparent.
+- `/MK/BC` (border colour): not rendered.  No border is drawn around the widget.
+- ZapfDingbats defaults: checkbox on-state uses glyph `4` (✔, U+0034 in
+  ZapfDingbats); radio on-state uses glyph `l` (●, U+006C).  These match the
+  most common viewer defaults but may differ from qpdf if a document uses
+  non-standard `/MK/CA` overrides that qpdf respects differently.
+
+### Annotation flattening (content-stream layout) — `.9.8`
+
+**Decision:** observable  
+**Applies to:** `flpdf-9hc.9.8`  
+**Rationale:** `--flatten-annotations` burns each annotation's `/AP/N` Form
+XObject into the page content stream via `q {cm} Do Q`.  The resulting content
+stream differs from qpdf in:
+
+- **Matrix precision**: CTM values are formatted with up to 6 significant
+  figures; qpdf may use fewer or more.
+- **Content stream layout**: flpdf appends the `q cm Do Q` block with LF
+  separators; qpdf's exact whitespace and line structure may differ.
+- **XObject registration**: flpdf assigns a fresh name in `/Resources/XObject`;
+  qpdf may reuse existing names or emit them in a different order.
+
+The test suite verifies that the `Do` operator is present in the decoded page
+content and that the annotation is absent from `/Annots` — visual equivalence.
+
+**needs-review caveat:** `.9.8` is tagged `needs-review`; the observable policy
+adopted here supersedes the prior `deferred` state.
+
+### /Rotate flattening — `.9.9`
+
+**Decision:** observable  
+**Applies to:** `flpdf-9hc.9.9`  
+**Rationale:** `--flatten-rotation` removes `/Rotate` by prepending a `cm`
+rotation matrix to the page content and adjusting `/MediaBox` and other page
+boxes.  Float formatting in the `cm` matrix and the rewritten box values will
+differ from qpdf byte-for-byte.  See also existing entry `flpdf-9hc.9.9` above
+(this entry cross-links for completeness).
+
 ## Cross-references
 
 - Subepic `flpdf-9hc.20`: bytes-identical roadmap (this registry is the
