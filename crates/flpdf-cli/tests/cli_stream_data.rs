@@ -20,6 +20,12 @@ use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf, Stream};
 use std::io::Cursor;
 
+#[path = "support/filter_fixtures.rs"]
+mod filter_fixtures;
+use filter_fixtures::{
+    build_pdf_with_prefiltered_stream, LZW_ABABABABABABAB_EC1, LZW_ABABABABABABAB_PLAIN,
+};
+
 // ---------------------------------------------------------------------------
 // Helper: build a minimal PDF with a FlateDecode-wrapped content stream.
 // ---------------------------------------------------------------------------
@@ -195,85 +201,6 @@ fn cli_stream_data_overrides_compress_streams() {
 // ===========================================================================
 // flpdf-9hc.7.7: LZWDecode × 3 modes + passthrough × 3 modes
 // ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Known LZW-encoded vector (copied from crates/flpdf/tests/qdf_tests.rs and
-// crates/flpdf-cli/tests/cli_multi_filter_chain.rs — Rust integration tests
-// are crate-isolated, so we must duplicate the constant here).
-//
-// LZW_ABABABABABABAB_EC1 encodes "ABABABABABABAB" with EarlyChange=1 (PDF default).
-// ---------------------------------------------------------------------------
-
-const LZW_ABABABABABABAB_EC1: &[u8] = &[
-    0x80, 0x10, 0x48, 0x50, 0x28, 0x24, 0x0e, 0x0d, 0x02, 0x80, 0x80,
-];
-
-const LZW_ABABABABABABAB_PLAIN: &[u8] = b"ABABABABABABAB";
-
-// ---------------------------------------------------------------------------
-// Helper: build a minimal PDF whose stream data is supplied pre-encoded (no
-// encode_stream_data applied).  Mirrors build_pdf_with_prefiltered_stream in
-// cli_multi_filter_chain.rs.
-//
-// Object layout:
-//   1 0 obj  /Catalog  -> /Pages 2 0 R
-//   2 0 obj  /Pages    -> /Kids [3 0 R]
-//   3 0 obj  /Page     -> /Contents 4 0 R
-//   4 0 obj  stream    <- caller-supplied `encoded` bytes verbatim
-//
-// `filter_literal`       e.g. "/LZWDecode" or "/DCTDecode"
-// `decode_parms_literal` optional, e.g. "<< /K -1 /Columns 8 >>"
-// ---------------------------------------------------------------------------
-
-fn build_pdf_with_prefiltered_stream(
-    encoded: &[u8],
-    filter_literal: &str,
-    decode_parms_literal: Option<&str>,
-) -> Vec<u8> {
-    let mut pdf_bytes: Vec<u8> = b"%PDF-1.4\n".to_vec();
-    let mut offsets = Vec::<usize>::new();
-
-    offsets.push(pdf_bytes.len());
-    pdf_bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    offsets.push(pdf_bytes.len());
-    pdf_bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    offsets.push(pdf_bytes.len());
-    pdf_bytes.extend_from_slice(
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-          /Resources << >> /Contents 4 0 R >>\nendobj\n",
-    );
-
-    offsets.push(pdf_bytes.len());
-    let mut stream_header = format!(
-        "4 0 obj\n<< /Length {} /Filter {}",
-        encoded.len(),
-        filter_literal
-    )
-    .into_bytes();
-    if let Some(parms) = decode_parms_literal {
-        stream_header.extend_from_slice(b" /DecodeParms ");
-        stream_header.extend_from_slice(parms.as_bytes());
-    }
-    stream_header.extend_from_slice(b" >>\nstream\n");
-    pdf_bytes.extend_from_slice(&stream_header);
-    pdf_bytes.extend_from_slice(encoded);
-    pdf_bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-    let xref_offset = pdf_bytes.len();
-    let n = offsets.len() + 1;
-    pdf_bytes.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
-    pdf_bytes.extend_from_slice(b"0000000000 65535 f \n");
-    for o in &offsets {
-        pdf_bytes.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    pdf_bytes.extend_from_slice(
-        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
-            .as_bytes(),
-    );
-    pdf_bytes
-}
 
 // ---------------------------------------------------------------------------
 // LZWDecode × 3 modes
@@ -665,7 +592,8 @@ fn cli_show_stream_lzw_text_readable() {
 
     let stdout = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["show-stream", "4 0", pdf_path.to_str().unwrap()])
+        .args(["show-stream", "4 0"])
+        .arg(&pdf_path)
         .assert()
         .success()
         .get_output()
