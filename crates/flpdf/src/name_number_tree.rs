@@ -32,8 +32,8 @@ pub const LEAF_MAX: usize = 32;
 /// trailing orphan of an odd-length leaf array are dropped silently.
 ///
 /// # Errors
-/// Propagates [`Pdf::resolve`] errors and returns [`crate::Error::Unsupported`]
-/// if a `/Kids` chain reaches `max_depth`.
+/// Propagates [`Pdf::resolve_borrowed`] (indirect-object resolution) errors and
+/// returns [`crate::Error::Unsupported`] if a `/Kids` chain reaches `max_depth`.
 pub fn read_name_tree<R, V, F>(
     pdf: &mut Pdf<R>,
     root: Object,
@@ -70,8 +70,8 @@ where
 /// keys; non-integer keys are skipped.
 ///
 /// # Errors
-/// Propagates [`Pdf::resolve`] errors and returns [`crate::Error::Unsupported`]
-/// if a `/Kids` chain reaches `max_depth`.
+/// Propagates [`Pdf::resolve_borrowed`] (indirect-object resolution) errors and
+/// returns [`crate::Error::Unsupported`] if a `/Kids` chain reaches `max_depth`.
 pub fn read_number_tree<R, V, F>(
     pdf: &mut Pdf<R>,
     root: Object,
@@ -203,7 +203,7 @@ where
     }
 
     // Resolve a reference node (cycle-tracked); inline dicts pass through.
-    let dict: Dictionary = match node {
+    let mut dict: Dictionary = match node {
         Object::Dictionary(d) => d,
         Object::Reference(r) => {
             if !visited.insert(r) {
@@ -217,9 +217,11 @@ where
         _ => return Ok(()), // unexpected node type — skip
     };
 
-    // Leaf takes priority over /Kids (spec leaf vs. intermediate).
-    if let Some(arr) = dict.get(leaf_key).and_then(Object::as_array) {
-        let pairs = arr.to_vec(); // own the leaf array, drop the dict borrow
+    // Leaf takes priority over /Kids (spec leaf vs. intermediate). `dict` is
+    // owned here, so move the leaf array out instead of copying it. A non-array
+    // (or absent) leaf value falls through to /Kids, matching the old
+    // `.and_then(Object::as_array)` semantics.
+    if let Some(Object::Array(pairs)) = dict.remove(leaf_key) {
         let mut it = pairs.into_iter();
         while let Some(key_obj) = it.next() {
             let Some(val_obj) = it.next() else {
@@ -235,12 +237,14 @@ where
         return Ok(());
     }
 
-    // Intermediate node.
+    // Intermediate node. Only indirect-reference kids are descended (inline-dict
+    // kids are dropped, preserving the two legacy walkers this module replaces).
     if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        for kid in kids.iter().cloned() {
+        let kid_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
+        for r in kid_refs {
             walk_tree(
                 pdf,
-                kid,
+                Object::Reference(r),
                 leaf_key,
                 parse_key,
                 decode,
@@ -352,6 +356,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![(b"k".to_vec(), ObjectRef::new(99, 0))]);
+    }
+
+    #[test]
+    fn read_name_tree_skips_inline_dict_kid() {
+        // A /Kids array element that is an inline Dictionary leaf (not an
+        // indirect reference) must NOT be descended — preserving the legacy
+        // reference-only descent. Only Reference kids are followed.
+        let mut pdf = empty_pdf();
+        let mut inline_leaf = Dictionary::new();
+        inline_leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"k".to_vec()),
+                Object::Reference(ObjectRef::new(99, 0)),
+            ]),
+        );
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Dictionary(inline_leaf)]));
+        let out = read_name_tree(
+            &mut pdf,
+            Object::Dictionary(root),
+            |_, v| Ok(v.as_ref_id()),
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert!(out.is_empty(), "inline-dict kid must not be descended");
     }
 
     #[test]
