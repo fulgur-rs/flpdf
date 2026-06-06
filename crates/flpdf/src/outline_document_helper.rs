@@ -52,6 +52,7 @@ pub struct OutlineNode {
     /// Zero for top-level items, increasing per nesting level.
     pub depth: usize,
     /// `/Title` decoded with `from_utf8_lossy`; empty string when absent.
+    /// Resolves one level of indirection (an indirect `/Title` ref).
     pub title: String,
     /// Raw `/Count` value; `0` when absent.
     pub count: i64,
@@ -160,14 +161,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // owned locals here, ending the `dict` borrow, BEFORE any
             // `self.pdf.resolve(...)` call below - otherwise the borrow checker
             // rejects it. A later task adds `dest_src`/`action_src` here.
-            let title = read_title(dict.get("Title"));
             let first = dict.get_ref("First");
             let next = dict.get_ref("Next");
+            let title_src = dict.get("Title").cloned();
             let count_src = dict.get("Count").cloned();
             let dest_src = dict.get("Dest").cloned();
             let action_src = dict.get("A").cloned();
             // `dict` (and thus the &mut self.pdf borrow) is no longer used past
             // this point - owned values only from here on.
+            let title = resolve_title(self.pdf, title_src)?;
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
             let dest = self.resolve_node_dest(dest_src, action_src)?;
 
@@ -337,13 +339,17 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-/// `/Title` decode: qpdf yields an empty string when absent. Only a direct
-/// `Object::String` is decoded here; absent/other yields an empty string.
-fn read_title(value: Option<&Object>) -> String {
-    match value {
-        Some(Object::String(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
-        Some(_) | None => String::new(),
-    }
+/// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
+/// qpdf yields an empty string when absent or not a (resolved) string.
+fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
+    let resolved = match value {
+        Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
+        other => other,
+    };
+    Ok(match resolved {
+        Some(Object::String(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => String::new(),
+    })
 }
 
 /// Push `node` (with `children` cleared) then its descendants, pre-order.

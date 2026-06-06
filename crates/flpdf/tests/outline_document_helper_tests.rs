@@ -443,3 +443,25 @@ fn named_dest_modern_wins_over_legacy() {
     // Modern name-tree entry ([3 0 R ...]) wins over legacy /Dests ([2 0 R ...]).
     assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
 }
+
+/// Outline item whose /Title is an INDIRECT reference (obj 9) to a string.
+fn indirect_title_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title 9 0 R /Parent 4 0 R >>"),
+            (9, "(RealTitle)"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn title_resolves_indirect_reference() {
+    let mut pdf = Pdf::open(Cursor::new(indirect_title_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots[0].title, "RealTitle");
+}
