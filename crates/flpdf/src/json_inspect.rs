@@ -879,44 +879,20 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue
 /// - `prefix` = `/P` (PDF text string, decoded without `u:`/`b:` prefix; default `""`)
 /// - `style`  = `/S` (name string `"D"/"R"/"r"/"A"/"a"`, or `null` when absent)
 fn label_dict_to_json(dict: &Dictionary) -> JsonValue {
-    // first: /St integer, default 1
-    let first = match dict.get("St") {
-        Some(Object::Integer(n)) => *n,
-        _ => 1,
-    };
-
-    // prefix: /P text string, decoded as PDF text string without u:/b: decoration.
-    // Absent → "".  Undecodable bytes → lossy UTF-8 replacement.
-    let prefix = match dict.get("P") {
-        Some(Object::String(bytes)) => decode_pdf_text_string(bytes)
-            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
-        _ => String::new(),
-    };
-
-    // style: /S name, or null if absent / not a recognised name.
-    let style = match dict.get("S") {
-        Some(Object::Name(bytes)) => {
-            let s = match bytes.as_slice() {
-                b"D" => "D",
-                b"R" => "R",
-                b"r" => "r",
-                b"A" => "A",
-                b"a" => "a",
-                _ => "",
-            };
-            if s.is_empty() {
-                JsonValue::Null
-            } else {
-                JsonValue::String(s.to_string())
-            }
-        }
-        _ => JsonValue::Null,
+    // Derive /S, /P, /St via the shared (non-resolving) LabelRange parser to keep
+    // a single source of truth. `from_dict` is byte-for-byte equivalent to the
+    // prior inline extraction; use it (not `from_dict_resolved`) to preserve the
+    // existing non-resolving JSON behavior.
+    let range = crate::page_label_document_helper::LabelRange::from_dict(dict);
+    let style = match range.style.to_name() {
+        Some(s) => JsonValue::String(s.to_string()),
+        None => JsonValue::Null,
     };
 
     // Key order: alphabetical → first, prefix, style
     JsonValue::Object(vec![
-        ("first".to_string(), JsonValue::Integer(first)),
-        ("prefix".to_string(), JsonValue::String(prefix)),
+        ("first".to_string(), JsonValue::Integer(range.start)),
+        ("prefix".to_string(), JsonValue::String(range.prefix)),
         ("style".to_string(), style),
     ])
 }
