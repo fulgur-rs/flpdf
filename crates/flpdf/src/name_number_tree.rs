@@ -240,8 +240,10 @@ where
     // Intermediate node. Only indirect-reference kids are descended (inline-dict
     // kids are dropped, preserving the two legacy walkers this module replaces).
     if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        let kid_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
-        for r in kid_refs {
+        // `kids` borrows the owned local `dict`; the recursive call only borrows
+        // `pdf`/`decode`/… (never `dict`), so iterate the filter_map directly and
+        // avoid a per-node `Vec<ObjectRef>` heap allocation.
+        for r in kids.iter().filter_map(Object::as_ref_id) {
             walk_tree(
                 pdf,
                 Object::Reference(r),
