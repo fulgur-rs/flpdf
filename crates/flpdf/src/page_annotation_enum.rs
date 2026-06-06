@@ -215,10 +215,7 @@ pub fn enumerate_document_annotations<R: Read + Seek>(
 /// (each inheriting `/FT` from a shared parent) onto that single ancestor.
 ///
 /// Returns `None` when the widget has neither `/FT` nor a `/Parent` reference.
-fn find_field_ref<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-) -> Result<Option<ObjectRef>> {
+fn find_field_ref<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Option<ObjectRef>> {
     let node = pdf.resolve_borrowed(start)?;
     let Some(dict) = node.as_dict() else {
         return Ok(None);
@@ -268,10 +265,8 @@ mod tests {
 
         let off3 = pdf.len() as u64;
         let page_body = match annots_entry {
-            None => {
-                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
-                    .to_string()
-            }
+            None => "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
+                .to_string(),
             Some(annots) => format!(
                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
                  /Annots {annots} >>\nendobj\n"
@@ -287,11 +282,7 @@ mod tests {
         }
 
         let xref_start = pdf.len() as u64;
-        let max_num = extra_offsets
-            .iter()
-            .map(|(n, _)| *n)
-            .max()
-            .unwrap_or(3);
+        let max_num = extra_offsets.iter().map(|(n, _)| *n).max().unwrap_or(3);
         let total = max_num as usize + 1;
         let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
         xref.push_str(&format!("{:010} 00000 n \n", off1));
@@ -305,9 +296,8 @@ mod tests {
             }
         }
         pdf.extend_from_slice(xref.as_bytes());
-        let trailer = format!(
-            "trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-        );
+        let trailer =
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -362,10 +352,7 @@ mod tests {
         assert!(annots[0].is_widget);
         // Merged widget — field_ref should be annot itself
         assert_eq!(annots[0].field_ref, Some(ObjectRef::new(4, 0)));
-        assert_eq!(
-            annots[0].rect,
-            Some(PageBox::new(10.0, 20.0, 100.0, 30.0))
-        );
+        assert_eq!(annots[0].rect, Some(PageBox::new(10.0, 20.0, 100.0, 30.0)));
 
         // Second: Link
         assert_eq!(annots[1].annot_ref, ObjectRef::new(5, 0));
