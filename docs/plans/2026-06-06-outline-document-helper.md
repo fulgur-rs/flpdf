@@ -30,6 +30,7 @@ All paths below are relative to that worktree root. Run all `cargo` commands fro
 ## Task 1: Module skeleton + `Pdf::outline()` + `has_outlines()`
 
 **Files:**
+
 - Create: `crates/flpdf/src/outline_document_helper.rs`
 - Modify: `crates/flpdf/src/lib.rs` (add `pub mod outline_document_helper;` after line 62; add re-export after line 122)
 - Test: `crates/flpdf/tests/outline_document_helper_tests.rs` (create)
@@ -37,6 +38,7 @@ All paths below are relative to that worktree root. Run all `cargo` commands fro
 **Step 1: Write the failing test**
 
 Create `crates/flpdf/tests/outline_document_helper_tests.rs`:
+
 ```rust
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
@@ -121,6 +123,7 @@ Expected: compile error — `no method named outline` / unresolved `OutlineDocum
 **Step 3: Write minimal implementation**
 
 Create `crates/flpdf/src/outline_document_helper.rs`:
+
 ```rust
 //! High-level outline (`/Outlines`) document helper.
 //!
@@ -177,10 +180,13 @@ impl<R: Read + Seek> Pdf<R> {
 ```
 
 In `crates/flpdf/src/lib.rs` add after line 62 (`pub mod outline_dest_remap;` block):
+
 ```rust
 pub mod outline_document_helper;
 ```
+
 and after line 122 (`pub use outline::OutlineItem;`):
+
 ```rust
 pub use outline_document_helper::OutlineDocumentHelper;
 ```
@@ -191,6 +197,7 @@ Run: `cargo test -p flpdf --test outline_document_helper_tests 2>&1 | tail -20`
 Expected: 2 passed.
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/src/outline_document_helper.rs crates/flpdf/src/lib.rs crates/flpdf/tests/outline_document_helper_tests.rs
 git commit -m "feat(outline_document_helper): module skeleton + Pdf::outline() + has_outlines (flpdf-9hc.18.5)"
@@ -203,10 +210,12 @@ git commit -m "feat(outline_document_helper): module skeleton + Pdf::outline() +
 Materialize the tree with `title` (resolved, empty if absent — qpdf), raw `/Count` as `i64`, `parent: Option<ObjectRef>`, owned `children`. No dest yet (Task 5).
 
 **Files:**
+
 - Modify: `crates/flpdf/src/outline_document_helper.rs`
 - Test: `crates/flpdf/tests/outline_document_helper_tests.rs`
 
 **Step 1: Write the failing test** (append to test file)
+
 ```rust
 #[test]
 fn get_root_materializes_tree_with_titles_counts_parents() {
@@ -246,6 +255,7 @@ Expected: compile error — no `get_root`, no `OutlineNode`.
 **Step 3: Write minimal implementation**
 
 Add the const + node type near the top of `outline_document_helper.rs` (after the `use`):
+
 ```rust
 use std::collections::BTreeSet;
 
@@ -297,6 +307,7 @@ impl Dest {
 ```
 
 Add to the `impl OutlineDocumentHelper` block:
+
 ```rust
     /// Materialize and return the top-level outline nodes (qpdf
     /// `getTopLevelOutlines`). "root" is this top-level vector; the `/Outlines`
@@ -374,6 +385,7 @@ Add to the `impl OutlineDocumentHelper` block:
 ```
 
 Add free helpers at the bottom of the module:
+
 ```rust
 /// `/Title` decode: qpdf yields an empty string when absent. A resolved
 /// indirect string is handled by the caller passing the already-borrowed value;
@@ -407,6 +419,7 @@ Expected: 2 passed. Then run clippy:
 `cargo clippy -p flpdf --all-targets -- -D warnings 2>&1 | tail -15` — must be clean.
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/src/outline_document_helper.rs crates/flpdf/tests/outline_document_helper_tests.rs
 git commit -m "feat(outline_document_helper): OutlineNode + get_root materialization (flpdf-9hc.18.5)"
@@ -419,10 +432,12 @@ git commit -m "feat(outline_document_helper): OutlineNode + get_root materializa
 Pre-order flatten + closure visitor over the owned tree.
 
 **Files:**
+
 - Modify: `crates/flpdf/src/outline_document_helper.rs`
 - Test: `crates/flpdf/tests/outline_document_helper_tests.rs`
 
 **Step 1: Write the failing test** (append)
+
 ```rust
 #[test]
 fn iter_yields_preorder() {
@@ -456,6 +471,7 @@ Expected: compile error — no `iter`/`walk`.
 **Step 3: Write minimal implementation**
 
 Add to the `impl OutlineDocumentHelper` block:
+
 ```rust
     /// Pre-order iterator over every materialized node (owned).
     pub fn iter(&mut self) -> Result<impl Iterator<Item = OutlineNode>> {
@@ -478,6 +494,7 @@ Add to the `impl OutlineDocumentHelper` block:
 ```
 
 Add free helpers at the bottom:
+
 ```rust
 fn flatten_preorder(node: &OutlineNode, out: &mut Vec<OutlineNode>) {
     out.push(OutlineNode {
@@ -506,6 +523,7 @@ Run: `cargo test -p flpdf --test outline_document_helper_tests 2>&1 | tail -20`
 Expected: 6 passed total. Clippy clean.
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/src/outline_document_helper.rs crates/flpdf/tests/outline_document_helper_tests.rs
 git commit -m "feat(outline_document_helper): iter + walk pre-order traversal (flpdf-9hc.18.5)"
@@ -518,9 +536,11 @@ git commit -m "feat(outline_document_helper): iter + walk pre-order traversal (f
 Satisfies the acceptance criterion "integration test exercises deep outline traversal" at moderate depth (~30); true 1000-deep/iterative is deferred to flpdf-9hc.14.7.
 
 **Files:**
+
 - Test: `crates/flpdf/tests/outline_document_helper_tests.rs`
 
 **Step 1: Write the failing test** (append) — programmatic deep + cyclic fixtures
+
 ```rust
 /// Build a linear chain of `n` nested outline items (each is the sole child of
 /// the previous). Object numbers: catalog 1, pages 2, page 3, outlines 4,
@@ -606,6 +626,7 @@ Run: `cargo test -p flpdf --test outline_document_helper_tests 2>&1 | tail -25`
 Expected: 9 passed total.
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/tests/outline_document_helper_tests.rs
 git commit -m "test(outline_document_helper): deep (~30), depth-cap, and cycle traversal (flpdf-9hc.18.5)"
@@ -618,10 +639,12 @@ git commit -m "test(outline_document_helper): deep (~30), depth-cap, and cycle t
 Resolve `dest` for each node (no named-dest tree yet — Task 6). Mirrors qpdf `getDest` for the GoTo + explicit-array cases.
 
 **Files:**
+
 - Modify: `crates/flpdf/src/outline_document_helper.rs`
 - Test: `crates/flpdf/tests/outline_document_helper_tests.rs`
 
 **Step 1: Write the failing test** (append)
+
 ```rust
 #[test]
 fn dest_from_explicit_dest_array() {
@@ -664,6 +687,7 @@ Expected: FAIL — `a1.dest` is `None`.
 **Step 3: Write minimal implementation**
 
 Add `MAX_DEST_RESOLVE_DEPTH` const near the top:
+
 ```rust
 /// Indirection/`/D` nesting bound when resolving a destination. Mirrors the
 /// constant in `outline_dest_remap`. Only exists to make malformed/cyclic
@@ -675,6 +699,7 @@ In `build_siblings`, extend the owned-extraction block (the one that already
 clones `count_src` while `dict` is still borrowed) to also clone the dest
 sources, THEN — after the `dict` borrow has ended — resolve the dest alongside
 `count`:
+
 ```rust
             // ...inside the owned-extraction block, while `dict` is borrowed:
             let count_src = dict.get("Count").cloned();
@@ -684,10 +709,12 @@ sources, THEN — after the `dict` borrow has ended — resolve the dest alongsi
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
             let dest = self.resolve_node_dest(dest_src, action_src)?;
 ```
+
 and set `dest` in the pushed `OutlineNode { ... dest, ... }` (replace the
 `dest: None` from Task 2 with the resolved `dest`).
 
 Add to the `impl OutlineDocumentHelper` block:
+
 ```rust
     /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
     /// Named/string destinations are resolved in Task 6 (`resolve_named_dest`).
@@ -748,6 +775,7 @@ Run: `cargo test -p flpdf --test outline_document_helper_tests 2>&1 | tail -25`
 Expected: 11 passed total. Clippy clean.
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/src/outline_document_helper.rs crates/flpdf/tests/outline_document_helper_tests.rs
 git commit -m "feat(outline_document_helper): resolve explicit + GoTo-action destinations (flpdf-9hc.18.5)"
@@ -760,10 +788,12 @@ git commit -m "feat(outline_document_helper): resolve explicit + GoTo-action des
 Resolve Name/String destinations against the catalog name tree and legacy dict — the bulk of qpdf `getDest`'s `resolveNamedDest`.
 
 **Files:**
+
 - Modify: `crates/flpdf/src/outline_document_helper.rs`
 - Test: `crates/flpdf/tests/outline_document_helper_tests.rs`
 
 **Step 1: Write the failing test** (append) — both modern (string + name tree) and legacy (name + `/Dests` dict)
+
 ```rust
 /// Modern named dest: outline /Dest (named) is a string resolved via
 /// catalog /Names /Dests name tree. Name tree leaf maps (mydest) -> [3 0 R /Fit].
@@ -822,6 +852,7 @@ Expected: FAIL — `dest` is `None` for Name/String.
 **Step 3: Write minimal implementation**
 
 In `dest_from_value`, replace the `_ => Ok(None)` arm:
+
 ```rust
             Object::Name(name) => self.resolve_named_dest(name.clone()),
             Object::String(name) => self.resolve_named_dest(name.clone()),
@@ -829,6 +860,7 @@ In `dest_from_value`, replace the `_ => Ok(None)` arm:
 ```
 
 Add `use crate::name_number_tree::read_name_tree;` to the imports (top of file) and a const for the name-tree depth cap, then add to the `impl OutlineDocumentHelper` block:
+
 ```rust
     /// Resolve a named destination `name` to an explicit [`Dest`].
     ///
@@ -879,6 +911,7 @@ Add `use crate::name_number_tree::read_name_tree;` to the imports (top of file) 
 ```
 
 > **Implementation notes:**
+>
 > - `read_name_tree` takes the `/Dests` name-tree root `Object` (a ref or inline
 >   node dict) and a `decode` closure; returning `Ok(Some(value))` keeps the raw
 >   dest value (array or `/D` dict), which `dest_from_value` then normalizes.
@@ -894,6 +927,7 @@ Run: `cargo test -p flpdf --test outline_document_helper_tests 2>&1 | tail -25`
 Expected: 13 passed total. Clippy clean.
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/src/outline_document_helper.rs crates/flpdf/tests/outline_document_helper_tests.rs
 git commit -m "feat(outline_document_helper): resolve named destinations (name tree + legacy) (flpdf-9hc.18.5)"
@@ -906,17 +940,20 @@ git commit -m "feat(outline_document_helper): resolve named destinations (name t
 Satisfy the "API documented" acceptance criterion and finalize.
 
 **Files:**
+
 - Modify: `crates/flpdf/src/lib.rs` (extend the re-export to the new public types)
 - Modify: `crates/flpdf/src/outline_document_helper.rs` (rustdoc with a usage example)
 
 **Step 1: Extend exports**
 
 In `crates/flpdf/src/lib.rs`, change the Task-1 re-export to:
+
 ```rust
 pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};
 ```
 
 **Step 2: Add a rustdoc usage example** to the module header in `outline_document_helper.rs` (a doctest):
+
 ```rust
 //! # Example
 //!
@@ -937,6 +974,7 @@ pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};
 ```
 
 **Step 3: Run the full quality gate**
+
 ```bash
 cargo fmt --all
 cargo fmt --all -- --check
@@ -944,6 +982,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail
 cargo test -p flpdf 2>&1 | tail -30
 cargo test --doc -p flpdf 2>&1 | tail -15
 ```
+
 Expected: fmt clean, clippy clean, all flpdf tests pass (existing + 13 new), doctest compiles.
 
 **Step 4: Verify existing outline behavior is untouched**
@@ -951,6 +990,7 @@ Run: `cargo test -p flpdf --test inspection_tests 2>&1 | tail -12`
 Expected: 7 passed (including `outline_items_returns_titles_in_pre_order` — the `<untitled>` flat API is unchanged).
 
 **Step 5: Commit**
+
 ```bash
 git add crates/flpdf/src/lib.rs crates/flpdf/src/outline_document_helper.rs
 git commit -m "docs(outline_document_helper): export types + rustdoc example; finalize (flpdf-9hc.18.5)"
