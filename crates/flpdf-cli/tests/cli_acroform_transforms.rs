@@ -289,11 +289,29 @@ fn generate_appearances_tx_skips_existing_ap() {
 
     let n_obj = resolve_one(&mut pdf, n_val).unwrap();
     let stream = n_obj.as_stream().expect("/AP/N must be a stream");
-    // Original content "(Hello) Tj ET" is preserved verbatim in the XObject.
+    let data = &stream.data;
+    let as_str = std::str::from_utf8(data).unwrap_or("<non-utf8>");
+
+    // The widget arrived with a hand-authored appearance `BT (Hello) Tj ET`.
+    // --generate-appearances must NOT overwrite it. A regenerated appearance
+    // would (a) drop the original byte sequence and (b) carry the generator's
+    // distinctive markers — a `/Tx BMC` marked-content wrapper and a `Tf`
+    // font-selection operator — neither of which the original fixture has.
+    // (Asserting "(Hello) Tj" alone is insufficient: a regenerated appearance
+    // for the value "Hello" would also contain it.)
     assert!(
-        stream.data.windows(2).any(|w| w == b"Tj"),
-        "existing /AP/N stream must still contain Tj; data={:?}",
-        std::str::from_utf8(&stream.data).unwrap_or("<non-utf8>")
+        data.windows(16).any(|w| w == b"BT (Hello) Tj ET"),
+        "original /AP/N content must be preserved verbatim; data={as_str:?}"
+    );
+    assert!(
+        !data.windows(7).any(|w| w == b"/Tx BMC"),
+        "original /AP/N must not be replaced by a generated appearance \
+         (found /Tx BMC marker); data={as_str:?}"
+    );
+    assert!(
+        !data.windows(2).any(|w| w == b"Tf"),
+        "original /AP/N must not be replaced by a generated appearance \
+         (found Tf operator); data={as_str:?}"
     );
 }
 
