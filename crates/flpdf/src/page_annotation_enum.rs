@@ -2,8 +2,8 @@
 //!
 //! [`enumerate_page_annotations`] reads the `/Annots` array of a leaf page,
 //! resolves each annotation's `/Subtype` and `/Rect` via
-//! [`AnnotationObjectHelper`], and for Widget annotations walks the `/Parent`
-//! chain in the AcroForm field tree to determine the owning field object.
+//! [`AnnotationObjectHelper`], and for Widget annotations resolves the owning
+//! AcroForm field object.
 //!
 //! [`enumerate_document_annotations`] is a convenience wrapper that applies
 //! [`enumerate_page_annotations`] to every leaf page in the document.
@@ -13,28 +13,23 @@
 //! A Widget annotation may be "merged" into its field (the same dictionary
 //! object acts as both annotation and field, and carries `/FT`).  Alternatively
 //! the widget and its field may be separate objects, with the widget holding a
-//! `/Parent` reference to the field.  The linkage algorithm handles both cases:
+//! `/Parent` reference to the field.  The linkage rule handles both cases:
 //!
-//! 1. Start at `annot_ref`.
-//! 2. Check whether the current node has `/FT` (non-Null, any type including
-//!    Reference — a present entry is sufficient to identify the field root).
-//!    If found, return `Some(current)`.
-//! 3. If a `/Parent` reference exists, advance and repeat (up to
-//!    [`DEFAULT_MAX_ACROFORM_DEPTH`] levels).
-//! 4. If the chain ends without finding `/FT` but at least one `/Parent` hop
-//!    was taken, return the topmost node as the field reference (some
-//!    generators omit `/FT` from intermediate group nodes).
-//! 5. If no `/Parent` was ever found and no `/FT` present, return `None`
+//! 1. If the widget dict carries a non-Null `/FT` (any type, including a
+//!    Reference — its presence alone identifies a field), the widget *is* its
+//!    own field: return `Some(annot_ref)`.
+//! 2. Otherwise return the widget's direct `/Parent` reference — the terminal
+//!    field that owns this widget.
+//! 3. If the widget has neither `/FT` nor a `/Parent` reference, return `None`
 //!    (orphaned widget with no traceable field).
 //!
-//! A `BTreeSet` visited guard prevents infinite loops on cyclic graphs.
+//! The owning field is deliberately the *direct* parent rather than the nearest
+//! `/FT`-bearing ancestor: field attributes inherit *down* the field tree, so a
+//! terminal field may omit `/FT` while an ancestor supplies it. Returning the
+//! ancestor would wrongly merge several sibling terminal fields onto one ref.
 
 use crate::page_object_helper::PageBox;
-use crate::{
-    AnnotationObjectHelper, Error, Object, ObjectRef, PageObjectHelper, Pdf, Result,
-    DEFAULT_MAX_ACROFORM_DEPTH,
-};
-use std::collections::BTreeSet;
+use crate::{AnnotationObjectHelper, Object, ObjectRef, PageObjectHelper, Pdf, Result};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -68,9 +63,8 @@ pub struct EnumeratedAnnotation {
     ///
     /// - When the widget dict itself carries `/FT` (merged field/widget), this
     ///   equals `annot_ref`.
-    /// - When the field is a separate ancestor dict, this is the ref of the
-    ///   topmost field node with `/FT` (or the topmost `/Parent` if no node
-    ///   explicitly has `/FT`).
+    /// - Otherwise this is the widget's direct `/Parent` (the terminal field
+    ///   that owns it).
     /// - `None` for non-Widget annotations, or for Widget annotations where no
     ///   owning field can be found.
     pub field_ref: Option<ObjectRef>,
@@ -90,17 +84,15 @@ pub struct EnumeratedAnnotation {
 /// 2. For each ref, use [`AnnotationObjectHelper`] to read `/Subtype` and
 ///    `/Rect`.
 /// 3. Determine [`EnumeratedAnnotation::is_widget`].
-/// 4. For Widget annotations, walk the `/Parent` chain to identify the owning
-///    field (see module documentation for the full algorithm).
+/// 4. For Widget annotations, resolve the owning field (see module
+///    documentation for the linkage rule).
 ///
 /// Returns an empty `Vec` when the page has no `/Annots` entry.
 ///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] if `page_ref` does not resolve to a `/Type /Page`
-///   dictionary.
-/// - [`Error::Unsupported`] if the AcroForm field-tree depth limit is exceeded
-///   during widget-to-field linkage.
+/// - [`crate::Error::Unsupported`] if `page_ref` does not resolve to a
+///   `/Type /Page` dictionary.
 /// - Any error propagated from [`Pdf::resolve`].
 ///
 /// # Examples
@@ -209,75 +201,39 @@ pub fn enumerate_document_annotations<R: Read + Seek>(
 // Private: widget-to-field chain walk
 // ---------------------------------------------------------------------------
 
-/// Walk the AcroForm `/Parent` chain from `start` to find the owning field.
+/// Find the AcroForm field that directly owns the widget at `start`.
 ///
 /// Returns `Some(field_ref)` where `field_ref` is:
-/// - the first node in the chain that has a non-Null `/FT` entry, OR
-/// - the topmost `/Parent` node reached (when no node has `/FT`), if at least
-///   one hop was taken.
+/// - `start` itself when the widget carries its own non-Null `/FT` (a merged
+///   widget/field), OR
+/// - the widget's direct `/Parent` (the *terminal* field that owns it).
 ///
-/// Returns `None` when the starting node has neither `/FT` nor `/Parent`.
+/// The owning field is the **direct** parent, not the nearest `/FT`-bearing
+/// ancestor: field type and other attributes inherit *down* the field tree, so
+/// a terminal field may omit `/FT` while a higher ancestor supplies it. Walking
+/// up to the first `/FT` would wrongly collapse several sibling terminal fields
+/// (each inheriting `/FT` from a shared parent) onto that single ancestor.
+///
+/// Returns `None` when the widget has neither `/FT` nor a `/Parent` reference.
 fn find_field_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = start;
-    let mut depth: usize = 0;
-    // Whether we have taken at least one /Parent hop.
-    let mut took_parent_hop = false;
+    let node = pdf.resolve_borrowed(start)?;
+    let Some(dict) = node.as_dict() else {
+        return Ok(None);
+    };
 
-    loop {
-        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "AcroForm field-tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH} \
-                 starting from widget {start}"
-            )));
-        }
+    // Merged widget: a non-Null /FT (review-pattern #2: it may be indirect, so
+    // presence alone is enough) means the widget IS its own field.
+    if matches!(dict.get("FT"), Some(v) if !matches!(v, Object::Null)) {
+        return Ok(Some(start));
+    }
 
-        if !visited.insert(current) {
-            // Cycle detected — return `current` as best candidate (we have
-            // reached it at least once before, so it must be a real node).
-            return Ok(Some(current));
-        }
-
-        // Resolve current node; extract /FT presence and /Parent ref
-        // before the borrow ends.
-        let node = pdf.resolve_borrowed(current)?;
-        let dict = match node {
-            Object::Dictionary(d) => d,
-            _ => {
-                // Not a dict — stop. If we hopped at least once, return current
-                // (last known node before this non-dict).
-                return Ok(if took_parent_hop { Some(current) } else { None });
-            }
-        };
-
-        // Check /FT: present and non-Null means this node IS a field.
-        // We intentionally do NOT resolve a Reference value here — its mere
-        // presence (any non-Null object, including Reference) is sufficient to
-        // identify a field root (review-pattern #2: /FT may be indirect).
-        let has_ft = matches!(dict.get("FT"), Some(v) if !matches!(v, Object::Null));
-
-        let parent_val = dict.get("Parent").cloned();
-
-        if has_ft {
-            return Ok(Some(current));
-        }
-
-        match parent_val {
-            Some(Object::Reference(parent_ref)) => {
-                took_parent_hop = true;
-                current = parent_ref;
-                depth += 1;
-            }
-            _ => {
-                // No /Parent and no /FT found on this node.
-                // Return current when we have hopped at least once (this node
-                // is the topmost reachable in the chain).
-                return Ok(if took_parent_hop { Some(current) } else { None });
-            }
-        }
+    // Separated widget: the owning terminal field is its direct /Parent.
+    match dict.get("Parent") {
+        Some(Object::Reference(parent_ref)) => Ok(Some(*parent_ref)),
+        _ => Ok(None),
     }
 }
 
@@ -474,19 +430,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: multi-level parent chain — widget → intermediate → field(/FT)
+    // Test: multi-level chain — owning field is the DIRECT parent, not the
+    // nearest /FT-bearing ancestor.
     // -----------------------------------------------------------------------
     //
     // Object layout:
     //   4 = Widget annotation (no /FT, /Parent 5 0 R)
-    //   5 = Intermediate node (no /FT, /Parent 6 0 R)
-    //   6 = Field dict (/FT /Btn)
+    //   5 = Terminal field (no /FT — inherits it; /Parent 6 0 R)
+    //   6 = Parent field (/FT /Btn)
+    //
+    // The widget's owning field is obj 5 (its direct parent), even though obj 6
+    // supplies the inherited /FT.
 
     #[test]
-    fn multi_level_parent_chain_finds_field() {
+    fn owning_field_is_direct_parent_not_ft_ancestor() {
         let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
                              /Rect [0 0 100 20] /Parent 5 0 R >>\nendobj\n";
-        let obj5: &[u8] = b"5 0 obj\n<< /Parent 6 0 R >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /Parent 6 0 R /T (option1) >>\nendobj\n";
         let obj6: &[u8] = b"6 0 obj\n<< /FT /Btn /T (radio) >>\nendobj\n";
 
         let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5), (6, obj6)]);
@@ -496,7 +456,38 @@ mod tests {
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         let a = &annots[0];
         assert!(a.is_widget);
-        assert_eq!(a.field_ref, Some(ObjectRef::new(6, 0)));
+        assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: sibling terminal fields inheriting /FT from a shared parent must
+    // map to DISTINCT field_refs (not collapsed onto the ancestor).
+    // -----------------------------------------------------------------------
+    //
+    //   4 = Widget A (/Parent 6)   5 = Widget B (/Parent 7)
+    //   6 = Terminal field A (no /FT, /Parent 8)
+    //   7 = Terminal field B (no /FT, /Parent 8)
+    //   8 = Parent field (/FT /Btn)
+
+    #[test]
+    fn sibling_terminal_fields_are_distinct() {
+        let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [0 0 50 20] /Parent 6 0 R >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [60 0 110 20] /Parent 7 0 R >>\nendobj\n";
+        let obj6: &[u8] = b"6 0 obj\n<< /Parent 8 0 R /T (a) >>\nendobj\n";
+        let obj7: &[u8] = b"7 0 obj\n<< /Parent 8 0 R /T (b) >>\nendobj\n";
+        let obj8: &[u8] = b"8 0 obj\n<< /FT /Btn /T (group) >>\nendobj\n";
+
+        let bytes = build_pdf(
+            Some("[4 0 R 5 0 R]"),
+            &[(4, obj4), (5, obj5), (6, obj6), (7, obj7), (8, obj8)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let annots = enumerate_page_annotations(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(6, 0)));
+        assert_eq!(annots[1].field_ref, Some(ObjectRef::new(7, 0)));
+        assert_ne!(annots[0].field_ref, annots[1].field_ref);
     }
 
     // -----------------------------------------------------------------------
@@ -557,14 +548,13 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        // Must not hang. The exact field_ref value is implementation-defined
-        // (the visited guard fires at obj 4 the second time, so topmost = obj4).
+        // Linkage is a single hop to the direct parent, so a /Parent cycle is
+        // harmless — it never walks far enough to loop. field_ref = obj 5.
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         assert_eq!(annots.len(), 1);
         let a = &annots[0];
         assert!(a.is_widget);
-        // Cycle → should return Some (topmost seen before cycle fired = obj 4)
-        assert!(a.field_ref.is_some());
+        assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
     }
 
     // -----------------------------------------------------------------------
