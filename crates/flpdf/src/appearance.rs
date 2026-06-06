@@ -1497,6 +1497,553 @@ fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+// ── Ch (choice: combo/list) appearance ───────────────────────────────────────
+
+/// Generate and install a normal appearance stream for a Ch (choice) widget.
+///
+/// Handles two Ch sub-types determined by `/Ff` bit 18 (1-indexed, `0x20000`):
+///
+/// - **Combo** (bit 18 set): renders the selected value (`/V`) as a single-line
+///   text field, equivalent to a Tx single-line field.  If `/V` is absent the
+///   stream is a blank appearance.
+/// - **List** (bit 18 clear): renders each option from `/Opt` as a separate row,
+///   with a coloured highlight rectangle behind selected rows.  `/I` (selected
+///   indices) is consulted first; if absent, `/V` is matched against `/Opt`
+///   export values.  `/TI` (top-visible index) offsets the starting row.
+///
+/// Returns `Ok(Some(xobj_ref))` on success, `Ok(None)` when the widget should
+/// be skipped (not a Ch field or degenerate bounding box).
+///
+/// # Observable-equivalence policy
+///
+/// Rendering of selected values/options and highlight rectangles targets
+/// **observable equivalence** — the same rendered appearance as standard
+/// viewers.  Byte-identical output is not a goal; whitespace, operator
+/// ordering, highlight colour, and auto-size heuristics may differ between
+/// this implementation and any specific viewer.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when the field-tree depth limit is exceeded
+/// or an object is structurally invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{generate_choice_field_appearance, ObjectRef, Pdf};
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
+/// let widget = ObjectRef::new(10, 0);
+/// if let Some(ap_ref) = generate_choice_field_appearance(&mut pdf, widget)? {
+///     println!("choice appearance stream written at {ap_ref}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn generate_choice_field_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    // ── 1. Verify /FT is Ch ───────────────────────────────────────────────────
+    let ft = resolve_inherited_name(pdf, widget_ref, b"FT")?;
+    if ft.as_deref() != Some(b"Ch") {
+        return Ok(None);
+    }
+
+    // ── 2. /Ff — field flags; bit 18 (1-indexed) = Combo ─────────────────────
+    let ff = resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0);
+    let is_combo = ff & 0x20000 != 0; // bit 18 (1-indexed)
+
+    // ── 3. /Rect — bounding box ───────────────────────────────────────────────
+    let rect = resolve_rect(pdf, widget_ref)?;
+    let (bbox_w, bbox_h) = match rect {
+        Some(r) => {
+            let w = (r.urx - r.llx).abs();
+            let h = (r.ury - r.lly).abs();
+            if !w.is_finite() || !h.is_finite() || w < 1.0 || h < 1.0 {
+                return Ok(None);
+            }
+            (w, h)
+        }
+        None => return Ok(None),
+    };
+
+    // ── 4. /DA → parse → font resolution (same pattern as Tx) ────────────────
+    let da_bytes = resolve_da(pdf, widget_ref)?;
+    let da = parse_default_appearance(da_bytes.as_deref().unwrap_or(b""));
+
+    let font_name_bytes: Vec<u8> = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
+    let std_font = match StandardFont::from_base_name(&font_name_bytes) {
+        Some(sf) => sf,
+        None => lookup_dr_basefont(pdf, widget_ref, &font_name_bytes)?
+            .unwrap_or(StandardFont::Helvetica),
+    };
+    let base_font_name = official_base_name(std_font).to_vec();
+    let font_resource_name = font_name_bytes.clone();
+    let font_info = ChFontInfo {
+        resource_name: font_resource_name,
+        base_name: base_font_name,
+        std_font,
+    };
+
+    // ── 5. /Q — quadding ──────────────────────────────────────────────────────
+    let quadding = resolve_inherited_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
+
+    if is_combo {
+        generate_combo_appearance(pdf, widget_ref, bbox_w, bbox_h, &da, font_info, quadding)
+    } else {
+        generate_list_appearance(pdf, widget_ref, bbox_w, bbox_h, &da, font_info)
+    }
+}
+
+/// Resolved font information for Ch appearance rendering.
+struct ChFontInfo {
+    /// Name used in the Tf operator and `/Resources/Font` key (from /DA).
+    resource_name: Vec<u8>,
+    /// Official PDF BaseFont name (e.g. `b"Helvetica"`).
+    base_name: Vec<u8>,
+    /// Resolved standard font variant.
+    std_font: StandardFont,
+}
+
+/// Render a Combo-box appearance: the selected `/V` value as a single-line text.
+fn generate_combo_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    bbox_w: f64,
+    bbox_h: f64,
+    da: &crate::default_appearance::DefaultAppearance,
+    font: ChFontInfo,
+    quadding: i64,
+) -> Result<Option<ObjectRef>> {
+    // Read /V — combo boxes have a single String value.
+    // Resolve the raw value through any indirect reference (review-pattern #2).
+    let raw_value = resolve_inherited_object(pdf, widget_ref, b"V")?;
+    let text_bytes: Vec<u8> = match raw_value {
+        None => Vec::new(),
+        Some(Object::String(bytes)) => {
+            decode_pdf_text_string(&bytes)
+                .map(|s| to_winansi_bytes(&s))
+                .unwrap_or(bytes)
+        }
+        Some(Object::Reference(r)) => {
+            let obj = pdf.resolve(r)?;
+            match obj {
+                Object::String(bytes) => decode_pdf_text_string(&bytes)
+                    .map(|s| to_winansi_bytes(&s))
+                    .unwrap_or(bytes),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    // Best-effort: if /Opt has [export,display] entries and /V matches an
+    // export string, use the display string instead.
+    let text_bytes = resolve_combo_display(pdf, widget_ref, text_bytes);
+
+    // Font size: same single-line heuristic as Tx.
+    let font_size = if da.auto_size {
+        (bbox_h - 2.0).clamp(4.0, 12.0)
+    } else {
+        da.font_size
+    };
+
+    let params = TextAppearanceParams {
+        text_bytes,
+        font_resource_name: font.resource_name.clone(),
+        font_size,
+        color: da.color.clone(),
+        bbox_w,
+        bbox_h,
+        quadding,
+        multiline: false,
+        std_font: Some(font.std_font),
+    };
+    let content = build_text_appearance_content(&params);
+
+    let font_obj_ref = next_object_ref(pdf)?;
+    let xobj_ref = install_normal_appearance(
+        pdf,
+        widget_ref,
+        content,
+        bbox_w,
+        bbox_h,
+        Some((font.resource_name, font.base_name, font_obj_ref)),
+    )?;
+
+    Ok(Some(xobj_ref))
+}
+
+/// Best-effort: map a combo /V export value to its display string via /Opt.
+///
+/// Returns `value` unchanged when /Opt is absent, malformed, or does not
+/// contain an `[export, display]` pair matching `value`.  All /Opt elements
+/// and their sub-elements are resolved through indirect references
+/// (review-pattern #2).
+fn resolve_combo_display<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    value: Vec<u8>,
+) -> Vec<u8> {
+    // /Opt lives directly on the widget/field — no inheritance walk needed.
+    let opt_val = {
+        let obj = match pdf.resolve_borrowed(widget_ref) {
+            Ok(o) => o,
+            Err(_) => return value,
+        };
+        obj.as_dict().and_then(|d| d.get("Opt").cloned())
+    };
+    let opt_arr = match resolve_opt_array(pdf, opt_val) {
+        Some(a) => a,
+        None => return value,
+    };
+
+    for elem_obj in opt_arr {
+        // Each element may be indirect.
+        let elem = match elem_obj {
+            Object::Reference(r) => match pdf.resolve(r) {
+                Ok(o) => o,
+                Err(_) => continue,
+            },
+            other => other,
+        };
+        match elem {
+            Object::Array(pair) => {
+                // [export_string, display_string]
+                let export = resolve_string_elem(pdf, pair.first().cloned());
+                let display = resolve_string_elem(pdf, pair.get(1).cloned());
+                if let (Some(exp), Some(disp)) = (export, display) {
+                    let exp_wi = decode_pdf_text_string(&exp)
+                        .map(|s| to_winansi_bytes(&s))
+                        .unwrap_or(exp);
+                    if exp_wi == value {
+                        return decode_pdf_text_string(&disp)
+                            .map(|s| to_winansi_bytes(&s))
+                            .unwrap_or(disp);
+                    }
+                }
+            }
+            Object::String(s) => {
+                let wi = decode_pdf_text_string(&s)
+                    .map(|st| to_winansi_bytes(&st))
+                    .unwrap_or(s);
+                if wi == value {
+                    return value; // export == display
+                }
+            }
+            _ => {}
+        }
+    }
+    value
+}
+
+/// Resolve an /Opt value (possibly indirect) to a Vec<Object> array.
+fn resolve_opt_array<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    opt_val: Option<Object>,
+) -> Option<Vec<Object>> {
+    match opt_val {
+        Some(Object::Array(a)) => Some(a),
+        Some(Object::Reference(r)) => {
+            let resolved = pdf.resolve(r).ok()?;
+            match resolved {
+                Object::Array(a) => Some(a),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a single /Opt element (possibly indirect) to a String byte vec.
+fn resolve_string_elem<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    val: Option<Object>,
+) -> Option<Vec<u8>> {
+    match val? {
+        Object::String(s) => Some(s),
+        Object::Reference(r) => match pdf.resolve(r).ok()? {
+            Object::String(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Render a List-box appearance: each option as a row, selected rows highlighted.
+fn generate_list_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    bbox_w: f64,
+    bbox_h: f64,
+    da: &crate::default_appearance::DefaultAppearance,
+    font: ChFontInfo,
+) -> Result<Option<ObjectRef>> {
+    // ── Collect options from /Opt (direct on widget/field, no inheritance) ────
+    // /Opt may be an indirect reference (review-pattern #2).
+    let opt_val = {
+        let obj = pdf.resolve_borrowed(widget_ref)?;
+        obj.as_dict().and_then(|d| d.get("Opt").cloned())
+    };
+    let opt_arr = resolve_opt_array(pdf, opt_val).unwrap_or_default();
+    let n_opts = opt_arr.len();
+
+    // Build display texts and export texts (for /V matching).
+    struct OptEntry {
+        export: Vec<u8>,  // WinAnsi bytes of export string
+        display: Vec<u8>, // WinAnsi bytes of display string
+    }
+
+    let mut options: Vec<OptEntry> = Vec::with_capacity(n_opts);
+    for elem_obj in opt_arr {
+        let elem = match elem_obj {
+            Object::Reference(r) => pdf.resolve(r)?,
+            other => other,
+        };
+        match elem {
+            Object::Array(pair) => {
+                let exp_raw = resolve_string_elem(pdf, pair.first().cloned())
+                    .unwrap_or_default();
+                let disp_raw = resolve_string_elem(pdf, pair.get(1).cloned())
+                    .unwrap_or_default();
+                let export = decode_pdf_text_string(&exp_raw)
+                    .map(|s| to_winansi_bytes(&s))
+                    .unwrap_or(exp_raw);
+                let display = decode_pdf_text_string(&disp_raw)
+                    .map(|s| to_winansi_bytes(&s))
+                    .unwrap_or(disp_raw);
+                options.push(OptEntry { export, display });
+            }
+            Object::String(s) => {
+                let wi = decode_pdf_text_string(&s)
+                    .map(|st| to_winansi_bytes(&st))
+                    .unwrap_or(s);
+                options.push(OptEntry {
+                    export: wi.clone(),
+                    display: wi,
+                });
+            }
+            _ => {
+                options.push(OptEntry {
+                    export: Vec::new(),
+                    display: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // ── Determine selected indices ─────────────────────────────────────────────
+    // /I (integer array) takes priority; missing/invalid → fall back to /V.
+    let selected: std::collections::BTreeSet<usize> = {
+        let i_val = {
+            let obj = pdf.resolve_borrowed(widget_ref)?;
+            obj.as_dict().and_then(|d| d.get("I").cloned())
+        };
+        let i_arr = resolve_opt_array(pdf, i_val);
+
+        if let Some(arr) = i_arr {
+            let mut set = std::collections::BTreeSet::new();
+            for elem in arr {
+                let resolved = match elem {
+                    Object::Reference(r) => pdf.resolve(r)?,
+                    other => other,
+                };
+                if let Some(idx_i64) = resolved.as_integer() {
+                    // Non-negative and in-bounds check before cast (rule #3).
+                    if idx_i64 >= 0 {
+                        let idx = idx_i64 as usize;
+                        if idx < options.len() {
+                            set.insert(idx);
+                        }
+                    }
+                }
+            }
+            set
+        } else {
+            // Fall back: match /V against /Opt export strings.
+            let v_val = resolve_inherited_object(pdf, widget_ref, b"V")?;
+            let mut set = std::collections::BTreeSet::new();
+            match v_val {
+                None => {}
+                Some(Object::String(s)) => {
+                    let wi = decode_pdf_text_string(&s)
+                        .map(|st| to_winansi_bytes(&st))
+                        .unwrap_or(s);
+                    for (i, opt) in options.iter().enumerate() {
+                        if opt.export == wi {
+                            set.insert(i);
+                            break;
+                        }
+                    }
+                }
+                Some(Object::Array(arr)) => {
+                    for elem in arr {
+                        let resolved = match elem {
+                            Object::Reference(r) => pdf.resolve(r)?,
+                            other => other,
+                        };
+                        if let Object::String(s) = resolved {
+                            let wi = decode_pdf_text_string(&s)
+                                .map(|st| to_winansi_bytes(&st))
+                                .unwrap_or(s);
+                            for (i, opt) in options.iter().enumerate() {
+                                if opt.export == wi {
+                                    set.insert(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Object::Reference(r)) => {
+                    let resolved = pdf.resolve(r)?;
+                    if let Object::String(s) = resolved {
+                        let wi = decode_pdf_text_string(&s)
+                            .map(|st| to_winansi_bytes(&st))
+                            .unwrap_or(s);
+                        for (i, opt) in options.iter().enumerate() {
+                            if opt.export == wi {
+                                set.insert(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            set
+        }
+    };
+
+    // ── /TI — top index (first visible option) ────────────────────────────────
+    // Non-negative and in-bounds (review-pattern #3).
+    let ti_val = {
+        let obj = pdf.resolve_borrowed(widget_ref)?;
+        obj.as_dict().and_then(|d| d.get("TI").cloned())
+    };
+    let ti: usize = match ti_val {
+        Some(Object::Reference(r)) => {
+            let resolved = pdf.resolve(r)?;
+            match resolved.as_integer() {
+                Some(n) if n >= 0 && (n as usize) < options.len() => n as usize,
+                _ => 0,
+            }
+        }
+        Some(Object::Integer(n)) if n >= 0 && (n as usize) < options.len() => n as usize,
+        _ => 0,
+    };
+
+    // ── Font size ──────────────────────────────────────────────────────────────
+    // For list boxes use a fixed reasonable size when /DA has auto-size (0);
+    // using bbox_h (the total field height) would be wrong since it spans many rows.
+    let font_size = if da.auto_size {
+        12.0_f64.min(bbox_h * 0.8).max(4.0)
+    } else {
+        da.font_size
+    };
+    let leading = font_size * 1.15;
+
+    // ── Build content stream ───────────────────────────────────────────────────
+    // Structure (ISO 32000-1 §9.4.1: path operators must NOT appear inside BT..ET):
+    //   q
+    //   <highlight rects outside BT>
+    //   BT
+    //   /Font size Tf
+    //   <color ops>
+    //   <per-row Td Tj>
+    //   ET
+    //   Q
+    let mut content: Vec<u8> = Vec::new();
+    content.extend_from_slice(b"q\n");
+
+    // Emit highlight rectangles first (outside BT..ET).
+    // highlight colour: 0.6 0.75 0.85 rg (light blue)
+    let mut any_highlight = false;
+    for (row, i) in (ti..options.len()).enumerate() {
+        let row_top = bbox_h - leading * (row as f64 + 1.0);
+        if row_top < -leading {
+            break; // clipped below bbox
+        }
+        if selected.contains(&i) {
+            if !any_highlight {
+                content.extend_from_slice(b"0.6 0.75 0.85 rg\n");
+                any_highlight = true;
+            }
+            // Rect: x=0, y=row_top, w=bbox_w, h=leading
+            content.extend_from_slice(fmt_f64(0.0).as_bytes());
+            content.push(b' ');
+            content.extend_from_slice(fmt_f64(row_top).as_bytes());
+            content.push(b' ');
+            content.extend_from_slice(fmt_f64(bbox_w).as_bytes());
+            content.push(b' ');
+            content.extend_from_slice(fmt_f64(leading).as_bytes());
+            content.extend_from_slice(b" re\n");
+            content.extend_from_slice(b"f\n");
+        }
+    }
+
+    content.extend_from_slice(b"BT\n");
+
+    // Tf operator.
+    content.push(b'/');
+    crate::object::write_name_escaped(&mut content, &font.resource_name);
+    content.push(b' ');
+    content.extend_from_slice(fmt_f64(font_size).as_bytes());
+    content.extend_from_slice(b" Tf\n");
+
+    // Text colour (from /DA).
+    color_ops(&da.color, &mut content);
+
+    // Per-row text.
+    for (row, i) in (ti..options.len()).enumerate() {
+        let row_top = bbox_h - leading * (row as f64 + 1.0);
+        if row_top < -leading {
+            break;
+        }
+        // Baseline: midpoint of the row slot with typical descender offset.
+        let text_y = row_top + font_size * 0.2;
+        let text_x = 2.0_f64; // left margin
+
+        // Each row uses an absolute Td (text line matrix reset each row
+        // by issuing Td from origin each time by using a full absolute move).
+        // We achieve absolute positioning by resetting the text matrix with
+        // a Td that brings us from (0,0) to (text_x, text_y) on the first row,
+        // and using relative Td on subsequent rows.
+        if row == 0 {
+            content.extend_from_slice(fmt_f64(text_x).as_bytes());
+            content.push(b' ');
+            content.extend_from_slice(fmt_f64(text_y).as_bytes());
+            content.extend_from_slice(b" Td\n");
+        } else {
+            // delta: move down by -leading (y), x stays same
+            content.extend_from_slice(b"0 ");
+            content.extend_from_slice(fmt_f64(-leading).as_bytes());
+            content.extend_from_slice(b" Td\n");
+        }
+
+        write_literal_string(&mut content, &options[i].display);
+        content.extend_from_slice(b" Tj\n");
+    }
+
+    content.extend_from_slice(b"ET\n");
+    content.extend_from_slice(b"Q\n");
+
+    // ── Install ────────────────────────────────────────────────────────────────
+    let font_obj_ref = next_object_ref(pdf)?;
+    let xobj_ref = install_normal_appearance(
+        pdf,
+        widget_ref,
+        content,
+        bbox_w,
+        bbox_h,
+        Some((font.resource_name, font.base_name, font_obj_ref)),
+    )?;
+
+    Ok(Some(xobj_ref))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4169,6 +4716,436 @@ mod tests {
             matches!(xobj2, Object::Stream(_)),
             "on xobj must be a stream after round-trip"
         );
+    }
+
+    // ── Ch (choice) appearance tests ─────────────────────────────────────────
+
+    use crate::generate_choice_field_appearance;
+
+    /// Build a minimal PDF with a Ch combo widget.
+    fn build_combo_pdf(value: &str, ff: i64) -> Vec<u8> {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        let widget = format!(
+            "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (sel) \
+             /Ff {} /V ({}) /DA (/Helv 12 Tf 0 g) \
+             /Rect [100 700 300 720]>>\nendobj\n",
+            ff, value
+        );
+        raw.extend_from_slice(widget.as_bytes());
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n\
+             {off1:010} 00000 n \n{off2:010} 00000 n \n\
+             {off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        raw
+    }
+
+    /// Build a minimal PDF with a Ch list widget.
+    ///
+    /// `opts_str` is raw PDF array content, e.g. `"(Red) (Green) (Blue)"`.
+    /// `sel_i_str` is the raw /I array, e.g. `"[1]"` or empty string for absent.
+    /// `sel_v_str` is the raw /V value, e.g. `"(Green)"` or empty.
+    fn build_list_pdf(
+        opts_str: &str,
+        sel_i_str: &str,
+        sel_v_str: &str,
+    ) -> Vec<u8> {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        let ff = 0_i64; // List box (combo bit not set)
+        let i_entry = if sel_i_str.is_empty() {
+            String::new()
+        } else {
+            format!("/I {sel_i_str} ")
+        };
+        let v_entry = if sel_v_str.is_empty() {
+            String::new()
+        } else {
+            format!("/V {sel_v_str} ")
+        };
+        let widget = format!(
+            "4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (list) \
+             /Ff {} /Opt [{opts_str}] {i_entry}{v_entry}\
+             /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>\nendobj\n",
+            ff
+        );
+        raw.extend_from_slice(widget.as_bytes());
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n\
+             {off1:010} 00000 n \n{off2:010} 00000 n \n\
+             {off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        raw
+    }
+
+    /// non-Ch field → generate_choice_field_appearance must return None.
+    #[test]
+    fn ch_non_ch_field_returns_none() {
+        let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
+        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Btn field must return None from Ch generator");
+    }
+
+    /// Degenerate rect → None.
+    #[test]
+    fn ch_degenerate_rect_returns_none() {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n");
+        let off4 = raw.len() as u64;
+        // Rect [10 10 10 30] — zero width
+        raw.extend_from_slice(b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (f) /Rect [10 10 10 30]>>\nendobj\n");
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "degenerate rect should return None");
+    }
+
+    /// Combo with /V "Blue" → single /AP/N stream containing "Blue" in a Tj.
+    #[test]
+    fn ch_combo_v_renders_as_tj() {
+        let ff_combo = 0x20000_i64; // bit 18
+        let raw = build_combo_pdf("Blue", ff_combo);
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate");
+        let xobj_ref = result.expect("combo must produce appearance");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream");
+        };
+
+        // /AP/N must be a single reference (not a sub-dict).
+        let widget_obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        let Object::Dictionary(ap_dict) = wdict.get("AP").expect("AP").clone() else {
+            panic!("AP not dict")
+        };
+        assert!(
+            matches!(ap_dict.get("N"), Some(Object::Reference(_))),
+            "/AP/N must be a reference for combo"
+        );
+
+        // Content must have Tj with "Blue".
+        let mut found = false;
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"Blue" {
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "combo Tj must contain value 'Blue'");
+    }
+
+    /// Combo with no /V → blank appearance (Tj with empty or no string, but stream exists).
+    #[test]
+    fn ch_combo_no_value_blank_appearance() {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        // /Ff has combo bit; no /V
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (c) \
+              /Ff 131072 /DA (/Helv 12 Tf 0 g) /Rect [100 700 300 720]>>\nendobj\n",
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate");
+        // Combo always generates (even blank), so this must be Some.
+        assert!(result.is_some(), "combo without /V must still produce blank appearance");
+    }
+
+    /// List with /Opt [(Red) (Green) (Blue)] and /I [1] → Green highlighted.
+    #[test]
+    fn ch_list_selected_index_highlighted() {
+        let raw = build_list_pdf("(Red) (Green) (Blue)", "[1]", "");
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate");
+        let xobj_ref = result.expect("list must produce appearance");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream");
+        };
+
+        let content_str = String::from_utf8_lossy(&stream.data);
+
+        // All three options must appear as Tj operands.
+        let mut tj_vals: Vec<Vec<u8>> = Vec::new();
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    tj_vals.push(s.clone());
+                }
+            }
+        }
+        assert!(
+            tj_vals.contains(&b"Red".to_vec()),
+            "Red must appear in Tj; got: {tj_vals:?}"
+        );
+        assert!(
+            tj_vals.contains(&b"Green".to_vec()),
+            "Green must appear in Tj"
+        );
+        assert!(
+            tj_vals.contains(&b"Blue".to_vec()),
+            "Blue must appear in Tj"
+        );
+
+        // Highlight rect must appear (rg + re + f) for the selected row.
+        assert!(
+            content_str.contains("rg") && content_str.contains("re\n") && content_str.contains("f\n"),
+            "selected row must have highlight (rg re f), got:\n{content_str}"
+        );
+
+        // Highlight must appear BEFORE BT (path ops outside text object).
+        let bt_pos = content_str.find("BT").expect("BT missing");
+        let rg_pos = content_str.find("rg").expect("rg missing");
+        assert!(
+            rg_pos < bt_pos,
+            "highlight (rg) must appear before BT; rg@{rg_pos}, BT@{bt_pos}"
+        );
+    }
+
+    /// List multi-select: /I [0 2] → Red and Blue highlighted.
+    #[test]
+    fn ch_list_multi_select_highlights() {
+        let raw = build_list_pdf("(Red) (Green) (Blue)", "[0 2]", "");
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream")
+        };
+        let content_str = String::from_utf8_lossy(&stream.data);
+
+        // Two `f` operators expected (one per highlighted row).
+        let f_count = content_str
+            .lines()
+            .filter(|l| l.trim() == "f")
+            .count();
+        assert_eq!(f_count, 2, "two selected rows → two 'f' ops; got {f_count}");
+    }
+
+    /// List: /V selection (no /I) matches by /Opt export.
+    #[test]
+    fn ch_list_v_selection_matches_opt_export() {
+        // No /I; /V selects "Green".
+        let raw = build_list_pdf("(Red) (Green) (Blue)", "", "(Green)");
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream")
+        };
+        let content_str = String::from_utf8_lossy(&stream.data);
+
+        // Exactly one highlight row.
+        let f_count = content_str
+            .lines()
+            .filter(|l| l.trim() == "f")
+            .count();
+        assert_eq!(f_count, 1, "single /V match → one highlight; got {f_count}");
+
+        // Highlight must be before BT.
+        let bt_pos = content_str.find("BT").expect("BT missing");
+        let rg_pos = content_str.find("rg");
+        if let Some(rg) = rg_pos {
+            assert!(rg < bt_pos, "highlight before BT");
+        }
+    }
+
+    /// List with [export, display] /Opt pairs → display text rendered.
+    #[test]
+    fn ch_list_opt_export_display_pair() {
+        // /Opt contains [[exportA displayA] [exportB displayB]].
+        // We verify the display strings appear in Tj, not export strings.
+        let raw = build_list_pdf(
+            "[(expA)(dispA)] [(expB)(dispB)]",
+            "[0]",
+            "",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream")
+        };
+
+        let mut tj_vals: Vec<Vec<u8>> = Vec::new();
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    tj_vals.push(s.clone());
+                }
+            }
+        }
+        assert!(
+            tj_vals.contains(&b"dispA".to_vec()),
+            "display string 'dispA' must appear in Tj; got {tj_vals:?}"
+        );
+        assert!(
+            tj_vals.contains(&b"dispB".to_vec()),
+            "display string 'dispB' must appear in Tj"
+        );
+        // Export strings must NOT appear.
+        assert!(
+            !tj_vals.contains(&b"expA".to_vec()),
+            "export string must not appear in Tj"
+        );
+    }
+
+    /// Combo with [export, display] /Opt: /V matches export → display rendered.
+    #[test]
+    fn ch_combo_opt_display_substitution() {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        // /V is "expX"; /Opt has [expX, DisplayX]. Combo should render "DisplayX".
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (c2) \
+              /Ff 131072 /V (expX) /Opt [[(expX)(DisplayX)] [(expY)(DisplayY)]] \
+              /DA (/Helv 12 Tf 0 g) /Rect [100 700 300 720]>>\nendobj\n",
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not stream")
+        };
+
+        let mut found_display = false;
+        for tok in ContentStreamParser::new(&stream.data).flatten() {
+            let ContentToken::Op { operands, operator } = tok else { continue };
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"DisplayX" {
+                        found_display = true;
+                    }
+                }
+            }
+        }
+        assert!(found_display, "combo must render display string 'DisplayX' from /Opt");
+    }
+
+    /// Round-trip: write and re-read PDF; /AP survives.
+    #[test]
+    fn ch_list_round_trip() {
+        let raw = build_list_pdf("(Red) (Green) (Blue)", "[1]", "");
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("must produce appearance");
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("write_pdf");
+
+        let mut pdf2 = Pdf::open(Cursor::new(out)).expect("re-parse");
+        let widget_obj = pdf2.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget_obj else { panic!("not dict") };
+        assert!(wdict.get("AP").is_some(), "/AP missing after round-trip");
+
+        let xobj2 = pdf2.resolve(xobj_ref).expect("re-resolve xobj");
+        assert!(matches!(xobj2, Object::Stream(_)), "xobj must be stream after round-trip");
     }
 
     // ── New tests for previously uncovered production branches ──────────────
