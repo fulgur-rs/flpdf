@@ -77,6 +77,19 @@ fn outline_items_uses_untitled_when_title_absent() {
     assert_eq!(items[0].title, "<untitled>");
 }
 
+#[test]
+fn outline_items_serializes_non_string_title() {
+    // A `/Title` that is neither a string nor an indirect reference (here an
+    // integer) is not a valid PDF text string; it falls back to its serialized
+    // form rather than erroring.
+    let object4 = b"4 0 obj\n<< /Title 42 /Parent 3 0 R >>\nendobj\n".to_vec();
+    let pdf = single_outline_pdf(&[object4]);
+    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
+    let items = outline::outline_items(&mut pdf).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "42");
+}
+
 /// Build a minimal PDF whose catalog points at an `/Outlines` tree with a single
 /// top-level item (object 4). `tail` supplies object 4 and any objects it refers
 /// to, numbered consecutively from 4.
