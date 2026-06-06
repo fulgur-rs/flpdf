@@ -502,6 +502,14 @@ fn apply_single_filter_decode(
         return run_length::decode(stream_data);
     }
 
+    // Passthrough codecs: flpdf does not decode image/binary streams.
+    // The writer preserves these streams verbatim (qpdf parity).
+    if let Some(label) = passthrough_codec_label(filter_name) {
+        return Err(format!(
+            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
+        ));
+    }
+
     Err(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
@@ -627,6 +635,14 @@ fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, S
     Ok(output)
 }
 
+/// Apply a single encode filter to `stream_data`.
+///
+/// # Write-side compression policy
+///
+/// flpdf writes stream compression as **FlateDecode only** (decision flpdf-9hc.7.2).
+/// LZWEncode is intentionally unsupported — qpdf also has no LZW encoder.
+/// Image/binary passthrough codecs (DCTDecode, JBIG2Decode, JPXDecode, CCITTFaxDecode)
+/// are never re-encoded by flpdf; the writer preserves those streams verbatim.
 fn apply_single_filter_encode(
     filter_name: &[u8],
     stream_data: &[u8],
@@ -650,6 +666,24 @@ fn apply_single_filter_encode(
 
     if filter_name == b"RunLengthDecode" {
         return Ok(run_length::encode(stream_data));
+    }
+
+    // LZWEncode is not supported: flpdf writes stream compression as FlateDecode only
+    // (decision flpdf-9hc.7.2; qpdf has no LZW encoder either).
+    if filter_name == b"LZWDecode" {
+        return Err(
+            "LZWEncode is not supported: flpdf writes stream compression as FlateDecode only \
+             (decision flpdf-9hc.7.2; qpdf has no LZW encoder either)"
+                .to_string(),
+        );
+    }
+
+    // Passthrough codecs are never re-encoded; the writer preserves those streams verbatim.
+    if let Some(label) = passthrough_codec_label(filter_name) {
+        return Err(format!(
+            "encode not supported for passthrough codec {label}: \
+             image/binary streams are preserved verbatim by flpdf"
+        ));
     }
 
     Err(format!(
@@ -1182,5 +1216,105 @@ mod tests {
         assert_eq!(passthrough_codec_label(b"RunLengthDecode"), None);
         assert_eq!(passthrough_codec_label(b"UnknownFilter"), None);
         assert_eq!(passthrough_codec_label(b""), None);
+    }
+
+    // ----- flpdf-9hc.7.5: dispatch coverage tests -----
+
+    /// Chain round-trip: Flate→ASCII85 encode, [/ASCII85Decode /FlateDecode] decode.
+    /// This verifies that encode and decode correctly handle multi-filter chains
+    /// (encode applies filters in reverse; decode applies in forward order).
+    #[test]
+    fn filter_chain_flate_ascii85_round_trip() {
+        let dict = array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]);
+        let payload = b"chain round-trip: Flate + ASCII85 (flpdf-9hc.7.5)";
+
+        let encoded = encode_stream_data(&dict, payload).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, payload.as_slice());
+    }
+
+    /// Case-sensitivity: lowercase filter names must not match and must return Err.
+    /// PDF names are case-sensitive per spec.
+    #[test]
+    fn filter_dispatch_is_case_sensitive() {
+        // lowercase "flatedecode" is not a recognised filter
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"flatedecode".to_vec()));
+        let result = decode_stream_data(&dict, b"anything");
+        assert!(
+            result.is_err(),
+            "lowercase 'flatedecode' must not be accepted"
+        );
+
+        // passthrough_codec_label also rejects lowercase
+        assert_eq!(
+            passthrough_codec_label(b"dctdecode"),
+            None,
+            "passthrough_codec_label must be case-sensitive"
+        );
+        assert_eq!(passthrough_codec_label(b"jpxdecode"), None);
+
+        // lowercase "dctdecode" in a stream dict must produce an unsupported Err
+        let mut dict2 = Dictionary::new();
+        dict2.insert("Filter", Object::Name(b"dctdecode".to_vec()));
+        let result2 = decode_stream_data(&dict2, b"anything");
+        assert!(
+            result2.is_err(),
+            "lowercase 'dctdecode' must not be accepted"
+        );
+        // message should NOT claim it is a passthrough codec; it is generic unsupported
+        let msg2 = result2.unwrap_err().to_string();
+        assert!(
+            !msg2.contains("passthrough codec"),
+            "lowercase filter should hit generic unsupported, not passthrough branch; got: {msg2}"
+        );
+    }
+
+    /// passthrough-in-chain: /Filter [/ASCII85Decode /DCTDecode] decode must return Err
+    /// because DCTDecode is a passthrough codec that flpdf does not decode.
+    /// The input must be valid ASCII85 data so that step 0 succeeds and
+    /// step 1 (DCTDecode) is reached.
+    #[test]
+    fn passthrough_in_chain_returns_err_with_passthrough_message() {
+        // Build a valid ASCII85-encoded payload so the first filter succeeds.
+        let ascii85_encoded = ascii85::encode(b"some binary jpeg payload");
+
+        let dict = array_filter_dict(&[b"ASCII85Decode", b"DCTDecode"]);
+        let result = decode_stream_data(&dict, &ascii85_encoded);
+
+        assert!(
+            result.is_err(),
+            "chain containing DCTDecode must return Err"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("DCTDecode"),
+            "error must mention DCTDecode; got: {msg}"
+        );
+        assert!(
+            msg.contains("passthrough"),
+            "error must indicate passthrough intent; got: {msg}"
+        );
+    }
+
+    /// LZWEncode is not supported: encode_stream_data with /LZWDecode filter must Err.
+    #[test]
+    fn lzw_encode_unsupported_returns_err() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
+
+        let result = encode_stream_data(&dict, b"some data");
+
+        assert!(result.is_err(), "LZWEncode must not be supported");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("LZWEncode"),
+            "error must mention LZWEncode; got: {msg}"
+        );
+        assert!(
+            msg.contains("FlateDecode only"),
+            "error must mention FlateDecode only policy; got: {msg}"
+        );
     }
 }
