@@ -83,7 +83,6 @@
 //! ```
 
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 // ── remove_attachment ─────────────────────────────────────────────────────────
@@ -338,7 +337,7 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
 /// This mirrors the threshold used by qpdf's aggressive rebuild policy.  Any
 /// tree with more than this many entries will have two levels (root + leaves);
 /// three levels are never emitted.
-pub const LEAF_MAX: usize = 32;
+pub use crate::name_number_tree::LEAF_MAX;
 
 /// Default maximum depth when descending `/Kids` chains.
 ///
@@ -409,109 +408,12 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         _ => return Ok(vec![]),
     };
 
-    // ── Step 3: locate /EmbeddedFiles value ───────────────────────────────────
-    // /EmbeddedFiles may itself be an indirect reference or an inline dict.
-    let ef_root = match names_dict.get("EmbeddedFiles").cloned() {
-        Some(Object::Reference(r)) => {
-            // Indirect reference to the name-tree root node.
-            let mut visited = BTreeSet::new();
-            let mut out = Vec::new();
-            collect_name_tree(pdf, r, &mut out, &mut visited, 0, max_depth)?;
-            return Ok(out);
-        }
-        Some(Object::Dictionary(d)) => d,
-        _ => return Ok(vec![]),
+    // ── Step 3: walk the /EmbeddedFiles name tree (ref-only view) ─────────────
+    let ef_value = match names_dict.get("EmbeddedFiles").cloned() {
+        Some(v) => v,
+        None => return Ok(vec![]),
     };
-
-    // /EmbeddedFiles is an inline (direct) dict — treat it as the root node.
-    let mut out = Vec::new();
-    let mut visited = BTreeSet::new();
-    collect_name_tree_dict(pdf, ef_root, &mut out, &mut visited, 0, max_depth)?;
-    Ok(out)
-}
-
-// ── Internal tree walker ──────────────────────────────────────────────────────
-
-/// Walk a name-tree node reachable via an indirect reference, appending
-/// `(key, filespec_ref)` pairs to `out` in DFS order.
-fn collect_name_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
-    out: &mut Vec<(Vec<u8>, ObjectRef)>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<()> {
-    if depth >= max_depth {
-        return Err(crate::Error::Unsupported(format!(
-            "embedded_files: name-tree depth limit {max_depth} exceeded at {node_ref}"
-        )));
-    }
-    if !visited.insert(node_ref) {
-        // Cycle detected — skip this node silently.
-        return Ok(());
-    }
-
-    let Some(node) = pdf.resolve_borrowed(node_ref)?.as_dict().cloned() else {
-        // Malformed node — skip.
-        return Ok(());
-    };
-    collect_name_tree_dict(pdf, node, out, visited, depth, max_depth)
-}
-
-/// Walk a name-tree node already resolved to a [`crate::Dictionary`].
-fn collect_name_tree_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: crate::Dictionary,
-    out: &mut Vec<(Vec<u8>, ObjectRef)>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<()> {
-    // Leaf node: /Names holds [(key, val), ...] pairs as a flat array.
-    if let Some(pairs) = node.get("Names").and_then(Object::as_array) {
-        collect_leaf_pairs(pairs.to_vec(), out);
-        return Ok(());
-    }
-
-    // Intermediate node: /Kids holds [node_ref, ...].
-    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
-        for child_ref in kids.iter().filter_map(Object::as_ref_id) {
-            collect_name_tree(pdf, child_ref, out, visited, depth + 1, max_depth)?;
-        }
-        // Non-reference kids are skipped (malformed tree).
-    }
-    // A node with neither /Names nor /Kids is treated as empty.
-
-    Ok(())
-}
-
-/// Extract `(key, filespec_ref)` pairs from a leaf `/Names` flat array.
-///
-/// The array is `[key₁, val₁, key₂, val₂, …]`.  Keys must be PDF strings
-/// (`Object::String`).  Values must be indirect references (`Object::Reference`);
-/// direct-dict values are skipped.  An odd-length array (malformed) drops the
-/// trailing orphan key.
-fn collect_leaf_pairs(pairs: Vec<Object>, out: &mut Vec<(Vec<u8>, ObjectRef)>) {
-    let mut iter = pairs.into_iter();
-    while let Some(key_obj) = iter.next() {
-        let val_obj = match iter.next() {
-            Some(o) => o,
-            None => break, // Odd-length array — drop orphan key.
-        };
-
-        let key = match key_obj {
-            Object::String(bytes) => bytes,
-            _ => continue, // Non-string key — skip this pair.
-        };
-
-        let filespec_ref = match val_obj {
-            Object::Reference(r) => r,
-            _ => continue, // Direct-dict filespec — skip (out of scope).
-        };
-
-        out.push((key, filespec_ref));
-    }
+    crate::name_number_tree::read_name_tree(pdf, ef_value, |_, v| Ok(v.as_ref_id()), max_depth)
 }
 
 // ── Raw collector (writer source of truth) ────────────────────────────────────
@@ -546,82 +448,11 @@ pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
         _ => return Ok(vec![]),
     };
 
-    let mut out = Vec::new();
-    let mut visited = BTreeSet::new();
-    match names_dict.get("EmbeddedFiles").cloned() {
-        Some(Object::Reference(r)) => {
-            collect_name_tree_raw(pdf, r, &mut out, &mut visited, 0, max_depth)?;
-        }
-        Some(Object::Dictionary(d)) => {
-            collect_name_tree_dict_raw(pdf, d, &mut out, &mut visited, 0, max_depth)?;
-        }
-        _ => return Ok(vec![]),
-    }
-    Ok(out)
-}
-
-/// Raw counterpart of [`collect_name_tree`] — preserves `Object` values.
-fn collect_name_tree_raw<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
-    out: &mut Vec<(Vec<u8>, Object)>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<()> {
-    if depth >= max_depth {
-        return Err(crate::Error::Unsupported(format!(
-            "embedded_files: name-tree depth limit {max_depth} exceeded at {node_ref}"
-        )));
-    }
-    if !visited.insert(node_ref) {
-        return Ok(()); // Cycle — skip silently.
-    }
-    let Some(node) = pdf.resolve_borrowed(node_ref)?.as_dict().cloned() else {
-        return Ok(()); // Malformed node — skip.
+    let ef_value = match names_dict.get("EmbeddedFiles").cloned() {
+        Some(v) => v,
+        None => return Ok(vec![]),
     };
-    collect_name_tree_dict_raw(pdf, node, out, visited, depth, max_depth)
-}
-
-/// Raw counterpart of [`collect_name_tree_dict`] — preserves `Object` values.
-fn collect_name_tree_dict_raw<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: crate::Dictionary,
-    out: &mut Vec<(Vec<u8>, Object)>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<()> {
-    if let Some(pairs) = node.get("Names").and_then(Object::as_array) {
-        collect_leaf_pairs_raw(pairs.to_vec(), out);
-        return Ok(());
-    }
-    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
-        for child_ref in kids.iter().filter_map(Object::as_ref_id) {
-            collect_name_tree_raw(pdf, child_ref, out, visited, depth + 1, max_depth)?;
-        }
-    }
-    Ok(())
-}
-
-/// Raw counterpart of [`collect_leaf_pairs`].
-///
-/// Keeps the value `Object` verbatim (reference *or* direct dict), so the
-/// writer's rebuild does not discard direct-dict `/Filespec` entries. Only
-/// non-string keys and odd-length-array orphans are dropped.
-fn collect_leaf_pairs_raw(pairs: Vec<Object>, out: &mut Vec<(Vec<u8>, Object)>) {
-    let mut iter = pairs.into_iter();
-    while let Some(key_obj) = iter.next() {
-        let val_obj = match iter.next() {
-            Some(o) => o,
-            None => break, // Odd-length array — drop orphan key.
-        };
-        let key = match key_obj {
-            Object::String(bytes) => bytes,
-            _ => continue, // Non-string key — skip this pair.
-        };
-        out.push((key, val_obj));
-    }
+    crate::name_number_tree::read_name_tree(pdf, ef_value, |_, v| Ok(Some(v)), max_depth)
 }
 
 // ── Writer ────────────────────────────────────────────────────────────────────
@@ -761,39 +592,11 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
         return Ok(());
     }
 
-    // ── Build the name-tree nodes ─────────────────────────────────────────────
-    let tree_root_ref = if entries.len() <= LEAF_MAX {
-        // Single-leaf root.
-        let leaf = build_leaf_dict(&entries);
-        let leaf_ref = alloc();
-        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-        leaf_ref
-    } else {
-        // Multi-leaf: chunk entries evenly, each chunk ≤ LEAF_MAX.
-        let n_leaves = entries.len().div_ceil(LEAF_MAX);
-        let chunk_size = entries.len().div_ceil(n_leaves);
-
-        let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
-        for chunk in entries.chunks(chunk_size) {
-            let leaf = build_leaf_dict(chunk);
-            let leaf_ref = alloc();
-            pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-            kids.push(Object::Reference(leaf_ref));
-        }
-
-        // Root node: /Kids + /Limits
-        let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-        let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
-        let mut root = Dictionary::new();
-        root.insert(
-            "Limits",
-            Object::Array(vec![Object::String(first), Object::String(last)]),
-        );
-        root.insert("Kids", Object::Array(kids));
-        let root_ref = alloc();
-        pdf.set_object(root_ref, Object::Dictionary(root));
-        root_ref
-    };
+    // ── Build the name-tree nodes (shared builder) ────────────────────────────
+    let (tree_root_ref, nodes) = crate::name_number_tree::build_name_tree(&entries, &mut alloc);
+    for (node_ref, node) in nodes {
+        pdf.set_object(node_ref, node);
+    }
 
     // ── Patch the catalog /Names dictionary ───────────────────────────────────
     // Resolve or create the /Names dict.  We always store it as an indirect
@@ -824,35 +627,6 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
     Ok(())
-}
-
-/// Build a leaf name-tree node dictionary from an ordered slice of entries.
-///
-/// The returned dictionary has:
-/// - `/Limits [first_key, last_key]`
-/// - `/Names [key₁, ref₁, key₂, ref₂, …]`
-fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
-    debug_assert!(
-        !entries.is_empty(),
-        "build_leaf_dict called with empty slice"
-    );
-
-    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
-
-    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
-    for (key, val) in entries {
-        pairs.push(Object::String(key.clone()));
-        pairs.push(val.clone());
-    }
-
-    let mut dict = Dictionary::new();
-    dict.insert(
-        "Limits",
-        Object::Array(vec![Object::String(first), Object::String(last)]),
-    );
-    dict.insert("Names", Object::Array(pairs));
-    dict
 }
 
 // ── Tests for remove_attachment ───────────────────────────────────────────────
@@ -1689,6 +1463,39 @@ mod tests {
         assert!(
             live.contains(&fs_ref2),
             "surviving filespec ref must remain alive"
+        );
+    }
+
+    // ── Test: /Names present but /EmbeddedFiles absent → empty ────────────────
+    //
+    // Covers the `None => Ok(vec![])` branch in both readers when the catalog
+    // has a /Names dictionary that simply does not carry an /EmbeddedFiles key.
+    #[test]
+    fn readers_return_empty_when_names_has_no_embedded_files() {
+        let mut pdf = open_minimal();
+
+        // Attach a /Names dict carrying only an unrelated key (no /EmbeddedFiles).
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        let mut names = Dictionary::new();
+        names.insert("Dests", Object::Dictionary(Dictionary::new()));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        assert!(
+            list_embedded_files(&mut pdf).expect("list").is_empty(),
+            "list_embedded_files must be empty when /EmbeddedFiles is absent"
+        );
+        assert!(
+            collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
+                .expect("raw")
+                .is_empty(),
+            "raw collector must be empty when /EmbeddedFiles is absent"
         );
     }
 }

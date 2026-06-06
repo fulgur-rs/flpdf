@@ -56,6 +56,7 @@ pub mod fonts;
 pub mod json;
 pub mod json_inspect;
 pub mod linearization;
+pub mod name_number_tree;
 pub mod object;
 pub mod object_copy;
 pub mod outline;
@@ -103,7 +104,6 @@ pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use embedded_files::{
     delete_embedded_file, insert_embedded_file, list_embedded_files,
     list_embedded_files_with_max_depth, remove_attachment, DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
-    LEAF_MAX,
 };
 pub use encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
 pub use error::{EncryptedError, Error, Result};
@@ -111,6 +111,9 @@ pub use filespec_helper::{
     add_attachment_from_path, copy_attachments_from, encode_utf16be, extract_attachment,
     extract_attachment_to_path, format_pdf_date, md5_checksum, write_attachment,
     EmbeddedFileStream, FileParamDates, FileSpec, FileSpecBuilder,
+};
+pub use name_number_tree::{
+    build_name_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;

@@ -921,71 +921,6 @@ fn label_dict_to_json(dict: &Dictionary) -> JsonValue {
     ])
 }
 
-/// Walk a number-tree node for `/PageLabels`, collecting `(page_index, label_dict)` pairs.
-///
-/// Handles both leaf nodes (`/Nums`) and intermediate nodes (`/Kids`).  When both are
-/// present (spec violation), `/Nums` takes priority.  The `seen` set prevents infinite
-/// loops on cyclic indirect references.
-fn walk_pagelabels<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: Object,
-    entries: &mut Vec<(i64, Dictionary)>,
-    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<(), ConvertError> {
-    if depth > max_depth {
-        return Ok(()); // silently truncate to avoid unbounded recursion
-    }
-
-    let dict = match node {
-        Object::Dictionary(d) => d,
-        _ => return Ok(()), // unexpected node type — skip
-    };
-
-    // /Nums takes priority over /Kids (spec §7.9.7 leaf vs. intermediate).
-    if let Some(nums) = dict.get("Nums").and_then(Object::as_array) {
-        let mut iter = nums.iter();
-        while let (Some(idx_obj), Some(label_obj)) = (iter.next(), iter.next()) {
-            let idx = match idx_obj {
-                Object::Integer(n) => *n,
-                _ => continue, // malformed — skip pair
-            };
-            // Label value may be a direct Dictionary or an indirect Reference.
-            let label_dict = match label_obj {
-                Object::Dictionary(d) => d.clone(),
-                Object::Reference(r) => {
-                    match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-                        Object::Dictionary(d) => d.clone(),
-                        _ => continue,
-                    }
-                }
-                _ => continue,
-            };
-            entries.push((idx, label_dict));
-        }
-        return Ok(());
-    }
-
-    // No /Nums — try /Kids (intermediate node).
-    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        let kids = kids.to_vec();
-        for kid in kids {
-            let kid_ref = match kid {
-                Object::Reference(r) => r,
-                _ => continue,
-            };
-            if !seen.insert(kid_ref) {
-                continue; // cycle — skip
-            }
-            let child = pdf.resolve(kid_ref).map_err(ConvertError::from)?;
-            walk_pagelabels(pdf, child, entries, seen, depth + 1, max_depth)?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Build the qpdf JSON v2 `"pagelabels"` section.
 ///
 /// Returns a [`JsonValue::Array`] where each element is a JSON object with
@@ -1020,22 +955,19 @@ pub fn build_pagelabels_section<R: Read + Seek>(
         None => return Ok(JsonValue::Array(vec![])),
     };
 
-    // Resolve indirect reference if needed.
-    let root_node = match pagelabels_val {
-        Object::Reference(r) => pdf.resolve_borrowed(r).map_err(ConvertError::from)?.clone(),
-        other => other,
-    };
-
-    let mut entries: Vec<(i64, Dictionary)> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    walk_pagelabels(
+    // The generic number-tree walker resolves the root reference itself, so
+    // pass `pagelabels_val` (Reference or Dictionary) straight in.
+    let mut entries: Vec<(i64, Dictionary)> = crate::name_number_tree::read_number_tree(
         pdf,
-        root_node,
-        &mut entries,
-        &mut seen,
-        0,
+        pagelabels_val,
+        |pdf, v| match v {
+            Object::Dictionary(d) => Ok(Some(d)),
+            Object::Reference(r) => Ok(pdf.resolve_borrowed(r)?.as_dict().cloned()),
+            _ => Ok(None),
+        },
         DEFAULT_MAX_PAGE_TREE_DEPTH,
-    )?;
+    )
+    .map_err(ConvertError::from)?;
 
     // Sort by page index (ascending) — spec guarantees ascending order in a
     // well-formed number tree, but we sort defensively.
@@ -1766,10 +1698,6 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Walk a name-tree node for `/EmbeddedFiles`, collecting `(name_string, filespec_ref)` pairs.
-///
-/// Both leaf nodes (`/Names`) and intermediate nodes (`/Kids`) are handled.
-/// The `seen` set prevents infinite loops on cyclic references.
 /// Source of a filespec value found in the EmbeddedFiles name tree.
 ///
 /// PDF name tree leaf values can be either an indirect Reference (the common
@@ -1778,67 +1706,6 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
 enum FilespecSource {
     Indirect(crate::ObjectRef),
     Direct(Dictionary),
-}
-
-fn walk_embedded_files_name_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: Object,
-    entries: &mut Vec<(String, FilespecSource)>,
-    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<(), ConvertError> {
-    if depth > max_depth {
-        return Ok(());
-    }
-
-    let dict = match node {
-        Object::Dictionary(d) => d,
-        _ => return Ok(()),
-    };
-
-    // /Names: leaf node with [name1 value1 name2 value2 ...] pairs
-    if let Some(names) = dict.get("Names").and_then(Object::as_array) {
-        let mut iter = names.iter();
-        while let (Some(name_obj), Some(value_obj)) = (iter.next(), iter.next()) {
-            // name is a PDF string (text or byte string)
-            let name_str = match name_obj {
-                Object::String(bytes) => decode_pdf_text_string(bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
-                _ => continue,
-            };
-            // value can be either an indirect reference or a direct filespec
-            // dictionary inlined in the name tree.
-            let source = match value_obj {
-                Object::Reference(r) => FilespecSource::Indirect(*r),
-                Object::Dictionary(d) => FilespecSource::Direct(d.clone()),
-                _ => continue,
-            };
-            entries.push((name_str, source));
-        }
-        return Ok(());
-    }
-
-    // /Kids: intermediate node
-    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        let kids = kids.to_vec();
-        for kid in kids {
-            let kid_ref = match kid {
-                Object::Reference(r) => r,
-                _ => continue,
-            };
-            if !seen.insert(kid_ref) {
-                continue; // cycle guard
-            }
-            let child = pdf
-                .resolve_borrowed(kid_ref)
-                .map_err(ConvertError::from)?
-                .clone();
-            walk_embedded_files_name_tree(pdf, child, entries, seen, depth + 1, max_depth)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Build a JSON entry for one filespec dictionary.
@@ -2092,27 +1959,36 @@ pub fn build_attachments_section<R: Read + Seek>(
         _ => return Ok(JsonValue::Object(vec![])),
     };
 
-    // /EmbeddedFiles name tree root
-    let ef_root = match names_dict.get("EmbeddedFiles") {
-        Some(Object::Dictionary(d)) => Object::Dictionary(d.clone()),
-        Some(Object::Reference(r)) => pdf
-            .resolve_borrowed(*r)
-            .map_err(ConvertError::from)?
-            .clone(),
-        _ => return Ok(JsonValue::Object(vec![])),
+    // /EmbeddedFiles name tree root: keep the original object shape so the
+    // shared walker can resolve an indirect root itself and track its
+    // ObjectRef in the visited set (cycle guard on a self-referential root).
+    let ef_root = match names_dict.get("EmbeddedFiles").cloned() {
+        Some(v) => v,
+        None => return Ok(JsonValue::Object(vec![])),
     };
 
-    // Walk the name tree to collect (name, filespec_ref) pairs
-    let mut raw_entries: Vec<(String, FilespecSource)> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    walk_embedded_files_name_tree(
+    // Walk the name tree to collect (name, filespec source) pairs via the
+    // shared name-tree reader; decode the raw string key afterwards.
+    let mut raw_entries: Vec<(String, FilespecSource)> = crate::name_number_tree::read_name_tree(
         pdf,
         ef_root,
-        &mut raw_entries,
-        &mut seen,
-        0,
+        |_, v| {
+            Ok(match v {
+                Object::Reference(r) => Some(FilespecSource::Indirect(r)),
+                Object::Dictionary(d) => Some(FilespecSource::Direct(d)),
+                _ => None,
+            })
+        },
         DEFAULT_MAX_PAGE_TREE_DEPTH,
-    )?;
+    )
+    .map_err(ConvertError::from)?
+    .into_iter()
+    .map(|(key_bytes, source)| {
+        let name = decode_pdf_text_string(&key_bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(&key_bytes).into_owned());
+        (name, source)
+    })
+    .collect();
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3870,6 +3746,60 @@ mod tests {
         assert_eq!(lp1[1].1, JsonValue::String("Appx".to_string()));
     }
 
+    // ── 38b. Indirect label value is resolved ────────────────────────────────
+
+    #[test]
+    fn pagelabels_indirect_label_value_resolved() {
+        // A /Nums value that is an indirect reference to a label dict must be
+        // resolved (covers the `Object::Reference` arm of the decode hook).
+        let mut pdf = load_one_page_pdf();
+        let label_ref = crate::ObjectRef::new(900, 0);
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name("D".into()));
+        pdf.set_object(label_ref, Object::Dictionary(label));
+
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![Object::Integer(0), Object::Reference(label_ref)]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        assert!(
+            matches!(&result, JsonValue::Array(arr) if arr.len() == 1),
+            "indirect label value must resolve to one entry, got {result:?}"
+        );
+    }
+
+    // ── 38c. Non-dict label value is skipped ──────────────────────────────────
+
+    #[test]
+    fn pagelabels_non_dict_value_skipped() {
+        // A /Nums value that is neither a dict nor a reference is skipped
+        // (covers the `_ => Ok(None)` arm of the decode hook).
+        let mut pdf = load_one_page_pdf();
+        let pagelabels = Object::Dictionary({
+            let mut d = Dictionary::new();
+            d.insert(
+                "Nums",
+                Object::Array(vec![Object::Integer(0), Object::Integer(42)]),
+            );
+            d
+        });
+        patch_pagelabels(&mut pdf, pagelabels);
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![]),
+            "non-dict label value yields no entries"
+        );
+    }
+
     // ── 39. /S absent → style: null ──────────────────────────────────────────
 
     #[test]
@@ -5394,6 +5324,67 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+    }
+
+    // ── attachments Test 1b: /Names present but no /EmbeddedFiles → empty ─────
+
+    #[test]
+    fn attachments_names_without_embedded_files_returns_empty() {
+        // Covers the `None => return empty` branch when /Names exists but
+        // carries no /EmbeddedFiles key.
+        let mut pdf = load_one_page_pdf();
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        let mut names = Dictionary::new();
+        names.insert("Dests", Object::Dictionary(Dictionary::new()));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+    }
+
+    // ── attachments Test 1c: non-ref/non-dict leaf value is skipped ──────────
+
+    #[test]
+    fn attachments_non_ref_non_dict_value_skipped() {
+        // A name-tree leaf value that is neither a reference nor a dict is
+        // skipped (covers the `_ => None` arm of the attachments decode hook).
+        let mut pdf = load_one_page_pdf();
+        let ef_root_ref = crate::ObjectRef::new(901, 0);
+        let mut ef_root = Dictionary::new();
+        ef_root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"weird".to_vec()), Object::Integer(7)]),
+        );
+        pdf.set_object(ef_root_ref, Object::Dictionary(ef_root));
+
+        let names_ref = crate::ObjectRef::new(902, 0);
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
+        pdf.set_object(names_ref, Object::Dictionary(names));
+
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(
+            result,
+            JsonValue::Object(vec![]),
+            "non-ref/non-dict leaf value must be skipped"
+        );
     }
 
     // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────
