@@ -17,10 +17,16 @@
 //!   - JBIG2Decode with /JBIG2Globals indirect ref: passthrough + ref preserved.
 
 use assert_cmd::Command;
-use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf, Stream};
+use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf};
 use std::io::Cursor;
 use std::process::Command as ShellCommand;
 use tempfile::tempdir;
+
+#[path = "support/filter_fixtures.rs"]
+mod filter_fixtures;
+use filter_fixtures::{
+    build_pdf_with_prefiltered_stream, LZW_ABABABABABABAB_EC1, LZW_ABABABABABABAB_PLAIN,
+};
 
 // ---------------------------------------------------------------------------
 // qpdf availability
@@ -180,87 +186,6 @@ fn rewrite_pdf(pdf_path: &str, extra_args: &[&str]) -> (tempfile::TempDir, std::
 }
 
 // ---------------------------------------------------------------------------
-// Known LZW-encoded vector (copied from crates/flpdf/tests/qdf_tests.rs).
-//
-// LZW_ABABABABABABAB_EC1 encodes "ABABABABABABAB" with EarlyChange=1 (PDF default).
-// Generated and verified by an independent Python implementation.
-// ---------------------------------------------------------------------------
-
-const LZW_ABABABABABABAB_EC1: &[u8] = &[
-    0x80, 0x10, 0x48, 0x50, 0x28, 0x24, 0x0e, 0x0d, 0x02, 0x80, 0x80,
-];
-
-const LZW_ABABABABABABAB_PLAIN: &[u8] = b"ABABABABABABAB";
-
-// ---------------------------------------------------------------------------
-// Build a minimal PDF whose stream data is supplied pre-encoded (no encode_stream_data).
-//
-// Object layout:
-//   1 0 obj  /Catalog  -> /Pages 2 0 R
-//   2 0 obj  /Pages    -> /Kids [3 0 R]
-//   3 0 obj  /Page     -> /Contents 4 0 R
-//   4 0 obj  stream    <- caller-supplied `encoded` bytes verbatim
-//
-// `filter_array_literal`  e.g. "/DCTDecode" or "[/ASCII85Decode /LZWDecode]"
-// `decode_parms_literal`  optional, e.g. "<< /K -1 /Columns 8 >>"
-// ---------------------------------------------------------------------------
-
-fn build_pdf_with_prefiltered_stream(
-    encoded: &[u8],
-    filter_array_literal: &str,
-    decode_parms_literal: Option<&str>,
-) -> Vec<u8> {
-    let mut pdf_bytes: Vec<u8> = b"%PDF-1.4\n".to_vec();
-    let mut offsets = Vec::<usize>::new();
-
-    // Object 1: Catalog
-    offsets.push(pdf_bytes.len());
-    pdf_bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    // Object 2: Pages
-    offsets.push(pdf_bytes.len());
-    pdf_bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-    // Object 3: Page
-    offsets.push(pdf_bytes.len());
-    pdf_bytes.extend_from_slice(
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-          /Resources << >> /Contents 4 0 R >>\nendobj\n",
-    );
-
-    // Object 4: stream with the pre-encoded data.
-    offsets.push(pdf_bytes.len());
-    let mut stream_header = format!(
-        "4 0 obj\n<< /Length {} /Filter {}",
-        encoded.len(),
-        filter_array_literal
-    )
-    .into_bytes();
-    if let Some(parms) = decode_parms_literal {
-        stream_header.extend_from_slice(b" /DecodeParms ");
-        stream_header.extend_from_slice(parms.as_bytes());
-    }
-    stream_header.extend_from_slice(b" >>\nstream\n");
-    pdf_bytes.extend_from_slice(&stream_header);
-    pdf_bytes.extend_from_slice(encoded);
-    pdf_bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-    // xref + trailer
-    let xref_offset = pdf_bytes.len();
-    let n = offsets.len() + 1;
-    pdf_bytes.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
-    pdf_bytes.extend_from_slice(b"0000000000 65535 f \n");
-    for o in &offsets {
-        pdf_bytes.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-    }
-    pdf_bytes.extend_from_slice(
-        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
-            .as_bytes(),
-    );
-
-    pdf_bytes
-}
-
 // ---------------------------------------------------------------------------
 // Build a minimal PDF with a JBIG2Decode stream that has /JBIG2Globals as an
 // indirect reference.
@@ -526,9 +451,10 @@ fn cli_show_stream_dct_passthrough_marker_and_rewrite() {
         .clone();
     let marker_str = String::from_utf8_lossy(&stdout);
     let expected_marker = format!("<binary, {} bytes, codec DCTDecode>", fake_jpeg.len());
-    assert!(
-        marker_str.trim() == expected_marker,
-        "show-stream DCTDecode must emit passthrough marker; got: {marker_str:?}"
+    assert_eq!(
+        marker_str.trim(),
+        expected_marker,
+        "show-stream DCTDecode must emit passthrough marker"
     );
 
     // (b) After full-rewrite, stream data must be byte-identical.
@@ -548,8 +474,9 @@ fn cli_show_stream_dct_passthrough_marker_and_rewrite() {
         "DCTDecode passthrough: stream data must be byte-identical after full-rewrite"
     );
     // /Filter must still be /DCTDecode.
-    assert!(
-        matches!(stream.dict.get("Filter"), Some(Object::Name(n)) if n.as_slice() == b"DCTDecode"),
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"DCTDecode".to_vec())),
         "DCTDecode passthrough: /Filter must be preserved after full-rewrite"
     );
 }
@@ -587,9 +514,10 @@ fn cli_show_stream_ccitt_passthrough_marker_and_rewrite() {
         .clone();
     let marker_str = String::from_utf8_lossy(&stdout);
     let expected_marker = format!("<binary, {} bytes, codec CCITTFaxDecode>", fake_ccitt.len());
-    assert!(
-        marker_str.trim() == expected_marker,
-        "show-stream CCITTFaxDecode must emit passthrough marker; got: {marker_str:?}"
+    assert_eq!(
+        marker_str.trim(),
+        expected_marker,
+        "show-stream CCITTFaxDecode must emit passthrough marker"
     );
 
     // (b) After full-rewrite, stream data must be byte-identical.
@@ -608,8 +536,9 @@ fn cli_show_stream_ccitt_passthrough_marker_and_rewrite() {
         "CCITTFaxDecode passthrough: stream data must be byte-identical after full-rewrite"
     );
     // /Filter must still be /CCITTFaxDecode.
-    assert!(
-        matches!(stream.dict.get("Filter"), Some(Object::Name(n)) if n.as_slice() == b"CCITTFaxDecode"),
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"CCITTFaxDecode".to_vec())),
         "CCITTFaxDecode passthrough: /Filter must be preserved after full-rewrite"
     );
 }
@@ -648,9 +577,10 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
         .clone();
     let marker_str = String::from_utf8_lossy(&stdout);
     let expected_marker = format!("<binary, {} bytes, codec JBIG2Decode>", fake_jbig2.len());
-    assert!(
-        marker_str.trim() == expected_marker,
-        "show-stream JBIG2Decode must emit passthrough marker; got: {marker_str:?}"
+    assert_eq!(
+        marker_str.trim(),
+        expected_marker,
+        "show-stream JBIG2Decode must emit passthrough marker"
     );
 
     // (b) After full-rewrite, stream body must be verbatim and /JBIG2Globals ref preserved.
@@ -674,8 +604,9 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
     );
 
     // /Filter must still be /JBIG2Decode.
-    assert!(
-        matches!(stream.dict.get("Filter"), Some(Object::Name(n)) if n.as_slice() == b"JBIG2Decode"),
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"JBIG2Decode".to_vec())),
         "JBIG2Decode passthrough: /Filter must be preserved after full-rewrite"
     );
 
@@ -695,11 +626,10 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
     let globals_val = parms_dict.get("JBIG2Globals").unwrap_or_else(|| {
         panic!("JBIG2Decode: /DecodeParms /JBIG2Globals must be present after full-rewrite")
     });
-    assert!(
-        matches!(globals_val, Object::Reference(_)),
-        "JBIG2Decode: /JBIG2Globals must remain an indirect reference (not inlined) after full-rewrite; \
-         got: {:?}",
-        globals_val
+    assert_eq!(
+        globals_val,
+        &Object::Reference(ObjectRef::new(5, 0)),
+        "JBIG2Decode: /JBIG2Globals must remain an indirect reference to 5 0 R after full-rewrite"
     );
 
     // The globals stream (obj 5) must still be resolvable (reference is not dangling).
@@ -713,8 +643,3 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
         globals_obj
     );
 }
-
-// ---------------------------------------------------------------------------
-// Suppress unused-import warning for Stream (used in JBIG2 test via type check).
-// ---------------------------------------------------------------------------
-fn _use_stream_type(_: Stream) {}
