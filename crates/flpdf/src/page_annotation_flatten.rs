@@ -1085,4 +1085,1257 @@ mod tests {
         let count = flatten_annotations(&mut pdf, FlattenMode::All).unwrap();
         assert_eq!(count, 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Test: annotation with no /Rect is skipped (line 125)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn annotation_without_rect_is_skipped() {
+        // Build annotation with /AP but no /Rect
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) =
+            obj_dict(4, "<< /Type /Annot /Subtype /Widget /AP << /N 5 0 R >> >>");
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 0, "annotation without /Rect should be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: inverted /Rect (llx>urx, lly>ury) is normalized (lines 132,137)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn inverted_rect_normalized_and_flattened() {
+        // /Rect [150 70 50 50] → swapped to [50 50 150 70]
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [150 70 50 50] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1, "inverted rect should be normalized and flattened");
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        let content_str = String::from_utf8_lossy(&content);
+        assert!(content_str.contains("cm"), "content should contain cm");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: degenerate /Rect (zero-dimension) is skipped (line 142)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn degenerate_zero_dim_rect_is_skipped() {
+        // /Rect [50 50 50 70] → zero width → skipped
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 50 70] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 0, "zero-dim rect should be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: XObject without /BBox is skipped (line 149)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn xobj_without_bbox_is_skipped() {
+        // Form XObject stream without /BBox entry
+        let no_bbox_xobj = "<< /Type /XObject /Subtype /Form /Length 0 >>\nstream\n\nendstream\n";
+        let (n5, obj5_bytes) = obj_wrap(5, no_bbox_xobj.as_bytes().to_vec());
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 0, "XObject without /BBox should be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: degenerate transformed BBox (zero-area matrix) is skipped (line 175)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn degenerate_transformed_bbox_is_skipped() {
+        // /Matrix [0 0 0 0 0 0] collapses all corners to (0,0) → tw=0, th=0
+        let xobj_str = "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [0 0 0 0 0 0] /Length 0 >>\nstream\n\nendstream\n";
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_str.as_bytes().to_vec());
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 0, "degenerate transformed BBox should be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: /XObject as indirect ref in /Resources (lines 203-206)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn resources_xobject_as_indirect_ref() {
+        // Build a PDF with /Resources/XObject as an indirect reference
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+        // obj 6: an XObject dictionary as indirect object (will be referenced by /Resources)
+        let (n6, obj6_bytes) = obj_dict(6, "<< /ExistingEntry 5 0 R >>");
+
+        // Page has /Resources with /XObject pointing to obj 6 (indirect ref)
+        let bytes = build_pdf(
+            "/Annots [4 0 R] /Resources << /XObject 6 0 R >>",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1);
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        assert!(
+            content.windows(2).any(|w| w == b"Do"),
+            "content should contain Do"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: XObject name collision forces loop to find unique name (line 223)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn xobj_name_collision_forces_unique_name() {
+        // Pre-populate /Resources/XObject with FlAnnot1 so the loop must increment
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf(
+            "/Annots [4 0 R] /Resources << /XObject << /FlAnnot1 5 0 R >> >>",
+            &[(n4, obj4_bytes), (n5, obj5_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1);
+
+        // The content should contain FlAnnot2 (since FlAnnot1 was taken)
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        let content_str = String::from_utf8_lossy(&content);
+        assert!(
+            content_str.contains("FlAnnot2"),
+            "expected FlAnnot2 due to name collision, got: {content_str}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: page content not ending in newline gets one appended (line 247)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn page_content_without_trailing_newline_gets_newline() {
+        // Content stream that does NOT end in '\n'
+        // We need to put raw content bytes in the page — use a content stream obj
+        let content_data = b"BT /F1 12 Tf 100 700 Td (hello) Tj ET"; // no trailing newline
+        let content_len = content_data.len();
+        let stream_header = format!("<< /Length {content_len} >>\nstream\n");
+        let mut stream_bytes = stream_header.into_bytes();
+        stream_bytes.extend_from_slice(content_data);
+        stream_bytes.extend_from_slice(b"\nendstream\n");
+        let (n6, obj6_bytes) = obj_wrap(6, stream_bytes);
+
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+
+        // Page with /Contents pointing to obj 6 and /Annots
+        let bytes = build_pdf(
+            "/Annots [4 0 R] /Contents 6 0 R",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1);
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        assert!(
+            content.windows(2).any(|w| w == b"Do"),
+            "content should contain Do"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Screen mode with NoView flag skips annotation (lines 110,112)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn screen_mode_skips_noview_annotation() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        // F=0x20 = NoView bit set, no Print bit
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /F 32 /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::Screen).unwrap();
+        assert_eq!(
+            count, 0,
+            "NoView annotation should be skipped in Screen mode"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Hidden annotation skipped in Print mode (line 109)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn print_mode_skips_hidden_annotation() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        // F = Hidden(0x2) | Print(0x4) = 0x6
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /F 6 /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::Print).unwrap();
+        assert_eq!(
+            count, 0,
+            "Hidden+Print annotation should be skipped in Print mode"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for read_xobj_bbox_and_matrix private fn
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal PDF with one stream object and return a Pdf handle + its ref.
+    fn build_pdf_with_stream_obj(stream_dict_str: &str, data: &[u8]) -> (Vec<u8>, ObjectRef) {
+        let data_len = data.len();
+        let header = format!("{stream_dict_str} /Length {data_len}");
+        // Build it as obj 4
+        let mut body = format!("<< {header} >>\nstream\n").into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, body);
+        let pdf_bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        (pdf_bytes, ObjectRef::new(4, 0))
+    }
+
+    #[test]
+    fn read_bbox_matrix_non_stream_object_returns_none_bbox() {
+        // obj 4 is a plain dict (not a stream) → should return (None, identity)
+        let (n4, obj4_bytes) = obj_dict(4, "<< /Foo /Bar >>");
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let xobj_ref = ObjectRef::new(4, 0);
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, xobj_ref).unwrap();
+        assert!(bbox.is_none(), "non-stream should return None bbox");
+        assert_eq!(
+            matrix,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "non-stream should return identity matrix"
+        );
+    }
+
+    #[test]
+    fn read_bbox_matrix_missing_bbox_returns_none() {
+        // Stream dict without /BBox → (None, identity)
+        let (pdf_bytes, xobj_ref) = build_pdf_with_stream_obj("/Type /XObject /Subtype /Form", b"");
+        let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, xobj_ref).unwrap();
+        assert!(bbox.is_none());
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn read_bbox_matrix_bbox_wrong_length_returns_none() {
+        // /BBox with 3 elements (not 4) → (None, identity)
+        let xobj_str =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100] /Length 0 >>\nstream\n\nendstream\n";
+        let (n4, obj4_bytes) = obj_wrap(4, xobj_str.as_bytes().to_vec());
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_none(), "BBox with wrong length should return None");
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn read_bbox_matrix_bbox_with_real_values() {
+        // /BBox with Real values (e.g. 0.5) covers the Object::Real arm (line 487)
+        let xobj_str =
+            "<< /Type /XObject /Subtype /Form /BBox [0.5 0.5 100.5 20.5] /Length 0 >>\nstream\n\nendstream\n";
+        let (n4, obj4_bytes) = obj_wrap(4, xobj_str.as_bytes().to_vec());
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some(), "real-valued BBox should succeed");
+        let b = bbox.unwrap();
+        assert!((b[0] - 0.5).abs() < 1e-10);
+        assert!((b[2] - 100.5).abs() < 1e-10);
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn read_bbox_matrix_bbox_non_numeric_element_returns_none() {
+        // /BBox with a non-numeric element → (None, identity)
+        let xobj_str =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 /Bad 20] /Length 0 >>\nstream\n\nendstream\n";
+        let (n4, obj4_bytes) = obj_wrap(4, xobj_str.as_bytes().to_vec());
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, _matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(
+            bbox.is_none(),
+            "non-numeric BBox element should return None"
+        );
+    }
+
+    #[test]
+    fn read_bbox_matrix_matrix_with_real_values() {
+        // /Matrix with Real values covers the Object::Real arm for matrix (line 503)
+        let xobj_str =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1.5 0.0 0.0 1.5 0.0 0.0] /Length 0 >>\nstream\n\nendstream\n";
+        let (n4, obj4_bytes) = obj_wrap(4, xobj_str.as_bytes().to_vec());
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert!((matrix[0] - 1.5).abs() < 1e-10, "matrix[0] should be 1.5");
+        assert!((matrix[3] - 1.5).abs() < 1e-10, "matrix[3] should be 1.5");
+    }
+
+    #[test]
+    fn read_bbox_matrix_matrix_with_non_numeric_element_falls_back_to_identity() {
+        // /Matrix with a non-numeric element → identity (lines 505-506, 513)
+        let xobj_str =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0 /Bad 0 0] /Length 0 >>\nstream\n\nendstream\n";
+        let (n4, obj4_bytes) = obj_wrap(4, xobj_str.as_bytes().to_vec());
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert_eq!(
+            matrix,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "should fall back to identity"
+        );
+    }
+
+    #[test]
+    fn read_bbox_matrix_matrix_wrong_length_falls_back_to_identity() {
+        // /Matrix with wrong length (5 elements instead of 6) → identity (line 538)
+        let xobj_str =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0 1 0] /Length 0 >>\nstream\n\nendstream\n";
+        let (n4, obj4_bytes) = obj_wrap(4, xobj_str.as_bytes().to_vec());
+        let bytes = build_pdf("", &[(n4, obj4_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert_eq!(
+            matrix,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "wrong-length matrix falls back to identity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for read_xobj_bbox_and_matrix: /BBox and /Matrix as indirect refs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_bbox_via_indirect_ref() {
+        // /BBox as indirect reference to an Array object (lines 474-476)
+        // obj 5 = Array [0 0 100 20]
+        // obj 4 = Stream with /BBox 5 0 R
+        let (n5, obj5_bytes) = {
+            let body = "[0 0 100 20]\n";
+            obj_wrap(5, body.as_bytes().to_vec())
+        };
+        // Build stream with /BBox pointing to obj 5
+        let stream_header = "<< /Type /XObject /Subtype /Form /BBox 5 0 R /Length 0 >>";
+        let mut stream_body = stream_header.as_bytes().to_vec();
+        stream_body.extend_from_slice(b"\nstream\n\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, stream_body);
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // We need to register obj5 as an Array in the pdf
+        // Since the parser may not handle a bare array as an indirect object,
+        // let's set it directly using set_object
+        let array_ref = ObjectRef::new(5, 0);
+        pdf.set_object(
+            array_ref,
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some(), "BBox via indirect ref should be parsed");
+        let b = bbox.unwrap();
+        assert_eq!(b[2] as i64, 100);
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn read_bbox_indirect_ref_non_array_returns_none() {
+        // /BBox indirect ref resolving to non-array (line 476)
+        // Set up stream with /BBox pointing to obj 5, which is a dict (not array)
+        let stream_header = "<< /Type /XObject /Subtype /Form /BBox 5 0 R /Length 0 >>";
+        let mut stream_body = stream_header.as_bytes().to_vec();
+        stream_body.extend_from_slice(b"\nstream\n\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, stream_body);
+        let (n5, obj5_bytes) = obj_dict(5, "<< /NotAnArray true >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_none(), "BBox ref → non-array should return None");
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn read_matrix_via_indirect_ref() {
+        // /Matrix as indirect reference (lines 516-536)
+        // Build stream with /BBox [0 0 100 20] and /Matrix pointing to obj 5
+        let stream_header =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix 5 0 R /Length 0 >>";
+        let mut stream_body = stream_header.as_bytes().to_vec();
+        stream_body.extend_from_slice(b"\nstream\n\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, stream_body);
+        let (n5, obj5_bytes) = obj_dict(5, "<< /NotAnArray true >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Override obj 5 to be a proper 6-element array via set_object
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Array(vec![
+                Object::Real(2.0),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(2.0),
+                Object::Integer(0),
+                Object::Integer(0),
+            ]),
+        );
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert!(
+            (matrix[0] - 2.0).abs() < 1e-10,
+            "matrix[0] via indirect ref should be 2.0"
+        );
+        assert!(
+            (matrix[3] - 2.0).abs() < 1e-10,
+            "matrix[3] via indirect ref should be 2.0"
+        );
+    }
+
+    #[test]
+    fn read_matrix_indirect_ref_non_array_returns_identity() {
+        // /Matrix ref → non-array → identity (line 536)
+        let stream_header =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix 5 0 R /Length 0 >>";
+        let mut stream_body = stream_header.as_bytes().to_vec();
+        stream_body.extend_from_slice(b"\nstream\n\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, stream_body);
+        let (n5, obj5_bytes) = obj_dict(5, "<< /NotAnArray true >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert_eq!(
+            matrix,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "non-array matrix ref → identity"
+        );
+    }
+
+    #[test]
+    fn read_matrix_indirect_ref_with_non_numeric_element_falls_back_to_identity() {
+        // /Matrix ref → 6-element array with non-numeric element → identity (lines 524-526, 532-533)
+        let stream_header =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix 5 0 R /Length 0 >>";
+        let mut stream_body = stream_header.as_bytes().to_vec();
+        stream_body.extend_from_slice(b"\nstream\n\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, stream_body);
+        let (n5, obj5_bytes) = obj_dict(5, "<< /NotAnArray true >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Set obj5 to 6-element array with a bad element
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Name(b"BadElement".to_vec()), // non-numeric
+                Object::Integer(0),
+                Object::Integer(0),
+            ]),
+        );
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert_eq!(
+            matrix,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "bad element in matrix ref → identity"
+        );
+    }
+
+    #[test]
+    fn read_matrix_indirect_ref_wrong_length_returns_identity() {
+        // /Matrix ref → array with wrong length (not 6) → identity (line 517 guard fails)
+        let stream_header =
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix 5 0 R /Length 0 >>";
+        let mut stream_body = stream_header.as_bytes().to_vec();
+        stream_body.extend_from_slice(b"\nstream\n\nendstream\n");
+        let (n4, obj4_bytes) = obj_wrap(4, stream_body);
+        let (n5, obj5_bytes) = obj_dict(5, "<< /NotAnArray true >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Set obj5 to a 4-element array (wrong length)
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(1),
+            ]),
+        );
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(bbox.is_some());
+        assert_eq!(
+            matrix,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "wrong-length matrix ref → identity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for read_annot_flags private fn
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_annot_flags_non_dict_returns_zero() {
+        // annot_ref resolves to a non-dict object → returns 0 (line 327)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Register obj 10 as an Integer (not a dict)
+        let annot_ref = ObjectRef::new(10, 0);
+        pdf.set_object(annot_ref, Object::Integer(42));
+
+        let flags = read_annot_flags(&mut pdf, annot_ref).unwrap();
+        assert_eq!(flags, 0, "non-dict annot should return flags=0");
+    }
+
+    #[test]
+    fn read_annot_flags_f_as_indirect_ref() {
+        // /F value is an indirect reference to an Integer (line 335)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 11 = Integer 4 (Print bit)
+        let flag_ref = ObjectRef::new(11, 0);
+        pdf.set_object(flag_ref, Object::Integer(4));
+
+        // obj 10 = annotation dict with /F → 11 0 R
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("Type", Object::Name(b"Annot".to_vec()));
+        annot_dict.insert("F", Object::Reference(flag_ref));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let flags = read_annot_flags(&mut pdf, annot_ref).unwrap();
+        assert_eq!(
+            flags, 4,
+            "/F via indirect ref should resolve to 4 (Print bit)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for resolve_ap_n private fn
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_ap_n_non_dict_annot_returns_none() {
+        // annot_ref resolves to non-dict → None (line 359)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annot_ref = ObjectRef::new(10, 0);
+        pdf.set_object(annot_ref, Object::Integer(99));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "non-dict annot should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_ap_null_returns_none() {
+        // /AP is null → None (line 364)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("AP", Object::Null);
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_ap_n_ap_as_indirect_ref_to_dict() {
+        // /AP is an indirect ref to a dict (lines 369-370)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 11 = Form XObject stream
+        let xobj_ref = ObjectRef::new(11, 0);
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        xobj_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        xobj_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        pdf.set_object(xobj_ref, Object::Stream(Stream::new(xobj_dict, vec![])));
+
+        // obj 12 = AP dict {N: 11 0 R} as indirect object
+        let ap_dict_ref = ObjectRef::new(12, 0);
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(xobj_ref));
+        pdf.set_object(ap_dict_ref, Object::Dictionary(ap_dict));
+
+        // obj 10 = annotation with /AP as indirect ref → obj 12
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("Type", Object::Name(b"Annot".to_vec()));
+        annot_dict.insert("AP", Object::Reference(ap_dict_ref));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert_eq!(
+            result,
+            Some(xobj_ref),
+            "/AP as indirect ref should resolve to xobj"
+        );
+    }
+
+    #[test]
+    fn resolve_ap_n_ap_ref_to_non_dict_returns_none() {
+        // /AP is indirect ref to non-dict → None (line 371)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let bad_ref = ObjectRef::new(11, 0);
+        pdf.set_object(bad_ref, Object::Integer(42));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("AP", Object::Reference(bad_ref));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "/AP ref → non-dict should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_ap_direct_non_dict_returns_none() {
+        // /AP is a direct non-dict value (e.g. Integer) → None (line 373)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        annot_dict.insert("AP", Object::Integer(99));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "non-dict /AP should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_n_null_returns_none() {
+        // /N is null → None (line 378)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Null);
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "/N null should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_n_ref_to_dict_selects_by_as() {
+        // /N is ref → dict (state dict case), selects by /AS (lines 391,393)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 11 = Form XObject stream (the "On" state)
+        let xobj_ref = ObjectRef::new(11, 0);
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        xobj_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        xobj_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(20),
+                Object::Integer(20),
+            ]),
+        );
+        pdf.set_object(xobj_ref, Object::Stream(Stream::new(xobj_dict, vec![])));
+
+        // obj 12 = state dict {On: 11 0 R, Off: ...}
+        let state_dict_ref = ObjectRef::new(12, 0);
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", Object::Reference(xobj_ref));
+        pdf.set_object(state_dict_ref, Object::Dictionary(state_dict));
+
+        // obj 10 = annotation with /AP/N as ref to state dict, /AS /On
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_dict_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Name(b"On".to_vec()));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert_eq!(
+            result,
+            Some(xobj_ref),
+            "state dict /AS selection should return correct xobj"
+        );
+    }
+
+    #[test]
+    fn resolve_ap_n_n_ref_to_non_stream_non_dict_returns_none() {
+        // /N ref → non-stream/non-dict → None (line 393)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let bad_ref = ObjectRef::new(11, 0);
+        pdf.set_object(bad_ref, Object::Integer(99));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(bad_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(
+            result.is_none(),
+            "/N ref → non-stream/dict should return None"
+        );
+    }
+
+    #[test]
+    fn resolve_ap_n_n_direct_integer_returns_none() {
+        // /N is a direct non-stream/dict/ref value → None (line 404)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Integer(42));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "direct integer /N should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_as_via_indirect_ref() {
+        // /AS is an indirect ref → Name (lines 423-424)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 11 = Form XObject stream
+        let xobj_ref = ObjectRef::new(11, 0);
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        xobj_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        xobj_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(20),
+                Object::Integer(20),
+            ]),
+        );
+        pdf.set_object(xobj_ref, Object::Stream(Stream::new(xobj_dict, vec![])));
+
+        // obj 13 = Name "On" (indirect)
+        let name_ref = ObjectRef::new(13, 0);
+        pdf.set_object(name_ref, Object::Name(b"On".to_vec()));
+
+        // obj 12 = state dict
+        let state_dict_ref = ObjectRef::new(12, 0);
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", Object::Reference(xobj_ref));
+        pdf.set_object(state_dict_ref, Object::Dictionary(state_dict));
+
+        // obj 10 = annotation with /AS as indirect ref → Name "On"
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_dict_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Reference(name_ref));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert_eq!(result, Some(xobj_ref), "/AS via indirect ref should work");
+    }
+
+    #[test]
+    fn resolve_ap_n_as_ref_to_non_name_returns_none() {
+        // /AS ref → non-Name → None (line 425)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 13 = Integer (not a Name)
+        let bad_ref = ObjectRef::new(13, 0);
+        pdf.set_object(bad_ref, Object::Integer(42));
+
+        // obj 12 = state dict
+        let state_dict_ref = ObjectRef::new(12, 0);
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", Object::Integer(0));
+        pdf.set_object(state_dict_ref, Object::Dictionary(state_dict));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_dict_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Reference(bad_ref));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "/AS ref → non-name should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_state_dict_as_absent_returns_none() {
+        // No /AS in annotation when state dict selected → None (line 427)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 12 = state dict
+        let state_dict_ref = ObjectRef::new(12, 0);
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", Object::Integer(0));
+        pdf.set_object(state_dict_ref, Object::Dictionary(state_dict));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_dict_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        // No /AS key
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(result.is_none(), "missing /AS should return None");
+    }
+
+    #[test]
+    fn resolve_ap_n_state_dict_entry_ref_to_non_stream_returns_none() {
+        // State dict entry ref → non-stream → None (line 434)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 11 = Integer (not a stream)
+        let non_stream_ref = ObjectRef::new(11, 0);
+        pdf.set_object(non_stream_ref, Object::Integer(99));
+
+        // obj 12 = state dict with /On → bad ref
+        let state_dict_ref = ObjectRef::new(12, 0);
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", Object::Reference(non_stream_ref));
+        pdf.set_object(state_dict_ref, Object::Dictionary(state_dict));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_dict_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Name(b"On".to_vec()));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(
+            result.is_none(),
+            "state entry ref → non-stream should return None"
+        );
+    }
+
+    #[test]
+    fn resolve_ap_n_state_dict_missing_key_returns_none() {
+        // State dict does not have the /AS key → None (line 442)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // obj 12 = state dict without "On" key
+        let state_dict_ref = ObjectRef::new(12, 0);
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("Off", Object::Integer(0));
+        pdf.set_object(state_dict_ref, Object::Dictionary(state_dict));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_dict_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Name(b"On".to_vec())); // key not in state dict
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(
+            result.is_none(),
+            "missing state dict key should return None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for build_pruned_annots_array private fn
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pruned_annots_no_annots_entry_returns_empty() {
+        // page_dict has no /Annots → empty vec (line 554)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let page_dict = Dictionary::new();
+        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[]).unwrap();
+        assert!(result.is_empty(), "no /Annots should return empty vec");
+    }
+
+    #[test]
+    fn pruned_annots_annots_as_indirect_ref_to_array() {
+        // /Annots is an indirect ref to an array (lines 559-560)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let keep_ref = ObjectRef::new(11, 0);
+
+        // Set up obj 20 = array [annot_ref, keep_ref]
+        let arr_ref = ObjectRef::new(20, 0);
+        pdf.set_object(
+            arr_ref,
+            Object::Array(vec![
+                Object::Reference(annot_ref),
+                Object::Reference(keep_ref),
+            ]),
+        );
+
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Annots", Object::Reference(arr_ref));
+
+        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[annot_ref]).unwrap();
+        assert_eq!(result.len(), 1, "one annot should be pruned");
+        assert_eq!(result[0], Object::Reference(keep_ref));
+    }
+
+    #[test]
+    fn pruned_annots_annots_ref_to_non_array_returns_empty() {
+        // /Annots indirect ref → non-array → empty (line 561)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let bad_ref = ObjectRef::new(20, 0);
+        pdf.set_object(bad_ref, Object::Integer(42));
+
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Annots", Object::Reference(bad_ref));
+
+        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[]).unwrap();
+        assert!(result.is_empty(), "ref → non-array should return empty");
+    }
+
+    #[test]
+    fn pruned_annots_annots_direct_non_array_returns_empty() {
+        // /Annots is a direct non-array value → empty (line 563)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Annots", Object::Integer(99));
+
+        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[]).unwrap();
+        assert!(
+            result.is_empty(),
+            "direct non-array /Annots should return empty"
+        );
+    }
+
+    #[test]
+    fn pruned_annots_non_ref_entries_are_kept() {
+        // Array with non-ref entries (unusual) — these should be kept (line 570)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let keep_ref = ObjectRef::new(11, 0);
+        let remove_ref = ObjectRef::new(10, 0);
+
+        let mut page_dict = Dictionary::new();
+        page_dict.insert(
+            "Annots",
+            Object::Array(vec![
+                Object::Reference(remove_ref),
+                Object::Integer(42), // non-ref entry — keep
+                Object::Reference(keep_ref),
+            ]),
+        );
+
+        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[remove_ref]).unwrap();
+        assert_eq!(result.len(), 2, "non-ref entries should be kept");
+        assert_eq!(result[0], Object::Integer(42));
+        assert_eq!(result[1], Object::Reference(keep_ref));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: /AP/N direct stream materializes as new indirect object (lines 402, 408-412)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn resolve_ap_n_direct_stream_materializes() {
+        // /AP/N is a direct Object::Stream (defensive path for malformed PDFs)
+        // This requires constructing the object directly via set_object
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Build an inline (direct) stream for /N
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        xobj_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        xobj_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        let inline_stream = Object::Stream(Stream::new(xobj_dict, b"q Q".to_vec()));
+
+        // obj 10 = annotation dict with /AP/N as direct stream
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", inline_stream);
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(
+            result.is_some(),
+            "direct stream /N should be materialized and returned"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: state dict with direct stream entry materializes (lines 436-440)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn resolve_ap_n_state_dict_direct_stream_entry_materializes() {
+        // State dict entry is a direct Object::Stream (defensive path)
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Build inline stream for /On state entry
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        xobj_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        xobj_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(20),
+                Object::Integer(20),
+            ]),
+        );
+        let inline_stream = Object::Stream(Stream::new(xobj_dict, vec![]));
+
+        // obj 10 = annotation with /AP/N as direct state dict
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", inline_stream);
+        ap_dict.insert("N", Object::Dictionary(state_dict));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Name(b"On".to_vec()));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert!(
+            result.is_some(),
+            "state dict direct stream entry should be materialized"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: /XObject in resources is ref → non-dict → creates empty dict (line 206)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn resources_xobject_indirect_ref_to_non_dict_uses_empty_dict() {
+        // /Resources/XObject is an indirect ref to a non-dict object (e.g. Integer)
+        // This should fall back to an empty XObject dict
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+        // obj 6: a non-dict object (Integer), used as /XObject ref
+        let (n6, obj6_bytes) = obj_dict(6, "42"); // integer as standalone object
+
+        let bytes = build_pdf(
+            "/Annots [4 0 R] /Resources << /XObject 6 0 R >>",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Override obj 6 to be a non-dict value to trigger the fallback path
+        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
+
+        let page_ref = ObjectRef::new(3, 0);
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1, "should flatten even when /XObject ref → non-dict");
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        assert!(content.windows(2).any(|w| w == b"Do"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: /BBox as a direct non-array value (line 478)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn read_bbox_direct_non_array_value_returns_none() {
+        // /BBox is a direct non-array, non-ref value (e.g., a Name) → (None, identity)
+        // Must use set_object since the parser normalizes, but we can inject it directly
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Build stream object with /BBox as an Integer directly
+        let xobj_ref = ObjectRef::new(10, 0);
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        xobj_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        // Set /BBox to an Integer (not an array) — malformed
+        xobj_dict.insert("BBox", Object::Integer(99));
+        pdf.set_object(xobj_ref, Object::Stream(Stream::new(xobj_dict, vec![])));
+
+        let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, xobj_ref).unwrap();
+        assert!(bbox.is_none(), "direct non-array /BBox should return None");
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: fmt_f64 for non-finite / non-integer float
+    // -----------------------------------------------------------------------
+    #[test]
+    fn fmt_f64_non_integer_float() {
+        // covers the else branch of fmt_f64 (line 316-319)
+        assert_eq!(fmt_f64(0.5), "0.5");
+        assert_eq!(fmt_f64(1.25), "1.25");
+        assert_eq!(fmt_f64(0.123456), "0.123456");
+        // trailing zeros removed
+        assert_eq!(fmt_f64(1.500_000), "1.5");
+        // very large integer-valued float
+        assert_eq!(fmt_f64(1_000_000.0), "1000000");
+    }
 }
