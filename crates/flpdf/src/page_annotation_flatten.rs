@@ -490,14 +490,8 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
     }
 
     // Read /Matrix — 6-element array, defaults to identity (review-pattern #2).
-    // Re-borrow to avoid borrow checker issues.
-    let obj2 = pdf.resolve_borrowed(xobj_ref)?;
-    let stream_dict2 = match obj2 {
-        Object::Stream(s) => s.dict.clone(),
-        _ => return Ok((Some(bbox_vals), identity)),
-    };
-
-    let matrix_val = stream_dict2.get("Matrix").cloned();
+    // `stream_dict` is already an owned clone, so reuse it — no second resolve.
+    let matrix_val = stream_dict.get("Matrix").cloned();
     let ap_matrix = match matrix_val {
         None | Some(Object::Null) => identity,
         Some(Object::Array(a)) if a.len() == 6 => {
