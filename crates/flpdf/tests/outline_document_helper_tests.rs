@@ -275,3 +275,53 @@ fn dest_from_goto_action() {
         .expect("GoTo action should yield a dest");
     assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
 }
+
+/// Outline item whose /Dest is an INDIRECT ref (obj 8) to an explicit array.
+fn indirect_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Ind) /Parent 4 0 R /Dest 8 0 R >>"),
+            (8, "[3 0 R /Fit]"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn dest_from_indirect_dest_reference() {
+    let mut pdf = Pdf::open(Cursor::new(indirect_dest_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    let dest = roots[0]
+        .dest
+        .as_ref()
+        .expect("indirect /Dest should resolve");
+    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+}
+
+/// Outline item whose /Dest points at a dict whose /D points back at itself:
+/// 8 0 obj << /D 8 0 R >>. Resolution must terminate (depth bound) -> None.
+fn cyclic_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Cyc) /Parent 4 0 R /Dest 8 0 R >>"),
+            (8, "<< /D 8 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn cyclic_dest_terminates_as_none() {
+    let mut pdf = Pdf::open(Cursor::new(cyclic_dest_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    // The cyclic /D bottoms out at the depth bound and resolves to no dest.
+    assert!(roots[0].dest.is_none());
+}

@@ -39,7 +39,8 @@ pub struct OutlineNode {
     pub count: i64,
     /// Parent item ref; `None` for top-level items.
     pub parent: Option<ObjectRef>,
-    /// Resolved destination (set in a later task); `None` until then.
+    /// Resolved explicit destination (`/Dest`, or a `/A` GoTo action's `/D`),
+    /// or `None` when absent or a still-unresolved named destination.
     pub dest: Option<Dest>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
