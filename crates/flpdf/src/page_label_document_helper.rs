@@ -88,6 +88,34 @@ impl LabelRange {
         }
     }
 
+    /// Like [`LabelRange::from_dict`] but resolves indirect `/S`, `/P`, `/St`
+    /// values via `pdf` before interpreting them (ISO 32000-1 allows any value
+    /// to be an indirect reference). Used by the document reader; the plain
+    /// [`LabelRange::from_dict`] is retained for callers without a `Pdf` handle.
+    pub(crate) fn from_dict_resolved<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        dict: &Dictionary,
+    ) -> Result<Self> {
+        let style = match resolve_entry(pdf, dict.get("S"))? {
+            Some(Object::Name(bytes)) => LabelStyle::from_name(&bytes),
+            _ => LabelStyle::None,
+        };
+        let prefix = match resolve_entry(pdf, dict.get("P"))? {
+            Some(Object::String(bytes)) => crate::json_inspect::decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+            _ => String::new(),
+        };
+        let start = match resolve_entry(pdf, dict.get("St"))? {
+            Some(Object::Integer(n)) => n,
+            _ => 1,
+        };
+        Ok(LabelRange {
+            style,
+            prefix,
+            start,
+        })
+    }
+
     /// Build a label dictionary mirroring qpdf `pageLabelDict`: `/S` name when
     /// the style is not [`LabelStyle::None`]; `/P` only when non-empty; `/St`
     /// only when `!= 1`.
@@ -119,6 +147,19 @@ impl LabelRange {
             LabelStyle::None => {}
         }
         s
+    }
+}
+
+/// Resolve a dictionary entry that may be an indirect reference, returning the
+/// owned target object (or the value verbatim if direct, `None` if absent).
+fn resolve_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Option<&Object>,
+) -> Result<Option<Object>> {
+    match value {
+        Some(Object::Reference(r)) => Ok(Some(pdf.resolve_borrowed(*r)?.clone())),
+        Some(o) => Ok(Some(o.clone())),
+        None => Ok(None),
     }
 }
 
@@ -212,7 +253,10 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                     Object::Reference(r) => pdf.resolve_borrowed(r)?.as_dict().cloned(),
                     _ => None,
                 };
-                Ok(dict.map(|d| LabelRange::from_dict(&d)))
+                match dict {
+                    Some(d) => Ok(Some(LabelRange::from_dict_resolved(pdf, &d)?)),
+                    None => Ok(None),
+                }
             },
             DEFAULT_MAX_TREE_DEPTH,
         )
@@ -264,6 +308,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// call: the leading entry is always emitted (the result vector starts
     /// empty, so there is no prior entry to be redundant against). A later
     /// accumulating consumer can dedupe across calls.
+    ///
+    /// Re-reads the `/PageLabels` tree once per explicit page in the span (the
+    /// helper caches nothing by design); acceptable for typical small label trees.
     pub fn labels_for_page_range(
         &mut self,
         start_idx: i64,
@@ -477,7 +524,6 @@ mod tests {
     #[test]
     fn no_pagelabels_defaults_to_decimal() {
         let mut pdf = pdf_with_pagelabels(vec![]); // empty /Nums -> ranges empty
-                                                   // Remove the (empty) /PageLabels to exercise the absent path too:
         let mut h = pdf.page_labels();
         assert_eq!(h.label_string_for_page(0).unwrap(), "1");
         assert_eq!(h.label_string_for_page(4).unwrap(), "5");
@@ -663,5 +709,58 @@ mod tests {
             bare.to_dict().iter().next().is_none(),
             "all-default range => empty dict"
         );
+    }
+
+    #[test]
+    fn ranges_resolves_indirect_inner_st() {
+        let mut pdf = pdf_with_pagelabels(vec![]); // empty root; we set a custom tree below
+                                                   // Put an indirect /St value: label dict {/S /D /St 11 0 R}, 11 0 obj = Integer(7).
+        let st_ref = ObjectRef::new(11, 0);
+        pdf.set_object(st_ref, Object::Integer(7));
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name("D".into()));
+        label.insert("St", Object::Reference(st_ref));
+        let pl_ref = ObjectRef::new(10, 0);
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
+        );
+        pdf.set_object(pl_ref, Object::Dictionary(leaf));
+        // catalog already points /PageLabels -> 10 0 R from pdf_with_pagelabels.
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].1.start, 7, "indirect /St must be resolved");
+    }
+
+    #[test]
+    fn set_range_round_trips_multi_leaf_tree() {
+        let mut pdf = pdf_with_pagelabels(vec![]);
+        {
+            let mut h = pdf.page_labels();
+            for i in 0..40i64 {
+                h.set_range(
+                    i * 2,
+                    LabelRange {
+                        style: LabelStyle::Decimal,
+                        prefix: String::new(),
+                        start: 1,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(
+            ranges.len(),
+            40,
+            "all 40 ranges survive the multi-leaf tree"
+        );
+        // Spot-check ordering + a mid entry.
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[39].0, 78);
+        assert!(ranges.windows(2).all(|w| w[0].0 < w[1].0), "ascending");
     }
 }
