@@ -5,6 +5,23 @@
 //! `QPDFOutlineDocumentHelper`. It materializes the tree into owned
 //! [`OutlineNode`]s; navigation (`children`, `parent`, `count`, `dest`) lives on
 //! each node, mirroring `QPDFOutlineObjectHelper`.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use flpdf::Pdf;
+//! use std::io::Cursor;
+//!
+//! # fn f(bytes: Vec<u8>) -> flpdf::Result<()> {
+//! let mut pdf = Pdf::open(Cursor::new(bytes))?;
+//! if pdf.outline().has_outlines()? {
+//!     pdf.outline().walk(|node, depth| {
+//!         println!("{:indent$}{}", "", node.title, indent = depth * 2);
+//!     })?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::name_number_tree::read_name_tree;
 use crate::{Object, ObjectRef, Pdf, Result};

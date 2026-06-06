@@ -122,7 +122,7 @@ pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
-pub use outline_document_helper::OutlineDocumentHelper;
+pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
