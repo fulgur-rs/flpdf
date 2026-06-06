@@ -14,262 +14,262 @@
 /// Bytes with no defined glyph are mapped to ".notdef".
 /// Source: PDF 32000-1:2008 Appendix D.2 + CP1252.
 const WINANSI_ENCODING: [&str; 256] = [
-    ".notdef",  // 0x00
-    ".notdef",  // 0x01
-    ".notdef",  // 0x02
-    ".notdef",  // 0x03
-    ".notdef",  // 0x04
-    ".notdef",  // 0x05
-    ".notdef",  // 0x06
-    ".notdef",  // 0x07
-    ".notdef",  // 0x08
-    ".notdef",  // 0x09
-    ".notdef",  // 0x0A
-    ".notdef",  // 0x0B
-    ".notdef",  // 0x0C
-    ".notdef",  // 0x0D
-    ".notdef",  // 0x0E
-    ".notdef",  // 0x0F
-    ".notdef",  // 0x10
-    ".notdef",  // 0x11
-    ".notdef",  // 0x12
-    ".notdef",  // 0x13
-    ".notdef",  // 0x14
-    ".notdef",  // 0x15
-    ".notdef",  // 0x16
-    ".notdef",  // 0x17
-    ".notdef",  // 0x18
-    ".notdef",  // 0x19
-    ".notdef",  // 0x1A
-    ".notdef",  // 0x1B
-    ".notdef",  // 0x1C
-    ".notdef",  // 0x1D
-    ".notdef",  // 0x1E
-    ".notdef",  // 0x1F
-    "space",  // 0x20
-    "exclam",  // 0x21
-    "quotedbl",  // 0x22
-    "numbersign",  // 0x23
-    "dollar",  // 0x24
-    "percent",  // 0x25
-    "ampersand",  // 0x26
-    "quotesingle",  // 0x27
-    "parenleft",  // 0x28
-    "parenright",  // 0x29
-    "asterisk",  // 0x2A
-    "plus",  // 0x2B
-    "comma",  // 0x2C
-    "hyphen",  // 0x2D
-    "period",  // 0x2E
-    "slash",  // 0x2F
-    "zero",  // 0x30
-    "one",  // 0x31
-    "two",  // 0x32
-    "three",  // 0x33
-    "four",  // 0x34
-    "five",  // 0x35
-    "six",  // 0x36
-    "seven",  // 0x37
-    "eight",  // 0x38
-    "nine",  // 0x39
-    "colon",  // 0x3A
-    "semicolon",  // 0x3B
-    "less",  // 0x3C
-    "equal",  // 0x3D
-    "greater",  // 0x3E
-    "question",  // 0x3F
-    "at",  // 0x40
-    "A",  // 0x41
-    "B",  // 0x42
-    "C",  // 0x43
-    "D",  // 0x44
-    "E",  // 0x45
-    "F",  // 0x46
-    "G",  // 0x47
-    "H",  // 0x48
-    "I",  // 0x49
-    "J",  // 0x4A
-    "K",  // 0x4B
-    "L",  // 0x4C
-    "M",  // 0x4D
-    "N",  // 0x4E
-    "O",  // 0x4F
-    "P",  // 0x50
-    "Q",  // 0x51
-    "R",  // 0x52
-    "S",  // 0x53
-    "T",  // 0x54
-    "U",  // 0x55
-    "V",  // 0x56
-    "W",  // 0x57
-    "X",  // 0x58
-    "Y",  // 0x59
-    "Z",  // 0x5A
-    "bracketleft",  // 0x5B
-    "backslash",  // 0x5C
-    "bracketright",  // 0x5D
-    "asciicircum",  // 0x5E
-    "underscore",  // 0x5F
-    "grave",  // 0x60
-    "a",  // 0x61
-    "b",  // 0x62
-    "c",  // 0x63
-    "d",  // 0x64
-    "e",  // 0x65
-    "f",  // 0x66
-    "g",  // 0x67
-    "h",  // 0x68
-    "i",  // 0x69
-    "j",  // 0x6A
-    "k",  // 0x6B
-    "l",  // 0x6C
-    "m",  // 0x6D
-    "n",  // 0x6E
-    "o",  // 0x6F
-    "p",  // 0x70
-    "q",  // 0x71
-    "r",  // 0x72
-    "s",  // 0x73
-    "t",  // 0x74
-    "u",  // 0x75
-    "v",  // 0x76
-    "w",  // 0x77
-    "x",  // 0x78
-    "y",  // 0x79
-    "z",  // 0x7A
-    "braceleft",  // 0x7B
-    "bar",  // 0x7C
-    "braceright",  // 0x7D
-    "asciitilde",  // 0x7E
-    ".notdef",  // 0x7F
-    "Euro",  // 0x80
-    ".notdef",  // 0x81
-    "quotesinglbase",  // 0x82
-    "florin",  // 0x83
-    "quotedblbase",  // 0x84
-    "ellipsis",  // 0x85
-    "dagger",  // 0x86
-    "daggerdbl",  // 0x87
-    "circumflex",  // 0x88
-    "perthousand",  // 0x89
-    "Scaron",  // 0x8A
+    ".notdef",        // 0x00
+    ".notdef",        // 0x01
+    ".notdef",        // 0x02
+    ".notdef",        // 0x03
+    ".notdef",        // 0x04
+    ".notdef",        // 0x05
+    ".notdef",        // 0x06
+    ".notdef",        // 0x07
+    ".notdef",        // 0x08
+    ".notdef",        // 0x09
+    ".notdef",        // 0x0A
+    ".notdef",        // 0x0B
+    ".notdef",        // 0x0C
+    ".notdef",        // 0x0D
+    ".notdef",        // 0x0E
+    ".notdef",        // 0x0F
+    ".notdef",        // 0x10
+    ".notdef",        // 0x11
+    ".notdef",        // 0x12
+    ".notdef",        // 0x13
+    ".notdef",        // 0x14
+    ".notdef",        // 0x15
+    ".notdef",        // 0x16
+    ".notdef",        // 0x17
+    ".notdef",        // 0x18
+    ".notdef",        // 0x19
+    ".notdef",        // 0x1A
+    ".notdef",        // 0x1B
+    ".notdef",        // 0x1C
+    ".notdef",        // 0x1D
+    ".notdef",        // 0x1E
+    ".notdef",        // 0x1F
+    "space",          // 0x20
+    "exclam",         // 0x21
+    "quotedbl",       // 0x22
+    "numbersign",     // 0x23
+    "dollar",         // 0x24
+    "percent",        // 0x25
+    "ampersand",      // 0x26
+    "quotesingle",    // 0x27
+    "parenleft",      // 0x28
+    "parenright",     // 0x29
+    "asterisk",       // 0x2A
+    "plus",           // 0x2B
+    "comma",          // 0x2C
+    "hyphen",         // 0x2D
+    "period",         // 0x2E
+    "slash",          // 0x2F
+    "zero",           // 0x30
+    "one",            // 0x31
+    "two",            // 0x32
+    "three",          // 0x33
+    "four",           // 0x34
+    "five",           // 0x35
+    "six",            // 0x36
+    "seven",          // 0x37
+    "eight",          // 0x38
+    "nine",           // 0x39
+    "colon",          // 0x3A
+    "semicolon",      // 0x3B
+    "less",           // 0x3C
+    "equal",          // 0x3D
+    "greater",        // 0x3E
+    "question",       // 0x3F
+    "at",             // 0x40
+    "A",              // 0x41
+    "B",              // 0x42
+    "C",              // 0x43
+    "D",              // 0x44
+    "E",              // 0x45
+    "F",              // 0x46
+    "G",              // 0x47
+    "H",              // 0x48
+    "I",              // 0x49
+    "J",              // 0x4A
+    "K",              // 0x4B
+    "L",              // 0x4C
+    "M",              // 0x4D
+    "N",              // 0x4E
+    "O",              // 0x4F
+    "P",              // 0x50
+    "Q",              // 0x51
+    "R",              // 0x52
+    "S",              // 0x53
+    "T",              // 0x54
+    "U",              // 0x55
+    "V",              // 0x56
+    "W",              // 0x57
+    "X",              // 0x58
+    "Y",              // 0x59
+    "Z",              // 0x5A
+    "bracketleft",    // 0x5B
+    "backslash",      // 0x5C
+    "bracketright",   // 0x5D
+    "asciicircum",    // 0x5E
+    "underscore",     // 0x5F
+    "grave",          // 0x60
+    "a",              // 0x61
+    "b",              // 0x62
+    "c",              // 0x63
+    "d",              // 0x64
+    "e",              // 0x65
+    "f",              // 0x66
+    "g",              // 0x67
+    "h",              // 0x68
+    "i",              // 0x69
+    "j",              // 0x6A
+    "k",              // 0x6B
+    "l",              // 0x6C
+    "m",              // 0x6D
+    "n",              // 0x6E
+    "o",              // 0x6F
+    "p",              // 0x70
+    "q",              // 0x71
+    "r",              // 0x72
+    "s",              // 0x73
+    "t",              // 0x74
+    "u",              // 0x75
+    "v",              // 0x76
+    "w",              // 0x77
+    "x",              // 0x78
+    "y",              // 0x79
+    "z",              // 0x7A
+    "braceleft",      // 0x7B
+    "bar",            // 0x7C
+    "braceright",     // 0x7D
+    "asciitilde",     // 0x7E
+    ".notdef",        // 0x7F
+    "Euro",           // 0x80
+    ".notdef",        // 0x81
+    "quotesinglbase", // 0x82
+    "florin",         // 0x83
+    "quotedblbase",   // 0x84
+    "ellipsis",       // 0x85
+    "dagger",         // 0x86
+    "daggerdbl",      // 0x87
+    "circumflex",     // 0x88
+    "perthousand",    // 0x89
+    "Scaron",         // 0x8A
     "guilsinglleft",  // 0x8B
-    "OE",  // 0x8C
-    ".notdef",  // 0x8D
-    "Zcaron",  // 0x8E
-    ".notdef",  // 0x8F
-    ".notdef",  // 0x90
-    "quoteleft",  // 0x91
-    "quoteright",  // 0x92
-    "quotedblleft",  // 0x93
+    "OE",             // 0x8C
+    ".notdef",        // 0x8D
+    "Zcaron",         // 0x8E
+    ".notdef",        // 0x8F
+    ".notdef",        // 0x90
+    "quoteleft",      // 0x91
+    "quoteright",     // 0x92
+    "quotedblleft",   // 0x93
     "quotedblright",  // 0x94
-    "bullet",  // 0x95
-    "endash",  // 0x96
-    "emdash",  // 0x97
-    "tilde",  // 0x98
-    "trademark",  // 0x99
-    "scaron",  // 0x9A
-    "guilsinglright",  // 0x9B
-    "oe",  // 0x9C
-    ".notdef",  // 0x9D
-    "zcaron",  // 0x9E
-    "Ydieresis",  // 0x9F
-    "space",  // 0xA0
-    "exclamdown",  // 0xA1
-    "cent",  // 0xA2
-    "sterling",  // 0xA3
-    "currency",  // 0xA4
-    "yen",  // 0xA5
-    "brokenbar",  // 0xA6
-    "section",  // 0xA7
-    "dieresis",  // 0xA8
-    "copyright",  // 0xA9
-    "ordfeminine",  // 0xAA
+    "bullet",         // 0x95
+    "endash",         // 0x96
+    "emdash",         // 0x97
+    "tilde",          // 0x98
+    "trademark",      // 0x99
+    "scaron",         // 0x9A
+    "guilsinglright", // 0x9B
+    "oe",             // 0x9C
+    ".notdef",        // 0x9D
+    "zcaron",         // 0x9E
+    "Ydieresis",      // 0x9F
+    "space",          // 0xA0
+    "exclamdown",     // 0xA1
+    "cent",           // 0xA2
+    "sterling",       // 0xA3
+    "currency",       // 0xA4
+    "yen",            // 0xA5
+    "brokenbar",      // 0xA6
+    "section",        // 0xA7
+    "dieresis",       // 0xA8
+    "copyright",      // 0xA9
+    "ordfeminine",    // 0xAA
     "guillemotleft",  // 0xAB
-    "logicalnot",  // 0xAC
-    "hyphen",  // 0xAD
-    "registered",  // 0xAE
-    "macron",  // 0xAF
-    "degree",  // 0xB0
-    "plusminus",  // 0xB1
-    "twosuperior",  // 0xB2
+    "logicalnot",     // 0xAC
+    "hyphen",         // 0xAD
+    "registered",     // 0xAE
+    "macron",         // 0xAF
+    "degree",         // 0xB0
+    "plusminus",      // 0xB1
+    "twosuperior",    // 0xB2
     "threesuperior",  // 0xB3
-    "acute",  // 0xB4
-    "mu",  // 0xB5
-    "paragraph",  // 0xB6
-    "periodcentered",  // 0xB7
-    "cedilla",  // 0xB8
-    "onesuperior",  // 0xB9
-    "ordmasculine",  // 0xBA
-    "guillemotright",  // 0xBB
-    "onequarter",  // 0xBC
-    "onehalf",  // 0xBD
+    "acute",          // 0xB4
+    "mu",             // 0xB5
+    "paragraph",      // 0xB6
+    "periodcentered", // 0xB7
+    "cedilla",        // 0xB8
+    "onesuperior",    // 0xB9
+    "ordmasculine",   // 0xBA
+    "guillemotright", // 0xBB
+    "onequarter",     // 0xBC
+    "onehalf",        // 0xBD
     "threequarters",  // 0xBE
-    "questiondown",  // 0xBF
-    "Agrave",  // 0xC0
-    "Aacute",  // 0xC1
-    "Acircumflex",  // 0xC2
-    "Atilde",  // 0xC3
-    "Adieresis",  // 0xC4
-    "Aring",  // 0xC5
-    "AE",  // 0xC6
-    "Ccedilla",  // 0xC7
-    "Egrave",  // 0xC8
-    "Eacute",  // 0xC9
-    "Ecircumflex",  // 0xCA
-    "Edieresis",  // 0xCB
-    "Igrave",  // 0xCC
-    "Iacute",  // 0xCD
-    "Icircumflex",  // 0xCE
-    "Idieresis",  // 0xCF
-    "Eth",  // 0xD0
-    "Ntilde",  // 0xD1
-    "Ograve",  // 0xD2
-    "Oacute",  // 0xD3
-    "Ocircumflex",  // 0xD4
-    "Otilde",  // 0xD5
-    "Odieresis",  // 0xD6
-    "multiply",  // 0xD7
-    "Oslash",  // 0xD8
-    "Ugrave",  // 0xD9
-    "Uacute",  // 0xDA
-    "Ucircumflex",  // 0xDB
-    "Udieresis",  // 0xDC
-    "Yacute",  // 0xDD
-    "Thorn",  // 0xDE
-    "germandbls",  // 0xDF
-    "agrave",  // 0xE0
-    "aacute",  // 0xE1
-    "acircumflex",  // 0xE2
-    "atilde",  // 0xE3
-    "adieresis",  // 0xE4
-    "aring",  // 0xE5
-    "ae",  // 0xE6
-    "ccedilla",  // 0xE7
-    "egrave",  // 0xE8
-    "eacute",  // 0xE9
-    "ecircumflex",  // 0xEA
-    "edieresis",  // 0xEB
-    "igrave",  // 0xEC
-    "iacute",  // 0xED
-    "icircumflex",  // 0xEE
-    "idieresis",  // 0xEF
-    "eth",  // 0xF0
-    "ntilde",  // 0xF1
-    "ograve",  // 0xF2
-    "oacute",  // 0xF3
-    "ocircumflex",  // 0xF4
-    "otilde",  // 0xF5
-    "odieresis",  // 0xF6
-    "divide",  // 0xF7
-    "oslash",  // 0xF8
-    "ugrave",  // 0xF9
-    "uacute",  // 0xFA
-    "ucircumflex",  // 0xFB
-    "udieresis",  // 0xFC
-    "yacute",  // 0xFD
-    "thorn",  // 0xFE
-    "ydieresis",  // 0xFF
+    "questiondown",   // 0xBF
+    "Agrave",         // 0xC0
+    "Aacute",         // 0xC1
+    "Acircumflex",    // 0xC2
+    "Atilde",         // 0xC3
+    "Adieresis",      // 0xC4
+    "Aring",          // 0xC5
+    "AE",             // 0xC6
+    "Ccedilla",       // 0xC7
+    "Egrave",         // 0xC8
+    "Eacute",         // 0xC9
+    "Ecircumflex",    // 0xCA
+    "Edieresis",      // 0xCB
+    "Igrave",         // 0xCC
+    "Iacute",         // 0xCD
+    "Icircumflex",    // 0xCE
+    "Idieresis",      // 0xCF
+    "Eth",            // 0xD0
+    "Ntilde",         // 0xD1
+    "Ograve",         // 0xD2
+    "Oacute",         // 0xD3
+    "Ocircumflex",    // 0xD4
+    "Otilde",         // 0xD5
+    "Odieresis",      // 0xD6
+    "multiply",       // 0xD7
+    "Oslash",         // 0xD8
+    "Ugrave",         // 0xD9
+    "Uacute",         // 0xDA
+    "Ucircumflex",    // 0xDB
+    "Udieresis",      // 0xDC
+    "Yacute",         // 0xDD
+    "Thorn",          // 0xDE
+    "germandbls",     // 0xDF
+    "agrave",         // 0xE0
+    "aacute",         // 0xE1
+    "acircumflex",    // 0xE2
+    "atilde",         // 0xE3
+    "adieresis",      // 0xE4
+    "aring",          // 0xE5
+    "ae",             // 0xE6
+    "ccedilla",       // 0xE7
+    "egrave",         // 0xE8
+    "eacute",         // 0xE9
+    "ecircumflex",    // 0xEA
+    "edieresis",      // 0xEB
+    "igrave",         // 0xEC
+    "iacute",         // 0xED
+    "icircumflex",    // 0xEE
+    "idieresis",      // 0xEF
+    "eth",            // 0xF0
+    "ntilde",         // 0xF1
+    "ograve",         // 0xF2
+    "oacute",         // 0xF3
+    "ocircumflex",    // 0xF4
+    "otilde",         // 0xF5
+    "odieresis",      // 0xF6
+    "divide",         // 0xF7
+    "oslash",         // 0xF8
+    "ugrave",         // 0xF9
+    "uacute",         // 0xFA
+    "ucircumflex",    // 0xFB
+    "udieresis",      // 0xFC
+    "yacute",         // 0xFD
+    "thorn",          // 0xFE
+    "ydieresis",      // 0xFF
 ];
 
 const GLYPHS_HELVETICA: &[(&str, u16)] = &[
@@ -4601,9 +4601,7 @@ impl StandardFont {
                 if glyph == ".notdef" {
                     notdef
                 } else {
-                    self.glyph_width(glyph)
-                        .map(f64::from)
-                        .unwrap_or(notdef)
+                    self.glyph_width(glyph).map(f64::from).unwrap_or(notdef)
                 }
             })
             .sum();
@@ -4641,38 +4639,122 @@ mod tests {
 
     #[test]
     fn from_base_name_short_aliases() {
-        assert_eq!(StandardFont::from_base_name(b"Helv"),  Some(StandardFont::Helvetica));
-        assert_eq!(StandardFont::from_base_name(b"HeBo"),  Some(StandardFont::HelveticaBold));
-        assert_eq!(StandardFont::from_base_name(b"HeOb"),  Some(StandardFont::HelveticaOblique));
-        assert_eq!(StandardFont::from_base_name(b"HeBO"),  Some(StandardFont::HelveticaBoldOblique));
-        assert_eq!(StandardFont::from_base_name(b"TiRo"),  Some(StandardFont::TimesRoman));
-        assert_eq!(StandardFont::from_base_name(b"TiBo"),  Some(StandardFont::TimesBold));
-        assert_eq!(StandardFont::from_base_name(b"TiIt"),  Some(StandardFont::TimesItalic));
-        assert_eq!(StandardFont::from_base_name(b"TiBI"),  Some(StandardFont::TimesBoldItalic));
-        assert_eq!(StandardFont::from_base_name(b"Cour"),  Some(StandardFont::Courier));
-        assert_eq!(StandardFont::from_base_name(b"CoBo"),  Some(StandardFont::CourierBold));
-        assert_eq!(StandardFont::from_base_name(b"CoOb"),  Some(StandardFont::CourierOblique));
-        assert_eq!(StandardFont::from_base_name(b"CoBO"),  Some(StandardFont::CourierBoldOblique));
-        assert_eq!(StandardFont::from_base_name(b"Symb"),  Some(StandardFont::Symbol));
-        assert_eq!(StandardFont::from_base_name(b"ZaDb"),  Some(StandardFont::ZapfDingbats));
+        assert_eq!(
+            StandardFont::from_base_name(b"Helv"),
+            Some(StandardFont::Helvetica)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"HeBo"),
+            Some(StandardFont::HelveticaBold)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"HeOb"),
+            Some(StandardFont::HelveticaOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"HeBO"),
+            Some(StandardFont::HelveticaBoldOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"TiRo"),
+            Some(StandardFont::TimesRoman)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"TiBo"),
+            Some(StandardFont::TimesBold)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"TiIt"),
+            Some(StandardFont::TimesItalic)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"TiBI"),
+            Some(StandardFont::TimesBoldItalic)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Cour"),
+            Some(StandardFont::Courier)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"CoBo"),
+            Some(StandardFont::CourierBold)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"CoOb"),
+            Some(StandardFont::CourierOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"CoBO"),
+            Some(StandardFont::CourierBoldOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Symb"),
+            Some(StandardFont::Symbol)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"ZaDb"),
+            Some(StandardFont::ZapfDingbats)
+        );
     }
 
     #[test]
     fn from_base_name_full_names() {
-        assert_eq!(StandardFont::from_base_name(b"Helvetica"),             Some(StandardFont::Helvetica));
-        assert_eq!(StandardFont::from_base_name(b"Helvetica-Bold"),        Some(StandardFont::HelveticaBold));
-        assert_eq!(StandardFont::from_base_name(b"Helvetica-Oblique"),     Some(StandardFont::HelveticaOblique));
-        assert_eq!(StandardFont::from_base_name(b"Helvetica-BoldOblique"), Some(StandardFont::HelveticaBoldOblique));
-        assert_eq!(StandardFont::from_base_name(b"Times-Roman"),           Some(StandardFont::TimesRoman));
-        assert_eq!(StandardFont::from_base_name(b"Times-Bold"),            Some(StandardFont::TimesBold));
-        assert_eq!(StandardFont::from_base_name(b"Times-Italic"),          Some(StandardFont::TimesItalic));
-        assert_eq!(StandardFont::from_base_name(b"Times-BoldItalic"),      Some(StandardFont::TimesBoldItalic));
-        assert_eq!(StandardFont::from_base_name(b"Courier"),               Some(StandardFont::Courier));
-        assert_eq!(StandardFont::from_base_name(b"Courier-Bold"),          Some(StandardFont::CourierBold));
-        assert_eq!(StandardFont::from_base_name(b"Courier-Oblique"),       Some(StandardFont::CourierOblique));
-        assert_eq!(StandardFont::from_base_name(b"Courier-BoldOblique"),   Some(StandardFont::CourierBoldOblique));
-        assert_eq!(StandardFont::from_base_name(b"Symbol"),                Some(StandardFont::Symbol));
-        assert_eq!(StandardFont::from_base_name(b"ZapfDingbats"),          Some(StandardFont::ZapfDingbats));
+        assert_eq!(
+            StandardFont::from_base_name(b"Helvetica"),
+            Some(StandardFont::Helvetica)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Helvetica-Bold"),
+            Some(StandardFont::HelveticaBold)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Helvetica-Oblique"),
+            Some(StandardFont::HelveticaOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Helvetica-BoldOblique"),
+            Some(StandardFont::HelveticaBoldOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Times-Roman"),
+            Some(StandardFont::TimesRoman)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Times-Bold"),
+            Some(StandardFont::TimesBold)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Times-Italic"),
+            Some(StandardFont::TimesItalic)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Times-BoldItalic"),
+            Some(StandardFont::TimesBoldItalic)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Courier"),
+            Some(StandardFont::Courier)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Courier-Bold"),
+            Some(StandardFont::CourierBold)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Courier-Oblique"),
+            Some(StandardFont::CourierOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Courier-BoldOblique"),
+            Some(StandardFont::CourierBoldOblique)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"Symbol"),
+            Some(StandardFont::Symbol)
+        );
+        assert_eq!(
+            StandardFont::from_base_name(b"ZapfDingbats"),
+            Some(StandardFont::ZapfDingbats)
+        );
     }
 
     #[test]
@@ -4688,8 +4770,8 @@ mod tests {
     fn helvetica_reference_widths() {
         let f = StandardFont::Helvetica;
         assert_eq!(f.glyph_width("space"), Some(278));
-        assert_eq!(f.glyph_width("A"),     Some(667));
-        assert_eq!(f.glyph_width("V"),     Some(667));
+        assert_eq!(f.glyph_width("A"), Some(667));
+        assert_eq!(f.glyph_width("V"), Some(667));
     }
 
     #[test]
@@ -4697,14 +4779,14 @@ mod tests {
         let f = StandardFont::HelveticaBold;
         // Helvetica-Bold A=722, space=278 per AFM
         assert_eq!(f.glyph_width("space"), Some(278));
-        assert_eq!(f.glyph_width("A"),     Some(722));
+        assert_eq!(f.glyph_width("A"), Some(722));
     }
 
     #[test]
     fn times_roman_reference_widths() {
         let f = StandardFont::TimesRoman;
         assert_eq!(f.glyph_width("space"), Some(250));
-        assert_eq!(f.glyph_width("A"),     Some(722));
+        assert_eq!(f.glyph_width("A"), Some(722));
     }
 
     #[test]
@@ -4724,7 +4806,10 @@ mod tests {
 
     #[test]
     fn glyph_width_unknown_returns_none() {
-        assert_eq!(StandardFont::Helvetica.glyph_width("nonexistentglyph_xyz"), None);
+        assert_eq!(
+            StandardFont::Helvetica.glyph_width("nonexistentglyph_xyz"),
+            None
+        );
     }
 
     #[test]
@@ -4737,7 +4822,11 @@ mod tests {
             StandardFont::Symbol,
             StandardFont::ZapfDingbats,
         ] {
-            assert_eq!(font.notdef_width(), 0, "notdef_width should be 0 for {font:?}");
+            assert_eq!(
+                font.notdef_width(),
+                0,
+                "notdef_width should be 0 for {font:?}"
+            );
         }
     }
 
@@ -4784,11 +4873,17 @@ mod tests {
 
         // 0xE9 = eacute; Helvetica eacute = 556
         let w2 = StandardFont::Helvetica.string_width(&[0xE9u8], 1000.0);
-        assert!((w2 - 556.0).abs() < 1e-9, "Expected 556.0 for eacute, got {w2}");
+        assert!(
+            (w2 - 556.0).abs() < 1e-9,
+            "Expected 556.0 for eacute, got {w2}"
+        );
 
         // 0x92 = quoteright (CP1252); Helvetica quoteright = 222
         let w3 = StandardFont::Helvetica.string_width(&[0x92u8], 1000.0);
-        assert!((w3 - 222.0).abs() < 1e-9, "Expected 222.0 for quoteright (0x92), got {w3}");
+        assert!(
+            (w3 - 222.0).abs() < 1e-9,
+            "Expected 222.0 for quoteright (0x92), got {w3}"
+        );
 
         // 0x96 = endash; check it resolves without panic
         let w4 = StandardFont::Helvetica.string_width(&[0x96u8], 1000.0);
@@ -4801,7 +4896,10 @@ mod tests {
         let helvetica = StandardFont::Helvetica;
         for &b in &[0x81u8, 0x8Du8, 0x8Fu8, 0x90u8, 0x9Du8] {
             let w = helvetica.string_width(&[b], 1000.0);
-            assert_eq!(w, 0.0, "Expected 0 for undefined WinAnsi byte 0x{b:02X}, got {w}");
+            assert_eq!(
+                w, 0.0,
+                "Expected 0 for undefined WinAnsi byte 0x{b:02X}, got {w}"
+            );
         }
     }
 
@@ -4810,20 +4908,20 @@ mod tests {
     #[test]
     fn all_fonts_from_base_name_and_one_glyph() {
         let cases = [
-            (b"Helv" as &[u8],               StandardFont::Helvetica,            "space", 278u16),
-            (b"HeBo",                         StandardFont::HelveticaBold,        "space", 278),
-            (b"HeOb",                         StandardFont::HelveticaOblique,     "space", 278),
-            (b"HeBO",                         StandardFont::HelveticaBoldOblique, "space", 278),
-            (b"TiRo",                         StandardFont::TimesRoman,           "space", 250),
-            (b"TiBo",                         StandardFont::TimesBold,            "space", 250),
-            (b"TiIt",                         StandardFont::TimesItalic,          "space", 250),
-            (b"TiBI",                         StandardFont::TimesBoldItalic,      "space", 250),
-            (b"Cour",                         StandardFont::Courier,              "space", 600),
-            (b"CoBo",                         StandardFont::CourierBold,          "space", 600),
-            (b"CoOb",                         StandardFont::CourierOblique,       "space", 600),
-            (b"CoBO",                         StandardFont::CourierBoldOblique,   "space", 600),
-            (b"Symb",                         StandardFont::Symbol,               "space", 250),
-            (b"ZaDb",                         StandardFont::ZapfDingbats,         "space", 278),
+            (b"Helv" as &[u8], StandardFont::Helvetica, "space", 278u16),
+            (b"HeBo", StandardFont::HelveticaBold, "space", 278),
+            (b"HeOb", StandardFont::HelveticaOblique, "space", 278),
+            (b"HeBO", StandardFont::HelveticaBoldOblique, "space", 278),
+            (b"TiRo", StandardFont::TimesRoman, "space", 250),
+            (b"TiBo", StandardFont::TimesBold, "space", 250),
+            (b"TiIt", StandardFont::TimesItalic, "space", 250),
+            (b"TiBI", StandardFont::TimesBoldItalic, "space", 250),
+            (b"Cour", StandardFont::Courier, "space", 600),
+            (b"CoBo", StandardFont::CourierBold, "space", 600),
+            (b"CoOb", StandardFont::CourierOblique, "space", 600),
+            (b"CoBO", StandardFont::CourierBoldOblique, "space", 600),
+            (b"Symb", StandardFont::Symbol, "space", 250),
+            (b"ZaDb", StandardFont::ZapfDingbats, "space", 278),
         ];
         for (name_bytes, expected_variant, glyph, expected_width) in cases {
             let resolved = StandardFont::from_base_name(name_bytes)
