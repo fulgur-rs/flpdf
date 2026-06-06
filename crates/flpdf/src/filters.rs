@@ -19,19 +19,13 @@ use std::io::{Read, Write};
 /// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
 /// Returns `None` for any other filter name.
 pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
-    if filter_name == b"DCTDecode" {
-        return Some("DCTDecode");
+    match filter_name {
+        b"DCTDecode" => Some("DCTDecode"),
+        b"JBIG2Decode" => Some("JBIG2Decode"),
+        b"JPXDecode" => Some("JPXDecode"),
+        b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
+        _ => None,
     }
-    if filter_name == b"JBIG2Decode" {
-        return Some("JBIG2Decode");
-    }
-    if filter_name == b"JPXDecode" {
-        return Some("JPXDecode");
-    }
-    if filter_name == b"CCITTFaxDecode" {
-        return Some("CCITTFaxDecode");
-    }
-    None
 }
 
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
