@@ -56,6 +56,12 @@ pub struct SelectedPage {
 /// [`PagePlan::from_1based_indices`] (from a pre-resolved slice of 1-based
 /// page numbers). The ordering is deterministic: it reflects the input
 /// expression order, with deduplication already handled by [`PageRange::resolve`].
+///
+/// This type is part of the document page extraction and merge primitives epic
+/// (flpdf-5h5). The selected page refs it produces feed directly into
+/// [`rebuild_page_tree`](crate::page_tree_rebuild::rebuild_page_tree), which
+/// rewrites the document's `/Pages` tree to contain exactly those pages. For an
+/// end-to-end extraction walkthrough see the runnable `examples/extract_pages.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagePlan {
     /// Number of pages in the source document.

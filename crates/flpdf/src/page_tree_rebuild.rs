@@ -183,6 +183,12 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 /// attributes materialized and `/Parent` repointed at the root. Serialize the
 /// result with [`crate::write_pdf`].
 ///
+/// This function is part of the document page extraction and merge primitives
+/// epic (flpdf-5h5). The `selected` refs it consumes are produced by
+/// [`PagePlan`](crate::page_plan::PagePlan) (single document) or a single-input
+/// [`CombinedPlan`](crate::page_combine::CombinedPlan). For an end-to-end
+/// extraction walkthrough see the runnable `examples/extract_pages.rs`.
+///
 /// # Errors
 ///
 /// - [`Error::Missing`] when `/Root` or the catalog `/Pages` reference is

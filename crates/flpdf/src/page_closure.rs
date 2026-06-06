@@ -32,6 +32,12 @@ use std::io::{Read, Seek};
 /// Returns [`Err`] only if [`Pdf::resolve`] fails for an object (e.g. corrupt
 /// or missing xref entry).
 ///
+/// This function is part of the document page extraction and merge primitives
+/// epic (flpdf-5h5). The closure it returns is the object set you hand to
+/// [`copy_objects`](crate::object_copy::copy_objects) to deep-copy a page into
+/// another document. See the runnable `examples/merge_pdfs.rs` and
+/// `examples/splice_pages.rs`.
+///
 /// # Examples
 ///
 /// ```no_run
