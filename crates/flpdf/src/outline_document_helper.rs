@@ -208,8 +208,13 @@ fn read_title(value: Option<&Object>) -> String {
 /// Push `node` (with `children` cleared) then its descendants, pre-order.
 fn flatten_preorder(node: &OutlineNode, out: &mut Vec<OutlineNode>) {
     out.push(OutlineNode {
+        object_ref: node.object_ref,
+        depth: node.depth,
+        title: node.title.clone(),
+        count: node.count,
+        parent: node.parent,
+        dest: node.dest.clone(),
         children: Vec::new(),
-        ..node.clone()
     });
     for child in &node.children {
         flatten_preorder(child, out);
