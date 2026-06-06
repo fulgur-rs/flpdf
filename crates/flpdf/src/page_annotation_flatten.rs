@@ -393,14 +393,20 @@ fn resolve_ap_n<R: Read + Seek>(
                 _ => return Ok(None),
             }
         }
-        Object::Stream(_) => n_val.clone(),     // inline stream
+        // Per PDF 32000-1 §7.3.8.1, streams must be indirect objects; a direct
+        // stream here would only appear in structurally-malformed PDFs.  The
+        // flpdf parser never emits direct Object::Stream values as dictionary
+        // entries, so the two branches below are defensive dead-code for real
+        // PDFs.  They materialize the stream so callers get a valid ref even on
+        // malformed input, rather than silently dropping the annotation.
+        Object::Stream(_) => n_val.clone(), // inline stream (malformed PDF)
         Object::Dictionary(_) => n_val.clone(), // inline state dict
         _ => return Ok(None),
     };
 
     match n_resolved_for_type {
         Object::Stream(s) => {
-            // Inline stream — materialize as new indirect object.
+            // Inline stream in malformed PDF — materialize as new indirect object.
             let new_ref = next_object_ref(pdf)?;
             pdf.set_object(new_ref, Object::Stream(s));
             Ok(Some(new_ref))
@@ -428,6 +434,7 @@ fn resolve_ap_n<R: Read + Seek>(
                     _ => Ok(None),
                 },
                 Some(Object::Stream(s)) => {
+                    // Inline stream in state dict of malformed PDF.
                     let new_ref = next_object_ref(pdf)?;
                     pdf.set_object(new_ref, Object::Stream(s));
                     Ok(Some(new_ref))
