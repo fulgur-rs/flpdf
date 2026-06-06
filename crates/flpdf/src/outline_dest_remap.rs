@@ -753,7 +753,11 @@ fn count_visible_in_chain<R: Read + Seek>(
     if depth >= max_depth {
         return Ok(0);
     }
-    let mut count = items.len() as i64;
+    // `/Count` magnitudes are attacker-controlled (PDF-supplied). Many items, or
+    // a single huge `/Count`, could overflow i64 (panic in debug, wrap in
+    // release) under naive `+=`. Accumulate with saturating arithmetic so a
+    // hostile outline produces a clamped count instead of a crash/wrap.
+    let mut count = i64::try_from(items.len()).unwrap_or(i64::MAX);
     for &item_ref in items {
         let item_obj = pdf.resolve_borrowed(item_ref)?;
         let Some(d) = item_obj.as_dict() else {
@@ -762,7 +766,7 @@ fn count_visible_in_chain<R: Read + Seek>(
         // If the item's /Count is positive (open), add its visible descendants.
         if let Some(n) = d.get("Count").and_then(Object::as_integer) {
             if n > 0 {
-                count += n;
+                count = count.saturating_add(n);
             }
         }
     }
@@ -2328,5 +2332,33 @@ mod tests {
         )
         .expect_err("depth limit must be enforced");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn count_visible_descendants_saturates_on_hostile_count() {
+        // Two items each claiming /Count i64::MAX. Summing them overflows i64
+        // (panic in debug, wrap in release) without saturating arithmetic
+        // (flpdf-35z, review-patterns category #3). Must clamp to i64::MAX.
+        let huge = i64::MAX.to_string();
+        let item40 = format!("<< /Title (a) /Count {huge} >>");
+        let item41 = format!("<< /Title (b) /Count {huge} >>");
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (40, item40.as_str()),
+                (41, item41.as_str()),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let count = count_visible_descendants(
+            &mut pdf,
+            &[ObjectRef::new(40, 0), ObjectRef::new(41, 0)],
+            100,
+        )
+        .expect("hostile /Count must not error");
+        assert_eq!(count, i64::MAX, "count must saturate, not overflow");
     }
 }
