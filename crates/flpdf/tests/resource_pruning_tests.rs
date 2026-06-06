@@ -1883,3 +1883,110 @@ fn corrupt_page_content_single_page_default_mode_does_not_abort() {
          undecodable so no entry can be proven unused: {keys:?}"
     );
 }
+
+// Exercises the AncestorInline branch of the `protected_groups` prune-loop skip
+// (step 5): a corrupt page inheriting its /Resources from an ancestor /Pages
+// node (AncestorInline loc) poisons that group, so the ancestor's inline
+// resources must NOT be pruned to the healthy sibling's incomplete used-name
+// union. Yes mode, because Auto would skip the shared ancestor group entirely.
+#[test]
+fn corrupt_page_content_ancestor_inline_resources_not_pruned_yes_mode() {
+    // 1=Catalog, 2=Pages(inline /Resources F1+F2), 3=Page A (valid, uses F1),
+    // 4=Page B (corrupt /Contents), 5=content A, 6=corrupt content B.
+    // Both pages have NO own /Resources → both inherit AncestorInline(2 0 R).
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (
+            2,
+            obj_bytes(
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>",
+            ),
+        ),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+            ),
+        ),
+        (
+            4,
+            obj_bytes(
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>",
+            ),
+        ),
+        (5, stream_obj(5, b"BT /F1 12 Tf (a) Tj ET")),
+        (
+            6,
+            stream_obj_with_filter(6, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must degrade gracefully, not abort");
+
+    // The /Pages (2 0 R) inline /Resources must retain BOTH fonts: the corrupt
+    // sibling protects the shared ancestor group from being pruned to {F1}.
+    let pages_obj = pdf.resolve(ObjectRef::new(2, 0)).expect("resolve Pages");
+    let Object::Dictionary(pages_dict) = pages_obj else {
+        panic!("2 0 R is not a dictionary");
+    };
+    let Object::Dictionary(res) = pages_dict.get("Resources").expect("Resources key") else {
+        panic!("Resources is not a dict");
+    };
+    let Object::Dictionary(fonts) = res.get("Font").expect("Font key") else {
+        panic!("Font is not a dict");
+    };
+    let keys: Vec<String> = fonts
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
+        "ancestor inline /Font must retain both F1 and F2 — the corrupt sibling \
+         page protects the shared AncestorInline group from pruning: {keys:?}"
+    );
+}
+
+// Exercises the `ResourcesLoc::None` arm of `res_group_key` (resources.rs:81):
+// a corrupt page that has NO /Resources anywhere in its chain. Collection fails,
+// `res_group_key` returns `None` (nothing to protect — there is no group to key
+// on), and the operation must still degrade gracefully rather than abort.
+#[test]
+fn corrupt_page_content_no_resources_anywhere_does_not_abort() {
+    // 1=Catalog, 2=Pages (no /Resources), 3=Page (no /Resources), 4=corrupt content.
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+        ),
+        (
+            4,
+            stream_obj_with_filter(4, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must degrade gracefully on a resource-less corrupt page, not abort");
+
+    // The page never had /Resources; it must remain absent (nothing fabricated).
+    let page_obj = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve page");
+    let Object::Dictionary(page_dict) = page_obj else {
+        panic!("3 0 R is not a dictionary");
+    };
+    assert!(
+        page_dict.get("Resources").is_none(),
+        "page without /Resources must stay resource-less after graceful degradation"
+    );
+}
