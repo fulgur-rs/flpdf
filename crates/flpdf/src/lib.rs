@@ -83,6 +83,7 @@ pub mod resources;
 pub mod rotate_spec;
 pub(crate) mod run_length;
 pub mod signatures;
+pub mod standard_font_metrics;
 pub mod subset_prune;
 pub mod writer;
 pub mod xref;
@@ -151,6 +152,7 @@ pub use signatures::{
     SignatureInfo, SignatureRewriteImpact, SignatureRewriteReason, SignatureWriteMode,
     DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
+pub use standard_font_metrics::StandardFont;
 pub use subset_prune::prune_after_subset;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
