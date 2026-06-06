@@ -444,9 +444,44 @@ fn to_winansi_bytes(s: &str) -> Vec<u8> {
     for ch in s.chars() {
         let code = ch as u32;
         if code <= 0x007F || (0x00A0..=0x00FF).contains(&code) {
+            // ASCII and Latin-1 share code points with WinAnsi (CP1252).
             out.push(code as u8);
         } else {
-            out.push(b'?');
+            // The CP1252 0x80–0x9F range holds common typographic characters
+            // (Euro, smart quotes, dashes, ellipsis, bullet, …) that standard
+            // PDF fonts render. Map them to their CP1252 byte rather than `?`.
+            // Undefined CP1252 slots (0x81/0x8D/0x8F/0x90/0x9D) fall through to `?`.
+            let byte = match ch {
+                '\u{20AC}' => 0x80, // €  Euro Sign
+                '\u{201A}' => 0x82, // ‚  Single Low-9 Quotation Mark
+                '\u{0192}' => 0x83, // ƒ  Latin Small Letter F With Hook
+                '\u{201E}' => 0x84, // „  Double Low-9 Quotation Mark
+                '\u{2026}' => 0x85, // …  Horizontal Ellipsis
+                '\u{2020}' => 0x86, // †  Dagger
+                '\u{2021}' => 0x87, // ‡  Double Dagger
+                '\u{02C6}' => 0x88, // ˆ  Modifier Letter Circumflex Accent
+                '\u{2030}' => 0x89, // ‰  Per Mille Sign
+                '\u{0160}' => 0x8A, // Š  Latin Capital Letter S With Caron
+                '\u{2039}' => 0x8B, // ‹  Single Left-Pointing Angle Quotation Mark
+                '\u{0152}' => 0x8C, // Œ  Latin Capital Ligature OE
+                '\u{017D}' => 0x8E, // Ž  Latin Capital Letter Z With Caron
+                '\u{2018}' => 0x91, // '  Left Single Quotation Mark
+                '\u{2019}' => 0x92, // '  Right Single Quotation Mark
+                '\u{201C}' => 0x93, // "  Left Double Quotation Mark
+                '\u{201D}' => 0x94, // "  Right Double Quotation Mark
+                '\u{2022}' => 0x95, // •  Bullet
+                '\u{2013}' => 0x96, // –  En Dash
+                '\u{2014}' => 0x97, // —  Em Dash
+                '\u{02DC}' => 0x98, // ˜  Small Tilde
+                '\u{2122}' => 0x99, // ™  Trade Mark Sign
+                '\u{0161}' => 0x9A, // š  Latin Small Letter S With Caron
+                '\u{203A}' => 0x9B, // ›  Single Right-Pointing Angle Quotation Mark
+                '\u{0153}' => 0x9C, // œ  Latin Small Ligature OE
+                '\u{017E}' => 0x9E, // ž  Latin Small Letter Z With Caron
+                '\u{0178}' => 0x9F, // Ÿ  Latin Capital Letter Y With Dieresis
+                _ => b'?',
+            };
+            out.push(byte);
         }
     }
     out
@@ -493,15 +528,28 @@ fn resolve_inherited_name<R: Read + Seek>(
             )));
         };
 
-        if let Some(val) = dict.get(key).cloned() {
-            match val {
+        let val = dict.get(key).cloned();
+        let parent_val = dict.get("Parent").cloned();
+        // The two `.cloned()` calls above copy what we need; the `node_obj`
+        // borrow ends here so `pdf.resolve` can run below.
+        let _ = node_obj;
+
+        if let Some(val) = val {
+            // The value may itself be an indirect reference (review pattern #2);
+            // resolve it before matching the type, otherwise an indirect `/FT`
+            // would be missed and the field skipped.
+            let resolved = match val {
+                Object::Reference(r) => pdf.resolve(r)?,
+                other => other,
+            };
+            match resolved {
                 Object::Null => {}
                 Object::Name(bytes) => return Ok(Some(bytes)),
                 _ => {}
             }
         }
 
-        match dict.get("Parent").cloned() {
+        match parent_val {
             Some(Object::Reference(r)) => {
                 current = r;
                 depth += 1;
@@ -584,15 +632,28 @@ fn resolve_inherited_integer<R: Read + Seek>(
             )));
         };
 
-        if let Some(val) = dict.get(key).cloned() {
-            match val {
+        let val = dict.get(key).cloned();
+        let parent_val = dict.get("Parent").cloned();
+        // Values cloned above; release the `node_obj` borrow before `pdf.resolve`.
+        let _ = node_obj;
+
+        if let Some(val) = val {
+            // Inherited integer properties such as `/Ff` (field flags) or `/Q`
+            // (quadding) may be stored as indirect references (review pattern #2);
+            // resolve before matching so they are not missed (which would fall
+            // back to single-line / left-aligned defaults).
+            let resolved = match val {
+                Object::Reference(r) => pdf.resolve(r)?,
+                other => other,
+            };
+            match resolved {
                 Object::Null => {}
                 Object::Integer(n) => return Ok(Some(n)),
                 _ => {}
             }
         }
 
-        match dict.get("Parent").cloned() {
+        match parent_val {
             Some(Object::Reference(r)) => {
                 current = r;
                 depth += 1;
@@ -939,9 +1000,15 @@ fn word_wrap(
     // preserving the entered line structure.
     for segment in split_hard_lines(text) {
         let mut current: Vec<u8> = Vec::new();
+        // Track the first word explicitly rather than testing `current.is_empty()`:
+        // a segment that begins with a space yields an empty first word, and an
+        // emptiness test would treat the following word as the first one again,
+        // silently dropping the leading space.
+        let mut first = true;
         for word in segment.split(|&b| b == b' ') {
-            if current.is_empty() {
+            if first {
                 current.extend_from_slice(word);
+                first = false;
             } else {
                 // Tentatively append.
                 let mut candidate = current.clone();
@@ -1069,6 +1136,26 @@ mod tests {
     fn to_winansi_beyond_latin1_replaced() {
         let out = to_winansi_bytes("\u{0100}");
         assert_eq!(out, b"?");
+    }
+
+    #[test]
+    fn to_winansi_cp1252_typographic_chars_mapped() {
+        // CP1252 0x80–0x9F typographic characters map to their CP1252 byte,
+        // not '?'.
+        assert_eq!(to_winansi_bytes("\u{20AC}"), b"\x80"); // € Euro
+        assert_eq!(to_winansi_bytes("\u{2019}"), b"\x92"); // ' right single quote
+        assert_eq!(to_winansi_bytes("\u{201C}\u{201D}"), b"\x93\x94"); // " "
+        assert_eq!(to_winansi_bytes("\u{2013}\u{2014}"), b"\x96\x97"); // – —
+        assert_eq!(to_winansi_bytes("\u{2022}"), b"\x95"); // • bullet
+        assert_eq!(to_winansi_bytes("\u{2026}"), b"\x85"); // … ellipsis
+        assert_eq!(to_winansi_bytes("\u{0152}\u{0153}"), b"\x8c\x9c"); // Œ œ
+        assert_eq!(to_winansi_bytes("\u{2122}"), b"\x99"); // ™
+    }
+
+    #[test]
+    fn to_winansi_undefined_cp1252_slots_replaced() {
+        // A character beyond Latin-1 with no CP1252 slot still maps to '?'.
+        assert_eq!(to_winansi_bytes("\u{2603}"), b"?"); // ☃ snowman
     }
 
     #[test]
@@ -1242,6 +1329,20 @@ mod tests {
     fn word_wrap_no_font_returns_single_line() {
         let lines = word_wrap(b"Hello World", 12.0, 50.0, None);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn word_wrap_preserves_leading_space() {
+        // A segment that begins with a space must keep that leading space and
+        // not drop it (regression for the first-word emptiness bug). Width is
+        // large enough that no soft-wrapping occurs.
+        let font = StandardFont::from_base_name(b"Helv");
+        assert_eq!(word_wrap(b" hi", 12.0, 1000.0, font), vec![b" hi".to_vec()]);
+        // A leading space on a hard line is also preserved.
+        assert_eq!(
+            word_wrap(b"a\n bc", 12.0, 1000.0, font),
+            vec![b"a".to_vec(), b" bc".to_vec()]
+        );
     }
 
     #[test]
@@ -1706,5 +1807,84 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    /// Build a minimal Tx-field PDF whose `/FT` and `/Q` are stored as
+    /// **indirect references** (obj 5 = `/Tx`, obj 6 = `1`), to exercise
+    /// indirect-reference resolution in the inherited-property walkers.
+    fn build_pdf_with_indirect_field_props() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // /FT and /Q are indirect references (5 0 R / 6 0 R).
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT 5 0 R /Q 6 0 R /T (field1) \
+              /V (Hello World) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n/Tx\nendobj\n");
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n1\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 7\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n\
+             {off6:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 7 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn resolve_inherited_name_follows_indirect_reference() {
+        // /FT stored as `5 0 R` (-> /Tx) must resolve to the name, not None.
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let ft = resolve_inherited_name(&mut pdf, ObjectRef::new(4, 0), b"FT").unwrap();
+        assert_eq!(ft.as_deref(), Some(b"Tx" as &[u8]));
+    }
+
+    #[test]
+    fn resolve_inherited_integer_follows_indirect_reference() {
+        // /Q stored as `6 0 R` (-> 1) must resolve to the integer, not None.
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let q = resolve_inherited_integer(&mut pdf, ObjectRef::new(4, 0), b"Q").unwrap();
+        assert_eq!(q, Some(1));
+    }
+
+    #[test]
+    fn generate_appearance_recognizes_indirect_ft() {
+        // With an indirect /FT, the field must still be recognized as a text
+        // field and produce an appearance stream (it would be skipped if the
+        // indirect /FT were not resolved).
+        let raw = build_pdf_with_indirect_field_props();
+        let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        assert!(
+            result.is_some(),
+            "indirect /FT /Tx must be resolved so the field is not skipped"
+        );
     }
 }
