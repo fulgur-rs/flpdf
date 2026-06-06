@@ -1856,22 +1856,20 @@ fn generate_list_appearance<R: Read + Seek>(
             }
             set
         } else {
-            // Fall back: match /V against /Opt export strings.
-            let v_val = resolve_inherited_object(pdf, widget_ref, b"V")?;
+            // Fall back: match /V against /Opt export strings. /V may be a
+            // single string or an array (multi-select), and either form may
+            // arrive indirectly — resolve a top-level reference first so the
+            // indirect array case is handled identically to the direct one.
+            let v_val = match resolve_inherited_object(pdf, widget_ref, b"V")? {
+                Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
+                other => other,
+            };
             let mut set = std::collections::BTreeSet::new();
+            // Collect candidate value strings (each /V entry may itself be an
+            // indirect string).
+            let mut value_strings: Vec<Vec<u8>> = Vec::new();
             match v_val {
-                None => {}
-                Some(Object::String(s)) => {
-                    let wi = decode_pdf_text_string(&s)
-                        .map(|st| to_winansi_bytes(&st))
-                        .unwrap_or(s);
-                    for (i, opt) in options.iter().enumerate() {
-                        if opt.export == wi {
-                            set.insert(i);
-                            break;
-                        }
-                    }
-                }
+                Some(Object::String(s)) => value_strings.push(s),
                 Some(Object::Array(arr)) => {
                     for elem in arr {
                         let resolved = match elem {
@@ -1879,33 +1877,22 @@ fn generate_list_appearance<R: Read + Seek>(
                             other => other,
                         };
                         if let Object::String(s) = resolved {
-                            let wi = decode_pdf_text_string(&s)
-                                .map(|st| to_winansi_bytes(&st))
-                                .unwrap_or(s);
-                            for (i, opt) in options.iter().enumerate() {
-                                if opt.export == wi {
-                                    set.insert(i);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(Object::Reference(r)) => {
-                    let resolved = pdf.resolve(r)?;
-                    if let Object::String(s) = resolved {
-                        let wi = decode_pdf_text_string(&s)
-                            .map(|st| to_winansi_bytes(&st))
-                            .unwrap_or(s);
-                        for (i, opt) in options.iter().enumerate() {
-                            if opt.export == wi {
-                                set.insert(i);
-                                break;
-                            }
+                            value_strings.push(s);
                         }
                     }
                 }
                 _ => {}
+            }
+            for s in value_strings {
+                let wi = decode_pdf_text_string(&s)
+                    .map(|st| to_winansi_bytes(&st))
+                    .unwrap_or(s);
+                for (i, opt) in options.iter().enumerate() {
+                    if opt.export == wi {
+                        set.insert(i);
+                        break;
+                    }
+                }
             }
             set
         }
@@ -4943,6 +4930,64 @@ mod tests {
             }
         }
         assert!(saw_fill, "inherited /I did not produce a selection highlight");
+    }
+
+    /// List whose /V is an INDIRECT reference to a multi-select array.
+    ///
+    ///  1 Catalog 2 Pages 3 Page 4 Widget(/V 5 0 R) 5 [(Red)(Blue)]
+    fn build_indirect_array_v_list_pdf() -> Vec<u8> {
+        let mut raw = Vec::<u8>::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 10 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = raw.len() as u64;
+        // Multi-select list, /V points to an indirect array.
+        raw.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Ch /T (list) /Ff 0 \
+              /Opt [(Red) (Green) (Blue)] /V 5 0 R \
+              /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>\nendobj\n",
+        );
+        let off5 = raw.len() as u64;
+        raw.extend_from_slice(b"5 0 obj\n[(Red) (Blue)]\nendobj\n");
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n\
+             {off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n\
+             {off4:010} 00000 n \n{off5:010} 00000 n \n"
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        raw.extend_from_slice(
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        raw
+    }
+
+    /// Regression: an indirect-reference /V resolving to a multi-select array
+    /// must still highlight the selected rows (Red and Blue → two highlights).
+    #[test]
+    fn ch_list_indirect_array_v_highlights_multiselect() {
+        let mut pdf = Pdf::open(Cursor::new(build_indirect_array_v_list_pdf())).expect("parse");
+        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Ch widget handled");
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
+            panic!("not a stream");
+        };
+        // Two selected rows ⇒ two highlight fills (re … f).
+        let fills = ContentStreamParser::new(&stream.data)
+            .flatten()
+            .filter(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"f"))
+            .count();
+        assert_eq!(fills, 2, "expected two selection highlights for Red+Blue, got {fills}");
     }
 
     /// non-Ch field → generate_choice_field_appearance must return None.
