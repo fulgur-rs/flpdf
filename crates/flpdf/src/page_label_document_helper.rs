@@ -170,9 +170,19 @@ fn resolve_entry<R: Read + Seek>(
     }
 }
 
-/// Format `value` as a roman numeral (`upper` → uppercase). Empty for `value <= 0`.
+/// Upper bound on the numeric value [`to_roman`]/[`to_alpha`] will render.
+///
+/// Values above this produce an empty numeric portion — a defensive cap against
+/// CPU/memory exhaustion from a hostile `/St`: without it the roman subtraction
+/// loop and the alphabetic repeat both scale with `value`, so an `i64::MAX`
+/// `/St` would spin/allocate unboundedly. 100 000 is far beyond any real page
+/// label yet keeps the rendered string short.
+const MAX_RENDERABLE_LABEL_VALUE: i64 = 100_000;
+
+/// Format `value` as a roman numeral (`upper` → uppercase). Empty for
+/// `value <= 0` or `value > MAX_RENDERABLE_LABEL_VALUE`.
 fn to_roman(value: i64, upper: bool) -> String {
-    if value <= 0 {
+    if value <= 0 || value > MAX_RENDERABLE_LABEL_VALUE {
         return String::new();
     }
     const TABLE: &[(i64, &str, &str)] = &[
@@ -202,9 +212,9 @@ fn to_roman(value: i64, upper: bool) -> String {
 }
 
 /// Format `value` as repeating letters (§12.4.2): 1→A … 26→Z, 27→AA, 53→AAA.
-/// Empty for `value <= 0`.
+/// Empty for `value <= 0` or `value > MAX_RENDERABLE_LABEL_VALUE`.
 fn to_alpha(value: i64, upper: bool) -> String {
-    if value <= 0 {
+    if value <= 0 || value > MAX_RENDERABLE_LABEL_VALUE {
         return String::new();
     }
     let v = value - 1;
@@ -285,11 +295,14 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             }
         }
         Ok(chosen.map(|(first, r)| {
-            let offset = page_idx - first;
+            // Saturating arithmetic: `first <= page_idx` so the offset is
+            // non-negative, but a hostile `/St` near i64::MAX could otherwise
+            // overflow the start (panic in debug, wrap in release).
+            let offset = page_idx.saturating_sub(*first);
             LabelRange {
                 style: r.style,
                 prefix: r.prefix.clone(),
-                start: r.start + offset,
+                start: r.start.saturating_add(offset),
             }
         }))
     }
@@ -334,17 +347,18 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             None => LabelRange {
                 style: LabelStyle::Decimal,
                 prefix: String::new(),
-                start: 1 + new_start_idx,
+                start: new_start_idx.saturating_add(1),
             },
         };
 
         let mut out = vec![(new_start_idx, first_label)];
-        let idx_offset = new_start_idx - start_idx;
-        for i in (start_idx + 1)..=end_idx {
-            if explicit.contains(&i) {
-                if let Some(lab) = self.label_for_page(i)? {
-                    out.push((i + idx_offset, lab));
-                }
+        let idx_offset = new_start_idx.saturating_sub(start_idx);
+        // Iterate only the explicit indices within the span (the rest sequence
+        // implicitly from the prior entry), so the cost is O(log N + M) in the
+        // number of ranges rather than O(end_idx - start_idx) over the page span.
+        for &i in explicit.range((start_idx + 1)..=end_idx) {
+            if let Some(lab) = self.label_for_page(i)? {
+                out.push((i.saturating_add(idx_offset), lab));
             }
         }
         Ok(out)
@@ -660,6 +674,18 @@ mod tests {
     }
 
     #[test]
+    fn formatters_cap_huge_values() {
+        // DoS guard: at the cap the formatters still render; above it (incl.
+        // i64::MAX) they return empty instead of spinning/allocating unboundedly.
+        assert!(!to_roman(MAX_RENDERABLE_LABEL_VALUE, true).is_empty());
+        assert_eq!(to_roman(MAX_RENDERABLE_LABEL_VALUE + 1, true), "");
+        assert_eq!(to_roman(i64::MAX, true), "");
+        assert!(!to_alpha(MAX_RENDERABLE_LABEL_VALUE, true).is_empty());
+        assert_eq!(to_alpha(MAX_RENDERABLE_LABEL_VALUE + 1, true), "");
+        assert_eq!(to_alpha(i64::MAX, true), "");
+    }
+
+    #[test]
     fn alpha_repeating_letters() {
         assert_eq!(to_alpha(1, true), "A");
         assert_eq!(to_alpha(26, true), "Z");
@@ -769,5 +795,160 @@ mod tests {
         assert_eq!(ranges[0].0, 0);
         assert_eq!(ranges[39].0, 78);
         assert!(ranges.windows(2).all(|w| w[0].0 < w[1].0), "ascending");
+    }
+
+    #[test]
+    fn label_style_name_round_trip_all_variants() {
+        for (bytes, style, name) in [
+            (b"D".as_ref(), LabelStyle::Decimal, Some("D")),
+            (b"R".as_ref(), LabelStyle::RomanUpper, Some("R")),
+            (b"r".as_ref(), LabelStyle::RomanLower, Some("r")),
+            (b"A".as_ref(), LabelStyle::AlphaUpper, Some("A")),
+            (b"a".as_ref(), LabelStyle::AlphaLower, Some("a")),
+        ] {
+            assert_eq!(LabelStyle::from_name(bytes), style);
+            assert_eq!(style.to_name(), name);
+        }
+        // Unrecognised /S name -> None (from_name `_` arm); None has no name.
+        assert_eq!(LabelStyle::from_name(b"Z"), LabelStyle::None);
+        assert_eq!(LabelStyle::None.to_name(), None);
+    }
+
+    #[test]
+    fn format_alpha_styles() {
+        let up = LabelRange {
+            style: LabelStyle::AlphaUpper,
+            prefix: String::new(),
+            start: 1,
+        };
+        assert_eq!(up.format(27), "AA");
+        let lo = LabelRange {
+            style: LabelStyle::AlphaLower,
+            prefix: "x".into(),
+            start: 1,
+        };
+        assert_eq!(lo.format(2), "xb");
+    }
+
+    #[test]
+    fn from_dict_non_name_style_is_none() {
+        let mut d = Dictionary::new();
+        d.insert("S", Object::Integer(0)); // /S not a Name -> LabelStyle::None
+        assert_eq!(LabelRange::from_dict(&d).style, LabelStyle::None);
+    }
+
+    #[test]
+    fn ranges_handles_indirect_and_non_dict_values() {
+        // entry 0: indirect ref to a label dict; entry 5: a non-dict value (skipped).
+        let mut pdf = pdf_with_pagelabels(vec![]);
+        let lab_ref = ObjectRef::new(20, 0);
+        let mut lab = Dictionary::new();
+        lab.insert("S", Object::Name("D".into()));
+        pdf.set_object(lab_ref, Object::Dictionary(lab));
+        let pl_ref = ObjectRef::new(10, 0);
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Nums",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Reference(lab_ref), // indirect entry value -> resolve
+                Object::Integer(5),
+                Object::Integer(99), // non-dict entry value -> skipped
+            ]),
+        );
+        pdf.set_object(pl_ref, Object::Dictionary(leaf));
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(ranges.len(), 1, "non-dict value skipped");
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[0].1.style, LabelStyle::Decimal);
+    }
+
+    #[test]
+    fn ranges_non_name_style_resolves_to_none() {
+        // A label dict whose /S is not a Name resolves to LabelStyle::None via
+        // the resolving reader path (from_dict_resolved).
+        let mut pdf = pdf_with_pagelabels(vec![]);
+        let pl_ref = ObjectRef::new(10, 0);
+        let mut lab = Dictionary::new();
+        lab.insert("S", Object::Integer(0)); // non-Name /S
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(0), Object::Dictionary(lab)]),
+        );
+        pdf.set_object(pl_ref, Object::Dictionary(leaf));
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].1.style, LabelStyle::None);
+    }
+
+    #[test]
+    fn labels_for_page_range_fabricates_default_when_first_unlabeled() {
+        // Only an explicit range at index 5; extract starting before it (idx 0).
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("D", Some(1), None)]);
+        let mut h = pdf.page_labels();
+        let out = h.labels_for_page_range(0, 6, 0).unwrap();
+        // First entry fabricated: Decimal, start = new_start(0) + 1 = 1.
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1.style, LabelStyle::Decimal);
+        assert_eq!(out[0].1.start, 1);
+        // The explicit range at 5 is copied (renumbered to 5).
+        assert!(out.iter().any(|(idx, _)| *idx == 5));
+    }
+
+    #[test]
+    fn helper_tolerates_non_dict_catalog() {
+        let mut pdf = pdf_with_pagelabels(vec![]);
+        let catalog_ref = pdf.root_ref().unwrap();
+        pdf.set_object(catalog_ref, Object::Integer(0)); // catalog no longer a dict
+        let mut h = pdf.page_labels();
+        assert!(
+            !h.has_page_labels().unwrap(),
+            "non-dict catalog => no labels"
+        );
+        assert_eq!(h.ranges().unwrap(), vec![]);
+        // rebuild path bails out gracefully when the catalog is not a dict.
+        h.set_range(
+            0,
+            LabelRange {
+                style: LabelStyle::Decimal,
+                prefix: String::new(),
+                start: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn helper_tolerates_missing_root() {
+        // A trailer without /Root makes root_ref() return None; the helper must
+        // degrade gracefully (no labels, rebuild is a no-op).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless trailer still opens");
+        assert!(pdf.root_ref().is_none(), "rootless trailer => no root_ref");
+        let mut h = pdf.page_labels();
+        assert!(!h.has_page_labels().unwrap());
+        assert_eq!(h.ranges().unwrap(), vec![]);
+        h.set_range(
+            0,
+            LabelRange {
+                style: LabelStyle::Decimal,
+                prefix: String::new(),
+                start: 1,
+            },
+        )
+        .unwrap();
     }
 }

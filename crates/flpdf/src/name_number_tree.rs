@@ -805,9 +805,7 @@ mod tests {
         assert!(d.get("Kids").is_none(), "single leaf must not have /Kids");
         assert!(d.get("Nums").is_some());
         // Integer /Limits.
-        let Some(Object::Array(lim)) = d.get("Limits") else {
-            panic!("limits")
-        };
+        let lim = d.get("Limits").and_then(Object::as_array).expect("limits");
         assert_eq!(lim[0], Object::Integer(0));
         assert_eq!(lim[1], Object::Integer(20));
     }
