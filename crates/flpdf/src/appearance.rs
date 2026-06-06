@@ -859,28 +859,32 @@ fn word_wrap(
     }
 
     let mut lines: Vec<Vec<u8>> = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
 
-    // Split on '\n' (PDF newline in WinAnsi text) and space.
-    for word in text.split(|&b| b == b' ') {
-        if current.is_empty() {
-            current.extend_from_slice(word);
-        } else {
-            // Tentatively append.
-            let mut candidate = current.clone();
-            candidate.push(b' ');
-            candidate.extend_from_slice(word);
-            if sf.string_width(&candidate, font_size) <= max_width {
-                current = candidate;
-            } else {
-                lines.push(current.clone());
-                current.clear();
+    // First honour explicit hard line breaks the user typed into the field
+    // value (`\r\n`, `\r`, or `\n`); only then soft-wrap each segment on
+    // spaces. Without this, embedded newlines would be carried into a single
+    // `Tj` literal and render as one run (or a control glyph) instead of
+    // preserving the entered line structure.
+    for segment in split_hard_lines(text) {
+        let mut current: Vec<u8> = Vec::new();
+        for word in segment.split(|&b| b == b' ') {
+            if current.is_empty() {
                 current.extend_from_slice(word);
+            } else {
+                // Tentatively append.
+                let mut candidate = current.clone();
+                candidate.push(b' ');
+                candidate.extend_from_slice(word);
+                if sf.string_width(&candidate, font_size) <= max_width {
+                    current = candidate;
+                } else {
+                    lines.push(current.clone());
+                    current.clear();
+                    current.extend_from_slice(word);
+                }
             }
         }
-    }
-
-    if !current.is_empty() {
+        // Preserve the segment even when empty (a blank hard line).
         lines.push(current);
     }
 
@@ -889,6 +893,30 @@ fn word_wrap(
     }
 
     lines
+}
+
+/// Split `text` into hard lines on `\r\n`, `\r`, or `\n`, preserving empty
+/// segments (so blank lines entered by the user are kept).
+fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        match text[i] {
+            b'\r' => {
+                out.push(std::mem::take(&mut line));
+                // Treat CRLF as a single break.
+                if text.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'\n' => out.push(std::mem::take(&mut line)),
+            b => line.push(b),
+        }
+        i += 1;
+    }
+    out.push(line);
+    out
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1094,6 +1122,30 @@ mod tests {
     fn word_wrap_no_font_returns_single_line() {
         let lines = word_wrap(b"Hello World", 12.0, 50.0, None);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn word_wrap_honours_explicit_newlines() {
+        // Explicit hard line breaks must split into separate lines even when
+        // the whole value would fit on one line by width.
+        let font = StandardFont::from_base_name(b"Helv");
+        assert_eq!(
+            word_wrap(b"one\ntwo", 12.0, 500.0, font),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
+        // CRLF counts as a single break, and a blank line is preserved.
+        assert_eq!(
+            word_wrap(b"a\r\n\r\nb", 12.0, 500.0, font),
+            vec![b"a".to_vec(), Vec::new(), b"b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn split_hard_lines_variants() {
+        assert_eq!(split_hard_lines(b"a\nb"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(split_hard_lines(b"a\r\nb"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(split_hard_lines(b"a\rb"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(split_hard_lines(b"plain"), vec![b"plain".to_vec()]);
     }
 
     // ── Integration round-trip test ──────────────────────────────────────────
