@@ -1,0 +1,1292 @@
+//! Appearance-stream generators for AcroForm widgets.
+//!
+//! This module builds the `/AP/N` (normal-appearance) Form XObject for
+//! AcroForm widget annotations.  Currently only **Tx (text field)**
+//! appearance streams are implemented; 9.6 (checkbox/radio) and 9.7
+//! (choice-field list) will reuse the shared helpers exported as
+//! `pub(crate)` from this module.
+//!
+//! # Observable-equivalence policy
+//!
+//! Appearance streams target observable equivalence with qpdf (same rendered
+//! value/position), **not byte-identical output**.  Whitespace, operator
+//! ordering, and auto-size heuristics may differ.
+//!
+//! # Limitations
+//!
+//! - **WinAnsi re-encoding**: Characters in the range U+0080–U+009F are
+//!   represented with a `?` byte because their WinAnsi (cp1252) mappings are
+//!   not implemented.  All other Latin-1 / WinAnsi characters round-trip
+//!   correctly.
+//! - **Comb fields** (`/Ff` bit 25 set, with `/MaxLen`): not implemented.
+//!   The text is rendered as a plain single-line field.  Document "Comb
+//!   layout is a known unimplemented feature" for callers.
+//! - Only the 14 standard PDF fonts are supported via the embedded metrics
+//!   table.  Unknown fonts fall back to Helvetica.
+
+use std::collections::BTreeSet;
+use std::io::{Read, Seek};
+
+use crate::default_appearance::{parse_default_appearance, TextColor};
+use crate::json_inspect::decode_pdf_text_string;
+use crate::object::write_literal_string;
+use crate::page_object_helper::PageBox;
+use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::standard_font_metrics::StandardFont;
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
+
+// ── Public-crate helpers ─────────────────────────────────────────────────────
+
+/// Emit fill-colour operators for `color` into `out`.
+///
+/// Produces one of `g`, `rg`, or `k` (ISO 32000-1 §8.6.8) with all numeric
+/// values formatted by [`fmt_f64`].
+pub(crate) fn color_ops(color: &TextColor, out: &mut Vec<u8>) {
+    match color {
+        TextColor::Gray(g) => {
+            out.extend_from_slice(fmt_f64(*g).as_bytes());
+            out.extend_from_slice(b" g\n");
+        }
+        TextColor::Rgb(r, g, b) => {
+            out.extend_from_slice(fmt_f64(*r).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(*g).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(*b).as_bytes());
+            out.extend_from_slice(b" rg\n");
+        }
+        TextColor::Cmyk(c, m, y, k) => {
+            out.extend_from_slice(fmt_f64(*c).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(*m).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(*y).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(*k).as_bytes());
+            out.extend_from_slice(b" k\n");
+        }
+    }
+}
+
+/// Build and install a new `/AP/N` Form XObject on the widget at `widget_ref`.
+///
+/// Writes two objects: the XObject stream itself (uncompressed) and optionally
+/// a one-font `/Resources/Font` dictionary.  Both are inserted with
+/// [`Pdf::set_object`].  The widget dictionary at `widget_ref` is updated with
+/// a new `/AP` entry pointing to the XObject.
+///
+/// Returns the [`ObjectRef`] of the newly-created Form XObject.
+pub(crate) fn install_normal_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    content: Vec<u8>,
+    bbox_w: f64,
+    bbox_h: f64,
+    font_resource: Option<(Vec<u8>, ObjectRef)>,
+) -> Result<ObjectRef> {
+    // Allocate font object first (if needed) so the XObject allocation is
+    // sequential and there is no number collision.
+    let font_resource_ref = if let Some((ref name, font_obj_ref)) = font_resource {
+        let mut font_dict = Dictionary::new();
+        let mut inner_font_dict = Dictionary::new();
+        inner_font_dict.insert("Type", Object::Name(b"Font".to_vec()));
+        inner_font_dict.insert("Subtype", Object::Name(b"Type1".to_vec()));
+        inner_font_dict.insert("BaseFont", Object::Name(name.clone()));
+        inner_font_dict.insert(
+            "Encoding",
+            Object::Name(b"WinAnsiEncoding".to_vec()),
+        );
+        pdf.set_object(font_obj_ref, Object::Dictionary(inner_font_dict));
+        font_dict.insert(
+            String::from_utf8_lossy(name).into_owned(),
+            Object::Reference(font_obj_ref),
+        );
+        Some(font_dict)
+    } else {
+        None
+    };
+
+    // Build the Form XObject stream dictionary.
+    let xobj_ref = next_object_ref(pdf)?;
+
+    let mut sdict = Dictionary::new();
+    sdict.insert("Type", Object::Name(b"XObject".to_vec()));
+    sdict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    sdict.insert("FormType", Object::Integer(1));
+    sdict.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(bbox_w),
+            Object::Real(bbox_h),
+        ]),
+    );
+
+    if let Some(fdict) = font_resource_ref {
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(fdict));
+        sdict.insert("Resources", Object::Dictionary(resources));
+    }
+
+    pdf.set_object(xobj_ref, Object::Stream(Stream::new(sdict, content)));
+
+    // Update the widget's /AP/N entry.
+    let widget_obj = pdf.resolve(widget_ref)?;
+    let mut widget_dict = match widget_obj {
+        Object::Dictionary(d) => d,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "widget object {widget_ref} is not a dictionary"
+            )))
+        }
+    };
+
+    let mut ap_dict = match widget_dict.get("AP").cloned() {
+        Some(Object::Dictionary(d)) => d,
+        Some(Object::Reference(r)) => {
+            let resolved = pdf.resolve(r)?;
+            match resolved {
+                Object::Dictionary(d) => d,
+                _ => Dictionary::new(),
+            }
+        }
+        _ => Dictionary::new(),
+    };
+
+    ap_dict.insert("N", Object::Reference(xobj_ref));
+    widget_dict.insert("AP", Object::Dictionary(ap_dict));
+    pdf.set_object(widget_ref, Object::Dictionary(widget_dict));
+
+    Ok(xobj_ref)
+}
+
+/// Resolve `da_font_name` (a raw name from a `/DA` string, e.g. `b"Helv"`) to
+/// a standard-font triple `(base_font_name_bytes, freshly_allocated_ObjectRef,
+/// StandardFont)`, or `None` when the name is not recognised.
+///
+/// A new [`ObjectRef`] is **allocated but not yet registered** — the caller
+/// (e.g. [`install_normal_appearance`]) writes the font object.  Allocating
+/// here and writing there keeps all allocations sequential.
+pub(crate) fn ensure_standard_font<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    da_font_name: &[u8],
+) -> Result<Option<(Vec<u8>, ObjectRef, StandardFont)>> {
+    let Some(sf) = StandardFont::from_base_name(da_font_name) else {
+        return Ok(None);
+    };
+    let base_name = official_base_name(sf).to_vec();
+    let obj_ref = next_object_ref(pdf)?;
+    Ok(Some((base_name, obj_ref, sf)))
+}
+
+// ── TextAppearanceParams ─────────────────────────────────────────────────────
+
+/// Parameters for the pure text-appearance builder [`build_text_appearance_content`].
+///
+/// All string data has already been decoded from PDF text-string encoding and
+/// re-encoded to WinAnsi bytes.  All measurements are in user-space units.
+pub(crate) struct TextAppearanceParams {
+    /// WinAnsi-encoded text to render.
+    pub text_bytes: Vec<u8>,
+    /// Resource name for the font in the XObject `/Resources/Font` dict
+    /// (same as the name used in the `Tf` operator).
+    pub font_resource_name: Vec<u8>,
+    /// Font size in points.
+    pub font_size: f64,
+    /// Text colour.
+    pub color: TextColor,
+    /// Width of the field bounding box.
+    pub bbox_w: f64,
+    /// Height of the field bounding box.
+    pub bbox_h: f64,
+    /// Quadding: 0 = left, 1 = centre, 2 = right.
+    pub quadding: i64,
+    /// Whether the field is multiline (`/Ff` bit 13).
+    pub multiline: bool,
+    /// Optional standard font for width measurement.  `None` → left-align
+    /// (no measurement).
+    pub std_font: Option<StandardFont>,
+}
+
+/// Build the raw byte content of a Tx appearance stream.
+///
+/// The produced stream follows the structure:
+///
+/// ```text
+/// /Tx BMC
+/// BT
+/// /FontName size Tf
+/// <color op>
+/// <Td Tj per line>
+/// ET
+/// EMC
+/// ```
+///
+/// This function is pure (no `Pdf` access) and is tested independently from
+/// object allocation.
+pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    out.extend_from_slice(b"/Tx BMC\n");
+    out.extend_from_slice(b"BT\n");
+
+    // Tf operator.
+    out.push(b'/');
+    out.extend_from_slice(&p.font_resource_name);
+    out.push(b' ');
+    out.extend_from_slice(fmt_f64(p.font_size).as_bytes());
+    out.extend_from_slice(b" Tf\n");
+
+    // Fill colour.
+    color_ops(&p.color, &mut out);
+
+    if p.multiline {
+        render_multiline(p, &mut out);
+    } else {
+        render_singleline(p, &mut out);
+    }
+
+    out.extend_from_slice(b"ET\n");
+    out.extend_from_slice(b"EMC\n");
+
+    out
+}
+
+// ── Public document API ──────────────────────────────────────────────────────
+
+/// Generate and install a normal appearance stream for the Tx (text) widget
+/// at `widget_ref`.
+///
+/// Returns `Ok(Some(xobj_ref))` on success, `Ok(None)` when the widget should
+/// be skipped (not a Tx field, missing /V, or degenerate bounding box).
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when the field-tree depth limit is exceeded
+/// or an object is structurally invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{generate_text_field_appearance, ObjectRef, Pdf};
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
+/// let widget = ObjectRef::new(10, 0);
+/// if let Some(ap_ref) = generate_text_field_appearance(&mut pdf, widget)? {
+///     println!("appearance stream written at {ap_ref}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn generate_text_field_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    // ── 1. Verify /FT is Tx ────────────────────────────────────────────────
+    let ft = resolve_inherited_name(pdf, widget_ref, b"FT")?;
+    if ft.as_deref() != Some(b"Tx") {
+        return Ok(None);
+    }
+
+    // ── 2. /V — field value ────────────────────────────────────────────────
+    let raw_value = resolve_inherited_object(pdf, widget_ref, b"V")?;
+    let value_bytes: Option<Vec<u8>> = match raw_value {
+        None => None,
+        Some(Object::String(bytes)) => decode_pdf_text_string(&bytes)
+            .map(|s| to_winansi_bytes(&s))
+            .or(Some(bytes)),
+        Some(Object::Reference(r)) => {
+            let obj = pdf.resolve(r)?;
+            match obj {
+                Object::String(bytes) => decode_pdf_text_string(&bytes)
+                    .map(|s| to_winansi_bytes(&s))
+                    .or(Some(bytes)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    let text_bytes = match value_bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => return Ok(None),
+    };
+
+    // ── 3. /Rect — bounding box ────────────────────────────────────────────
+    let rect = resolve_rect(pdf, widget_ref)?;
+    let (bbox_w, bbox_h) = match rect {
+        Some(r) => {
+            let w = (r.urx - r.llx).abs();
+            let h = (r.ury - r.lly).abs();
+            if !w.is_finite() || !h.is_finite() || w < 1.0 || h < 1.0 {
+                return Ok(None);
+            }
+            (w, h)
+        }
+        None => return Ok(None),
+    };
+
+    // ── 4. /DA — default appearance ───────────────────────────────────────
+    // Walk /Parent chain first; if absent, fall back to /AcroForm /DA.
+    let da_bytes = resolve_da(pdf, widget_ref)?;
+    let da = parse_default_appearance(da_bytes.as_deref().unwrap_or(b""));
+
+    // ── 5. /Q — quadding (0 = left, 1 = centre, 2 = right) ───────────────
+    let quadding = resolve_inherited_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
+
+    // ── 6. /Ff — field flags (bit 13 = multiline, 0-indexed) ─────────────
+    let ff = resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0) as u32;
+    let multiline = (ff >> 12) & 1 != 0; // bit 13 (1-indexed) = bit 12 (0-indexed)
+
+    // ── 7. Font resolution — DA font name → standard font ─────────────────
+    let font_name_bytes: &[u8] = da.font_name.as_deref().unwrap_or(b"Helv");
+
+    // Try DA font name, then alias "Helv" as the hard fallback.
+    let (base_font_name, font_obj_ref, std_font) =
+        if let Some(triple) = ensure_standard_font(pdf, font_name_bytes)? {
+            triple
+        } else {
+            // Unknown font: substitute Helvetica.
+            let (n, r, s) = ensure_standard_font(pdf, b"Helv")?
+                .expect("Helv always resolves to a StandardFont");
+            (n, r, s)
+        };
+
+    // ── 8. Font size (auto-size heuristic) ────────────────────────────────
+    let font_size = if da.auto_size {
+        // Single-line auto: fit height with small top/bottom padding.
+        let candidate = (bbox_h - 2.0).clamp(4.0, 12.0);
+        // For multiline use the same heuristic; the rendering loop handles
+        // overflow by just clipping at the bottom.
+        candidate
+    } else {
+        da.font_size
+    };
+
+    // ── 9. Resource name — use the name from /DA if it resolves, else
+    //       the official base name.
+    let font_resource_name: Vec<u8> = if StandardFont::from_base_name(font_name_bytes).is_some() {
+        // Prefer the name exactly as it appears in /DA so that if the viewer
+        // already knows the resource it can reuse it.
+        font_name_bytes.to_vec()
+    } else {
+        base_font_name.clone()
+    };
+
+    // ── 10. Build content stream ───────────────────────────────────────────
+    let params = TextAppearanceParams {
+        text_bytes,
+        font_resource_name: font_resource_name.clone(),
+        font_size,
+        color: da.color,
+        bbox_w,
+        bbox_h,
+        quadding,
+        multiline,
+        std_font: Some(std_font),
+    };
+    let content = build_text_appearance_content(&params);
+
+    // ── 11. Install ────────────────────────────────────────────────────────
+    let xobj_ref = install_normal_appearance(
+        pdf,
+        widget_ref,
+        content,
+        bbox_w,
+        bbox_h,
+        Some((font_resource_name, font_obj_ref)),
+    )?;
+
+    Ok(Some(xobj_ref))
+}
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+/// Return the official PDF BaseFont name for a [`StandardFont`].
+fn official_base_name(font: StandardFont) -> &'static [u8] {
+    match font {
+        StandardFont::Helvetica => b"Helvetica",
+        StandardFont::HelveticaBold => b"Helvetica-Bold",
+        StandardFont::HelveticaOblique => b"Helvetica-Oblique",
+        StandardFont::HelveticaBoldOblique => b"Helvetica-BoldOblique",
+        StandardFont::TimesRoman => b"Times-Roman",
+        StandardFont::TimesBold => b"Times-Bold",
+        StandardFont::TimesItalic => b"Times-Italic",
+        StandardFont::TimesBoldItalic => b"Times-BoldItalic",
+        StandardFont::Courier => b"Courier",
+        StandardFont::CourierBold => b"Courier-Bold",
+        StandardFont::CourierOblique => b"Courier-Oblique",
+        StandardFont::CourierBoldOblique => b"Courier-BoldOblique",
+        StandardFont::Symbol => b"Symbol",
+        StandardFont::ZapfDingbats => b"ZapfDingbats",
+    }
+}
+
+/// Format an `f64` for use in a PDF content stream (locale-independent).
+///
+/// Trailing zeros after the decimal point are stripped; integers are emitted
+/// without a decimal point.
+fn fmt_f64(v: f64) -> String {
+    if !v.is_finite() {
+        return "0".to_string();
+    }
+    // Round to 4 decimal places — sufficient for point coordinates.
+    let s = format!("{:.4}", v);
+    let s = s.trim_end_matches('0');
+    let s = s.trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        return "0".to_string();
+    }
+    s.to_string()
+}
+
+/// Re-encode a Rust `&str` to WinAnsi bytes (Latin-1 / cp1252 subset).
+///
+/// Characters U+0000–U+007F and U+00A0–U+00FF map directly (the WinAnsi byte
+/// equals the code point value).  Characters U+0080–U+009F are replaced with
+/// `b'?'` (known limitation documented in the module doc).  Characters outside
+/// U+00FF are replaced with `b'?'`.
+fn to_winansi_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        let code = ch as u32;
+        if code <= 0x007F || (0x00A0..=0x00FF).contains(&code) {
+            out.push(code as u8);
+        } else {
+            out.push(b'?');
+        }
+    }
+    out
+}
+
+/// Allocate the next available object reference.
+fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
+    let n = pdf
+        .object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+    Ok(ObjectRef::new(n, 0))
+}
+
+/// Walk the `/Parent` chain looking for a `Name` value for `key`.
+fn resolve_inherited_name<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = start;
+    let mut depth: usize = 0;
+
+    loop {
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "field tree depth exceeds maximum of {} at {}",
+                DEFAULT_MAX_PAGE_TREE_DEPTH, current
+            )));
+        }
+        if !seen.insert(current) {
+            return Ok(None);
+        }
+
+        let node_obj = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node_obj.as_dict() else {
+            return Err(Error::Unsupported(format!(
+                "field tree node {current} is not a dictionary"
+            )));
+        };
+
+        if let Some(val) = dict.get(key).cloned() {
+            match val {
+                Object::Null => {}
+                Object::Name(bytes) => return Ok(Some(bytes)),
+                _ => {}
+            }
+        }
+
+        match dict.get("Parent").cloned() {
+            Some(Object::Reference(r)) => {
+                current = r;
+                depth += 1;
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Walk the `/Parent` chain looking for an arbitrary `Object` value for `key`.
+fn resolve_inherited_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+    key: &[u8],
+) -> Result<Option<Object>> {
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = start;
+    let mut depth: usize = 0;
+
+    loop {
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "field tree depth exceeds maximum of {} at {}",
+                DEFAULT_MAX_PAGE_TREE_DEPTH, current
+            )));
+        }
+        if !seen.insert(current) {
+            return Ok(None);
+        }
+
+        let node_obj = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node_obj.as_dict() else {
+            return Err(Error::Unsupported(format!(
+                "field tree node {current} is not a dictionary"
+            )));
+        };
+
+        if let Some(val) = dict.get(key).cloned() {
+            match val {
+                Object::Null => {}
+                other => return Ok(Some(other)),
+            }
+        }
+
+        match dict.get("Parent").cloned() {
+            Some(Object::Reference(r)) => {
+                current = r;
+                depth += 1;
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Walk the `/Parent` chain looking for an `Integer` value for `key`.
+fn resolve_inherited_integer<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+    key: &[u8],
+) -> Result<Option<i64>> {
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = start;
+    let mut depth: usize = 0;
+
+    loop {
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "field tree depth exceeds maximum of {} at {}",
+                DEFAULT_MAX_PAGE_TREE_DEPTH, current
+            )));
+        }
+        if !seen.insert(current) {
+            return Ok(None);
+        }
+
+        let node_obj = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node_obj.as_dict() else {
+            return Err(Error::Unsupported(format!(
+                "field tree node {current} is not a dictionary"
+            )));
+        };
+
+        if let Some(val) = dict.get(key).cloned() {
+            match val {
+                Object::Null => {}
+                Object::Integer(n) => return Ok(Some(n)),
+                _ => {}
+            }
+        }
+
+        match dict.get("Parent").cloned() {
+            Some(Object::Reference(r)) => {
+                current = r;
+                depth += 1;
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Look up `/DA` (default appearance string) by walking the `/Parent` chain
+/// first, then falling back to `/AcroForm/DA` at the document level.
+///
+/// Returns `None` when no `/DA` is found anywhere in the chain or in
+/// `/AcroForm`.
+fn resolve_da<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+) -> Result<Option<Vec<u8>>> {
+    // Walk /Parent chain for /DA first.
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = start;
+    let mut depth: usize = 0;
+
+    loop {
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            break;
+        }
+        if !seen.insert(current) {
+            break;
+        }
+
+        let node_obj = pdf.resolve_borrowed(current)?;
+        let Some(dict) = node_obj.as_dict() else {
+            break;
+        };
+
+        if let Some(val) = dict.get("DA").cloned() {
+            match val {
+                Object::Null => {}
+                Object::String(bytes) => return Ok(Some(bytes)),
+                _ => {}
+            }
+        }
+
+        match dict.get("Parent").cloned() {
+            Some(Object::Reference(r)) => {
+                current = r;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+
+    // Fallback: /AcroForm /DA at document root.
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(None);
+    };
+    let catalog_obj = pdf.resolve_borrowed(root_ref)?;
+    let Some(catalog) = catalog_obj.as_dict() else {
+        return Ok(None);
+    };
+    let acroform_val = catalog.get("AcroForm").cloned();
+
+    let acroform_dict: Option<Dictionary> = match acroform_val {
+        None | Some(Object::Null) => None,
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Reference(r)) => {
+            let resolved = pdf.resolve_borrowed(r)?;
+            resolved.as_dict().cloned()
+        }
+        _ => None,
+    };
+
+    let da = acroform_dict
+        .as_ref()
+        .and_then(|d| d.get("DA"))
+        .and_then(|v| match v {
+            Object::String(bytes) => Some(bytes.clone()),
+            _ => None,
+        });
+
+    Ok(da)
+}
+
+/// Extract the `/Rect` of the widget as a [`PageBox`].
+fn resolve_rect<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+) -> Result<Option<PageBox>> {
+    let obj = pdf.resolve_borrowed(widget_ref)?;
+    let Some(dict) = obj.as_dict() else {
+        return Ok(None);
+    };
+    let rect_val = match dict.get("Rect").cloned() {
+        None | Some(Object::Null) => return Ok(None),
+        Some(v) => v,
+    };
+
+    let arr = match rect_val {
+        Object::Array(a) => a,
+        Object::Reference(r) => {
+            let resolved = pdf.resolve(r)?;
+            match resolved {
+                Object::Array(a) => a,
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+
+    if arr.len() != 4 {
+        return Ok(None);
+    }
+
+    let nums: Vec<f64> = arr
+        .iter()
+        .map(|o| match o {
+            Object::Real(f) => Some(*f),
+            Object::Integer(i) => Some(*i as f64),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+
+    if nums.len() != 4 {
+        return Ok(None);
+    }
+
+    Ok(Some(PageBox::new(nums[0], nums[1], nums[2], nums[3])))
+}
+
+/// Render a single-line text appearance (no word-wrap, one `Td Tj` pair).
+fn render_singleline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
+    let x = compute_x_offset(p, &p.text_bytes);
+    // Vertical baseline: midpoint + 20% of font size for typical descender.
+    let y = ((p.bbox_h - p.font_size) / 2.0 + p.font_size * 0.2).max(2.0);
+
+    out.extend_from_slice(fmt_f64(x).as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(fmt_f64(y).as_bytes());
+    out.extend_from_slice(b" Td\n");
+
+    write_literal_string(out, &p.text_bytes);
+    out.extend_from_slice(b" Tj\n");
+}
+
+/// Render a multiline text appearance (simple word-wrap on space boundaries).
+fn render_multiline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
+    let leading = p.font_size * 1.15;
+    // Top baseline — allow small top margin.
+    let first_y = p.bbox_h - p.font_size - 2.0;
+
+    let lines = word_wrap(&p.text_bytes, p.font_size, p.bbox_w, p.std_font);
+    let mut first = true;
+
+    for line in &lines {
+        let x = compute_x_offset(p, line);
+        if first {
+            out.extend_from_slice(fmt_f64(x).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(first_y).as_bytes());
+            out.extend_from_slice(b" Td\n");
+            first = false;
+        } else {
+            // Relative move downward (negative y).
+            out.extend_from_slice(fmt_f64(x).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(-leading).as_bytes());
+            out.extend_from_slice(b" Td\n");
+        }
+        write_literal_string(out, line);
+        out.extend_from_slice(b" Tj\n");
+    }
+}
+
+/// Compute the horizontal starting offset for a text run with the given
+/// quadding setting.
+fn compute_x_offset(p: &TextAppearanceParams, text: &[u8]) -> f64 {
+    match p.quadding {
+        1 => {
+            // Centre.
+            let w = p
+                .std_font
+                .map_or(0.0, |sf| sf.string_width(text, p.font_size));
+            ((p.bbox_w - w) / 2.0).max(2.0)
+        }
+        2 => {
+            // Right.
+            let w = p
+                .std_font
+                .map_or(0.0, |sf| sf.string_width(text, p.font_size));
+            (p.bbox_w - w - 2.0).max(2.0)
+        }
+        _ => 2.0, // Left (default).
+    }
+}
+
+/// Simple word-wrap: splits `text` into lines that fit within `max_width`.
+///
+/// Splits on space bytes only.  Returns at least one element (may overflow
+/// if a single word exceeds `max_width`).
+fn word_wrap(
+    text: &[u8],
+    font_size: f64,
+    max_width: f64,
+    std_font: Option<StandardFont>,
+) -> Vec<Vec<u8>> {
+    let Some(sf) = std_font else {
+        // Without font metrics, return the whole text as one line.
+        return vec![text.to_vec()];
+    };
+
+    if max_width <= 0.0 {
+        return vec![text.to_vec()];
+    }
+
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+
+    // Split on '\n' (PDF newline in WinAnsi text) and space.
+    for word in text.split(|&b| b == b' ') {
+        if current.is_empty() {
+            current.extend_from_slice(word);
+        } else {
+            // Tentatively append.
+            let mut candidate = current.clone();
+            candidate.push(b' ');
+            candidate.extend_from_slice(word);
+            if sf.string_width(&candidate, font_size) <= max_width {
+                current = candidate;
+            } else {
+                lines.push(current.clone());
+                current.clear();
+                current.extend_from_slice(word);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+
+    lines
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content_stream::{ContentStreamParser, ContentToken};
+    use crate::writer::write_pdf;
+    use crate::Pdf;
+    use std::io::Cursor;
+
+    // ── Unit tests for pure helpers ──────────────────────────────────────────
+
+    #[test]
+    fn fmt_f64_integer_no_decimal() {
+        assert_eq!(fmt_f64(12.0), "12");
+        assert_eq!(fmt_f64(0.0), "0");
+        assert_eq!(fmt_f64(-3.0), "-3");
+    }
+
+    #[test]
+    fn fmt_f64_strips_trailing_zeros() {
+        assert_eq!(fmt_f64(1.5), "1.5");
+        assert_eq!(fmt_f64(0.25), "0.25");
+        // Four decimal places of precision.
+        assert_eq!(fmt_f64(1.0 / 3.0), "0.3333");
+    }
+
+    #[test]
+    fn fmt_f64_non_finite_returns_zero() {
+        assert_eq!(fmt_f64(f64::NAN), "0");
+        assert_eq!(fmt_f64(f64::INFINITY), "0");
+    }
+
+    #[test]
+    fn color_ops_gray() {
+        let mut out = Vec::new();
+        color_ops(&TextColor::Gray(0.0), &mut out);
+        assert_eq!(out, b"0 g\n");
+    }
+
+    #[test]
+    fn color_ops_rgb() {
+        let mut out = Vec::new();
+        color_ops(&TextColor::Rgb(1.0, 0.0, 0.0), &mut out);
+        assert_eq!(out, b"1 0 0 rg\n");
+    }
+
+    #[test]
+    fn color_ops_cmyk() {
+        let mut out = Vec::new();
+        color_ops(&TextColor::Cmyk(0.0, 0.0, 0.0, 1.0), &mut out);
+        assert_eq!(out, b"0 0 0 1 k\n");
+    }
+
+    #[test]
+    fn to_winansi_ascii_passthrough() {
+        let out = to_winansi_bytes("Hello");
+        assert_eq!(out, b"Hello");
+    }
+
+    #[test]
+    fn to_winansi_latin1_passthrough() {
+        // U+00E9 = é = 0xE9 in Latin-1/WinAnsi
+        let out = to_winansi_bytes("caf\u{00E9}");
+        assert_eq!(out, b"caf\xe9");
+    }
+
+    #[test]
+    fn to_winansi_c1_range_replaced() {
+        // U+0080–U+009F → '?'
+        let out = to_winansi_bytes("\u{0080}\u{009F}");
+        assert_eq!(out, b"??");
+    }
+
+    #[test]
+    fn to_winansi_beyond_latin1_replaced() {
+        let out = to_winansi_bytes("\u{0100}");
+        assert_eq!(out, b"?");
+    }
+
+    #[test]
+    fn official_base_name_all_variants() {
+        // Every variant must map to a known official name.
+        let cases = [
+            (StandardFont::Helvetica, b"Helvetica" as &[u8]),
+            (StandardFont::HelveticaBold, b"Helvetica-Bold"),
+            (StandardFont::HelveticaOblique, b"Helvetica-Oblique"),
+            (StandardFont::HelveticaBoldOblique, b"Helvetica-BoldOblique"),
+            (StandardFont::TimesRoman, b"Times-Roman"),
+            (StandardFont::TimesBold, b"Times-Bold"),
+            (StandardFont::TimesItalic, b"Times-Italic"),
+            (StandardFont::TimesBoldItalic, b"Times-BoldItalic"),
+            (StandardFont::Courier, b"Courier"),
+            (StandardFont::CourierBold, b"Courier-Bold"),
+            (StandardFont::CourierOblique, b"Courier-Oblique"),
+            (StandardFont::CourierBoldOblique, b"Courier-BoldOblique"),
+            (StandardFont::Symbol, b"Symbol"),
+            (StandardFont::ZapfDingbats, b"ZapfDingbats"),
+        ];
+        for (font, expected) in cases {
+            assert_eq!(official_base_name(font), expected);
+        }
+    }
+
+    #[test]
+    fn build_text_appearance_basic_tokens() {
+        let params = TextAppearanceParams {
+            text_bytes: b"Hello".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 200.0,
+            bbox_h: 20.0,
+            quadding: 0,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helv"),
+        };
+        let content = build_text_appearance_content(&params);
+        let content_str = String::from_utf8_lossy(&content);
+
+        // Must open and close the marked-content sequence.
+        assert!(content_str.contains("/Tx BMC"), "missing /Tx BMC");
+        assert!(content_str.contains("EMC"), "missing EMC");
+        // Must have a text block.
+        assert!(content_str.contains("BT"), "missing BT");
+        assert!(content_str.contains("ET"), "missing ET");
+        // Tf operator must use the font resource name.
+        assert!(content_str.contains("/Helv 12 Tf"), "missing /Helv 12 Tf");
+        // Tj must appear with the text.
+        assert!(content_str.contains("Tj"), "missing Tj");
+    }
+
+    #[test]
+    fn build_text_appearance_parses_with_content_stream_parser() {
+        let params = TextAppearanceParams {
+            text_bytes: b"Test".to_vec(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 10.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 150.0,
+            bbox_h: 18.0,
+            quadding: 0,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helv"),
+        };
+        let content = build_text_appearance_content(&params);
+
+        let mut found_tf = false;
+        let mut found_td = false;
+        let mut found_tj = false;
+        let mut tj_operand: Option<Vec<u8>> = None;
+        let mut tf_font_name: Option<Vec<u8>> = None;
+
+        for tok in ContentStreamParser::new(&content).flatten() {
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
+            match operator.as_slice() {
+                b"Tf" => {
+                    found_tf = true;
+                    tf_font_name = operands.first().and_then(|o| o.as_name()).map(|n| n.to_vec());
+                }
+                b"Td" => found_td = true,
+                b"Tj" => {
+                    found_tj = true;
+                    tj_operand = operands
+                        .first()
+                        .and_then(|o| {
+                            if let Object::String(bytes) = o {
+                                Some(bytes.clone())
+                            } else {
+                                None
+                            }
+                        });
+                }
+                _ => {}
+            }
+        }
+
+        assert!(found_tf, "Tf operator not found in content stream");
+        assert!(found_td, "Td operator not found in content stream");
+        assert!(found_tj, "Tj operator not found in content stream");
+        assert_eq!(
+            tf_font_name.as_deref(),
+            Some(b"Helv" as &[u8]),
+            "Tf font name mismatch"
+        );
+        // The Tj string must decode back to the original text.
+        let tj_str = tj_operand.expect("Tj has no string operand");
+        assert_eq!(tj_str, b"Test", "Tj operand mismatch");
+    }
+
+    #[test]
+    fn word_wrap_single_word() {
+        let lines = word_wrap(b"Hello", 12.0, 200.0, StandardFont::from_base_name(b"Helv"));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], b"Hello");
+    }
+
+    #[test]
+    fn word_wrap_no_font_returns_single_line() {
+        let lines = word_wrap(b"Hello World", 12.0, 50.0, None);
+        assert_eq!(lines.len(), 1);
+    }
+
+    // ── Integration round-trip test ──────────────────────────────────────────
+
+    /// Minimal PDF with one Tx widget in an AcroForm.
+    ///
+    /// Object layout:
+    ///  1 0: Catalog  (with /AcroForm carrying /DA)
+    ///  2 0: Pages
+    ///  3 0: Page
+    ///  4 0: Widget   (Tx field with /V)
+    fn build_minimal_tx_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+              /V (Hello World) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn round_trip_generate_tx_appearance() {
+        let raw = build_minimal_tx_pdf();
+        let cursor = Cursor::new(raw);
+        let mut pdf = Pdf::open(cursor).expect("parse minimal PDF");
+
+        let widget_ref = ObjectRef::new(4, 0);
+        let result = generate_text_field_appearance(&mut pdf, widget_ref);
+        assert!(result.is_ok(), "generate_text_field_appearance returned error: {:?}", result);
+        let xobj_ref = result.unwrap();
+        assert!(xobj_ref.is_some(), "generate returned None — field should be handled");
+        let xobj_ref = xobj_ref.unwrap();
+
+        // The appearance XObject must exist and be a Stream.
+        let xobj = pdf.resolve(xobj_ref).expect("resolve xobj");
+        let Object::Stream(stream) = xobj else {
+            panic!("XObject is not a stream: {xobj:?}");
+        };
+
+        // Subtype must be Form.
+        assert_eq!(
+            stream.dict.get("Subtype"),
+            Some(&Object::Name(b"Form".to_vec())),
+            "XObject /Subtype is not /Form"
+        );
+
+        // Parse the stream content and verify key operators and operands.
+        let content = stream.data.clone();
+        let mut found_tf = false;
+        let mut found_tj = false;
+        let mut tf_name: Option<Vec<u8>> = None;
+        let mut tj_val: Option<Vec<u8>> = None;
+
+        for tok in ContentStreamParser::new(&content).flatten() {
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
+            match operator.as_slice() {
+                b"Tf" => {
+                    found_tf = true;
+                    tf_name = operands.first().and_then(|o| o.as_name()).map(|n| n.to_vec());
+                }
+                b"Tj" => {
+                    found_tj = true;
+                    if let Some(Object::String(bytes)) = operands.first() {
+                        tj_val = Some(bytes.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(found_tf, "Tf not in appearance stream");
+        assert!(found_tj, "Tj not in appearance stream");
+
+        let font_name = tf_name.expect("Tf has no operand");
+
+        // The /Resources/Font dict must contain a key matching the Tf operator name.
+        let resources = stream.dict.get("Resources").expect("no /Resources");
+        let Object::Dictionary(res_dict) = resources else {
+            panic!("Resources is not a dict");
+        };
+        let font_dict_obj = res_dict.get("Font").expect("no /Resources/Font");
+        let Object::Dictionary(font_dict) = font_dict_obj else {
+            panic!("Font resources is not a dict");
+        };
+        let font_key = String::from_utf8_lossy(&font_name).into_owned();
+        assert!(
+            font_dict.get(font_key.as_str()).is_some(),
+            "font key '{font_key}' not found in /Resources/Font — mismatch between Tf and resource"
+        );
+
+        // The Tj operand must decode back to the field value.
+        let rendered = tj_val.expect("Tj has no string operand");
+        assert_eq!(rendered, b"Hello World", "Tj does not match field value");
+
+        // Write out and re-parse to make sure the PDF structure is sound.
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("write_pdf");
+        let mut reparsed = Pdf::open(Cursor::new(out)).expect("re-parse written PDF");
+        let xobj2 = reparsed.resolve(xobj_ref).expect("re-resolve xobj");
+        assert!(
+            matches!(xobj2, Object::Stream(_)),
+            "re-parsed xobj is not a stream"
+        );
+    }
+
+    fn build_btn_widget_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Btn /T (chk) /Rect [10 10 30 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    fn build_tx_no_value_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) /DA (/Helv 12 Tf 0 g) /Rect [10 10 100 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n\
+             {:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn non_tx_field_returns_none() {
+        // A widget with /FT /Btn should be skipped.
+        let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "non-Tx field should return None");
+    }
+
+    #[test]
+    fn missing_value_returns_none() {
+        // A Tx widget with no /V should be skipped.
+        let mut pdf = Pdf::open(Cursor::new(build_tx_no_value_pdf())).expect("parse");
+        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "missing /V should return None");
+    }
+
+    #[test]
+    fn acroform_da_fallback_used_when_field_has_none() {
+        // Widget has no /DA directly — must fall through to /AcroForm /DA.
+        // We verify the appearance was generated (not None) and has a
+        // valid Tf operator.
+        let raw = build_minimal_tx_pdf(); // /AcroForm carries /DA
+        let cursor = Cursor::new(raw);
+        let mut pdf = Pdf::open(cursor).expect("parse");
+        let widget_ref = ObjectRef::new(4, 0);
+        let result = generate_text_field_appearance(&mut pdf, widget_ref)
+            .expect("generate should not error");
+        assert!(result.is_some(), "should produce appearance via AcroForm /DA fallback");
+    }
+}

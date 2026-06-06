@@ -40,6 +40,7 @@
 pub mod acroform_document_helper;
 pub mod acroform_field_prune;
 pub mod annotation_helper;
+pub mod appearance;
 pub(crate) mod ascii85;
 pub(crate) mod ascii_hex;
 pub mod attachment_list;
@@ -97,6 +98,7 @@ pub use acroform_field_prune::{
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use annotation_helper::{AnnotationObjectHelper, FormFieldObjectHelper};
+pub use appearance::generate_text_field_appearance;
 pub use attachment_list::{format_attachment_list, list_attachment_info, AttachmentInfo};
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{check_reader, check_reader_strict, check_reader_with_options, CheckReport};

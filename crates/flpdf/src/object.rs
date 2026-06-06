@@ -511,7 +511,7 @@ fn is_printable_string(value: &[u8]) -> bool {
         .all(|byte| (0x20..=0x7e).contains(byte) && !matches!(*byte, b'\r' | b'\n'))
 }
 
-fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
+pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
     out.push(b'(');
     for byte in value {
         match byte {
