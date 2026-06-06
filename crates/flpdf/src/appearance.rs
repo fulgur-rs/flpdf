@@ -239,9 +239,11 @@ pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8>
     out.extend_from_slice(b"/Tx BMC\n");
     out.extend_from_slice(b"BT\n");
 
-    // Tf operator.
+    // Tf operator. The resource name is a decoded PDF name, so re-escape any
+    // delimiter/whitespace bytes (e.g. a `/DA` font named `/F#20A`) instead of
+    // appending raw bytes — otherwise the operand stream would be malformed.
     out.push(b'/');
-    out.extend_from_slice(&p.font_resource_name);
+    crate::object::write_name_escaped(&mut out, &p.font_resource_name);
     out.push(b' ');
     out.extend_from_slice(fmt_f64(p.font_size).as_bytes());
     out.extend_from_slice(b" Tf\n");
@@ -317,9 +319,13 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
         _ => None,
     };
 
+    // Distinguish a missing `/V` (nothing to render — leave any inherited or
+    // pre-existing appearance alone) from a present-but-empty `/V` (the field
+    // was explicitly cleared). An empty value must still produce a blank
+    // appearance stream so a cleared field stops rendering its stale `/AP/N`.
     let text_bytes = match value_bytes {
-        Some(b) if !b.is_empty() => b,
-        _ => return Ok(None),
+        Some(b) => b,
+        None => return Ok(None),
     };
 
     // ── 3. /Rect — bounding box ────────────────────────────────────────────
@@ -1049,6 +1055,53 @@ mod tests {
         assert!(content_str.contains("/Helv 12 Tf"), "missing /Helv 12 Tf");
         // Tj must appear with the text.
         assert!(content_str.contains("Tj"), "missing Tj");
+    }
+
+    #[test]
+    fn build_text_appearance_escapes_font_resource_name() {
+        // A resource name with a delimiter byte (space) must be #-escaped in
+        // the Tf operator so the content stream stays well-formed.
+        let params = TextAppearanceParams {
+            text_bytes: b"Hi".to_vec(),
+            font_resource_name: b"F A".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 100.0,
+            bbox_h: 20.0,
+            quadding: 0,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helv"),
+        };
+        let content = build_text_appearance_content(&params);
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains("/F#20A 12 Tf"), "name not escaped: {s}");
+        // The raw, unescaped name must not leak into the stream.
+        assert!(!s.contains("/F A 12 Tf"), "raw name leaked: {s}");
+    }
+
+    #[test]
+    fn build_text_appearance_empty_value_is_valid_blank() {
+        // A present-but-empty value still yields a structurally valid blank
+        // appearance (marked content + text block), which replaces any stale
+        // /AP/N on a cleared field.
+        let params = TextAppearanceParams {
+            text_bytes: Vec::new(),
+            font_resource_name: b"Helv".to_vec(),
+            font_size: 12.0,
+            color: TextColor::Gray(0.0),
+            bbox_w: 100.0,
+            bbox_h: 20.0,
+            quadding: 0,
+            multiline: false,
+            std_font: StandardFont::from_base_name(b"Helv"),
+        };
+        let content = build_text_appearance_content(&params);
+        // Every token must parse cleanly.
+        for tok in ContentStreamParser::new(&content) {
+            tok.expect("blank appearance must tokenize");
+        }
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains("/Tx BMC") && s.contains("EMC"));
     }
 
     #[test]
