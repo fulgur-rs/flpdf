@@ -679,25 +679,37 @@ fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Opti
     let mut depth: usize = 0;
 
     loop {
+        // Malformed parent chains (over-deep, cyclic, non-dictionary node) are
+        // not fatal: stop walking, warn, and fall back to /AcroForm /DA — the
+        // same graceful degradation qpdf performs (it warns and continues rather
+        // than aborting on a broken field tree). The depth limit + `seen` set
+        // also bound traversal per review pattern #4 (DoS).
         if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            pdf.push_warning(format!(
+                "/DA inheritance: parent chain exceeded max depth {DEFAULT_MAX_PAGE_TREE_DEPTH} at {current}; falling back to /AcroForm /DA"
+            ));
             break;
         }
         if !seen.insert(current) {
+            pdf.push_warning(format!(
+                "/DA inheritance: cycle detected at {current}; falling back to /AcroForm /DA"
+            ));
             break;
         }
 
         let node_obj = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node_obj.as_dict() else {
+        // Extract the values we need while the borrow is live, then drop it so
+        // `pdf` is free for `push_warning` / `resolve` below.
+        let extracted = node_obj
+            .as_dict()
+            .map(|dict| (dict.get("DA").cloned(), dict.get("Parent").cloned()));
+        let _ = node_obj;
+        let Some((da_val, parent_val)) = extracted else {
+            pdf.push_warning(format!(
+                "/DA inheritance: /Parent node {current} is not a dictionary; falling back to /AcroForm /DA"
+            ));
             break;
         };
-
-        let da_val = dict.get("DA").cloned();
-        let parent_val = dict.get("Parent").cloned();
-        // `node_obj` is a reference (not owned), so its lifetime ends when the
-        // last use of `dict` (through it) is complete.  The two `.cloned()` calls
-        // above copy the values we need; after this point the borrow is gone and
-        // we can call `pdf.resolve` below.
-        let _ = node_obj; // suppress unused-variable lint; borrow already ended
 
         if let Some(val) = da_val {
             // /DA may itself be an indirect reference (rule #2 in review patterns).
@@ -713,6 +725,8 @@ fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Opti
         }
 
         match parent_val {
+            // No /Parent — reached the field-tree root. Normal termination, not
+            // an anomaly, so no warning.
             Some(Object::Reference(r)) => {
                 current = r;
                 depth += 1;
@@ -799,16 +813,32 @@ fn lookup_dr_basefont<R: Read + Seek>(
     let mut current = start;
     let mut depth: usize = 0;
     loop {
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH || !seen.insert(current) {
+        // Same graceful-degradation policy as resolve_da: warn and fall back to
+        // /AcroForm /DR (and ultimately the default font) on an over-deep,
+        // cyclic, or non-dictionary parent chain rather than aborting.
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            pdf.push_warning(format!(
+                "/DR font lookup: parent chain exceeded max depth {DEFAULT_MAX_PAGE_TREE_DEPTH} at {current}; falling back to /AcroForm /DR"
+            ));
+            break;
+        }
+        if !seen.insert(current) {
+            pdf.push_warning(format!(
+                "/DR font lookup: cycle detected at {current}; falling back to /AcroForm /DR"
+            ));
             break;
         }
         let node = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node.as_dict() else {
+        let extracted = node
+            .as_dict()
+            .map(|dict| (dict.get("DR").cloned(), dict.get("Parent").cloned()));
+        let _ = node;
+        let Some((dr_val, parent_val)) = extracted else {
+            pdf.push_warning(format!(
+                "/DR font lookup: /Parent node {current} is not a dictionary; falling back to /AcroForm /DR"
+            ));
             break;
         };
-        let dr_val = dict.get("DR").cloned();
-        let parent_val = dict.get("Parent").cloned();
-        let _ = node;
         if let Some(dr) = resolve_to_dict(pdf, dr_val)? {
             dr_candidates.push(dr);
         }
@@ -2901,11 +2931,20 @@ mod tests {
 
     #[test]
     fn resolve_da_cycle_returns_none() {
-        // A /Parent cycle must be detected and return Ok(None) without looping
+        // A /Parent cycle must be detected and return Ok(None) without looping,
+        // and must record a warning (qpdf-style: warn + fall back, not silent,
+        // not abort).
         let raw = build_pdf_with_parent_cycle();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
         let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(da.is_none(), "cycle in /Parent chain must return None");
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|d| {
+                d.severity == crate::Severity::Warning && d.message.contains("cycle detected")
+            }),
+            "a cycle in the /DA parent chain must record a warning, got: {:?}",
+            pdf.repair_diagnostics().entries()
+        );
     }
 
     #[test]
