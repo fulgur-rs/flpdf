@@ -94,15 +94,13 @@ pub(crate) fn install_normal_appearance<R: Read + Seek>(
 ) -> Result<ObjectRef> {
     // Allocate font object first (if needed) so the XObject allocation is
     // sequential and there is no number collision.
-    let font_resource_ref = if let Some((ref res_key, ref base_name, font_obj_ref)) = font_resource {
+    let font_resource_ref = if let Some((ref res_key, ref base_name, font_obj_ref)) = font_resource
+    {
         let mut inner_font_dict = Dictionary::new();
         inner_font_dict.insert("Type", Object::Name(b"Font".to_vec()));
         inner_font_dict.insert("Subtype", Object::Name(b"Type1".to_vec()));
         inner_font_dict.insert("BaseFont", Object::Name(base_name.clone()));
-        inner_font_dict.insert(
-            "Encoding",
-            Object::Name(b"WinAnsiEncoding".to_vec()),
-        );
+        inner_font_dict.insert("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
         pdf.set_object(font_obj_ref, Object::Dictionary(inner_font_dict));
         let mut font_dict = Dictionary::new();
         font_dict.insert(
@@ -609,10 +607,7 @@ fn resolve_inherited_integer<R: Read + Seek>(
 ///
 /// Returns `None` when no `/DA` is found anywhere in the chain or in
 /// `/AcroForm`.
-fn resolve_da<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-) -> Result<Option<Vec<u8>>> {
+fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Option<Vec<u8>>> {
     // Walk /Parent chain for /DA first.
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut current = start;
@@ -682,10 +677,7 @@ fn resolve_da<R: Read + Seek>(
     };
 
     // /AcroForm /DA may also be an indirect reference.
-    let da_raw = acroform_dict
-        .as_ref()
-        .and_then(|d| d.get("DA"))
-        .cloned();
+    let da_raw = acroform_dict.as_ref().and_then(|d| d.get("DA")).cloned();
 
     let da = match da_raw {
         None | Some(Object::Null) => None,
@@ -1206,20 +1198,21 @@ mod tests {
             match operator.as_slice() {
                 b"Tf" => {
                     found_tf = true;
-                    tf_font_name = operands.first().and_then(|o| o.as_name()).map(|n| n.to_vec());
+                    tf_font_name = operands
+                        .first()
+                        .and_then(|o| o.as_name())
+                        .map(|n| n.to_vec());
                 }
                 b"Td" => found_td = true,
                 b"Tj" => {
                     found_tj = true;
-                    tj_operand = operands
-                        .first()
-                        .and_then(|o| {
-                            if let Object::String(bytes) = o {
-                                Some(bytes.clone())
-                            } else {
-                                None
-                            }
-                        });
+                    tj_operand = operands.first().and_then(|o| {
+                        if let Object::String(bytes) = o {
+                            Some(bytes.clone())
+                        } else {
+                            None
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -1269,9 +1262,18 @@ mod tests {
 
     #[test]
     fn split_hard_lines_variants() {
-        assert_eq!(split_hard_lines(b"a\nb"), vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(split_hard_lines(b"a\r\nb"), vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(split_hard_lines(b"a\rb"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(
+            split_hard_lines(b"a\nb"),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(
+            split_hard_lines(b"a\r\nb"),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(
+            split_hard_lines(b"a\rb"),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
         assert_eq!(split_hard_lines(b"plain"), vec![b"plain".to_vec()]);
     }
 
@@ -1320,8 +1322,7 @@ mod tests {
             off1, off2, off3, off4,
         );
         pdf.extend_from_slice(xref.as_bytes());
-        let trailer =
-            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -1334,9 +1335,16 @@ mod tests {
 
         let widget_ref = ObjectRef::new(4, 0);
         let result = generate_text_field_appearance(&mut pdf, widget_ref);
-        assert!(result.is_ok(), "generate_text_field_appearance returned error: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "generate_text_field_appearance returned error: {:?}",
+            result
+        );
         let xobj_ref = result.unwrap();
-        assert!(xobj_ref.is_some(), "generate returned None — field should be handled");
+        assert!(
+            xobj_ref.is_some(),
+            "generate returned None — field should be handled"
+        );
         let xobj_ref = xobj_ref.unwrap();
 
         // The appearance XObject must exist and be a Stream.
@@ -1366,7 +1374,10 @@ mod tests {
             match operator.as_slice() {
                 b"Tf" => {
                     found_tf = true;
-                    tf_name = operands.first().and_then(|o| o.as_name()).map(|n| n.to_vec());
+                    tf_name = operands
+                        .first()
+                        .and_then(|o| o.as_name())
+                        .map(|n| n.to_vec());
                 }
                 b"Tj" => {
                     found_tj = true;
@@ -1468,8 +1479,7 @@ mod tests {
              {off5:010} 00000 n \n",
         );
         pdf.extend_from_slice(xref.as_bytes());
-        let trailer =
-            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -1493,11 +1503,18 @@ mod tests {
         for tok in ContentStreamParser::new(&stream.data).flatten() {
             if let ContentToken::Op { operands, operator } = tok {
                 if operator == b"Tf" {
-                    tf_name = operands.first().and_then(|o| o.as_name()).map(|n| n.to_vec());
+                    tf_name = operands
+                        .first()
+                        .and_then(|o| o.as_name())
+                        .map(|n| n.to_vec());
                 }
             }
         }
-        assert_eq!(tf_name.as_deref(), Some(b"F1" as &[u8]), "Tf name must stay F1");
+        assert_eq!(
+            tf_name.as_deref(),
+            Some(b"F1" as &[u8]),
+            "Tf name must stay F1"
+        );
 
         // The synthesized /Resources/Font/F1 must be Times-Roman.
         let Object::Dictionary(res) = stream.dict.get("Resources").expect("resources") else {
@@ -1546,8 +1563,7 @@ mod tests {
             off1, off2, off3, off4,
         );
         pdf.extend_from_slice(xref.as_bytes());
-        let trailer =
-            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -1578,8 +1594,7 @@ mod tests {
             off1, off2, off3, off4,
         );
         pdf.extend_from_slice(xref.as_bytes());
-        let trailer =
-            format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -1613,7 +1628,10 @@ mod tests {
         let widget_ref = ObjectRef::new(4, 0);
         let result = generate_text_field_appearance(&mut pdf, widget_ref)
             .expect("generate should not error");
-        assert!(result.is_some(), "should produce appearance via AcroForm /DA fallback");
+        assert!(
+            result.is_some(),
+            "should produce appearance via AcroForm /DA fallback"
+        );
     }
 
     /// Verify that multiline Td x-offsets do not accumulate across lines.
@@ -1629,9 +1647,9 @@ mod tests {
             font_resource_name: b"Helv".to_vec(),
             font_size: 10.0,
             color: TextColor::Gray(0.0),
-            bbox_w: 30.0,  // narrow — forces each word to its own line
+            bbox_w: 30.0, // narrow — forces each word to its own line
             bbox_h: 60.0,
-            quadding: 0,   // left-align
+            quadding: 0, // left-align
             multiline: true,
             std_font: StandardFont::from_base_name(b"Helv"),
         };
@@ -1639,11 +1657,17 @@ mod tests {
 
         let mut td_ops: Vec<(f64, f64)> = Vec::new();
         for tok in ContentStreamParser::new(&content).flatten() {
-            let ContentToken::Op { operands, operator } = tok else { continue };
+            let ContentToken::Op { operands, operator } = tok else {
+                continue;
+            };
             if operator.as_slice() == b"Td" {
                 if let (Some(x_obj), Some(y_obj)) = (operands.first(), operands.get(1)) {
-                    let x = x_obj.as_real().or_else(|| x_obj.as_integer().map(|i| i as f64));
-                    let y = y_obj.as_real().or_else(|| y_obj.as_integer().map(|i| i as f64));
+                    let x = x_obj
+                        .as_real()
+                        .or_else(|| x_obj.as_integer().map(|i| i as f64));
+                    let y = y_obj
+                        .as_real()
+                        .or_else(|| y_obj.as_integer().map(|i| i as f64));
                     if let (Some(x), Some(y)) = (x, y) {
                         td_ops.push((x, y));
                     }
@@ -1651,12 +1675,22 @@ mod tests {
             }
         }
 
-        assert!(td_ops.len() >= 3, "expected at least 3 Td ops for 3 wrapped lines, got {}", td_ops.len());
+        assert!(
+            td_ops.len() >= 3,
+            "expected at least 3 Td ops for 3 wrapped lines, got {}",
+            td_ops.len()
+        );
 
         // First Td: absolute x (2.0 for left-align), positive first_y.
         let (x0, y0) = td_ops[0];
-        assert!((x0 - 2.0).abs() < 0.01, "first Td x should be 2.0, got {x0}");
-        assert!(y0 > 0.0, "first Td y should be positive (first_y), got {y0}");
+        assert!(
+            (x0 - 2.0).abs() < 0.01,
+            "first Td x should be 2.0, got {x0}"
+        );
+        assert!(
+            y0 > 0.0,
+            "first Td y should be positive (first_y), got {y0}"
+        );
 
         // Subsequent Td ops: x must be the delta from previous x.
         // For left-align, prev_x is always 2.0, so delta == 0.
@@ -1666,7 +1700,11 @@ mod tests {
                 "Td[{}] x (delta) should be 0.0 for left-align, got {x}",
                 i + 1
             );
-            assert!(y < 0.0, "Td[{}] y should be negative (down-move), got {y}", i + 1);
+            assert!(
+                y < 0.0,
+                "Td[{}] y should be negative (down-move), got {y}",
+                i + 1
+            );
         }
     }
 }
