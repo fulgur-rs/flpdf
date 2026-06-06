@@ -457,8 +457,35 @@ fn cli_stream_data_ccitt_compress() {
 }
 
 // ---------------------------------------------------------------------------
-// JBIG2Decode passthrough × 2 representative modes (uncompress + compress)
+// JBIG2Decode passthrough × 3 modes
 // ---------------------------------------------------------------------------
+
+/// JBIG2Decode × preserve: /Filter preserved, data byte-identical.
+#[test]
+fn cli_stream_data_jbig2_preserve() {
+    let fake_jbig2: &[u8] = &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let src = build_pdf_with_prefiltered_stream(fake_jbig2, "/JBIG2Decode", None);
+    let out = rewrite_with_args(
+        &src,
+        &[
+            "--stream-data=preserve",
+            "--full-rewrite",
+            "--remove-unreferenced-resources=no", // flpdf-s9s
+        ],
+    );
+
+    let stream = extract_obj4(&out);
+    assert!(
+        matches!(stream.dict.get("Filter"), Some(Object::Name(n)) if n.as_slice() == b"JBIG2Decode"),
+        "JBIG2Decode preserve: /Filter must remain /JBIG2Decode; got {:?}",
+        stream.dict.get("Filter")
+    );
+    assert_eq!(
+        stream.data.as_slice(),
+        fake_jbig2,
+        "JBIG2Decode preserve: stream data must be byte-identical"
+    );
+}
 
 /// JBIG2Decode × uncompress: passthrough intact.
 #[test]
@@ -515,8 +542,35 @@ fn cli_stream_data_jbig2_compress() {
 }
 
 // ---------------------------------------------------------------------------
-// JPXDecode passthrough × 2 representative modes (uncompress + compress)
+// JPXDecode passthrough × 3 modes
 // ---------------------------------------------------------------------------
+
+/// JPXDecode × preserve: /Filter preserved, data byte-identical.
+#[test]
+fn cli_stream_data_jpx_preserve() {
+    let fake_jpx: &[u8] = &[0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0xDD, 0xEE];
+    let src = build_pdf_with_prefiltered_stream(fake_jpx, "/JPXDecode", None);
+    let out = rewrite_with_args(
+        &src,
+        &[
+            "--stream-data=preserve",
+            "--full-rewrite",
+            "--remove-unreferenced-resources=no", // flpdf-s9s
+        ],
+    );
+
+    let stream = extract_obj4(&out);
+    assert!(
+        matches!(stream.dict.get("Filter"), Some(Object::Name(n)) if n.as_slice() == b"JPXDecode"),
+        "JPXDecode preserve: /Filter must remain /JPXDecode; got {:?}",
+        stream.dict.get("Filter")
+    );
+    assert_eq!(
+        stream.data.as_slice(),
+        fake_jpx,
+        "JPXDecode preserve: stream data must be byte-identical"
+    );
+}
 
 /// JPXDecode × uncompress: passthrough intact.
 #[test]
