@@ -64,6 +64,7 @@ pub mod object_copy;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
+pub mod page_annotation_enum;
 pub mod page_closure;
 pub mod page_collate;
 pub mod page_combine;
@@ -131,6 +132,9 @@ pub use object_copy::copy_objects;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};
+pub use page_annotation_enum::{
+    enumerate_document_annotations, enumerate_page_annotations, EnumeratedAnnotation,
+};
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
