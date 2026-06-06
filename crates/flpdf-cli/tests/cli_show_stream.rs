@@ -5,35 +5,11 @@ use predicates::prelude::*;
 // Helper: build a minimal in-memory PDF with one stream object (obj 3).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a minimal valid PDF with obj 3 as a stream using the given filter and
-/// raw data.  Returns the PDF bytes.
+/// Build a minimal valid PDF with obj 3 as a stream using the given filter name
+/// (`/Filter /<name>`) and raw data.  Thin wrapper over
+/// [`build_pdf_with_filter_literal`].
 fn build_pdf_with_stream(filter_name: &str, stream_data: &[u8]) -> Vec<u8> {
-    let length = stream_data.len();
-    let mut bytes = b"%PDF-1.4\n".to_vec();
-
-    let cat_offset = bytes.len();
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    let pages_offset = bytes.len();
-    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-
-    let stream_offset = bytes.len();
-    bytes.extend_from_slice(
-        format!("3 0 obj\n<< /Filter /{filter_name} /Length {length} >>\nstream\n").as_bytes(),
-    );
-    bytes.extend_from_slice(stream_data);
-    bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-    let xref_offset = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 4\n");
-    bytes.extend_from_slice(b"0000000000 65535 f \n");
-    bytes.extend_from_slice(format!("{cat_offset:010} 00000 n \n").as_bytes());
-    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
-    bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
-    bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
-    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-
-    bytes
+    build_pdf_with_filter_literal(&format!("/{filter_name}"), stream_data)
 }
 
 #[test]

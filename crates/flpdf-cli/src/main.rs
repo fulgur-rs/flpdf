@@ -3392,11 +3392,10 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     };
 
     if cmd.raw {
-        let bytes = stream.data.clone();
         if let Some(path) = cmd.out {
-            std::fs::write(path, bytes)?;
+            std::fs::write(path, &stream.data)?;
         } else {
-            std::io::stdout().write_all(&bytes)?;
+            std::io::stdout().write_all(&stream.data)?;
             std::io::stdout().flush()?;
         }
         return Ok(());
