@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::Pdf;
+use flpdf::{ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -89,4 +89,34 @@ fn has_outlines_false_when_absent() {
 fn has_outlines_false_when_outline_dict_has_no_first() {
     let mut pdf = Pdf::open(Cursor::new(outline_present_but_empty_pdf())).unwrap();
     assert!(!pdf.outline().has_outlines().unwrap());
+}
+
+#[test]
+fn get_root_materializes_tree_with_titles_counts_parents() {
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+
+    // Two top-level nodes: A, B.
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0].title, "A");
+    assert_eq!(roots[0].depth, 0);
+    assert_eq!(roots[0].parent, Some(ObjectRef::new(4, 0)));
+    assert_eq!(roots[0].count, 1);
+    assert_eq!(roots[1].title, "B");
+    assert_eq!(roots[1].count, 2);
+
+    // A has one child A1.
+    assert_eq!(roots[0].children.len(), 1);
+    let a1 = &roots[0].children[0];
+    assert_eq!(a1.title, "A1");
+    assert_eq!(a1.depth, 1);
+    assert_eq!(a1.parent, Some(ObjectRef::new(5, 0)));
+    assert_eq!(a1.count, 0); // /Count absent -> 0 (qpdf)
+    assert_eq!(a1.object_ref, ObjectRef::new(6, 0));
+}
+
+#[test]
+fn get_root_empty_when_no_outline() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    assert!(pdf.outline().get_root().unwrap().is_empty());
 }
