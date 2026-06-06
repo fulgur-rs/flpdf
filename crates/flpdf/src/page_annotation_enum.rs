@@ -15,13 +15,15 @@
 //! the widget and its field may be separate objects, with the widget holding a
 //! `/Parent` reference to the field.  The linkage rule handles both cases:
 //!
-//! 1. If the widget dict carries a non-Null `/FT` (any type, including a
-//!    Reference — its presence alone identifies a field), the widget *is* its
-//!    own field: return `Some(annot_ref)`.
+//! 1. If the widget dict carries a non-Null `/FT` **or** `/T` (any type,
+//!    including a Reference — presence alone identifies a field), the widget
+//!    *is* its own terminal field: return `Some(annot_ref)`. `/T` must be
+//!    checked too because a merged terminal field that *inherits* `/FT` from an
+//!    ancestor has no direct `/FT` but always carries its own `/T` (field name).
 //! 2. Otherwise return the widget's direct `/Parent` reference — the terminal
 //!    field that owns this widget.
-//! 3. If the widget has neither `/FT` nor a `/Parent` reference, return `None`
-//!    (orphaned widget with no traceable field).
+//! 3. If the widget has neither `/FT`/`/T` nor a `/Parent` reference, return
+//!    `None` (orphaned widget with no traceable field).
 //!
 //! The owning field is deliberately the *direct* parent rather than the nearest
 //! `/FT`-bearing ancestor: field attributes inherit *down* the field tree, so a
@@ -221,9 +223,16 @@ fn find_field_ref<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<
         return Ok(None);
     };
 
-    // Merged widget: a non-Null /FT (review-pattern #2: it may be indirect, so
-    // presence alone is enough) means the widget IS its own field.
-    if matches!(dict.get("FT"), Some(v) if !matches!(v, Object::Null)) {
+    // Merged widget: a non-Null /FT OR /T (field name) means the widget IS its
+    // own terminal field. /FT alone is not sufficient: a merged terminal field
+    // that *inherits* /FT from an ancestor has no direct /FT, but a terminal
+    // field always carries its own /T. Without the /T check such a field would
+    // fall through to the /Parent branch below and be wrongly aggregated into
+    // the ancestor together with its siblings. (review-pattern #2: both keys may
+    // be indirect, so presence — not value type — is what matters.)
+    if matches!(dict.get("FT"), Some(v) if !matches!(v, Object::Null))
+        || matches!(dict.get("T"), Some(v) if !matches!(v, Object::Null))
+    {
         return Ok(Some(start));
     }
 
@@ -414,6 +423,39 @@ mod tests {
         assert!(a.is_widget);
         // field_ref should point to parent (obj 5 which has /FT)
         assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: merged terminal fields that INHERIT /FT from a common ancestor must
+    // resolve to themselves, not be aggregated into the ancestor (regression).
+    // -----------------------------------------------------------------------
+    //
+    // Object layout:
+    //   4 = Widget+field merged (no direct /FT, has /T, /Parent 5 0 R)
+    //   6 = Widget+field merged (no direct /FT, has /T, /Parent 5 0 R)
+    //   5 = Ancestor field supplying the inherited /FT (/FT /Tx, /Kids [4 6])
+    //
+    // Both leaves omit /FT (inherited) but carry their own /T. They are distinct
+    // terminal fields and must each report field_ref == itself — checking only
+    // /FT would send both to obj 5 and wrongly merge the siblings.
+
+    #[test]
+    fn merged_fields_inheriting_ft_are_not_aggregated_to_ancestor() {
+        let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [0 0 100 20] /T (field0) /Parent 5 0 R >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /FT /Tx /T (group) /Kids [4 0 R 6 0 R] >>\nendobj\n";
+        let obj6: &[u8] = b"6 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [0 30 100 50] /T (field1) /Parent 5 0 R >>\nendobj\n";
+
+        let bytes = build_pdf(Some("[4 0 R 6 0 R]"), &[(4, obj4), (5, obj5), (6, obj6)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
+        assert_eq!(annots.len(), 2);
+        // Each merged terminal field resolves to itself — NOT both to obj 5.
+        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(4, 0)));
+        assert_eq!(annots[1].field_ref, Some(ObjectRef::new(6, 0)));
     }
 
     // -----------------------------------------------------------------------
