@@ -1317,4 +1317,125 @@ mod tests {
             "error must mention FlateDecode only policy; got: {msg}"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CARRY-OVER flpdf-9hc.7.1: LZW malformed-rejection unit tests
+    //
+    // Verifies that lzw_decode (via decode_stream_data) returns Err for
+    // inputs containing out-of-range codes (review-pattern #3: external
+    // integer values must not cause silent wrap-around or panic).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A 9-bit LZW stream containing a code that is one past the current table
+    /// end (code 258, "KwKwK" scenario with no previous entry) must return Err.
+    /// This exercises the "one past table end but no previous entry" branch in
+    /// lzw_decode (~L610-613).
+    #[test]
+    fn lzw_decode_malformed_one_past_end_without_prev_returns_err() {
+        // Craft a minimal LZW stream:
+        //   9-bit codes, no ClearCode prefix (so table has entries 0-257 only,
+        //   next entry == 258).  Emit code 258 directly; since there is no
+        //   previous entry, this must Err.
+        //
+        // Code 258 in 9-bit big-endian MSB-first packing:
+        //   0b100_000_010 = 0x102
+        //   Packed into two bytes at the start of the bit buffer:
+        //     bits 8..0 of code 258 across two bytes:
+        //     byte 0: bits [8..1] = 0b1000_0001 = 0x81
+        //     byte 1: bits [0]   = 0b0_0000000 + EOD code...
+        //   Simpler: pack [ClearCode=256][code=258][EOD=257].
+        //   ClearCode resets the table but also clears prev_entry; then code 258
+        //   comes in with no prev → Err.
+        //
+        //   Bit layout (9 bits each, MSB first):
+        //     ClearCode 256 = 0b100000000 → 9 bits
+        //     code 258      = 0b100000010 → 9 bits
+        //     EOD 257       = 0b100000001 → 9 bits (never reached)
+        //   Total = 27 bits → 4 bytes.
+        //
+        //   Byte packing (MSB first across bytes):
+        //     256 = 1 00000000
+        //     258 = 1 00000010
+        //     Concatenated 18 bits: 1_00000000_1_00000010 = 0x10082 padded to 3 bytes
+        //     byte0 = 0x80, byte1 = 0x40 (256 = 0x100 >> 1, then 258 = 0x102 << 0)
+        //   Let's compute manually:
+        //     bit buffer: 1 00000000 | 1 00000010 = 0b10000000010000001_0
+        //       byte0 = bits [17..10] = 0b10000000 = 0x80
+        //       byte1 = bits [9..2]   = 0b01000000 = 0x40  (0b0_10000001 >> 1)
+        //       byte2 = bits [1..0]   = 0b10 << 6  = 0x80
+        //
+        //   Verified against the lzw_decode bit-extraction logic.
+        let malformed: &[u8] = &[0x80, 0x40, 0x80];
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
+        let result = decode_stream_data(&dict, malformed);
+        assert!(
+            result.is_err(),
+            "LZWDecode: code-258-after-clear-with-no-prev must return Err"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("LZWDecode"),
+            "error must mention LZWDecode; got: {msg}"
+        );
+        assert!(
+            msg.contains("no previous entry") || msg.contains("out of range"),
+            "error must describe the out-of-range / no-prev condition; got: {msg}"
+        );
+    }
+
+    /// A 9-bit LZW stream containing a genuinely out-of-range code (≥ 259 when
+    /// table has only 258 entries) must return Err with an "out of range" message.
+    /// This exercises the explicit range-check in lzw_decode (~L615-619).
+    #[test]
+    fn lzw_decode_malformed_genuinely_out_of_range_code_returns_err() {
+        // We want code 259 (0b100000011) to appear AFTER code 258 has been
+        // added by processing one normal code, making table size == 259.
+        // That is complicated; instead use the simpler path:
+        //   Emit ClearCode (resets table to 258 entries), then code 259.
+        //   Table size after clear is 258; code 259 > 258 → "out of range".
+        //
+        // Bit layout (9 bits each, MSB first):
+        //   ClearCode 256 = 0b100000000
+        //   code 259      = 0b100000011
+        //   = 18 bits: 1_00000000_1_00000011
+        //   byte0 = top 8 bits = 0b10000000 = 0x80
+        //   byte1 = next 8     = 0b01000000 = 0x40  (wait — need 259 after)
+        //
+        //   Concatenate 9+9 = 18 bits:
+        //     0b1_0000_0000_1_0000_0011
+        //     split into bytes:
+        //       byte0 = 0b1000_0000 = 0x80
+        //       byte1 = 0b0100_0000 = 0x40  [wrong: 0b01_00000011 >> 1 = 0b0010...]
+        //
+        //   Correct bit-level packing (MSB first):
+        //     bits: 1 0000_0000  1 0000_0011  (18 bits total)
+        //     byte 0: bits[17..10] = 1000_0000 = 0x80
+        //     byte 1: bits[9..2]   = 0100_0000 | (0b00_1100_0000 >> 2)...
+        //   Let's just do it directly:
+        //     value = (256 << 9) | 259 = 0x20103
+        //     byte0 = (0x20103 >> 10) & 0xFF = 0x80
+        //     byte1 = (0x20103 >> 2)  & 0xFF = 0x40
+        //     byte2 = (0x20103 << 6)  & 0xFF = 0xC0  (bits[1..0]=0b11, shifted left 6)
+        //
+        //   After ClearCode the table has entries 0..=257 (size 258).
+        //   Code 259 > 258 → "out of range" branch.
+        let malformed: &[u8] = &[0x80, 0x40, 0xC0];
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
+        let result = decode_stream_data(&dict, malformed);
+        assert!(
+            result.is_err(),
+            "LZWDecode: genuinely out-of-range code after ClearCode must return Err"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("LZWDecode"),
+            "error must mention LZWDecode; got: {msg}"
+        );
+        assert!(
+            msg.contains("out of range") || msg.contains("no previous entry"),
+            "error must describe the out-of-range condition; got: {msg}"
+        );
+    }
 }
