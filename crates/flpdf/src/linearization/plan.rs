@@ -788,7 +788,7 @@ impl Default for LinearizationPlan {
 // ObjStm batch planning
 // ---------------------------------------------------------------------------
 
-/// Part-tagged ObjStm batch plan produced by [`LinearizationPlan::objstm_batches`].
+/// Part-tagged ObjStm batch plan produced by `LinearizationPlan::objstm_batches`.
 ///
 /// Each inner `Vec<ObjectRef>` describes one ObjStm container; the contained
 /// refs are still **original** (pre-renumber) object references.  Renumbering

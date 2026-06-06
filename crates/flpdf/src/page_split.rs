@@ -166,7 +166,7 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
 /// This is a pure function suitable for unit testing independent of PDF I/O.
 /// It is the naming used by qpdf 11.9.0 for `--split-pages >= 2`. The
 /// `--split-pages=1` single-number form is produced by [`split_pages`] via
-/// the internal [`chunk_output_path`] helper, so this public helper keeps a
+/// the internal `chunk_output_path` helper, so this public helper keeps a
 /// stable signature and always emits the range form.
 ///
 /// # Naming rule (observed with qpdf 11.9.0)

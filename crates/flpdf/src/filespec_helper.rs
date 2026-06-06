@@ -247,7 +247,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 ///
 /// All accessors except [`embedded_file`](FileSpec::embedded_file) are
 /// cheap dictionary lookups that return `Ok(None)` when the key is absent.
-/// [`embedded_file`] resolves the `/EF /F` (or `/EF /UF`) indirect reference.
+/// [`embedded_file`](FileSpec::embedded_file) resolves the `/EF /F` (or `/EF /UF`) indirect reference.
 pub struct FileSpec<'a, R: Read + Seek> {
     filespec_ref: ObjectRef,
     pdf: &'a mut Pdf<R>,
@@ -1090,7 +1090,7 @@ fn sanitize_imported_object<R: Read + Seek>(
 ///    `[UF, F, Unix, Mac, DOS]`; the first key whose value is an indirect
 ///    reference that resolves to a `/EmbeddedFile` stream is selected.
 /// 3. The stream `data` bytes are copied verbatim (no decode/re-encode), and
-///    the stream dictionary is **sanitized** ([`sanitize_imported_object`]):
+///    the stream dictionary is **sanitized** (`sanitize_imported_object`):
 ///    every indirect reference it carries — at any nesting depth, including
 ///    `/Filter`, `/DecodeParms`, `/Params`, or refs nested inside an inlined
 ///    `/Params` — is inlined to its resolved value, and anything that cannot

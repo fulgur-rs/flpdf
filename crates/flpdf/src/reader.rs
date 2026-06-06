@@ -167,7 +167,7 @@ impl EncryptionMode {
 /// Read-only snapshot of an encrypted document's `/Encrypt` parameters,
 /// surfaced for the `show-encryption` inspection subcommand
 /// (flpdf-9hc.3.17). Built by re-reading the `/Encrypt` dictionary plus the
-/// already-authenticated [`EncryptionState`]; does not run or alter
+/// already-authenticated `EncryptionState`; does not run or alter
 /// authentication.
 #[derive(Debug, Clone)]
 pub struct EncryptionInfo {
@@ -310,7 +310,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `show-encryption` inspection subcommand (flpdf-9hc.3.17).
     ///
     /// Returns `None` for plaintext PDFs. Re-reads the `/Encrypt` dictionary
-    /// (for V/R/Length/Filter/CF, which the authenticated [`EncryptionState`]
+    /// (for V/R/Length/Filter/CF, which the authenticated `EncryptionState`
     /// does not retain verbatim) and combines it with the already-resolved
     /// crypt-filter methods. This does NOT re-run or alter authentication
     /// (layer-2 owns that ordering); it only reflects state from a document

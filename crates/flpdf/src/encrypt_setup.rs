@@ -182,7 +182,7 @@ impl EncryptParams {
 /// Built by the CLI layer from the donor PDF's on-disk state (opened with
 /// [`crate::Pdf::open_with_options`]) and stored in
 /// [`crate::WriteOptions::copy_encryption`].  The writer uses it to construct
-/// an [`crate::writer::EncryptionContext`] directly, bypassing the normal
+/// an `EncryptionContext` directly, bypassing the normal
 /// password-derivation path.
 ///
 /// **Scope:** Only V=4 AES-128 donors are supported in this release.
