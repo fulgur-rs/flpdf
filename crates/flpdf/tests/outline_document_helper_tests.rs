@@ -120,3 +120,27 @@ fn get_root_empty_when_no_outline() {
     let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
     assert!(pdf.outline().get_root().unwrap().is_empty());
 }
+
+#[test]
+fn iter_yields_preorder() {
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
+}
+
+#[test]
+fn walk_visits_preorder_with_depth() {
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    pdf.outline()
+        .walk(|node, depth| seen.push((node.title.clone(), depth)))
+        .unwrap();
+    assert_eq!(
+        seen,
+        vec![
+            ("A".to_string(), 0),
+            ("A1".to_string(), 1),
+            ("B".to_string(), 0),
+        ]
+    );
+}

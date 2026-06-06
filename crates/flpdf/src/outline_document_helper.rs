@@ -164,6 +164,29 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
         Ok(nodes)
     }
+
+    /// Pre-order iterator over every materialized node (owned). Each yielded
+    /// node has its `children` cleared — the flattened view is linear and
+    /// `depth` conveys structure; use [`get_root`](Self::get_root) or
+    /// [`walk`](Self::walk) when you need populated `children`.
+    pub fn iter(&mut self) -> Result<impl Iterator<Item = OutlineNode>> {
+        let roots = self.get_root()?;
+        let mut flat = Vec::new();
+        for node in &roots {
+            flatten_preorder(node, &mut flat);
+        }
+        Ok(flat.into_iter())
+    }
+
+    /// Visit every node pre-order, passing `(node, depth)` to `visitor`. The
+    /// visited nodes have populated `children`. Mirrors a qpdf outline walk.
+    pub fn walk<F: FnMut(&OutlineNode, usize)>(&mut self, mut visitor: F) -> Result<()> {
+        let roots = self.get_root()?;
+        for node in &roots {
+            walk_node(node, &mut visitor);
+        }
+        Ok(())
+    }
 }
 
 impl<R: Read + Seek> Pdf<R> {
@@ -179,6 +202,25 @@ fn read_title(value: Option<&Object>) -> String {
     match value {
         Some(Object::String(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
         Some(_) | None => String::new(),
+    }
+}
+
+/// Push `node` (with `children` cleared) then its descendants, pre-order.
+fn flatten_preorder(node: &OutlineNode, out: &mut Vec<OutlineNode>) {
+    out.push(OutlineNode {
+        children: Vec::new(),
+        ..node.clone()
+    });
+    for child in &node.children {
+        flatten_preorder(child, out);
+    }
+}
+
+/// Invoke `visitor(node, node.depth)` then recurse into children, pre-order.
+fn walk_node<F: FnMut(&OutlineNode, usize)>(node: &OutlineNode, visitor: &mut F) {
+    visitor(node, node.depth);
+    for child in &node.children {
+        walk_node(child, visitor);
     }
 }
 
