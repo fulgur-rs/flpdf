@@ -378,3 +378,124 @@ fn disable_mode_on_xref_table_form_preserves_classic_table() {
         "Disable mode on xref-table input must keep classic xref table form"
     );
 }
+
+// ── Generate mode on real fixtures: Catalog-first renumber + ObjStm parity ───
+
+/// Full-rewrite + Generate-mode round-trip on a real multi-page fixture.
+///
+/// Regression guard for the Catalog-first renumber path: when objects are
+/// packed into an ObjStm, every member must be emitted under its NEW (renumbered)
+/// object number AND have its internal references rewritten to NEW numbers. A
+/// member that keeps an OLD internal `/Pages` reference produces a dangling link
+/// that resolves to Null, which qpdf reports as "catalog /Type entry missing or
+/// invalid". This is the discriminating chain: it follows /Root → Catalog →
+/// /Pages → /Kids → /Page, so it fails if the Catalog's internal /Pages ref is
+/// not renumbered, regardless of whether the Catalog's own number happens to be
+/// stable.
+fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pages: usize) {
+    let source =
+        std::fs::read(fixture_path).unwrap_or_else(|e| panic!("read fixture {fixture_path}: {e}"));
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options)
+        .unwrap_or_else(|e| panic!("write {fixture_path}: {e:?}"));
+
+    let report = check_reader(Cursor::new(output.clone()))
+        .expect("check_reader must not return Err on rewritten output");
+    assert!(
+        report.valid,
+        "{fixture_path}: Generate-mode output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    let mut reopened = Pdf::open_mem(&output).unwrap();
+
+    // At least one ObjStm container must exist (otherwise the test would not
+    // exercise the renumbered-member path at all).
+    let mut found_objstm = false;
+    for r in reopened.object_refs() {
+        if let Ok(Object::Stream(s)) = reopened.resolve(r) {
+            if matches!(s.dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"ObjStm") {
+                found_objstm = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_objstm,
+        "{fixture_path}: Generate mode must emit at least one ObjStm container"
+    );
+
+    // /Root → Catalog.
+    let root_ref = reopened
+        .root_ref()
+        .unwrap_or_else(|| panic!("{fixture_path}: trailer must have a resolvable /Root"));
+    let catalog = reopened.resolve(root_ref).unwrap();
+    let catalog_dict = match &catalog {
+        Object::Dictionary(d) => d,
+        other => panic!("{fixture_path}: /Root must resolve to a dict, got {other:?}"),
+    };
+    assert_eq!(
+        catalog_dict.get("Type"),
+        Some(&Object::Name(b"Catalog".to_vec())),
+        "{fixture_path}: Catalog /Type must be /Catalog"
+    );
+
+    // Catalog /Pages → Pages tree root. This is the load-bearing assertion: a
+    // non-renumbered /Pages ref resolves to Null here.
+    let pages_ref = match catalog_dict.get("Pages") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("{fixture_path}: Catalog /Pages must be an indirect ref, got {other:?}"),
+    };
+    let pages = reopened.resolve(pages_ref).unwrap();
+    let pages_dict = match &pages {
+        Object::Dictionary(d) => d,
+        other => panic!(
+            "{fixture_path}: Catalog /Pages must resolve to a /Pages dict, got {other:?} \
+             (a dangling /Pages ref indicates members were not renumbered)"
+        ),
+    };
+    assert_eq!(
+        pages_dict.get("Type"),
+        Some(&Object::Name(b"Pages".to_vec())),
+        "{fixture_path}: /Pages /Type must be /Pages"
+    );
+
+    // Walk /Kids and confirm each leaf resolves to a /Page.
+    let kids = match pages_dict.get("Kids") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("{fixture_path}: /Pages /Kids must be an array, got {other:?}"),
+    };
+    assert_eq!(
+        kids.len(),
+        expected_pages,
+        "{fixture_path}: expected {expected_pages} page kids"
+    );
+    for kid in &kids {
+        let kid_ref = match kid {
+            Object::Reference(r) => *r,
+            other => panic!("{fixture_path}: /Kids entry must be an indirect ref, got {other:?}"),
+        };
+        let page = reopened.resolve(kid_ref).unwrap();
+        match &page {
+            Object::Dictionary(d) => assert_eq!(
+                d.get("Type"),
+                Some(&Object::Name(b"Page".to_vec())),
+                "{fixture_path}: kid must be a /Page dict"
+            ),
+            other => panic!("{fixture_path}: kid must resolve to a /Page dict, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn generate_mode_full_rewrite_roundtrips_real_fixtures() {
+    assert_generate_roundtrip_structurally_valid("../../tests/fixtures/compat/one-page.pdf", 1);
+    assert_generate_roundtrip_structurally_valid("../../tests/fixtures/compat/two-page.pdf", 2);
+    assert_generate_roundtrip_structurally_valid("../../tests/fixtures/compat/three-page.pdf", 3);
+}

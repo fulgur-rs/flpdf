@@ -2347,13 +2347,28 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             )
         })?;
 
-    // member_to_batch: ObjectRef → (container_obj_num, index_in_batch)
+    // member_to_batch: ORIGINAL ObjectRef → (container_obj_num, index_in_batch).
+    // Keyed on ORIGINAL refs because the main emit loop tests membership against
+    // each object's ORIGINAL ref to decide whether to skip it (it lives in an
+    // ObjStm instead of being emitted as a plain indirect).
     use std::collections::HashMap;
     let mut member_to_batch: HashMap<ObjectRef, (u32, u32)> = HashMap::new();
+    // member_new_to_batch: NEW member object number → (container_obj_num,
+    // index_in_batch). Keyed on NEW numbers because the type-2 (compressed)
+    // xref entries are written in NEW-number space; each member's xref slot must
+    // be located by the number it carries in the renumbered output.
+    let mut member_new_to_batch: HashMap<u32, (u32, u32)> = HashMap::new();
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_num = container_refs[batch_idx].number;
         for (idx_in_batch, &member_ref) in batch.iter().enumerate() {
             member_to_batch.insert(member_ref, (container_num, idx_in_batch as u32));
+            // ObjStm members are reachable objects (Catalog/Pages/etc.), so they
+            // are present in the Catalog-first renumber map. A member absent from
+            // the map is a planner/renumber inconsistency — surface it.
+            let new = renumber.new_for_original(member_ref).ok_or_else(|| {
+                crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
+            })?;
+            member_new_to_batch.insert(new.number, (container_num, idx_in_batch as u32));
         }
     }
 
@@ -2709,7 +2724,21 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // ── Step 5: emit each ObjStm container ───────────────────────────────────
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_ref = container_refs[batch_idx];
-        let body = object_streams::emit_objstm_body(pdf, batch)?;
+        // Resolve each member by its ORIGINAL ref, rewrite its internal
+        // references to NEW numbers, and pair it with its NEW ref so the ObjStm
+        // pair table records the renumbered member number. Without this the
+        // members keep their old numbers and old internal links, corrupting the
+        // Catalog-first output (e.g. Catalog /Pages would dangle).
+        let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(batch.len());
+        for &old in batch {
+            let mut obj = pdf.resolve(old)?;
+            crate::rewrite_renumber::renumber_refs_in_place(&mut obj, &renumber)?;
+            let new = renumber.new_for_original(old).ok_or_else(|| {
+                crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
+            })?;
+            resolved.push((new, obj));
+        }
+        let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
@@ -2861,7 +2890,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         ),
                     );
                 } else if let Some(&(container_num, index_in_batch)) =
-                    member_to_batch.get(&ObjectRef::new(number, 0))
+                    member_new_to_batch.get(&number)
                 {
                     // Member object that lives inside an ObjStm container.
                     // Compressed members have implicit generation 0; the
