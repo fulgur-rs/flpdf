@@ -245,3 +245,54 @@ fn extracted_doc_has_no_unrelated_objects() {
     assert_eq!(count_subtype(&mut rt, b"Image"), 0, "page 2's image must not leak in");
     assert_eq!(pages::page_refs(&mut rt).unwrap().len(), 1);
 }
+
+#[test]
+fn extracted_contents_match_source_page() {
+    let src = two_page_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let src_pages = pages::page_refs(&mut source).unwrap();
+    let src_leaf = source.resolve_borrowed(src_pages[0]).unwrap().as_dict().cloned().unwrap();
+    let src_contents_ref = match src_leaf.get("Contents") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected /Contents ref, got {other:?}"),
+    };
+    let src_stream = match source.resolve(src_contents_ref).unwrap() {
+        Object::Stream(s) => s,
+        other => panic!("expected stream, got {other:?}"),
+    };
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+    let out_contents_ref = match leaf.get("Contents") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected /Contents ref, got {other:?}"),
+    };
+    let out_stream = match out.resolve(out_contents_ref).unwrap() {
+        Object::Stream(s) => s,
+        other => panic!("expected stream, got {other:?}"),
+    };
+
+    assert_eq!(out_stream.data, src_stream.data, "content stream bytes must be identical");
+}
+
+#[test]
+fn out_of_range_index_errors() {
+    let src = two_page_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    assert!(extract_page(&mut source, 2).is_err(), "index 2 is out of range (2 pages)");
+}
+
+#[test]
+fn source_is_not_modified_by_extract() {
+    let src = two_page_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let before = pages::page_refs(&mut source).unwrap();
+    assert_eq!(before.len(), 2);
+
+    let _ = extract_page(&mut source, 0).unwrap();
+
+    // Source still has both pages, unchanged refs/order.
+    let after = pages::page_refs(&mut source).unwrap();
+    assert_eq!(after, before, "extract_page must not mutate the source page tree");
+}
