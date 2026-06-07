@@ -29,7 +29,7 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 }
 
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
-/// honouring any `/DecodeParms` (including PNG/TIFF predictors).
+/// honoring any `/DecodeParms` (including PNG/TIFF predictors).
 ///
 /// # Errors
 ///

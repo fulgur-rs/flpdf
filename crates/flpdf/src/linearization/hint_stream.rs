@@ -511,9 +511,9 @@ fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintT
 /// # Errors
 ///
 /// Returns [`crate::Error::Unsupported`] when a Page Offset or Shared Object
-/// header field value does not fit in its fixed-width Annex F slot (e.g. a
-/// 32-bit field whose value exceeds `u32::MAX`), which typically indicates a
-/// file larger than 4 GiB or a malformed linearization plan.
+/// header field value does not fit in its fixed-width Annex F slot (e.g. a value
+/// exceeding `u32::MAX` for a 32-bit slot), which typically indicates a file
+/// larger than 4 GiB or a malformed linearization plan.
 pub fn encode_hint_stream(
     page_offset: &PageOffsetHintTable,
     shared_object: &SharedObjectHintTable,

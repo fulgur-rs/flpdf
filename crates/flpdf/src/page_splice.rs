@@ -30,7 +30,7 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] if `remove.end > page_count`.
+/// - [`Error::Unsupported`] if `remove.end` exceeds the document's page count.
 /// - [`Error::Missing`] if the result would be an empty document.
 pub fn splice_pages<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -45,7 +45,7 @@ pub fn splice_pages<R: Read + Seek>(
 /// # Errors
 ///
 /// - [`Error::Unsupported`] if `remove.start > remove.end`, if
-///   `remove.end > page_count`, if the insert position is not found in the
+///   `remove.end` exceeds the document's page count, if the insert position is not found in the
 ///   page tree, or if the `/Pages` tree is malformed (a node deeper than
 ///   `max_depth`, a node that is not a dictionary, or a `/Pages` node with a
 ///   missing or negative `/Count`).

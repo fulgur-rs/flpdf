@@ -525,7 +525,7 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 ///   encryption is combined with `options.qdf`.
 /// - [`crate::Error::Encrypted`] when `options.encrypt` or
 ///   `options.copy_encryption` is set but the requested encryption parameters
-///   cannot be realised (an unsupported handler combination, malformed donor
+///   cannot be realized (an unsupported handler combination, malformed donor
 ///   `/Encrypt` data, or a system-RNG failure while deriving keys).
 /// - Propagates I/O errors and structural PDF errors from the underlying
 ///   incremental or full-rewrite writer.

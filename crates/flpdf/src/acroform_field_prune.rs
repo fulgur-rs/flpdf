@@ -85,8 +85,8 @@ pub const DEFAULT_MAX_ACROFORM_DEPTH: usize = 100;
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`].  [`crate::Error::Unsupported`]
-/// when the field-tree depth limit is exceeded.
+/// - Any error propagated from [`Pdf::resolve`].
+/// - [`crate::Error::Unsupported`] when the field-tree depth limit is exceeded.
 pub fn prune_acroform_after_subset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
@@ -99,8 +99,8 @@ pub fn prune_acroform_after_subset<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`].  [`crate::Error::Unsupported`]
-/// when the field-tree depth limit is exceeded.
+/// - Any error propagated from [`Pdf::resolve`].
+/// - [`crate::Error::Unsupported`] when the field-tree depth limit is exceeded.
 pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
