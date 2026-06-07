@@ -23,6 +23,11 @@
 //! then becomes unreachable and is pruned. Named, string, and external
 //! (`/URI`, `/GoToR`) destinations carry no in-document page reference and are
 //! left untouched, as are destinations targeting the extracted page itself.
+//!
+//! Only explicit page destinations (`/D`) are neutralized. A GoTo action's
+//! structure destination (`/SD`, ISO 32000-2 §12.6.4.3) is not inspected, so a
+//! `/SD` pointing into another page's structure tree can keep that page
+//! reachable in the output.
 
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
