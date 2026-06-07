@@ -7,9 +7,9 @@ baseline test, so silent drift is caught.
 
 | fixture | flpdf-sha | flpdf bytes | golden bytes | verdict | first-diff |
 |---|---|---|---|---|---|
-| one-page.pdf | fdb01346b94f8cc2 | 1217 | 1189 | diverge | length mismatch (flpdf=1217 golden=1189) |
-| two-page.pdf | 18fa4638a6243919 | 1611 | 1579 | diverge | length mismatch (flpdf=1611 golden=1579) |
-| three-page.pdf | 0b5000ccab151069 | 2006 | 1970 | diverge | length mismatch (flpdf=2006 golden=1970) |
-| attachment-two-page.pdf | 18017064c480ca19 | 2185 | 2153 | diverge | length mismatch (flpdf=2185 golden=2153) |
+| one-page.pdf | 30521f3ad971e35e | 1193 | 1189 | diverge | length mismatch (flpdf=1193 golden=1189) |
+| two-page.pdf | 4ba5ce08d49843db | 1587 | 1579 | diverge | length mismatch (flpdf=1587 golden=1579) |
+| three-page.pdf | da37d409ffc09c0d | 1982 | 1970 | diverge | length mismatch (flpdf=1982 golden=1970) |
+| attachment-two-page.pdf | b49495f9e50e6294 | 2161 | 2153 | diverge | length mismatch (flpdf=2161 golden=2153) |
 | linearized-one-page.pdf | - | - | - | skip | no golden for --static-id |
 | encrypted-r4-three-page.pdf | - | - | - | skip | no golden for --static-id |
