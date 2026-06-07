@@ -165,3 +165,29 @@ fn remaps_indirect_inherited_mediabox() {
         "indirect inherited /MediaBox must be remapped into the extracted doc, not nulled"
     );
 }
+
+#[test]
+fn own_mediabox_is_preserved() {
+    let src = two_page_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut p0 = extract_page(&mut source, 0).unwrap();
+    let leaf0 = only_leaf(&mut p0);
+    assert_eq!(
+        leaf0.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(612), Object::Integer(792),
+        ]))
+    );
+
+    let mut p1 = extract_page(&mut source, 1).unwrap();
+    let leaf1 = only_leaf(&mut p1);
+    assert_eq!(
+        leaf1.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(200), Object::Integer(300),
+        ]))
+    );
+}
