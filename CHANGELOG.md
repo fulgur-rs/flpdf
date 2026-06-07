@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-06-07
+
+* fix(outline_dest_remap): saturating /Count accumulation (flpdf-35z) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/273
+* feat(default_appearance): /DA parser (font/size/color) [flpdf-9hc.9.3] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/274
+* feat(standard_font_metrics): Adobe Core14 glyph width tables [flpdf-9hc.9.4] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/275
+* feat(appearance): Tx text-field appearance stream renderer [flpdf-9hc.9.5] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/276
+* feat(outline): OutlineDocumentHelper — Pdf::outline() iterable outline tree handle (flpdf-9hc.18.5) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/287
+* feat(appearance): Btn checkbox/radio/pushbutton appearance renderer [flpdf-9hc.9.6] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/277
+* feat(appearance): Ch combo/list appearance renderer [flpdf-9hc.9.7] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/278
+* feat(page_annotation_enum): per-page annotation enumeration + widget→field linkage [flpdf-9hc.9.2] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/279
+* feat(page_annotation_flatten): flatten annotations into page content [flpdf-9hc.9.8] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/280
+* feat(cli): --flatten-annotations / --generate-appearances / --flatten-rotation [flpdf-9hc.9.10] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/281
+* test(cli): observable-equivalence suite for AcroForm/annotation transforms [flpdf-9hc.9.11] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/282
+* feat(filters): passthrough codecs + show-stream binary marker (flpdf-9hc.7.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/283
+* fix(outline): resolve indirect /Title + decode UTF-16BE titles [flpdf-289y] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/288
+* feat(filters): explicit passthrough + LZWEncode-unsupported in dispatch (flpdf-9hc.7.5) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/284
+* test(filters): multi-filter chains for LZW/passthrough codecs (flpdf-9hc.7.6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/285
+* test(cli): --stream-data x {LZW,DCT,JBIG2,JPX,CCITT} coverage (flpdf-9hc.7.7) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/286
+* fix(resources): degrade gracefully on undecodable page /Contents [flpdf-s9s] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/289
+* fix(cli): requires-password returns 3 for weak-crypto file with correct password (flpdf-63g) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/290
+* docs(signed-pdf): add signed-PDF policy & scope doc [flpdf-9hc.22.9] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/291
+* docs(rules): add public-API documentation review patterns [flpdf-l90q] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/292
+* docs: sweep internal tracker noise from public-API doc comments [flpdf-cmlw] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/294
+* fix(linearization): share QPDF_BINARY_MARKER so --linearize emits qpdf marker [flpdf-9hc.30] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/295
+* feat(extract): single-page extract primitive [flpdf-5h5.3] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/293
+* docs: complete public-API doc — # Errors / # Examples / intra-doc links [flpdf-xvv5] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/297
+
+
+**Full Changelog**: https://github.com/fulgur-rs/flpdf/compare/v0.1.5...v0.1.6
+
 ## [0.1.5] - 2026-06-06
 
 * feat(reader): add borrowed object resolution by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/246
