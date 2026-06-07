@@ -108,7 +108,7 @@ pub struct RebuildResult {
 /// [`crate::pages::resolve_inherited_resources`].
 ///
 /// Returns `Ok(None)` when no node in the chain carries the key.
-fn resolve_inherited_raw<R: Read + Seek>(
+pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     key: &str,
