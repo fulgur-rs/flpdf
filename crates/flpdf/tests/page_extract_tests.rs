@@ -228,6 +228,26 @@ fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usi
     n
 }
 
+/// Count how many live objects in `doc` carry the given /Type name.
+fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usize {
+    let mut n = 0;
+    for r in doc.live_object_refs() {
+        if let Ok(obj) = doc.resolve(r) {
+            let dict = match &obj {
+                Object::Dictionary(d) => Some(d.clone()),
+                Object::Stream(s) => Some(s.dict.clone()),
+                _ => None,
+            };
+            if let Some(d) = dict {
+                if d.get("Type").and_then(|o| o.as_name()) == Some(type_name) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
 #[test]
 fn extracted_doc_has_no_unrelated_objects() {
     let src = shared_resource_pdf();
@@ -235,15 +255,24 @@ fn extracted_doc_has_no_unrelated_objects() {
 
     let mut out = extract_page(&mut source, 0).unwrap();
 
+    // Page 1's shared font survives; page 2's exclusive image was never copied.
+    assert_eq!(count_subtype(&mut out, b"Type1"), 1, "shared font must be present");
+    assert_eq!(count_subtype(&mut out, b"Image"), 0, "page 2's image must not leak in");
+
+    // Exactly one /Pages node — the fresh root. The copied ancestor /Pages node
+    // must have been pruned by the sweep (no orphan left in the object table).
+    assert_eq!(count_type(&mut out, b"Pages"), 1, "no orphan ancestor /Pages node");
+    assert_eq!(pages::page_refs(&mut out).unwrap().len(), 1);
+
+    // Sanity: the pruned document still writes and reopens to a single page,
+    // with no orphan /Pages reappearing.
     let mut bytes = Vec::new();
     let mut opts = WriteOptions::default();
     opts.full_rewrite = true;
     write_pdf_with_options(&mut out, &mut bytes, &opts).unwrap();
     let mut rt = Pdf::open_mem_owned(bytes).unwrap();
-
-    assert_eq!(count_subtype(&mut rt, b"Type1"), 1, "shared font must be present");
-    assert_eq!(count_subtype(&mut rt, b"Image"), 0, "page 2's image must not leak in");
     assert_eq!(pages::page_refs(&mut rt).unwrap().len(), 1);
+    assert_eq!(count_type(&mut rt, b"Pages"), 1, "no orphan /Pages after round-trip");
 }
 
 #[test]
@@ -280,7 +309,14 @@ fn extracted_contents_match_source_page() {
 fn out_of_range_index_errors() {
     let src = two_page_pdf();
     let mut source = Pdf::open_mem(&src).unwrap();
-    assert!(extract_page(&mut source, 2).is_err(), "index 2 is out of range (2 pages)");
+    let err = match extract_page(&mut source, 2) {
+        Ok(_) => panic!("index 2 out of range should error, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, flpdf::Error::Unsupported(_)),
+        "index 2 out of range should yield Error::Unsupported, got {err:?}"
+    );
 }
 
 #[test]

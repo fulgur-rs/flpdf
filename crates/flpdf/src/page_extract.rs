@@ -22,6 +22,7 @@ use crate::page_tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
     page_refs, resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
+use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Seek};
@@ -30,10 +31,12 @@ use std::io::{Cursor, Read, Seek};
 /// document.
 ///
 /// Returns an owned in-memory [`Pdf`] whose catalog has a single-level
-/// `/Pages` tree with one `/Kid`. Write it with
-/// [`write_pdf_with_options`](crate::write_pdf_with_options) and
-/// `WriteOptions { full_rewrite: true, .. }` so the (unreferenced) copied
-/// ancestor `/Pages` nodes are dropped.
+/// `/Pages` tree with one `/Kid`. The returned document is already minimal:
+/// copied ancestor `/Pages` nodes left over from the closure are pruned
+/// (mark-and-sweep from the new catalog) before returning. Write it with
+/// [`write_pdf`](crate::write_pdf) or
+/// [`write_pdf_with_options`](crate::write_pdf_with_options); `full_rewrite`
+/// is recommended for compaction but is not required for correctness.
 ///
 /// `source` is not modified.
 ///
@@ -113,6 +116,14 @@ pub fn extract_page<R: Read + Seek>(
     root.insert("Kids", Object::Array(vec![Object::Reference(copied_page_ref)]));
     root.insert("Count", Object::Integer(1));
     target.set_object(pages_root_ref, Object::Dictionary(root));
+
+    // Drop the copied ancestor /Pages node(s) and any objects only they
+    // referenced: they are unreachable from the new catalog now that the leaf
+    // /Parent points at the fresh root. full_rewrite does NOT garbage-collect
+    // (it emits every non-deleted object), so prune here to satisfy
+    // "no unrelated objects". Same mark-and-sweep used after page-subset
+    // rebuild (subset_prune::sweep_unreachable_objects).
+    sweep_unreachable_objects(&mut target)?;
 
     Ok(target)
 }
