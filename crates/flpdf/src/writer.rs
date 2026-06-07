@@ -1535,7 +1535,7 @@ fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
 }
 
 /// Remap the trailer's surviving indirect references to their Catalog-first
-/// (NEW) numbers (flpdf-9hc.32).
+/// (new) numbers.
 ///
 /// `/Root` is overwritten by the caller with the new root ref and `/Encrypt`
 /// is written by [`apply_encrypt_trailer_entries`], so both are left untouched
@@ -3963,7 +3963,7 @@ mod tests {
     /// Resolve the `/Title` string and the content-stream payload from a
     /// re-opened encrypted output of [`build_string_and_stream_fixture`].
     ///
-    /// The Catalog-first renumber (flpdf-9hc.32) reassigns output object
+    /// The Catalog-first renumber reassigns output object
     /// numbers, so navigate by reference (trailer `/Info` for the `/Title`
     /// dict, Catalog `/Metadata` for the stream) rather than hardcoding numbers.
     fn resolve_title_and_stream<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
