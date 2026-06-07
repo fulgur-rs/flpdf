@@ -545,3 +545,225 @@ fn cross_page_link_neutralized_no_sibling_leak() {
         "leaf /Resources /Font /F1 intact"
     );
 }
+
+#[test]
+fn self_page_link_is_preserved() {
+    // /Dest targets the extracted page itself -> kept, no neutralization.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [3 0 R /Fit] >>",
+            ),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert!(
+        annot.get("Dest").is_some(),
+        "self-link /Dest must be preserved"
+    );
+}
+
+#[test]
+fn named_dest_is_preserved_no_leak() {
+    // A named destination (/Dest is a name) carries no in-doc page ref, so it
+    // never pulled a sibling in; leave it untouched.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest /SomeNamedDest >>",
+            ),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "named dest must not leak a sibling"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        annot.get("Dest").and_then(|o| o.as_name()),
+        Some(&b"SomeNamedDest"[..]),
+        "named /Dest preserved",
+    );
+}
+
+#[test]
+fn action_goto_absent_page_is_neutralized() {
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /GoTo /D [4 0 R /Fit] >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert!(
+        annot.get("A").is_none(),
+        "/A GoTo must be neutralized (removed)"
+    );
+}
+
+#[test]
+fn action_uri_is_preserved() {
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (http://example.com) >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert!(annot.get("A").is_some(), "/A URI must be preserved");
+}
+
+#[test]
+fn indirect_dest_absent_page_is_neutralized() {
+    // /Dest is an indirect ref (8 0 R) to the [sibling /Fit] array.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest 8 0 R >>",
+            ),
+            (8, "[4 0 R /Fit]"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "indirect-dest sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert!(
+        annot.get("Dest").is_none(),
+        "indirect /Dest must be neutralized"
+    );
+}
