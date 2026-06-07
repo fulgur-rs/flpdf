@@ -13,15 +13,18 @@
 //!
 //! Composes [`page_object_closure`] and [`copy_objects`].
 //!
-//! # Known limitation
+//! # Cross-page annotation destinations
 //!
-//! Annotations on the extracted page whose explicit `/Dest` targets another
-//! (now-absent) page currently leak a stub of that sibling page and its
-//! ancestor `/Pages` node into the output; explicit cross-page destinations are
-//! not yet pruned or neutralized. The extracted page's
-//! own content and resources are unaffected.
+//! An annotation on the extracted page whose explicit `/Dest` (or `/A /GoTo`
+//! `/D`) targets another, now-absent page is neutralized: the dead destination
+//! is removed while the annotation itself is retained. The sibling-page stub
+//! then becomes unreachable and is pruned, leaving the output minimal. Named,
+//! string, and external (`/URI`, `/GoToR`) destinations carry no in-document
+//! page reference and are left untouched. The extracted page's own content and
+//! resources are unaffected.
 
 use crate::object_copy::{copy_objects, rewrite_refs};
+use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
 use crate::page_closure::page_object_closure;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::page_tree_rebuild::resolve_inherited_raw;
@@ -126,6 +129,13 @@ pub fn extract_page<R: Read + Seek>(
     root.insert("Count", Object::Integer(1));
     target.set_object(pages_root_ref, Object::Dictionary(root));
 
+    // Neutralize annotations on the extracted leaf whose destination targets a
+    // page absent from this single-page output. Without this, an explicit
+    // cross-page /Dest keeps the copied sibling-page stub (and its ancestor
+    // /Pages) reachable, so the sweep below cannot prune them. qpdf-aligned:
+    // the annotation is retained, only the dead destination is removed.
+    neutralize_absent_dests(&mut target, copied_page_ref)?;
+
     // Drop the copied ancestor /Pages node(s) and any objects only they
     // referenced: they are unreachable from the new catalog now that the leaf
     // /Parent points at the fresh root. full_rewrite does NOT garbage-collect
@@ -135,6 +145,89 @@ pub fn extract_page<R: Read + Seek>(
     sweep_unreachable_objects(&mut target)?;
 
     Ok(target)
+}
+
+/// Remove `/Dest` and/or `/A /GoTo` from any annotation on `page_ref` whose
+/// destination targets a page other than `page_ref` (i.e. a page absent from
+/// the single-page output). Named / string / `/URI` / `/GoToR` destinations
+/// carry no in-document page reference and are left untouched.
+fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
+    let page_obj = target.resolve_borrowed(page_ref)?;
+    let Some(page_dict) = page_obj.as_dict() else {
+        return Ok(());
+    };
+    // /Annots may be an inline array or an indirect reference to one.
+    let annot_refs: Vec<ObjectRef> = match page_dict.get("Annots").cloned() {
+        Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
+        Some(Object::Reference(r)) => match target.resolve_borrowed(r)? {
+            Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+
+    for annot_ref in annot_refs {
+        neutralize_annot_if_absent(target, annot_ref, page_ref)?;
+    }
+    Ok(())
+}
+
+/// Inspect one annotation; strip `/Dest` and/or the `/A` GoTo action when its
+/// destination resolves to a page other than `keep`.
+fn neutralize_annot_if_absent(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    annot_ref: ObjectRef,
+    keep: ObjectRef,
+) -> Result<()> {
+    let Some(mut annot) = target.resolve_borrowed(annot_ref)?.as_dict().cloned() else {
+        return Ok(());
+    };
+    let mut changed = false;
+
+    // /Dest — explicit array, dict, or an indirect reference to either.
+    if let Some(dest) = annot.get("Dest").cloned() {
+        if dest_targets_absent_page(target, &dest, keep)? {
+            annot.remove("Dest");
+            changed = true;
+        }
+    }
+
+    // /A — only a /GoTo action carries an in-document page /D. Follow the /A
+    // ref chain to the action dict; if it is a GoTo whose /D is absent, drop
+    // the whole /A key (an actionless annotation is the neutralized form).
+    if let Some(a_val) = annot.get("A").cloned() {
+        let (action_obj, _) = resolve_ref_chain(target, &a_val)?;
+        if let Some(action) = action_obj.as_dict() {
+            let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+            if is_goto {
+                if let Some(d_val) = action.get("D").cloned() {
+                    if dest_targets_absent_page(target, &d_val, keep)? {
+                        annot.remove("A");
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        target.set_object(annot_ref, Object::Dictionary(annot));
+    }
+    Ok(())
+}
+
+/// `true` when `dest` resolves to an explicit page reference other than `keep`.
+/// Named / string / external destinations (no resolvable in-doc page ref) and
+/// self-links (`== keep`) return `false` — they are not neutralized.
+fn dest_targets_absent_page(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    dest: &Object,
+    keep: ObjectRef,
+) -> Result<bool> {
+    Ok(match dest_page_ref_resolved(target, dest)? {
+        Some(page_ref) => page_ref != keep,
+        None => false,
+    })
 }
 
 /// Minimal valid target: Catalog(1) + empty Pages(2). No placeholder page (so
