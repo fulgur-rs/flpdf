@@ -10,6 +10,13 @@ Before writing or reviewing code, consult the review patterns in
 （不要な`.clone()`、PDF間接参照の解決漏れ、符号なしキャストのオーバーフロー、
 グラフ走査の境界/深さ制御）を予防ルール化したもの。
 
+公開API向けドキュメント（docs.rs に published される `crates/*/src/` の doc コメント）を
+書く・レビューするときは、併せて
+[`.claude/rules/pdf-rust-doc-review-patterns.md`](.claude/rules/pdf-rust-doc-review-patterns.md)
+を確認すること。beads issue ID・内部ジャーゴンの漏れ、公開/非公開コメントの境界、
+rustdoc 必須要素、intra-doc リンク／doctest の健全性、公開 doc の英語統一を
+5カテゴリで予防ルール化したもの。
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
