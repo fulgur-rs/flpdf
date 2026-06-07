@@ -23,6 +23,7 @@
 //! | encrypted/v2-rc4-128-r3 (weak)| user-v2     | 0      | 3      | (weak)   |
 //! | encrypted/v2-rc4-128-r3 (weak)| (none/wrong)| 0      | 0      | (auth fails) |
 //! | encrypted/v5-aes-256-r5 (weak)| user-v5-r5  | 0      | 3      | (weak)   |
+//! | encrypted/v5-aes-256-r5 (weak)| (none/wrong)| 0      | 0      | (auth fails) |
 //! | fixtures/minimal.pdf          | —           | 2      | 2      | n/a      |
 //!
 //! Reference keys verified with
@@ -152,6 +153,17 @@ fn requires_password_weak_r5_correct_password_exits_3() {
         .args(["requires-password", "--password=user-v5-r5", V5_R5])
         .assert()
         .code(3);
+}
+
+#[test]
+fn requires_password_weak_r5_wrong_or_no_password_exits_0() {
+    // Empty password does NOT authenticate v5-aes-256-r5 → a different
+    // password is required → exit 0 (auth fails before the weak-crypto gate).
+    // Symmetry with the RC4 wrong/absent-password case above.
+    flpdf()
+        .args(["requires-password", V5_R5])
+        .assert()
+        .success();
 }
 
 // ---------------------------------------------------------------------------
