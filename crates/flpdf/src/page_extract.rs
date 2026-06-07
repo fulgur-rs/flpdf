@@ -327,6 +327,28 @@ fn neutralize_action_chain(
         }
     }
 
+    // An action value may also be an ARRAY of actions (ISO 32000-1 §12.6.3:
+    // `/Next` may be a single action or an array). When `/Next NN 0 R` resolves
+    // to a separately stored array object, handle it here so its cross-page
+    // GoTos are not silently skipped by the dict-only path below.
+    if let Object::Array(mut elems) = concrete {
+        let any = neutralize_action_array(target, &mut elems, keep, visited, depth)?;
+        if !any {
+            return Ok(None);
+        }
+        return match terminal_ref {
+            // Indirect array: rewrite the referenced object in place.
+            Some(r) => {
+                target.set_object(r, Object::Array(elems));
+                Ok(None)
+            }
+            // Inline array: the caller stores the updated value back. (Not
+            // reachable via the `/Next` single-value arm, which only recurses
+            // here on an indirect reference; kept for completeness.)
+            None => Ok(Some(Object::Array(elems))),
+        };
+    }
+
     let Some(mut act) = concrete.into_dict() else {
         return Ok(None);
     };
@@ -346,19 +368,11 @@ fn neutralize_action_chain(
     // /Next — a single action or an array of actions. Recurse into each.
     if let Some(next_val) = act.get("Next").cloned() {
         match next_val {
-            Object::Array(elems) => {
-                let mut updated = elems.clone();
-                let mut any = false;
-                for (i, elem) in elems.iter().enumerate() {
-                    if let Some(new) =
-                        neutralize_action_chain(target, elem, keep, visited, depth - 1)?
-                    {
-                        updated[i] = new;
-                        any = true;
-                    }
-                }
-                if any {
-                    act.insert("Next", Object::Array(updated));
+            // `elems` is owned (from `.cloned()` above); mutate in place via the
+            // shared helper — no second clone of the nested action dicts.
+            Object::Array(mut elems) => {
+                if neutralize_action_array(target, &mut elems, keep, visited, depth)? {
+                    act.insert("Next", Object::Array(elems));
                     changed = true;
                 }
             }
@@ -386,6 +400,28 @@ fn neutralize_action_chain(
         // Inline action: the caller stores the updated value back.
         None => Ok(Some(Object::Dictionary(act))),
     }
+}
+
+/// Neutralize each element of an action array in place, returning `true` if any
+/// element changed. Each element is an independent action (chain) recursed at
+/// `depth - 1`; the shared `visited` set and length are preserved (no splicing).
+/// Used both for an inline `/Next` array and for an indirect `/Next` resolving
+/// to a separately stored array object.
+fn neutralize_action_array(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    elems: &mut [Object],
+    keep: ObjectRef,
+    visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+) -> Result<bool> {
+    let mut any = false;
+    for elem in elems.iter_mut() {
+        if let Some(new) = neutralize_action_chain(target, elem, keep, visited, depth - 1)? {
+            *elem = new;
+            any = true;
+        }
+    }
+    Ok(any)
 }
 
 /// `true` when `dest` resolves to an explicit page reference other than `keep`.
