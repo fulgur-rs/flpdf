@@ -15,13 +15,14 @@
 //!
 //! # Cross-page annotation destinations
 //!
-//! An annotation on the extracted page whose explicit `/Dest` (or `/A /GoTo`
-//! `/D`) targets another, now-absent page is neutralized: the dead destination
-//! is removed while the annotation itself is retained. The sibling-page stub
-//! then becomes unreachable and is pruned, leaving the output minimal. Named,
-//! string, and external (`/URI`, `/GoToR`) destinations carry no in-document
-//! page reference and are left untouched. The extracted page's own content and
-//! resources are unaffected.
+//! Destinations on the extracted page that target another, now-absent page are
+//! neutralized by dropping the dead destination while retaining the annotation
+//! and action structure. This covers an annotation's `/Dest`, and `/GoTo`
+//! actions reached through its `/A`, `/AA`, or `/A` `/Next` action chains, as
+//! well as the page's own `/AA` actions. The sibling-page stub these referenced
+//! then becomes unreachable and is pruned. Named, string, and external
+//! (`/URI`, `/GoToR`) destinations carry no in-document page reference and are
+//! left untouched, as are destinations targeting the extracted page itself.
 
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
@@ -33,7 +34,14 @@ use crate::pages::{
 };
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Seek};
+
+/// Upper bound on inline `/Next` action-chain nesting traversed when
+/// neutralizing cross-page destinations. Indirect cycles are stopped by a
+/// visited-set; this caps pathological inline nesting (ISO 32000-1 §12.6.3
+/// permits `/Next` chains of arbitrary length).
+const MAX_ACTION_CHAIN_DEPTH: usize = 64;
 
 /// Extract page `page_index` (0-based) from `source` into a brand-new minimal
 /// document.
@@ -147,35 +155,57 @@ pub fn extract_page<R: Read + Seek>(
     Ok(target)
 }
 
-/// Remove `/Dest` and/or `/A /GoTo` from any annotation on `page_ref` whose
-/// destination targets a page other than `page_ref` (i.e. a page absent from
-/// the single-page output). Named / string / `/URI` / `/GoToR` destinations
-/// carry no in-document page reference and are left untouched.
+/// Drop cross-page `/GoTo` destinations from any annotation on `page_ref`, and
+/// from the page's own `/AA`. A destination targeting a page other than
+/// `page_ref` (i.e. a page absent from the single-page output) has its `/D`
+/// dropped (annotation `/Dest`: the whole `/Dest` key); the action and chain
+/// structure are otherwise retained. Named / string / `/URI` / `/GoToR`
+/// destinations carry no in-document page reference and are left untouched.
 fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
-    let page_obj = target.resolve_borrowed(page_ref)?;
-    let Some(page_dict) = page_obj.as_dict() else {
-        return Ok(());
+    // Detach everything we need from the immutable page borrow before any
+    // `&mut target` call: the raw /Annots value and the page's own /AA value.
+    let (annots_val, page_aa): (Option<Object>, Option<Object>) = {
+        let page_obj = target.resolve_borrowed(page_ref)?;
+        let Some(page_dict) = page_obj.as_dict() else {
+            return Ok(());
+        };
+        (
+            page_dict.get("Annots").cloned(),
+            page_dict.get("AA").cloned(),
+        )
     };
+
     // /Annots may be an inline array or an indirect reference to one.
     // Inline-dict annotations (no indirect ref) are skipped: there is no
     // object to set_object back; in practice /Annots entries are indirect.
-    let annot_refs: Vec<ObjectRef> = match page_dict.get("Annots").cloned() {
+    let annot_refs: Vec<ObjectRef> = match annots_val {
         Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
         Some(Object::Reference(r)) => match target.resolve_borrowed(r)? {
             Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
-            _ => return Ok(()),
+            _ => Vec::new(),
         },
-        _ => return Ok(()),
+        _ => Vec::new(),
     };
 
     for annot_ref in annot_refs {
         neutralize_annot_if_absent(target, annot_ref, page_ref)?;
     }
+
+    // Page-level /AA (open/close etc.). An inline /AA dict is rewritten back
+    // onto the page; an indirect /AA is mutated in place via its own ref, so
+    // the page needs no change in that case.
+    if let Some(aa_val) = page_aa {
+        if let Some(new_aa) = neutralize_aa_if_absent(target, &aa_val, page_ref)? {
+            let mut page = resolve_dict(target, page_ref, "extracted page is not a dictionary")?;
+            page.insert("AA", new_aa);
+            target.set_object(page_ref, Object::Dictionary(page));
+        }
+    }
     Ok(())
 }
 
-/// Inspect one annotation; strip `/Dest` and/or the `/A` GoTo action when its
-/// destination resolves to a page other than `keep`.
+/// Inspect one annotation; drop the cross-page destination from `/Dest`, `/A`,
+/// and `/AA` when it resolves to a page other than `keep`.
 fn neutralize_annot_if_absent(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     annot_ref: ObjectRef,
@@ -186,7 +216,9 @@ fn neutralize_annot_if_absent(
     };
     let mut changed = false;
 
-    // /Dest — explicit array, dict, or an indirect reference to either.
+    // /Dest — explicit array, dict, or an indirect reference to either. The
+    // whole key is dropped (a destination-less annotation is the neutralized
+    // form for an explicit destination).
     if let Some(dest) = annot.get("Dest").cloned() {
         if dest_targets_absent_page(target, &dest, keep)? {
             annot.remove("Dest");
@@ -194,21 +226,23 @@ fn neutralize_annot_if_absent(
         }
     }
 
-    // /A — only a /GoTo action carries an in-document page /D. Follow the /A
-    // ref chain to the action dict; if it is a GoTo whose /D is absent, drop
-    // the whole /A key (an actionless annotation is the neutralized form).
+    // /A — an action (or chain via /Next). Drop the /D of every cross-page
+    // GoTo, keeping the action(s) and chain structure intact.
     if let Some(a_val) = annot.get("A").cloned() {
-        let (action_obj, _) = resolve_ref_chain(target, &a_val)?;
-        if let Some(action) = action_obj.as_dict() {
-            let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-            if is_goto {
-                if let Some(d_val) = action.get("D").cloned() {
-                    if dest_targets_absent_page(target, &d_val, keep)? {
-                        annot.remove("A");
-                        changed = true;
-                    }
-                }
-            }
+        let mut visited = BTreeSet::new();
+        if let Some(new) =
+            neutralize_action_chain(target, &a_val, keep, &mut visited, MAX_ACTION_CHAIN_DEPTH)?
+        {
+            annot.insert("A", new);
+            changed = true;
+        }
+    }
+
+    // /AA — additional-actions dict; each entry is an action (or chain).
+    if let Some(aa_val) = annot.get("AA").cloned() {
+        if let Some(new_aa) = neutralize_aa_if_absent(target, &aa_val, keep)? {
+            annot.insert("AA", new_aa);
+            changed = true;
         }
     }
 
@@ -216,6 +250,142 @@ fn neutralize_annot_if_absent(
         target.set_object(annot_ref, Object::Dictionary(annot));
     }
     Ok(())
+}
+
+/// Neutralize every subaction in an `/AA` additional-actions value.
+///
+/// `aa_value` may be an inline dict or an indirect reference to one. Each entry
+/// (`/O`, `/C`, `/U`, `/E`, …) is an action value handled by
+/// [`neutralize_action_chain`]. Returns `Some(updated_aa_dict)` when an INLINE
+/// `/AA` must be stored back by the caller; returns `None` when nothing changed
+/// OR the change was applied in place on an indirect `/AA` dict (the caller
+/// keeps pointing at the same ref).
+fn neutralize_aa_if_absent(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    aa_value: &Object,
+    keep: ObjectRef,
+) -> Result<Option<Object>> {
+    let (concrete, terminal_ref) = resolve_ref_chain(target, aa_value)?;
+    let Some(mut aa) = concrete.into_dict() else {
+        return Ok(None);
+    };
+    let keys: Vec<Vec<u8>> = aa.iter().map(|(k, _)| k.to_vec()).collect();
+    let mut changed = false;
+    for key in keys {
+        let Some(sub_val) = aa.get(&key).cloned() else {
+            continue;
+        };
+        // Reset visited per subaction: each subaction is an independent chain,
+        // and re-running over an already-neutralized GoTo is a no-op.
+        let mut visited = BTreeSet::new();
+        if let Some(new) =
+            neutralize_action_chain(target, &sub_val, keep, &mut visited, MAX_ACTION_CHAIN_DEPTH)?
+        {
+            aa.insert(&key, new);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    match terminal_ref {
+        // Indirect /AA: rewrite the referenced dict; the carrier's /AA ref is
+        // unchanged.
+        Some(r) => {
+            target.set_object(r, Object::Dictionary(aa));
+            Ok(None)
+        }
+        // Inline /AA: the caller stores the updated dict back.
+        None => Ok(Some(Object::Dictionary(aa))),
+    }
+}
+
+/// Walk an action value (`/A`, an `/AA` subaction, or a `/Next` element),
+/// dropping the `/D` of every GoTo whose destination targets a page other than
+/// `keep`. Follows the `/A`->action indirection chain and `/Next` chains
+/// (single action or array). Indirect cycles are bounded by `visited`; inline
+/// `/Next` nesting by `depth`. Returns `Some(updated)` when an INLINE action
+/// value must be stored back by the caller; returns `None` when there was no
+/// change OR the change was applied in place via `set_object` on an indirect
+/// action (the caller keeps pointing at the same ref).
+fn neutralize_action_chain(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    action_value: &Object,
+    keep: ObjectRef,
+    visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+) -> Result<Option<Object>> {
+    if depth == 0 {
+        return Ok(None);
+    }
+
+    let (concrete, terminal_ref) = resolve_ref_chain(target, action_value)?;
+    // Indirect-cycle guard: stop if we have already entered this action object.
+    if let Some(r) = terminal_ref {
+        if !visited.insert(r) {
+            return Ok(None);
+        }
+    }
+
+    let Some(mut act) = concrete.into_dict() else {
+        return Ok(None);
+    };
+    let mut changed = false;
+
+    // Drop a cross-page GoTo destination (the action itself is retained).
+    let is_goto = matches!(act.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+    if is_goto {
+        if let Some(d_val) = act.get("D").cloned() {
+            if dest_targets_absent_page(target, &d_val, keep)? {
+                act.remove("D");
+                changed = true;
+            }
+        }
+    }
+
+    // /Next — a single action or an array of actions. Recurse into each.
+    if let Some(next_val) = act.get("Next").cloned() {
+        match next_val {
+            Object::Array(elems) => {
+                let mut updated = elems.clone();
+                let mut any = false;
+                for (i, elem) in elems.iter().enumerate() {
+                    if let Some(new) =
+                        neutralize_action_chain(target, elem, keep, visited, depth - 1)?
+                    {
+                        updated[i] = new;
+                        any = true;
+                    }
+                }
+                if any {
+                    act.insert("Next", Object::Array(updated));
+                    changed = true;
+                }
+            }
+            single => {
+                if let Some(new) =
+                    neutralize_action_chain(target, &single, keep, visited, depth - 1)?
+                {
+                    act.insert("Next", new);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    match terminal_ref {
+        // Indirect action: rewrite the referenced object in place; the caller's
+        // ref is unchanged.
+        Some(r) => {
+            target.set_object(r, Object::Dictionary(act));
+            Ok(None)
+        }
+        // Inline action: the caller stores the updated value back.
+        None => Ok(Some(Object::Dictionary(act))),
+    }
 }
 
 /// `true` when `dest` resolves to an explicit page reference other than `keep`.
