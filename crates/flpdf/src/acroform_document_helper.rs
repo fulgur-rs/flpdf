@@ -74,6 +74,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// Missing `/AcroForm` or missing/malformed `/Fields` returns an empty list.
     /// Cycles are ignored after the first visit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
+    ///   node is not a dictionary, or when the field-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn fields(&mut self) -> Result<Vec<ObjectRef>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
@@ -96,6 +103,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// Missing `/AcroForm` or missing/malformed `/Fields` returns an empty
     /// list. Cycles are ignored after the first visit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
+    ///   node is not a dictionary, or when the field-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn field_infos(&mut self) -> Result<Vec<AcroFormFieldInfo>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
@@ -127,6 +141,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     /// Return the field's inherited `/V` value.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] when a field-tree node is not a dictionary, or
+    ///   when the field-tree depth limit is exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn field_value(&mut self, field_ref: ObjectRef) -> Result<Option<Object>> {
         FormFieldObjectHelper::new(field_ref, self.pdf).field_value()
     }
@@ -135,6 +155,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// This updates the field dictionary itself. It does not synthesize widget
     /// appearance streams.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] when `field_ref` does not resolve to a
+    ///   dictionary.
+    /// - Any error from [`Pdf::resolve`].
     pub fn set_field_value(&mut self, field_ref: ObjectRef, value: Object) -> Result<()> {
         let mut dict = self.resolve_field_dict(field_ref)?;
         dict.insert("V", value);
@@ -143,6 +169,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     /// Set `/AcroForm/DA`, creating `/AcroForm` if needed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Missing`] when the document has no `/Root`.
+    /// - [`Error::Unsupported`] when the catalog or `/AcroForm` does not resolve
+    ///   to a dictionary, or when the object-number space is exhausted while
+    ///   creating `/AcroForm`.
+    /// - Any error from [`Pdf::resolve`].
     pub fn set_default_appearance(&mut self, appearance: Vec<u8>) -> Result<()> {
         let acroform_ref = self.ensure_acroform_ref()?;
         let mut acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
@@ -155,6 +189,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Copy `/AcroForm/DA` onto fields that do not carry a direct `/DA`.
     ///
     /// Existing field-level `/DA` values are preserved.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
+    ///   node is not a dictionary, or when the field-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn fix_appearance_inheritance(&mut self) -> Result<()> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(());
@@ -184,6 +225,16 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Copy all top-level fields from `source` and append them to this document.
     ///
     /// Returns the copied top-level field refs in the target document.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Missing`] when the target document has no `/Root`.
+    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
+    ///   node is not a dictionary, when a depth limit (field-tree or
+    ///   reference-chain) is exceeded, or when the target object-number space is
+    ///   exhausted.
+    /// - Any error propagated from [`copy_objects`] (for example a failed
+    ///   [`Pdf::resolve`] on `source`).
     pub fn copy_fields_from<RS: Read + Seek>(
         &mut self,
         source: &mut Pdf<RS>,

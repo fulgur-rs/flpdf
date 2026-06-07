@@ -96,6 +96,11 @@ pub fn prune_acroform_after_subset<R: Read + Seek>(
 
 /// Like [`prune_acroform_after_subset`] but with a caller-supplied depth limit
 /// for the field-tree walk.
+///
+/// # Errors
+///
+/// Any error propagated from [`Pdf::resolve`].  [`crate::Error::Unsupported`]
+/// when the field-tree depth limit is exceeded.
 pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,

@@ -26,10 +26,45 @@ pub enum XrefForm {
     Stream,
 }
 
+/// Load the cross-reference table and trailer dictionary from `reader`, with
+/// the qpdf-style recovery pass disabled (strict parse).
+///
+/// # Errors
+///
+/// Calls [`load_xref_and_trailer_with_repair`] with repair disabled, so it
+/// propagates the same errors that function raises when `allow_repair` is
+/// `false`:
+///
+/// - [`Error::Io`] when reading the input fails.
+/// - [`Error::Parse`] when the PDF header, `startxref`, or a cross-reference
+///   section is malformed (including a `startxref`/`/Prev` offset that does not
+///   fit `usize` and a circular `/Prev` chain).
+/// - [`Error::Missing`] when a required cross-reference stream entry (such as
+///   `/Size` or `/W`) is absent.
+/// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
+///   object or entry type.
 pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
     load_xref_and_trailer_with_repair(reader, false)
 }
 
+/// Load the cross-reference table and trailer dictionary from `reader`, running
+/// the qpdf-style recovery pass when `allow_repair` is `true`.
+///
+/// # Errors
+///
+/// - [`Error::Io`] when seeking or reading the input fails.
+/// - [`Error::Parse`] when the PDF header is missing or its version is not
+///   UTF-8 (this check runs before any repair fallback). When `allow_repair`
+///   is `false`, also when `startxref`, a cross-reference table or stream, or a
+///   `/Prev` chain is malformed (including offsets that do not fit `usize` and a
+///   circular `/Prev` chain). When `allow_repair` is `true`, such failures are
+///   recorded as diagnostics and recovered by a linear scan, which itself
+///   raises [`Error::Parse`] when no cross-reference entries can be recovered or
+///   no `trailer` dictionary is found.
+/// - [`Error::Missing`] when a required cross-reference stream entry (such as
+///   `/Size` or `/W`) is absent and `allow_repair` is `false`.
+/// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
+///   object or entry type and `allow_repair` is `false`.
 pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     reader: &mut R,
     allow_repair: bool,
@@ -186,6 +221,19 @@ fn recover_xref_from_linear_scan(
     })
 }
 
+/// Load the cross-reference table and trailer dictionary from `reader`, with the
+/// qpdf-style recovery pass always enabled (best-effort).
+///
+/// # Errors
+///
+/// Calls [`load_xref_and_trailer_with_repair`] with repair enabled, so
+/// malformed cross-reference data is recovered rather than reported. It still
+/// fails with:
+///
+/// - [`Error::Io`] when seeking or reading the input fails.
+/// - [`Error::Parse`] when the PDF header is missing or its version is not
+///   UTF-8, or when the linear-scan recovery cannot find any cross-reference
+///   entries or a `trailer` dictionary.
 pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
     load_xref_and_trailer_with_repair(reader, true)
 }

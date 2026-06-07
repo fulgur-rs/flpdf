@@ -41,6 +41,19 @@ pub fn splice_pages<R: Read + Seek>(
 }
 
 /// Like [`splice_pages`] but with an explicit page-tree depth limit.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if `remove.start > remove.end`, if
+///   `remove.end > page_count`, if the insert position is not found in the
+///   page tree, or if the `/Pages` tree is malformed (a node deeper than
+///   `max_depth`, a node that is not a dictionary, or a `/Pages` node with a
+///   missing or negative `/Count`).
+/// - [`Error::Missing`] if the result would be an empty document, or if a
+///   required structural entry is absent (`/Root`, the `/Catalog` dictionary,
+///   or `/Pages`).
+/// - Propagates any error from resolving objects and from collecting the page
+///   refs (for example a malformed cross-reference table).
 pub fn splice_pages_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     remove: std::ops::Range<usize>,

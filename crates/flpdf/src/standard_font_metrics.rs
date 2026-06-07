@@ -4585,7 +4585,7 @@ impl StandardFont {
 
     /// Measure a WinAnsiEncoding byte string at the given font size.
     ///
-    /// Each byte is mapped through [`WINANSI_ENCODING`] to a glyph name,
+    /// Each byte is mapped through the WinAnsi encoding to a glyph name,
     /// then looked up in this font's width table.  Unmapped bytes (`.notdef`
     /// entries) and glyphs absent from the table both fall back to
     /// [`Self::notdef_width`].

@@ -251,12 +251,22 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     }
 
     /// Whether the document carries a `/PageLabels` tree with at least the root.
+    ///
+    /// # Errors
+    ///
+    /// - Any error from [`Pdf::resolve`].
     pub fn has_page_labels(&mut self) -> Result<bool> {
         Ok(self.pagelabels_root()?.is_some())
     }
 
     /// All label ranges as `(first_page_index, LabelRange)`, ascending by index.
     /// Empty when `/PageLabels` is absent.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn ranges(&mut self) -> Result<Vec<(i64, LabelRange)>> {
         let Some(root) = self.pagelabels_root()? else {
             return Ok(vec![]);
@@ -283,6 +293,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// the range whose first index is the largest `<= page_idx`, with `start`
     /// offset to that page. `None` when no range applies (no `/PageLabels`, or
     /// the page precedes the first range).
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn label_for_page(&mut self, page_idx: i64) -> Result<Option<LabelRange>> {
         let ranges = self.ranges()?;
         // ranges is ascending; take the last with first_index <= page_idx.
@@ -310,6 +326,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// The rendered display string for a 0-based page index. Falls back to
     /// 1-based decimal (`(page_idx + 1)`) when no range applies — matching the
     /// "default 1-based numeric labels" requirement.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn label_string_for_page(&mut self, page_idx: i64) -> Result<String> {
         match self.label_for_page(page_idx)? {
             Some(effective) => Ok(effective.format(effective.start)),
@@ -331,6 +353,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// Re-reads the `/PageLabels` tree once per explicit page in the span (the
     /// helper caches nothing by design); acceptable for typical small label trees.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded.
+    /// - Any error from [`Pdf::resolve`].
     pub fn labels_for_page_range(
         &mut self,
         start_idx: i64,
@@ -381,6 +409,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// Insert or replace the label range whose first page index is
     /// `first_page_idx`. Rebuilds the `/Nums` tree and points the catalog
     /// `/PageLabels` at the new (indirect) root.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded while reading the existing tree.
+    /// - Any error from [`Pdf::resolve`].
     pub fn set_range(&mut self, first_page_idx: i64, range: LabelRange) -> Result<()> {
         let mut entries = self.raw_entries()?;
         let value = Object::Dictionary(range.to_dict());
@@ -397,6 +431,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// Remove the label range whose first page index is `first_page_idx`.
     /// Returns `false` if no such range exists. When the last range is removed,
     /// `/PageLabels` is dropped from the catalog.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded while reading the existing tree.
+    /// - Any error from [`Pdf::resolve`].
     pub fn remove_range(&mut self, first_page_idx: i64) -> Result<bool> {
         let mut entries = self.raw_entries()?;
         let before = entries.len();

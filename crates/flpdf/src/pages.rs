@@ -19,9 +19,12 @@ pub const DEFAULT_MAX_PAGE_TREE_DEPTH: usize = 100;
 
 /// Return every `Page` object in document order using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
 ///
-/// Returns [`Error::Missing`] if the catalog or `/Pages` entry is absent. Returns
-/// [`Error::Unsupported`] if the page tree exceeds the depth limit or the catalog is
-/// not a dictionary.
+/// # Errors
+///
+/// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
+/// - [`Error::Unsupported`] when the catalog is not a dictionary, or when the page
+///   tree exceeds [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
+/// - Any [`Error`] propagated from [`Pdf::resolve`] while walking the tree.
 ///
 /// # Examples
 ///
@@ -40,6 +43,13 @@ pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
 }
 
 /// Like [`page_refs`] but with a caller-supplied recursion limit.
+///
+/// # Errors
+///
+/// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
+/// - [`Error::Unsupported`] when the catalog is not a dictionary, or when the page
+///   tree exceeds `max_depth`.
+/// - Any [`Error`] propagated from [`Pdf::resolve`] while walking the tree.
 pub fn page_refs_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
@@ -407,7 +417,8 @@ fn object_type_name(obj: &Object) -> &'static str {
 /// # Errors
 ///
 /// - [`Error::Unsupported`] if the depth limit is exceeded (indicates a malformed or
-///   extremely deeply nested document).
+///   extremely deeply nested document), or when a `/Resources` entry (or a
+///   reference it points to) is neither a dictionary nor null.
 /// - Any [`Error`] propagated from [`Pdf::resolve`].
 pub fn resolve_inherited_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -417,6 +428,13 @@ pub fn resolve_inherited_resources<R: Read + Seek>(
 }
 
 /// Like [`resolve_inherited_resources`] but with a caller-supplied recursion limit.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] when the `/Parent` chain reaches `max_depth`, when a
+///   `/Resources` entry (or a reference it points to) is neither a dictionary nor
+///   null, or when a `/Resources` reference does not resolve to a dictionary.
+/// - Any [`Error`] propagated from [`Pdf::resolve`].
 pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -531,13 +549,22 @@ pub struct PageWalk<'a, R: Read + Seek> {
 impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// Create a `PageWalk` using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
     ///
-    /// Returns [`Error::Missing`] if the catalog or `/Pages` entry is absent.
-    /// Returns [`Error::Unsupported`] if the catalog is not a dictionary.
+    /// # Errors
+    ///
+    /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
+    /// - [`Error::Unsupported`] when the catalog is not a dictionary.
+    /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
         Self::with_max_depth(pdf, DEFAULT_MAX_PAGE_TREE_DEPTH)
     }
 
     /// Create a `PageWalk` with a caller-supplied recursion limit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
+    /// - [`Error::Unsupported`] when the catalog is not a dictionary.
+    /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
         let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let catalog = pdf.resolve_borrowed(catalog_ref)?;

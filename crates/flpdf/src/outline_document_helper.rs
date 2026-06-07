@@ -95,6 +95,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
 
     /// Return `true` if the catalog has an `/Outlines` dictionary with at least
     /// one top-level item (a resolvable `/First`). Mirrors qpdf `hasOutlines`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from resolving the catalog and `/Outlines`
+    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve_borrowed`]).
     pub fn has_outlines(&mut self) -> Result<bool> {
         Ok(self.outline_root_first()?.is_some())
     }
@@ -119,12 +124,23 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Materialize and return the top-level outline nodes (qpdf
     /// `getTopLevelOutlines`). "root" is this top-level vector; the `/Outlines`
     /// dict itself is not a navigable item and is not wrapped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn get_root(&mut self) -> Result<Vec<OutlineNode>> {
         self.get_root_with_max_depth(DEFAULT_MAX_OUTLINE_DEPTH)
     }
 
     /// Like [`get_root`](Self::get_root) with a caller-supplied recursion limit.
-    /// Returns [`crate::Error::Unsupported`] if the limit is exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+    /// `max_depth`. Propagates any error from resolving outline objects (for
+    /// example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn get_root_with_max_depth(&mut self, max_depth: usize) -> Result<Vec<OutlineNode>> {
         let Some(first) = self.outline_root_first()? else {
             return Ok(Vec::new());
@@ -312,6 +328,12 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// node has its `children` cleared — the flattened view is linear and
     /// `depth` conveys structure; use [`get_root`](Self::get_root) or
     /// [`walk`](Self::walk) when you need populated `children`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn iter(&mut self) -> Result<impl Iterator<Item = OutlineNode>> {
         let roots = self.get_root()?;
         let mut flat = Vec::new();
@@ -323,6 +345,12 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
 
     /// Visit every node pre-order, passing `(node, depth)` to `visitor`. The
     /// visited nodes have populated `children`. Mirrors a qpdf outline walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn walk<F: FnMut(&OutlineNode, usize)>(&mut self, mut visitor: F) -> Result<()> {
         let roots = self.get_root()?;
         for node in &roots {

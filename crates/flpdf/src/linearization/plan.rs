@@ -374,7 +374,14 @@ impl LinearizationPlan {
     /// 6. Fills `shared_hints` with one entry per Part-3 object, listing
     ///    every page index that references it.
     ///
-    /// Returns an error if reading page references from the document fails.
+    /// # Errors
+    ///
+    /// Propagates any error from [`crate::pages::page_refs`] when collecting the
+    /// document's page references (e.g. a malformed or unresolvable `/Pages`
+    /// tree). Also propagates any error from resolving objects while computing
+    /// each page's reachability closure (via [`Pdf::resolve`] /
+    /// [`Pdf::resolve_borrowed`]) — typically an [`crate::Error::Io`] or
+    /// [`crate::Error::Parse`] on a truncated or malformed object.
     pub fn from_pdf<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Self> {
         // ----------------------------------------------------------------
         // Step 1: collect all known object refs (Part 4 initial state).

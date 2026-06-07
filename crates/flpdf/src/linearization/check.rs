@@ -140,6 +140,24 @@ fn debug_obj(obj: &Object) -> String {
 ///
 /// Returns `Ok(())` if all checks pass, or the first failing
 /// [`LinearizationCheckError`] otherwise.
+///
+/// # Errors
+///
+/// Returns [`LinearizationCheckError::NotLinearized`] when no first object
+/// header can be located, the first object is not a dictionary, or it has no
+/// positive `/Linearized` key.
+///
+/// Returns [`LinearizationCheckError::InvalidParam`] when a param-dict
+/// invariant fails: a value (`/L`, `/N`, `/O`, `/E`, `/T`, `/H` elements) is
+/// not a non-negative integer, `/O` does not fit in `u32` or does not refer to
+/// a Page object, `/L` does not equal the file length, `/N` does not equal the
+/// page count, `/E` is not less than the file length, `/H` is malformed or out
+/// of bounds, the hint stream cannot be located or decoded, or `/T` does not
+/// fall within the last cross-reference section (no `xref` keyword in the
+/// backscan window and no `/Type /XRef` stream at the `/T` target).
+///
+/// Returns [`LinearizationCheckError::Io`] when resolving an object via `pdf`
+/// or enumerating the page references fails.
 pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) -> CheckResult {
     let file_len = file_bytes.len() as u64;
 
@@ -662,6 +680,12 @@ fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
 /// Check linearization using raw bytes (opens a `Pdf` from a `Cursor`).
 ///
 /// This is a convenience wrapper for tests that already have the PDF in memory.
+///
+/// # Errors
+///
+/// Returns [`LinearizationCheckError::Io`] when opening the [`Pdf`] from the
+/// in-memory bytes fails. Otherwise propagates any error from
+/// [`check_linearization`].
 pub fn check_linearization_bytes(file_bytes: &[u8]) -> CheckResult {
     use std::io::Cursor;
     let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec()))
@@ -677,6 +701,12 @@ pub fn check_linearization_bytes(file_bytes: &[u8]) -> CheckResult {
 ///
 /// Reads the file, opens a [`Pdf`], and runs all structural checks.
 /// Returns a human-readable [`LinearizationCheckError`] on failure.
+///
+/// # Errors
+///
+/// Returns [`LinearizationCheckError::Io`] when reading the file at `path` or
+/// opening the [`Pdf`] fails. Otherwise propagates any error from
+/// [`check_linearization`].
 pub fn check_linearization_path(
     path: &std::path::Path,
 ) -> std::result::Result<(), LinearizationCheckError> {

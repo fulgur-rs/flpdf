@@ -11,16 +11,14 @@
 //! exactly as [`crate::page_tree_rebuild`] does, so the page renders
 //! identically in isolation.
 //!
-//! Part of the page extraction & merge primitives epic (flpdf-5h5). Composes
-//! [`page_object_closure`](crate::page_closure::page_object_closure) and
-//! [`copy_objects`](crate::object_copy::copy_objects).
+//! Composes [`page_object_closure`] and [`copy_objects`].
 //!
 //! # Known limitation
 //!
 //! Annotations on the extracted page whose explicit `/Dest` targets another
 //! (now-absent) page currently leak a stub of that sibling page and its
 //! ancestor `/Pages` node into the output; explicit cross-page destinations are
-//! not yet pruned or neutralized (tracked in flpdf-4924). The extracted page's
+//! not yet pruned or neutralized. The extracted page's
 //! own content and resources are unaffected.
 
 use crate::object_copy::{copy_objects, rewrite_refs};

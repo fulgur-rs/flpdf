@@ -28,6 +28,19 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
+/// honouring any `/DecodeParms` (including PNG/TIFF predictors).
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when:
+/// - a `/Filter` entry is an unknown or unimplemented codec, or a `Crypt`
+///   filter (decryption is not performed by this entry point).
+/// - `/Filter` is neither a name nor an array of names.
+/// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
+///   negative predictor parameter, or a predictor configuration that overflows).
+/// - an implemented codec fails on malformed input — corrupt deflate, LZW,
+///   ASCII85, ASCIIHex, or RunLength data, or a corrupt PNG-predictor stream.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     decode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
@@ -60,6 +73,16 @@ where
     )
 }
 
+/// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
+/// the inverse of [`decode_stream_data`].
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when:
+/// - a `/Filter` entry is an unknown or unimplemented codec.
+/// - `/Filter` is neither a name nor an array of names.
+/// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
+///   negative predictor parameter, or a predictor configuration that overflows).
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }

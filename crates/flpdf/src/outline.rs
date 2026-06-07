@@ -29,12 +29,24 @@ pub struct OutlineItem {
 /// Walk the document's outline tree using [`DEFAULT_MAX_OUTLINE_DEPTH`].
 ///
 /// Returns an empty `Vec` if the catalog has no `/Outlines` entry or the outline root
-/// has no `First` child. Returns [`Error::Unsupported`] if the depth limit is exceeded.
+/// has no `First` child.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] if the outline nesting depth exceeds
+/// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline objects
+/// (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
 pub fn outline_items<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<OutlineItem>> {
     outline_items_with_max_depth(pdf, DEFAULT_MAX_OUTLINE_DEPTH)
 }
 
 /// Like [`outline_items`] but with a caller-supplied recursion limit.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] if the outline nesting depth exceeds `max_depth`.
+/// Propagates any error from resolving outline objects (for example I/O or parse
+/// failures surfaced by [`Pdf::resolve`]).
 pub fn outline_items_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,

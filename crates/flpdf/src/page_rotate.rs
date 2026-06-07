@@ -140,6 +140,10 @@ pub fn compose_rotate(existing: i32, op: &RotateOp) -> i32 {
 /// node in the chain has a `/Rotate` entry.
 ///
 /// Uses [`DEFAULT_MAX_PAGE_TREE_DEPTH`] as the depth limit.
+///
+/// # Errors
+///
+/// Propagates any error from [`resolve_inherited_rotate_with_max_depth`].
 pub fn resolve_inherited_rotate<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -148,6 +152,14 @@ pub fn resolve_inherited_rotate<R: Read + Seek>(
 }
 
 /// Like [`resolve_inherited_rotate`] but with a caller-supplied recursion limit.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if walking the `/Parent` chain reaches `max_depth`
+///   before finding a `/Rotate` entry.
+/// - [`Error::Unsupported`] if a `/Rotate` entry is an indirect reference that
+///   does not resolve to an integer, or has an otherwise unexpected type.
+/// - Any error from resolving objects in the page-tree chain.
 pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,

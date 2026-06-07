@@ -22,11 +22,46 @@ pub struct CheckReport {
 /// Errors during the strict parse are downgraded to a single error diagnostic so the
 /// caller always receives a report. Equivalent to `qpdf --check` (which also runs the
 /// recovery heuristics).
+///
+/// # Errors
+///
+/// - [`Error::Encrypted`] when the document is encrypted and cannot be opened; unlike
+///   other open failures, this is propagated rather than downgraded to a diagnostic.
+/// - Propagates errors from [`Pdf::linearized_hint_ref`] (resolving object `(1, 0)`)
+///   raised while probing for linearization.
+///
+/// Other failures from the repair-enabled open path are turned into an error
+/// [`Diagnostic`] and returned inside an `Ok(CheckReport)`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::check_reader;
+///
+/// let report = check_reader(BufReader::new(File::open("input.pdf")?))?;
+/// println!("valid: {}", report.valid);
+/// for diagnostic in report.diagnostics.entries() {
+///     println!("{diagnostic:?}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn check_reader<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, true)
 }
 
 /// Validate the document with explicit open options.
+///
+/// # Errors
+///
+/// - When `options.repair` is set, behaves like [`check_reader`]: only
+///   [`Error::Encrypted`] is propagated from the open path, while other open
+///   failures become an error [`Diagnostic`] inside an `Ok(CheckReport)`.
+/// - When `options.repair` is clear, any error from [`Pdf::open_with_options`] is
+///   propagated unchanged (e.g. [`Error::Io`], [`Error::Parse`], [`Error::Encrypted`]).
+/// - Propagates errors from [`Pdf::linearized_hint_ref`] (resolving object `(1, 0)`)
+///   raised while probing for linearization.
 pub fn check_reader_with_options<R: Read + Seek>(
     reader: R,
     options: PdfOpenOptions,
@@ -39,6 +74,14 @@ pub fn check_reader_with_options<R: Read + Seek>(
 /// A failed strict parse is propagated as a hard [`crate::Error`] rather than turned
 /// into a diagnostic; the caller is expected to handle the I/O error explicitly.
 /// Equivalent to `qpdf --check` without `--password=...`-style recovery toggles.
+///
+/// # Errors
+///
+/// - Propagates any error from [`Pdf::open_with_options`] unchanged, since the
+///   recovery heuristics are disabled (e.g. [`Error::Io`], [`Error::Parse`],
+///   [`Error::Encrypted`]).
+/// - Propagates errors from [`Pdf::linearized_hint_ref`] (resolving object `(1, 0)`)
+///   raised while probing for linearization.
 pub fn check_reader_strict<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, false)
 }
