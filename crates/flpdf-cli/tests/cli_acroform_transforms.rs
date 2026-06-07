@@ -207,6 +207,22 @@ fn resolve_one<R: std::io::Read + std::io::Seek>(
     }
 }
 
+/// Find the single Widget annotation on the first page by structure.
+///
+/// Full-rewrite output is renumbered Catalog-first, so the widget no longer
+/// has a stable object number; navigate to it via `/Annots` rather than
+/// hardcoding a number. Each fixture has exactly one merged widget (it carries
+/// `/FT`+`/T` directly), so its `annot_ref` is the dict that holds `/AP`.
+fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
+    let page_refs = flpdf::pages::page_refs(pdf).unwrap();
+    flpdf::enumerate_page_annotations(pdf, page_refs[0])
+        .unwrap()
+        .into_iter()
+        .find(|a| a.is_widget)
+        .expect("fixture must have exactly one Widget annotation")
+        .annot_ref
+}
+
 // ── Tests: generate-appearances ───────────────────────────────────────────────
 
 /// `--generate-appearances` on a Tx widget adds `/AP/N`, and the uncompressed
@@ -228,7 +244,7 @@ fn generate_appearances_tx_ap_n_contains_tj() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
 
     // /AP/N must be present after generate-appearances.
     // Use a block to end the borrow of `pdf` before the resolve call below.
@@ -278,7 +294,7 @@ fn generate_appearances_tx_skips_existing_ap() {
     // /AP/N must still be present; the existing stream content must contain the
     // original literal "(Hello) Tj ET" — not overwritten with a newly generated one.
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -335,7 +351,7 @@ fn generate_appearances_checkbox_creates_state_dict() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -393,7 +409,7 @@ fn generate_appearances_radio_creates_state_dict() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -438,7 +454,7 @@ fn generate_appearances_combo_ap_n_contains_tj() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -581,12 +597,20 @@ fn flatten_print_removes_print_bit_annot_only() {
         annots.len()
     );
 
-    // The surviving annotation must be object 5 (the non-Print one, /F 0).
+    // The surviving annotation must be the non-Print widget. Identify it by
+    // the behavioral property (Print bit clear in /F) rather than its object
+    // number, which is unstable under the Catalog-first renumber. An absent /F
+    // means no flags set, i.e. no Print bit — that is exactly the survivor.
+    let survivor = pdf.resolve(annots[0].annot_ref).unwrap();
+    let f = survivor
+        .as_dict()
+        .and_then(|d| d.get("F"))
+        .and_then(|o| o.as_integer())
+        .unwrap_or(0);
     assert_eq!(
-        annots[0].annot_ref,
-        ObjectRef::new(5, 0),
-        "surviving annotation must be the non-Print widget (5 0 R), got {}",
-        annots[0].annot_ref
+        f & 0x4,
+        0,
+        "surviving annotation must be the non-Print widget (Print bit clear in /F), got /F={f}"
     );
 
     // Page content must have a Do (from the Print-bit annotation being flattened).
