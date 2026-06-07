@@ -159,6 +159,53 @@ fn materializes_inherited_attributes() {
     assert_eq!(font.get("Subtype"), Some(&Object::Name(b"Type1".to_vec())));
 }
 
+/// Parent /Pages carries an inheritable /CropBox; the leaf (obj 3) has its own
+/// /MediaBox but inherits the /CropBox. Covers the /CropBox materialization
+/// branch (own /MediaBox wins, inherited /CropBox is materialized).
+fn inherited_cropbox_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /CropBox [5 5 590 770] >>",
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn materializes_inherited_cropbox() {
+    let src = inherited_cropbox_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    // Own /MediaBox preserved.
+    assert_eq!(
+        leaf.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]))
+    );
+    // Inherited /CropBox materialized onto the leaf.
+    assert_eq!(
+        leaf.get("CropBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(5),
+            Object::Integer(5),
+            Object::Integer(590),
+            Object::Integer(770),
+        ]))
+    );
+}
+
 /// Ancestor /Pages stores /MediaBox as an INDIRECT reference (obj 6), the qpdf
 /// shared-array pattern. The leaf (obj 3) inherits it. Exercises rewrite_refs'
 /// Object::Reference branch: the extracted leaf's /MediaBox must resolve to a
