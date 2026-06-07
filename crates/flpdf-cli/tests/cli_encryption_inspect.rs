@@ -20,10 +20,16 @@
 //! | encrypted/v4-aes-128-r4       | (none/wrong)| 0      | 0      | (auth fails) |
 //! | encrypted/v4-aes-128-r4       | user-v4-aes | 0      | 3      | 5042ec…  |
 //! | encrypted/v5-aes-256-r6       | user-v5-r6  | 0      | 3      | fc4594…  |
+//! | encrypted/v2-rc4-128-r3 (weak)| user-v2     | 0      | 3      | (weak)   |
+//! | encrypted/v2-rc4-128-r3 (weak)| (none/wrong)| 0      | 0      | (auth fails) |
+//! | encrypted/v5-aes-256-r5 (weak)| user-v5-r5  | 0      | 3      | (weak)   |
 //! | fixtures/minimal.pdf          | —           | 2      | 2      | n/a      |
 //!
 //! Reference keys verified with
 //!   `qpdf --show-encryption-key --check --password=… FIXTURE`.
+//! Weak-crypto (RC4 / R=5) req-pw codes verified with
+//!   `qpdf --requires-password [--password=…] FIXTURE` (flpdf-63g): qpdf does
+//! NOT require `--allow-weak-crypto` for this read-only inspection.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -31,6 +37,10 @@ use predicates::prelude::*;
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const V4_AES: &str = "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf";
 const V5_R6: &str = "../../tests/fixtures/encrypted/v5-aes-256-r6.pdf";
+// Weak-crypto fixtures (RC4 / R=5): qpdf answers --requires-password on these
+// without --allow-weak-crypto (flpdf-63g).
+const V2_RC4: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
+const V5_R5: &str = "../../tests/fixtures/encrypted/v5-aes-256-r5.pdf";
 const UNENCRYPTED: &str = "../../tests/fixtures/minimal.pdf";
 
 fn flpdf() -> Command {
@@ -59,6 +69,14 @@ fn is_encrypted_encrypted_empty_password_exits_0() {
 fn is_encrypted_unencrypted_exits_2() {
     // qpdf_exit_is_not_encrypted = 2.
     flpdf().args(["is-encrypted", UNENCRYPTED]).assert().code(2);
+}
+
+#[test]
+fn is_encrypted_weak_rc4_no_password_exits_0() {
+    // A weak (RC4) file is still encrypted; is-encrypted reports 0 without a
+    // password and without --allow-weak-crypto (guards the probe's forced
+    // weak-crypto opt-in, flpdf-63g).
+    flpdf().args(["is-encrypted", V2_RC4]).assert().success();
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +118,40 @@ fn requires_password_encrypted_wrong_or_no_password_exits_0() {
         .args(["requires-password", V4_AES])
         .assert()
         .success();
+}
+
+// Weak-crypto (RC4 / R=5): qpdf answers --requires-password purely on the
+// password — a correct password yields 3 and a wrong/absent one yields 0,
+// with NO --allow-weak-crypto opt-in required. flpdf previously reported 0
+// for the correct-password case because the library's post-auth weak-crypto
+// gate surfaced as "a different password is required" (flpdf-63g).
+
+#[test]
+fn requires_password_weak_rc4_correct_password_exits_3() {
+    // v2-rc4-128-r3 (RC4, weak) with the correct user password → qpdf 3.
+    flpdf()
+        .args(["requires-password", "--password=user-v2", V2_RC4])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn requires_password_weak_rc4_wrong_or_no_password_exits_0() {
+    // Empty password does NOT authenticate v2-rc4-128-r3 → a different
+    // password is required → exit 0 (auth fails before the weak-crypto gate).
+    flpdf()
+        .args(["requires-password", V2_RC4])
+        .assert()
+        .success();
+}
+
+#[test]
+fn requires_password_weak_r5_correct_password_exits_3() {
+    // v5-aes-256-r5 (R=5, weak) with the correct user password → qpdf 3.
+    flpdf()
+        .args(["requires-password", "--password=user-v5-r5", V5_R5])
+        .assert()
+        .code(3);
 }
 
 // ---------------------------------------------------------------------------
