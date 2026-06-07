@@ -33,13 +33,13 @@
 //!
 //! # Page extraction strategy
 //!
-//! Since the page-tree rebuild pass (flpdf-9hc.8.8) is not yet available,
+//! Since a full page-tree rebuild pass is not yet available,
 //! this module uses a minimal approach: for each chunk it reopens the source
 //! bytes, mutates the `/Pages` root to contain only the chunk's page refs
 //! (updating `/Count` and `/Kids`), then writes the modified PDF via
 //! [`write_pdf`] (incremental update). Orphan objects from the other pages
 //! remain in the file but are unreachable from the page tree — this is
-//! tolerated per the "qpdf 同等の最小限" requirement; all output files open
+//! tolerated under the "minimal, qpdf-equivalent" requirement; all output files open
 //! correctly in PDF readers.
 //!
 //! ## Known limitation: inheritable attributes
@@ -59,9 +59,9 @@
 //!   versions) may produce chunks with missing resources.
 //!
 //! Full resolution requires materialising inherited attributes before
-//! reparenting, which is deferred to the page-tree rebuild pass
-//! (flpdf-9hc.8.8).  Until then, prefer running `qpdf --linearize` (or
-//! equivalent) on the source to flatten the page tree before splitting.
+//! reparenting, which is not yet implemented.  For now, prefer running
+//! `qpdf --linearize` (or equivalent) on the source to flatten the page
+//! tree before splitting.
 //!
 //! # Example
 //!
@@ -270,7 +270,7 @@ fn join_parent(parent: &Path, filename: String) -> PathBuf {
 ///   (e.g. 3 pages `--split-pages=2` → `out-1-2.pdf`, `out-3-3.pdf`).
 ///
 /// Internal: keeps the public [`split_output_path`] signature stable while
-/// adding the single-number form needed by `--split-pages=1` (flpdf-s5e).
+/// adding the single-number form needed by `--split-pages=1`.
 fn chunk_output_path(
     template: &Path,
     first_page: u32,

@@ -15,7 +15,7 @@
 //! ISO 32000-1 §7.7.3.4 lists `/Rotate` as an inheritable page attribute; its default
 //! when absent at every level is `0` (§7.7.3.3 Table 30).
 //!
-//! # `/Rotate` flattening (flpdf-9hc.9.9)
+//! # `/Rotate` flattening
 //!
 //! [`flatten_rotation_on_pages`] *bakes* a page's effective `/Rotate` into its
 //! geometry so the page reads upright with `/Rotate = 0`. A single affine matrix

@@ -1,4 +1,4 @@
-//! AcroForm field preservation after page-subset extraction (flpdf-9hc.8.11).
+//! AcroForm field preservation after page-subset extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree so that only the selected pages remain reachable from `/Root`, this
@@ -51,13 +51,12 @@
 //! extraction pipeline.  Multi-input cross-document AcroForm merging (merging
 //! `/AcroForm` dicts from multiple source documents, handling field-name
 //! collisions with qpdf-style suffix renaming) is explicitly **out of scope**
-//! here and must be addressed in a future layer (flpdf-9hc.9 or a dedicated
-//! new issue).  The single-document API boundary makes the cross-doc case
+//! here and is not currently supported.  The single-document API boundary makes the cross-doc case
 //! unreachable at this layer, so no `Error::Unsupported` stub is needed; see
 //! the comment in `page_tree_rebuild` for the same rationale.
 //!
-//! Heavy AcroForm operations (flattening, rendering appearance streams) are the
-//! responsibility of the flpdf-9hc.9 epic; this module handles only the
+//! Heavy AcroForm operations (flattening, rendering appearance streams) are out
+//! of scope; this module handles only the
 //! extract-time field/widget survival filter and `/P` back-pointer repair.
 
 use crate::page_tree_rebuild::RebuildResult;

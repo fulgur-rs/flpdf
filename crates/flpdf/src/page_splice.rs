@@ -20,8 +20,8 @@ use std::io::{Read, Seek};
 /// A no-op call (`remove.is_empty() && insert.is_empty()`) returns immediately
 /// without touching the document.
 ///
-/// This function is part of the document page extraction and merge primitives
-/// epic (flpdf-5h5). The `insert` refs it splices in are typically pages copied
+/// This function is part of the document page extraction and merge primitives.
+/// The `insert` refs it splices in are typically pages copied
 /// from another document with
 /// [`copy_objects`](crate::object_copy::copy_objects), whose object set is first
 /// computed per page by

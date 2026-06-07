@@ -1,4 +1,4 @@
-//! Page-tree rebuild after extraction / merge / rotate (flpdf-9hc.8.8).
+//! Page-tree rebuild after extraction / merge / rotate.
 //!
 //! Given an open [`Pdf`] and an ordered list of selected leaf `/Page`
 //! `ObjectRef`s (the output of [`crate::page_plan::PagePlan`] /
@@ -53,13 +53,13 @@
 //! documents ([`crate::page_combine::CombinedPlan`] with >1 input) additionally
 //! requires cross-document object copying (renumbering, encryption-boundary
 //! handling, name-conflict resolution) and is a separate future layer. The
-//! single-input CLI wiring (8.12), outline/dest remap (8.10), and AcroForm
-//! handling (8.11) all operate over a single document and can build on the
+//! single-input CLI wiring, outline/dest remap, and AcroForm
+//! handling all operate over a single document and can build on the
 //! [`RebuildResult`] returned here.
 //!
 //! Obsolete intermediate `/Pages` nodes are intentionally left as orphan
 //! objects (unreachable from the page tree) for the unreferenced-resource
-//! pruning layer (8.9) to remove, mirroring the precedent set by
+//! pruning layer to remove, mirroring the precedent set by
 //! [`crate::page_split`]. They do not affect output validity.
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
@@ -183,8 +183,7 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 /// attributes materialized and `/Parent` repointed at the root. Serialize the
 /// result with [`crate::write_pdf`].
 ///
-/// This function is part of the document page extraction and merge primitives
-/// epic (flpdf-5h5). The `selected` refs it consumes are produced by
+/// The `selected` refs it consumes are produced by
 /// [`PagePlan`](crate::page_plan::PagePlan) (single document) or a single-input
 /// [`CombinedPlan`](crate::page_combine::CombinedPlan). For an end-to-end
 /// extraction walkthrough see the runnable `examples/extract_pages.rs`.

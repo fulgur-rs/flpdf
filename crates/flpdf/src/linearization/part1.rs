@@ -12,13 +12,13 @@
 //!
 //! Every numeric value in the dict is initially represented as a **10-digit,
 //! zero-padded** ASCII decimal string (e.g. `0000000000`).  This fixed-width
-//! encoding means that a back-patcher (sub-task 2.9) can overwrite values
+//! encoding means that a back-patcher can overwrite values
 //! in-place without shifting any downstream byte offsets.
 //!
 //! Immediately after `endobj\n`, the emitter reserves
 //! [`PARAM_DICT_TRAILING_PAD`] bytes of ASCII space (`b' '`).  Once the
 //! back-patcher knows the final numeric values, it rewrites the dict with
-//! **variable-width** decimals (matching qpdf's byte format, flpdf-9hc.20.25)
+//! **variable-width** decimals (matching qpdf's byte format)
 //! and grows this trailing pad to absorb the bytes saved, so the total Part 1
 //! byte length stays constant.  Without the reserve, shrinking the dict would
 //! shift every downstream offset and force a second convergence loop.
@@ -32,7 +32,7 @@
 //!
 //! This module emits **header + object 1 + trailing pad** only.  The Part 1
 //! xref subsection and trailer (required by the linearized format) are
-//! written by the full orchestrator in sub-task 2.8.
+//! written by the full orchestrator.
 
 use std::ops::Range;
 

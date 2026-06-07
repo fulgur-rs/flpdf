@@ -1,5 +1,4 @@
-//! Typed permission configuration for writer-side `/Encrypt` `/P` encoding
-//! (flpdf-9hc.4.8).
+//! Typed permission configuration for writer-side `/Encrypt` `/P` encoding.
 //!
 //! [`Permissions`](crate::Permissions) (in `reader.rs`) is the read-only
 //! view of an already-encrypted document's `/P` bitfield, with one accessor

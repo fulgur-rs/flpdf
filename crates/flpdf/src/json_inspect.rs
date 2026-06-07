@@ -339,10 +339,11 @@ fn stream_to_json(stream: &Stream) -> Result<JsonValue, ConvertError> {
     )]))
 }
 
-/// PDF オブジェクトを qpdf v2 JSON value 形式に変換する。
+/// Convert a PDF object into the qpdf v2 JSON value form.
 ///
-/// Stream は dict 部分のみが含まれ、stream data 本体は別経路で扱う（.11.10）。
-/// Stream が他のオブジェクト内にネストしている場合も `{"stream":{"dict":...}}` を返す。
+/// For streams, only the dictionary part is included; the stream data body is
+/// handled through a separate path. A stream nested inside another object also
+/// returns `{"stream":{"dict":...}}`.
 ///
 /// # Errors
 ///
@@ -452,7 +453,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 // ── build_qpdf_key ────────────────────────────────────────────────────────────
 
-/// `qpdf` トップレベル key の中身 (`[metadata, objects_map]`) を構築する。
+/// Build the contents of the top-level `qpdf` key (`[metadata, objects_map]`).
 ///
 /// Returns a [`JsonValue::Array`] of exactly two elements:
 /// 1. The metadata object with fixed key order.
@@ -815,8 +816,8 @@ fn collect_image_refs<R: Read + Seek>(
 /// keys in alphabetical order:
 /// `contents`, `images`, `label`, `object`, `outlines`, `pageposfrom1`.
 ///
-/// - `label` is always `null` (placeholder until flpdf-9hc.11.5).
-/// - `outlines` is always `[]` (placeholder until flpdf-9hc.11.6).
+/// - `label` is always `null` (placeholder; not yet populated).
+/// - `outlines` is always `[]` (placeholder; not yet populated).
 ///
 /// # Errors
 ///
@@ -2505,7 +2506,7 @@ pub fn filter_json_objects(v2: JsonValue, selectors: &[JsonObjectSelector]) -> J
 /// (`version`, `parameters`) with every section that flpdf currently
 /// implements.
 ///
-/// As of flpdf-9hc.11.9 this produces: `version`, `parameters`, `pages`,
+/// This produces: `version`, `parameters`, `pages`,
 /// `pagelabels`, `acroform`, `attachments`, `encrypt`, `outlines`, `qpdf`.
 /// Key order matches qpdf v2 output (fixed, not alphabetical).
 ///

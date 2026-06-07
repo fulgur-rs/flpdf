@@ -502,7 +502,7 @@ fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintT
 ///
 /// # Placeholder fields
 ///
-/// Fields that have not yet been back-patched (sub-task 2.9) are encoded as
+/// Fields that have not yet been back-patched are encoded as
 /// `0`.  For fields whose bit-width is `0` (e.g. `bits_page_length_delta = 0`
 /// while lengths are still placeholder), `write_bits(value, 0)` is a no-op;
 /// those bits are simply absent until the stream is regenerated after

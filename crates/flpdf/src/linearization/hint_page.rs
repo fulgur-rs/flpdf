@@ -2,7 +2,7 @@
 //!
 //! This module builds the **data** for the Page Offset Hint Table.  It does
 //! **not** encode the table as bits/bytes — that is the responsibility of the
-//! hint-stream encoder (sub-task 2.7).
+//! hint-stream encoder.
 //!
 //! # Structure overview (Annex F.3.1)
 //!
@@ -24,7 +24,7 @@
 //! | `entry.page_length_minus_least` (item 2) per page | entries | `0` |
 //!
 //! These fields are stored as `0` in the returned structs.  The back-patcher
-//! (sub-task 2.9) locates them by field name and overwrites them once the real
+//! locates them by field name and overwrites them once the real
 //! byte offsets are available.
 //!
 //! # Object count
@@ -100,13 +100,13 @@ pub fn bits_needed(value: u64) -> u32 {
 ///
 /// * `location_of_first_page` (item 2): byte offset of the first page's page
 ///   object from the start of the file.  Set to `0` (placeholder); back-patched
-///   by sub-task 2.9.
+///   once the real offsets are known.
 /// * `least_page_length` (item 4): minimum page byte length across all pages.
-///   Set to `0` (placeholder); back-patched by sub-task 2.9.
+///   Set to `0` (placeholder); back-patched once the real offsets are known.
 /// * `least_content_offset` (item 6): minimum content stream offset.
-///   Set to `0` (placeholder); back-patched by sub-task 2.9.
+///   Set to `0` (placeholder); back-patched once the real offsets are known.
 /// * `least_content_length` (item 8): minimum content stream length.
-///   Set to `0` (placeholder); back-patched by sub-task 2.9.
+///   Set to `0` (placeholder); back-patched once the real offsets are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOffsetHeader {
     /// Item 1 — Least number of objects in a page across all pages (32-bit).
@@ -115,7 +115,7 @@ pub struct PageOffsetHeader {
     /// Item 2 — Byte offset of the first page's page object from the start of
     /// the file (32-bit).
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offsets are known.**
     pub location_of_first_page: u64,
 
     /// Item 3 — Bits needed to represent the difference between the greatest
@@ -124,7 +124,7 @@ pub struct PageOffsetHeader {
 
     /// Item 4 — Least page length in bytes (32-bit).
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offsets are known.**
     pub least_page_length: u64,
 
     /// Item 5 — Bits needed to represent the difference between the greatest
@@ -133,7 +133,7 @@ pub struct PageOffsetHeader {
 
     /// Item 6 — Least content stream offset from the start of the page's data (32-bit).
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offsets are known.**
     pub least_content_offset: u64,
 
     /// Item 7 — Bits needed to represent the difference between the greatest
@@ -142,7 +142,7 @@ pub struct PageOffsetHeader {
 
     /// Item 8 — Least content stream length in bytes (32-bit).
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offsets are known.**
     pub least_content_length: u64,
 
     /// Item 9 — Bits needed to represent the difference between the greatest
@@ -175,8 +175,8 @@ pub struct PageOffsetHeader {
 /// ## Back-patch fields
 ///
 /// * `page_length_minus_least` (item 2): byte length of this page minus
-///   `header.least_page_length`.  Set to `0` (placeholder); back-patched by
-///   sub-task 2.9.
+///   `header.least_page_length`.  Set to `0` (placeholder); back-patched
+///   once the real offsets are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOffsetEntry {
     /// Item 1 — Number of objects in this page minus
@@ -185,7 +185,7 @@ pub struct PageOffsetEntry {
 
     /// Item 2 — Page length in bytes minus `header.least_page_length`.
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offsets are known.**
     pub page_length_minus_least: u64,
 
     /// Item 3 — Number of shared object references for this page.
@@ -228,9 +228,9 @@ pub struct PageOffsetEntry {
 /// (`location_of_first_page`, `least_page_length`, `least_content_offset`,
 /// `least_content_length`, per-page `page_length_minus_least`,
 /// `content_stream_offset`, `content_stream_length`)
-/// are initialized to `0`; sub-task 2.9 back-patches them.
+/// are initialized to `0` and back-patched once the real offsets are known.
 ///
-/// The sub-task 2.7 encoder serializes this struct into the binary bit-packed
+/// The hint-stream encoder serializes this struct into the binary bit-packed
 /// format required by Annex F.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOffsetHintTable {

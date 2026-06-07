@@ -1,8 +1,8 @@
-//! Back-patcher for Part 1 linearization parameter dictionary (sub-task 2.9).
+//! Back-patcher for Part 1 linearization parameter dictionary.
 //!
 //! After layout is complete and all byte offsets are known, this module
 //! rewrites the linearization parameter dictionary with **variable-width**
-//! decimal values (qpdf byte format, flpdf-9hc.20.25):
+//! decimal values (qpdf byte format):
 //!
 //! | Param dict key | Source field in [`LinearizedOffsets`]       |
 //! |----------------|---------------------------------------------|

@@ -848,9 +848,8 @@ pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
 /// Name-tree entries whose value is a direct `/Filespec` dictionary (rather than
 /// an indirect reference) are not surfaced by the underlying
 /// [`crate::embedded_files::list_embedded_files`] enumeration; they are
-/// skipped with the same limitation documented there (see also the TODO comment
-/// for flpdf-9hc.10.6). Only attachments with indirect-reference values are
-/// extractable by this function.
+/// skipped with the same limitation documented there. Only attachments with
+/// indirect-reference values are extractable by this function.
 ///
 /// # Errors
 ///

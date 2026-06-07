@@ -5,7 +5,7 @@
 //! that should be included in the output.
 //!
 //! This module is the foundation shared by the extraction, split, rotate, and
-//! page-tree-rebuild layers (flpdf-9hc.8.3, 8.7, 8.8). It does **not** perform
+//! page-tree-rebuild layers. It does **not** perform
 //! any rewriting; it only computes what pages are selected and in which order.
 //!
 //! # Example
@@ -39,9 +39,9 @@ use std::io::{Read, Seek};
 /// pair `(index_1based, page_ref)` carries enough information for all
 /// downstream layers:
 ///
-/// - `page_ref` is used by page-tree rebuild (8.8) and content extraction.
-/// - `index_1based` is used by split-pages (8.7) for output file naming and
-///   by the rotate layer (8.4) for per-page diagnostics.
+/// - `page_ref` is used by page-tree rebuild and content extraction.
+/// - `index_1based` is used by split-pages for output file naming and
+///   by the rotate layer for per-page diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedPage {
     /// 1-based page number in the source document.
@@ -57,8 +57,7 @@ pub struct SelectedPage {
 /// page numbers). The ordering is deterministic: it reflects the input
 /// expression order, with deduplication already handled by [`PageRange::resolve`].
 ///
-/// This type is part of the document page extraction and merge primitives epic
-/// (flpdf-5h5). The selected page refs it produces feed directly into
+/// The selected page refs it produces feed directly into
 /// [`rebuild_page_tree`](crate::page_tree_rebuild::rebuild_page_tree), which
 /// rewrites the document's `/Pages` tree to contain exactly those pages. For an
 /// end-to-end extraction walkthrough see the runnable `examples/extract_pages.rs`.
@@ -118,7 +117,7 @@ impl PagePlan {
     /// Build a plan from a pre-resolved slice of 1-based page numbers.
     ///
     /// This entry point is intended for callers that have already resolved a
-    /// range (e.g., the multi-input combiner, flpdf-9hc.8.3) or that need to
+    /// range (e.g., the multi-input combiner) or that need to
     /// specify exact page indices programmatically.
     ///
     /// Validation rules:

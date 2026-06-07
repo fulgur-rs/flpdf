@@ -204,7 +204,7 @@ fn collect_content_streams<R: Read + Seek>(
 ///    allows any whitespace between concatenated content streams, and newline
 ///    is qpdf's choice).
 /// 3. Stores the result as a new indirect `Stream` object (no filter applied —
-///    re-encoding is the responsibility of the write path / flpdf-9hc.12.5).
+///    re-encoding is the responsibility of the write path).
 /// 4. Updates the page dictionary's `/Contents` entry to reference the new
 ///    single stream object.
 ///

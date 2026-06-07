@@ -48,8 +48,7 @@ use std::io::{Read, Seek};
 /// error: [`Pdf::resolve`] yields [`Object::Null`] for them, so they are simply
 /// copied as `Null`.
 ///
-/// This function is part of the document page extraction and merge primitives
-/// epic (flpdf-5h5). Callers normally obtain `refs` from
+/// Callers normally obtain `refs` from
 /// [`page_object_closure`](crate::page_closure::page_object_closure) (one page's
 /// transitive object set) and feed the copied pages into
 /// [`splice_pages`](crate::page_splice::splice_pages) on the target. Note that

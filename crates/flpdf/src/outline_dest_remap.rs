@@ -1,4 +1,4 @@
-//! Outline and named-destination remapping after page extraction (flpdf-9hc.8.10).
+//! Outline and named-destination remapping after page extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page tree
 //! for a subset extraction, this module updates the document's `/Outlines` tree
