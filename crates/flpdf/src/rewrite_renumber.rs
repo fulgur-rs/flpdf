@@ -23,10 +23,6 @@
 //! - Objects unreachable from the seed never receive a number (qpdf drops them
 //!   by default).
 
-// The plain-rewrite writer that consumes this map is a separate change; until
-// it lands, these items are exercised only by tests in a non-test build.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek};
 
