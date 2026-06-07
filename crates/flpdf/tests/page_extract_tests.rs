@@ -1124,3 +1124,97 @@ fn indirect_dest_absent_page_is_neutralized() {
         "indirect /Dest must be neutralized"
     );
 }
+
+#[test]
+fn indirect_aa_goto_is_neutralized() {
+    // /AA is an indirect ref (9 0 R) to the additional-actions dict; its /U
+    // subaction is a cross-page GoTo. Exercises the indirect-/AA in-place arm.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /AA 9 0 R >>",
+            ),
+            (9, "<< /U << /S /GoTo /D [4 0 R /Fit] >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "indirect-/AA GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    // /AA must stay an indirect reference: the indirect arm rewrites the
+    // referenced dict in place via set_object, it does not inline /AA.
+    let aa_ref = match annot.get("AA") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("/AA must stay indirect, got {other:?}"),
+    };
+    // Resolve the indirect /AA and confirm /U lost its /D.
+    let aa = out
+        .resolve_borrowed(aa_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .expect("/AA resolves to a dict");
+    let u = aa
+        .get("U")
+        .and_then(|o| o.as_dict())
+        .expect("/AA /U present");
+    assert_eq!(
+        u.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "action kept"
+    );
+    assert!(u.get("D").is_none(), "indirect /AA /U /D must be dropped");
+}
+
+#[test]
+fn indirect_next_array_goto_is_neutralized() {
+    // /A /Next is an indirect ref (10 0 R) to an ARRAY of actions; one is a
+    // cross-page GoTo. Without handling indirect-/Next-to-array it would leak.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (http://x) /Next 10 0 R >> >>"),
+            (10, "[ << /S /GoTo /D [4 0 R /Fit] >> ]"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "indirect-/Next-array GoTo must be pruned"
+    );
+}
