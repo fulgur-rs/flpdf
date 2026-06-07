@@ -2350,8 +2350,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // it to the plain path — qpdf parity requires it in every mode, and without
     // it the plain rewrite leaks `0 65535 obj null` as a body object, shifting
     // every subsequent offset and blocking bytes-identical output.)
-    let skip_refs: std::collections::HashSet<ObjectRef> =
-        pdf.deleted_object_refs().into_iter().collect();
+    //
+    // Kept as the `Vec` `deleted_object_refs()` returns rather than collected
+    // into a `HashSet`: deleted objects are typically zero or a handful, so a
+    // linear `contains` over a contiguous slice beats hashing plus a heap
+    // allocation for that size.
+    let skip_refs = pdf.deleted_object_refs();
 
     for object_ref in &object_refs {
         if Some(*object_ref) == pdf.encryption_ref() {
