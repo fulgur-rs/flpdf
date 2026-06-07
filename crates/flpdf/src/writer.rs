@@ -521,12 +521,13 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 ///   (`options.full_rewrite == true`) would invalidate existing signatures and
 ///   `options.allow_signed_full_rewrite` is not set.
 /// - [`crate::Error::Unsupported`] when `options.encrypt` and
-///   `options.copy_encryption` are both set (mutually exclusive), or when
-///   encryption is combined with `options.qdf`.
+///   `options.copy_encryption` are both set (mutually exclusive), when
+///   encryption is combined with `options.qdf`, or when the OS CSPRNG
+///   (`getrandom`) is unavailable while deriving encryption keys or an AES IV.
 /// - [`crate::Error::Encrypted`] when `options.encrypt` or
 ///   `options.copy_encryption` is set but the requested encryption parameters
-///   cannot be realized (an unsupported handler combination, malformed donor
-///   `/Encrypt` data, or a system-RNG failure while deriving keys).
+///   cannot be realized (an unsupported handler combination or malformed donor
+///   `/Encrypt` data).
 /// - Propagates I/O errors and structural PDF errors from the underlying
 ///   incremental or full-rewrite writer.
 pub fn write_pdf_with_options<R: Read + Seek, W: Write>(

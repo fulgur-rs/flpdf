@@ -77,9 +77,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
-    ///   node is not a dictionary, or when the field-tree depth limit is
-    ///   exceeded.
+    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
+    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
+    ///   dictionary, or when the field-tree depth limit is exceeded. A direct
+    ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error from [`Pdf::resolve`].
     pub fn fields(&mut self) -> Result<Vec<ObjectRef>> {
         let Some(acroform) = self.acroform_dict()? else {
@@ -106,9 +107,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
-    ///   node is not a dictionary, or when the field-tree depth limit is
-    ///   exceeded.
+    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
+    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
+    ///   dictionary, or when the field-tree depth limit is exceeded. A direct
+    ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error from [`Pdf::resolve`].
     pub fn field_infos(&mut self) -> Result<Vec<AcroFormFieldInfo>> {
         let Some(acroform) = self.acroform_dict()? else {
@@ -192,9 +194,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
-    ///   node is not a dictionary, or when the field-tree depth limit is
-    ///   exceeded.
+    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
+    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
+    ///   dictionary, or when the field-tree depth limit is exceeded. A direct
+    ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error from [`Pdf::resolve`].
     pub fn fix_appearance_inheritance(&mut self) -> Result<()> {
         let Some(acroform) = self.acroform_dict()? else {
@@ -229,10 +232,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// - [`Error::Missing`] when the target document has no `/Root`.
-    /// - [`Error::Unsupported`] when the catalog, `/AcroForm`, or a field-tree
-    ///   node is not a dictionary, when a depth limit (field-tree or
-    ///   reference-chain) is exceeded, or when the target object-number space is
-    ///   exhausted.
+    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
+    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
+    ///   dictionary, when a depth limit (field-tree or reference-chain) is
+    ///   exceeded, or when the target object-number space is exhausted. A direct
+    ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error propagated from [`copy_objects`] (for example a failed
     ///   [`Pdf::resolve`] on `source`).
     pub fn copy_fields_from<RS: Read + Seek>(
