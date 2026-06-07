@@ -30,10 +30,13 @@ use crate::object::{Object, ObjectRef};
 use crate::reader::Pdf;
 use crate::Error;
 
-/// Maximum inline structural nesting depth walked when collecting references
-/// from a single resolved object. Indirect references are enqueued rather than
-/// recursed, so this only bounds inline dictionary/array nesting and guards
-/// against stack overflow on adversarial input.
+/// Maximum inline structural nesting depth walked when collecting or rewriting
+/// references inside a single resolved object. Indirect references are enqueued
+/// rather than recursed, so this only bounds inline dictionary/array nesting and
+/// guards against stack overflow on adversarial input. Exceeding it is a hard
+/// error (not a silent stop): a reference past the limit would be left
+/// uncollected/un-rewritten and corrupt the renumbered output. Real PDFs never
+/// nest inline structures this deeply.
 const MAX_INLINE_DEPTH: usize = 256;
 
 /// A map from original object references to their qpdf-style Catalog-first
@@ -98,10 +101,22 @@ impl CatalogFirstRenumber {
             let obj = pdf.resolve_borrowed(cur)?;
             collect_refs(obj, 0, &mut |r| {
                 enqueue(r, &mut old_to_new, &mut order, &mut queue);
-            });
+            })?;
         }
 
         Ok(Self { old_to_new, order })
+    }
+}
+
+#[cfg(test)]
+impl CatalogFirstRenumber {
+    /// Build a map directly from `(old, new)` pairs (test-only). Used by writer
+    /// unit tests that need a known mapping without parsing a PDF.
+    pub(crate) fn from_pairs_for_test(pairs: &[(ObjectRef, ObjectRef)]) -> Self {
+        Self {
+            old_to_new: pairs.iter().copied().collect(),
+            order: pairs.iter().map(|(old, _)| *old).collect(),
+        }
     }
 }
 
@@ -128,31 +143,43 @@ fn enqueue(
 /// Invoke `f` for every indirect reference found inline in `obj`, descending
 /// into dictionary entries (lexicographic key order via the dictionary's
 /// ordered iteration) and array elements in order. Stream data bytes are not
-/// inspected. Recursion is bounded by [`MAX_INLINE_DEPTH`]; nesting deeper than
-/// that is not descended into.
-fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) {
+/// inspected.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when inline structural nesting exceeds
+/// [`MAX_INLINE_DEPTH`]. Silently stopping would leave references in the
+/// over-deep region uncollected, so they would never be numbered — emitting a
+/// corrupt renumbered PDF as if it succeeded. Refusing is the safe choice
+/// (real PDFs never nest inline structures that deeply).
+fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) -> crate::Result<()> {
     if depth >= MAX_INLINE_DEPTH {
-        return;
+        return Err(Error::Unsupported(
+            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
+             reference collection"
+                .to_string(),
+        ));
     }
     match obj {
         Object::Reference(r) => f(*r),
         Object::Array(elements) => {
             for element in elements {
-                collect_refs(element, depth + 1, f);
+                collect_refs(element, depth + 1, f)?;
             }
         }
         Object::Dictionary(dict) => {
             for (_key, value) in dict.iter() {
-                collect_refs(value, depth + 1, f);
+                collect_refs(value, depth + 1, f)?;
             }
         }
         Object::Stream(stream) => {
             for (_key, value) in stream.dict.iter() {
-                collect_refs(value, depth + 1, f);
+                collect_refs(value, depth + 1, f)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Rewrite every [`Object::Reference`] inside `obj` to its new reference from
@@ -161,7 +188,10 @@ fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) {
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when a reference has no entry in `map`
-/// (a dangling reference that the renumbered xref would not describe).
+/// (a dangling reference that the renumbered xref would not describe), or when
+/// inline structural nesting exceeds [`MAX_INLINE_DEPTH`] (leaving an over-deep
+/// reference un-rewritten would point it at the wrong renumbered object, so we
+/// refuse rather than emit a corrupt PDF).
 pub(crate) fn renumber_refs_in_place(
     obj: &mut Object,
     map: &CatalogFirstRenumber,
@@ -171,7 +201,11 @@ pub(crate) fn renumber_refs_in_place(
 
 fn rewrite(obj: &mut Object, depth: usize, map: &CatalogFirstRenumber) -> crate::Result<()> {
     if depth >= MAX_INLINE_DEPTH {
-        return Ok(());
+        return Err(Error::Unsupported(
+            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
+             reference rewriting"
+                .to_string(),
+        ));
     }
     match obj {
         Object::Reference(r) => {
@@ -345,5 +379,57 @@ mod tests {
         let mut obj = Object::Reference(ObjectRef::new(99, 0));
         let err = renumber_refs_in_place(&mut obj, &map).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    /// Wrap `leaf` in `n` nested single-element arrays, producing inline
+    /// nesting `n` levels deep.
+    fn nest_in_arrays(leaf: Object, n: usize) -> Object {
+        let mut obj = leaf;
+        for _ in 0..n {
+            obj = Object::Array(vec![obj]);
+        }
+        obj
+    }
+
+    #[test]
+    fn renumber_refs_in_place_errors_on_excessive_nesting() {
+        // A reference buried deeper than MAX_INLINE_DEPTH must NOT be silently
+        // left un-rewritten (which would point it at the wrong object); the
+        // rewrite must refuse with an error instead.
+        let map = CatalogFirstRenumber {
+            old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
+            order: vec![ObjectRef::new(10, 0)],
+        };
+        let mut obj = nest_in_arrays(
+            Object::Reference(ObjectRef::new(10, 0)),
+            MAX_INLINE_DEPTH + 5,
+        );
+        let err = renumber_refs_in_place(&mut obj, &map).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn collect_refs_errors_on_excessive_nesting() {
+        // The numbering walk must refuse over-deep inline nesting rather than
+        // silently skipping references it cannot reach.
+        let obj = nest_in_arrays(
+            Object::Reference(ObjectRef::new(10, 0)),
+            MAX_INLINE_DEPTH + 5,
+        );
+        let err = collect_refs(&obj, 0, &mut |_| {}).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn collect_refs_accepts_nesting_up_to_the_limit() {
+        // Nesting just under the limit is walked normally and the buried
+        // reference is collected.
+        let obj = nest_in_arrays(
+            Object::Reference(ObjectRef::new(10, 0)),
+            MAX_INLINE_DEPTH - 1,
+        );
+        let mut collected: Vec<ObjectRef> = Vec::new();
+        collect_refs(&obj, 0, &mut |r| collected.push(r)).expect("within limit");
+        assert_eq!(collected, vec![ObjectRef::new(10, 0)]);
     }
 }

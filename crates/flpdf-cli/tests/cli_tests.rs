@@ -15,13 +15,22 @@ use std::io::Write;
 /// hardcoding a number. Each fixture used here has exactly one merged widget,
 /// so its `annot_ref` is the dict that holds `/AP`.
 fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
-    let page_refs = flpdf::pages::page_refs(pdf).unwrap();
-    flpdf::enumerate_page_annotations(pdf, page_refs[0])
+    let page_ref = *flpdf::pages::page_refs(pdf)
+        .unwrap()
+        .first()
+        .expect("fixture must have at least one page");
+    let widgets: Vec<_> = flpdf::enumerate_page_annotations(pdf, page_ref)
         .unwrap()
         .into_iter()
-        .find(|a| a.is_widget)
-        .expect("fixture must have exactly one Widget annotation")
-        .annot_ref
+        .filter(|a| a.is_widget)
+        .collect();
+    assert_eq!(
+        widgets.len(),
+        1,
+        "fixture must have exactly one Widget annotation, found {}",
+        widgets.len()
+    );
+    widgets[0].annot_ref
 }
 
 #[test]

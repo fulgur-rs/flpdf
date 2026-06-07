@@ -1545,18 +1545,28 @@ fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
 fn remap_trailer_refs(
     trailer: &mut Dictionary,
     map: &crate::rewrite_renumber::CatalogFirstRenumber,
+    deleted: &[ObjectRef],
 ) -> Result<()> {
     // Collect the (key, old_ref) pairs first; the trailer holds only a handful
     // of entries, so the small Vec is cheaper than threading a mutable iterator.
     let to_remap: Vec<(Vec<u8>, ObjectRef)> = trailer
         .iter()
-        .filter(|(key, _)| !matches!(*key, b"Root" | b"Encrypt"))
+        .filter(|(key, _)| *key != b"Root" && *key != b"Encrypt")
         .filter_map(|(key, value)| match value {
             Object::Reference(r) => Some((key.to_vec(), *r)),
             _ => None,
         })
         .collect();
     for (key, old) in to_remap {
+        // A trailer reference to a deleted object (e.g. `/Info` pointing at a
+        // freed entry in malformed/edited input) has no body in the output and
+        // is not in the renumber map. Remapping it would leave the trailer
+        // pointing at a free xref row, corrupting the file on reopen — so drop
+        // the key entirely instead (the object is gone; the reference is moot).
+        if deleted.contains(&old) {
+            trailer.remove(&key);
+            continue;
+        }
         let new = map.new_for_original(old).ok_or_else(|| {
             crate::Error::Unsupported(format!(
                 "renumber: trailer /{} reference {old} absent from map",
@@ -2852,7 +2862,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // Remap surviving indirect trailer refs (notably /Info) to NEW
             // numbers. /Root is overwritten explicitly with new_root below, and
             // /Encrypt is handled by apply_encrypt_trailer_entries, so skip both.
-            remap_trailer_refs(&mut trailer, &renumber)?;
+            remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
             trailer.insert("Size", Object::Integer(object_count as i64));
             trailer.insert("Root", Object::Reference(new_root));
             apply_encrypt_trailer_entries(&mut trailer, pdf, options, encrypt_ctx.as_ref());
@@ -2962,7 +2972,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // Remap surviving indirect trailer refs (notably /Info) to NEW
             // numbers. /Root is set explicitly to new_root below; /Encrypt is
             // handled by apply_encrypt_trailer_entries.
-            remap_trailer_refs(&mut xref_dict, &renumber)?;
+            remap_trailer_refs(&mut xref_dict, &renumber, &skip_refs)?;
             // The trailer may carry filter keys from the input's xref stream
             // (e.g. /Filter /FlateDecode). We're emitting freshly built bytes
             // via `Stream::new`, so any stale filter declaration would make
@@ -3289,6 +3299,56 @@ fn write_qdf_trailer(bytes: &mut Vec<u8>, trailer: &Dictionary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite_renumber::CatalogFirstRenumber;
+
+    #[test]
+    fn remap_trailer_refs_remaps_live_and_drops_deleted() {
+        // /Info points at a live object (10 -> new 3); /Meta points at a
+        // deleted object (20). The live ref must be remapped; the deleted ref's
+        // key must be dropped (not remapped to a free xref row). /Root and
+        // /Encrypt are left for the caller and must be untouched here.
+        let map = CatalogFirstRenumber::from_pairs_for_test(&[
+            (ObjectRef::new(1, 0), ObjectRef::new(1, 0)),
+            (ObjectRef::new(10, 0), ObjectRef::new(3, 0)),
+        ]);
+        let mut trailer = Dictionary::new();
+        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
+        trailer.insert("Info", Object::Reference(ObjectRef::new(10, 0)));
+        trailer.insert("Meta", Object::Reference(ObjectRef::new(20, 0)));
+        trailer.insert("Size", Object::Integer(4));
+
+        let deleted = [ObjectRef::new(20, 0)];
+        remap_trailer_refs(&mut trailer, &map, &deleted).expect("remap");
+
+        assert_eq!(
+            trailer.get("Info"),
+            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            "live /Info must be remapped to its new number"
+        );
+        assert!(
+            trailer.get("Meta").is_none(),
+            "/Meta pointing at a deleted object must be dropped, not remapped"
+        );
+        // /Root is filtered from remapping (caller owns it) and stays as-is.
+        assert_eq!(
+            trailer.get("Root"),
+            Some(&Object::Reference(ObjectRef::new(1, 0)))
+        );
+    }
+
+    #[test]
+    fn remap_trailer_refs_errors_on_unmapped_live_ref() {
+        // A non-deleted trailer ref absent from the map is a real
+        // inconsistency and must surface as an error, not a stale number.
+        let map = CatalogFirstRenumber::from_pairs_for_test(&[(
+            ObjectRef::new(1, 0),
+            ObjectRef::new(1, 0),
+        )]);
+        let mut trailer = Dictionary::new();
+        trailer.insert("Info", Object::Reference(ObjectRef::new(99, 0)));
+        let err = remap_trailer_refs(&mut trailer, &map, &[]).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(_)));
+    }
 
     fn id_array(d: &Dictionary) -> Vec<Object> {
         match d.get("ID") {

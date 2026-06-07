@@ -36,9 +36,10 @@ Captured via `qpdf --static-id --object-streams=disable <fixture> out.pdf` then
 | three-page  | 1=Catalog, 2=Info, 3=Pages, 4=Page1, 5=Page2, 6=Page3, 7=Contents1, 8=Font dict, 9=Contents2, 10=Contents3, 11=Font |
 
 This proves: **BFS** (both pages numbered before any page content), **sorted dict keys**
-(`/Contents` < `/Resources`, so Contents precedes the Font dict), **first-encounter-wins**
-for shared objects (the single Font dict is numbered from Page1, reused by Page2/3),
-**`/Info` seeded at 2** (not reachable from Catalog — comes from the trailer seed).
+(`/Contents` < `/Resources`, so Contents precedes the Font dictionary),
+**first-encounter-wins** for shared objects (the single Font dictionary is numbered on
+Page 1 and reused by Pages 2 and 3), **`/Info` seeded at 2** (not reachable from the
+Catalog — it comes from the trailer seed).
 
 Confirmed against qpdf source (`QPDFWriter::enqueueObjectsStandard` / `enqueue`,
 deepwiki): `/Root` enqueued first; remaining `trimmed_trailer()` refs next (trailer
@@ -139,6 +140,7 @@ impl CatalogFirstRenumber {
 ```
 
 **Step 3:** Commit.
+
 ```bash
 git add crates/flpdf/src/rewrite_renumber.rs crates/flpdf/src/lib.rs
 git commit -m "feat(writer): scaffold CatalogFirstRenumber module [flpdf-9hc.32]"
@@ -278,6 +280,7 @@ Expected: PASS for all three fixtures.
 the qpdf object count for each fixture (7 / 9 / 11). Run → PASS.
 
 **Step 4: Commit.**
+
 ```bash
 git add crates/flpdf/src/rewrite_renumber.rs
 git commit -m "feat(writer): Catalog-first numbering walk matching qpdf order [flpdf-9hc.32]"
@@ -303,6 +306,7 @@ object, so consider taking `Object` by value and rewriting in place to avoid the
 clone — prefer in-place mutation per `.claude/rules` #1).
 
 Prefer this in-place signature to avoid cloning stream payloads:
+
 ```rust
 /// Rewrite all references inside `obj` to their new numbers, in place.
 pub(crate) fn renumber_refs_in_place(
@@ -324,6 +328,7 @@ editing (line numbers drift).
 
 **Step 1:** Build the map at the top of the function, right after `root_ref` is obtained
 (~`writer.rs:2166`) and before `object_refs`/`existing_max` (`2281-2284`):
+
 ```rust
 let renumber = crate::rewrite_renumber::CatalogFirstRenumber::build(pdf)?;
 ```
@@ -331,12 +336,14 @@ let renumber = crate::rewrite_renumber::CatalogFirstRenumber::build(pdf)?;
 **Step 2:** Replace the iteration source. Instead of
 `object_refs.sort_by_key(|r| (r.number, r.generation))` driving the loop with original
 numbers, build:
+
 ```rust
 // (new_ref, old_ref) in ascending new-number order. Drives both the emit loop
 // and existing_max. Object 0 / deleted are never reachable from /Root, so the
 // existing skip guards become no-ops here, but keep them for defensive parity.
 let renumbered: Vec<(ObjectRef, ObjectRef)> = renumber.pairs().collect();
 ```
+
 Then in the main loop iterate `&renumbered` as `(new_ref, old_ref)`:
 - resolve `old_ref` (`pdf.resolve(*old_ref)?`),
 - `renumber_refs_in_place(&mut object, &renumber)?` BEFORE encryption/stream policy,
@@ -377,34 +384,42 @@ failures (golden/struct tests may need re-bless in Task 5; unit tests should pas
 **Step 1:** Add/locate a direct cmp acceptance check. The compat harness
 (`crates/flpdf-cli/tests/compat_baseline_static_id.rs`,
 `compat_matrix_baseline.rs`) already compares flpdf vs qpdf with `--static-id`. Run:
+
 ```bash
 cargo test -p flpdf-cli --test compat_baseline_static_id --test compat_matrix_baseline
 ```
+
 Inspect the new verdicts: the plain `--static-id` column for one/two/three-page must move
 from `byte-equal=diverge` to `match`.
 
 **Step 2:** Manual cmp sanity (ground truth, independent of the harness):
+
 ```bash
 # In the worktree. Produce flpdf plain --static-id output and qpdf output, elide /ID, cmp.
 # (Use the CLI: `cargo run -p flpdf-cli -- rewrite --static-id in.pdf out.pdf`; confirm
 #  the exact subcommand/flags from flpdf-cli --help.)
 ```
+
 Expected: identical bytes after `/ID` elision for all three fixtures.
 
 **Step 3:** Full regression — the shared writer affects everything:
+
 ```bash
 cargo test -p flpdf
 cargo test -p flpdf-cli
 ```
+
 Triage EVERY failure. Golden diffs are expected (re-bless in Step 4); logic failures are
 not.
 
 **Step 4:** Re-bless goldens and **inspect every diff**:
+
 ```bash
 BLESS=1 cargo test -p flpdf-cli --test compat_matrix_baseline
 BLESS=1 cargo test -p flpdf-cli --test compat_baseline_static_id
 git diff tests/golden/
 ```
+
 Confirm each change is an intended renumber (object counts, offsets, verdict flips) — NOT
 a dropped object, broken ref, or regressed verdict elsewhere. Pay attention to: qdf
 columns (valid + re-blessed, not necessarily byte-equal), encrypt/objstm columns (must
