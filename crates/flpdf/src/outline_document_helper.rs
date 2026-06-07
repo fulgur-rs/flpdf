@@ -30,7 +30,7 @@ use std::io::{Read, Seek};
 
 /// Default recursion limit for outline materialization. Matches
 /// [`crate::outline::DEFAULT_MAX_OUTLINE_DEPTH`]. True unbounded/iterative deep
-/// walking (1000+ levels, cycle diagnostics) is tracked by flpdf-9hc.14.7.
+/// walking (1000+ levels, cycle diagnostics) is not currently supported.
 pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
 
 /// Indirection/`/D` nesting bound when resolving a destination. Mirrors the

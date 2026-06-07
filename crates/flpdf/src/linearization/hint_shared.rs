@@ -2,7 +2,7 @@
 //!
 //! This module builds the **data** for the Shared Object Hint Table.  It does
 //! **not** encode the table as bits/bytes — that is the responsibility of the
-//! hint-stream encoder (sub-task 2.7).
+//! hint-stream encoder.
 //!
 //! # Structure overview (Annex F.3.2)
 //!
@@ -40,7 +40,7 @@
 //! | `entry.group_offset` (item 4) per object | entries | `0` |
 //!
 //! These fields are stored as `0` in the returned structs.  The back-patcher
-//! (sub-task 2.9) locates them by field name and overwrites them once the real
+//! locates them by field name and overwrites them once the real
 //! byte offsets are available.
 
 use super::plan::LinearizationPlan;
@@ -57,9 +57,9 @@ use super::renumber::RenumberMap;
 /// ## Back-patch fields
 ///
 /// * `location` (item 2): byte offset of the first object in the shared
-///   objects section.  Set to `0` (placeholder); back-patched by sub-task 2.9.
+///   objects section.  Set to `0` (placeholder); back-patched once the real offset is known.
 /// * `least_length` (item 6): minimum byte length of an object in the shared
-///   objects section.  Set to `0` (placeholder); back-patched by sub-task 2.9.
+///   objects section.  Set to `0` (placeholder); back-patched once the real offset is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedObjectHeader {
     /// Item 1 — Object number of the first object in the shared objects
@@ -70,7 +70,7 @@ pub struct SharedObjectHeader {
 
     /// Item 2 — Byte offset of the first object in the shared objects section.
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offset is known.**
     pub location: u64,
 
     /// Item 3 — Number of shared object entries for the first page
@@ -86,7 +86,7 @@ pub struct SharedObjectHeader {
 
     /// Item 6 — Least byte length of an object in the shared objects section.
     ///
-    /// **Placeholder: 0.  Back-patched by sub-task 2.9.**
+    /// **Placeholder: 0; back-patched once the real offset is known.**
     pub least_length: u64,
 
     /// Item 7 — Bits needed to represent the difference between the greatest
@@ -119,8 +119,8 @@ pub struct SharedGroupEntry {
 /// ## Back-patch fields
 ///
 /// * `length_minus_least` (item 2): byte length of this object minus
-///   `header.least_length`.  Set to `0` (placeholder); back-patched by
-///   sub-task 2.9.
+///   `header.least_length`.  Set to `0` (placeholder); back-patched once
+///   the real offsets are known.
 /// * `nobjects_minus_one` (item 4): number of additional objects in this
 ///   shared object's group, minus one.  In our 1-object-per-group model this
 ///   is always `0`; encoded with `bits_group_object_count` bits, which is
@@ -157,9 +157,10 @@ pub struct SharedObjectEntry {
 ///
 /// Constructed via [`SharedObjectHintTable::from_plan`].  All placeholder fields
 /// (`location`, `least_length`, per-object `length_minus_least`, `group_offset`)
-/// are initialized to `0`; sub-task 2.9 back-patches them.
+/// are initialized to `0`; the back-patcher fills them in once the real
+/// byte offsets are available.
 ///
-/// The sub-task 2.7 encoder serializes this struct into the binary bit-packed
+/// The hint-stream encoder serializes this struct into the binary bit-packed
 /// format required by Annex F.
 ///
 /// # Group model

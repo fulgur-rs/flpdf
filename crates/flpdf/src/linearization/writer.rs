@@ -1,8 +1,8 @@
-//! Layout writer — orchestrates the full linearized PDF output (sub-task 2.8).
+//! Layout writer — orchestrates the full linearized PDF output.
 //!
 //! This module assembles the six-part Annex F layout in correct order, tracks
 //! byte offsets for back-patching, and returns the finished bytes together with
-//! all offset information that the back-patcher (sub-task 2.9) needs.
+//! all offset information that the back-patcher needs.
 //!
 //! # Part ordering (Annex F)
 //!
@@ -54,7 +54,7 @@
 //!
 //! # Scope
 //!
-//! Back-patching the placeholder values is the responsibility of sub-task 2.9.
+//! Back-patching the placeholder values is the responsibility of a later step.
 //! This module returns `LinearizedOffsets` containing all information required
 //! for that step.
 
@@ -281,7 +281,7 @@ fn build_objstm_container_object<R: Read + Seek>(
 /// Byte offsets and derived values returned by [`write_linearized`].
 ///
 /// All values are absolute byte positions within `LinearizedDocument::bytes`
-/// unless stated otherwise.  The back-patcher (sub-task 2.9) uses these to
+/// unless stated otherwise.  The back-patcher uses these to
 /// fill the placeholder fields in the Part 1 parameter dictionary.
 #[derive(Debug, Clone)]
 pub struct LinearizedOffsets {
@@ -326,7 +326,7 @@ pub struct LinearizedOffsets {
     pub part1_placeholders: Part1Placeholders,
 
     /// `new_object_number → byte_offset` map covering every object in the
-    /// linearized file.  Used by sub-task 2.11 for structural verification.
+    /// linearized file.  Used for structural verification.
     pub xref_offsets: BTreeMap<u32, usize>,
 
     /// Byte range of the `/Prev` value placeholder in the Part 1 (first)
@@ -339,7 +339,7 @@ pub struct LinearizedOffsets {
     /// Absolute byte range spanning the rewritable param-dict region:
     /// `<<` through the end of the trailing pad (inclusive of `\nendobj\n`).
     /// The back-patcher splices a variable-width dict body + space-pad into
-    /// this region in one operation (flpdf-9hc.20.25).
+    /// this region in one operation.
     pub dict_writable_region: std::ops::Range<usize>,
 }
 
@@ -654,12 +654,11 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 
 /// Emit the **first-page (Part-1) cross-reference stream** at its proper
 /// position — physically inside the first-page region, *before* `/E*, in the
-/// slot where the classic Part-1 mini-xref + first trailer would otherwise go
-/// (flpdf-56u).
+/// slot where the classic Part-1 mini-xref + first trailer would otherwise go.
 ///
 /// A linearized PDF's first-page cross-reference section is part of the
 /// first-page byte range so a reader can resolve page 1 from the leading
-/// bytes; emitting it only at EOF defeats linearization (flpdf-56u review).
+/// bytes; emitting it only at EOF defeats linearization.
 ///
 /// The stream is written **uncompressed** with a *deterministic* payload
 /// length (`first_count * 13`, where `first_count = first_xref_slot + 1` is a
@@ -686,10 +685,10 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// range — they live exclusively in the main xref's `/Index`.  Part-3
 /// (page-1 shared) objects are additionally kept *plain* by the planner
 /// (`LinearizationPlan::objstm_batches` unconditionally clears
-/// `part3_batches`, flpdf-9hc.5.8.3), so no Part-3 ObjStm container is ever
+/// `part3_batches`), so no Part-3 ObjStm container is ever
 /// emitted before `/E`.  Re-enabling Part-3 packing requires reconciling
-/// container numbering with this split-xref range (tracked by the
-/// `flpdf-ihb` epic); until then this range is exactly the Part-3-plain set.
+/// container numbering with this split-xref range; until then this range is
+/// exactly the Part-3-plain set.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
@@ -815,7 +814,7 @@ fn patch_first_page_xref(
 }
 
 /// Emit the **main (Part-6) cross-reference stream** at end-of-body, followed
-/// by the trailing `startxref`/`%%EOF` (flpdf-56u).
+/// by the trailing `startxref`/`%%EOF`.
 ///
 /// `/Index [main_xref_slot, Size − main_xref_slot]`: objects `main_xref_slot
 /// ..= last`, type-1 (the main xref object + remaining Part-4 containers)
@@ -1253,7 +1252,7 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// compressed byte length is stable before the final write.
 ///
 /// Returns [`LinearizedDocument`] containing both the bytes and the
-/// [`LinearizedOffsets`] needed for back-patching (sub-task 2.9).
+/// [`LinearizedOffsets`] needed for back-patching.
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,

@@ -27,8 +27,8 @@
 //! # Divergence from qpdf
 //!
 //! qpdf does **not** deduplicate — `1,1,2` in qpdf produces page 1 twice. This
-//! implementation **does** deduplicate per the acceptance criteria of flpdf-9hc.8.1.
-//! The syntax parser and resolve error conditions are otherwise qpdf-compatible.
+//! implementation **does** deduplicate. The syntax parser and resolve error
+//! conditions are otherwise qpdf-compatible.
 
 use crate::{Error, Result};
 

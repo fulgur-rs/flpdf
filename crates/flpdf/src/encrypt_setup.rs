@@ -1,4 +1,4 @@
-//! User-facing encryption parameters for the writer side (flpdf-9hc.4.9).
+//! User-facing encryption parameters for the writer side.
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API
 //! arguments) and pass it through [`crate::WriteOptions::encrypt`]; the
@@ -9,14 +9,11 @@
 //!
 //! # Algorithm coverage
 //!
-//! Wired through end to end: `V=4 R=4 Length=128 /CFM AESV2` (AES-128,
-//! flpdf-9hc.4.9), `V=5 R=6 Length=256 /CFM AESV3` (AES-256,
-//! flpdf-9hc.4.9.4), and `V=5 R=5 Length=256 /CFM AESV3` (deprecated
-//! pre-ISO 32000-2 AES-256, flpdf-9hc.4.15). The remaining Standard handler
-//! revisions (V=1, V=2, V=4 RC4) have their dictionary builders shipped
-//! already (PRs #219 / #220) but no writer integration yet; the corresponding
-//! flpdf-9hc.4.9 follow-ups (flpdf-9hc.4.9.1/.2/.3) add dispatch into the
-//! same pipeline.
+//! Wired through end to end: `V=4 R=4 Length=128 /CFM AESV2` (AES-128),
+//! `V=5 R=6 Length=256 /CFM AESV3` (AES-256), and
+//! `V=5 R=5 Length=256 /CFM AESV3` (deprecated pre-ISO 32000-2 AES-256).
+//! The remaining Standard handler revisions (V=1, V=2, V=4 RC4) have their
+//! dictionary builders shipped already but no writer integration yet.
 //!
 //! # Randomness
 //!
@@ -24,8 +21,7 @@
 //! (IV reuse with the same key under CBC leaks plaintext XORs — a well-
 //! known weakness). The writer fills IVs via [`getrandom::getrandom`]
 //! (OS CSPRNG). The deterministic-IV opt-in for byte-identical CI
-//! testing is the separate `--static-aes-iv` flag tracked under
-//! flpdf-9hc.4.13.
+//! testing is the separate `--static-aes-iv` flag.
 
 use crate::object::Dictionary;
 use crate::permissions::PermissionsConfig;
@@ -36,9 +32,7 @@ use crate::security::standard::ObjectKeyAlg;
 /// The Standard handler V/R/Length/CFM tuple is encoded as one enum
 /// variant per (algorithm × key-length × cipher) combination, so callers
 /// pick a method rather than threading three integers and a CFM name
-/// separately. The walking-skeleton release only includes `V4Aes128`;
-/// future variants land alongside the corresponding writer-dispatch
-/// follow-ups.
+/// separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptMethod {
     /// V=4 R=4 Length=128 with `/CFM AESV2` (AES-128 CBC). Default for
@@ -66,9 +60,8 @@ pub enum EncryptMethod {
 /// User-facing encryption parameters for the writer.
 ///
 /// Set via [`crate::WriteOptions::encrypt`]. The CLI populates these from
-/// `--encrypt user-pw owner-pw key-len -- [--print …] [--modify …] [...]`
-/// (flpdf-9hc.4.9 CLI surface); library callers can construct one
-/// directly.
+/// `--encrypt user-pw owner-pw key-len -- [--print …] [--modify …] [...]`;
+/// library callers can construct one directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptParams {
     /// Standard handler V/R/Length/CFM tuple to emit.
@@ -90,13 +83,12 @@ pub struct EncryptParams {
     /// 2. Appends the `0xFF×4` tail to the Algorithm 2 file-key MD5 input.
     /// 3. Skips encryption on the `/Metadata` stream payload and prepends
     ///    `/Crypt` + `/DecodeParms <</Name /Identity>>` to its filter
-    ///    chain (via the helper from flpdf-9hc.4.7) so readers know not
-    ///    to decrypt those bytes.
+    ///    chain so readers know not to decrypt those bytes.
     pub encrypt_metadata: bool,
 }
 
 impl EncryptParams {
-    /// Convenience constructor for the V=4 AES-128 walking-skeleton case
+    /// Convenience constructor for the V=4 AES-128 case
     /// with the default "all permissions granted" permission set and
     /// `encrypt_metadata = true`.
     pub fn v4_aes128(
@@ -116,8 +108,7 @@ impl EncryptParams {
     /// "all permissions granted" permission set and `encrypt_metadata = true`.
     ///
     /// Unlike V<5 there is no empty-owner fallback to the user password — the
-    /// owner password is passed through verbatim (the empty-owner +
-    /// non-empty-user "insecure" combination guard is flpdf-9hc.4.14).
+    /// owner password is passed through verbatim.
     pub fn v5_r6(user_password: impl Into<Vec<u8>>, owner_password: impl Into<Vec<u8>>) -> Self {
         Self {
             method: EncryptMethod::V5R6Aes256,
@@ -177,7 +168,7 @@ impl EncryptParams {
 }
 
 /// Donor `/Encrypt` dictionary and derived file key for the
-/// `--copy-encryption-from` write path (flpdf-9hc.4.11).
+/// `--copy-encryption-from` write path.
 ///
 /// Built by the CLI layer from the donor PDF's on-disk state (opened with
 /// [`crate::Pdf::open_with_options`]) and stored in
@@ -187,8 +178,7 @@ impl EncryptParams {
 ///
 /// **Scope:** Only V=4 AES-128 donors are supported in this release.
 /// Donors using other schemes (V=1/V=2/V=4 RC4/V=5 R=6) are rejected at the
-/// CLI layer with a clear "not yet supported (flpdf-9hc.4.9 follow-up)"
-/// diagnostic.
+/// CLI layer with a clear "not yet supported" diagnostic.
 #[derive(Debug, Clone)]
 pub struct CopyEncryptionSource {
     /// The donor's `/Encrypt` dictionary, copied verbatim.  The writer emits
@@ -204,6 +194,6 @@ pub struct CopyEncryptionSource {
     /// position; Algorithm 2 key derivation is pinned to this value.
     pub id0: Vec<u8>,
     /// Per-object key derivation algorithm implied by the donor's crypt filter.
-    /// Always [`ObjectKeyAlg::Aes`] for the V=4 AES-128 walking-skeleton scope.
+    /// Always [`ObjectKeyAlg::Aes`] for the V=4 AES-128 scope.
     pub object_key_alg: ObjectKeyAlg,
 }

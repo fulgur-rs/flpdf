@@ -26,8 +26,8 @@
 //! * a single classic `xref` table with one `0 N` subsection, followed by a
 //!   `trailer` dictionary, `startxref`, and `%%EOF`.
 //!
-//! Object streams (`/Type /ObjStm`) are not handled: QDF mode disables them
-//! (epic layer 6.2), so they should never appear. If one is present
+//! Object streams (`/Type /ObjStm`) are not handled: QDF mode disables them,
+//! so they should never appear. If one is present
 //! [`fix_qdf`] returns [`crate::Error::Unsupported`].
 //!
 //! ## The four regenerated regions
@@ -212,7 +212,7 @@ enum LengthKind {
     /// Indirect `/Length M G R` with `G != 0` — not canonical QDF; qdf_fix
     /// keys holders by object number only, so a non-zero generation cannot be
     /// validated/rewritten safely. Treated as an explicit error rather than
-    /// silently rewriting the wrong-generation object (flpdf-9hc.25).
+    /// silently rewriting the wrong-generation object.
     IndirectUnsupportedGeneration,
     Direct,
     None,

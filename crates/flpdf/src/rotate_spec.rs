@@ -11,7 +11,8 @@
 //! ## Sign semantics
 //!
 //! NOTE: This implementation intentionally diverges from one interpretation of
-//! qpdf where "no sign = Assign". Per the flpdf-9hc.8.5 specification:
+//! qpdf where "no sign = Assign". This implementation uses the following
+//! sign semantics:
 //!
 //! - `+angle` or `angle` (no sign) → additive rotation (`RotateMode::Add`, positive degrees)
 //! - `-angle`                       → additive rotation (`RotateMode::Add`, **negative** degrees)
@@ -31,7 +32,7 @@
 //!
 //! The parser returns a single [`RotateSpec`].  Callers that accept multiple
 //! `--rotate` flags should collect them into a `Vec<RotateSpec>`; the specs are
-//! applied in order (responsibility of the CLI layer, flpdf-9hc.8.12).
+//! applied in order (responsibility of the CLI layer).
 
 use crate::page_range::PageRange;
 use crate::page_rotate::{RotateMode, RotateOp};

@@ -639,7 +639,7 @@ fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, S
 ///
 /// # Write-side compression policy
 ///
-/// flpdf writes stream compression as **FlateDecode only** (decision flpdf-9hc.7.2).
+/// flpdf writes stream compression as **FlateDecode only**.
 /// LZWEncode is intentionally unsupported — qpdf also has no LZW encoder.
 /// Image/binary passthrough codecs (DCTDecode, JBIG2Decode, JPXDecode, CCITTFaxDecode)
 /// are never re-encoded by flpdf; the writer preserves those streams verbatim.

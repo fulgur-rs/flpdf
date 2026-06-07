@@ -46,7 +46,7 @@ struct CatRefInfo {
     /// but they still increment `group_count`, so the ref ends up protected.
     used_union: BTreeSet<Vec<u8>>,
     /// True if any top-level `/Resources` group pointing to this sub-dict belongs
-    /// to a page whose content stream could not be decoded (flpdf-s9s). Such a
+    /// to a page whose content stream could not be decoded. Such a
     /// sub-dict must never be pruned in either mode: the corrupt page's true
     /// usage is unknown, so we conservatively retain every entry.
     protected: bool,
@@ -58,9 +58,9 @@ struct CatRefInfo {
 /// collide even when they share the same `ObjectRef` number.
 ///
 /// `PageInline` stores the page's own `ObjectRef` (generation 0) without
-/// inventing a synthetic generation-1 value, eliminating the collision described
-/// in roborev low 指摘2: a real indirect `(N, 1)` object and a page-inline
-/// group for page object `(N, 0)` could previously share the same synthetic key.
+/// inventing a synthetic generation-1 value, eliminating a collision where a
+/// real indirect `(N, 1)` object and a page-inline group for page object
+/// `(N, 0)` could previously share the same synthetic key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ResGroupKey {
     /// `/Resources` is an indirect object at the given ref.
@@ -511,7 +511,7 @@ fn resources_location<R: Read + Seek>(
 /// any name that falls outside a Form's own resources sub-category is
 /// attributed to the calling page's resources.
 ///
-/// # Return value (flpdf-s9s)
+/// # Return value
 ///
 /// - `Ok(Some(used))` — the content was fully decoded and tokenised; `used` is a
 ///   reliable, complete picture of the page's resource usage and is safe to
@@ -571,7 +571,7 @@ const MAX_FORM_DEPTH: usize = 64;
 ///
 /// Returns `Ok(true)` when the stream was tokenised to the end, `Ok(false)` when
 /// tokenisation stopped early on a malformed token (so `used` is incomplete and
-/// the page must be conservatively retained — flpdf-s9s). Structural errors from
+/// the page must be conservatively retained). Structural errors from
 /// nested Form XObject resolution propagate as `Err`.
 fn collect_from_stream<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -617,7 +617,7 @@ fn collect_from_stream<R: Read + Seek>(
 ///
 /// Returns the completeness flag of any nested Form XObject recursion (`true`
 /// for non-recursing operators): `false` propagates an incomplete collection up
-/// so the page is conservatively retained (flpdf-s9s).
+/// so the page is conservatively retained.
 fn process_operator<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     operator: &[u8],
@@ -728,7 +728,7 @@ fn process_operator<R: Read + Seek>(
 /// Returns `Ok(true)` when the Form (if any) was tokenised completely, `Ok(false)`
 /// when the Form's content could not be fully decoded/tokenised AND its names
 /// feed the calling page's scope — signalling the page must be conservatively
-/// retained (flpdf-s9s). A Form with its **own** `/Resources` cannot make the
+/// retained. A Form with its **own** `/Resources` cannot make the
 /// page incomplete (its names are scoped to itself and discarded here), so it
 /// always reports `Ok(true)`. Non-Form / absent / cycle / depth-limit cases also
 /// report `Ok(true)` (nothing page-relevant was lost). Structural resolution
@@ -965,7 +965,7 @@ fn prune_ancestor_inline_resources<R: Read + Seek>(
 /// category sub-dictionaries (e.g., `/Font 10 0 R`). When the category value
 /// is a Reference, the referenced object is pruned in-place via `pdf.set_object`.
 ///
-/// # Indirect category sub-dict sharing (指摘1 fix)
+/// # Indirect category sub-dict sharing
 ///
 /// An indirect category sub-dict (e.g. `/Font 6 0 R`) may be referenced by
 /// several different top-level `/Resources` groups.  `cat_ref_map` carries

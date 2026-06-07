@@ -9,12 +9,11 @@
 //! `--allow-weak-crypto` flag before calling [`rc4`].
 //!
 //! # Dead-code notice
-//! Several primitives in this module are scaffolding for the encrypted-PDF
-//! support epic (flpdf-9hc.3) and are not yet wired up to any call site
-//! within this single subtask. They become live as subsequent stack layers
-//! (V=1/V=2 key derivation, AES decryption, V=5 R=6 hashing) land. The
-//! module-level `allow(dead_code)` keeps each layer's CI green without
-//! losing the unused-detector for everything else.
+//! Several primitives in this module support encrypted-PDF handling
+//! (V=1/V=2 key derivation, AES decryption, V=5 R=6 hashing) and are not
+//! all wired up to a call site yet. The module-level `allow(dead_code)`
+//! keeps the build clean without losing the unused-detector for everything
+//! else.
 #![allow(dead_code)]
 
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
@@ -169,7 +168,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Compute the SHA-384 digest of `data`.
 ///
-/// Used by the V=5 R=6 password hashing path (flpdf-9hc.3.5).
+/// Used by the V=5 R=6 password hashing path.
 pub(crate) fn sha384(data: &[u8]) -> [u8; 48] {
     let result = Sha384::digest(data);
     result.into()
@@ -177,7 +176,7 @@ pub(crate) fn sha384(data: &[u8]) -> [u8; 48] {
 
 /// Compute the SHA-512 digest of `data`.
 ///
-/// Used by the V=5 R=6 password hashing path (flpdf-9hc.3.5).
+/// Used by the V=5 R=6 password hashing path.
 pub(crate) fn sha512(data: &[u8]) -> [u8; 64] {
     let result = Sha512::digest(data);
     result.into()

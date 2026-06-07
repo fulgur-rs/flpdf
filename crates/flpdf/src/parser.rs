@@ -14,7 +14,7 @@ pub fn parse_object(input: &[u8]) -> Result<Object> {
 /// parser cannot resolve `M` (it has no xref); it locates the payload window
 /// via the spec `endstream`-scan recovery and records these bounds so the
 /// reader — which *does* have the xref — can re-slice to the authoritative
-/// length (flpdf-9hc.27).
+/// length.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IndirectStreamLength {
     /// The `/Length M G R` holder object reference.
@@ -35,7 +35,7 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 /// Like [`parse_indirect_object`] but also returns
 /// [`IndirectStreamLength`] bounds when the parsed object is a stream whose
 /// `/Length` is an indirect reference. Used by the reader to resolve the
-/// authoritative length via the xref (flpdf-9hc.27); all other callers use
+/// authoritative length via the xref; all other callers use
 /// the plain [`parse_indirect_object`] wrapper.
 pub(crate) fn parse_indirect_object_detailed(
     input: &[u8],
@@ -66,7 +66,7 @@ pub(crate) struct Parser<'a> {
     no_reference: bool,
     /// Set by [`stream_from_dict`](Self::stream_from_dict) when a stream's
     /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
-    /// can surface the payload window for xref-based resolution (flpdf-9hc.27).
+    /// can surface the payload window for xref-based resolution.
     last_indirect_stream_len: Option<IndirectStreamLength>,
 }
 

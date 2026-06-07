@@ -949,11 +949,11 @@ mod tests {
         let _ = RenumberMap::from_plan(&plan);
     }
 
-    /// flpdf-9hc.5.8.4: with two ObjStm batches the relocated layout must
+    /// With two ObjStm batches the relocated layout must
     /// place **all** container slots before **all** member slots, so each
     /// split-xref `/Index` range stays strictly `type-1* type-2*` (qpdf
     /// rejects a type-1 entry after a type-2 one in a cross-reference
-    /// stream).  The single-batch (flpdf-56u Part-4-only) layout is a
+    /// stream).  The single-batch (Part-4-only) layout is a
     /// degenerate case of the same rule.
     #[test]
     fn relocate_orders_all_containers_before_all_members() {

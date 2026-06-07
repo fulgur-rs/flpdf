@@ -1,4 +1,4 @@
-//! Resource pruning after page-subset extraction (flpdf-9hc.8.9).
+//! Resource pruning after page-subset extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has restructured the
 //! document so that only the selected pages remain reachable from `/Root`,

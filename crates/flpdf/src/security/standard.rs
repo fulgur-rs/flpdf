@@ -13,8 +13,8 @@
 //! and `select_crypt_filter`. The `/StmF`, `/StrF`, `/EFF` use-site selection and the
 //! `cfm_to_object_key_alg` helper are included for completeness.
 //!
-//! Actual PDF parsing of the `/Encrypt` dictionary and end-to-end round-trip decryption
-//! are deferred to issues flpdf-9hc.3.7, 3.8, 3.14, and 3.15.
+//! This module provides key derivation only. Parsing of the `/Encrypt`
+//! dictionary and end-to-end round-trip decryption are handled elsewhere.
 //!
 //! # V=5 AES-256 support
 //! R=5 is the deprecated pre-ISO 32000-2 AES-256 Standard handler. It uses a
@@ -30,17 +30,15 @@
 //! V=5 R=5/R=6 AES-256 key derivation are covered here.
 //!
 //! # Note on end-to-end compatibility
-//! Full qpdf-compatible fixture testing (real encrypted PDF files) is deferred to
-//! issues flpdf-9hc.3.14 and flpdf-9hc.3.15.  The tests here use Python-generated
-//! known-answer vectors (see inline comments) to verify algorithmic correctness.
+//! The tests here use Python-generated known-answer vectors (see inline
+//! comments) to verify algorithmic correctness rather than full
+//! qpdf-compatible fixture testing against real encrypted PDF files.
 //!
 //! # Dead-code notice
-//! The items in this module are scaffolding for the encrypted-PDF support epic
-//! (flpdf-9hc.3) and are not yet wired up to any call site within the lower
-//! stack layers. They become live as subsequent layers (string decryption,
-//! stream decryption, CLI `--password`) land. The module-level
-//! `allow(dead_code)` keeps each layer's CI green without silencing the lint
-//! elsewhere.
+//! Some items in this module are not yet wired up to a call site. They
+//! become live as the string-decryption, stream-decryption, and CLI
+//! `--password` paths are added. The module-level `allow(dead_code)`
+//! keeps the lint quiet here without silencing it elsewhere.
 #![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
@@ -799,7 +797,7 @@ fn validate_v1_v2_params(params: &V1V2EncryptParams<'_>) -> Result<usize> {
 /// Algorithm 3 / 5 paths are defined only for the V<5 Standard handler
 /// revisions (r ∈ {2, 3, 4}). V=5 R=5/R=6 use a wholly different family
 /// (Algorithms 2.A/2.B/8/9) and dispatch via separate writer functions
-/// (e.g. `compute_u_ue_r6` once flpdf-9hc.4.3 lands); silently routing an
+/// (e.g. `compute_u_ue_r6`); silently routing an
 /// r=5 (or any other) value through the R≥3 branch would produce
 /// well-formed but cryptographically wrong bytes.
 fn ensure_v_lt_5_revision(r: i64, entry: &str) -> Result<()> {
@@ -891,7 +889,7 @@ pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8
 /// permissions, returning the dictionary and the derived file encryption key.
 ///
 /// The file key is returned alongside the dictionary because the
-/// string/stream encryption passes (flpdf-9hc.4.5 / flpdf-9hc.4.6) need it
+/// string/stream encryption passes need it
 /// to derive per-object keys via [`per_object_key`]; the dictionary alone
 /// does not carry it.
 ///
@@ -990,7 +988,7 @@ pub(crate) struct V4EncryptParams<'a> {
     pub id0: &'a [u8],
     /// `/EncryptMetadata` flag. When `false`, Algorithm 2 step 3 appends
     /// `0xFF×4` to the file-key MD5 input AND the `/Metadata` stream is
-    /// left unencrypted by the stream-encryption pass (flpdf-9hc.4.6). When
+    /// left unencrypted by the stream-encryption pass. When
     /// `true` (the spec default), the key is emitted without the suffix and
     /// the `/Metadata` stream is encrypted; the entry itself is omitted from
     /// the dictionary to match qpdf's defaults-elision.
@@ -1410,7 +1408,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
 /// (`0x73 0x41 0x6C 0x54`) is appended to the MD5 input.  For all RC4 variants
 /// (V=1, V=2, and V=4 `/CFM /V2`) no salt is added.
 ///
-/// Exposed as `pub` so that [`crate::CopyEncryptionSource`] (flpdf-9hc.4.11)
+/// Exposed as `pub` so that [`crate::CopyEncryptionSource`]
 /// can carry the donor's algorithm selection across the CLI→library boundary
 /// without needing a separate parallel enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1658,7 +1656,7 @@ fn aes256_cbc_encrypt_with_iv(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -
 /// Traverses arrays / dictionaries / stream dictionaries, encrypting each
 /// `Object::String` with `cipher`. Stream PAYLOAD bytes are intentionally
 /// left untouched — they are encrypted separately by the caller via
-/// [`encrypt_cipher_bytes`] (the stream-encryption pass of flpdf-9hc.4.6)
+/// [`encrypt_cipher_bytes`] (the stream-encryption pass)
 /// so that the caller controls the per-stream IV and the `/Metadata`
 /// exemption (skip the call entirely or pass `StringEncryptCipher::Identity`).
 ///
@@ -4420,7 +4418,7 @@ mod tests {
         assert_eq!(call_count, 0, "RC4 walker must not consume IVs");
     }
 
-    /// Stream payload round-trip (flpdf-9hc.4.6): `encrypt_cipher_bytes`
+    /// Stream payload round-trip: `encrypt_cipher_bytes`
     /// also serves stream payloads (single-buffer API; the caller controls
     /// per-stream IV uniqueness and the `/Metadata` exemption by choosing
     /// whether to call this at all). Verified for both V=4 ciphers and V=5.

@@ -52,7 +52,7 @@ impl ObjectCache {
     /// Mark `object_ref` as resolution-in-progress. A re-entrant
     /// [`resolve`](crate::Pdf::resolve) for the same ref then hits the
     /// `Reserved => Null` arm instead of recursing, breaking indirect cycles
-    /// (e.g. cyclic stream `/Length` holder chains — flpdf-9hc.27).
+    /// (e.g. cyclic stream `/Length` holder chains).
     pub(crate) fn set_reserved(&mut self, object_ref: ObjectRef) {
         self.entries.insert(object_ref, CacheEntry::Reserved);
     }

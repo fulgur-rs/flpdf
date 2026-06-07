@@ -1,6 +1,6 @@
 //! JSON emitter for `--json` output.
 //!
-//! Enforces the formatting policy decided in `flpdf-9hc.11.1`:
+//! Enforces the following formatting policy:
 //! - Structural equivalence with qpdf `--json` output (not byte-identical).
 //! - 2-space indentation, LF line endings, UTF-8.
 //! - Trailing LF at the end of the top-level value.

@@ -266,7 +266,7 @@ struct Cli {
     /// never for production output. This qpdf-shaped alias mirrors qpdf,
     /// which is silent for `--static-id`, so it emits no warning; the
     /// test-only diagnostic lives on the native `rewrite --static-id`
-    /// surface instead (flpdf-4x6).
+    /// surface instead.
     #[arg(long = "static-id")]
     static_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value
@@ -305,7 +305,7 @@ struct Cli {
     /// path the two flags produce IDENTICAL output bytes because flpdf
     /// always strips `/Encrypt` (and `/P` only exists inside `/Encrypt`).
     /// The flags differ only in intent and diagnostic. They become
-    /// distinguishable once `--encrypt` (flpdf-9hc.4.9) lands and the
+    /// distinguishable once `--encrypt` lands and the
     /// rewrite gains the ability to preserve or produce encryption.
     // Same conflict semantics as --remove-restrictions: this is a
     // rewrite-path modifier and must be rejected against the inspection
@@ -326,7 +326,7 @@ struct Cli {
     /// `qpdf --linearize-pass1=PATH` compatibility flag.  Accepted; flpdf
     /// writes the pass-1 intermediate file as a copy of the final
     /// linearized output (qpdf writes a distinct intermediate; matching
-    /// those bytes is out of scope here — see flpdf-vrn).
+    /// those bytes is out of scope here).
     #[arg(long = "linearize-pass1")]
     linearize_pass1: Option<PathBuf>,
     /// Omit the `%% Original object ID: N M` comments that QDF output would
@@ -449,7 +449,7 @@ struct Cli {
     ///
     /// USER-PW / OWNER-PW are the two password strings; KEY-LEN selects
     /// the algorithm (`40` → V=1, `128` → V=2 or V=4, `256` → V=5 R=6).
-    /// The walking-skeleton release (flpdf-9hc.4.9) only supports
+    /// The writer currently only supports
     /// `KEY-LEN=128` together with `--use-aes=y` (= V=4 AES-128); the
     /// other algorithms have their dict builders shipped but no writer
     /// dispatch yet and are rejected with a clear "not yet supported"
@@ -484,12 +484,11 @@ struct Cli {
     encrypt: Vec<String>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
-    /// output encryption (qpdf --copy-encryption-from equivalent —
-    /// flpdf-9hc.4.11).
+    /// output encryption (qpdf --copy-encryption-from equivalent).
     ///
     /// Supply the donor's password via `--encryption-file-password` (empty
     /// string if the donor has no user password).  Only V=4 AES-128 donors are
-    /// supported in the walking-skeleton release; other schemes are rejected
+    /// supported; other schemes are rejected
     /// with a "not yet supported" diagnostic.
     ///
     /// Mutually exclusive with `--encrypt`.
@@ -841,11 +840,11 @@ struct RewriteCommand {
     /// path the two flags produce identical output bytes because flpdf
     /// always drops `/Encrypt` and `/P` only lives inside `/Encrypt`. The
     /// flags differ only in intent and diagnostic (this one is silent).
-    /// They become distinguishable once `--encrypt` (flpdf-9hc.4.9) lands.
+    /// They become distinguishable once `--encrypt` lands.
     #[arg(long = "decrypt")]
     decrypt: bool,
     /// Encrypt the output (qpdf `--encrypt` compatible). See the top-level
-    /// `--encrypt` documentation for the full syntax and the walking-skeleton
+    /// `--encrypt` documentation for the full syntax and the current
     /// restrictions (KEY-LEN=128 + --use-aes=y only, default permissions).
     #[arg(
         long = "encrypt",
@@ -860,12 +859,11 @@ struct RewriteCommand {
     )]
     encrypt: Vec<String>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
-    /// output encryption (qpdf --copy-encryption-from equivalent —
-    /// flpdf-9hc.4.11).
+    /// output encryption (qpdf --copy-encryption-from equivalent).
     ///
     /// Supply the donor's password via `--encryption-file-password` (empty
     /// string if the donor has no user password).  Only V=4 AES-128 donors are
-    /// supported in the walking-skeleton release; other schemes are rejected
+    /// supported; other schemes are rejected
     /// with a "not yet supported" diagnostic.
     ///
     /// Mutually exclusive with `--encrypt`.
@@ -908,7 +906,7 @@ struct RewriteCommand {
     /// Observed (qpdf 11.9.0): this flag changes only QDF output; qpdf JSON
     /// v1/v2 is byte-identical with or without it, so flpdf does not wire it
     /// into any JSON path. flpdf's QDF writer does not yet emit these
-    /// comments (epic flpdf-9hc.6 owns the comment body); the flag is
+    /// comments; the flag is
     /// accepted and plumbed for forward-compatibility, so today it is a
     /// byte-level no-op.
     #[arg(long = "no-original-object-ids")]
@@ -937,7 +935,7 @@ struct RewriteCommand {
     ///   containers.
     ///
     /// Only applies to the full-rewrite path; the incremental write path
-    /// ignores this flag (tracked in flpdf-9hc.5.9).
+    /// ignores this flag.
     #[arg(long = "object-streams", value_enum, default_value_t = CliObjectStreamMode::Preserve)]
     object_streams: CliObjectStreamMode,
 
@@ -1229,11 +1227,10 @@ impl From<CliPasswordMode> for PasswordMode {
 /// `--static-id` exists purely so test/parity harnesses can produce a
 /// byte-stable trailer `/ID`; it must never be used for production output.
 /// flpdf's *native* surface (`rewrite --static-id`) therefore emits a stderr
-/// warning whenever the flag is requested (flpdf-9hc.13.4). The top-level
+/// warning whenever the flag is requested. The top-level
 /// qpdf-shaped alias (`flpdf --static-id …`) exists solely to mirror qpdf's
 /// command surface, and qpdf emits no such warning — so the alias stays
-/// silent to honour that contract and keep the qtest parity suite green
-/// (flpdf-4x6).
+/// silent to honour that contract and keep the qtest parity suite green.
 ///
 /// This env var opts the *native* surface out of the diagnostic: harnesses
 /// that exercise `rewrite --static-id` and assert on a clean stderr set it.
@@ -1243,8 +1240,7 @@ const STATIC_ID_QUIET_ENV: &str = "FLPDF_STATIC_ID_QUIET";
 
 /// Returns true when `--static-id` was requested via flpdf's native
 /// `rewrite` subcommand. The top-level qpdf-shaped alias deliberately does
-/// *not* count here: it mirrors qpdf, which is silent for `--static-id`
-/// (flpdf-4x6).
+/// *not* count here: it mirrors qpdf, which is silent for `--static-id`.
 fn static_id_warning_applies(args: &Cli) -> bool {
     matches!(&args.command, Some(Commands::Rewrite(cmd)) if cmd.static_id)
 }
@@ -2096,14 +2092,14 @@ fn apply_encryption_options(
 
 /// Open a donor PDF at `path` (with optional `password`) and extract the
 /// information needed to copy its encryption to a new output file
-/// (flpdf-9hc.4.11 `--copy-encryption-from`).
+/// (`--copy-encryption-from`).
 ///
 /// Returns a [`CopyEncryptionSource`] ready to be stored in
 /// [`WriteOptions::copy_encryption`] or an error string suitable for printing
 /// to stderr before `exit(2)`.
 ///
 /// Only V=4 AES-128 donors are accepted.  Other encryption schemes are
-/// rejected with a "not yet supported (flpdf-9hc.4.9 follow-up)" message.
+/// rejected with a "not yet supported" message.
 fn build_copy_encryption_source(
     path: &std::path::Path,
     password: Option<&str>,
@@ -2236,7 +2232,7 @@ fn build_copy_encryption_source(
 /// `--form`, `--assemble`, `--accessibility`) use the R>=3 grammar and are
 /// applied left-to-right onto a [`PermissionsConfig`] (matching qpdf's
 /// ordering). They are accepted for 128/256-bit only; on 40-bit (R=2) they are
-/// rejected (the R=2 `/P` encoding differs — flpdf-9hc.4.9.5 follow-up).
+/// rejected (the R=2 `/P` encoding differs).
 /// `--cleartext-metadata` is still rejected for V=1/V=2 (40-bit or 128-bit
 /// without AES/--force-V4); `--force-R5` is accepted for 256-bit only.
 fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
@@ -2953,8 +2949,8 @@ fn resolve_page_specs(
 
 /// Parse `--collate` value: `n` or `i,j,k,...`. flpdf's [`collate`] supports a
 /// single chunk size `n`; the comma form is parsed but only the first value is
-/// honoured (a documented divergence — full per-input groups are out of scope
-/// for 8.12; see flpdf-9hc.8.13's matrix).
+/// honoured (a documented divergence — full per-input groups are out of
+/// scope).
 fn parse_collate_n(raw: &str) -> CliResult<usize> {
     // Only a single positive integer is supported. Silently using the first
     // value of `--collate=1,2` would emit a different page order than the
@@ -2973,17 +2969,16 @@ fn parse_collate_n(raw: &str) -> CliResult<usize> {
 
 /// Run the `--pages` extraction pipeline.
 ///
-/// Pipeline order is fixed by the flpdf-9hc.8 DESIGN note (recorded on the bd
-/// issue):
+/// Pipeline order is fixed as follows:
 ///   1. page_combine / page_collate → selected ObjectRef list
 ///   2. page_tree_rebuild::rebuild_page_tree → RebuildResult
 ///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)
-///   4. outline_dest_remap::remap_outline_and_dests          [8.10]
-///   5. subset_prune::prune_after_subset (Auto/Yes/No)       [8.9]
-///   6. acroform_field_prune::prune_acroform_after_subset    [8.11]
+///   4. outline_dest_remap::remap_outline_and_dests
+///   5. subset_prune::prune_after_subset (Auto/Yes/No)
+///   6. acroform_field_prune::prune_acroform_after_subset
 ///   7. write (or split_pages when --split-pages is set)
 ///
-/// SCOPE BOUNDARY (single document only, flpdf-9hc.8.11 / .8.10):
+/// SCOPE BOUNDARY (single document only):
 /// `rebuild_page_tree` and the post-rebuild passes operate on ONE [`Pdf`].
 /// Cross-document page merge (selecting pages from more than one distinct
 /// source file) — and the cross-doc AcroForm field-collision renaming it
@@ -3678,8 +3673,8 @@ enum EncryptionProbe {
 /// `--requires-password` exit 3, identical to a strong file). Because the
 /// library applies the weak-crypto gate only AFTER authentication, leaving the
 /// gate enabled would surface `WeakCryptoNotAllowed` for a correctly
-/// authenticated file and mis-report it as "a different password is required"
-/// (flpdf-63g). Disabling the gate here keeps the answer a pure password
+/// authenticated file and mis-report it as "a different password is required".
+/// Disabling the gate here keeps the answer a pure password
 /// question: authentication still runs first, so a wrong password yields
 /// `BadPassword` exactly as before.
 fn probe_encryption(
@@ -3738,7 +3733,7 @@ fn run_is_encrypted(input: &PathBuf, repair: bool) -> CliResult<()> {
 ///
 /// Weak-crypto (RC4 / R=5) files are answered purely on the password, matching
 /// qpdf: a correct password yields 3 and a wrong/absent one yields 0, with no
-/// `--allow-weak-crypto` opt-in required (see `probe_encryption`, flpdf-63g).
+/// `--allow-weak-crypto` opt-in required (see `probe_encryption`).
 fn run_requires_password(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     match probe_encryption(input, repair, password)? {
         EncryptionProbe::Opened { encrypted: false } => {

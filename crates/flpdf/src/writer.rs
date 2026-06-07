@@ -219,8 +219,7 @@ pub struct WriteOptions {
     /// before each indirect object's `N G obj` line when `qdf = true` and this
     /// flag is `false`.  Setting this flag to `true` suppresses those comments
     /// while leaving the `N G obj` lines intact — matching qpdf's
-    /// `--no-original-object-ids` behaviour exactly (implemented in epic layer
-    /// `flpdf-9hc.6.5`).
+    /// `--no-original-object-ids` behaviour exactly.
     pub no_original_object_ids: bool,
 
     /// When `true`, decode every stream through its filter pipeline and re-emit
@@ -296,11 +295,9 @@ pub struct WriteOptions {
     /// When `true`, this setting takes precedence over [`compress_streams`] for the
     /// per-object stream emission: the stream is always emitted decompressed regardless
     /// of the `compress_streams` value.  The xref stream and ObjStm containers are
-    /// governed solely by `compress_streams` and are not affected by this flag
-    /// (QDF-specific xref/ObjStm behaviour is handled by later epic layers).
+    /// governed solely by `compress_streams` and are not affected by this flag.
     ///
-    /// The CLI flag `--qdf` is wired up in epic layer 6.8; until then this field
-    /// is the library-level entry point.  Test via
+    /// This field is the library-level entry point for QDF mode.  Test via
     /// `WriteOptions { qdf: true, full_rewrite: true, .. }`.
     ///
     /// [`FlateDecode`]: https://pdf.pizza/spec/7.4.4
@@ -334,7 +331,7 @@ pub struct WriteOptions {
     pub stream_data: Option<StreamDataMode>,
 
     /// Encrypt the output with the supplied [`crate::EncryptParams`] (qpdf
-    /// `--encrypt …` equivalent — flpdf-9hc.4.9).
+    /// `--encrypt …` equivalent).
     ///
     /// When set the writer:
     ///
@@ -346,14 +343,11 @@ pub struct WriteOptions {
     ///    skeleton).
     /// 3. Encrypts every string in every emitted object (per-object key
     ///    via Algorithm 1) and every stream payload (with random AES IV
-    ///    prepended + PKCS#7 padding, `/Length` updated to match), via
-    ///    the helpers from flpdf-9hc.4.5 / 4.6.
+    ///    prepended + PKCS#7 padding, `/Length` updated to match).
     /// 4. Emits the `/Encrypt` dictionary itself as a plaintext indirect
     ///    object whose number is referenced from the trailer.
     ///
-    /// **Required flag combinations** (the writer rejects others to keep
-    /// the walking-skeleton scope tractable; subsequent PRs in
-    /// flpdf-9hc.4.9 lift these as they wire each path):
+    /// **Required flag combinations** (the writer currently rejects others):
     ///
     /// - `full_rewrite` is implicitly forced to `true` (the incremental
     ///   path cannot rewrite source object bytes).
@@ -362,8 +356,7 @@ pub struct WriteOptions {
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
 
     /// Copy the `/Encrypt` dictionary verbatim from a donor PDF and re-use its
-    /// file encryption key (qpdf `--copy-encryption-from` equivalent —
-    /// flpdf-9hc.4.11).
+    /// file encryption key (qpdf `--copy-encryption-from` equivalent).
     ///
     /// When set the writer bypasses the normal password-derivation path and
     /// constructs an `EncryptionContext` directly from the pre-recovered file
@@ -374,9 +367,8 @@ pub struct WriteOptions {
     /// enforces mutual exclusion via `conflicts_with`.  The writer asserts this
     /// invariant at the top of the full-rewrite path.
     ///
-    /// **Scope:** Only V=4 AES-128 donors are supported (flpdf-9hc.4.9 walking
-    /// skeleton); other schemes are rejected by the CLI before this field is
-    /// populated.
+    /// **Scope:** Only V=4 AES-128 donors are currently supported; other schemes
+    /// are rejected by the CLI before this field is populated.
     pub copy_encryption: Option<crate::encrypt_setup::CopyEncryptionSource>,
 }
 
@@ -714,8 +706,7 @@ fn collect_touched_object_refs<R: Read + Seek>(
 /// Split `touched` into (objstm_packable, plain_remaining) using the same
 /// eligibility predicate as the full-rewrite ObjStm packer. Order-preserving.
 ///
-/// Wired into the incremental Generate-mode gate by `write_pdf_incremental`
-/// (flpdf-9hc.5.9 Task 5).
+/// Wired into the incremental Generate-mode gate by `write_pdf_incremental`.
 fn partition_objstm_eligible<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     touched: &[ObjectRef],
@@ -1080,8 +1071,7 @@ fn next_xref_stream_object_number(
 /// space (source xref max, touched, deleted) so it never collides with a
 /// `delete_object` free entry.
 ///
-/// Wired into the incremental write path by `write_pdf_incremental`
-/// (flpdf-9hc.5.9 Task 5).
+/// Wired into the incremental write path by `write_pdf_incremental`.
 fn allocate_incremental_objstm_container(
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
     touched: &[ObjectRef],
@@ -1110,7 +1100,7 @@ fn allocate_incremental_objstm_container(
 /// the full-rewrite path uses ([`object_streams::emit_objstm_body`] /
 /// [`object_streams::wrap_objstm_body`]); the compress policy mirrors the
 /// full-rewrite call site verbatim (`options.compress_streams`).  The returned
-/// member map is consumed by `write_pdf_incremental` (flpdf-9hc.5.9 Task 5)
+/// member map is consumed by `write_pdf_incremental`
 /// to build type-2 (compressed) xref entries via
 /// `merge_source_and_touched_offsets_for_xref_stream`'s `compressed_members`
 /// parameter.
@@ -1122,8 +1112,7 @@ fn allocate_incremental_objstm_container(
 /// `NewlineBeforeEndstream::Yes`; a divergence is only possible under
 /// `NewlineBeforeEndstream::No` with a payload ending in `\n`/`\r`.
 ///
-/// Wired into the incremental write path by `write_pdf_incremental`
-/// (flpdf-9hc.5.9 Task 5).
+/// Wired into the incremental write path by `write_pdf_incremental`.
 fn write_incremental_objstm<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     pdf: &mut Pdf<R>,
@@ -1538,11 +1527,9 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
 /// This is a thin wrapper over the canonical QDF entrypoint
 /// [`write_pdf_with_options`] with `WriteOptions { qdf: true, full_rewrite:
 /// true, .. }` — the same path the `flpdf qdf` / `flpdf rewrite --qdf` CLI
-/// uses. It therefore goes through the QDF serializers built by epic
-/// `flpdf-9hc.6` (decoded streams, indirect `/Length` holders, `%QDF-1.0`
-/// header, `%% Original object ID:` comments, classic `xref` table, and the
-/// `trailer <<` dict layout). The previous standalone implementation used the
-/// compact non-QDF serializers and diverged from this path (flpdf-9hc.24).
+/// uses. It therefore goes through the QDF serializers (decoded streams,
+/// indirect `/Length` holders, `%QDF-1.0` header, `%% Original object ID:`
+/// comments, classic `xref` table, and the `trailer <<` dict layout).
 ///
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<()> {
@@ -1575,17 +1562,16 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 /// appended to `/Producer`.  This mirrors `qpdf`'s default behaviour
 /// (`qpdf in.pdf out.pdf`) and is required for byte-identical round-trip tests.
 ///
-/// # Scope limitations (TODO)
+/// # Scope limitations
 ///
 /// - **ObjStm dissolve**: Object streams are dissolved — members are emitted as
 ///   ordinary indirect objects.  There is currently no merging of existing
 ///   ObjStm containers back into the regular sequence; they are simply skipped.
-///   A dedicated "renumber + pack into ObjStm" pass (flpdf-9hc.20.13) is a
-///   future concern.
+///   A dedicated "renumber + pack into ObjStm" pass is not yet implemented.
 ///
 /// - **Encrypted documents**: authenticated inputs are rewritten as plaintext
 ///   by default; pass [`WriteOptions::encrypt`] to produce encrypted output
-///   instead (flpdf-9hc.4.9 walking skeleton — V=4 AES-128 only).
+///   instead (currently V=4 AES-128 only).
 ///
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above attached to its function.
@@ -1695,7 +1681,7 @@ struct EncryptionContext {
 
 /// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
 /// Used to exempt the XMP metadata stream from encryption under
-/// `--cleartext-metadata` (flpdf-9hc.4.9.6).
+/// `--cleartext-metadata`.
 fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
     match pdf.resolve_borrowed(root).ok()? {
@@ -1858,7 +1844,7 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
 }
 
 /// Build an [`EncryptionContext`] from a donor [`CopyEncryptionSource`]
-/// (flpdf-9hc.4.11 `--copy-encryption-from` path).
+/// (the `--copy-encryption-from` path).
 ///
 /// Unlike [`build_encryption_context`], this function does **not** derive a
 /// file key from passwords: it takes the donor's already-recovered file key
@@ -2888,7 +2874,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// parameters than qpdf's internal zlib build.  The decoded bytes are
 /// identical to qpdf's, but the raw compressed bytes differ.  This is
 /// intentional: byte-identical agreement with qpdf is not a goal for this
-/// toggle (the held-for-review zlib-parity decision, flpdf-9hc.12.5).
+/// toggle.
 /// See [`CompressStreams`] for the full policy statement.
 pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
@@ -3009,7 +2995,7 @@ pub fn write_stream_to_buf(
 /// between the `stream` EOL and the `endstream` keyword) and is exactly the
 /// count [`crate::fix_qdf`] (qdf_fix.rs) recomputes from the emitted bytes.
 /// In QDF mode the indirect length-holder body MUST equal this — not the
-/// raw decoded length — so the writer and `fix_qdf` mesh (flpdf-9hc.6.12).
+/// raw decoded length — so the writer and `fix_qdf` mesh.
 fn on_disk_stream_len(data: &[u8], policy: NewlineBeforeEndstream) -> usize {
     let n = data.len();
     match policy {
@@ -3815,7 +3801,7 @@ mod tests {
         bytes
     }
 
-    /// flpdf-9hc.4.9.4: encrypt with V=5 R=6 AES-256, then re-open with flpdf
+    /// Encrypt with V=5 R=6 AES-256, then re-open with flpdf
     /// using EACH password and confirm the string AND stream decrypt back to
     /// their original plaintext. This exercises the V=5 file-key-direct
     /// AES-256 string pass and stream pass via the reader. V=5 has random
@@ -3881,7 +3867,7 @@ mod tests {
         }
     }
 
-    /// flpdf-9hc.4.15: encrypt with V=5 R=5 (--force-R5), then re-open with flpdf
+    /// Encrypt with V=5 R=5 (--force-R5), then re-open with flpdf
     /// using the user password and verify strings and streams round-trip.
     #[test]
     fn v5_r5_encrypt_round_trips_string_and_stream_via_reader() {
@@ -3946,7 +3932,7 @@ mod tests {
         }
     }
 
-    /// flpdf-9hc.4.9.1/.2/.3: each RC4 writer method (V=1 RC4-40, V=2 RC4-128,
+    /// Each RC4 writer method (V=1 RC4-40, V=2 RC4-128,
     /// V=4 RC4-128) round-trips. Encrypt a string+stream fixture, then re-open
     /// with flpdf under EACH password and confirm `/Title` and the stream
     /// decrypt to plaintext. The reader gates RC4 behind weak-crypto, so the
@@ -4092,7 +4078,7 @@ mod tests {
         bytes
     }
 
-    /// flpdf-9hc.4.9.6: with `encrypt_metadata = false` the `/Catalog`'s
+    /// With `encrypt_metadata = false` the `/Catalog`'s
     /// `/Metadata` stream is left UNENCRYPTED (its bytes survive in the clear)
     /// and tagged `/Crypt`, and the `/Encrypt` dict carries `/EncryptMetadata
     /// false` — whereas the default (`encrypt_metadata = true`) ciphers it.

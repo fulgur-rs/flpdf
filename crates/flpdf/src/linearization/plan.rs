@@ -828,10 +828,9 @@ impl LinearizationPlan {
     /// | `Preserve` | Existing source ObjStm membership is re-used for Part-4, but any member in `part2_objects` or ineligible per [`is_eligible_for_objstm`] is silently dropped. Members that span the Part-3/Part-4 boundary are split into separate batches per part. If the source document contained no ObjStms, both batch lists are **empty** — Preserve does **not** fall through to Generate; it mirrors the behaviour of the non-linearized `writer::object_streams::plan_preserve` and qpdf's `--object-streams=preserve` semantics (preserve means "keep what was there", not "invent new ObjStms"). |
     ///
     /// **Note:** regardless of mode, `part3_batches` is unconditionally
-    /// cleared by the Part-3 safety valve at the end of `objstm_batches`
-    /// (flpdf-9hc.5.8.4 / tracked as flpdf-ihb), so Part-3 page-1 shared
-    /// objects always remain plain indirect until a section-aware renumber
-    /// layout lands.
+    /// cleared by the Part-3 safety valve at the end of `objstm_batches`,
+    /// so Part-3 page-1 shared objects always remain plain indirect until a
+    /// section-aware renumber layout lands.
     ///
     /// # Invariants
     ///
@@ -1783,7 +1782,7 @@ mod tests {
         pdf
     }
 
-    /// flpdf-ws2 regression: `compute_closure`'s `/Parent`-chain walk must
+    /// `compute_closure`'s `/Parent`-chain walk must
     /// propagate `pdf.resolve` errors rather than swallowing them with
     /// `let Ok(..) else { continue }`. A swallowed error lets `from_pdf`
     /// return a degraded plan (truncated closure / hint tables) for a
@@ -1869,7 +1868,7 @@ mod tests {
         pdf
     }
 
-    /// flpdf-ws2 (PR review): the `/Parent`-chain walk must follow a parent
+    /// The `/Parent`-chain walk must follow a parent
     /// that resolves to a bare `Object::Reference`, mirroring the main BFS
     /// loop. Otherwise inherited resources reached through a reference-chain
     /// `/Parent` are silently stranded outside the page closure.

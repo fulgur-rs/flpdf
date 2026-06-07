@@ -44,7 +44,7 @@ pub struct Pdf<R: Read + Seek> {
     /// QDF form). Used by [`resolve`](Self::resolve) to disambiguate the
     /// exact-window indirect `/Length` case: QDF holders count the framing
     /// EOL (keep the parser's endstream-scan to preserve round-trip), whereas
-    /// non-QDF holders are the spec content length (flpdf-9hc.28).
+    /// non-QDF holders are the spec content length.
     is_qdf: bool,
     trailer: Dictionary,
     startxref: u64,
@@ -165,8 +165,8 @@ impl EncryptionMode {
 }
 
 /// Read-only snapshot of an encrypted document's `/Encrypt` parameters,
-/// surfaced for the `show-encryption` inspection subcommand
-/// (flpdf-9hc.3.17). Built by re-reading the `/Encrypt` dictionary plus the
+/// surfaced for the `show-encryption` inspection subcommand.
+/// Built by re-reading the `/Encrypt` dictionary plus the
 /// already-authenticated `EncryptionState`; does not run or alter
 /// authentication.
 #[derive(Debug, Clone)]
@@ -311,7 +311,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// encrypted file. `None` for plaintext PDFs.
     ///
     /// Read-only accessor for the `show-encryption-key` inspection
-    /// subcommand (flpdf-9hc.3.17); does not run or alter authentication.
+    /// subcommand; does not run or alter authentication.
     pub fn encryption_file_key(&self) -> Option<&[u8]> {
         self.encryption
             .as_ref()
@@ -319,7 +319,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Read-only snapshot of the `/Encrypt` parameters for the
-    /// `show-encryption` inspection subcommand (flpdf-9hc.3.17).
+    /// `show-encryption` inspection subcommand.
     ///
     /// Returns `None` for plaintext PDFs. Re-reads the `/Encrypt` dictionary
     /// (for V/R/Length/Filter/CF, which the authenticated `EncryptionState`
@@ -1492,7 +1492,7 @@ fn standard_handler_inputs<'a>(
 /// Only the `/U` / `/O` *length* error is remapped. `/UE` / `/OE` length
 /// errors, missing entries, and non-string entries stay `Malformed`: those are
 /// genuine structural defects, not credential mismatches. No broader
-/// `Malformed` reclassification is performed (flpdf-9hc.3.21).
+/// `Malformed` reclassification is performed.
 fn map_uo_length_to_bad_password(err: Error) -> Error {
     match &err {
         Error::Encrypted(EncryptedError::Malformed { reason })

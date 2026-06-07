@@ -2,7 +2,8 @@
 //! stored inside an object stream (PDF 1.5+, ISO 32000-1 §7.5.7).
 //! Also provides the packing planner that groups eligible objects into batches.
 //! Provides the body emitter that serialises a list of objects into an ObjStm
-//! payload (§7.5.7 body format; compression/dict wrapping is done in 5.4).
+//! payload (§7.5.7 body format; compression/dict wrapping is done in a
+//! subsequent step).
 
 // These items are consumed by the upcoming ObjStm writer; suppress dead_code
 // until that code lands.
@@ -146,8 +147,8 @@ pub(crate) struct PackingPlan {
 /// When `options.qdf` is `true`, the effective mode is forced to
 /// [`ObjectStreamMode::Disable`] regardless of `options.object_streams`.  QDF
 /// output must not contain any ObjStm containers.  `options.object_streams` is
-/// intentionally left unmodified so that layer 6.6 can detect conflicts between
-/// `--qdf` and an explicit `--object-streams=generate` flag.
+/// intentionally left unmodified so that conflicts between
+/// `--qdf` and an explicit `--object-streams=generate` flag can be detected.
 pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> PlannerConfig {
     let mode = if options.qdf {
         ObjectStreamMode::Disable
@@ -316,10 +317,10 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
 ///
 /// Contains the raw pair table concatenated with the objects section.
 /// Compression (FlateDecode) and the stream dictionary wrapping are handled
-/// by a subsequent step (5.4).
+/// by a subsequent step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjStmBody {
-    /// Raw concatenation: pair table || objects section.  To be deflate-wrapped by 5.4.
+    /// Raw concatenation: pair table || objects section.  To be deflate-wrapped later.
     pub bytes: Vec<u8>,
     /// Offset within `bytes` where the first object body starts.  Matches /First.
     pub first_offset: usize,

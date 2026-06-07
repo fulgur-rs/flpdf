@@ -1,4 +1,4 @@
-//! Linearization structural checker (sub-task 2.10).
+//! Linearization structural checker.
 //!
 //! This module validates that a PDF file conforms to the linearization layout
 //! described in ISO 32000-1 Annex F.  It is invoked by the `check-linearization`
