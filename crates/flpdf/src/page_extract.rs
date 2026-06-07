@@ -223,31 +223,37 @@ fn neutralize_annot_if_absent(
 
     // /Dest — explicit array, dict, or an indirect reference to either. The
     // whole key is dropped (a destination-less annotation is the neutralized
-    // form for an explicit destination).
-    if let Some(dest) = annot.get("Dest").cloned() {
+    // form for an explicit destination). `annot` is already owned, so take the
+    // value by `remove` and re-insert it when it stays (no inner clone).
+    if let Some(dest) = annot.remove("Dest") {
         if dest_targets_absent_page(target, &dest, keep)? {
-            annot.remove("Dest");
             changed = true;
+        } else {
+            annot.insert("Dest", dest);
         }
     }
 
     // /A — an action (or chain via /Next). Drop the /D of every cross-page
     // GoTo, keeping the action(s) and chain structure intact.
-    if let Some(a_val) = annot.get("A").cloned() {
+    if let Some(a_val) = annot.remove("A") {
         let mut visited = BTreeSet::new();
         if let Some(new) =
             neutralize_action_chain(target, &a_val, keep, &mut visited, MAX_ACTION_CHAIN_DEPTH)?
         {
             annot.insert("A", new);
             changed = true;
+        } else {
+            annot.insert("A", a_val);
         }
     }
 
     // /AA — additional-actions dict; each entry is an action (or chain).
-    if let Some(aa_val) = annot.get("AA").cloned() {
+    if let Some(aa_val) = annot.remove("AA") {
         if let Some(new_aa) = neutralize_aa_if_absent(target, &aa_val, keep)? {
             annot.insert("AA", new_aa);
             changed = true;
+        } else {
+            annot.insert("AA", aa_val);
         }
     }
 
@@ -277,7 +283,9 @@ fn neutralize_aa_if_absent(
     let keys: Vec<Vec<u8>> = aa.iter().map(|(k, _)| k.to_vec()).collect();
     let mut changed = false;
     for key in keys {
-        let Some(sub_val) = aa.get(&key).cloned() else {
+        // `aa` is owned: take the subaction by `remove` and re-insert it when it
+        // stays (no inner clone of potentially deep action chains).
+        let Some(sub_val) = aa.remove(&key) else {
             continue;
         };
         // Reset visited per subaction: each subaction is an independent chain,
@@ -288,6 +296,8 @@ fn neutralize_aa_if_absent(
         {
             aa.insert(&key, new);
             changed = true;
+        } else {
+            aa.insert(&key, sub_val);
         }
     }
     if !changed {
@@ -360,35 +370,37 @@ fn neutralize_action_chain(
     let mut changed = false;
 
     // Drop a cross-page GoTo destination (the action itself is retained).
+    // `act` is owned: take `/D` by `remove` and re-insert it when it stays.
     let is_goto = matches!(act.get("S"), Some(Object::Name(n)) if n == b"GoTo");
     if is_goto {
-        if let Some(d_val) = act.get("D").cloned() {
+        if let Some(d_val) = act.remove("D") {
             if dest_targets_absent_page(target, &d_val, keep)? {
-                act.remove("D");
                 changed = true;
+            } else {
+                act.insert("D", d_val);
             }
         }
     }
 
-    // /Next — a single action or an array of actions. Recurse into each.
-    if let Some(next_val) = act.get("Next").cloned() {
+    // /Next — a single action or an array of actions. Recurse into each. The
+    // value is taken by `remove` (no clone) and re-inserted after walking.
+    if let Some(next_val) = act.remove("Next") {
         match next_val {
-            // `elems` is owned (from `.cloned()` above); mutate in place via the
-            // shared helper — no second clone of the nested action dicts.
             Object::Array(mut elems) => {
                 if neutralize_action_array(target, &mut elems, keep, visited, depth)? {
-                    act.insert("Next", Object::Array(elems));
                     changed = true;
                 }
+                act.insert("Next", Object::Array(elems));
             }
-            single => {
-                if let Some(new) =
-                    neutralize_action_chain(target, &single, keep, visited, depth - 1)?
-                {
+            single => match neutralize_action_chain(target, &single, keep, visited, depth - 1)? {
+                Some(new) => {
                     act.insert("Next", new);
                     changed = true;
                 }
-            }
+                None => {
+                    act.insert("Next", single);
+                }
+            },
         }
     }
 
