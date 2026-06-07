@@ -115,7 +115,7 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
 /// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
 /// `map` are remapped, refs outside `map` become [`Object::Null`].  Stream byte
 /// payloads are left untouched (never cloned); scalars are unchanged.
-fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
+pub(crate) fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
     match obj {
         Object::Reference(r) => {
             let replacement = match map.get(r) {
