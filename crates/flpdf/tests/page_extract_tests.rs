@@ -469,10 +469,10 @@ fn cross_page_link_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn cross_page_link_leaks_sibling_known_limitation() {
-    // KNOWN LIMITATION (flpdf-4924): an explicit cross-page /Dest leaks a sibling
-    // /Page stub and its ancestor /Pages node. When flpdf-4924 lands (drop/
-    // neutralize such annotations), update these two assertions to expect 1.
+fn cross_page_link_neutralized_no_sibling_leak() {
+    // flpdf-4924: an explicit cross-page /Dest is neutralized (dest removed,
+    // annotation kept). The sibling /Page stub + its ancestor /Pages node then
+    // become unreachable and are swept. qpdf-aligned.
     let src = cross_page_link_pdf();
     let mut source = Pdf::open_mem(&src).unwrap();
 
@@ -480,29 +480,47 @@ fn cross_page_link_leaks_sibling_known_limitation() {
 
     assert_eq!(
         count_type(&mut out, b"Page"),
-        2,
-        "sibling page currently leaks (flpdf-4924)"
+        1,
+        "sibling page must be pruned after neutralizing its inbound /Dest"
     );
     assert_eq!(
         count_type(&mut out, b"Pages"),
-        2,
-        "ancestor /Pages kept reachable by the leaked stub (flpdf-4924)"
+        1,
+        "ancestor /Pages must be pruned once the sibling stub is gone"
     );
 
-    // CORE GUARANTEE still holds: the page tree has exactly one real page, and the
-    // extracted leaf's OWN content + resources are intact.
+    // Annotation is RETAINED but its /Dest is removed (neutralized).
     let leaf_refs = pages::page_refs(&mut out).unwrap();
-    assert_eq!(
-        leaf_refs.len(),
-        1,
-        "extracted page tree still has exactly one page"
-    );
+    assert_eq!(leaf_refs.len(), 1);
     let leaf = out
         .resolve_borrowed(leaf_refs[0])
         .unwrap()
         .as_dict()
         .cloned()
         .unwrap();
+    let annots = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    assert_eq!(annots.len(), 1, "annotation must be retained, not dropped");
+    let annot_ref = annots[0].as_ref_id().expect("annot is an indirect ref");
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert!(
+        annot.get("Dest").is_none(),
+        "/Dest must be neutralized (removed)"
+    );
+    assert_eq!(
+        annot.get("Subtype").and_then(|o| o.as_name()),
+        Some(&b"Link"[..]),
+        "annotation subtype preserved"
+    );
+
+    // CORE GUARANTEE: extracted leaf content + resources intact.
     let contents_ref = match leaf.get("Contents") {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /Contents ref, got {other:?}"),
@@ -513,7 +531,7 @@ fn cross_page_link_leaks_sibling_known_limitation() {
     };
     assert_eq!(
         stream.data, b"BT /F1 12 Tf ET",
-        "leaf content stream must be intact"
+        "leaf content stream intact"
     );
     let res = leaf
         .get("Resources")
@@ -524,6 +542,6 @@ fn cross_page_link_leaks_sibling_known_limitation() {
             .and_then(|o| o.as_dict())
             .and_then(|f| f.get("F1"))
             .is_some(),
-        "leaf /Resources /Font /F1 must be intact"
+        "leaf /Resources /Font /F1 intact"
     );
 }
