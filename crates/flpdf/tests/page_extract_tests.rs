@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::extract_page`].
 
-use flpdf::{extract_page, pages, Object, Pdf};
+use flpdf::{extract_page, pages, write_pdf_with_options, Object, Pdf, WriteOptions};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -190,4 +190,58 @@ fn own_mediabox_is_preserved() {
             Object::Integer(200), Object::Integer(300),
         ]))
     );
+}
+
+/// obj 6 = shared font (both pages); obj 7 = image used ONLY by page 2.
+fn shared_resource_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 5 0 R >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> /XObject << /Im1 7 0 R >> >> >>"),
+            (5, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (7, "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Length 3 >>\nstream\n\x00\x00\x00\nendstream"),
+        ],
+        1,
+    )
+}
+
+/// Count how many live objects in `doc` carry the given /Subtype name.
+fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usize {
+    let mut n = 0;
+    for r in doc.live_object_refs() {
+        if let Ok(obj) = doc.resolve(r) {
+            let dict = match &obj {
+                Object::Dictionary(d) => Some(d.clone()),
+                Object::Stream(s) => Some(s.dict.clone()),
+                _ => None,
+            };
+            if let Some(d) = dict {
+                if d.get("Subtype").and_then(|o| o.as_name()) == Some(subtype) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn extracted_doc_has_no_unrelated_objects() {
+    let src = shared_resource_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+
+    let mut bytes = Vec::new();
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    write_pdf_with_options(&mut out, &mut bytes, &opts).unwrap();
+    let mut rt = Pdf::open_mem_owned(bytes).unwrap();
+
+    assert_eq!(count_subtype(&mut rt, b"Type1"), 1, "shared font must be present");
+    assert_eq!(count_subtype(&mut rt, b"Image"), 0, "page 2's image must not leak in");
+    assert_eq!(pages::page_refs(&mut rt).unwrap().len(), 1);
 }
