@@ -2341,27 +2341,27 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 
-    // QDF framing (flpdf-9hc.6.10): qpdf `--qdf` never emits a body object for
-    // object 0 (the xref free-list head) or for any free/deleted entry — those
-    // exist only as `f` rows in the regenerated xref table. flpdf's
-    // `object_refs()` includes the free head (0 65535) and any deleted refs, so
-    // on the qdf path we suppress them here. The non-qdf path is unaffected and
-    // its byte output is unchanged.
-    let qdf_skip_refs: std::collections::HashSet<ObjectRef> = if options.qdf {
-        pdf.deleted_object_refs().into_iter().collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    // qpdf never emits a body object for object 0 (the xref free-list head) or
+    // for any free/deleted entry — in any mode (plain rewrite, --qdf, or
+    // object-stream output). Those entries exist only as `f` rows in the
+    // regenerated xref table. flpdf's `object_refs()` includes the free head
+    // (0 65535) and any deleted refs, so we suppress them here unconditionally.
+    // (flpdf-9hc.6.10 first added this on the qdf path; flpdf-9hc.31 extended
+    // it to the plain path — qpdf parity requires it in every mode, and without
+    // it the plain rewrite leaks `0 65535 obj null` as a body object, shifting
+    // every subsequent offset and blocking bytes-identical output.)
+    let skip_refs: std::collections::HashSet<ObjectRef> =
+        pdf.deleted_object_refs().into_iter().collect();
 
     for object_ref in &object_refs {
         if Some(*object_ref) == pdf.encryption_ref() {
             continue;
         }
 
-        // QDF: never emit object 0 or any free/deleted entry as a body object
-        // (qpdf --qdf parity, flpdf-9hc.6.10). The xref free-list head and any
-        // free rows are still written into the regenerated `xref` table below.
-        if options.qdf && (object_ref.number == 0 || qdf_skip_refs.contains(object_ref)) {
+        // Never emit object 0 or any free/deleted entry as a body object (qpdf
+        // parity, all modes). The xref free-list head and any free rows are
+        // still written into the regenerated `xref` table below.
+        if object_ref.number == 0 || skip_refs.contains(object_ref) {
             continue;
         }
 

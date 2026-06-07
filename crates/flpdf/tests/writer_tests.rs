@@ -26,6 +26,136 @@ fn rewrites_minimal_pdf_to_valid_pdf() {
     );
 }
 
+/// flpdf-9hc.31 regression: the plain (non-qdf) full-rewrite path must NOT
+/// emit object 0 — the xref free-list head — as a body object. `object_refs()`
+/// includes the free head `(0, 65535)`, but qpdf never writes it (or any
+/// free/deleted entry) as a `0 65535 obj … endobj` body in any mode; it exists
+/// only as an `f` row in the regenerated xref table. Leaking it shifts every
+/// subsequent object offset and blocks bytes-identical output. The qdf path
+/// already suppressed this (flpdf-9hc.6.10); this pins the plain path so the
+/// guard can't silently regress to qdf-only.
+#[test]
+fn plain_full_rewrite_does_not_emit_object_0_as_body() {
+    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    // Plain full rewrite (no qdf).
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &opts).unwrap();
+
+    // No body object for the free-list head, whether at the very start of the
+    // file or after any preceding newline.
+    assert!(
+        !output.starts_with(b"0 65535 obj") && !contains_subslice(&output, b"\n0 65535 obj"),
+        "plain full rewrite must not emit object 0 as a body object"
+    );
+
+    // The free-list head must still appear as an `f` row in the rebuilt xref
+    // table — it is not dropped, just relocated out of the body.
+    assert!(
+        contains_subslice(&output, b"0000000000 65535 f "),
+        "rebuilt xref table must still carry the free-list head row"
+    );
+
+    // And the result must remain a valid PDF.
+    let report = check_reader(Cursor::new(output)).unwrap();
+    assert!(
+        report.valid,
+        "diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+/// flpdf-9hc.31 regression (free/deleted parity): the plain full-rewrite path
+/// must also drop a *non-zero* deleted object from the body, not just object 0.
+/// `resolve()` returns `Object::Null` for a deleted ref, so without the guard
+/// the plain path would emit `N 0 obj / null / endobj` for it — qpdf never does.
+/// The deleted entry must survive only as an `f` row in the rebuilt xref table.
+///
+/// A *middle* object (3 of 4) is deleted so the rebuilt `/Size` still spans it
+/// and it must appear as a free row — deleting the trailing object would just
+/// shrink `/Size` past it and is a different (also-correct) outcome.
+#[test]
+fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
+    // Source with four objects; objects 3 and 4 are unreferenced leaves, so
+    // deleting object 3 leaves object 4 as the max and keeps 3 inside /Size.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    let add = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+    add(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add(
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add(
+        b"3 0 obj\n<< /Unreferenced 3 >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    add(
+        b"4 0 obj\n<< /Unreferenced 4 >>\nendobj\n",
+        &mut bytes,
+        &mut offsets,
+    );
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1,
+        )
+        .as_bytes(),
+    );
+
+    let deleted_ref = ObjectRef::new(3, 0);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.delete_object(deleted_ref);
+
+    // Plain full rewrite (no qdf): the deleted object must not be re-emitted.
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &opts).unwrap();
+
+    assert!(
+        !contains_subslice(&output, b"3 0 obj"),
+        "plain full rewrite must not emit the deleted object 3 as a body object"
+    );
+    // Object 3's slot survives as a free row in the rebuilt table.
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(
+        latest_entries.get(&3),
+        Some(&b'f'),
+        "deleted object 3 must remain a free xref entry"
+    );
+
+    let report = check_reader(Cursor::new(output)).unwrap();
+    assert!(
+        report.valid,
+        "diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+/// Returns true when `haystack` contains `needle` as a contiguous subslice.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// flpdf-9hc.13.2: default (no-flag) /ID strategy, full-rewrite path.
 ///
 /// First save of a source with no /ID emits a fresh two-element random /ID;
