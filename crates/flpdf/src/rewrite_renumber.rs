@@ -71,8 +71,9 @@ impl CatalogFirstRenumber {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when the trailer has no `/Root` entry, or
-    /// when resolving an object fails during the walk.
+    /// Returns [`Error::Unsupported`] when the trailer has no `/Root` entry.
+    /// Propagates [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] if an
+    /// object fails to load during the walk.
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Self> {
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut order: Vec<ObjectRef> = Vec::new();
@@ -119,6 +120,9 @@ fn enqueue(
     if old_to_new.contains_key(&original) {
         return;
     }
+    // Keyed on the full ObjectRef (number + generation); flpdf inputs are
+    // generation 0 throughout, whereas qpdf keys on object number alone. Revisit
+    // this key if mixed-generation inputs ever reach the renumber walk.
     let new_ref = ObjectRef::new(order.len() as u32 + 1, 0);
     old_to_new.insert(original, new_ref);
     order.push(original);
