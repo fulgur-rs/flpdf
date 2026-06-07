@@ -363,6 +363,54 @@ fn qdf_mode_round_trip_content_preserved() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// (g2) qdf=true of qdf output: indirect /Length holders are reused and the
+//      Catalog-first renumber is stable, so a second qdf pass is byte-identical
+//      (with %% Original object ID comments suppressed, which necessarily track
+//      input numbering and would otherwise differ between passes).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn qdf_of_qdf_reuses_length_holders_and_is_byte_stable() {
+    let raw = b"qdf-of-qdf must reuse the indirect /Length holders.";
+    let compressed = flate_encode(raw);
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.qdf = true;
+    // Suppress "%% Original object ID: N G": those comments record each object's
+    // number in the *input* file, which differs between pass 1 (original) and
+    // pass 2 (pass-1 output), so leaving them on would make the passes differ
+    // for a reason unrelated to the holder-reuse path under test.
+    opts.no_original_object_ids = true;
+    // Fix /ID so the comparison isolates the holder-reuse + renumber path; the
+    // second /ID element is otherwise content-derived and differs per pass.
+    opts.static_id = true;
+
+    // Pass 1: qdf rewrite introduces `/Length H 0 R` indirect holder objects.
+    let mut pass1 = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut pass1, &opts).unwrap();
+    assert!(
+        check_reader(Cursor::new(pass1.clone())).is_ok(),
+        "pass 1 qdf output must be structurally valid"
+    );
+
+    // Pass 2: qdf of the qdf output. The pre-pass must detect the existing
+    // holders, map them through the Catalog-first renumber, reuse their numbers
+    // (rather than allocating fresh ones), and skip re-emitting them as ordinary
+    // integer objects — yielding byte-identical output.
+    let mut pdf2 = Pdf::open(Cursor::new(pass1.clone())).unwrap();
+    let mut pass2 = Vec::new();
+    write_pdf_with_options(&mut pdf2, &mut pass2, &opts).unwrap();
+
+    assert_eq!(
+        pass1, pass2,
+        "qdf-of-qdf must be byte-stable: holders reused and renumber order stable"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // (h) qdf=true: LZWDecode stream decoded and /Filter absent
 // ─────────────────────────────────────────────────────────────────────────────
 
