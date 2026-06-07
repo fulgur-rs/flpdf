@@ -2648,9 +2648,8 @@ fn build_minimal_pdf_with_stream(stream_data: &[u8]) -> Vec<u8> {
     // stays reachable from /Root and survives the Catalog-first reachability
     // walk (which drops objects unreachable from /Root).
     offsets.push(bytes.len());
-    bytes.extend_from_slice(
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n",
-    );
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     // object 2: pages
     offsets.push(bytes.len());
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
@@ -2706,9 +2705,8 @@ fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
     // stays reachable from /Root and survives the Catalog-first reachability
     // walk (which drops objects unreachable from /Root).
     offsets.push(bytes.len());
-    bytes.extend_from_slice(
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n",
-    );
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     // object 2: pages
     offsets.push(bytes.len());
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
@@ -3161,9 +3159,8 @@ fn build_pdf_with_external_file_stream() -> Vec<u8> {
     // The Catalog references the stream (obj 3) via /Metadata so it stays
     // reachable from /Root and survives the Catalog-first reachability walk.
     offsets.push(bytes.len());
-    bytes.extend_from_slice(
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n",
-    );
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     offsets.push(bytes.len());
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
     offsets.push(bytes.len());

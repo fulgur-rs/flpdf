@@ -2207,9 +2207,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // load) and returns an owned map, releasing the borrow before the loop.
     let renumber = crate::rewrite_renumber::CatalogFirstRenumber::build(pdf)?;
     // The new /Root reference (always seeded first by the walk, so present).
-    let new_root = renumber.new_for_original(root_ref).ok_or_else(|| {
-        crate::Error::Unsupported("renumber: /Root absent from map".to_string())
-    })?;
+    let new_root = renumber
+        .new_for_original(root_ref)
+        .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
 
     refuse_signed_full_rewrite(pdf, options)?;
 
@@ -4150,7 +4150,11 @@ mod tests {
                 // Navigate by reference (trailer /Info, Catalog /Metadata)
                 // rather than hardcoded numbers, since output is renumbered.
                 let (title, stream) = resolve_title_and_stream(&mut rt);
-                assert_eq!(title.as_slice(), b"TopSecretTitle", "{label} string round-trip");
+                assert_eq!(
+                    title.as_slice(),
+                    b"TopSecretTitle",
+                    "{label} string round-trip"
+                );
                 assert_eq!(stream.as_slice(), b"hello", "{label} stream round-trip");
             }
         }

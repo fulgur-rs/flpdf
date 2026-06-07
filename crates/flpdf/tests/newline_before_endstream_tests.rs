@@ -58,9 +58,8 @@ fn build_minimal_pdf(payload: &[u8]) -> Vec<u8> {
     // reachable from /Root and survives the writer's Catalog-first reachability
     // walk (which drops objects unreachable from /Root).
     let cat_offset = bytes.len();
-    bytes.extend_from_slice(
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n",
-    );
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
 
     let pages_offset = bytes.len();
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
