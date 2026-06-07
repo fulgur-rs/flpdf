@@ -489,12 +489,47 @@ pub(crate) const QPDF_STATIC_ID: [u8; 16] = [
 /// readable by older PDF consumers when the source used `xref` tables and stays
 /// compact when the source used cross-reference streams.
 ///
-/// Returns [`crate::Error::Missing`] if the input has no `/Root`.
+/// # Errors
+///
+/// - [`crate::Error::Missing`] if the input has no `/Root`.
+/// - Propagates I/O errors and structural PDF errors from the underlying
+///   incremental writer (this path uses [`WriteOptions::default`], so it never
+///   takes the full-rewrite, encryption, or QDF branches).
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{write_pdf, Pdf};
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// let mut out = File::create("output.pdf")?;
+/// write_pdf(&mut pdf, &mut out)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<()> {
     write_pdf_with_options(pdf, out, &WriteOptions::default())
 }
 
 /// Like [`write_pdf`] but with caller-supplied [`WriteOptions`].
+///
+/// # Errors
+///
+/// - [`crate::Error::Missing`] if the input has no `/Root`.
+/// - [`crate::Error::Signed`] when the full-rewrite path
+///   (`options.full_rewrite == true`) would invalidate existing signatures and
+///   `options.allow_signed_full_rewrite` is not set.
+/// - [`crate::Error::Unsupported`] when `options.encrypt` and
+///   `options.copy_encryption` are both set (mutually exclusive), when
+///   encryption is combined with `options.qdf`, or when the OS CSPRNG
+///   (`getrandom`) is unavailable while deriving encryption keys or an AES IV.
+/// - [`crate::Error::Encrypted`] when `options.encrypt` or
+///   `options.copy_encryption` is set but the requested encryption parameters
+///   cannot be realized (an unsupported handler combination or malformed donor
+///   `/Encrypt` data).
+/// - Propagates I/O errors and structural PDF errors from the underlying
+///   incremental or full-rewrite writer.
 pub fn write_pdf_with_options<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
@@ -1534,7 +1569,27 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
 /// indirect `/Length` holders, `%QDF-1.0` header, `%% Original object ID:`
 /// comments, classic `xref` table, and the `trailer <<` dict layout).
 ///
-/// Returns [`crate::Error::Missing`] if the input has no `/Root`.
+/// # Errors
+///
+/// - [`crate::Error::Missing`] if the input has no `/Root`.
+/// - [`crate::Error::Signed`] when rewriting would invalidate existing
+///   signatures (this entry point always uses the full-rewrite path and does
+///   not set `allow_signed_full_rewrite`).
+/// - Propagates I/O errors and structural PDF errors from the underlying
+///   full-rewrite writer.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{write_qdf, Pdf};
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// let mut out = File::create("output.qdf.pdf")?;
+/// write_qdf(&mut pdf, &mut out)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<()> {
     let options = WriteOptions {
         qdf: true,

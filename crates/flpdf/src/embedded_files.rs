@@ -361,6 +361,11 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 // TODO(flpdf-9hc.10.6): consider exposing direct-dict entries via the public
 // list/show API (e.g. an `Object`-valued variant) once list/show land.
 ///
+/// List every embedded file referenced by an indirect `/Filespec` entry,
+/// returning each entry's name and the [`ObjectRef`] of its file-specification
+/// dictionary. Name-tree entries whose value is a *direct* `/Filespec`
+/// dictionary (rather than an indirect reference) are intentionally skipped.
+///
 /// # Errors
 ///
 /// Propagates any error from [`Pdf::resolve`], and returns

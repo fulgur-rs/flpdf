@@ -19,13 +19,26 @@ pub const DEFAULT_MAX_PAGE_TREE_DEPTH: usize = 100;
 /// multiple pages are deduplicated and the latest definition wins, matching qpdf's
 /// `--show-fonts` semantics.
 ///
-/// Returns [`Error::Missing`] if `/Root` or `/Pages` is absent. Returns
-/// [`Error::Unsupported`] if the page tree exceeds the depth limit.
+/// # Errors
+///
+/// - [`Error::Missing`] when `/Root` or `/Pages` is absent.
+/// - [`Error::Unsupported`] when the document catalog is not a dictionary, or when the
+///   page tree exceeds the depth limit.
+/// - Any [`Error`] propagated from [`Pdf::resolve_borrowed`] while resolving the catalog
+///   or page-tree nodes.
 pub fn font_entries<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<BTreeMap<Vec<u8>, Object>> {
     font_entries_with_max_depth(pdf, DEFAULT_MAX_PAGE_TREE_DEPTH)
 }
 
 /// Like [`font_entries`] but with a caller-supplied recursion limit.
+///
+/// # Errors
+///
+/// - [`Error::Missing`] when `/Root` or `/Pages` is absent.
+/// - [`Error::Unsupported`] when the document catalog is not a dictionary, or when the
+///   page tree exceeds `max_depth`.
+/// - Any [`Error`] propagated from [`Pdf::resolve_borrowed`] while resolving the catalog
+///   or page-tree nodes.
 pub fn font_entries_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,

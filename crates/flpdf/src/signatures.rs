@@ -127,11 +127,25 @@ impl SignatureRewriteImpact {
 }
 
 /// Return all signed AcroForm signature fields in document field order.
+///
+/// # Errors
+///
+/// - Propagates any error from resolving catalog, `/AcroForm`, and field-tree
+///   objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+/// - [`Error::Parse`] when a signature field's `/ByteRange` is malformed (not a
+///   four-element array of non-negative integers).
 pub fn signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<SignatureInfo>> {
     signatures_with_max_depth(pdf, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH)
 }
 
 /// Like [`signatures`], but with an explicit field-tree recursion limit.
+///
+/// # Errors
+///
+/// - Propagates any error from resolving catalog, `/AcroForm`, and field-tree
+///   objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+/// - [`Error::Parse`] when a signature field's `/ByteRange` is malformed (not a
+///   four-element array of non-negative integers).
 pub fn signatures_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
@@ -169,6 +183,13 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
 /// This is a convenience predicate over [`signature_rewrite_impact`]. It maps
 /// `WriteOptions::full_rewrite = true` to full rewrite and the default writer
 /// path to incremental update.
+///
+/// # Errors
+///
+/// Propagates any error from [`signature_rewrite_impact`], that is any error
+/// from resolving catalog, `/AcroForm`, and signature objects (surfaced by
+/// [`Pdf::resolve`]), and [`Error::Unsupported`] when the signature field-tree
+/// or known-container recursion depth limit is exceeded.
 pub fn would_rewrite_invalidate_signatures<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriteOptions,
@@ -184,6 +205,11 @@ pub fn would_rewrite_invalidate_signatures<R: Read + Seek>(
 /// Returns `None` when there is no `/AcroForm`, no `/SigFlags`, or the value is
 /// not a non-negative integer that fits in `u32`. An indirect `/SigFlags`
 /// reference (vanishingly rare for a scalar flag) is treated as absent.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog and `/AcroForm` objects (for
+/// example I/O or parse failures surfaced by [`Pdf::resolve`]).
 pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32>> {
     Ok(resolve_catalog_acroform(pdf)?
         .and_then(|(_, acroform)| sig_flags_from_acroform_dict(&acroform)))
@@ -196,6 +222,11 @@ pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32
 /// marking the containing object dirty. Returns `true` when a bit was actually
 /// cleared. Used by the opt-in signature-stripping path; it does not by itself
 /// remove signature fields or `/V` dictionaries.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog and `/AcroForm` objects (for
+/// example I/O or parse failures surfaced by [`Pdf::resolve`]).
 pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);
@@ -223,6 +254,12 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
 /// The field dictionaries themselves are preserved so widgets and field names
 /// remain in place, but signed fields no longer point at a signature
 /// dictionary. Returns `true` when at least one field value was removed.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`, and
+/// field-tree objects (for example I/O or parse failures surfaced by
+/// [`Pdf::resolve`]).
 pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let Some((_, mut acroform)) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);
@@ -312,6 +349,14 @@ fn clear_sig_flags_in_dict(acroform: &mut Dictionary) -> bool {
 /// - incremental update preserves signatures when it appends unrelated changes;
 /// - incremental update invalidates signatures when it rewrites `/AcroForm` or
 ///   a signature field/signature dictionary.
+///
+/// # Errors
+///
+/// - Propagates any error from resolving the catalog, `/AcroForm`, and
+///   signature objects (for example I/O or parse failures surfaced by
+///   [`Pdf::resolve`]).
+/// - [`Error::Unsupported`] when the signature field-tree or known-container
+///   recursion depth limit is exceeded while collecting signed objects.
 pub fn signature_rewrite_impact<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mode: SignatureWriteMode,

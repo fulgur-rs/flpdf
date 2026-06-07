@@ -87,6 +87,13 @@ impl PageRange {
     /// An empty string returns the "all pages" sentinel. Any syntax error
     /// produces an [`Error::Parse`] with an actionable message; the byte
     /// offset is relative to the start of the input string.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Parse`] when the input is a non-empty string that is not a
+    ///   valid page-range expression (invalid endpoint, `0`/`r0`, a dangling
+    ///   `-`, an empty or trailing entry, an unknown `:` parity suffix, or any
+    ///   unexpected character).
     pub fn parse(input: &str) -> Result<Self> {
         if input.is_empty() {
             return Ok(Self { entries: None });

@@ -80,6 +80,12 @@ pub fn remap_outline_and_dests<R: Read + Seek>(
 }
 
 /// Like [`remap_outline_and_dests`] but with a caller-supplied outline-depth limit.
+///
+/// # Errors
+///
+/// - Any error propagated from [`Pdf::resolve`].
+/// - [`Error::Unsupported`] when the name-tree or outline-tree depth exceeds
+///   `max_depth` while pruning or remapping.
 pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,

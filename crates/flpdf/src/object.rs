@@ -35,6 +35,14 @@ impl ObjectRef {
     /// Whitespace between tokens is collapsed and the trailing `R` is optional, mirroring
     /// the indirect-reference syntax that qpdf accepts on its command line.
     ///
+    /// # Errors
+    ///
+    /// Returns [`ParseObjectRefError`] when `input` is not a valid reference:
+    /// - it does not split into exactly two or three whitespace-separated tokens;
+    /// - it has three tokens but the third is not `R`;
+    /// - the first token does not parse as a [`u32`] object number;
+    /// - the second token does not parse as a [`u16`] generation.
+    ///
     /// # Examples
     ///
     /// ```

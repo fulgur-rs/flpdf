@@ -219,6 +219,13 @@ pub struct PdfOpenOptions {
 impl<R: Read + Seek> Pdf<R> {
     /// Open a document strictly: parse the cross-reference and trailer, but do not run
     /// the recovery heuristics. Returns an [`Error`] if the document is malformed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`] (called with default
+    /// options): [`Error::Io`] / [`Error::Parse`] / [`Error::Missing`] from loading
+    /// the cross-reference and trailer, and [`Error::Encrypted`] when the document
+    /// is encrypted and cannot be authenticated.
     pub fn open(reader: R) -> Result<Self> {
         Self::open_with_options(reader, PdfOpenOptions::default())
     }
@@ -226,6 +233,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// Open a document, falling back to qpdf-style xref/trailer recovery when the
     /// strict parse fails. Diagnostics from the recovery pass are stored on the handle
     /// and exposed via [`Pdf::repair_diagnostics`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`] (called with `repair`
+    /// enabled); see that method for the full error set.
     pub fn open_with_repair(reader: R) -> Result<Self> {
         Self::open_with_options(
             reader,
@@ -237,11 +249,32 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Alias for [`Pdf::open_with_repair`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_repair`].
     pub fn open_best_effort(reader: R) -> Result<Self> {
         Self::open_with_repair(reader)
     }
 
     /// Open a document with explicit repair and password options.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] / [`Error::Parse`] / [`Error::Missing`] when loading the
+    ///   cross-reference table and trailer fails (e.g. an unreadable stream, a
+    ///   malformed xref, or a cross-reference stream missing its `/Size` or `/W`
+    ///   entry). With `options.repair` set, the qpdf-style recovery pass runs
+    ///   first and only its residual failures surface.
+    /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
+    ///   entry type or `/W` field-width layout.
+    /// - [`Error::Encrypted`] when the document carries an `/Encrypt` dictionary
+    ///   that cannot be authenticated or processed: a wrong password
+    ///   ([`EncryptedError::BadPassword`]), an unsupported filter or revision
+    ///   ([`EncryptedError::UnsupportedHandler`]), a structurally invalid
+    ///   `/Encrypt` dictionary ([`EncryptedError::Malformed`]), or an RC4 / R=5
+    ///   document opened without `options.allow_weak_crypto`
+    ///   ([`EncryptedError::WeakCryptoNotAllowed`]).
     pub fn open_with_options(reader: R, options: PdfOpenOptions) -> Result<Self> {
         Self::open_with_repair_mode(reader, options)
     }
@@ -327,6 +360,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// crypt-filter methods. This does NOT re-run or alter authentication
     /// (layer-2 owns that ordering); it only reflects state from a document
     /// already opened successfully.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Encrypted`] ([`EncryptedError::Malformed`]) when the re-read
+    ///   `/Encrypt` dictionary is missing or has the wrong type for `/V`, `/R`,
+    ///   `/Filter`, or the `/EFF` crypt-filter selector. Returns `Ok(None)` for a
+    ///   plaintext document rather than an error.
+    /// - [`Error::Io`] / [`Error::Parse`] when the `/Encrypt` entry is an indirect
+    ///   reference whose resolution fails.
     pub fn encryption_info(&mut self) -> Result<Option<EncryptionInfo>> {
         if self.encryption.is_none() {
             return Ok(None);
@@ -392,6 +434,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// This walks `/Catalog /AcroForm /Fields`, descends through field `/Kids`,
     /// and returns only `/FT /Sig` fields whose `/V` signature dictionary has a
     /// valid four-integer `/ByteRange`.
+    ///
+    /// # Errors
+    ///
+    /// - Propagates any error from resolving the catalog, `/AcroForm`, and
+    ///   field-tree objects (for example I/O or parse failures surfaced by
+    ///   [`Pdf::resolve`]).
+    /// - [`Error::Parse`] when a signature field's `/ByteRange` is malformed (not a
+    ///   four-element array of non-negative integers).
     pub fn signatures(&mut self) -> Result<Vec<crate::SignatureInfo>> {
         crate::signatures::signatures(self)
     }
@@ -808,6 +858,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// ("fast web view"). Returns `Ok(None)` for non-linearized documents.
     ///
     /// This resolves object `(1, 0)` and inspects its `/Linearized` entry.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::resolve_borrowed`] while resolving object
+    /// `(1, 0)` (for example [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`]).
     pub fn linearized_hint_ref(&mut self) -> Result<Option<ObjectRef>> {
         let candidate = ObjectRef::new(1, 0);
         let object = self.resolve_borrowed(candidate)?;
@@ -832,6 +887,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// Resolution caches the result so subsequent calls are constant-time. Unknown,
     /// freed, or compressed-but-broken entries return [`Object::Null`] rather than an
     /// error, matching the behavior the PDF spec mandates for missing objects (§7.3.10).
+    ///
+    /// # Errors
+    ///
+    /// Has the same error behavior as [`Pdf::resolve_borrowed`]:
+    ///
+    /// - [`Error::Io`] when seeking to or reading the object's bytes fails.
+    /// - [`Error::Parse`] when the indirect object cannot be parsed.
+    /// - [`Error::Encrypted`] when decrypting the resolved object fails.
+    ///
+    /// An unknown, freed, or compressed-but-broken reference is **not** an error;
+    /// it resolves to [`Object::Null`].
     pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
         Ok(self.resolve_borrowed(object_ref)?.clone())
     }
@@ -842,6 +908,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// the resolved [`Object`]. The returned reference is tied to the mutable borrow
     /// of this [`Pdf`], so callers must finish using it before resolving or mutating
     /// other objects through the same reader.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] when seeking to or reading the object's bytes fails.
+    /// - [`Error::Parse`] when the indirect object cannot be parsed.
+    /// - [`Error::Encrypted`] when decrypting the resolved object fails.
+    ///
+    /// An unknown, freed, or compressed-but-broken reference is **not** an error;
+    /// it resolves to [`Object::Null`].
     pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
         if self.resolve_to_cache(object_ref)? {
             if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
@@ -1132,6 +1207,10 @@ impl<'a> Pdf<Cursor<&'a [u8]>> {
     ///
     /// For an owned, movable version see [`Pdf::open_mem_owned`].
     ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open`]; see that method for the full error set.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1150,6 +1229,11 @@ impl<'a> Pdf<Cursor<&'a [u8]>> {
     ///
     /// Like [`Pdf::open_mem`] but accepts a [`PdfOpenOptions`] struct for repair and
     /// password configuration, mirroring [`Pdf::open_with_options`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`]; see that method for the
+    /// full error set.
     ///
     /// # Examples
     ///
@@ -1176,6 +1260,10 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// This is the preferred form for in-memory PDF handling in most contexts (e.g. WASM,
     /// test helpers, fulgur's document pipeline).
     ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open`]; see that method for the full error set.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1194,6 +1282,11 @@ impl Pdf<Cursor<Vec<u8>>> {
     ///
     /// Like [`Pdf::open_mem_owned`] but accepts a [`PdfOpenOptions`] struct for repair
     /// and password configuration, mirroring [`Pdf::open_with_options`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Pdf::open_with_options`]; see that method for the
+    /// full error set.
     ///
     /// # Examples
     ///

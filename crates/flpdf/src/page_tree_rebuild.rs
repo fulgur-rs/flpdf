@@ -205,6 +205,17 @@ pub fn rebuild_page_tree<R: Read + Seek>(
 
 /// Like [`rebuild_page_tree`] but with a caller-supplied inheritance-walk
 /// recursion limit.
+///
+/// # Errors
+///
+/// - [`Error::Missing`] when `selected` is empty, or when `/Root` or the
+///   catalog `/Pages` reference is absent.
+/// - [`Error::Unsupported`] when the catalog, a selected ref, or the `/Pages`
+///   root is not a dictionary, a selected object is not a `/Page` dictionary,
+///   the page-tree depth limit (`max_depth`) is exceeded, or an object-number
+///   overflow occurs while allocating clones for duplicate selections.
+/// - Any error propagated from [`Pdf::resolve`] / [`Pdf::resolve_borrowed`] while
+///   resolving the catalog, leaves, or inherited attributes.
 pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     selected: &[ObjectRef],

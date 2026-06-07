@@ -181,7 +181,7 @@ pub enum RemoveUnreferencedResources {
 ///
 /// Propagates *structural* errors: page-tree traversal
 /// ([`crate::pages::page_refs`]), resources-location resolution
-/// ([`resources_location`]), inherited-`/Resources` resolution
+/// (`resources_location`), inherited-`/Resources` resolution
 /// ([`crate::pages::resolve_inherited_resources`]), and Form XObject object
 /// resolution. These are not content-comprehension failures.
 ///

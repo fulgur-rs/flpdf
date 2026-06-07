@@ -1253,6 +1253,21 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 ///
 /// Returns [`LinearizedDocument`] containing both the bytes and the
 /// [`LinearizedOffsets`] needed for back-patching.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
+/// inconsistent or a layout value does not fit its slot — for example an
+/// object (catalog, page, shared, or body object) has no entry in the
+/// [`RenumberMap`], the plan has no page hints or a `per_page_private_objects`
+/// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
+/// object lacks a probed byte length, or the hint-stream compressed length
+/// fails to converge within the iteration budget.
+///
+/// Propagates any error from resolving source objects via
+/// [`Pdf::resolve_borrowed`] (e.g. [`crate::Error::Io`] or
+/// [`crate::Error::Parse`]) and from the underlying ObjStm-batch planning,
+/// hint-stream encoding, and xref-stream filtering steps.
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,

@@ -1,5 +1,14 @@
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 
+/// Parse a single PDF object from `input`, which must contain nothing but
+/// that object (apart from trailing whitespace).
+///
+/// # Errors
+///
+/// - Returns [`Error::Parse`] if `input` does not contain a syntactically
+///   valid PDF object, propagated from the underlying object parser.
+/// - Returns [`Error::Parse`] with `"trailing bytes after object"` if any
+///   non-whitespace bytes remain after the object has been parsed.
 pub fn parse_object(input: &[u8]) -> Result<Object> {
     let mut parser = Parser::new(input);
     let object = parser.object()?;
