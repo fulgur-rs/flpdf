@@ -678,9 +678,366 @@ fn action_goto_absent_page_is_neutralized() {
         .as_dict()
         .cloned()
         .unwrap();
+    // The /A action is RETAINED; only its dead /D is dropped (qpdf-aligned).
+    let action = annot
+        .get("A")
+        .and_then(|o| o.as_dict())
+        .expect("/A action retained");
+    assert_eq!(
+        action.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "/A action is still a GoTo"
+    );
     assert!(
-        annot.get("A").is_none(),
-        "/A GoTo must be neutralized (removed)"
+        action.get("D").is_none(),
+        "cross-page /D must be dropped from the GoTo action"
+    );
+}
+
+#[test]
+fn annot_aa_goto_absent_page_is_neutralized() {
+    // Annotation /AA additional-actions dict: an /U subaction is a cross-page
+    // GoTo. Its /D must be dropped, /AA and /U retained.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /AA << /U << /S /GoTo /D [4 0 R /Fit] >> >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "/AA GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let aa = annot
+        .get("AA")
+        .and_then(|o| o.as_dict())
+        .expect("/AA retained");
+    let u = aa
+        .get("U")
+        .and_then(|o| o.as_dict())
+        .expect("/AA /U retained");
+    assert_eq!(
+        u.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "/AA /U is still a GoTo"
+    );
+    assert!(
+        u.get("D").is_none(),
+        "cross-page /D must be dropped from /AA /U"
+    );
+}
+
+#[test]
+fn action_next_chain_goto_is_neutralized() {
+    // /A is a /URI action whose /Next is a cross-page GoTo. The URI action is
+    // untouched; the chained GoTo's /D is dropped.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (http://example.com) /Next << /S /GoTo /D [4 0 R /Fit] >> >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "/Next GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let action = annot
+        .get("A")
+        .and_then(|o| o.as_dict())
+        .expect("/A retained");
+    assert_eq!(
+        action.get("S").and_then(|o| o.as_name()),
+        Some(&b"URI"[..]),
+        "/A is still the URI action"
+    );
+    assert!(
+        action.get("URI").is_some(),
+        "/A /URI value must be preserved"
+    );
+    let next = action
+        .get("Next")
+        .and_then(|o| o.as_dict())
+        .expect("/A /Next retained");
+    assert_eq!(
+        next.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "/Next action is still a GoTo"
+    );
+    assert!(
+        next.get("D").is_none(),
+        "cross-page /D must be dropped from the /Next GoTo"
+    );
+}
+
+#[test]
+fn next_array_goto_is_neutralized() {
+    // /Next is an ARRAY of actions: [URI, GoTo]. Only the GoTo's /D is dropped.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (x) /Next [ << /S /URI /URI (y) >> << /S /GoTo /D [4 0 R /Fit] >> ] >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "/Next array GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let next = annot
+        .get("A")
+        .and_then(|o| o.as_dict())
+        .and_then(|a| a.get("Next"))
+        .cloned()
+        .expect("/A /Next retained");
+    let elems = match next {
+        Object::Array(a) => a,
+        other => panic!("expected /Next array, got {other:?}"),
+    };
+    assert_eq!(elems.len(), 2, "both /Next actions retained");
+    let first = elems[0].as_dict().expect("first /Next element is a dict");
+    assert!(
+        first.get("URI").is_some(),
+        "first (URI) /Next action untouched"
+    );
+    let second = elems[1].as_dict().expect("second /Next element is a dict");
+    assert_eq!(
+        second.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "second /Next action is still a GoTo"
+    );
+    assert!(
+        second.get("D").is_none(),
+        "cross-page /D must be dropped from the array GoTo"
+    );
+}
+
+#[test]
+fn page_level_aa_goto_is_neutralized() {
+    // The extracted page leaf's OWN /AA (open action) is a cross-page GoTo.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /AA << /O << /S /GoTo /D [4 0 R /Fit] >> >> >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "page /AA GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let o = leaf
+        .get("AA")
+        .and_then(|o| o.as_dict())
+        .and_then(|aa| aa.get("O"))
+        .and_then(|o| o.as_dict())
+        .expect("page /AA /O retained");
+    assert_eq!(
+        o.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "page /AA /O is still a GoTo"
+    );
+    assert!(
+        o.get("D").is_none(),
+        "cross-page /D must be dropped from page /AA /O"
+    );
+}
+
+#[test]
+fn indirect_action_goto_is_neutralized() {
+    // /A is an indirect reference to a GoTo action (obj 8). The walker must
+    // rewrite obj 8 in place (set_object on the terminal ref).
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A 8 0 R >>",
+            ),
+            (8, "<< /S /GoTo /D [4 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "indirect-action GoTo sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    // /A is still an indirect ref to the (now neutralized) action.
+    let action_ref = annot.get("A").and_then(Object::as_ref_id).expect("/A ref");
+    let action = out
+        .resolve_borrowed(action_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        action.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoTo"[..]),
+        "indirect action is still a GoTo"
+    );
+    assert!(
+        action.get("D").is_none(),
+        "cross-page /D must be dropped from the indirect action"
+    );
+}
+
+#[test]
+fn selflink_dest_kept_with_crosspage_action_neutralized() {
+    // Independence: a self-link /Dest (kept) coexists with a cross-page /A GoTo
+    // (neutralized). /Dest stays; the action's /D is dropped.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [3 0 R /Fit] /A << /S /GoTo /D [4 0 R /Fit] >> >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "cross-page action sibling must be pruned"
+    );
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    assert!(
+        annot.get("Dest").is_some(),
+        "self-link /Dest must be preserved"
+    );
+    let action = annot
+        .get("A")
+        .and_then(|o| o.as_dict())
+        .expect("/A action retained");
+    assert!(
+        action.get("D").is_none(),
+        "cross-page /A GoTo /D must be dropped"
     );
 }
 
