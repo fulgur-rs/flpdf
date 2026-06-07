@@ -8,6 +8,22 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
 
+/// Find the single Widget annotation on the first page by structure.
+///
+/// Full-rewrite output is renumbered Catalog-first, so the widget no longer
+/// has a stable object number; navigate to it via `/Annots` rather than
+/// hardcoding a number. Each fixture used here has exactly one merged widget,
+/// so its `annot_ref` is the dict that holds `/AP`.
+fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
+    let page_refs = flpdf::pages::page_refs(pdf).unwrap();
+    flpdf::enumerate_page_annotations(pdf, page_refs[0])
+        .unwrap()
+        .into_iter()
+        .find(|a| a.is_widget)
+        .expect("fixture must have exactly one Widget annotation")
+        .annot_ref
+}
+
 #[test]
 fn check_valid_fixture_exits_successfully() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
@@ -392,7 +408,7 @@ fn qdf_subcommand_rewrites_output() {
 }
 
 #[test]
-fn qdf_subcommand_dumps_all_objects() {
+fn qdf_subcommand_dumps_all_reachable_objects() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = fixture_with_orphan_object();
     let output = temp.path().join("out.pdf");
@@ -408,13 +424,28 @@ fn qdf_subcommand_dumps_all_objects() {
 
     // The QDF output contains a binary header marker (non-UTF-8 bytes), so we
     // read raw bytes and search for target substrings as bytes. Canonical QDF
-    // (the new `qdf` == `rewrite --qdf` behavior) preserves every object,
-    // including the unreferenced `5 0 obj` (/Type /Orphan), and carries the
-    // QDF markers.
+    // (the new `qdf` == `rewrite --qdf` behavior) renumbers objects Catalog-first
+    // and emits only those reachable from the trailer `/Root`+`/Info` seed.
+    // The fixture's `/Type /Orphan` object is unreferenced, so it is dropped —
+    // matching qpdf's default (`qpdf --qdf` drops unreferenced objects unless
+    // `--preserve-unreferenced` is given). We therefore assert by object *type*
+    // (object numbers are unstable under renumber), not by hardcoded `N 0 obj`.
     let rendered = std::fs::read(&output).unwrap();
     let has = |needle: &[u8]| rendered.windows(needle.len()).any(|w| w == needle);
-    assert!(has(b"5 0 obj"), "expected '5 0 obj' in QDF output");
-    assert!(has(b"/Type /Orphan"), "expected the orphan object body");
+    // Every object reachable from /Root is dumped.
+    assert!(
+        has(b"/Type /Catalog"),
+        "expected the reachable Catalog object"
+    );
+    assert!(has(b"/Type /Pages"), "expected the reachable Pages object");
+    assert!(has(b"/Type /Page"), "expected the reachable Page object");
+    // The unreferenced orphan is dropped (qpdf-consistent, no
+    // --preserve-unreferenced). This assertion is the test's teeth: it fails if
+    // the renumber stops dropping unreachable objects.
+    assert!(
+        !has(b"/Type /Orphan"),
+        "unreferenced orphan object must be dropped (qpdf-consistent)"
+    );
     assert!(has(b"%QDF-1.0"), "expected %QDF-1.0 header marker");
     assert!(
         has(b"%% Original object ID:"),
@@ -3243,7 +3274,8 @@ fn rewrite_generate_appearances_replaces_null_ap_n() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let mut helper = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let widget = first_widget_ref(&mut pdf);
+    let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
     let ap = helper
         .appearance()
         .unwrap()
@@ -3314,7 +3346,7 @@ fn rewrite_generate_appearances_adds_ap_n() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget = ObjectRef::new(4, 0);
+    let widget = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
     let ap = helper
         .appearance()

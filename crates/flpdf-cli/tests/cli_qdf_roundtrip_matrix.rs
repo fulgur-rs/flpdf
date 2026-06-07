@@ -231,10 +231,13 @@ fn assert_qdf_invariants(bytes: &[u8], expect_streams: bool) {
         "QDF must carry the %QDF-1.0 header marker"
     );
     // Every `%% Original object ID: A B` line must be immediately followed by
-    // the matching `A B obj` line (the annotation is well-formed and adjacent
-    // to its object). Synthetic length-holder objects (flpdf-9hc.6.12) carry
-    // no such comment by design and are simply not annotated — so we assert
-    // structural correctness of each annotation, not a bare substring.
+    // a well-formed `N 0 obj` header. The comment records the object's number
+    // in the *input* file (A); the header carries the *output* number (N),
+    // which the Catalog-first renumber reassigns — so A and N differ in
+    // general (matching qpdf --qdf, e.g. `Original object ID: 5 0` -> `2 0 obj`).
+    // We therefore assert the annotation is well-formed and adjacent to a real
+    // object header, not that the numbers are equal. Synthetic length-holder
+    // objects carry no such comment by design and are simply not annotated.
     let text = String::from_utf8_lossy(bytes);
     let lines: Vec<&str> = text.split('\n').collect();
     let mut annotated = 0usize;
@@ -243,12 +246,19 @@ fn assert_qdf_invariants(bytes: &[u8], expect_streams: bool) {
             continue;
         };
         annotated += 1;
-        let expected_obj = format!("{} obj", id.trim());
-        assert_eq!(
-            lines.get(i + 1).map(|s| s.trim_end_matches('\r')),
-            Some(expected_obj.as_str()),
-            "QDF `%% Original object ID: {id}` must be immediately followed \
-             by `{expected_obj}`"
+        let next = lines.get(i + 1).map(|s| s.trim_end_matches('\r'));
+        let is_obj_header = next.is_some_and(|s| {
+            let mut parts = s.split(' ');
+            let num_ok = parts.next().is_some_and(|n| n.parse::<u32>().is_ok());
+            num_ok
+                && parts.next() == Some("0")
+                && parts.next() == Some("obj")
+                && parts.next().is_none()
+        });
+        assert!(
+            is_obj_header,
+            "QDF `%% Original object ID: {id}` must be immediately followed by a \
+             well-formed `N 0 obj` header, got {next:?}"
         );
     }
     assert!(
