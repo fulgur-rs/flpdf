@@ -198,7 +198,8 @@ impl Part1Bytes {
     ///
     /// # Header
     ///
-    /// `%PDF-1.7\n` followed by a binary marker line `%<0xE2 0xE3 0xCF 0xD3>\n`.
+    /// `%PDF-1.7\n` followed by a binary marker line
+    /// `%<0xBF 0xF7 0xA2 0xFE>\n` (shared `crate::writer::QPDF_BINARY_MARKER`).
     ///
     /// # Object 1 format
     ///
