@@ -56,6 +56,13 @@ fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     doc.resolve_borrowed(pages_ref).unwrap().as_dict().cloned().unwrap()
 }
 
+/// Fetch the single extracted leaf page dict.
+fn only_leaf(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
+    let refs = pages::page_refs(doc).unwrap();
+    assert_eq!(refs.len(), 1);
+    doc.resolve_borrowed(refs[0]).unwrap().as_dict().cloned().unwrap()
+}
+
 #[test]
 fn extracts_single_page_with_count_one() {
     let src = two_page_pdf();
@@ -74,4 +81,87 @@ fn extracts_single_page_with_count_one() {
         Some(Object::Array(kids)) => assert_eq!(kids.len(), 1),
         other => panic!("expected /Kids array, got {other:?}"),
     }
+}
+
+/// Parent /Pages carries /MediaBox, /Resources (font), and /Rotate; the leaf
+/// page (obj 3) inherits all three.
+fn inherited_attrs_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 400 500] /Rotate 90 /Resources << /Font << /F1 5 0 R >> >> >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"),
+            (4, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn materializes_inherited_attributes() {
+    let src = inherited_attrs_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    assert_eq!(
+        leaf.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(400), Object::Integer(500),
+        ]))
+    );
+    assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
+
+    let res = leaf.get("Resources").and_then(|o| o.as_dict()).expect("/Resources");
+    let font_ref = res
+        .get("Font").and_then(|o| o.as_dict())
+        .and_then(|f| f.get("F1"))
+        .and_then(|o| match o { Object::Reference(r) => Some(*r), _ => None })
+        .expect("/Font /F1 ref");
+    let font = out.resolve_borrowed(font_ref).unwrap().as_dict().cloned().unwrap();
+    assert_eq!(font.get("Subtype"), Some(&Object::Name(b"Type1".to_vec())));
+}
+
+/// Ancestor /Pages stores /MediaBox as an INDIRECT reference (obj 6), the qpdf
+/// shared-array pattern. The leaf (obj 3) inherits it. Exercises remap_refs'
+/// Object::Reference branch: the extracted leaf's /MediaBox must resolve to a
+/// live array, not become Null.
+fn indirect_inherited_mediabox_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox 6 0 R >>"),
+            (3, "<< /Type /Page /Parent 2 0 R >>"),
+            (6, "[0 0 321 654]"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn remaps_indirect_inherited_mediabox() {
+    let src = indirect_inherited_mediabox_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    // /MediaBox must be present and resolve to the live array (not Null, not a
+    // dangling source ref).
+    let mb = leaf.get("MediaBox").expect("/MediaBox present");
+    let arr = match mb {
+        Object::Reference(r) => out.resolve(*r).unwrap(),
+        other => other.clone(),
+    };
+    assert_eq!(
+        arr,
+        Object::Array(vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(321), Object::Integer(654),
+        ]),
+        "indirect inherited /MediaBox must be remapped into the extracted doc, not nulled"
+    );
 }

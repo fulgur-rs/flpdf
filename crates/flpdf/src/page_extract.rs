@@ -164,6 +164,12 @@ fn has_own(dict: &Dictionary, key: &str) -> bool {
 /// in `map` (out-of-closure) become `Object::Null`, matching `copy_objects`'
 /// out-of-set policy. Used to fix up materialized inherited attribute values,
 /// whose refs point into the SOURCE document.
+///
+/// Nulling an out-of-map ref is safe for materialized inherited attributes
+/// because `page_object_closure` follows `/Parent` and collects all non-`/Kids`
+/// refs from ancestor `/Pages` nodes, so any ancestor-inherited referent (e.g.
+/// an indirectly-stored `/MediaBox` array) is already in the closure and
+/// therefore in `map`.
 fn remap_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
     match obj {
         Object::Reference(r) => {
