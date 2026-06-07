@@ -33,7 +33,7 @@ A **full rewrite** of a signed PDF is refused, because renumbering and
 re-serializing objects relocates the signed byte ranges and invalidates the
 signature. The diagnostic names the offending signature field(s):
 
-```
+```text
 refusing full rewrite of signed PDF because it would invalidate signature
 field(s): <fields>. Use --remove-restrictions to explicitly allow
 invalidating signatures, or use an incremental rewrite that preserves
@@ -43,7 +43,7 @@ signed byte ranges.
 On the CLI this is printed (without the internal `signed PDF:` prefix) and
 exits non-zero:
 
-```
+```text
 flpdf: refusing full rewrite of signed PDF because it would invalidate signature field(s): ...
 ```
 
@@ -61,7 +61,7 @@ flpdf rewrite --remove-restrictions input.pdf output.pdf
 When signatures are removed, flpdf prints a warning so the loss is never
 silent:
 
-```
+```text
 flpdf: warning: removed signatures; signatures are now invalidated
 ```
 

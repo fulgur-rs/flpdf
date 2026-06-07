@@ -20,8 +20,8 @@ template's "Compat matrix" section.
 
 flpdf preserves digital signatures by default and refuses operations that
 would silently invalidate them. Before touching the writer or signature
-handling, read `docs/signed-pdf.md` for the preserve / refuse / opt-in-strip
-policy. Note that signature *generation* is intentionally out of scope.
+handling, read [docs/signed-pdf.md](docs/signed-pdf.md) for the preserve /
+refuse / opt-in-strip policy. Note that signature *generation* is intentionally out of scope.
 
 ## Issue tracking
 
