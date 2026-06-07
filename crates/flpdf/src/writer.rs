@@ -478,7 +478,10 @@ pub fn effective_pdf_version<'a>(
 /// that flpdf output is byte-identical to qpdf output for the header section.
 ///
 /// Hex: `25 BF F7 A2 FE 0A`  →  `%` + four high bytes + newline.
-const QPDF_BINARY_MARKER: &[u8] = b"%\xbf\xf7\xa2\xfe\n";
+///
+/// Shared with the linearization writer ([`crate::linearization`]) so the
+/// linearized output uses the identical marker as the plain rewrite path.
+pub(crate) const QPDF_BINARY_MARKER: &[u8] = b"%\xbf\xf7\xa2\xfe\n";
 
 /// qpdf's static-id constant: the first 32 hex digits of π, encoded as 16 raw
 /// bytes so the trailer emits `<31415926535897932384626433832795>`.

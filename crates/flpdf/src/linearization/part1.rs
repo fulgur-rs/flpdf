@@ -235,8 +235,10 @@ impl Part1Bytes {
         // ------------------------------------------------------------------
         // Emit the caller-supplied version (computed via effective_pdf_version).
         bytes.extend_from_slice(format!("%PDF-{pdf_version}\n").as_bytes());
-        // Binary marker: four bytes >= 128 signals a binary file.
-        bytes.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
+        // Binary marker: four bytes >= 128 signals a binary file. Share the
+        // marker with the plain rewrite path so linearized output stays
+        // byte-identical to qpdf (which uses the same marker for both paths).
+        bytes.extend_from_slice(crate::writer::QPDF_BINARY_MARKER);
 
         // ------------------------------------------------------------------
         // Object {param_dict_obj_number}: linearization parameter dictionary
@@ -525,7 +527,7 @@ mod tests {
         let p1 = build_part1();
         // The binary marker bytes follow immediately after the header line.
         // build_part1() uses version "1.4", so the header is "%PDF-1.4\n".
-        let expected_marker: &[u8] = b"%\xE2\xE3\xCF\xD3\n";
+        let expected_marker: &[u8] = crate::writer::QPDF_BINARY_MARKER;
         let header_len = b"%PDF-1.4\n".len();
         assert!(
             p1.bytes.len() > header_len + expected_marker.len(),
