@@ -1,37 +1,14 @@
 use assert_cmd::Command;
 use flpdf::{
-    acroform_sig_flags, filespec_helper::encode_utf16be, AnnotationObjectHelper, Object, ObjectRef,
-    Pdf,
+    acroform_sig_flags, filespec_helper::encode_utf16be, AnnotationObjectHelper, Object, Pdf,
 };
 use predicates::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
 
-/// Find the single Widget annotation on the first page by structure.
-///
-/// Full-rewrite output is renumbered Catalog-first, so the widget no longer
-/// has a stable object number; navigate to it via `/Annots` rather than
-/// hardcoding a number. Each fixture used here has exactly one merged widget,
-/// so its `annot_ref` is the dict that holds `/AP`.
-fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
-    let page_ref = *flpdf::pages::page_refs(pdf)
-        .unwrap()
-        .first()
-        .expect("fixture must have at least one page");
-    let widgets: Vec<_> = flpdf::enumerate_page_annotations(pdf, page_ref)
-        .unwrap()
-        .into_iter()
-        .filter(|a| a.is_widget)
-        .collect();
-    assert_eq!(
-        widgets.len(),
-        1,
-        "fixture must have exactly one Widget annotation, found {}",
-        widgets.len()
-    );
-    widgets[0].annot_ref
-}
+mod common;
+use common::first_widget_ref;
 
 #[test]
 fn check_valid_fixture_exits_successfully() {

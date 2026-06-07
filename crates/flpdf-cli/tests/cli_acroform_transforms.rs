@@ -26,9 +26,12 @@
 //! See `docs/qpdf-compat-decisions.md` §AcroForm & annotation transforms.
 
 use assert_cmd::Command;
-use flpdf::{AnnotationObjectHelper, Object, ObjectRef, Pdf};
+use flpdf::{AnnotationObjectHelper, Object, Pdf};
 use std::fs::File;
 use std::io::BufReader;
+
+mod common;
+use common::first_widget_ref;
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -205,31 +208,6 @@ fn resolve_one<R: std::io::Read + std::io::Seek>(
         Object::Reference(r) => pdf.resolve(r),
         other => Ok(other),
     }
-}
-
-/// Find the single Widget annotation on the first page by structure.
-///
-/// Full-rewrite output is renumbered Catalog-first, so the widget no longer
-/// has a stable object number; navigate to it via `/Annots` rather than
-/// hardcoding a number. Each fixture has exactly one merged widget (it carries
-/// `/FT`+`/T` directly), so its `annot_ref` is the dict that holds `/AP`.
-fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
-    let page_ref = *flpdf::pages::page_refs(pdf)
-        .unwrap()
-        .first()
-        .expect("fixture must have at least one page");
-    let widgets: Vec<_> = flpdf::enumerate_page_annotations(pdf, page_ref)
-        .unwrap()
-        .into_iter()
-        .filter(|a| a.is_widget)
-        .collect();
-    assert_eq!(
-        widgets.len(),
-        1,
-        "fixture must have exactly one Widget annotation, found {}",
-        widgets.len()
-    );
-    widgets[0].annot_ref
 }
 
 // ── Tests: generate-appearances ───────────────────────────────────────────────
