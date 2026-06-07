@@ -2,6 +2,17 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
+> **Note (superseded during implementation):** Tasks 1–6 below were the initial
+> plan. During implementation the neutralization strategy was changed to the
+> uniform qpdf-aligned rule "**drop the destination, keep the action**": a
+> cross-page `/GoTo` has only its `/D` removed (the `/A` / action / chain is
+> retained), and coverage was expanded to annotation `/AA`, `/A` `/Next` chains
+> (single, array, indirect array), and the page's own `/AA`. The historical
+> "remove the whole `/A`" / `assert annot.get("A").is_none()` snippets below
+> reflect the original plan, **not** the shipped behavior. The source of truth is
+> the beads `flpdf-4924` design (v2), the `page_extract.rs` module doc, and the
+> tests in `page_extract_tests.rs`.
+
 **Goal:** In single-page `extract_page`, neutralize Link annotations whose
 explicit `/Dest` (or `/A /GoTo /D`) targets a page absent from the one-page
 output, so the leaked sibling page stub + ancestor `/Pages` node get swept.
@@ -9,7 +20,8 @@ output, so the leaked sibling page stub + ancestor `/Pages` node get swept.
 **Architecture:** Post-copy fixup in `page_extract::extract_page`, inserted after
 leaf materialization and before the existing `sweep_unreachable_objects` call.
 Operate on the TARGET side: a destination whose resolved page ref `!=
-copied_page_ref` is "absent" → remove `/Dest` / `/A` from the annotation. The
+copied_page_ref` is "absent" → drop the dead destination (remove the `/Dest` key,
+or the `/D` key of the offending `/GoTo` action — the action is kept). The
 existing sweep then prunes the now-unreferenced sibling stub. Destination parsing
 reuses `outline_dest_remap::dest_page_ref_resolved` (made `pub(crate)`), which
 returns `None` for named/string/URI/GoToR dests — so those are left intact with
@@ -382,7 +394,11 @@ fn action_goto_absent_page_is_neutralized() {
         other => panic!("got {other:?}"),
     };
     let annot = out.resolve_borrowed(annot_ref).unwrap().as_dict().cloned().unwrap();
-    assert!(annot.get("A").is_none(), "/A GoTo must be neutralized (removed)");
+    // SHIPPED behavior (see superseded note at top): the /A action is RETAINED;
+    // only its cross-page /D is dropped.
+    let a = annot.get("A").and_then(|o| o.as_dict()).expect("/A retained");
+    assert_eq!(a.get("S").and_then(|o| o.as_name()), Some(&b"GoTo"[..]));
+    assert!(a.get("D").is_none(), "/A GoTo /D must be neutralized (removed)");
 }
 ```
 
