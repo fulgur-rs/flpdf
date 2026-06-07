@@ -157,6 +157,8 @@ fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRe
         return Ok(());
     };
     // /Annots may be an inline array or an indirect reference to one.
+    // Inline-dict annotations (no indirect ref) are skipped: there is no
+    // object to set_object back; in practice /Annots entries are indirect.
     let annot_refs: Vec<ObjectRef> = match page_dict.get("Annots").cloned() {
         Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
         Some(Object::Reference(r)) => match target.resolve_borrowed(r)? {
