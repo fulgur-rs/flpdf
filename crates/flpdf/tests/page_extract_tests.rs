@@ -48,19 +48,35 @@ fn two_page_pdf() -> Vec<u8> {
 /// Resolve the catalog's /Pages dict from a freshly-extracted document.
 fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     let catalog_ref = doc.root_ref().unwrap();
-    let catalog = doc.resolve_borrowed(catalog_ref).unwrap().as_dict().cloned().unwrap();
-    let pages_ref = catalog.get("Pages").and_then(|o| match o {
-        Object::Reference(r) => Some(*r),
-        _ => None,
-    }).unwrap();
-    doc.resolve_borrowed(pages_ref).unwrap().as_dict().cloned().unwrap()
+    let catalog = doc
+        .resolve_borrowed(catalog_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let pages_ref = catalog
+        .get("Pages")
+        .and_then(|o| match o {
+            Object::Reference(r) => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    doc.resolve_borrowed(pages_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap()
 }
 
 /// Fetch the single extracted leaf page dict.
 fn only_leaf(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     let refs = pages::page_refs(doc).unwrap();
     assert_eq!(refs.len(), 1);
-    doc.resolve_borrowed(refs[0]).unwrap().as_dict().cloned().unwrap()
+    doc.resolve_borrowed(refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap()
 }
 
 #[test]
@@ -72,7 +88,11 @@ fn extracts_single_page_with_count_one() {
 
     // Exactly one page in the extracted document.
     let page_refs = pages::page_refs(&mut out).unwrap();
-    assert_eq!(page_refs.len(), 1, "extracted doc must have exactly one page");
+    assert_eq!(
+        page_refs.len(),
+        1,
+        "extracted doc must have exactly one page"
+    );
 
     // /Pages root: /Count 1, /Kids has one element.
     let root = pages_dict(&mut out);
@@ -109,19 +129,33 @@ fn materializes_inherited_attributes() {
     assert_eq!(
         leaf.get("MediaBox"),
         Some(&Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(400), Object::Integer(500),
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(400),
+            Object::Integer(500),
         ]))
     );
     assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
 
-    let res = leaf.get("Resources").and_then(|o| o.as_dict()).expect("/Resources");
+    let res = leaf
+        .get("Resources")
+        .and_then(|o| o.as_dict())
+        .expect("/Resources");
     let font_ref = res
-        .get("Font").and_then(|o| o.as_dict())
+        .get("Font")
+        .and_then(|o| o.as_dict())
         .and_then(|f| f.get("F1"))
-        .and_then(|o| match o { Object::Reference(r) => Some(*r), _ => None })
+        .and_then(|o| match o {
+            Object::Reference(r) => Some(*r),
+            _ => None,
+        })
         .expect("/Font /F1 ref");
-    let font = out.resolve_borrowed(font_ref).unwrap().as_dict().cloned().unwrap();
+    let font = out
+        .resolve_borrowed(font_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
     assert_eq!(font.get("Subtype"), Some(&Object::Name(b"Type1".to_vec())));
 }
 
@@ -133,7 +167,10 @@ fn indirect_inherited_mediabox_pdf() -> Vec<u8> {
     build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox 6 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox 6 0 R >>",
+            ),
             (3, "<< /Type /Page /Parent 2 0 R >>"),
             (6, "[0 0 321 654]"),
         ],
@@ -159,8 +196,10 @@ fn remaps_indirect_inherited_mediabox() {
     assert_eq!(
         arr,
         Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(321), Object::Integer(654),
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(321),
+            Object::Integer(654),
         ]),
         "indirect inherited /MediaBox must be remapped into the extracted doc, not nulled"
     );
@@ -176,8 +215,10 @@ fn own_mediabox_is_preserved() {
     assert_eq!(
         leaf0.get("MediaBox"),
         Some(&Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(612), Object::Integer(792),
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
         ]))
     );
 
@@ -186,8 +227,10 @@ fn own_mediabox_is_preserved() {
     assert_eq!(
         leaf1.get("MediaBox"),
         Some(&Object::Array(vec![
-            Object::Integer(0), Object::Integer(0),
-            Object::Integer(200), Object::Integer(300),
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(200),
+            Object::Integer(300),
         ]))
     );
 }
@@ -256,12 +299,24 @@ fn extracted_doc_has_no_unrelated_objects() {
     let mut out = extract_page(&mut source, 0).unwrap();
 
     // Page 1's shared font survives; page 2's exclusive image was never copied.
-    assert_eq!(count_subtype(&mut out, b"Type1"), 1, "shared font must be present");
-    assert_eq!(count_subtype(&mut out, b"Image"), 0, "page 2's image must not leak in");
+    assert_eq!(
+        count_subtype(&mut out, b"Type1"),
+        1,
+        "shared font must be present"
+    );
+    assert_eq!(
+        count_subtype(&mut out, b"Image"),
+        0,
+        "page 2's image must not leak in"
+    );
 
     // Exactly one /Pages node — the fresh root. The copied ancestor /Pages node
     // must have been pruned by the sweep (no orphan left in the object table).
-    assert_eq!(count_type(&mut out, b"Pages"), 1, "no orphan ancestor /Pages node");
+    assert_eq!(
+        count_type(&mut out, b"Pages"),
+        1,
+        "no orphan ancestor /Pages node"
+    );
     assert_eq!(pages::page_refs(&mut out).unwrap().len(), 1);
 
     // Sanity: the pruned document still writes and reopens to a single page,
@@ -272,7 +327,11 @@ fn extracted_doc_has_no_unrelated_objects() {
     write_pdf_with_options(&mut out, &mut bytes, &opts).unwrap();
     let mut rt = Pdf::open_mem_owned(bytes).unwrap();
     assert_eq!(pages::page_refs(&mut rt).unwrap().len(), 1);
-    assert_eq!(count_type(&mut rt, b"Pages"), 1, "no orphan /Pages after round-trip");
+    assert_eq!(
+        count_type(&mut rt, b"Pages"),
+        1,
+        "no orphan /Pages after round-trip"
+    );
 }
 
 #[test]
@@ -281,7 +340,12 @@ fn extracted_contents_match_source_page() {
     let mut source = Pdf::open_mem(&src).unwrap();
 
     let src_pages = pages::page_refs(&mut source).unwrap();
-    let src_leaf = source.resolve_borrowed(src_pages[0]).unwrap().as_dict().cloned().unwrap();
+    let src_leaf = source
+        .resolve_borrowed(src_pages[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
     let src_contents_ref = match src_leaf.get("Contents") {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /Contents ref, got {other:?}"),
@@ -302,7 +366,10 @@ fn extracted_contents_match_source_page() {
         other => panic!("expected stream, got {other:?}"),
     };
 
-    assert_eq!(out_stream.data, src_stream.data, "content stream bytes must be identical");
+    assert_eq!(
+        out_stream.data, src_stream.data,
+        "content stream bytes must be identical"
+    );
 }
 
 #[test]
@@ -330,5 +397,8 @@ fn source_is_not_modified_by_extract() {
 
     // Source still has both pages, unchanged refs/order.
     let after = pages::page_refs(&mut source).unwrap();
-    assert_eq!(after, before, "extract_page must not mutate the source page tree");
+    assert_eq!(
+        after, before,
+        "extract_page must not mutate the source page tree"
+    );
 }

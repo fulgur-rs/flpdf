@@ -113,7 +113,10 @@ pub fn extract_page<R: Read + Seek>(
         .as_dict()
         .cloned()
         .ok_or(Error::Missing("target /Pages is not a dictionary"))?;
-    root.insert("Kids", Object::Array(vec![Object::Reference(copied_page_ref)]));
+    root.insert(
+        "Kids",
+        Object::Array(vec![Object::Reference(copied_page_ref)]),
+    );
     root.insert("Count", Object::Integer(1));
     target.set_object(pages_root_ref, Object::Dictionary(root));
 
