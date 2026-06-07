@@ -499,3 +499,137 @@ fn generate_mode_full_rewrite_roundtrips_real_fixtures() {
     assert_generate_roundtrip_structurally_valid("../../tests/fixtures/compat/two-page.pdf", 2);
     assert_generate_roundtrip_structurally_valid("../../tests/fixtures/compat/three-page.pdf", 3);
 }
+
+/// Build an in-memory PDF whose Catalog→Pages→Page chain is reachable plus one
+/// ObjStm-eligible *unreachable* object (`<< /Type /Orphan >>`, gen 0,
+/// referenced by nothing). A plain dict of gen 0 passes
+/// `is_eligible_for_objstm`, so the planner batches it into an ObjStm even
+/// though the Catalog-first renumber map omits it (it is not reachable from the
+/// trailer `/Root`+`/Info` seed).
+fn pdf_with_eligible_orphan() -> Vec<u8> {
+    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec();
+    let object2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec();
+    let object3 =
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n"
+            .to_vec();
+    let content_data: &[u8] = b"Hello PDF";
+    let object4 = format!(
+        "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+        content_data.len(),
+        String::from_utf8_lossy(content_data)
+    )
+    .into_bytes();
+    // The orphan: referenced by nothing reachable, but ObjStm-eligible.
+    let object5 = b"5 0 obj\n<< /Type /Orphan >>\nendobj\n".to_vec();
+
+    let objects = [object1, object2, object3, object4, object5];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for &offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            start_xref
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Regression for flpdf-9hc.32: an ObjStm-eligible object that is unreachable
+/// from the trailer seed must be DROPPED from ObjStm batches (qpdf-consistent),
+/// not cause the whole write to abort. Before the fix the planner batched the
+/// orphan, then the renumber-map lookup failed with
+/// `Error::Unsupported("ObjStm member absent from renumber map")`.
+#[test]
+fn generate_mode_full_rewrite_drops_eligible_orphan() {
+    let source = pdf_with_eligible_orphan();
+    let mut pdf = Pdf::open_mem(&source).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    // (a) The write SUCCEEDS (it aborted before the fix).
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options)
+        .expect("full-rewrite + Generate must succeed when an eligible orphan is present");
+
+    // Output must be a valid PDF.
+    let report = check_reader(Cursor::new(output.clone()))
+        .expect("check_reader must not return Err on rewritten output");
+    assert!(
+        report.valid,
+        "Generate-mode output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // (b) Re-opened output: Catalog/Pages/pages resolve.
+    let mut reopened = Pdf::open_mem(&output).unwrap();
+    let root_ref = reopened
+        .root_ref()
+        .expect("trailer must have a resolvable /Root");
+    let catalog = reopened.resolve(root_ref).unwrap();
+    let catalog_dict = match &catalog {
+        Object::Dictionary(d) => d,
+        other => panic!("/Root must resolve to a dict, got {other:?}"),
+    };
+    assert_eq!(
+        catalog_dict.get("Type"),
+        Some(&Object::Name(b"Catalog".to_vec())),
+    );
+    let pages_ref = match catalog_dict.get("Pages") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("Catalog /Pages must be an indirect ref, got {other:?}"),
+    };
+    let pages = reopened.resolve(pages_ref).unwrap();
+    let pages_dict = match &pages {
+        Object::Dictionary(d) => d,
+        other => panic!("Catalog /Pages must resolve to a /Pages dict, got {other:?}"),
+    };
+    assert_eq!(
+        pages_dict.get("Type"),
+        Some(&Object::Name(b"Pages".to_vec()))
+    );
+    let kids = match pages_dict.get("Kids") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("/Pages /Kids must be an array, got {other:?}"),
+    };
+    assert_eq!(kids.len(), 1, "expected one page kid");
+    let kid_ref = match &kids[0] {
+        Object::Reference(r) => *r,
+        other => panic!("/Kids entry must be an indirect ref, got {other:?}"),
+    };
+    let page = reopened.resolve(kid_ref).unwrap();
+    match &page {
+        Object::Dictionary(d) => {
+            assert_eq!(d.get("Type"), Some(&Object::Name(b"Page".to_vec())))
+        }
+        other => panic!("kid must resolve to a /Page dict, got {other:?}"),
+    }
+
+    // (c) The orphan is GONE: no live object carries /Type /Orphan.
+    for r in reopened.object_refs() {
+        if let Ok(obj) = reopened.resolve(r) {
+            if let Some(dict) = obj.as_dict() {
+                assert_ne!(
+                    dict.get("Type"),
+                    Some(&Object::Name(b"Orphan".to_vec())),
+                    "unreachable orphan object must be dropped (qpdf-consistent)"
+                );
+            }
+        }
+    }
+}

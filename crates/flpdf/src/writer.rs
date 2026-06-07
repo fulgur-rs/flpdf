@@ -2256,7 +2256,23 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     } else {
         object_streams::planner_config_from_options(options)
     };
-    let plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+    let mut plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+
+    // Drop ObjStm members that are not reachable from the trailer seed. The
+    // planner draws candidates from the full live-object universe with a
+    // type-only eligibility filter, so an eligible-but-unreachable object
+    // (e.g. an orphan dict referenced by nothing) can be batched even though
+    // the Catalog-first renumber map (which drives emission) omits it. Such an
+    // object has no NEW number, so leaving it in a batch would make the
+    // renumber-map lookups below fail and abort the whole write. Filtering
+    // here — before the `plan.batches.is_empty()` xref-form decision below —
+    // drops the orphan from every container; the main emit loop already only
+    // emits objects present in the renumber map, so the orphan disappears
+    // cleanly (qpdf-consistent, matching flpdf's qdf/disable paths).
+    for batch in &mut plan.batches {
+        batch.retain(|member| renumber.new_for_original(*member).is_some());
+    }
+    plan.batches.retain(|batch| !batch.is_empty());
 
     // Xref form selection: ObjStm-resident objects need type-2 xref entries,
     // which can only live in xref streams.  When the planner emits any batch
