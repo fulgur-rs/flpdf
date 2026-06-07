@@ -160,7 +160,7 @@ fn materializes_inherited_attributes() {
 }
 
 /// Ancestor /Pages stores /MediaBox as an INDIRECT reference (obj 6), the qpdf
-/// shared-array pattern. The leaf (obj 3) inherits it. Exercises remap_refs'
+/// shared-array pattern. The leaf (obj 3) inherits it. Exercises rewrite_refs'
 /// Object::Reference branch: the extracted leaf's /MediaBox must resolve to a
 /// live array, not become Null.
 fn indirect_inherited_mediabox_pdf() -> Vec<u8> {
@@ -400,5 +400,83 @@ fn source_is_not_modified_by_extract() {
     assert_eq!(
         after, before,
         "extract_page must not mutate the source page tree"
+    );
+}
+
+/// Page 0 (obj 3) has a Link annotation (obj 5) whose explicit /Dest targets the
+/// SIBLING page (obj 4). The sibling and its ancestor /Pages currently leak into
+/// the extracted doc.
+fn cross_page_link_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 7 0 R /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>"),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (7, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn cross_page_link_leaks_sibling_known_limitation() {
+    // KNOWN LIMITATION (flpdf-4924): an explicit cross-page /Dest leaks a sibling
+    // /Page stub and its ancestor /Pages node. When flpdf-4924 lands (drop/
+    // neutralize such annotations), update these two assertions to expect 1.
+    let src = cross_page_link_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        2,
+        "sibling page currently leaks (flpdf-4924)"
+    );
+    assert_eq!(
+        count_type(&mut out, b"Pages"),
+        2,
+        "ancestor /Pages kept reachable by the leaked stub (flpdf-4924)"
+    );
+
+    // CORE GUARANTEE still holds: the page tree has exactly one real page, and the
+    // extracted leaf's OWN content + resources are intact.
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(
+        leaf_refs.len(),
+        1,
+        "extracted page tree still has exactly one page"
+    );
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let contents_ref = match leaf.get("Contents") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected /Contents ref, got {other:?}"),
+    };
+    let stream = match out.resolve(contents_ref).unwrap() {
+        Object::Stream(s) => s,
+        other => panic!("expected content stream, got {other:?}"),
+    };
+    assert_eq!(
+        stream.data, b"BT /F1 12 Tf ET",
+        "leaf content stream must be intact"
+    );
+    let res = leaf
+        .get("Resources")
+        .and_then(|o| o.as_dict())
+        .expect("/Resources present");
+    assert!(
+        res.get("Font")
+            .and_then(|o| o.as_dict())
+            .and_then(|f| f.get("F1"))
+            .is_some(),
+        "leaf /Resources /Font /F1 must be intact"
     );
 }

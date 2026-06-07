@@ -14,8 +14,16 @@
 //! Part of the page extraction & merge primitives epic (flpdf-5h5). Composes
 //! [`page_object_closure`](crate::page_closure::page_object_closure) and
 //! [`copy_objects`](crate::object_copy::copy_objects).
+//!
+//! # Known limitation
+//!
+//! Annotations on the extracted page whose explicit `/Dest` targets another
+//! (now-absent) page currently leak a stub of that sibling page and its
+//! ancestor `/Pages` node into the output; explicit cross-page destinations are
+//! not yet pruned or neutralized (tracked in flpdf-4924). The extracted page's
+//! own content and resources are unaffected.
 
-use crate::object_copy::copy_objects;
+use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::page_closure::page_object_closure;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::page_tree_rebuild::resolve_inherited_raw;
@@ -24,7 +32,6 @@ use crate::pages::{
 };
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Seek};
 
 /// Extract page `page_index` (0-based) from `source` into a brand-new minimal
@@ -76,28 +83,27 @@ pub fn extract_page<R: Read + Seek>(
 
     // Materialize inherited attrs onto the copied leaf (remapping refs), then
     // repoint /Parent at the fresh root.
-    let mut leaf = target
-        .resolve_borrowed(copied_page_ref)?
-        .as_dict()
-        .cloned()
-        .ok_or(Error::Missing("copied page is not a dictionary"))?;
+    let mut leaf = match target.resolve(copied_page_ref)? {
+        Object::Dictionary(d) => d,
+        _ => return Err(Error::Missing("copied page is not a dictionary")),
+    };
 
     if !has_own(&leaf, "Resources") {
         if let Some(res) = inherited_resources {
             let mut value = Object::Dictionary(res);
-            remap_refs(&mut value, &map);
+            rewrite_refs(&mut value, &map);
             leaf.insert("Resources", value);
         }
     }
     if !has_own(&leaf, "MediaBox") {
         if let Some(mut mb) = inherited_mediabox {
-            remap_refs(&mut mb, &map);
+            rewrite_refs(&mut mb, &map);
             leaf.insert("MediaBox", mb);
         }
     }
     if !has_own(&leaf, "CropBox") {
         if let Some(mut cb) = inherited_cropbox {
-            remap_refs(&mut cb, &map);
+            rewrite_refs(&mut cb, &map);
             leaf.insert("CropBox", cb);
         }
     }
@@ -108,11 +114,10 @@ pub fn extract_page<R: Read + Seek>(
     target.set_object(copied_page_ref, Object::Dictionary(leaf));
 
     // Build the fresh single-level /Pages root.
-    let mut root = target
-        .resolve_borrowed(pages_root_ref)?
-        .as_dict()
-        .cloned()
-        .ok_or(Error::Missing("target /Pages is not a dictionary"))?;
+    let mut root = match target.resolve(pages_root_ref)? {
+        Object::Dictionary(d) => d,
+        _ => return Err(Error::Missing("target /Pages is not a dictionary")),
+    };
     root.insert(
         "Kids",
         Object::Array(vec![Object::Reference(copied_page_ref)]),
@@ -153,11 +158,10 @@ fn minimal_target_bytes() -> Vec<u8> {
 /// Resolve the target catalog's `/Pages` root ref.
 fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<ObjectRef> {
     let catalog_ref = target.root_ref().ok_or(Error::Missing("/Root"))?;
-    let catalog = target
-        .resolve_borrowed(catalog_ref)?
-        .as_dict()
-        .cloned()
-        .ok_or(Error::Missing("/Root is not a dictionary"))?;
+    let catalog = match target.resolve(catalog_ref)? {
+        Object::Dictionary(d) => d,
+        _ => return Err(Error::Missing("/Root is not a dictionary")),
+    };
     catalog
         .get("Pages")
         .and_then(|o| match o {
@@ -172,46 +176,4 @@ fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<ObjectRef> {
 /// `page_tree_rebuild::leaf_has_own`.
 fn has_own(dict: &Dictionary, key: &str) -> bool {
     !matches!(dict.get(key), None | Some(Object::Null))
-}
-
-/// Rewrite every indirect reference inside `obj` through `map`. Refs not present
-/// in `map` (out-of-closure) become `Object::Null`, matching `copy_objects`'
-/// out-of-set policy. Used to fix up materialized inherited attribute values,
-/// whose refs point into the SOURCE document.
-///
-/// Nulling an out-of-map ref is safe for materialized inherited attributes
-/// because `page_object_closure` follows `/Parent` and collects all non-`/Kids`
-/// refs from ancestor `/Pages` nodes, so any ancestor-inherited referent (e.g.
-/// an indirectly-stored `/MediaBox` array) is already in the closure and
-/// therefore in `map`.
-fn remap_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
-    match obj {
-        Object::Reference(r) => {
-            *obj = match map.get(r) {
-                Some(target) => Object::Reference(*target),
-                None => Object::Null,
-            };
-        }
-        Object::Array(items) => {
-            for item in items.iter_mut() {
-                remap_refs(item, map);
-            }
-        }
-        Object::Dictionary(dict) => {
-            for value in dict.values_mut() {
-                remap_refs(value, map);
-            }
-        }
-        Object::Stream(stream) => {
-            for value in stream.dict.values_mut() {
-                remap_refs(value, map);
-            }
-        }
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::Name(_)
-        | Object::String(_) => {}
-    }
 }
