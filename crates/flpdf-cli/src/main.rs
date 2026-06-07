@@ -3660,34 +3660,46 @@ enum EncryptionProbe {
     /// Opened successfully. The bool is `Pdf::is_encrypted()`.
     Opened { encrypted: bool },
     /// The file is encrypted but the supplied/empty password did not
-    /// authenticate (or the document needs the weak-crypto opt-in to open
-    /// at all). qpdf can still report "encrypted" / "password required"
-    /// without authenticating, so this is a normal classification here,
-    /// not an error.
+    /// authenticate (`BadPassword`). qpdf can still report "encrypted" /
+    /// "password required" without authenticating, so this is a normal
+    /// classification here, not an error.
     EncryptedAuthFailed,
 }
 
-/// Open `input`, treating `BadPassword` / `WeakCryptoNotAllowed` as
-/// "the file is encrypted but we could not authenticate" rather than a
-/// hard error. This mirrors qpdf's ability to answer `--is-encrypted` /
-/// `--requires-password` for password-protected files without the password.
+/// Open `input` for a read-only encryption inspection (`is-encrypted` /
+/// `requires-password`), treating a wrong/empty password (`BadPassword`) as
+/// "the file is encrypted but we could not authenticate" rather than a hard
+/// error. This mirrors qpdf's ability to answer these queries for
+/// password-protected files without the password.
+///
+/// The probe forces `allow_weak_crypto = true`: qpdf applies its weak-crypto
+/// refusal to write/transform operations, NOT to these read-only inspections
+/// (verified against qpdf — a correct password on an RC4/R=5 file yields
+/// `--requires-password` exit 3, identical to a strong file). Because the
+/// library applies the weak-crypto gate only AFTER authentication, leaving the
+/// gate enabled would surface `WeakCryptoNotAllowed` for a correctly
+/// authenticated file and mis-report it as "a different password is required"
+/// (flpdf-63g). Disabling the gate here keeps the answer a pure password
+/// question: authentication still runs first, so a wrong password yields
+/// `BadPassword` exactly as before.
 fn probe_encryption(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<EncryptionProbe> {
     let file = File::open(input)?;
-    match Pdf::open_with_options(BufReader::new(file), pdf_open_options(repair, password)?) {
+    let mut options = pdf_open_options(repair, password)?;
+    options.allow_weak_crypto = true;
+    match Pdf::open_with_options(BufReader::new(file), options) {
         Ok(pdf) => Ok(EncryptionProbe::Opened {
             encrypted: pdf.is_encrypted(),
         }),
-        // A wrong/empty password or a weak-crypto file we declined to open:
-        // the document is definitely encrypted, we just have not (or cannot,
-        // without --allow-weak-crypto) authenticate it. qpdf treats both as
-        // "encrypted, password required".
-        Err(flpdf::Error::Encrypted(
-            flpdf::EncryptedError::BadPassword | flpdf::EncryptedError::WeakCryptoNotAllowed,
-        )) => Ok(EncryptionProbe::EncryptedAuthFailed),
+        // A wrong/empty password: the document is definitely encrypted, we
+        // just have not authenticated it. qpdf treats this as "encrypted,
+        // password required".
+        Err(flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)) => {
+            Ok(EncryptionProbe::EncryptedAuthFailed)
+        }
         Err(other) => Err(other.into()),
     }
 }
@@ -3723,6 +3735,10 @@ fn run_is_encrypted(input: &PathBuf, repair: bool) -> CliResult<()> {
 ///   3 = encrypted, supplied/empty password opens it
 ///       (qpdf_exit_correct_password — no further password required)
 ///   0 = encrypted, a password other than the one supplied is required
+///
+/// Weak-crypto (RC4 / R=5) files are answered purely on the password, matching
+/// qpdf: a correct password yields 3 and a wrong/absent one yields 0, with no
+/// `--allow-weak-crypto` opt-in required (see `probe_encryption`, flpdf-63g).
 fn run_requires_password(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     match probe_encryption(input, repair, password)? {
         EncryptionProbe::Opened { encrypted: false } => {
