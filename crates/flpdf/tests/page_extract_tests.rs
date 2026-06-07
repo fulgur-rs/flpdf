@@ -1218,3 +1218,193 @@ fn indirect_next_array_goto_is_neutralized() {
         "indirect-/Next-array GoTo must be pruned"
     );
 }
+
+// --- Additional coverage: defensive/safety branches in the neutralize pass ---
+
+#[test]
+fn indirect_annots_array_crosspage_dest_is_neutralized() {
+    // /Annots is an indirect ref (9 0 R) to the array — exercises the
+    // indirect-/Annots resolution arm. The annotation's cross-page /Dest is
+    // still neutralized and the sibling pruned.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots 9 0 R >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>",
+            ),
+            (9, "[5 0 R]"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "indirect /Annots cross-page dest must be neutralized"
+    );
+}
+
+#[test]
+fn aa_with_only_local_subaction_is_unchanged() {
+    // /AA carries a single non-GoTo (/URI) subaction: nothing is neutralized,
+    // exercising the "subaction unchanged -> re-insert" and "no change -> None"
+    // arms of neutralize_aa_if_absent. No sibling is pulled in.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /AA << /U << /S /URI /URI (http://example.com) >> >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let aa = annot.get("AA").and_then(|o| o.as_dict()).expect("/AA kept");
+    let u = aa.get("U").and_then(|o| o.as_dict()).expect("/AA /U kept");
+    assert_eq!(
+        u.get("S").and_then(|o| o.as_name()),
+        Some(&b"URI"[..]),
+        "/URI subaction untouched"
+    );
+}
+
+#[test]
+fn indirect_next_cycle_terminates_and_neutralizes() {
+    // /A -> action 8 whose /Next is 9, and 9's /Next is 8 (an A<->B indirect
+    // cycle). Both are cross-page GoTos. The visited-set must terminate the walk
+    // (no hang / stack overflow) and still drop both /D, pruning the sibling.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A 8 0 R >>",
+            ),
+            (8, "<< /S /GoTo /D [4 0 R /Fit] /Next 9 0 R >>"),
+            (9, "<< /S /GoTo /D [4 0 R /Fit] /Next 8 0 R >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "cyclic indirect /Next chain must terminate and prune the sibling"
+    );
+}
+
+#[test]
+fn action_goto_self_link_is_preserved() {
+    // An /A /GoTo whose /D targets the extracted page itself: the /D is retained
+    // (self-link), exercising the "dest not absent -> re-insert /D" arm.
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /GoTo /D [3 0 R /Fit] >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf_refs = pages::page_refs(&mut out).unwrap();
+    let leaf = out
+        .resolve_borrowed(leaf_refs[0])
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let annot_ref = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("got {other:?}"),
+    };
+    let annot = out
+        .resolve_borrowed(annot_ref)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let a = annot.get("A").and_then(|o| o.as_dict()).expect("/A kept");
+    assert!(
+        a.get("D").is_some(),
+        "self-link /A GoTo /D must be preserved"
+    );
+}
+
+#[test]
+fn deep_inline_next_chain_terminates_at_depth_bound() {
+    // A /Next chain deeper than MAX_ACTION_CHAIN_DEPTH (64). All actions are
+    // /URI (no cross-page), so nothing leaks; the point is that the depth bound
+    // makes the walk terminate instead of recursing without limit.
+    let mut a = String::from("<< /S /URI /URI (http://leaf) >>");
+    for _ in 0..70 {
+        a = format!("<< /S /URI /URI (http://x) /Next {a} >>");
+    }
+    let annot = format!("<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A {a} >>");
+    let src = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>"),
+            (5, annot.as_str()),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+}
