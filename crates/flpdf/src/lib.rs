@@ -70,6 +70,7 @@ pub mod page_closure;
 pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
+pub mod page_extract;
 pub mod page_label_document_helper;
 pub mod page_object_helper;
 pub mod page_plan;
@@ -140,6 +141,7 @@ pub use page_annotation_flatten::{flatten_annotations, flatten_annotations_on_pa
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
+pub use page_extract::extract_page;
 pub use page_label_document_helper::{LabelRange, LabelStyle, PageLabelDocumentHelper};
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};
