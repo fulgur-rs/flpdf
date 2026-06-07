@@ -1884,6 +1884,47 @@ fn corrupt_page_content_single_page_default_mode_does_not_abort() {
     );
 }
 
+// A page whose /Contents DECODES fine (no filter) but is malformed PART-WAY:
+// `BT /F1 Tf ... ` collects /F1, then trailing dangling operands make the
+// content-stream tokeniser error mid-stream. The pre-fix code `break`-ed and
+// treated the partial collection as complete, so /F2 (whose usage cannot be
+// proven either way) was pruned. The collection must instead report itself
+// incomplete and the page's resources be conservatively retained (flpdf-s9s).
+#[test]
+fn malformed_page_content_midstream_retains_resources() {
+    // `1 2 3` after `Tf` are dangling operands with no operator → at EOF the
+    // ContentStreamParser yields Err("content stream ended with dangling
+    // operands"). /F1 is recorded before the error; /F2 must NOT be pruned.
+    let extra = vec![
+        (4u32, stream_obj(4, b"BT /F1 12 Tf (x) Tj ET 1 2 3")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    // Yes mode would prune the partial set most aggressively — use it to make the
+    // discriminating assertion (F2 retained) meaningful.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("malformed-midstream content must not abort");
+
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "F1 must be kept: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"F2".to_string()),
+        "F2 must be retained — tokenisation stopped mid-stream, so the used-name \
+         set is incomplete and nothing can be proven unused: {keys:?}"
+    );
+}
+
 // Exercises the AncestorInline branch of the `protected_groups` prune-loop skip
 // (step 5): a corrupt page inheriting its /Resources from an ancestor /Pages
 // node (AncestorInline loc) poisons that group, so the ancestor's inline

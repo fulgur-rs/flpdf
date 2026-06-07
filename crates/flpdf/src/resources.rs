@@ -179,13 +179,17 @@ pub enum RemoveUnreferencedResources {
 ///
 /// # Errors
 ///
-/// Propagates errors from page-tree traversal ([`crate::pages::page_refs`]) and
-/// resources-location resolution ([`resources_location`]).
+/// Propagates *structural* errors: page-tree traversal
+/// ([`crate::pages::page_refs`]), resources-location resolution
+/// ([`resources_location`]), inherited-`/Resources` resolution
+/// ([`crate::pages::resolve_inherited_resources`]), and Form XObject object
+/// resolution. These are not content-comprehension failures.
 ///
-/// A failure to decode or tokenise an individual page's content stream does NOT
-/// abort the operation: that page is skipped and its resources are
-/// conservatively retained (never pruned), matching qpdf's liberal behaviour and
-/// the graceful degradation already applied to Form XObjects
+/// A failure to **decode** (corrupt filter) or **tokenise** (malformed content
+/// syntax, even part-way through a stream that decoded fine) an individual page's
+/// content stream does NOT abort the operation: that page is skipped and its
+/// resources are conservatively retained (never pruned), matching qpdf's liberal
+/// behaviour and the graceful degradation already applied to Form XObjects
 /// (see `recurse_form_xobject`).
 pub fn remove_unreferenced_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -253,15 +257,17 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
             continue;
         }
 
-        // Collect the used names for this page. A failure to decode or tokenise
-        // the page's /Contents (e.g. a corrupt FlateDecode stream in a damaged
-        // PDF) must NOT abort the whole operation — degrade gracefully like the
-        // Form XObject decode-failure path (see `recurse_form_xobject`). Mark the
-        // page's resources group as protected so its resources are conservatively
-        // retained rather than pruned against an incomplete used-name set.
-        let used = match collect_used_names_for_page(pdf, page_ref) {
-            Ok(used) => used,
-            Err(_) => {
+        // Collect the used names for this page. When the page's /Contents cannot
+        // be fully understood — it failed to decode (corrupt FlateDecode) or to
+        // tokenise part-way (malformed content syntax) — collection returns
+        // `None` rather than aborting, degrading like the Form XObject path (see
+        // `recurse_form_xobject`). Mark the page's resources group as protected so
+        // its resources are conservatively retained rather than pruned against an
+        // incomplete used-name set. Genuine structural errors (resolving the
+        // inherited /Resources or a Form object reference) still propagate via `?`.
+        let used = match collect_used_names_for_page(pdf, page_ref)? {
+            Some(used) => used,
+            None => {
                 if let Some(key) = res_group_key(&page_res_loc[i], page_ref) {
                     protected_groups.insert(key);
                 }
@@ -504,19 +510,42 @@ fn resources_location<R: Read + Seek>(
 /// Form XObjects are recursed into (using their own `/Resources` scope), and
 /// any name that falls outside a Form's own resources sub-category is
 /// attributed to the calling page's resources.
+///
+/// # Return value (flpdf-s9s)
+///
+/// - `Ok(Some(used))` — the content was fully decoded and tokenised; `used` is a
+///   reliable, complete picture of the page's resource usage and is safe to
+///   prune against.
+/// - `Ok(None)` — the page's content could not be fully understood: its
+///   `/Contents` failed to **decode** (corrupt filter) or failed to **tokenise**
+///   part-way (malformed content syntax). The collected names would be
+///   incomplete, so the caller must conservatively retain the page's resources
+///   rather than prune against a partial set. This mirrors the Form XObject
+///   decode-failure path (`recurse_form_xobject`).
+/// - `Err(_)` — a genuine structural error (e.g. resolving the inherited
+///   `/Resources`, or a Form XObject object reference). These are **not**
+///   content-comprehension failures and propagate as before.
 fn collect_used_names_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> Result<UsedNames> {
-    let content_bytes = crate::pages::page_content_bytes(pdf, page_ref)?;
+) -> Result<Option<UsedNames>> {
+    // A failure to *decode* the page's /Contents (corrupt filter) is a
+    // content-comprehension failure → conservatively retain (None), do not abort.
+    let content_bytes = match crate::pages::page_content_bytes(pdf, page_ref) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
 
-    // Resolve the page's own /Resources for Form recursion scoping.
+    // Resolving the inherited /Resources is a structural operation, not content
+    // comprehension: propagate its errors rather than silently degrading.
     let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
 
     let mut used: UsedNames = BTreeMap::new();
     let mut visited_xobjects: BTreeSet<ObjectRef> = BTreeSet::new();
 
-    collect_from_stream(
+    // `collect_from_stream` returns `false` when tokenisation stopped early on a
+    // malformed token: the collected names are then incomplete → retain.
+    let complete = collect_from_stream(
         pdf,
         &content_bytes,
         page_resources.as_ref(),
@@ -525,7 +554,7 @@ fn collect_used_names_for_page<R: Read + Seek>(
         0,
     )?;
 
-    Ok(used)
+    Ok(complete.then_some(used))
 }
 
 /// Maximum recursion depth for Form XObject traversal.
@@ -539,6 +568,11 @@ const MAX_FORM_DEPTH: usize = 64;
 /// reference into `used`. `resources` is the `/Resources` dict in scope for
 /// this stream (the page dict's or a Form XObject's). `visited` prevents
 /// infinite recursion through cyclic Form XObjects.
+///
+/// Returns `Ok(true)` when the stream was tokenised to the end, `Ok(false)` when
+/// tokenisation stopped early on a malformed token (so `used` is incomplete and
+/// the page must be conservatively retained — flpdf-s9s). Structural errors from
+/// nested Form XObject resolution propagate as `Err`.
 fn collect_from_stream<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     stream_bytes: &[u8],
@@ -546,15 +580,21 @@ fn collect_from_stream<R: Read + Seek>(
     used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
     depth: usize,
-) -> Result<()> {
+) -> Result<bool> {
     let parser = ContentStreamParser::new(stream_bytes);
     for token_result in parser {
-        // On parse error: skip the rest of this stream gracefully.
-        let Ok(token) = token_result else { break };
+        // A malformed token means the rest of this stream is unreliable. Signal
+        // an incomplete collection so the page's resources are retained rather
+        // than pruned against a partial used-name set.
+        let Ok(token) = token_result else {
+            return Ok(false);
+        };
 
         match token {
             ContentToken::Op { operands, operator } => {
-                process_operator(pdf, &operator, &operands, resources, used, visited, depth)?;
+                if !process_operator(pdf, &operator, &operands, resources, used, visited, depth)? {
+                    return Ok(false);
+                }
             }
             ContentToken::InlineImage { dict, .. } => {
                 // /CS operand in an inline image may reference /ColorSpace.
@@ -569,11 +609,15 @@ fn collect_from_stream<R: Read + Seek>(
             ContentToken::Comment(_) => {}
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Process a single content-stream operator and record any resource references
 /// into `used`.
+///
+/// Returns the completeness flag of any nested Form XObject recursion (`true`
+/// for non-recursing operators): `false` propagates an incomplete collection up
+/// so the page is conservatively retained (flpdf-s9s).
 fn process_operator<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     operator: &[u8],
@@ -582,7 +626,7 @@ fn process_operator<R: Read + Seek>(
     used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
     depth: usize,
-) -> Result<()> {
+) -> Result<bool> {
     match operator {
         // /XObject — `name Do`
         b"Do" => {
@@ -591,8 +635,8 @@ fn process_operator<R: Read + Seek>(
                     .or_default()
                     .insert(name.to_vec());
 
-                // Recurse into Form XObjects.
-                recurse_form_xobject(pdf, name, resources, used, visited, depth)?;
+                // Recurse into Form XObjects, propagating their completeness.
+                return recurse_form_xobject(pdf, name, resources, used, visited, depth);
             }
         }
 
@@ -656,7 +700,7 @@ fn process_operator<R: Read + Seek>(
 
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 /// If `xobject_name` resolves to a Form XObject, decode and recurse into its
@@ -680,6 +724,15 @@ fn process_operator<R: Read + Seek>(
 /// Direct streams are owned by their containing dictionary and therefore cannot
 /// be reached through a cycle in well-formed PDFs; `depth` provides an extra
 /// guard against pathological documents.
+///
+/// Returns `Ok(true)` when the Form (if any) was tokenised completely, `Ok(false)`
+/// when the Form's content could not be fully decoded/tokenised AND its names
+/// feed the calling page's scope — signalling the page must be conservatively
+/// retained (flpdf-s9s). A Form with its **own** `/Resources` cannot make the
+/// page incomplete (its names are scoped to itself and discarded here), so it
+/// always reports `Ok(true)`. Non-Form / absent / cycle / depth-limit cases also
+/// report `Ok(true)` (nothing page-relevant was lost). Structural resolution
+/// errors propagate as `Err`.
 fn recurse_form_xobject<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_name: &[u8],
@@ -687,11 +740,11 @@ fn recurse_form_xobject<R: Read + Seek>(
     used: &mut UsedNames,
     visited: &mut BTreeSet<ObjectRef>,
     depth: usize,
-) -> Result<()> {
+) -> Result<bool> {
     // Guard against excessively deep recursion (applies to direct-stream forms
     // in particular, since indirect refs are additionally guarded by `visited`).
     if depth >= MAX_FORM_DEPTH {
-        return Ok(());
+        return Ok(true);
     }
 
     // Locate the XObject entry in the current /Resources scope. The
@@ -709,7 +762,7 @@ fn recurse_form_xobject<R: Read + Seek>(
     };
 
     let Some(xobj_val) = xobj_val else {
-        return Ok(());
+        return Ok(true);
     };
 
     // For indirect XObject references, record the ObjectRef so we can do
@@ -726,7 +779,7 @@ fn recurse_form_xobject<R: Read + Seek>(
             let obj = pdf.resolve_borrowed(xobj_ref)?;
             match obj {
                 Object::Stream(s) => s.clone(),
-                _ => return Ok(()),
+                _ => return Ok(true),
             }
         }
         Object::Stream(s) => {
@@ -734,7 +787,7 @@ fn recurse_form_xobject<R: Read + Seek>(
             // in well-formed PDFs.  Depth guard above is sufficient.
             s
         }
-        _ => return Ok(()),
+        _ => return Ok(true),
     };
 
     // Only recurse into Form XObjects.
@@ -743,19 +796,23 @@ fn recurse_form_xobject<R: Read + Seek>(
         .get("Subtype")
         .is_some_and(|v| matches!(v, Object::Name(n) if n.as_slice() == b"Form"));
     if !is_form {
-        return Ok(());
+        return Ok(true);
     }
 
-    // Decode the Form's content stream.
+    // Determine whether the Form has its own /Resources entry (checked before
+    // decode so a decode failure can report the right completeness). We check for
+    // key *presence* (not the resolved value) because an empty or indirect
+    // /Resources still means the Form owns its resource scope.
+    let form_has_own_resources = stream.dict.get("Resources").is_some();
+
+    // Decode the Form's content stream. On failure, the Form's resource usage is
+    // unknown: that only makes the *page* incomplete when the Form inherits the
+    // page scope (its names feed `used`). A Form with its own /Resources scopes
+    // its names to itself (discarded here), so the page stays complete.
     let form_bytes = match decode_stream_data(&stream.dict, &stream.data) {
         Ok(b) => b,
-        Err(_) => return Ok(()), // graceful degradation
+        Err(_) => return Ok(form_has_own_resources),
     };
-
-    // Determine whether the Form has its own /Resources entry.
-    // We check for key *presence* (not the resolved value) because an empty or
-    // indirect /Resources still means the Form owns its resource scope.
-    let form_has_own_resources = stream.dict.get("Resources").is_some();
 
     // ── Cycle guard (stack-pop style, roborev medium 指摘1) ──────────────────
     //
@@ -776,11 +833,11 @@ fn recurse_form_xobject<R: Read + Seek>(
     // A from `visited`, no infinite loop is possible.
     if let Some(r) = indirect_ref {
         if !visited.insert(r) {
-            return Ok(()); // cycle detected — already on the current call stack
+            return Ok(true); // cycle detected — already on the current call stack
         }
     }
 
-    if form_has_own_resources {
+    let page_complete = if form_has_own_resources {
         // Resolve the Form's own /Resources dict (may be direct or indirect).
         let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
             Some(Object::Dictionary(d)) => Some(d),
@@ -792,7 +849,9 @@ fn recurse_form_xobject<R: Read + Seek>(
         };
 
         // Use a throwaway accumulator so that resource names referenced inside
-        // the Form do NOT pollute the calling page's used set.
+        // the Form do NOT pollute the calling page's used set. Because those
+        // names are scoped to the Form and discarded, an incomplete tokenisation
+        // here cannot make the *page* unreliable — the page stays complete.
         let mut form_used: UsedNames = BTreeMap::new();
         collect_from_stream(
             pdf,
@@ -804,18 +863,21 @@ fn recurse_form_xobject<R: Read + Seek>(
         )?;
         // form_used is intentionally discarded; Form's own /Resources pruning
         // is out of scope for this minimum fix (flpdf-9hc.12.4).
+        true
     } else {
         // No /Resources key → Form inherits the calling scope's resources.
         // Attribute all references to the page's used set (original behaviour).
-        collect_from_stream(pdf, &form_bytes, page_resources, used, visited, depth + 1)?;
-    }
+        // The Form's completeness IS the page's completeness here: an incomplete
+        // tokenisation means page-scoped names may be missing → retain.
+        collect_from_stream(pdf, &form_bytes, page_resources, used, visited, depth + 1)?
+    };
 
     // ── Stack pop: remove from visited so sibling/later paths can visit this ref ─
     if let Some(r) = indirect_ref {
         visited.remove(&r);
     }
 
-    Ok(())
+    Ok(page_complete)
 }
 
 /// Prune `res_ref` (an indirect /Resources object) in-place: remove every
