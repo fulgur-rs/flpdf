@@ -822,7 +822,7 @@ fn item_survives<R: Read + Seek>(
 /// the last `ObjectRef` traversed (for in-place rewrite of an indirect
 /// target). A cyclic / over-deep chain terminates at the bound and yields the
 /// last resolved value, so a hostile `/A`/`/Dest` cannot loop forever.
-fn resolve_ref_chain<R: Read + Seek>(
+pub(crate) fn resolve_ref_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: &Object,
 ) -> Result<(Object, Option<ObjectRef>)> {
@@ -999,7 +999,7 @@ fn remap_dest_value_depth<R: Read + Seek>(
 /// — inline array, dict `/D`, indirect dest, dict whose `/D` is indirect — is
 /// classified uniformly. Returns `None` for named/string/external dests, or
 /// when a cyclic/over-deep structure is hit (handled conservatively).
-fn dest_page_ref_resolved<R: Read + Seek>(
+pub(crate) fn dest_page_ref_resolved<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest: &Object,
 ) -> Result<Option<ObjectRef>> {
