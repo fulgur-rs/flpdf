@@ -374,10 +374,20 @@ fn qdf_never_emits_adjacent_endstream() {
         output.windows(adjacent.len()).any(|w| w == adjacent),
         "qdf + Never must emit the payload adjacent to endstream (no EOL inserted)"
     );
-    // QDF splits /Length into an indirect length-holder (`N 0 R`).
+    // QDF splits /Length into an indirect length-holder: `/Length <N> 0 R`.
+    // Match that exact shape so an unrelated `N 0 R` (e.g. `/Root 1 0 R`) can't
+    // satisfy the assertion.
+    let has_indirect_length = output.windows(b"/Length ".len()).enumerate().any(|(i, w)| {
+        if w != b"/Length " {
+            return false;
+        }
+        let tail = &output[i + b"/Length ".len()..];
+        let digits = tail.iter().take_while(|b| b.is_ascii_digit()).count();
+        digits > 0 && tail.get(digits..digits + 4) == Some(&b" 0 R"[..])
+    });
     assert!(
-        rfind(&output, b" 0 R").is_some(),
-        "qdf must emit an indirect /Length holder"
+        has_indirect_length,
+        "qdf must emit an indirect /Length holder (`/Length <N> 0 R`)"
     );
 }
 
