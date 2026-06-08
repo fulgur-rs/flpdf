@@ -197,3 +197,303 @@ fn full_rewrite_converges_across_object_numbers() {
         b"Page"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shared object-list PDF builders
+// ---------------------------------------------------------------------------
+
+/// Build a minimal cross-reffed PDF from `(objnum, body)` pairs, where each
+/// body is the literal text between `N 0 obj\n` and `\nendobj`. Mirrors the
+/// builder used by the per-helper integration tests; the xref/trailer emission
+/// matches `build_n_page_pdf`.
+fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+    let max = objects.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    for (n, body) in objects {
+        offsets.insert(*n, out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    let size = max + 1;
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for n in 1..=max {
+        match offsets.get(&n) {
+            Some(offset) => out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 smoke: AcroForm helper vs manual raw extraction
+// ---------------------------------------------------------------------------
+
+/// Catalog with a direct inline `/AcroForm << /Fields [4 0 R 5 0 R] >>` and two
+/// text fields. F2's `/V` is stored as an indirect reference (6 0 R) so the
+/// read path must resolve it (review pattern #2).
+fn acroform_smoke_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /FT /Tx /T (name) /V (Alice) /DA (/Helv 0 Tf 0 g) >>"),
+            (5, "<< /FT /Tx /T (city) /V 6 0 R >>"),
+            (6, "(Paris)"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn acroform_helper_field_infos_match_manual_and_resolve_indirect_value() {
+    let bytes = acroform_smoke_pdf();
+    let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    // Manual raw extraction of the field refs: catalog -> AcroForm -> Fields.
+    let root = pdf.root_ref().unwrap();
+    let manual_field_refs: Vec<flpdf::ObjectRef> = {
+        let cat = pdf.resolve(root).unwrap();
+        let cat_dict = cat.as_dict().unwrap();
+        // /AcroForm is a direct inline dictionary here.
+        let acroform = cat_dict.get("AcroForm").unwrap().as_dict().unwrap();
+        acroform
+            .get("Fields")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_ref_id().unwrap())
+            .collect()
+    };
+    assert_eq!(
+        manual_field_refs,
+        vec![flpdf::ObjectRef::new(4, 0), flpdf::ObjectRef::new(5, 0)]
+    );
+
+    let infos = pdf.acroform().field_infos().unwrap();
+    assert_eq!(infos.len(), 2);
+
+    // Helper-reported refs cross-check the manual extraction.
+    let helper_refs: Vec<flpdf::ObjectRef> = infos.iter().map(|f| f.object_ref).collect();
+    assert_eq!(helper_refs, manual_field_refs);
+
+    // Both fields are text fields.
+    assert_eq!(infos[0].field_type, Some(b"Tx".to_vec()));
+    assert_eq!(infos[1].field_type, Some(b"Tx".to_vec()));
+
+    // Full names.
+    assert_eq!(infos[0].full_name, "name");
+    assert_eq!(infos[1].full_name, "city");
+
+    // F2's value must be the RESOLVED string, not the indirect reference:
+    // field_infos() dereferences indirect /V via deref_leaf (review pattern #2).
+    assert_eq!(
+        infos[1].value,
+        Some(flpdf::Object::String(b"Paris".to_vec()))
+    );
+
+    // NOTE: AcroFormDocumentHelper::field_value() does NOT resolve an indirect
+    // /V — it returns the raw Object::Reference(6 0) here (the underlying
+    // FormFieldObjectHelper::resolve_inherited_object returns /V verbatim). That
+    // contradicts review pattern #2 and the field_value doc example, which only
+    // matches Object::String/Object::Name. Tracked separately; this smoke test
+    // does not assert that (known-incorrect) raw-reference output. The resolve
+    // path is still guarded above through field_infos().
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 smoke: Outline helper preorder walk vs expected (title, depth)
+// ---------------------------------------------------------------------------
+
+/// `/Outlines` with two top-level items A and B; A has two children A.1 and A.2.
+/// Linkage uses /First /Last /Next /Prev /Parent /Count.
+fn outline_smoke_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 8 0 R /Count 2 >>"),
+            (
+                5,
+                "<< /Title (A) /Parent 4 0 R /First 6 0 R /Last 7 0 R /Next 8 0 R /Count 2 >>",
+            ),
+            (6, "<< /Title (A.1) /Parent 5 0 R /Next 7 0 R >>"),
+            (7, "<< /Title (A.2) /Parent 5 0 R /Prev 6 0 R >>"),
+            (8, "<< /Title (B) /Parent 4 0 R /Prev 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn outline_helper_walk_yields_preorder_titles_with_depth() {
+    let bytes = outline_smoke_pdf();
+    let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    assert!(pdf.outline().has_outlines().unwrap());
+
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    pdf.outline()
+        .walk(|node, depth| seen.push((node.title.clone(), depth)))
+        .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            ("A".to_string(), 0),
+            ("A.1".to_string(), 1),
+            ("A.2".to_string(), 1),
+            ("B".to_string(), 0),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 smoke: PageLabel helper rendered strings vs expectation
+// ---------------------------------------------------------------------------
+
+/// A 5-page PDF with `/PageLabels << /Nums [0 << /S /r >> 3 << /S /D /P (A-) >>] >>`.
+/// Range 1 (pages 0..3): lowercase roman, start defaults to 1.
+/// Range 2 (pages 3..): decimal with prefix "A-", start defaults to 1.
+fn page_label_smoke_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /PageLabels << /Nums [0 << /S /r >> 3 << /S /D /P (A-) >>] >> >>",
+            ),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R] /Count 5 >>",
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (7, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn page_label_helper_renders_expected_strings() {
+    let bytes = page_label_smoke_pdf();
+    let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    assert!(pdf.page_labels().has_page_labels().unwrap());
+    assert_eq!(pdf.page_labels().ranges().unwrap().len(), 2);
+
+    let labels: Vec<String> = (0..5)
+        .map(|i| pdf.page_labels().label_string_for_page(i).unwrap())
+        .collect();
+    assert_eq!(labels, vec!["i", "ii", "iii", "A-1", "A-2"]);
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 smoke: Attachment free functions vs manual extraction
+// ---------------------------------------------------------------------------
+
+/// Build a one-attachment PDF: `/Names /EmbeddedFiles` flat leaf with key
+/// `(hello.txt)` -> Filespec (5 0 R) -> EmbeddedFile stream (6 0 R) whose
+/// `/Params /Size` equals the payload length.
+fn attachment_smoke_pdf(payload: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names 3 0 R >>\nendobj\n");
+
+    offsets.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
+
+    // Name-tree: /Names dict -> /EmbeddedFiles flat leaf.
+    offsets.insert(3, out.len() as u64);
+    out.extend_from_slice(
+        b"3 0 obj\n<< /EmbeddedFiles << /Names [ (hello.txt) 5 0 R ] >> >>\nendobj\n",
+    );
+
+    offsets.insert(4, out.len() as u64);
+    out.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+
+    // Filespec.
+    offsets.insert(5, out.len() as u64);
+    out.extend_from_slice(
+        b"5 0 obj\n<< /Type /Filespec /F (hello.txt) /EF << /F 6 0 R >> >>\nendobj\n",
+    );
+
+    // EmbeddedFile stream: /Length and /Params /Size both equal payload length.
+    offsets.insert(6, out.len() as u64);
+    let header = format!(
+        "6 0 obj\n<< /Type /EmbeddedFile /Length {len} /Params << /Size {len} >> >>\nstream\n",
+        len = payload.len()
+    );
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_start = out.len() as u64;
+    let n = 7u32; // objects 0..6
+    out.extend_from_slice(format!("xref\n0 {n}\n0000000000 65535 f \n").as_bytes());
+    for i in 1..n {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&i]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn attachment_helpers_list_one_entry_matching_manual_name_tree() {
+    let payload = b"hello world\n";
+    let expected_size = payload.len() as i64;
+    let bytes = attachment_smoke_pdf(payload);
+    let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+    let infos = flpdf::list_attachment_info(&mut pdf).unwrap();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].key, b"hello.txt".to_vec());
+    assert_eq!(infos[0].size, Some(expected_size));
+
+    let embedded = flpdf::list_embedded_files(&mut pdf).unwrap();
+    assert_eq!(embedded.len(), 1);
+    assert_eq!(embedded[0].0, b"hello.txt".to_vec());
+
+    // Cross-check the filespec ref against a manual name-tree read:
+    // catalog -> /Names -> /EmbeddedFiles -> /Names [(key) ref].
+    let root = pdf.root_ref().unwrap();
+    let manual_ref = {
+        let cat = pdf.resolve(root).unwrap();
+        let names_ref = cat.as_dict().unwrap().get_ref("Names").unwrap();
+        let names = pdf.resolve(names_ref).unwrap();
+        let ef = names.as_dict().unwrap().get("EmbeddedFiles").unwrap();
+        let pairs = ef
+            .as_dict()
+            .unwrap()
+            .get("Names")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        // pairs == [ String(key), Reference(filespec) ]
+        assert_eq!(pairs[0].as_string().unwrap(), b"hello.txt");
+        pairs[1].as_ref_id().unwrap()
+    };
+    assert_eq!(embedded[0].1, manual_ref);
+    assert_eq!(infos[0].filespec_ref, manual_ref);
+}
