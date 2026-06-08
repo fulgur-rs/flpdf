@@ -60,6 +60,8 @@ struct FieldInheritance {
 /// Construct with [`AcroFormDocumentHelper::new`] or [`Pdf::acroform`]. The
 /// helper holds no cached field state; methods re-read the live document so
 /// prior mutations are immediately visible.
+///
+/// For a runnable walkthrough see `examples/list_form_fields.rs`.
 pub struct AcroFormDocumentHelper<'a, R: Read + Seek> {
     pdf: &'a mut Pdf<R>,
 }
