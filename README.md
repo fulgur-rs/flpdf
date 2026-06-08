@@ -95,6 +95,28 @@ The crate is organized as a few small layers:
 Errors flow through the unified `Error` enum and the crate-level `Result`
 alias. See the rustdoc on `crates/flpdf/src/lib.rs` for the full API.
 
+## Examples
+
+Runnable examples live in [`crates/flpdf/examples`](crates/flpdf/examples).
+Each one is a small, self-contained program; run any of them with:
+
+```bash
+cargo run --example <name> -p flpdf
+```
+
+| Example | Description |
+| --- | --- |
+| `inspect` | Inspect and dump a PDF's basic structure end to end. |
+| `extract_page` | Extract a single page (0-based) into a new minimal PDF. |
+| `extract_pages` | Extract a non-contiguous selection (pages 1, 3, 5) into a new file. |
+| `extract_first_5_pages` | Extract the first 5 pages of a document into a new file. |
+| `list_form_fields` | List every interactive form field with its type and value. |
+| `walk_outline` | Walk the document outline (bookmarks) as an indented tree. |
+| `pull_attachments` | Pull every embedded attachment out of a document to disk. |
+| `reorder_pages` | Reorder a document's pages (here: reverse them) and write the result. |
+| `merge_pdfs` | Merge two PDFs, preserving fonts shared between the merged-in pages. |
+| `splice_pages` | Splice pages from one document into another at a given index. |
+
 ## qpdf compatibility
 
 flpdf's writer-level outputs are compared against qpdf in two places:
