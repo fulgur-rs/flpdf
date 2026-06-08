@@ -131,7 +131,12 @@ jobs:
       # spurious diffs.
       - name: bytes-identical zlib compat (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
-        run: cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
+        run: |
+          set -euo pipefail
+          # Pins flate2's deflate backend to classic libz.
+          cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
+          # Demonstrates plain --static-id rewrite is cmp-diff-0 vs qpdf golden.
+          cargo test -p flpdf --features qpdf-zlib-compat --test cmp_diff_zero_tests
 
       - name: Compat matrix baselines (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}

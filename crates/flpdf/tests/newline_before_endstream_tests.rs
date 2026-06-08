@@ -252,6 +252,52 @@ fn no_inserts_minimal_newline_when_payload_has_no_trailing_eol() {
 }
 
 // ---------------------------------------------------------------------------
+// (c2) Never mode: endstream is always adjacent — no newline ever inserted
+//      (matches qpdf's default output: exactly /Length bytes then endstream).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn never_does_not_insert_newline_for_non_eol_payload() {
+    let payload = b"binary-ish tail \xe0".to_vec();
+    let stream = make_stream(None, payload.clone());
+
+    let mut buf = Vec::new();
+    write_stream_to_buf(&mut buf, &stream, NewlineBeforeEndstream::Never);
+
+    let es_pos = rfind(&buf, b"endstream").expect("endstream not found");
+    // endstream immediately follows the payload's last byte; no \n inserted.
+    assert_eq!(
+        buf[es_pos - 1],
+        payload[payload.len() - 1],
+        "Never mode: endstream must immediately follow the payload's last byte"
+    );
+    // Exactly `Length` bytes sit between `stream\n` and `endstream`.
+    let stream_kw = rfind(&buf[..es_pos], b"stream\n").expect("stream keyword");
+    assert_eq!(
+        es_pos - (stream_kw + b"stream\n".len()),
+        payload.len(),
+        "Never mode: exactly /Length bytes between stream and endstream (no added EOL)"
+    );
+}
+
+#[test]
+fn never_does_not_add_extra_newline_for_eol_payload() {
+    let payload = b"payload ends with lf\n".to_vec();
+    let stream = make_stream(None, payload.clone());
+
+    let mut buf = Vec::new();
+    write_stream_to_buf(&mut buf, &stream, NewlineBeforeEndstream::Never);
+
+    let es_pos = rfind(&buf, b"endstream").expect("endstream not found");
+    let stream_kw = rfind(&buf[..es_pos], b"stream\n").expect("stream keyword");
+    assert_eq!(
+        es_pos - (stream_kw + b"stream\n".len()),
+        payload.len(),
+        "Never mode: payload written verbatim, no extra EOL even when it ends with \\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (d) Round-trip: write PDF with each mode, re-open, verify stream data
 // ---------------------------------------------------------------------------
 
@@ -289,6 +335,16 @@ fn round_trip_yes_mode() {
 #[test]
 fn round_trip_no_mode() {
     run_round_trip_test(NewlineBeforeEndstream::No);
+}
+
+/// `Never` writes the payload with `endstream` immediately adjacent (no EOL).
+/// flpdf must be able to re-open its own no-EOL-before-endstream output — the
+/// reader has to rely on `/Length` and skip the *optional* whitespace before
+/// `endstream`. (Round-trip payload does not end in a newline, so this exercises
+/// the adjacent-endstream parse path that `Yes`/`No` never produce here.)
+#[test]
+fn round_trip_never_mode() {
+    run_round_trip_test(NewlineBeforeEndstream::Never);
 }
 
 // ---------------------------------------------------------------------------

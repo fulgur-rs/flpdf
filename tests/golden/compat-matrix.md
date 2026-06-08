@@ -19,6 +19,27 @@ so the baseline detects byte-level drift even when every comparator
 verdict stays at `diverge`. The `byte-equal` column likewise compares
 with `/ID` elided.
 
+## Byte-identity (feature-gated)
+
+The `byte-equal` column reflects the **default Pure-Rust build** (miniz_oxide
+deflate, `NewlineBeforeEndstream::Yes`), and is `diverge` for every row — the
+default build deliberately does **not** chase byte-identity (see
+`tests/golden/README.md`).
+
+Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an
+opt-in combination, and is verified separately by
+`crates/flpdf/tests/cmp_diff_zero_tests.rs` (gated on the `qpdf-zlib-compat`
+feature, run in the Linux amd64 CI job). It requires all of:
+
+- the `qpdf-zlib-compat` feature (classic libz deflate, matching qpdf), and
+- `WriteOptions { full_rewrite: true, static_id: true,
+  newline_before_endstream: NewlineBeforeEndstream::Never, .. }`.
+
+Under those conditions `one-page`, `two-page`, and `three-page` plain rewrites
+are `cmp`-diff-0 against the committed `static-id.pdf` goldens. This is kept out
+of the default-build matrix on purpose: faking `byte-equal: match` here would
+misrepresent the default build. (Byte-identity pins to the linked libz version.)
+
 ## Review cadence
 
 Re-bless this file when:
