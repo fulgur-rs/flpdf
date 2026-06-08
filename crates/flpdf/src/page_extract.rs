@@ -380,6 +380,13 @@ fn neutralize_action_chain(
                 act.insert("D", d_val);
             }
         }
+        if let Some(sd_val) = act.remove("SD") {
+            if sd_targets_absent_page(target, &sd_val, keep)? {
+                changed = true;
+            } else {
+                act.insert("SD", sd_val);
+            }
+        }
     }
 
     // /Next — a single action or an array of actions. Recurse into each. The
@@ -453,6 +460,47 @@ fn dest_targets_absent_page(
         Some(page_ref) => page_ref != keep,
         None => false,
     })
+}
+
+/// `true` when a GoTo `/SD` structure destination resolves to a page other than
+/// `keep`. An `/SD` value is `[structElemRef /Fit ...]` (or an indirect ref to
+/// one); the first element is a *structure element*, whose `/Pg` is the target
+/// page (ISO 32000-2 §12.6.4.3). Named structure destinations (a name/string,
+/// resolved via the structure tree) carry no in-document page ref and return
+/// `false`. A missing / unresolvable / non-Page `/Pg`, or a `/Pg` pointing at
+/// `keep`, returns `false` (kept conservatively). Each level may be indirect;
+/// `resolve_ref_chain` bounds the indirection.
+fn sd_targets_absent_page(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    sd: &Object,
+    keep: ObjectRef,
+) -> Result<bool> {
+    let (concrete, _) = resolve_ref_chain(target, sd)?;
+    let Object::Array(arr) = concrete else {
+        return Ok(false); // named structure destination or malformed
+    };
+    let Some(struct_elem) = arr.into_iter().next() else {
+        return Ok(false);
+    };
+    let (se, _) = resolve_ref_chain(target, &struct_elem)?;
+    let Some(se_dict) = se.into_dict() else {
+        return Ok(false);
+    };
+    let Some(pg) = se_dict.get("Pg").cloned() else {
+        return Ok(false);
+    };
+    let (pg_concrete, pg_ref) = resolve_ref_chain(target, &pg)?;
+    Ok(match pg_ref {
+        Some(r) => r != keep && is_page_dict(&pg_concrete),
+        None => false,
+    })
+}
+
+/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
+fn is_page_dict(obj: &Object) -> bool {
+    obj.as_dict()
+        .and_then(|d| d.get("Type"))
+        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
 }
 
 /// Minimal valid target: Catalog(1) + empty Pages(2). No placeholder page (so
