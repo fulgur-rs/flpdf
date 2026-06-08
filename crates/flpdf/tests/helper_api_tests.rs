@@ -704,3 +704,300 @@ fn page_insert_matches_manual_splice() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// Layer 2 round-trip: AcroForm mutating helpers == independent raw manipulation
+// ---------------------------------------------------------------------------
+
+/// AcroForm `set_field_value` parity (byte-identity).
+///
+/// `set_field_value` resolves the field dict and `insert("V", value)` then
+/// `set_object`s it back — a plain single-key dictionary edit. The manual path
+/// does exactly that on the same field ref (4 0 R, the `name` field), so the two
+/// resulting graphs are structurally identical ⇒ byte-identity.
+#[test]
+fn acroform_set_field_value_matches_manual_v_insert() {
+    use flpdf::{Object, ObjectRef};
+    let f1_ref = ObjectRef::new(4, 0); // the `name` text field
+    roundtrip_eq(
+        acroform_smoke_pdf,
+        |pdf| {
+            pdf.acroform()
+                .set_field_value(f1_ref, Object::String(b"Bob".to_vec()))
+                .unwrap();
+        },
+        |pdf| {
+            let mut field = pdf.resolve(f1_ref).unwrap().into_dict().unwrap();
+            field.insert("V", Object::String(b"Bob".to_vec()));
+            pdf.set_object(f1_ref, Object::Dictionary(field));
+        },
+    );
+}
+
+/// AcroForm `set_default_appearance` parity (byte-identity).
+///
+/// In `acroform_smoke_pdf` the catalog carries `/AcroForm` as a *direct inline*
+/// dictionary, so `set_default_appearance` promotes it to an indirect object:
+/// `ensure_acroform_ref` allocates a fresh ref, moves the inline dict there with
+/// `/DA` inserted, and repoints the catalog `/AcroForm` at that reference. The
+/// manual path reproduces exactly that promotion (at a different free object
+/// number; `full_rewrite` renumbers Catalog-first so the number is irrelevant)
+/// ⇒ byte-identity. Inserting `/DA` into the still-inline dict would NOT match,
+/// since inline-vs-indirect is a structural difference full_rewrite preserves.
+#[test]
+fn acroform_set_default_appearance_matches_manual_promote_and_insert() {
+    use flpdf::{Object, ObjectRef};
+    let da = b"/Helv 12 Tf 0 g";
+    roundtrip_eq(
+        acroform_smoke_pdf,
+        |pdf| {
+            pdf.acroform().set_default_appearance(da.to_vec()).unwrap();
+        },
+        |pdf| {
+            // Reproduce the inline -> indirect promotion the helper performs.
+            let root = pdf.root_ref().unwrap();
+            let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+            let mut acroform = match catalog.get("AcroForm").cloned() {
+                Some(Object::Dictionary(d)) => d,
+                other => panic!("expected inline /AcroForm dict, got {other:?}"),
+            };
+            acroform.insert("DA", Object::String(da.to_vec()));
+            // Allocate a fresh object number (helper uses max+1; full_rewrite
+            // renumbers so any free number converges to the same bytes).
+            let next = pdf
+                .object_refs()
+                .iter()
+                .map(|r| r.number)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let af_ref = ObjectRef::new(next, 0);
+            catalog.insert("AcroForm", Object::Reference(af_ref));
+            pdf.set_object(af_ref, Object::Dictionary(acroform));
+            pdf.set_object(root, Object::Dictionary(catalog));
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 round-trip: PageLabel mutating helpers == independent raw manipulation
+// ---------------------------------------------------------------------------
+
+/// Point the catalog `/PageLabels` at a freshly-allocated single-leaf number
+/// tree built from `nums` (a flat `/Nums` pair array). Mirrors what
+/// `PageLabelDocumentHelper::rebuild` emits for a small tree (<= LEAF_MAX
+/// entries): one leaf dict `<< /Limits [first last] /Nums [...] >>` at a new
+/// indirect ref, with the old inline `/PageLabels` dict left as an orphan that
+/// `full_rewrite` drops. `first`/`last` are the leading key of the first/last
+/// `(key, dict)` pair in `nums`.
+fn manual_set_pagelabels_leaf(
+    pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>,
+    nums: Vec<flpdf::Object>,
+    first: i64,
+    last: i64,
+) {
+    use flpdf::{Dictionary, Object, ObjectRef};
+    let next = pdf
+        .object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let leaf_ref = ObjectRef::new(next, 0);
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
+    );
+    leaf.insert("Nums", Object::Array(nums));
+    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+
+    let root = pdf.root_ref().unwrap();
+    let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+    catalog.insert("PageLabels", Object::Reference(leaf_ref));
+    pdf.set_object(root, Object::Dictionary(catalog));
+}
+
+/// PageLabel `set_range` parity (byte-identity).
+///
+/// `set_range(0, ..)` replaces the existing index-0 range (lowercase roman) with
+/// an uppercase-roman range, then rebuilds the `/Nums` tree. With two entries
+/// (<= LEAF_MAX) the rebuild produces ONE leaf `<< /Limits [0 3] /Nums [...] >>`
+/// at a fresh ref, with catalog `/PageLabels` repointed there. The replacement
+/// dict is `LabelRange { RomanUpper, "", 1 }.to_dict()` == `<< /S /R >>` (no
+/// `/St` since start==1, no `/P` since empty). The index-3 dict is preserved
+/// verbatim from the original inline `/Nums`. The manual path builds that exact
+/// flat array + leaf ⇒ byte-identity (no tree logic is re-implemented; only the
+/// single replaced value uses the public `LabelRange::to_dict`).
+#[test]
+fn page_label_set_range_matches_manual_nums_rebuild() {
+    use flpdf::{LabelRange, LabelStyle, Object};
+    let new_range = LabelRange {
+        style: LabelStyle::RomanUpper,
+        prefix: String::new(),
+        start: 1,
+    };
+    roundtrip_eq(
+        page_label_smoke_pdf,
+        {
+            let new_range = new_range.clone();
+            move |pdf| {
+                pdf.page_labels().set_range(0, new_range).unwrap();
+            }
+        },
+        move |pdf| {
+            // Original inline /Nums is [0 <</S /r>> 3 <</S /D /P (A-)>>].
+            // Preserve the index-3 dict verbatim; replace the index-0 dict with
+            // the new range's to_dict() (public value logic, not tree logic).
+            let mut idx3 = flpdf::Dictionary::new();
+            idx3.insert("S", Object::Name(b"D".to_vec()));
+            idx3.insert("P", Object::String(b"A-".to_vec()));
+            let nums = vec![
+                Object::Integer(0),
+                Object::Dictionary(new_range.to_dict()),
+                Object::Integer(3),
+                Object::Dictionary(idx3),
+            ];
+            manual_set_pagelabels_leaf(pdf, nums, 0, 3);
+        },
+    );
+}
+
+/// PageLabel `remove_range` parity (byte-identity).
+///
+/// `remove_range(3)` drops the index-3 range, leaving the single non-last entry
+/// `(0, <</S /r>>)`. Because the entry list is non-empty, `/PageLabels` is NOT
+/// dropped (that only happens when the LAST range is removed); instead the tree
+/// is rebuilt as one leaf `<< /Limits [0 0] /Nums [0 <</S /r>>] >>` at a fresh
+/// ref. The manual path reproduces that exact single-entry leaf, preserving the
+/// index-0 dict verbatim ⇒ byte-identity.
+#[test]
+fn page_label_remove_range_matches_manual_nums_shrink() {
+    use flpdf::Object;
+    roundtrip_eq(
+        page_label_smoke_pdf,
+        |pdf| {
+            assert!(pdf.page_labels().remove_range(3).unwrap());
+        },
+        |pdf| {
+            // Surviving entry: index 0 -> <</S /r>> (preserved verbatim).
+            let mut idx0 = flpdf::Dictionary::new();
+            idx0.insert("S", Object::Name(b"r".to_vec()));
+            let nums = vec![Object::Integer(0), Object::Dictionary(idx0)];
+            manual_set_pagelabels_leaf(pdf, nums, 0, 0);
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 round-trip: Attachment free fns == independent raw manipulation
+// ---------------------------------------------------------------------------
+
+/// Create a minimal `/Filespec` object at `num`, parented to nothing. Used by
+/// both routes in the insert test so the filespec is byte-identical on each
+/// side; the only structural variation under test is the name-tree wiring.
+fn make_filespec(
+    pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>,
+    num: u32,
+    name: &[u8],
+) -> flpdf::ObjectRef {
+    use flpdf::{Dictionary, Object, ObjectRef};
+    let mut fs = Dictionary::new();
+    fs.insert("Type", Object::Name(b"Filespec".to_vec()));
+    fs.insert("F", Object::String(name.to_vec()));
+    fs.insert("UF", Object::String(name.to_vec()));
+    let fs_ref = ObjectRef::new(num, 0);
+    pdf.set_object(fs_ref, Object::Dictionary(fs));
+    fs_ref
+}
+
+/// Attachment `insert_embedded_file` parity (byte-identity).
+///
+/// Starting from a no-attachment PDF, `insert_embedded_file(b"new.txt", fs)`
+/// rebuilds the name tree from one entry (<= LEAF_MAX), emitting a leaf
+/// `<< /Limits [(new.txt) (new.txt)] /Names [(new.txt) fs] >>`, a fresh
+/// `/Names` dict `<< /EmbeddedFiles <leaf_ref> >>`, and catalog
+/// `/Names -> <names_ref>`. The manual path reproduces that exact graph
+/// (filespec created identically on both sides via `make_filespec`);
+/// `full_rewrite` renumbers Catalog-first so the differing fresh object numbers
+/// converge ⇒ byte-identity.
+#[test]
+fn attachment_insert_embedded_file_matches_manual_name_tree() {
+    use flpdf::{Dictionary, Object, ObjectRef};
+    let key = b"new.txt";
+    roundtrip_eq(
+        || build_n_page_pdf(1),
+        |pdf| {
+            let fs_ref = make_filespec(pdf, 50, key);
+            flpdf::insert_embedded_file(pdf, key, fs_ref).unwrap();
+        },
+        |pdf| {
+            // Create the filespec identically (different free number; renumber
+            // converges). Then hand-build the single-leaf name tree + /Names.
+            let fs_ref = make_filespec(pdf, 70, key);
+            let next = pdf
+                .object_refs()
+                .iter()
+                .map(|r| r.number)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let leaf_ref = ObjectRef::new(next, 0);
+            let names_ref = ObjectRef::new(next + 1, 0);
+
+            let mut leaf = Dictionary::new();
+            leaf.insert(
+                "Limits",
+                Object::Array(vec![
+                    Object::String(key.to_vec()),
+                    Object::String(key.to_vec()),
+                ]),
+            );
+            leaf.insert(
+                "Names",
+                Object::Array(vec![
+                    Object::String(key.to_vec()),
+                    Object::Reference(fs_ref),
+                ]),
+            );
+            pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+
+            let mut names_dict = Dictionary::new();
+            names_dict.insert("EmbeddedFiles", Object::Reference(leaf_ref));
+            pdf.set_object(names_ref, Object::Dictionary(names_dict));
+
+            let root = pdf.root_ref().unwrap();
+            let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+            catalog.insert("Names", Object::Reference(names_ref));
+            pdf.set_object(root, Object::Dictionary(catalog));
+        },
+    );
+}
+
+/// Attachment `delete_embedded_file` parity (byte-identity).
+///
+/// In `attachment_smoke_pdf` the catalog `/Names` (3 0 R) holds ONLY
+/// `/EmbeddedFiles`. Deleting the sole entry "hello.txt" empties the tree, so
+/// `rebuild_embedded_files_tree` removes `/EmbeddedFiles` from the `/Names`
+/// dict; that leaves it empty, so `/Names` is removed from the catalog and the
+/// `/Names` object (3 0 R) is `delete_object`-ed. The filespec (5 0 R) and its
+/// `/EmbeddedFile` stream (6 0 R) become unreachable. The manual path just
+/// removes `/Names` from the catalog; `full_rewrite` emits only reachable
+/// objects, so the now-orphan name dict, filespec, and stream are dropped
+/// symmetrically on both sides ⇒ byte-identity.
+#[test]
+fn attachment_delete_embedded_file_matches_manual_names_drop() {
+    roundtrip_eq(
+        || attachment_smoke_pdf(b"hello world\n"),
+        |pdf| {
+            assert!(flpdf::delete_embedded_file(pdf, b"hello.txt").unwrap());
+        },
+        |pdf| {
+            let root = pdf.root_ref().unwrap();
+            let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+            catalog.remove("Names");
+            pdf.set_object(root, flpdf::Object::Dictionary(catalog));
+        },
+    );
+}
