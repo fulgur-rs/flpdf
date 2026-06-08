@@ -80,6 +80,18 @@ fn write_canonical<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pdf<R>) ->
     buf
 }
 
+/// Lowest object number not yet used by any live object (max + 1, or 1 if none).
+/// Mirrors the helpers' own free-number allocation; `full_rewrite` renumbers
+/// Catalog-first, so the exact number chosen here never affects output bytes.
+fn next_free_number<R: std::io::Read + std::io::Seek>(pdf: &flpdf::Pdf<R>) -> u32 {
+    pdf.object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
 // ---------------------------------------------------------------------------
 // Layer 1 smoke: page helper vs manual raw extraction
 // ---------------------------------------------------------------------------
@@ -757,20 +769,16 @@ fn acroform_set_default_appearance_matches_manual_promote_and_insert() {
             // Reproduce the inline -> indirect promotion the helper performs.
             let root = pdf.root_ref().unwrap();
             let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
-            let mut acroform = match catalog.get("AcroForm").cloned() {
+            // We own `catalog` and repoint /AcroForm immediately below, so move
+            // the old value out rather than cloning it.
+            let mut acroform = match catalog.remove("AcroForm") {
                 Some(Object::Dictionary(d)) => d,
                 other => panic!("expected inline /AcroForm dict, got {other:?}"),
             };
             acroform.insert("DA", Object::String(da.to_vec()));
             // Allocate a fresh object number (helper uses max+1; full_rewrite
             // renumbers so any free number converges to the same bytes).
-            let next = pdf
-                .object_refs()
-                .iter()
-                .map(|r| r.number)
-                .max()
-                .unwrap_or(0)
-                + 1;
+            let next = next_free_number(pdf);
             let af_ref = ObjectRef::new(next, 0);
             catalog.insert("AcroForm", Object::Reference(af_ref));
             pdf.set_object(af_ref, Object::Dictionary(acroform));
@@ -797,13 +805,7 @@ fn manual_set_pagelabels_leaf(
     last: i64,
 ) {
     use flpdf::{Dictionary, Object, ObjectRef};
-    let next = pdf
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let next = next_free_number(pdf);
     let leaf_ref = ObjectRef::new(next, 0);
     let mut leaf = Dictionary::new();
     leaf.insert(
@@ -840,22 +842,25 @@ fn page_label_set_range_matches_manual_nums_rebuild() {
     };
     roundtrip_eq(
         page_label_smoke_pdf,
-        {
-            let new_range = new_range.clone();
-            move |pdf| {
-                pdf.page_labels().set_range(0, new_range).unwrap();
-            }
-        },
         move |pdf| {
+            pdf.page_labels().set_range(0, new_range).unwrap();
+        },
+        |pdf| {
             // Original inline /Nums is [0 <</S /r>> 3 <</S /D /P (A-)>>].
-            // Preserve the index-3 dict verbatim; replace the index-0 dict with
-            // the new range's to_dict() (public value logic, not tree logic).
+            // Preserve the index-3 dict verbatim; build the index-0 replacement
+            // LITERALLY as << /S /R >> (RomanUpper, empty prefix, start==1: no
+            // /P, no /St). Building it by hand instead of via `to_dict` keeps the
+            // manual side independent of the serializer `set_range` uses, so a
+            // RomanUpper/empty-prefix/start==1-specific `to_dict` bug cannot pass
+            // on both sides.
+            let mut idx0 = flpdf::Dictionary::new();
+            idx0.insert("S", Object::Name(b"R".to_vec()));
             let mut idx3 = flpdf::Dictionary::new();
             idx3.insert("S", Object::Name(b"D".to_vec()));
             idx3.insert("P", Object::String(b"A-".to_vec()));
             let nums = vec![
                 Object::Integer(0),
-                Object::Dictionary(new_range.to_dict()),
+                Object::Dictionary(idx0),
                 Object::Integer(3),
                 Object::Dictionary(idx3),
             ];
@@ -936,13 +941,7 @@ fn attachment_insert_embedded_file_matches_manual_name_tree() {
             // Create the filespec identically (different free number; renumber
             // converges). Then hand-build the single-leaf name tree + /Names.
             let fs_ref = make_filespec(pdf, 70, key);
-            let next = pdf
-                .object_refs()
-                .iter()
-                .map(|r| r.number)
-                .max()
-                .unwrap_or(0)
-                + 1;
+            let next = next_free_number(pdf);
             let leaf_ref = ObjectRef::new(next, 0);
             let names_ref = ObjectRef::new(next + 1, 0);
 
