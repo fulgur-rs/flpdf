@@ -24,10 +24,21 @@
 //! (`/URI`, `/GoToR`) destinations carry no in-document page reference and are
 //! left untouched, as are destinations targeting the extracted page itself.
 //!
-//! Only explicit page destinations (`/D`) are neutralized. A GoTo action's
-//! structure destination (`/SD`, ISO 32000-2 §12.6.4.3) is not inspected, so a
-//! `/SD` pointing into another page's structure tree can keep that page
-//! reachable in the output.
+//! Both kinds of page destination are neutralized when they target an absent
+//! page: an explicit destination (`/D`) and a GoTo action's structure
+//! destination (`/SD`, ISO 32000-2 §12.6.4.3), the latter resolved through its
+//! structure element's `/Pg`.
+//!
+//! # Cross-page page references
+//!
+//! Two further page references are dropped when they point at an absent page: a
+//! malformed annotation `/P` (the page an annotation belongs to) and an
+//! article-thread bead `/P`, reached by walking the page's `/B` thread ring
+//! through each bead's `/N` and `/V` links. The `/B` array and the bead ring
+//! itself are otherwise retained, matching qpdf's single-page output; a
+//! retained bead whose dangling `/P` was dropped therefore lacks the `/P` key.
+//! This is a deliberate parity tradeoff: qpdf likewise leaves the orphaned ring
+//! in place rather than splicing it.
 
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
