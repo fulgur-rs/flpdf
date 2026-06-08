@@ -109,6 +109,8 @@ use std::io::{Read, Seek};
 /// traverse or mutate the document's page list.  All operations are delegated to
 /// the underlying `Pdf<R>` infrastructure; no page-tree state is cached inside
 /// this struct.
+///
+/// For a runnable walkthrough see `examples/reorder_pages.rs`.
 pub struct PageDocumentHelper<'a, R: Read + Seek> {
     pdf: &'a mut Pdf<R>,
 }

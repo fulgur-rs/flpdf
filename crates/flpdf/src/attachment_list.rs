@@ -114,6 +114,8 @@ fn decode_pdf_text_string(bytes: &[u8]) -> String {
 /// An empty list is returned — without error — when the document has no
 /// embedded files.
 ///
+/// For a runnable walkthrough see `examples/pull_attachments.rs`.
+///
 /// # Errors
 ///
 /// Propagates any error from [`Pdf::resolve`] or the embedded-files walker.

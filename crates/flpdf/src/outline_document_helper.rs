@@ -346,6 +346,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Visit every node pre-order, passing `(node, depth)` to `visitor`. The
     /// visited nodes have populated `children`. Mirrors a qpdf outline walk.
     ///
+    /// For a runnable walkthrough see `examples/walk_outline.rs`.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
