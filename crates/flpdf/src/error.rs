@@ -46,6 +46,23 @@ impl Error {
             message: message.into(),
         }
     }
+
+    /// Rebase a relative [`Error::Parse`] offset onto an absolute position.
+    ///
+    /// When an error is produced while parsing a sub-slice that begins at
+    /// `base` within a larger buffer, its `offset` is relative to that slice.
+    /// This shifts it back to an absolute offset (`base + offset`) so
+    /// diagnostics point at the true byte position. Non-[`Error::Parse`]
+    /// variants are returned unchanged.
+    pub(crate) fn rebase_offset(self, base: usize) -> Self {
+        match self {
+            Self::Parse { offset, message } => Self::Parse {
+                offset: base + offset,
+                message,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Sub-kind of [`Error::Encrypted`], describing why an encrypted PDF could not
@@ -221,6 +238,25 @@ mod tests {
             }
             other => panic!("expected Error::Encrypted(Malformed), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rebase_offset_shifts_parse_errors() {
+        let rebased = Error::parse(5, "boom").rebase_offset(100);
+        match rebased {
+            Error::Parse { offset, message } => {
+                assert_eq!(offset, 105);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected Error::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_offset_leaves_non_parse_errors_unchanged() {
+        let original = Error::Unsupported("nope".into());
+        let rebased = original.rebase_offset(100);
+        assert!(matches!(rebased, Error::Unsupported(ref s) if s == "nope"));
     }
 
     #[test]
