@@ -511,9 +511,11 @@ fn sd_targets_absent_page(
 }
 
 /// `true` when `p` (an annotation's or bead's `/P`) resolves to a Page object
-/// other than `keep`. `/P` always denotes "the page this object belongs to"
-/// (ISO 32000-2); a `/P` pointing at an absent page is dangling and dropped.
-/// Non-Page / unresolvable / `keep` targets return `false` (kept).
+/// other than `keep`. On an annotation (ISO 32000-2 §12.5.2, Table 166) or an
+/// article bead (§12.4.3), `/P` denotes the page the object belongs to, so a
+/// `/P` pointing at an absent page is dangling and dropped. Non-Page /
+/// unresolvable / `keep` targets return `false` (kept) — the `is_page_dict`
+/// gate also keeps any non-page `/P` (e.g. a StructElem's parent `/P`).
 fn p_targets_absent_page(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     p: &Object,
