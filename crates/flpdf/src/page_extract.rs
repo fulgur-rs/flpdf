@@ -206,6 +206,55 @@ fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRe
             target.set_object(page_ref, Object::Dictionary(page));
         }
     }
+
+    neutralize_bead_ring(target, page_ref)?;
+    Ok(())
+}
+
+/// Walk the article-thread bead ring reachable from this page's `/B` and drop
+/// each bead's `/P` that targets an absent page. `/N`/`/V` link beads (not
+/// pages), so they never leak; only the page-valued `/P` is neutralized. The
+/// ring is bounded by `visited` (each bead handled once). The `/B` array and
+/// the beads themselves are retained — only dangling `/P` keys are dropped,
+/// matching qpdf's single-page output.
+fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
+    let b_val = {
+        let page_obj = target.resolve_borrowed(page_ref)?;
+        let Some(page_dict) = page_obj.as_dict() else {
+            return Ok(());
+        };
+        page_dict.get("B").cloned()
+    };
+    let mut queue: Vec<ObjectRef> = match b_val {
+        Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
+        Some(Object::Reference(r)) => match target.resolve_borrowed(r)? {
+            Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    while let Some(bead_ref) = queue.pop() {
+        if !visited.insert(bead_ref) {
+            continue;
+        }
+        let Some(mut bead) = target.resolve_borrowed(bead_ref)?.as_dict().cloned() else {
+            continue;
+        };
+        // Enqueue ring neighbours before mutating.
+        for key in ["N", "V"] {
+            if let Some(Object::Reference(r)) = bead.get(key) {
+                queue.push(*r);
+            }
+        }
+        if let Some(p_val) = bead.remove("P") {
+            if p_targets_absent_page(target, &p_val, page_ref)? {
+                target.set_object(bead_ref, Object::Dictionary(bead));
+            } else {
+                bead.insert("P", p_val);
+            }
+        }
+    }
     Ok(())
 }
 

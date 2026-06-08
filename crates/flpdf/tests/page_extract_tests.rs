@@ -1579,3 +1579,42 @@ fn annot_p_self_page_is_preserved() {
     let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
     assert!(annot.get("P").is_some(), "self-page /P must be preserved");
 }
+
+#[test]
+fn bead_p_absent_page_is_neutralized() {
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [10 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [11 0 R] >>",
+            ),
+            // Bead ring: 10 (on kept page) <-> 11 (on sibling page).
+            (
+                10,
+                "<< /T 12 0 R /N 11 0 R /V 11 0 R /P 3 0 R /R [0 0 10 10] >>",
+            ),
+            (
+                11,
+                "<< /T 12 0 R /N 10 0 R /V 10 0 R /P 4 0 R /R [0 0 10 10] >>",
+            ),
+            (12, "<< /T (Article) /F 10 0 R >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "sibling reached via bead /P must be pruned"
+    );
+    // The kept page's /B is retained (qpdf keeps the ring).
+    let leaf = only_leaf(&mut out);
+    assert!(leaf.get("B").is_some(), "page /B must be retained");
+}
