@@ -23,7 +23,27 @@ fn full_rewrite_bytes(fixture: &str) -> Vec<u8> {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Return the classic trailer dictionary slice — from the `trailer ` keyword to
+/// the `startxref` that follows it — so key-order assertions are scoped to the
+/// trailer and cannot be confused by `/ID` / `/Size` occurrences elsewhere in
+/// the file (e.g. inside object bodies).
+fn trailer_slice(out: &[u8]) -> &[u8] {
+    let start = out
+        .windows(b"trailer".len())
+        .rposition(|w| w == b"trailer")
+        .expect("trailer keyword present");
+    let after = &out[start..];
+    let end = after
+        .windows(b"startxref".len())
+        .position(|w| w == b"startxref")
+        .expect("startxref after trailer");
+    &after[..end]
 }
 
 #[test]
@@ -45,19 +65,21 @@ fn classic_trailer_dict_is_on_the_trailer_line() {
 fn classic_trailer_keys_sorted_with_id_last() {
     for fixture in ["one-page.pdf", "two-page.pdf", "three-page.pdf"] {
         let out = full_rewrite_bytes(fixture);
+        let trailer = trailer_slice(&out);
         // qpdf order for these fixtures: /Info /Root /Size then /ID last.
         assert!(
-            contains(&out, b"trailer << /Info ")
-                && contains(&out, b"/Root ")
-                && contains(&out, b"/Size "),
+            contains(trailer, b"trailer << /Info ")
+                && contains(trailer, b"/Root ")
+                && contains(trailer, b"/Size "),
             "{fixture}: expected sorted /Info /Root /Size leading keys"
         );
-        // /ID must appear AFTER /Size (i.e. last), never as the first key.
-        let pos_id = out
+        // /ID must appear AFTER /Size (i.e. last), never as the first key —
+        // searched within the trailer slice only.
+        let pos_id = trailer
             .windows(4)
             .position(|w| w == b"/ID ")
             .expect("trailer /ID present");
-        let pos_size = out
+        let pos_size = trailer
             .windows(6)
             .position(|w| w == b"/Size ")
             .expect("trailer /Size present");
@@ -66,7 +88,7 @@ fn classic_trailer_keys_sorted_with_id_last() {
             "{fixture}: /ID must be emitted after /Size (forced last), got /ID@{pos_id} /Size@{pos_size}"
         );
         assert!(
-            !contains(&out, b"trailer << /ID"),
+            !contains(trailer, b"trailer << /ID"),
             "{fixture}: /ID must not be the first trailer key"
         );
     }
