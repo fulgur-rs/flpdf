@@ -300,6 +300,94 @@ fn field_absent_returns_none() {
     assert_eq!(field.field_flags().expect("field_flags()"), None);
 }
 
+// ── FormFieldObjectHelper — indirect /V and /DV resolution ────────────────────
+//
+// /V and /DV may be stored as indirect references. field_value() /
+// field_default_value() must dereference one level so the two read paths
+// (FormFieldObjectHelper vs AcroFormDocumentHelper::field_infos) agree.
+
+#[test]
+fn field_value_resolves_indirect_reference() {
+    // 4 0 obj << ... /V 6 0 R >> ; 6 0 obj (Paris). field_value() must return
+    // the resolved String, not Object::Reference(6 0).
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (
+            4,
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (city) /V 6 0 R >>".to_vec(),
+        ),
+        (6, b"(Paris)".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    match field.field_value().expect("field_value()") {
+        Some(Object::String(bytes)) => assert_eq!(bytes, b"Paris"),
+        other => panic!("expected resolved String 'Paris', got {other:?}"),
+    }
+}
+
+#[test]
+fn field_default_value_resolves_indirect_reference() {
+    // /DV stored as an indirect reference must be resolved one level too.
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (
+            4,
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /DV 6 0 R >>".to_vec(),
+        ),
+        (6, b"(default text)".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    match field.field_default_value().expect("field_default_value()") {
+        Some(Object::String(bytes)) => assert_eq!(bytes, b"default text"),
+        other => panic!("expected resolved String 'default text', got {other:?}"),
+    }
+}
+
+#[test]
+fn field_value_indirect_null_treated_as_absent_inherits_parent() {
+    // Child /V is an indirect reference that resolves to null. Per §7.3.9 a null
+    // value is absent, so resolution must keep climbing the /Parent chain and
+    // return the parent's /V rather than the resolved null or the raw reference.
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 5 0 R ] >>".to_vec(),
+        ),
+        (
+            4,
+            b"<< /Kids [ 5 0 R ] /FT /Tx /V (from parent) >>".to_vec(),
+        ),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /Parent 4 0 R /V 6 0 R >>".to_vec(),
+        ),
+        (6, b"null".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
+    match child.field_value().expect("field_value()") {
+        Some(Object::String(bytes)) => assert_eq!(bytes, b"from parent"),
+        other => panic!("expected inherited String 'from parent', got {other:?}"),
+    }
+}
+
 // ── FormFieldObjectHelper — /Parent chain inheritance ─────────────────────────
 //
 // Object layout:

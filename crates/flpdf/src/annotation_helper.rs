@@ -542,14 +542,29 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 )));
             };
 
-            if let Some(val) = dict.get(key).cloned() {
+            // Clone out the matched value and the /Parent link before any
+            // mutable resolve, releasing the borrow on `node_obj`/`self.pdf`.
+            let found = dict.get(key).cloned();
+            let parent = dict.get("Parent").cloned();
+
+            if let Some(val) = found {
                 match val {
                     Object::Null => {} // absent per §7.3.9
+                    // The value may be stored as an indirect reference; resolve
+                    // one level so callers receive the materialized object, not
+                    // a bare Reference (matches AcroFormDocumentHelper's
+                    // deref_leaf, keeping the two read paths consistent). A
+                    // reference resolving to Null is treated as absent, so we
+                    // keep climbing the /Parent chain.
+                    Object::Reference(r) => match self.pdf.resolve(r)? {
+                        Object::Null => {}
+                        resolved => return Ok(Some(resolved)),
+                    },
                     other => return Ok(Some(other)),
                 }
             }
 
-            match dict.get("Parent").cloned() {
+            match parent {
                 Some(Object::Reference(r)) => {
                     current = r;
                     depth += 1;
