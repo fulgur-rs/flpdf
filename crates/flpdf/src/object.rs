@@ -606,6 +606,48 @@ impl Dictionary {
         out.extend_from_slice(b" >>");
     }
 
+    /// Serialize a stream's dictionary using qpdf's stream-dictionary key
+    /// ordering, appending to `out`.
+    ///
+    /// qpdf (see `QPDFWriter::unparseObject`, stream branch) does not emit a
+    /// stream dictionary in plain lexicographic order. It pulls `/Length` out
+    /// of the key iteration and writes it explicitly after the remaining keys;
+    /// and when it re-encodes ("filters") the stream, it also pulls `/Filter`
+    /// and `/DecodeParms` out and re-appends `/Filter /FlateDecode` after
+    /// `/Length`. The remaining keys keep their sorted order, which already
+    /// matches this dictionary's `BTreeMap` iteration.
+    ///
+    /// The resulting layout is therefore:
+    /// - re-filtered: `[other keys sorted] /Length N /Filter /FlateDecode`
+    /// - preserved:   `[other keys sorted, incl. /Filter] /Length N`
+    ///
+    /// `refiltered` selects between the two. The `/Length` value is taken from
+    /// this dictionary (the writer stores the on-disk byte count before
+    /// serialization); if `/Length` is absent it is simply omitted.
+    pub(crate) fn write_pdf_stream(&self, out: &mut Vec<u8>, refiltered: bool) {
+        out.extend_from_slice(b"<<");
+        for (key, value) in self.iter() {
+            if key == b"Length" {
+                continue;
+            }
+            if refiltered && (key == b"Filter" || key == b"DecodeParms") {
+                continue;
+            }
+            out.extend_from_slice(b" /");
+            out.extend_from_slice(key);
+            out.push(b' ');
+            value.write_pdf(out);
+        }
+        if let Some(length) = self.get(b"Length") {
+            out.extend_from_slice(b" /Length ");
+            length.write_pdf(out);
+        }
+        if refiltered {
+            out.extend_from_slice(b" /Filter /FlateDecode");
+        }
+        out.extend_from_slice(b" >>");
+    }
+
     /// Serialize this dictionary in qpdf `--qdf` formatting: `<<` then one
     /// `  /Key value` entry per line (keys in lexicographic-by-raw-name order,
     /// which is qpdf's alphabetical sort, with exactly one ASCII space between
@@ -682,5 +724,77 @@ mod qdf_key_escape_tests {
         let mut out = Vec::new();
         d.write_pdf_qdf(&mut out, 0);
         assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
+    }
+}
+
+#[cfg(test)]
+mod stream_dict_order_tests {
+    use super::*;
+
+    /// A re-filtered two-key content-stream dict serializes `/Length` first,
+    /// then `/Filter /FlateDecode`, matching `qpdf --static-id` output
+    /// (`<< /Length 82 /Filter /FlateDecode >>`).
+    #[test]
+    fn refiltered_two_key_emits_length_then_filter() {
+        let mut d = Dictionary::new();
+        // Stored in lexicographic order by BTreeMap; the serializer reorders.
+        d.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        d.insert(b"Length", Object::Integer(82));
+        let mut out = Vec::new();
+        d.write_pdf_stream(&mut out, true);
+        assert_eq!(out, b"<< /Length 82 /Filter /FlateDecode >>");
+    }
+
+    /// When not re-filtered (qpdf preserves the existing filter), `/Filter`
+    /// stays in its sorted position and `/Length` is emitted last.
+    #[test]
+    fn preserved_two_key_emits_filter_then_length_last() {
+        let mut d = Dictionary::new();
+        d.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        d.insert(b"Length", Object::Integer(82));
+        let mut out = Vec::new();
+        d.write_pdf_stream(&mut out, false);
+        assert_eq!(out, b"<< /Filter /FlateDecode /Length 82 >>");
+    }
+
+    /// Preserved multi-key dict: `/Length` is pulled past later-sorting keys
+    /// (`/Params`, `/Type`) to the very end, while `/Filter` stays in its
+    /// sorted position. This is the qpdf order that makes the
+    /// `attachment-two-page` `/EmbeddedFile` stream byte-identical, and it is
+    /// the case that distinguishes `write_pdf_stream(false)` from the plain
+    /// lexicographic [`Dictionary::write_pdf`] (which would leave `/Length` in
+    /// its sorted position, before `/Params`).
+    #[test]
+    fn preserved_multi_key_moves_length_last_filter_stays_sorted() {
+        let mut d = Dictionary::new();
+        d.insert(b"Type", Object::Name(b"EmbeddedFile".to_vec()));
+        d.insert(b"Params", Object::Dictionary(Dictionary::new()));
+        d.insert(b"Length", Object::Integer(90));
+        d.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut out = Vec::new();
+        d.write_pdf_stream(&mut out, false);
+        assert_eq!(
+            out,
+            b"<< /Filter /FlateDecode /Params << >> /Type /EmbeddedFile /Length 90 >>".to_vec()
+        );
+    }
+
+    /// Re-filtered multi-key dict: the other keys stay sorted, `/Filter` and
+    /// `/DecodeParms` are dropped from the iteration, then `/Length` and the
+    /// regenerated `/Filter /FlateDecode` are appended (qpdf's order).
+    #[test]
+    fn refiltered_multi_key_orders_others_then_length_then_filter() {
+        let mut d = Dictionary::new();
+        d.insert(b"Type", Object::Name(b"Foo".to_vec()));
+        d.insert(b"Width", Object::Integer(100));
+        d.insert(b"DecodeParms", Object::Dictionary(Dictionary::new()));
+        d.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        d.insert(b"Length", Object::Integer(21));
+        let mut out = Vec::new();
+        d.write_pdf_stream(&mut out, true);
+        assert_eq!(
+            out,
+            b"<< /Type /Foo /Width 100 /Length 21 /Filter /FlateDecode >>".to_vec()
+        );
     }
 }
