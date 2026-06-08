@@ -9,6 +9,13 @@
 //! serialisation is invariant to a caller's absolute object numbers (the
 //! `full_rewrite` writer renumbers Catalog-first), which is what makes the
 //! later helper-vs-raw byte comparisons meaningful.
+//!
+//! The Layer-2 manual paths intentionally reproduce helper-internal structural
+//! details (e.g. `/Rotate 0` materialisation by `rebuild_page_tree`, the
+//! inline-to-indirect `/AcroForm` promotion by `ensure_acroform_ref`). If a
+//! helper's resulting structure changes, these byte-identity tests are
+//! *expected* to fail: update the corresponding manual path to mirror the new
+//! structure rather than weakening the assertion.
 
 use std::collections::BTreeMap;
 
