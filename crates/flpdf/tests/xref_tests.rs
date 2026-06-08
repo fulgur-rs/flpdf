@@ -339,6 +339,32 @@ fn rejects_startxref_offset_beyond_eof_without_panic() {
 }
 
 #[test]
+fn xref_stream_parse_error_offset_is_absolute() {
+    // When `startxref` points to an in-bounds but malformed location, the error
+    // from parsing the indirect object must be reported in absolute file
+    // coordinates (`xref_pos + relative_offset`), not relative to the sliced
+    // tail. Here the tail starts with a non-integer token, so the parse fails at
+    // relative offset 0, which must surface as the absolute `garbage_pos`.
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let garbage_pos = bytes.len();
+    bytes.extend_from_slice(b"not-an-indirect-object\n");
+    bytes.extend_from_slice(format!("startxref\n{garbage_pos}\n%%EOF\n").as_bytes());
+
+    let mut reader = Cursor::new(bytes);
+    let err =
+        load_xref_and_trailer(&mut reader).expect_err("malformed xref stream object should error");
+    let Error::Parse { offset, .. } = err else {
+        panic!("expected Error::Parse, got {err:?}");
+    };
+    assert_eq!(
+        offset, garbage_pos,
+        "parse error offset must be absolute (xref_pos + relative)"
+    );
+}
+
+#[test]
 fn rejects_startxref_offset_exactly_at_eof_without_panic() {
     // Boundary companion to the test above: when `startxref` equals the file
     // length exactly, `bytes.get(xref_pos..)` yields an empty slice rather than
