@@ -318,8 +318,8 @@ fn corrupt_xref_pdf() -> Vec<u8> {
 #[test]
 fn rejects_startxref_offset_beyond_eof_without_panic() {
     // Regression test for GitHub issue #304: a `startxref` offset pointing past
-    // the end of the file must yield a parse error, not panic when the xref
-    // stream branch slices `bytes[xref_pos..]`.
+    // the end of the file must yield a descriptive parse error, not panic when
+    // the xref stream branch slices `bytes[xref_pos..]`.
     let mut bytes = b"%PDF-1.4\n".to_vec();
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
 
@@ -328,7 +328,46 @@ fn rejects_startxref_offset_beyond_eof_without_panic() {
     bytes.extend_from_slice(format!("startxref\n{beyond_eof}\n%%EOF\n").as_bytes());
 
     let mut reader = Cursor::new(bytes);
-    let err = load_xref_and_trailer(&mut reader)
-        .expect_err("startxref past EOF should error, not panic");
+    let err =
+        load_xref_and_trailer(&mut reader).expect_err("startxref past EOF should error, not panic");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref stream offset is beyond end of file"),
+        "expected descriptive offset error, got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+#[test]
+fn rejects_startxref_offset_exactly_at_eof_without_panic() {
+    // Boundary companion to the test above: when `startxref` equals the file
+    // length exactly, `bytes.get(xref_pos..)` yields an empty slice rather than
+    // `None`. That empty tail must still produce the descriptive
+    // "beyond end of file" error instead of slipping into a generic parse
+    // failure at offset 0.
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    // Choose a target offset past the current trailer, then pad the file so its
+    // total length equals that offset exactly (the empty-slice boundary).
+    let target = bytes.len() + 256;
+    bytes.extend_from_slice(format!("startxref\n{target}\n%%EOF\n").as_bytes());
+    while bytes.len() < target {
+        bytes.push(b' ');
+    }
+    assert_eq!(
+        bytes.len(),
+        target,
+        "file length must equal startxref offset"
+    );
+
+    let mut reader = Cursor::new(bytes);
+    let err =
+        load_xref_and_trailer(&mut reader).expect_err("startxref at EOF should error, not panic");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref stream offset is beyond end of file"),
+        "expected descriptive offset error, got {message}"
+    );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
