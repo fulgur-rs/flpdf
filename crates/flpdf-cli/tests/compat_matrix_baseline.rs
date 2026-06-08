@@ -528,17 +528,25 @@ fn render_markdown(rows: &[MatrixRow]) -> String {
     out.push_str("deflate, `NewlineBeforeEndstream::Yes`), and is `diverge` for every row — the\n");
     out.push_str("default build deliberately does **not** chase byte-identity (see\n");
     out.push_str("`tests/golden/README.md`).\n\n");
-    out.push_str("Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an\n");
+    out.push_str(
+        "Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an\n",
+    );
     out.push_str("opt-in combination, and is verified separately by\n");
     out.push_str("`crates/flpdf/tests/cmp_diff_zero_tests.rs` (gated on the `qpdf-zlib-compat`\n");
     out.push_str("feature, run in the Linux amd64 CI job). It requires all of:\n\n");
     out.push_str("- the `qpdf-zlib-compat` feature (classic libz deflate, matching qpdf), and\n");
     out.push_str("- `WriteOptions { full_rewrite: true, static_id: true,\n");
     out.push_str("  newline_before_endstream: NewlineBeforeEndstream::Never, .. }`.\n\n");
-    out.push_str("Under those conditions `one-page`, `two-page`, and `three-page` plain rewrites\n");
-    out.push_str("are `cmp`-diff-0 against the committed `static-id.pdf` goldens. This is kept out\n");
+    out.push_str(
+        "Under those conditions `one-page`, `two-page`, and `three-page` plain rewrites\n",
+    );
+    out.push_str(
+        "are `cmp`-diff-0 against the committed `static-id.pdf` goldens. This is kept out\n",
+    );
     out.push_str("of the default-build matrix on purpose: faking `byte-equal: match` here would\n");
-    out.push_str("misrepresent the default build. (Byte-identity pins to the linked libz version.)\n\n");
+    out.push_str(
+        "misrepresent the default build. (Byte-identity pins to the linked libz version.)\n\n",
+    );
     out.push_str("## Review cadence\n\n");
     out.push_str("Re-bless this file when:\n");
     out.push_str("- qpdf binary is upgraded (qpdf-json comparator may shift)\n");

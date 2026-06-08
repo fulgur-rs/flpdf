@@ -3315,29 +3315,9 @@ fn write_stream_to_buf_qdf(
     policy: NewlineBeforeEndstream,
 ) {
     stream.dict.write_pdf_qdf(buf, 0);
-    buf.extend_from_slice(b"\nstream\n");
-    buf.extend_from_slice(&stream.data);
-
-    match policy {
-        NewlineBeforeEndstream::Yes => {
-            buf.push(b'\n');
-        }
-        NewlineBeforeEndstream::No => {
-            let ends_with_eol = stream
-                .data
-                .last()
-                .map(|&b| b == b'\n' || b == b'\r')
-                .unwrap_or(false);
-            if !ends_with_eol {
-                buf.push(b'\n');
-            }
-        }
-        NewlineBeforeEndstream::Never => {
-            // Adjacent endstream (no EOL); on_disk_stream_len agrees (returns n).
-        }
-    }
-
-    buf.extend_from_slice(b"endstream");
+    // Stream framing + newline-before-endstream policy is identical to the
+    // compact path; only the dict serialization differs in qdf mode.
+    write_stream_payload(buf, &stream.data, policy);
 }
 
 /// Emit the rebuilt full-rewrite trailer in qpdf `--qdf` formatting:
