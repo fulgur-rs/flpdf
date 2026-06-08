@@ -626,8 +626,12 @@ impl Dictionary {
     /// serialization); if `/Length` is absent it is simply omitted.
     pub(crate) fn write_pdf_stream(&self, out: &mut Vec<u8>, refiltered: bool) {
         out.extend_from_slice(b"<<");
+        // Capture /Length during the single iteration (it is appended after the
+        // other keys) instead of looking it up again afterwards.
+        let mut length_value: Option<&Object> = None;
         for (key, value) in self.iter() {
             if key == b"Length" {
+                length_value = Some(value);
                 continue;
             }
             if refiltered && (key == b"Filter" || key == b"DecodeParms") {
@@ -638,7 +642,7 @@ impl Dictionary {
             out.push(b' ');
             value.write_pdf(out);
         }
-        if let Some(length) = self.get(b"Length") {
+        if let Some(length) = length_value {
             out.extend_from_slice(b" /Length ");
             length.write_pdf(out);
         }

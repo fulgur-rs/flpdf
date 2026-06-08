@@ -2630,8 +2630,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // dict order with /Length last. Capture that from the source filter
             // so the output ordering tracks qpdf's re-filter decision rather
             // than flpdf's unconditional decode/re-encode.
-            let source_filter_is_lone_flate =
-                stream.dict.get("Filter") == Some(&Object::Name(b"FlateDecode".to_vec()));
+            let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
             let mut reencoded = match effective_stream_policy(options) {
                 Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
                 // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
@@ -2738,11 +2737,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                     //  - the *final* dict carries a lone /FlateDecode, so we
                     //    never drop a /Crypt chain (encryption) or a fallback
                     //    filter (decode/encode failure) by re-appending /Filter.
-                    let refiltered = matches!(
-                        effective_stream_policy(options),
-                        Some(CompressStreams::Yes)
-                    ) && !source_filter_is_lone_flate
-                        && s.dict.get("Filter") == Some(&Object::Name(b"FlateDecode".to_vec()));
+                    let refiltered =
+                        matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
+                            && !source_filter_is_lone_flate
+                            && is_lone_flate(s.dict.get("Filter"));
                     write_stream_to_buf_qpdf_order(
                         &mut bytes,
                         s,
@@ -3109,6 +3107,21 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// intentional: byte-identical agreement with qpdf is not a goal for this
 /// toggle.
 /// See [`CompressStreams`] for the full policy statement.
+/// Whether a stream's `/Filter` value is a lone `/FlateDecode` — either the
+/// bare name `/FlateDecode` or a single-element array `[ /FlateDecode ]`. PDF
+/// permits both forms (ISO 32000-1 §7.3.8.2), and qpdf preserves such streams
+/// (does not re-filter them), so the stream-dict key ordering must treat both
+/// the same way.
+fn is_lone_flate(filter: Option<&Object>) -> bool {
+    match filter {
+        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode",
+        Some(Object::Array(items)) => {
+            matches!(items.as_slice(), [Object::Name(name)] if name.as_slice() == b"FlateDecode")
+        }
+        _ => false,
+    }
+}
+
 pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {

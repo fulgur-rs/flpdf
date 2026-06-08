@@ -84,10 +84,12 @@ fn already_flate_source_keeps_length_last() {
         count(&out, b"/Filter /FlateDecode /Length ") >= 1,
         "expected qpdf preserve-order `<< /Filter /FlateDecode /Length N >>` for already-Flate source"
     );
-    // The re-filtered (/Length-first) form must NOT appear for these streams.
+    // The re-filtered, /Length-first dict form opens with `<< /Length ` — value
+    // independent. Every stream in attachment-two-page is already single-Flate
+    // (qpdf-produced) and therefore preserved, so no stream dict may open that
+    // way regardless of the deflate-backend-dependent length value.
     assert_eq!(
-        count(&out, b"<< /Length 85 /Filter /FlateDecode >>")
-            + count(&out, b"<< /Length 82 /Filter /FlateDecode >>"),
+        count(&out, b"<< /Length "),
         0,
         "already-Flate content stream was wrongly emitted in re-filtered /Length-first order"
     );
