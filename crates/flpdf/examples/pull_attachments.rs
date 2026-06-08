@@ -35,16 +35,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         flpdf::write_pdf_with_options(&mut pdf, out, &opts)?;
     }
 
+    // Expected payloads keyed by display name, used to verify the round-trip.
+    let expected: std::collections::HashMap<&str, &[u8]> = [
+        ("notes.txt", b"hello from flpdf".as_slice()),
+        ("data.csv", b"a,b,c\n1,2,3\n".as_slice()),
+    ]
+    .into_iter()
+    .collect();
+
     // Re-open and pull each attachment back out, asserting the round-trip.
     let mut pdf = Pdf::open(BufReader::new(File::open(&with_files)?))?;
     let infos = list_attachment_info(&mut pdf)?;
     let mut pulled = 0usize;
     for info in &infos {
         let bytes = extract_attachment(&mut pdf, &info.key)?;
-        let name = info
-            .display_name
-            .clone()
-            .unwrap_or_else(|| "<unnamed>".into());
+        let name = info.display_name.as_deref().unwrap_or("<unnamed>");
+        let want = expected
+            .get(name)
+            .unwrap_or_else(|| panic!("unexpected attachment name {name:?}"));
+        assert_eq!(
+            bytes, *want,
+            "payload mismatch for {name:?}: extracted bytes differ from the original"
+        );
         println!("  pulled {} ({} bytes)", name, bytes.len());
         pulled += 1;
     }

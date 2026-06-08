@@ -25,6 +25,9 @@ fn append_xref_trailer(out: &mut Vec<u8>, offsets: &BTreeMap<u32, u64>, last: u3
 
 /// Build a minimal multi-page PDF whose pages all share a single `/Font` object.
 ///
+/// Each page carries a distinct MediaBox width (`100 + 1-based page index`) so
+/// examples can observe page order.
+///
 /// Object layout:
 ///   1: Catalog
 ///   2: Pages root
@@ -59,11 +62,15 @@ pub fn build_shared_font_pdf(page_count: u32) -> Vec<u8> {
     );
 
     // 4 ..= 3+page_count: Page objects, each referencing shared font `3 0 R`.
+    // Give each page a distinct MediaBox width (`100 + 1-based page index`) so
+    // examples can observe page identity/order after a reorder or extract.
     for i in first_page..=last_page {
         offsets.insert(i, out.len() as u64);
+        let page_index = i - first_page + 1; // 1-based page position
+        let width = 100 + page_index;
         out.extend_from_slice(
             format!(
-                "{i} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                "{i} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} 792] \
                  /Resources << /Font << /F1 3 0 R >> >> >>\nendobj\n"
             )
             .as_bytes(),

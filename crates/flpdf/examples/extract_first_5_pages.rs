@@ -8,7 +8,9 @@ mod common;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 
-use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PagePlan, Pdf, WriteOptions};
+use flpdf::{
+    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, PagePlan, Pdf, WriteOptions,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // An 8-page source document (all pages share one font object).
@@ -32,10 +34,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = BufWriter::new(File::create(&out_path)?);
     flpdf::write_pdf_with_options(&mut pdf, out, &opts)?;
 
+    // Re-open and verify these are the *first* five pages by their distinct
+    // MediaBox widths (the fixture assigns width = 100 + 1-based page index, so
+    // pages 1..=5 carry widths 101..=105).
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
-    let count = page_refs(&mut out_pdf)?.len();
-    assert_eq!(count, 5, "expected 5 pages, got {count}");
-    println!("extract_first_5_pages: output has {count} pages");
+    let refs: Vec<ObjectRef> = page_refs(&mut out_pdf)?;
+    let mut widths = Vec::with_capacity(refs.len());
+    for page_ref in refs {
+        let mut helper = PageObjectHelper::new(page_ref, &mut out_pdf);
+        let mb = helper.media_box()?.ok_or("page has no MediaBox")?;
+        widths.push((mb.urx - mb.llx).round() as i64);
+    }
+    assert_eq!(
+        widths,
+        vec![101, 102, 103, 104, 105],
+        "expected the first five pages (widths 101..=105), got {widths:?}"
+    );
+    println!(
+        "extract_first_5_pages: output has {} pages, widths {:?}",
+        widths.len(),
+        widths
+    );
 
     drop(pdf);
     drop(out_pdf);

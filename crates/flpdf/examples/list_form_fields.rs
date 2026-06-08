@@ -14,8 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src_path = common::write_temp("forms-src", &common::build_acroform_pdf())?;
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
 
-    // `field_infos` reconstructs the dotted full name, resolves inherited
-    // `/FT` / `/V`, and follows indirect references for us.
+    // `field_infos` reconstructs each field's dotted full name and resolves
+    // inherited `/FT` / `/V` (following indirect references when present).
     let infos = pdf.acroform().field_infos()?;
     for info in &infos {
         let ft = info
@@ -30,6 +30,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} : /{} = {}", info.full_name, ft, value);
     }
     assert_eq!(infos.len(), 2, "expected 2 form fields, got {}", infos.len());
+
+    // The fixture provides a /Tx field `FirstName` and a /Btn field `Agree`;
+    // assert their field types (not just the count) so identity is verified.
+    let find = |name: &str| {
+        infos
+            .iter()
+            .find(|i| i.full_name == name)
+            .unwrap_or_else(|| panic!("missing field {name:?}"))
+    };
+    assert_eq!(
+        find("FirstName").field_type.as_deref(),
+        Some(b"Tx".as_ref()),
+        "FirstName should be a /Tx field"
+    );
+    assert_eq!(
+        find("Agree").field_type.as_deref(),
+        Some(b"Btn".as_ref()),
+        "Agree should be a /Btn field"
+    );
+
     println!("list_form_fields: {} field(s)", infos.len());
 
     drop(pdf);
