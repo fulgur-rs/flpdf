@@ -347,6 +347,40 @@ fn round_trip_never_mode() {
     run_round_trip_test(NewlineBeforeEndstream::Never);
 }
 
+/// qdf + `Never`: in QDF mode each stream's `/Length` becomes an indirect
+/// length-holder whose body is `on_disk_stream_len`, which for `Never` adds no
+/// EOL (holder == raw payload length). This asserts the *emitted* bytes: the
+/// payload is written verbatim with `endstream` immediately adjacent (no EOL),
+/// and the dict carries an indirect `/Length`. (Re-opening QDF + `Never` output
+/// is a separate code path and is not covered here.)
+#[test]
+fn qdf_never_emits_adjacent_endstream() {
+    let raw: &[u8] = b"qdf never-mode payload";
+    let source = build_minimal_pdf(raw);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.compress_streams = flpdf::CompressStreams::No;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    // Never = no EOL: the payload is immediately followed by `endstream`.
+    let adjacent = b"qdf never-mode payloadendstream";
+    assert!(
+        output.windows(adjacent.len()).any(|w| w == adjacent),
+        "qdf + Never must emit the payload adjacent to endstream (no EOL inserted)"
+    );
+    // QDF splits /Length into an indirect length-holder (`N 0 R`).
+    assert!(
+        rfind(&output, b" 0 R").is_some(),
+        "qdf must emit an indirect /Length holder"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Verify /Length excludes the inserted newline in E2E output (raw bytes check)
 // ---------------------------------------------------------------------------
