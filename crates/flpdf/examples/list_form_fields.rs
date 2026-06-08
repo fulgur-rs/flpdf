@@ -29,7 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("  {} : /{} = {}", info.full_name, ft, value);
     }
-    assert_eq!(infos.len(), 2, "expected 2 form fields, got {}", infos.len());
+    assert_eq!(
+        infos.len(),
+        2,
+        "expected 2 form fields, got {}",
+        infos.len()
+    );
 
     // The fixture provides a /Tx field `FirstName` and a /Btn field `Agree`;
     // assert their field types (not just the count) so identity is verified.

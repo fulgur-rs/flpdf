@@ -8,9 +8,7 @@ mod common;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 
-use flpdf::{
-    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, Pdf, WriteOptions,
-};
+use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, Pdf, WriteOptions};
 
 /// Read each page's MediaBox width (`urx - llx`, rounded to `i64`) in document
 /// order. The shared-font fixture assigns distinct widths so order is observable.
@@ -21,9 +19,7 @@ fn page_widths<R: std::io::Read + std::io::Seek>(
     let mut widths = Vec::with_capacity(refs.len());
     for page_ref in refs {
         let mut helper = PageObjectHelper::new(page_ref, pdf);
-        let mb = helper
-            .media_box()?
-            .ok_or("page has no MediaBox")?;
+        let mb = helper.media_box()?.ok_or("page has no MediaBox")?;
         widths.push((mb.urx - mb.llx).round() as i64);
     }
     Ok(widths)

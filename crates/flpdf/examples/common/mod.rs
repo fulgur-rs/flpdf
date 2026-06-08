@@ -99,7 +99,10 @@ pub fn build_acroform_pdf() -> Vec<u8> {
     let objs: [(u32, &str); 6] = [
         (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 3 0 R >>"),
         (2, "<< /Type /Pages /Kids [4 0 R] /Count 1 >>"),
-        (3, "<< /Fields [5 0 R 6 0 R] /DA (/Helv 0 Tf 0 g) /NeedAppearances true >>"),
+        (
+            3,
+            "<< /Fields [5 0 R 6 0 R] /DA (/Helv 0 Tf 0 g) /NeedAppearances true >>",
+        ),
         (
             4,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R 6 0 R] >>",
@@ -142,9 +145,15 @@ pub fn build_outline_pdf() -> Vec<u8> {
     let page = "/Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
                 /Resources << /Font << /F1 8 0 R >> >>";
     let objs: [(u32, String); 9] = [
-        (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >>".into()),
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >>".into(),
+        ),
         (2, "<< /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 >>".into()),
-        (3, "<< /Type /Outlines /First 6 0 R /Last 7 0 R /Count 3 >>".into()),
+        (
+            3,
+            "<< /Type /Outlines /First 6 0 R /Last 7 0 R /Count 3 >>".into(),
+        ),
         (4, format!("<< {page} >>")),
         (5, format!("<< {page} >>")),
         (
@@ -157,7 +166,10 @@ pub fn build_outline_pdf() -> Vec<u8> {
             7,
             "<< /Title (Chapter 2) /Parent 3 0 R /Prev 6 0 R /Dest [5 0 R /Fit] >>".into(),
         ),
-        (8, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+        (
+            8,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        ),
         (
             9,
             "<< /Title (Section 1.1) /Parent 6 0 R /Dest [4 0 R /Fit] >>".into(),
