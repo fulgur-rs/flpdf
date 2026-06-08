@@ -2905,8 +2905,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 write_qdf_trailer(&mut bytes, &trailer);
                 bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
             } else {
-                bytes.extend_from_slice(b"trailer\n");
-                trailer.write_pdf(&mut bytes);
+                // qpdf classic trailer: the dict sits on the `trailer ` line
+                // (single space, not its own line) with keys sorted but /ID
+                // forced last — `trailer << /Info .. /Root .. /Size N /ID [..]
+                // >>` (verified against qpdf 11.9.0 static-id goldens).
+                bytes.extend_from_slice(b"trailer ");
+                trailer.write_pdf_trailer(&mut bytes);
                 bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
             }
         }

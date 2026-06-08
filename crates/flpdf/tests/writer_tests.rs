@@ -2060,7 +2060,9 @@ fn parse_last_xref_generations(bytes: &[u8]) -> BTreeMap<u32, u16> {
     let mut generations = BTreeMap::new();
 
     while let Some(section) = lines.next() {
-        if section == "trailer" {
+        // The trailer keyword now carries its dict on the same line
+        // (`trailer << ... >>`), so match the prefix, not the bare word.
+        if section.starts_with("trailer") {
             break;
         }
 
@@ -2170,7 +2172,9 @@ fn parse_last_xref_table_entries(bytes: &[u8], startxref: usize) -> BTreeMap<u32
     let mut entries = BTreeMap::new();
 
     while let Some(section) = lines.next() {
-        if section == "trailer" {
+        // The trailer keyword now carries its dict on the same line
+        // (`trailer << ... >>`), so match the prefix, not the bare word.
+        if section.starts_with("trailer") {
             break;
         }
 
