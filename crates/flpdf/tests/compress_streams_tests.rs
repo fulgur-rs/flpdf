@@ -253,9 +253,12 @@ fn build_minimal_pdf_with_flate_stream() -> (Vec<u8>, Vec<u8>) {
 
     let mut bytes = b"%PDF-1.4\n".to_vec();
 
-    // obj 1: Catalog
+    // obj 1: Catalog. References the stream (obj 3) via /Metadata so it stays
+    // reachable from /Root and survives the writer's Catalog-first
+    // reachability walk (which drops objects unreachable from /Root).
     let cat_offset = bytes.len();
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
 
     // obj 2: Pages
     let pages_offset = bytes.len();
@@ -285,9 +288,29 @@ fn build_minimal_pdf_with_flate_stream() -> (Vec<u8>, Vec<u8>) {
     (bytes, raw)
 }
 
+/// Resolve the content stream that the Catalog references via `/Metadata`.
+///
+/// Full-rewrite output is renumbered Catalog-first, so the stream's object
+/// number is not stable; navigate by reference from `/Root` instead.
+fn resolve_metadata_stream<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pdf<R>) -> Stream {
+    use flpdf::Object;
+    let root = pdf.root_ref().expect("output must have a /Root");
+    let metadata_ref = match pdf.resolve(root).expect("resolve /Root") {
+        Object::Dictionary(d) => match d.get("Metadata") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
+        },
+        other => panic!("/Root must be a dictionary, got {other:?}"),
+    };
+    match pdf.resolve(metadata_ref).expect("resolve /Metadata") {
+        Object::Stream(s) => s,
+        other => panic!("/Metadata must be a stream, got {other:?}"),
+    }
+}
+
 #[test]
 fn full_rewrite_compress_no_strips_filter_from_all_streams() {
-    use flpdf::{write_pdf_with_options, Object, ObjectRef, Pdf, WriteOptions};
+    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
     use std::io::Cursor;
 
     let (source, original_raw) = build_minimal_pdf_with_flate_stream();
@@ -300,12 +323,11 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    // Re-open the output and inspect stream 3.
+    // Re-open the output and inspect the stream. Output object numbers are
+    // renumbered Catalog-first, so navigate via the Catalog's /Metadata ref
+    // rather than a hardcoded number.
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
-    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
-    let Object::Stream(stream) = stream_obj else {
-        panic!("object 3 should be a stream");
-    };
+    let stream = resolve_metadata_stream(&mut reopened);
 
     // /Filter must be absent.
     assert_eq!(
@@ -325,7 +347,7 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
 
 #[test]
 fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
-    use flpdf::{write_pdf_with_options, Object, ObjectRef, Pdf, WriteOptions};
+    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
     use std::io::Cursor;
 
     let (source, original_raw) = build_minimal_pdf_with_flate_stream();
@@ -339,10 +361,7 @@ fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
-    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
-    let Object::Stream(stream) = stream_obj else {
-        panic!("object 3 should be a stream");
-    };
+    let stream = resolve_metadata_stream(&mut reopened);
 
     // /Filter must be /FlateDecode.
     assert_eq!(

@@ -129,14 +129,16 @@ fn v4_aes128_wrong_password_is_rejected() {
 
 /// Richer round-trip on `compat/one-page.pdf` (has streams + content
 /// strings): after encryption + decryption via the reader path, the
-/// resolved `/Root` reference is the same as in the original plaintext
-/// input. This exercises per-object key derivation + AES IV/padding +
-/// `/Length` update on a non-trivial stream payload.
+/// resolved `/Root` is a valid `/Catalog`. This exercises per-object key
+/// derivation + AES IV/padding + `/Length` update on a non-trivial stream
+/// payload.
+///
+/// The full-rewrite writer renumbers objects Catalog-first (flpdf-9hc.32), so
+/// the output `/Root` number is NOT the input's; the round-trip property is
+/// that the trailer's `/Root` still resolves to the document catalog.
 #[test]
 fn v4_aes128_round_trip_on_one_page_resolves_to_same_root() {
     let input = fixture("tests/fixtures/compat/one-page.pdf");
-    let plain = Pdf::open(Cursor::new(input.clone())).unwrap();
-    let plain_root = plain.root_ref().expect("plaintext input has /Root");
 
     let encrypted = encrypt_to_bytes(
         &input,
@@ -144,10 +146,6 @@ fn v4_aes128_round_trip_on_one_page_resolves_to_same_root() {
     );
     let mut enc_pdf = open_encrypted(&encrypted, b"u");
     let enc_root = enc_pdf.root_ref().expect("encrypted output has /Root");
-    assert_eq!(
-        plain_root, enc_root,
-        "/Root reference number/generation must be preserved across the encrypt round-trip"
-    );
 
     // Resolve the catalog dictionary and verify it carries /Type /Catalog
     // after decryption (proves at least one full object decrypts cleanly).

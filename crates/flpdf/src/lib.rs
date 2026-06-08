@@ -85,6 +85,7 @@ pub mod permissions;
 pub mod qdf_fix;
 pub mod reader;
 pub mod resources;
+pub(crate) mod rewrite_renumber;
 pub mod rotate_spec;
 pub(crate) mod run_length;
 pub mod signatures;

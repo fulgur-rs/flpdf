@@ -206,6 +206,44 @@ boxes.  Float formatting in the `cm` matrix and the rewritten box values will
 differ from qpdf byte-for-byte.  See also existing entry `flpdf-9hc.9.9` above
 (this entry cross-links for completeness).
 
+### Plain-rewrite object renumbering (Catalog-first) — `.32`
+
+**Decision:** byte-identical (intent) — **renumber order achieved; full byte
+parity pending two follow-ups**  
+**Applies to:** `flpdf-9hc.32`  
+**Rationale:** The plain (non-linearized) full-rewrite path now renumbers output
+objects in qpdf's Catalog-first breadth-first order (seed the trailer `/Root`
+then remaining trailer indirect refs in sorted-key order; BFS descending into
+dictionary keys in lexicographic order and arrays in element order;
+first-encounter-wins; new numbers `1..=N`). This matches `qpdf --static-id`
+byte-for-byte for **all non-stream objects** (Catalog, Info, Pages, Page
+objects) and reproduces qpdf's exact object order and trailer
+(`/Info 2 0 R /Root 1 0 R`).
+
+**Behavior changes (qpdf-consistent):**
+- **Unreferenced objects are dropped.** The renumber numbers only objects
+  reachable from the trailer seed; unreachable ("orphan") objects are not
+  emitted, matching qpdf's default (no `--preserve-unreferenced`) and flpdf's
+  qdf/disable paths. ObjStm batches are filtered to reachable members so
+  generate/preserve modes drop orphans rather than failing.
+- **qdf `%% Original object ID: A`** now records the *input* number `A` while the
+  object header carries the renumbered *output* number `N` (`A != N` in general),
+  matching `qpdf --qdf`.
+
+**Full byte-identity is NOT yet reached.** Two further divergences remain,
+tracked as siblings under `flpdf-9hc.20`:
+- `flpdf-tqu1` — stream dictionaries must serialize with `/Length` first (qpdf
+  order); flpdf currently emits lexicographic key order.
+- `flpdf-onao` — deflate output parity. Standard zlib level 6 (the default)
+  reproduces qpdf's bytes exactly; available via the existing `qpdf-zlib-compat`
+  feature (classic libz), pinned to the linked libz version. The default
+  `miniz_oxide` backend diverges.
+
+Because `byte-equal` is all-or-nothing, the `tests/golden/compat-matrix.md`
+`byte-equal`/`qpdf-json` verdicts stay `diverge` until both land; only the
+`flpdf-sha` fingerprints were re-blessed for the renumber, and
+`structural=match` is preserved for all static-id rows.
+
 ## Cross-references
 
 - Subepic `flpdf-9hc.20`: bytes-identical roadmap (this registry is the

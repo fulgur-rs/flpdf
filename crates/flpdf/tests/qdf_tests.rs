@@ -56,8 +56,12 @@ fn build_minimal_pdf_with_stream(
 
     let mut bytes = b"%PDF-1.4\n".to_vec();
 
+    // The Catalog references the stream (obj 3) via /Metadata so it stays
+    // reachable from /Root and survives the writer's Catalog-first reachability
+    // walk (which drops objects unreachable from /Root).
     let cat_offset = bytes.len();
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
 
     let pages_offset = bytes.len();
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
@@ -177,7 +181,7 @@ fn qdf_mode_strips_filter_from_flate_stream() {
 
     // QDF output now uses indirect /Length (flpdf-9hc.6.12) which flpdf's
     // parser cannot yet re-read (flpdf-m41), so introspect the bytes.
-    let s = parse_qdf_stream(&output, 3);
+    let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
     // /Filter must be absent in QDF output.
     assert!(
@@ -227,7 +231,7 @@ fn qdf_mode_keeps_dct_stream_verbatim() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Indirect /Length (flpdf-9hc.6.12); parser re-read gated on flpdf-m41.
-    let s = parse_qdf_stream(&output, 3);
+    let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
     // /Filter must still be /DCTDecode (verbatim pass-through).
     assert!(
@@ -270,7 +274,7 @@ fn qdf_mode_length_matches_decoded_bytes() {
 
     // flpdf-9hc.6.12: /Length is now an INDIRECT `H 0 R` plus a separate
     // bare-integer holder object — qpdf 11.9.0 --qdf + flpdf::fix_qdf parity.
-    let s = parse_qdf_stream(&output, 3);
+    let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
     // The holder body must equal the ON-DISK byte count fix_qdf recomputes
     // (payload + the single EOL the Yes framing adds; raw has no trailing EOL).
@@ -334,11 +338,20 @@ fn qdf_mode_round_trip_content_preserved() {
     let mut final_output = Vec::new();
     write_pdf_with_options(&mut pdf2, &mut final_output, &compress_options).unwrap();
 
-    // Re-open and decode stream 3 — content must match original.
+    // Re-open and decode the stream — content must match original. Objects are
+    // renumbered Catalog-first, so navigate via the Catalog's /Metadata ref.
     let mut pdf3 = Pdf::open(Cursor::new(final_output)).unwrap();
-    let obj = pdf3.resolve(ObjectRef::new(3, 0)).unwrap();
+    let root = pdf3.root_ref().expect("output has /Root");
+    let metadata_ref = match pdf3.resolve(root).expect("resolve /Root") {
+        Object::Dictionary(d) => match d.get("Metadata") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
+        },
+        other => panic!("/Root must be a dictionary, got {other:?}"),
+    };
+    let obj = pdf3.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = obj else {
-        panic!("object 3 should be a stream after second rewrite");
+        panic!("/Metadata must be a stream after second rewrite");
     };
     let decoded =
         filters::decode_stream_data(&stream.dict, &stream.data).expect("second-pass decode");
@@ -346,6 +359,54 @@ fn qdf_mode_round_trip_content_preserved() {
         decoded.as_slice(),
         raw,
         "round-trip (QDF + rewrite) must recover original stream bytes"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (g2) qdf=true of qdf output: indirect /Length holders are reused and the
+//      Catalog-first renumber is stable, so a second qdf pass is byte-identical
+//      (with %% Original object ID comments suppressed, which necessarily track
+//      input numbering and would otherwise differ between passes).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn qdf_of_qdf_reuses_length_holders_and_is_byte_stable() {
+    let raw = b"qdf-of-qdf must reuse the indirect /Length holders.";
+    let compressed = flate_encode(raw);
+    let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.qdf = true;
+    // Suppress "%% Original object ID: N G": those comments record each object's
+    // number in the *input* file, which differs between pass 1 (original) and
+    // pass 2 (pass-1 output), so leaving them on would make the passes differ
+    // for a reason unrelated to the holder-reuse path under test.
+    opts.no_original_object_ids = true;
+    // Fix /ID so the comparison isolates the holder-reuse + renumber path; the
+    // second /ID element is otherwise content-derived and differs per pass.
+    opts.static_id = true;
+
+    // Pass 1: qdf rewrite introduces `/Length H 0 R` indirect holder objects.
+    let mut pass1 = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut pass1, &opts).unwrap();
+    assert!(
+        check_reader(Cursor::new(pass1.clone())).is_ok(),
+        "pass 1 qdf output must be structurally valid"
+    );
+
+    // Pass 2: qdf of the qdf output. The pre-pass must detect the existing
+    // holders, map them through the Catalog-first renumber, reuse their numbers
+    // (rather than allocating fresh ones), and skip re-emitting them as ordinary
+    // integer objects — yielding byte-identical output.
+    let mut pdf2 = Pdf::open(Cursor::new(pass1.clone())).unwrap();
+    let mut pass2 = Vec::new();
+    write_pdf_with_options(&mut pdf2, &mut pass2, &opts).unwrap();
+
+    assert_eq!(
+        pass1, pass2,
+        "qdf-of-qdf must be byte-stable: holders reused and renumber order stable"
     );
 }
 
@@ -370,7 +431,7 @@ fn qdf_mode_strips_filter_from_lzw_stream() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Indirect /Length (flpdf-9hc.6.12); parser re-read gated on flpdf-m41.
-    let s = parse_qdf_stream(&output, 3);
+    let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
     // /Filter must be absent after QDF decode.
     assert!(
@@ -743,27 +804,32 @@ fn qdf_original_object_id_comments_emitted_when_flag_false() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    // Helper: assert the comment+obj pair appears contiguously for (num, gen).
-    let check_pair = |num: u32, gen: u16| {
-        let comment_line = format!("%% Original object ID: {} {}\n", num, gen);
-        let obj_line = format!("{} {} obj\n", num, gen);
+    // Helper: assert the comment+obj pair appears contiguously. Objects are
+    // renumbered Catalog-first (flpdf-9hc.32), so the comment carries the
+    // ORIGINAL id while the "N G obj" header carries the NEW number; they are
+    // contiguous but no longer equal.
+    let check_pair = |old_num: u32, new_num: u32, gen: u16| {
+        let comment_line = format!("%% Original object ID: {} {}\n", old_num, gen);
+        let obj_line = format!("{} {} obj\n", new_num, gen);
         let pattern = format!("{}{}", comment_line, obj_line);
         let pattern_bytes = pattern.as_bytes();
         assert!(
             output
                 .windows(pattern_bytes.len())
                 .any(|w| w == pattern_bytes),
-            "expected contiguous pattern {:?} in QDF output (obj {} {})",
+            "expected contiguous pattern {:?} in QDF output (orig obj {} {})",
             pattern,
-            num,
+            old_num,
             gen
         );
     };
 
-    // Verify at least 3 distinct objects (1 0, 2 0, 3 0).
-    check_pair(1, 0);
-    check_pair(2, 0);
-    check_pair(3, 0);
+    // Verify all 3 reachable objects. The Catalog-first walk maps the input
+    // (Catalog 1, Pages 2, /Metadata stream 3) to new numbers Catalog->1,
+    // stream->2 (lexicographic /Metadata < /Pages), Pages->3.
+    check_pair(1, 1, 0); // Catalog
+    check_pair(3, 2, 0); // /Metadata stream
+    check_pair(2, 3, 0); // Pages
 
     // The output must still be a valid PDF (xref offsets point at "N G obj").
     let report = check_reader(Cursor::new(&output)).unwrap();
@@ -1098,6 +1164,26 @@ struct QdfStream {
     length_holder: u32,
 }
 
+/// Return the (renumbered) object number of the stream that the Catalog
+/// references via `/Metadata`.
+///
+/// Full-rewrite output is renumbered Catalog-first (flpdf-9hc.32), so the
+/// stream's number is not the input's; look it up from the output's Catalog
+/// rather than hardcoding. Reading the Catalog dict and the `/Metadata` ref
+/// number does not resolve the stream, so the indirect `/Length` holders in
+/// qdf output (which the reader cannot yet re-read) are irrelevant here.
+fn metadata_stream_number(output: &[u8]) -> u32 {
+    let mut pdf = Pdf::open(Cursor::new(output.to_vec())).expect("re-open qdf output");
+    let root = pdf.root_ref().expect("output has /Root");
+    match pdf.resolve(root).expect("resolve /Root") {
+        Object::Dictionary(d) => match d.get("Metadata") {
+            Some(Object::Reference(r)) => r.number,
+            other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
+        },
+        other => panic!("/Root must be a dictionary, got {other:?}"),
+    }
+}
+
 fn parse_qdf_stream(bytes: &[u8], obj_num: u32) -> QdfStream {
     let header = format!("\n{obj_num} 0 obj\n");
     let hpos = find_subslice(bytes, header.as_bytes())
@@ -1352,21 +1438,56 @@ fn qdf_empty_container_shape() {
     );
 }
 
-// Full parser-round-trip idempotence (qdf output re-fed through qdf rewrite)
-// requires `Pdf::open` of qdf output, which carries an indirect `/Length H 0 R`
-// the parser cannot yet read (flpdf-9hc.6.12 / flpdf-m41). The holder-reuse
-// logic in the writer (existing_holders detection + number reuse) is what
-// makes this byte-stable once the parser supports indirect lengths.
-// Un-ignore when flpdf-m41 lands.
+// Feeding qdf full-rewrite output back through qdf full-rewrite must produce a
+// valid PDF with the same objects, but is NOT byte-identical: the full-rewrite
+// writer renumbers objects Catalog-first (flpdf-9hc.32), and the
+// `%% Original object ID:` comments record the INPUT numbering, which
+// necessarily differs between pass 1 (raw fixture) and pass 2 (already
+// Catalog-first). qpdf behaves the same way (its --qdf comments also track the
+// input). Single-pass writer determinism is covered separately by
+// `qdf_rewrite_is_deterministic`; this test guards that the double pass neither
+// corrupts the file nor drops/duplicates objects.
 #[test]
 fn qdf_output_is_idempotent() {
     let source = std::fs::read("../../tests/fixtures/compat/three-page.pdf").unwrap();
     let once = qdf_rewrite(&source);
     let twice = qdf_rewrite(&once);
+
+    // The double-pass output must be a structurally valid PDF.
+    let report = check_reader(Cursor::new(&twice)).unwrap();
+    assert!(
+        report.valid,
+        "qdf-of-qdf output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // Both passes must emit the same set of object headers (no object dropped,
+    // added, or duplicated by the second renumber).
+    let headers = |bytes: &[u8]| -> std::collections::BTreeSet<u32> {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        text.lines()
+            .filter_map(|line| {
+                let rest = line.strip_suffix(" obj")?;
+                let mut it = rest.split_whitespace();
+                let num: u32 = it.next()?.parse().ok()?;
+                let _gen: u32 = it.next()?.parse().ok()?;
+                if it.next().is_some() {
+                    return None;
+                }
+                Some(num)
+            })
+            .collect()
+    };
+    let once_objs = headers(&once);
+    let twice_objs = headers(&twice);
+    assert!(
+        !twice_objs.is_empty(),
+        "qdf-of-qdf must emit object headers"
+    );
     assert_eq!(
-        once, twice,
-        "feeding qdf full-rewrite output back through qdf full-rewrite must \
-         be byte-identical"
+        once_objs, twice_objs,
+        "qdf-of-qdf must preserve the object-number set (Catalog-first renumber \
+         reorders emission but must not drop/add objects)"
     );
 }
 
@@ -1411,7 +1532,7 @@ fn passthrough_dct_stream_is_byte_identical_after_rewrite() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let s = parse_qdf_stream(&output, 3);
+    let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
     // /Filter must be preserved verbatim.
     assert!(
@@ -1448,7 +1569,7 @@ fn passthrough_ccitt_stream_with_decode_parms_is_byte_identical_after_rewrite() 
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let s = parse_qdf_stream(&output, 3);
+    let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
     // /Filter must be preserved verbatim.
     assert!(

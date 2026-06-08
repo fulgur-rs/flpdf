@@ -26,9 +26,12 @@
 //! See `docs/qpdf-compat-decisions.md` §AcroForm & annotation transforms.
 
 use assert_cmd::Command;
-use flpdf::{AnnotationObjectHelper, Object, ObjectRef, Pdf};
+use flpdf::{AnnotationObjectHelper, Object, Pdf};
 use std::fs::File;
 use std::io::BufReader;
+
+mod common;
+use common::first_widget_ref;
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -228,7 +231,7 @@ fn generate_appearances_tx_ap_n_contains_tj() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
 
     // /AP/N must be present after generate-appearances.
     // Use a block to end the borrow of `pdf` before the resolve call below.
@@ -278,7 +281,7 @@ fn generate_appearances_tx_skips_existing_ap() {
     // /AP/N must still be present; the existing stream content must contain the
     // original literal "(Hello) Tj ET" — not overwritten with a newly generated one.
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -335,7 +338,7 @@ fn generate_appearances_checkbox_creates_state_dict() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -393,7 +396,7 @@ fn generate_appearances_radio_creates_state_dict() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -438,7 +441,7 @@ fn generate_appearances_combo_ap_n_contains_tj() {
         .success();
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let widget_ref = ObjectRef::new(4, 0);
+    let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
         let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
         let ap = helper
@@ -581,12 +584,23 @@ fn flatten_print_removes_print_bit_annot_only() {
         annots.len()
     );
 
-    // The surviving annotation must be object 5 (the non-Print one, /F 0).
+    // The surviving annotation must be the non-Print widget. Identify it by
+    // the behavioral property (Print bit clear in /F) rather than its object
+    // number, which is unstable under the Catalog-first renumber. An absent /F
+    // means no flags set, i.e. no Print bit — that is exactly the survivor.
+    let survivor = pdf.resolve(annots[0].annot_ref).unwrap();
+    let survivor_dict = survivor
+        .as_dict()
+        .expect("surviving annotation must resolve to a dictionary");
+    // An absent /F means no flags set, i.e. no Print bit — that is the survivor.
+    let f = survivor_dict
+        .get("F")
+        .and_then(|o| o.as_integer())
+        .unwrap_or(0);
     assert_eq!(
-        annots[0].annot_ref,
-        ObjectRef::new(5, 0),
-        "surviving annotation must be the non-Print widget (5 0 R), got {}",
-        annots[0].annot_ref
+        f & 0x4,
+        0,
+        "surviving annotation must be the non-Print widget (Print bit clear in /F), got /F={f}"
     );
 
     // Page content must have a Do (from the Print-bit annotation being flattened).

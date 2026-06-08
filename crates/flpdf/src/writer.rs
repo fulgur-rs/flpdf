@@ -1534,6 +1534,50 @@ fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
     trailer.remove("Prev");
 }
 
+/// Remap the trailer's surviving indirect references to their Catalog-first
+/// (new) numbers.
+///
+/// `/Root` is overwritten by the caller with the new root ref and `/Encrypt`
+/// is written by [`apply_encrypt_trailer_entries`], so both are left untouched
+/// here. Every other indirect value (notably `/Info`, which the renumber walk
+/// always seeds) is rewritten through `map`; a value absent from the map is an
+/// error rather than a stale number leaking into the output.
+fn remap_trailer_refs(
+    trailer: &mut Dictionary,
+    map: &crate::rewrite_renumber::CatalogFirstRenumber,
+    deleted: &[ObjectRef],
+) -> Result<()> {
+    // Collect the (key, old_ref) pairs first; the trailer holds only a handful
+    // of entries, so the small Vec is cheaper than threading a mutable iterator.
+    let to_remap: Vec<(Vec<u8>, ObjectRef)> = trailer
+        .iter()
+        .filter(|(key, _)| *key != b"Root" && *key != b"Encrypt")
+        .filter_map(|(key, value)| match value {
+            Object::Reference(r) => Some((key.to_vec(), *r)),
+            _ => None,
+        })
+        .collect();
+    for (key, old) in to_remap {
+        // A trailer reference to a deleted object (e.g. `/Info` pointing at a
+        // freed entry in malformed/edited input) has no body in the output and
+        // is not in the renumber map. Remapping it would leave the trailer
+        // pointing at a free xref row, corrupting the file on reopen — so drop
+        // the key entirely instead (the object is gone; the reference is moot).
+        if deleted.contains(&old) {
+            trailer.remove(&key);
+            continue;
+        }
+        let new = map.new_for_original(old).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "renumber: trailer /{} reference {old} absent from map",
+                String::from_utf8_lossy(&key)
+            ))
+        })?;
+        trailer.insert(key, Object::Reference(new));
+    }
+    Ok(())
+}
+
 fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
     let has_xref_stream_markers = matches!(trailer.get("Type"), Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef")
         || trailer.get("XRefStm").is_some()
@@ -2167,6 +2211,16 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         return Err(crate::Error::Missing("/Root"));
     };
 
+    // Catalog-first renumber (flpdf-9hc.32): assign output object numbers in
+    // qpdf's `enqueueObjectsStandard` BFS order so that plain rewrite output is
+    // byte-identical to `qpdf --static-id`. `build` borrows `pdf` mutably (lazy
+    // load) and returns an owned map, releasing the borrow before the loop.
+    let renumber = crate::rewrite_renumber::CatalogFirstRenumber::build(pdf)?;
+    // The new /Root reference (always seeded first by the walk, so present).
+    let new_root = renumber
+        .new_for_original(root_ref)
+        .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
+
     refuse_signed_full_rewrite(pdf, options)?;
 
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
@@ -2212,7 +2266,23 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     } else {
         object_streams::planner_config_from_options(options)
     };
-    let plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+    let mut plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+
+    // Drop ObjStm members that are not reachable from the trailer seed. The
+    // planner draws candidates from the full live-object universe with a
+    // type-only eligibility filter, so an eligible-but-unreachable object
+    // (e.g. an orphan dict referenced by nothing) can be batched even though
+    // the Catalog-first renumber map (which drives emission) omits it. Such an
+    // object has no NEW number, so leaving it in a batch would make the
+    // renumber-map lookups below fail and abort the whole write. Filtering
+    // here — before the `plan.batches.is_empty()` xref-form decision below —
+    // drops the orphan from every container; the main emit loop already only
+    // emits objects present in the renumber map, so the orphan disappears
+    // cleanly (qpdf-consistent, matching flpdf's qdf/disable paths).
+    for batch in &mut plan.batches {
+        batch.retain(|member| renumber.new_for_original(*member).is_some());
+    }
+    plan.batches.retain(|batch| !batch.is_empty());
 
     // Xref form selection: ObjStm-resident objects need type-2 xref entries,
     // which can only live in xref streams.  When the planner emits any batch
@@ -2278,10 +2348,16 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     }
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
-    let mut object_refs = pdf.object_refs();
-    object_refs.sort_by_key(|r| (r.number, r.generation));
+    // Drive emission from the Catalog-first map: `(new_ref, old_ref)` pairs in
+    // ascending new-number order. The new numbers are a contiguous `1..=N`, so
+    // `existing_max` is simply `N` and aux objects (ObjStm containers,
+    // /Encrypt, qdf length-holders) allocate above it. Object 0 / deleted refs
+    // are never reachable from /Root, so they never appear here.
+    let renumbered: Vec<(ObjectRef, ObjectRef)> = renumber.pairs().collect();
 
-    let existing_max: u32 = object_refs.iter().map(|r| r.number).max().unwrap_or(0);
+    let existing_max: u32 = u32::try_from(renumber.len()).map_err(|_| {
+        crate::Error::Unsupported("full-rewrite: renumbered object count overflows u32".to_string())
+    })?;
 
     // Allocate a fresh object number for each container above existing_max.
     let container_refs: Vec<ObjectRef> = (1..=plan.batches.len())
@@ -2297,13 +2373,28 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             )
         })?;
 
-    // member_to_batch: ObjectRef → (container_obj_num, index_in_batch)
+    // member_to_batch: ORIGINAL ObjectRef → (container_obj_num, index_in_batch).
+    // Keyed on ORIGINAL refs because the main emit loop tests membership against
+    // each object's ORIGINAL ref to decide whether to skip it (it lives in an
+    // ObjStm instead of being emitted as a plain indirect).
     use std::collections::HashMap;
     let mut member_to_batch: HashMap<ObjectRef, (u32, u32)> = HashMap::new();
+    // member_new_to_batch: NEW member object number → (container_obj_num,
+    // index_in_batch). Keyed on NEW numbers because the type-2 (compressed)
+    // xref entries are written in NEW-number space; each member's xref slot must
+    // be located by the number it carries in the renumbered output.
+    let mut member_new_to_batch: HashMap<u32, (u32, u32)> = HashMap::new();
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_num = container_refs[batch_idx].number;
         for (idx_in_batch, &member_ref) in batch.iter().enumerate() {
             member_to_batch.insert(member_ref, (container_num, idx_in_batch as u32));
+            // ObjStm members are reachable objects (Catalog/Pages/etc.), so they
+            // are present in the Catalog-first renumber map. A member absent from
+            // the map is a planner/renumber inconsistency — surface it.
+            let new = renumber.new_for_original(member_ref).ok_or_else(|| {
+                crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
+            })?;
+            member_new_to_batch.insert(new.number, (container_num, idx_in_batch as u32));
         }
     }
 
@@ -2360,16 +2451,23 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // the main loop and (b) REUSE their number H rather than allocating a
     // fresh one — making `flpdf --qdf` of its own qdf output byte-stable.
     use std::collections::HashSet;
+    // Holder numbers found here are recorded in NEW-number space, because the
+    // /Length reference inside each stream is rewritten by
+    // `renumber_refs_in_place` before it is consulted in the main loop. We
+    // resolve via the ORIGINAL ref (`old_ref`) but map the holder's old number
+    // through `renumber` to the new number used downstream.
     let mut existing_holders: HashSet<u32> = HashSet::new();
     if options.qdf {
-        for object_ref in &object_refs {
-            if Some(*object_ref) == pdf.encryption_ref() || member_to_batch.contains_key(object_ref)
-            {
+        for (_new_ref, old_ref) in &renumbered {
+            // `pdf.encryption_ref()` and `member_to_batch` are original-space.
+            if Some(*old_ref) == pdf.encryption_ref() || member_to_batch.contains_key(old_ref) {
                 continue;
             }
-            if let Ok(Object::Stream(s)) = pdf.resolve_borrowed(*object_ref) {
+            if let Ok(Object::Stream(s)) = pdf.resolve_borrowed(*old_ref) {
                 if let Some(Object::Reference(r)) = s.dict.get("Length") {
-                    existing_holders.insert(r.number);
+                    if let Some(new_holder) = renumber.new_for_original(*r) {
+                        existing_holders.insert(new_holder.number);
+                    }
                 }
             }
         }
@@ -2412,42 +2510,57 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // allocation for that size.
     let skip_refs = pdf.deleted_object_refs();
 
-    for object_ref in &object_refs {
-        if Some(*object_ref) == pdf.encryption_ref() {
+    for (new_ref, old_ref) in &renumbered {
+        // `pdf.encryption_ref()`, `skip_refs` (deleted_object_refs), and
+        // `member_to_batch` are all keyed on ORIGINAL refs, so compare with
+        // `old_ref`. (Object 0 / deleted refs are unreachable from /Root and
+        // never appear in `renumbered`, but the guards stay for parity.)
+        if Some(*old_ref) == pdf.encryption_ref() {
             continue;
         }
 
         // Never emit object 0 or any free/deleted entry as a body object (qpdf
         // parity, all modes). The xref free-list head and any free rows are
         // still written into the regenerated `xref` table below.
-        if object_ref.number == 0 || skip_refs.contains(object_ref) {
+        if old_ref.number == 0 || skip_refs.contains(old_ref) {
             continue;
         }
 
         // ── Step 4: skip members that will be routed into an ObjStm batch ───
-        if member_to_batch.contains_key(object_ref) {
+        if member_to_batch.contains_key(old_ref) {
             continue;
         }
 
         // QDF length-holder objects from a prior qdf pass are reconstructed
         // (with the recomputed length) below; do not re-emit them here as
-        // ordinary integer objects, or idempotence breaks.
-        if options.qdf && existing_holders.contains(&object_ref.number) {
+        // ordinary integer objects, or idempotence breaks. `existing_holders`
+        // is in NEW-number space, so compare against `new_ref`.
+        if options.qdf && existing_holders.contains(&new_ref.number) {
             continue;
         }
 
-        // Resolve the object; propagate the error so callers see corrupt input
-        // rather than getting a silent success with missing /Root descendants.
-        let mut object = pdf.resolve(*object_ref)?;
+        // Resolve the object via its ORIGINAL ref; propagate the error so
+        // callers see corrupt input rather than a silent success with missing
+        // /Root descendants.
+        let mut object = pdf.resolve(*old_ref)?;
+
+        // Rewrite every internal reference to its new number BEFORE any
+        // string-encryption or stream policy looks at the object, so all
+        // downstream code sees new-number space.
+        crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
 
         // flpdf-9hc.4.9: encrypt every string inside this object's resolved
         // graph. Stream PAYLOAD encryption happens later (after the compress
         // policy reencode), and the /Encrypt dict object itself is exempt per
         // PDF 1.7 §7.6.1 ("strings and streams inside the encryption
         // dictionary are not encrypted").
+        // `ctx.encrypt_ref` is the freshly-allocated output /Encrypt slot (above
+        // the new max), so it lives in NEW-number space — compare and key the
+        // per-object encryption against `new_ref`, NOT `old_ref`. The encryption
+        // key derives from the object number, so it MUST be the new number.
         if let Some(ctx) = &encrypt_ctx {
-            if *object_ref != ctx.encrypt_ref {
-                encrypt_strings_in_object_for_writer(*object_ref, &mut object, ctx)?;
+            if *new_ref != ctx.encrypt_ref {
+                encrypt_strings_in_object_for_writer(*new_ref, &mut object, ctx)?;
             }
         }
 
@@ -2464,11 +2577,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             }
         }
 
-        // Duplicate detection (same contract as write_qdf).
-        if offsets.contains_key(&object_ref.number) {
+        // Duplicate detection (same contract as write_qdf). `offsets` is keyed
+        // on the emitted (NEW) number.
+        if offsets.contains_key(&new_ref.number) {
             return Err(crate::Error::Unsupported(format!(
                 "duplicate object number {} in xref table",
-                object_ref.number
+                new_ref.number
             )));
         }
 
@@ -2478,19 +2592,22 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         // 11.9.0 --qdf output.  Suppressed when no_original_object_ids=true.
         // The xref offset below is recorded AFTER the comment so it still
         // points at the "N G obj" line, not at the comment.
+        // The comment records the ORIGINAL object id (qpdf prints the pre-
+        // renumber number here), so use `old_ref`.
         if options.qdf && !options.no_original_object_ids {
             bytes.extend_from_slice(
                 format!(
                     "%% Original object ID: {} {}\n",
-                    object_ref.number, object_ref.generation
+                    old_ref.number, old_ref.generation
                 )
                 .as_bytes(),
             );
         }
 
+        // The body header uses the emitted (NEW) number.
         let emit_offset = bytes.len();
         bytes.extend_from_slice(
-            format!("{} {} obj\n", object_ref.number, object_ref.generation).as_bytes(),
+            format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes(),
         );
 
         if let Object::Stream(stream) = object {
@@ -2520,10 +2637,15 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // /Length is updated to the encrypted byte count (AES-CBC adds a
             // 16-byte IV prefix and PKCS#7 padding). Skip for the /Encrypt
             // object itself.
+            // `ctx.encrypt_ref` is the output /Encrypt slot (NEW space) and the
+            // payload key derives from the object number, so both the skip-check
+            // and the key use `new_ref`. `ctx.metadata_ref` comes from
+            // `resolve_metadata_stream_ref`, an ORIGINAL ref, so it is compared
+            // against `old_ref`.
             if let Some(ctx) = &encrypt_ctx {
-                if *object_ref != ctx.encrypt_ref {
+                if *new_ref != ctx.encrypt_ref {
                     if let Object::Stream(ref mut s) = reencoded {
-                        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*object_ref) {
+                        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*old_ref) {
                             // --cleartext-metadata: leave the /Metadata XMP
                             // stream in the clear and prepend /Crypt /Identity so
                             // readers know not to decrypt it (flpdf-9hc.4.9.6).
@@ -2533,7 +2655,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                                 b"Identity",
                             );
                         } else {
-                            encrypt_stream_payload_for_writer(*object_ref, s, ctx)?;
+                            encrypt_stream_payload_for_writer(*new_ref, s, ctx)?;
                         }
                     }
                 }
@@ -2622,13 +2744,27 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         if options.qdf {
             bytes.push(b'\n');
         }
-        offsets.insert(object_ref.number, (object_ref.generation, emit_offset));
+        offsets.insert(new_ref.number, (new_ref.generation, emit_offset));
     }
 
     // ── Step 5: emit each ObjStm container ───────────────────────────────────
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_ref = container_refs[batch_idx];
-        let body = object_streams::emit_objstm_body(pdf, batch)?;
+        // Resolve each member by its ORIGINAL ref, rewrite its internal
+        // references to NEW numbers, and pair it with its NEW ref so the ObjStm
+        // pair table records the renumbered member number. Without this the
+        // members keep their old numbers and old internal links, corrupting the
+        // Catalog-first output (e.g. Catalog /Pages would dangle).
+        let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(batch.len());
+        for &old in batch {
+            let mut obj = pdf.resolve(old)?;
+            crate::rewrite_renumber::renumber_refs_in_place(&mut obj, &renumber)?;
+            let new = renumber.new_for_original(old).ok_or_else(|| {
+                crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
+            })?;
+            resolved.push((new, obj));
+        }
+        let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
@@ -2723,8 +2859,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // Trailer — start from the document trailer, strip incremental keys.
             let mut trailer = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut trailer);
+            // Remap surviving indirect trailer refs (notably /Info) to NEW
+            // numbers. /Root is overwritten explicitly with new_root below, and
+            // /Encrypt is handled by apply_encrypt_trailer_entries, so skip both.
+            remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
             trailer.insert("Size", Object::Integer(object_count as i64));
-            trailer.insert("Root", Object::Reference(root_ref));
+            trailer.insert("Root", Object::Reference(new_root));
             apply_encrypt_trailer_entries(&mut trailer, pdf, options, encrypt_ctx.as_ref());
 
             if options.qdf {
@@ -2776,7 +2916,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         ),
                     );
                 } else if let Some(&(container_num, index_in_batch)) =
-                    member_to_batch.get(&ObjectRef::new(number, 0))
+                    member_new_to_batch.get(&number)
                 {
                     // Member object that lives inside an ObjStm container.
                     // Compressed members have implicit generation 0; the
@@ -2829,6 +2969,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
             let mut xref_dict = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut xref_dict);
+            // Remap surviving indirect trailer refs (notably /Info) to NEW
+            // numbers. /Root is set explicitly to new_root below; /Encrypt is
+            // handled by apply_encrypt_trailer_entries.
+            remap_trailer_refs(&mut xref_dict, &renumber, &skip_refs)?;
             // The trailer may carry filter keys from the input's xref stream
             // (e.g. /Filter /FlateDecode). We're emitting freshly built bytes
             // via `Stream::new`, so any stale filter declaration would make
@@ -2850,7 +2994,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 ]),
             );
             xref_dict.insert("Index", Object::Array(index_array));
-            xref_dict.insert("Root", Object::Reference(root_ref));
+            xref_dict.insert("Root", Object::Reference(new_root));
 
             // Apply the compress_streams policy: FlateDecode-compress the xref
             // binary payload when Yes, or store raw bytes when No.
@@ -3155,6 +3299,56 @@ fn write_qdf_trailer(bytes: &mut Vec<u8>, trailer: &Dictionary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite_renumber::CatalogFirstRenumber;
+
+    #[test]
+    fn remap_trailer_refs_remaps_live_and_drops_deleted() {
+        // /Info points at a live object (10 -> new 3); /Meta points at a
+        // deleted object (20). The live ref must be remapped; the deleted ref's
+        // key must be dropped (not remapped to a free xref row). /Root and
+        // /Encrypt are left for the caller and must be untouched here.
+        let map = CatalogFirstRenumber::from_pairs_for_test(&[
+            (ObjectRef::new(1, 0), ObjectRef::new(1, 0)),
+            (ObjectRef::new(10, 0), ObjectRef::new(3, 0)),
+        ]);
+        let mut trailer = Dictionary::new();
+        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
+        trailer.insert("Info", Object::Reference(ObjectRef::new(10, 0)));
+        trailer.insert("Meta", Object::Reference(ObjectRef::new(20, 0)));
+        trailer.insert("Size", Object::Integer(4));
+
+        let deleted = [ObjectRef::new(20, 0)];
+        remap_trailer_refs(&mut trailer, &map, &deleted).expect("remap");
+
+        assert_eq!(
+            trailer.get("Info"),
+            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            "live /Info must be remapped to its new number"
+        );
+        assert!(
+            trailer.get("Meta").is_none(),
+            "/Meta pointing at a deleted object must be dropped, not remapped"
+        );
+        // /Root is filtered from remapping (caller owns it) and stays as-is.
+        assert_eq!(
+            trailer.get("Root"),
+            Some(&Object::Reference(ObjectRef::new(1, 0)))
+        );
+    }
+
+    #[test]
+    fn remap_trailer_refs_errors_on_unmapped_live_ref() {
+        // A non-deleted trailer ref absent from the map is a real
+        // inconsistency and must surface as an error, not a stale number.
+        let map = CatalogFirstRenumber::from_pairs_for_test(&[(
+            ObjectRef::new(1, 0),
+            ObjectRef::new(1, 0),
+        )]);
+        let mut trailer = Dictionary::new();
+        trailer.insert("Info", Object::Reference(ObjectRef::new(99, 0)));
+        let err = remap_trailer_refs(&mut trailer, &map, &[]).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(_)));
+    }
 
     fn id_array(d: &Dictionary) -> Vec<Object> {
         match d.get("ID") {
@@ -3728,11 +3922,13 @@ mod tests {
     fn static_aes_iv_forces_all_zero_ivs_for_streams_and_strings() {
         use std::io::Cursor;
 
-        // build_partition_fixture has a real content stream (obj 4 = b"hello"),
-        // so encryption actually exercises AES stream IV generation. minimal.pdf
-        // has no streams and no encryptable strings, so it would never emit an
-        // IV and the zero-IV assertion below would be vacuous.
-        let fixture = build_partition_fixture();
+        // build_string_and_stream_fixture has a content stream reachable from
+        // /Root (obj 4 = b"hello", referenced via the Catalog's /Metadata), so
+        // it survives the Catalog-first reachability walk and encryption
+        // exercises AES stream IV generation. minimal.pdf has no streams and no
+        // encryptable strings, so it would never emit an IV and the zero-IV
+        // assertion below would be vacuous.
+        let fixture = build_string_and_stream_fixture();
 
         let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
         let mut out = Vec::new();
@@ -3830,8 +4026,14 @@ mod tests {
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let mut entries: Vec<(u32, u16, usize)> = Vec::new();
 
+        // The Catalog references the stream via /Metadata so it stays reachable
+        // from /Root; the /Title dict is reachable as the trailer's /Info. Both
+        // survive the writer's Catalog-first reachability walk (flpdf-9hc.32),
+        // which drops objects unreachable from /Root and the trailer seeds.
         entries.push((1, 0, bytes.len()));
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n",
+        );
 
         entries.push((2, 0, bytes.len()));
         bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
@@ -3861,6 +4063,40 @@ mod tests {
             .as_bytes(),
         );
         bytes
+    }
+
+    /// Resolve the `/Title` string and the content-stream payload from a
+    /// re-opened encrypted output of [`build_string_and_stream_fixture`].
+    ///
+    /// The Catalog-first renumber reassigns output object
+    /// numbers, so navigate by reference (trailer `/Info` for the `/Title`
+    /// dict, Catalog `/Metadata` for the stream) rather than hardcoding numbers.
+    fn resolve_title_and_stream<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
+        let info_ref = match rt.trailer().get("Info") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("trailer /Info must be a reference, got {other:?}"),
+        };
+        let title = match rt.resolve(info_ref).expect("resolve /Info") {
+            Object::Dictionary(d) => match d.get("Title") {
+                Some(Object::String(s)) => s.clone(),
+                other => panic!("/Title must be a string, got {other:?}"),
+            },
+            other => panic!("/Info must be a dictionary, got {other:?}"),
+        };
+
+        let root_ref = rt.root_ref().expect("root_ref");
+        let metadata_ref = match rt.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get("Metadata") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"),
+        };
+        let stream = match rt.resolve(metadata_ref).expect("resolve /Metadata") {
+            Object::Stream(s) => s.data,
+            other => panic!("/Metadata must be a stream, got {other:?}"),
+        };
+        (title, stream)
     }
 
     /// Encrypt with V=5 R=6 AES-256, then re-open with flpdf
@@ -3901,31 +4137,19 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("re-open of V=5 output with {label:?} failed: {e}"));
 
-            // String pass: obj 3 /Title must decrypt to the original plaintext.
-            let obj3 = rt.resolve(ObjectRef::new(3, 0)).expect("resolve obj 3");
-            let dict = match obj3 {
-                Object::Dictionary(d) => d,
-                other => panic!("obj 3 must be a dictionary, got {other:?}"),
-            };
-            match dict.get("Title") {
-                Some(Object::String(s)) => assert_eq!(
-                    s.as_slice(),
-                    b"TopSecretTitle",
-                    "V=5 R=6 string must round-trip via reader for {label:?}"
-                ),
-                other => panic!("/Title must be a string, got {other:?}"),
-            }
-
-            // Stream pass: obj 4 payload must decrypt to the original "hello".
-            let obj4 = rt.resolve(ObjectRef::new(4, 0)).expect("resolve obj 4");
-            match obj4 {
-                Object::Stream(s) => assert_eq!(
-                    s.data.as_slice(),
-                    b"hello",
-                    "V=5 R=6 stream must round-trip via reader for {label:?}"
-                ),
-                other => panic!("obj 4 must be a stream, got {other:?}"),
-            }
+            // String pass: /Title (via trailer /Info) must decrypt to plaintext.
+            // Stream pass: /Metadata (via Catalog) payload must decrypt.
+            let (title, stream) = resolve_title_and_stream(&mut rt);
+            assert_eq!(
+                title.as_slice(),
+                b"TopSecretTitle",
+                "V=5 R=6 string must round-trip via reader for {label:?}"
+            );
+            assert_eq!(
+                stream.as_slice(),
+                b"hello",
+                "V=5 R=6 stream must round-trip via reader for {label:?}"
+            );
         }
     }
 
@@ -3966,31 +4190,19 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("re-open of V=5 R=5 output with {label:?} failed: {e}"));
 
-            // String pass: obj 3 /Title must decrypt to the original plaintext.
-            let obj3 = rt.resolve(ObjectRef::new(3, 0)).expect("resolve obj 3");
-            let dict = match obj3 {
-                Object::Dictionary(d) => d,
-                other => panic!("obj 3 must be a dictionary, got {other:?}"),
-            };
-            match dict.get("Title") {
-                Some(Object::String(s)) => assert_eq!(
-                    s.as_slice(),
-                    b"TopSecretTitle",
-                    "V=5 R=5 string must round-trip via reader for {label:?}"
-                ),
-                other => panic!("/Title must be a string, got {other:?}"),
-            }
-
-            // Stream pass: obj 4 payload must decrypt to the original "hello".
-            let obj4 = rt.resolve(ObjectRef::new(4, 0)).expect("resolve obj 4");
-            match obj4 {
-                Object::Stream(s) => assert_eq!(
-                    s.data.as_slice(),
-                    b"hello",
-                    "V=5 R=5 stream must round-trip via reader for {label:?}"
-                ),
-                other => panic!("obj 4 must be a stream, got {other:?}"),
-            }
+            // String pass: /Title (via trailer /Info) must decrypt to plaintext.
+            // Stream pass: /Metadata (via Catalog) payload must decrypt.
+            let (title, stream) = resolve_title_and_stream(&mut rt);
+            assert_eq!(
+                title.as_slice(),
+                b"TopSecretTitle",
+                "V=5 R=5 string must round-trip via reader for {label:?}"
+            );
+            assert_eq!(
+                stream.as_slice(),
+                b"hello",
+                "V=5 R=5 stream must round-trip via reader for {label:?}"
+            );
         }
     }
 
@@ -4040,24 +4252,15 @@ mod tests {
                 )
                 .unwrap_or_else(|e| panic!("re-open {label} failed: {e}"));
 
-                let obj3 = rt.resolve(ObjectRef::new(3, 0)).expect("resolve obj 3");
-                let dict = match obj3 {
-                    Object::Dictionary(d) => d,
-                    other => panic!("obj 3 must be a dict, got {other:?}"),
-                };
-                match dict.get("Title") {
-                    Some(Object::String(s)) => {
-                        assert_eq!(s.as_slice(), b"TopSecretTitle", "{label} string round-trip")
-                    }
-                    other => panic!("/Title must be a string, got {other:?}"),
-                }
-                let obj4 = rt.resolve(ObjectRef::new(4, 0)).expect("resolve obj 4");
-                match obj4 {
-                    Object::Stream(s) => {
-                        assert_eq!(s.data.as_slice(), b"hello", "{label} stream round-trip")
-                    }
-                    other => panic!("obj 4 must be a stream, got {other:?}"),
-                }
+                // Navigate by reference (trailer /Info, Catalog /Metadata)
+                // rather than hardcoded numbers, since output is renumbered.
+                let (title, stream) = resolve_title_and_stream(&mut rt);
+                assert_eq!(
+                    title.as_slice(),
+                    b"TopSecretTitle",
+                    "{label} string round-trip"
+                );
+                assert_eq!(stream.as_slice(), b"hello", "{label} stream round-trip");
             }
         }
     }

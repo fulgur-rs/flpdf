@@ -79,8 +79,12 @@ fn plain_full_rewrite_does_not_emit_object_0_as_body() {
 /// shrink `/Size` past it and is a different (also-correct) outcome.
 #[test]
 fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
-    // Source with four objects; objects 3 and 4 are unreferenced leaves, so
-    // deleting object 3 leaves object 4 as the max and keeps 3 inside /Size.
+    // Source with four objects. The Catalog references both leaves (obj 3 and
+    // obj 4) via /Aux keys so both are reachable from /Root and would normally
+    // be emitted; deleting object 3 must therefore leave a genuine gap. (Under
+    // the Catalog-first renumber an UNreferenced object is dropped like any
+    // other unreachable object, so the deleted-vs-emitted distinction is only
+    // observable when the object is reachable.)
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     let add = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
@@ -88,7 +92,7 @@ fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
         bytes.extend_from_slice(object);
     };
     add(
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Aux1 3 0 R /Aux2 4 0 R >>\nendobj\n",
         &mut bytes,
         &mut offsets,
     );
@@ -131,16 +135,34 @@ fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &opts).unwrap();
 
+    // The deleted object's body must not be re-emitted. Objects are renumbered
+    // Catalog-first, so identify the deleted object by its (unique) content
+    // rather than its original number.
     assert!(
-        !contains_subslice(&output, b"3 0 obj"),
-        "plain full rewrite must not emit the deleted object 3 as a body object"
+        !contains_subslice(&output, b"/Unreferenced 3"),
+        "plain full rewrite must not emit the deleted object's body"
     );
-    // Object 3's slot survives as a free row in the rebuilt table.
+    // The deleted object was reachable from /Root, so it received a new number
+    // during the renumber walk but was skipped at emission. Its slot therefore
+    // survives as a free `f` row, leaving a single non-zero gap in the rebuilt
+    // table (object 4's body is still emitted under its new number).
     let latest_entries = parse_last_xref_entries(&output);
+    let free_nonzero: Vec<u32> = latest_entries
+        .iter()
+        .filter(|(num, kind)| **num != 0 && **kind == b'f')
+        .map(|(num, _)| *num)
+        .collect();
     assert_eq!(
-        latest_entries.get(&3),
-        Some(&b'f'),
-        "deleted object 3 must remain a free xref entry"
+        free_nonzero.len(),
+        1,
+        "exactly one non-zero free xref slot must mark the deleted object \
+         (entries: {latest_entries:?})"
+    );
+    // The surviving reachable object (obj 4's `/Unreferenced 4`) must still be
+    // present, proving only the deleted object was dropped.
+    assert!(
+        contains_subslice(&output, b"/Unreferenced 4"),
+        "the non-deleted reachable leaf must still be emitted"
     );
 
     let report = check_reader(Cursor::new(output)).unwrap();
@@ -154,6 +176,22 @@ fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
 /// Returns true when `haystack` contains `needle` as a contiguous subslice.
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Resolve the reference the Catalog stores under `/Metadata`.
+///
+/// Full-rewrite output is renumbered Catalog-first (flpdf-9hc.32), so a stream
+/// referenced as the Catalog's `/Metadata` has an unstable object number;
+/// navigate to it by reference rather than hardcoding a number.
+fn metadata_stream_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
+    let root = pdf.root_ref().expect("output must have a /Root");
+    match pdf.resolve(root).expect("resolve /Root") {
+        Object::Dictionary(d) => match d.get("Metadata") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
+        },
+        other => panic!("/Root must be a dictionary, got {other:?}"),
+    }
 }
 
 /// flpdf-9hc.13.2: default (no-flag) /ID strategy, full-rewrite path.
@@ -1796,8 +1834,14 @@ fn write_qdf_header_has_binary_marker() {
     );
 }
 
+/// A full rewrite normalizes every object's generation to 0 and drops objects
+/// unreachable from `/Root`. This fixture's `/Root` is `1 3 R` (a non-zero
+/// input generation — the sole mixed-generation exercise of the Catalog-first
+/// renumber map) and object 3 is an orphan, so after the qdf full rewrite the
+/// catalog must reappear at generation 0 and the orphan must be gone. (qpdf
+/// behaves the same way: full rewrite renumbers everything to `1..=N` gen 0.)
 #[test]
-fn writes_qdf_with_object_generations() {
+fn writes_qdf_normalizes_object_generations() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
 
@@ -1836,10 +1880,29 @@ fn writes_qdf_with_object_generations() {
     let mut output = Vec::new();
     write_qdf(&mut pdf, &mut output).unwrap();
 
+    // Re-open and verify the normalization contract via references, not
+    // hardcoded numbers.
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let root = reopened.root_ref().expect("output has /Root");
+    assert_eq!(
+        root.generation, 0,
+        "full rewrite must normalize the /Root generation to 0 (was 3)"
+    );
+    match reopened.resolve(root).expect("resolve /Root") {
+        Object::Dictionary(d) => assert_eq!(
+            d.get("Type"),
+            Some(&Object::Name(b"Catalog".to_vec())),
+            "the generation-3 catalog content must survive the renumber"
+        ),
+        other => panic!("/Root must be a dictionary, got {other:?}"),
+    }
+
+    // The orphan (obj 3, unreachable from /Root) must be dropped.
     let rendered = String::from_utf8_lossy(&output);
-    assert!(rendered.contains("1 3 obj"));
-    assert!(rendered.contains("3 0 obj"));
-    assert!(rendered.contains(" 00003 n"));
+    assert!(
+        !rendered.contains("/Orphan"),
+        "object unreachable from /Root must be dropped by the full rewrite"
+    );
 }
 
 #[test]
@@ -2581,9 +2644,12 @@ fn build_minimal_pdf_with_stream(stream_data: &[u8]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::<usize>::new();
 
-    // object 1: catalog
+    // object 1: catalog. References the stream (obj 3) via /Metadata so it
+    // stays reachable from /Root and survives the Catalog-first reachability
+    // walk (which drops objects unreachable from /Root).
     offsets.push(bytes.len());
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     // object 2: pages
     offsets.push(bytes.len());
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
@@ -2635,9 +2701,12 @@ fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::<usize>::new();
 
-    // object 1: catalog
+    // object 1: catalog. References the stream (obj 3) via /Metadata so it
+    // stays reachable from /Root and survives the Catalog-first reachability
+    // walk (which drops objects unreachable from /Root).
     offsets.push(bytes.len());
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     // object 2: pages
     offsets.push(bytes.len());
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
@@ -2718,9 +2787,10 @@ fn full_rewrite_single_flatedecode_filter() {
 
     // Re-open and inspect stream 3's filter.
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
-    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let metadata_ref = metadata_stream_ref(&mut reopened);
+    let stream_obj = reopened.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
-        panic!("object 3 should be a stream");
+        panic!("/Metadata must resolve to a stream");
     };
     match stream.dict.get("Filter") {
         Some(Object::Name(name)) => {
@@ -2763,9 +2833,10 @@ fn full_rewrite_multi_filter_decodes_and_reencodes() {
 
     // Stream 3 should now have a single FlateDecode filter (not ASCII85+Flate).
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
-    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let metadata_ref = metadata_stream_ref(&mut reopened);
+    let stream_obj = reopened.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
-        panic!("object 3 should be a stream");
+        panic!("/Metadata must resolve to a stream");
     };
     // Filter must NOT be an array containing ASCII85Decode.
     match stream.dict.get("Filter") {
@@ -3085,8 +3156,11 @@ fn build_pdf_with_external_file_stream() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::<usize>::new();
 
+    // The Catalog references the stream (obj 3) via /Metadata so it stays
+    // reachable from /Root and survives the Catalog-first reachability walk.
     offsets.push(bytes.len());
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     offsets.push(bytes.len());
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
     offsets.push(bytes.len());
@@ -3129,9 +3203,10 @@ fn full_rewrite_strips_external_file_ref_from_reencoded_stream() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
-    let stream_obj = reopened.resolve(ObjectRef::new(3, 0)).unwrap();
+    let metadata_ref = metadata_stream_ref(&mut reopened);
+    let stream_obj = reopened.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
-        panic!("object 3 should be a stream");
+        panic!("/Metadata must resolve to a stream");
     };
     for key in ["F", "FFilter", "FDecodeParms"] {
         assert!(
