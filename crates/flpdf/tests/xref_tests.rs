@@ -314,3 +314,21 @@ fn corrupt_xref_pdf() -> Vec<u8> {
     }
     corrupted
 }
+
+#[test]
+fn rejects_startxref_offset_beyond_eof_without_panic() {
+    // Regression test for GitHub issue #304: a `startxref` offset pointing past
+    // the end of the file must yield a parse error, not panic when the xref
+    // stream branch slices `bytes[xref_pos..]`.
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    // Point startxref well beyond the end of the buffer.
+    let beyond_eof = bytes.len() + 4096;
+    bytes.extend_from_slice(format!("startxref\n{beyond_eof}\n%%EOF\n").as_bytes());
+
+    let mut reader = Cursor::new(bytes);
+    let err = load_xref_and_trailer(&mut reader)
+        .expect_err("startxref past EOF should error, not panic");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}

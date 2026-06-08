@@ -459,7 +459,10 @@ fn parse_xref_stream(
     startxref: u64,
     version: String,
 ) -> Result<LoadedXref> {
-    let (_, object) = parse_indirect_object(&bytes[xref_pos..])?;
+    let tail = bytes
+        .get(xref_pos..)
+        .ok_or_else(|| Error::parse(xref_pos, "xref stream offset is beyond end of file"))?;
+    let (_, object) = parse_indirect_object(tail)?;
     let stream = match object {
         Object::Stream(stream) => stream,
         _ => {
