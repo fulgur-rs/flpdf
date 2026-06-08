@@ -1408,3 +1408,275 @@ fn deep_inline_next_chain_terminates_at_depth_bound() {
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
 }
+
+/// GoTo /SD -> StructElem(/Pg sibling) keeps the sibling reachable unless /SD is
+/// neutralized. (flpdf-2tmg, ISO 32000-2 §12.6.4.3.)
+fn cross_page_sd_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /GoTo /SD [8 0 R /Fit] >> >>"),
+            (8, "<< /Type /StructElem /S /P /Pg 4 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_goto_sd_absent_page_is_neutralized() {
+    let mut src = Pdf::open(std::io::Cursor::new(cross_page_sd_pdf())).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "GoTo /SD sibling must be pruned"
+    );
+    assert_eq!(
+        count_type(&mut out, b"StructElem"),
+        0,
+        "StructElem reachable only via the neutralized /SD must be swept"
+    );
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let action = annot.get("A").unwrap().as_dict().unwrap();
+    assert_eq!(
+        action.get("S"),
+        Some(&flpdf::Object::Name(b"GoTo".to_vec())),
+        "GoTo action retained"
+    );
+    assert!(
+        action.get("SD").is_none(),
+        "/SD must be neutralized (removed)"
+    );
+}
+
+#[test]
+fn action_goto_sd_self_page_is_preserved() {
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /GoTo /SD [8 0 R /Fit] >> >>"),
+            (8, "<< /Type /StructElem /S /P /Pg 3 0 R >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let action = annot.get("A").unwrap().as_dict().unwrap();
+    assert!(
+        action.get("SD").is_some(),
+        "self-page /SD must be preserved"
+    );
+}
+
+#[test]
+fn action_goto_sd_named_dest_is_preserved() {
+    // A named structure destination (/SD is a name, not an array) carries no
+    // in-doc page ref, so it never pulled a sibling in; leave it untouched.
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /GoTo /SD /SomeStructDest >> >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let action = annot.get("A").unwrap().as_dict().unwrap();
+    assert!(
+        action.get("SD").is_some(),
+        "named structure destination /SD must be preserved"
+    );
+}
+
+#[test]
+fn annot_p_absent_page_is_neutralized() {
+    // A malformed annotation /P points at the SIBLING page (obj 4); the closure
+    // copies the sibling as a stub. Dropping /P makes it unreachable.
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /P 4 0 R >>",
+            ),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "sibling reached via annotation /P must be pruned"
+    );
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    assert!(annot.get("P").is_none(), "absent-page /P must be dropped");
+}
+
+#[test]
+fn annot_p_self_page_is_preserved() {
+    // /P points at the extracted page itself: kept (remapped to the new ref).
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /P 3 0 R >>",
+            ),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    assert!(annot.get("P").is_some(), "self-page /P must be preserved");
+}
+
+#[test]
+fn bead_p_absent_page_is_neutralized() {
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [10 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [11 0 R] >>",
+            ),
+            // Bead ring: 10 (on kept page) <-> 11 (on sibling page).
+            (
+                10,
+                "<< /T 12 0 R /N 11 0 R /V 11 0 R /P 3 0 R /R [0 0 10 10] >>",
+            ),
+            (
+                11,
+                "<< /T 12 0 R /N 10 0 R /V 10 0 R /P 4 0 R /R [0 0 10 10] >>",
+            ),
+            (12, "<< /T (Article) /F 10 0 R >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "sibling reached via bead /P must be pruned"
+    );
+    // The kept page's /B is retained (qpdf keeps the ring).
+    let leaf = only_leaf(&mut out);
+    assert!(leaf.get("B").is_some(), "page /B must be retained");
+
+    // The kept page's own bead (obj 10) targets the kept page, so its /P must
+    // survive neutralization and still resolve to a /Type /Page dictionary.
+    let bead_ref = match leaf.get("B") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /B array, got {other:?}"),
+    };
+    let bead = out.resolve(bead_ref).unwrap().into_dict().unwrap();
+    let p_ref = bead
+        .get("P")
+        .and_then(flpdf::Object::as_ref_id)
+        .expect("kept bead /P must be preserved as a page reference");
+    let p_page = out.resolve(p_ref).unwrap().into_dict().unwrap();
+    assert_eq!(
+        p_page.get("Type"),
+        Some(&flpdf::Object::Name(b"Page".to_vec())),
+        "preserved bead /P must resolve to a /Type /Page"
+    );
+}
+
+#[test]
+fn bead_p_absent_page_via_indirect_chain_is_neutralized() {
+    // The sibling bead (obj 11) is reached from the on-page bead's /N through an
+    // indirect-reference chain (obj 13 is itself `11 0 R`). The ring walk must
+    // normalize the link to the terminal bead, else bead 11's /P 4 0 R is never
+    // inspected and the sibling page leaks.
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [10 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [11 0 R] >>",
+            ),
+            // On-page bead 10 links to the sibling bead through obj 13, which is
+            // an indirect reference to bead 11 (a reference-to-reference chain).
+            (
+                10,
+                "<< /T 12 0 R /N 13 0 R /V 13 0 R /P 3 0 R /R [0 0 10 10] >>",
+            ),
+            (13, "11 0 R"),
+            (
+                11,
+                "<< /T 12 0 R /N 10 0 R /V 10 0 R /P 4 0 R /R [0 0 10 10] >>",
+            ),
+            (12, "<< /T (Article) /F 10 0 R >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "sibling reached via an indirect bead chain must be pruned"
+    );
+    let leaf = only_leaf(&mut out);
+    assert!(leaf.get("B").is_some(), "page /B must be retained");
+}

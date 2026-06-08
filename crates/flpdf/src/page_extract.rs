@@ -24,10 +24,21 @@
 //! (`/URI`, `/GoToR`) destinations carry no in-document page reference and are
 //! left untouched, as are destinations targeting the extracted page itself.
 //!
-//! Only explicit page destinations (`/D`) are neutralized. A GoTo action's
-//! structure destination (`/SD`, ISO 32000-2 §12.6.4.3) is not inspected, so a
-//! `/SD` pointing into another page's structure tree can keep that page
-//! reachable in the output.
+//! Both kinds of page destination are neutralized when they target an absent
+//! page: an explicit destination (`/D`) and a GoTo action's structure
+//! destination (`/SD`, ISO 32000-2 §12.6.4.3), the latter resolved through its
+//! structure element's `/Pg`.
+//!
+//! # Cross-page page references
+//!
+//! Two further page references are dropped when they point at an absent page: a
+//! malformed annotation `/P` (the page an annotation belongs to) and an
+//! article-thread bead `/P`, reached by walking the page's `/B` thread ring
+//! through each bead's `/N` and `/V` links. The `/B` array and the bead ring
+//! itself are otherwise retained, matching qpdf's single-page output; a
+//! retained bead whose dangling `/P` was dropped therefore lacks the `/P` key.
+//! This is a deliberate parity tradeoff: qpdf likewise leaves the orphaned ring
+//! in place rather than splicing it.
 
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
@@ -206,6 +217,67 @@ fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRe
             target.set_object(page_ref, Object::Dictionary(page));
         }
     }
+
+    neutralize_bead_ring(target, page_ref)?;
+    Ok(())
+}
+
+/// Walk the article-thread bead ring reachable from this page's `/B` and drop
+/// each bead's `/P` that targets an absent page. `/N`/`/V` link beads (not
+/// pages), so they never leak; only the page-valued `/P` is neutralized. The
+/// ring is bounded by `visited` (each bead handled once). The `/B` array and
+/// the beads themselves are retained — only dangling `/P` keys are dropped,
+/// matching qpdf's single-page output.
+///
+/// `/B`, `/N`, and `/V` may each be an indirect-reference chain, so every link
+/// is normalized through [`resolve_ref_chain`] to the terminal bead object:
+/// this both reaches the bead body through a chain and ensures the write-back
+/// targets the real bead, not an intermediate reference holder.
+fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
+    let b_val = {
+        let page_obj = target.resolve_borrowed(page_ref)?;
+        let Some(page_dict) = page_obj.as_dict() else {
+            return Ok(());
+        };
+        page_dict.get("B").cloned()
+    };
+    let Some(b_val) = b_val else {
+        return Ok(());
+    };
+    // /B may itself be an indirect reference to the bead array; normalize it.
+    let (b_concrete, _) = resolve_ref_chain(target, &b_val)?;
+    let Object::Array(beads) = b_concrete else {
+        return Ok(());
+    };
+    let mut queue: Vec<ObjectRef> = beads.iter().filter_map(Object::as_ref_id).collect();
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    while let Some(start_ref) = queue.pop() {
+        // Resolve the link to the terminal bead object so an indirect chain
+        // still reaches the bead, and so `set_object` below rewrites the real
+        // bead rather than an intermediate reference holder.
+        let (concrete, terminal) = resolve_ref_chain(target, &Object::Reference(start_ref))?;
+        let bead_ref = terminal.unwrap_or(start_ref);
+        if !visited.insert(bead_ref) {
+            continue;
+        }
+        let Some(mut bead) = concrete.into_dict() else {
+            continue;
+        };
+        // Enqueue ring neighbours before mutating.
+        for key in ["N", "V"] {
+            if let Some(Object::Reference(r)) = bead.get(key) {
+                queue.push(*r);
+            }
+        }
+        // Inspect `/P` first; only `remove` it and write the bead back when it
+        // is actually dropped, so a kept bead's stored `/P` is never rewritten.
+        if let Some(p_val) = bead.get("P") {
+            if p_targets_absent_page(target, p_val, page_ref)? {
+                bead.remove("P");
+                target.set_object(bead_ref, Object::Dictionary(bead));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -254,6 +326,16 @@ fn neutralize_annot_if_absent(
             changed = true;
         } else {
             annot.insert("AA", aa_val);
+        }
+    }
+
+    // /P — the page this annotation belongs to. A malformed /P pointing at an
+    // absent (sibling) page keeps that page's stub reachable; drop it.
+    if let Some(p_val) = annot.remove("P") {
+        if p_targets_absent_page(target, &p_val, keep)? {
+            changed = true;
+        } else {
+            annot.insert("P", p_val);
         }
     }
 
@@ -380,6 +462,13 @@ fn neutralize_action_chain(
                 act.insert("D", d_val);
             }
         }
+        if let Some(sd_val) = act.remove("SD") {
+            if sd_targets_absent_page(target, &sd_val, keep)? {
+                changed = true;
+            } else {
+                act.insert("SD", sd_val);
+            }
+        }
     }
 
     // /Next — a single action or an array of actions. Recurse into each. The
@@ -453,6 +542,69 @@ fn dest_targets_absent_page(
         Some(page_ref) => page_ref != keep,
         None => false,
     })
+}
+
+/// `true` when a GoTo `/SD` structure destination resolves to a page other than
+/// `keep`. An `/SD` value is `[structElemRef /Fit ...]` (or an indirect ref to
+/// one); the first element is a *structure element*, whose `/Pg` is the target
+/// page (ISO 32000-2 §12.6.4.3). Named structure destinations (a name/string,
+/// resolved via the structure tree) carry no in-document page ref and return
+/// `false`. A missing / unresolvable / non-Page `/Pg`, or a `/Pg` pointing at
+/// `keep`, returns `false` (kept conservatively). Each level may be indirect;
+/// `resolve_ref_chain` bounds the indirection.
+fn sd_targets_absent_page(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    sd: &Object,
+    keep: ObjectRef,
+) -> Result<bool> {
+    let (concrete, _) = resolve_ref_chain(target, sd)?;
+    let Object::Array(arr) = concrete else {
+        return Ok(false); // named structure destination or malformed
+    };
+    let Some(struct_elem) = arr.into_iter().next() else {
+        return Ok(false);
+    };
+    let (se, _) = resolve_ref_chain(target, &struct_elem)?;
+    let Some(se_dict) = se.into_dict() else {
+        return Ok(false);
+    };
+    let Some(pg) = se_dict.get("Pg").cloned() else {
+        return Ok(false);
+    };
+    let (pg_concrete, pg_ref) = resolve_ref_chain(target, &pg)?;
+    // Unlike `dest_targets_absent_page`, where the `/D` array's first element IS
+    // the page ref, `/SD` reaches the page through an extra StructElem -> `/Pg`
+    // hop, so confirm the resolved `/Pg` target is actually a `/Type /Page`
+    // before treating it as a droppable cross-page destination.
+    Ok(match pg_ref {
+        Some(r) => r != keep && is_page_dict(&pg_concrete),
+        None => false,
+    })
+}
+
+/// `true` when `p` (an annotation's or bead's `/P`) resolves to a Page object
+/// other than `keep`. On an annotation (ISO 32000-2 §12.5.2, Table 166) or an
+/// article bead (§12.4.3), `/P` denotes the page the object belongs to, so a
+/// `/P` pointing at an absent page is dangling and dropped. Non-Page /
+/// unresolvable / `keep` targets return `false` (kept) — the `is_page_dict`
+/// gate also keeps any non-page `/P` (e.g. a StructElem's parent `/P`).
+fn p_targets_absent_page(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    p: &Object,
+    keep: ObjectRef,
+) -> Result<bool> {
+    let (concrete, p_ref) = resolve_ref_chain(target, p)?;
+    Ok(match p_ref {
+        Some(r) => r != keep && is_page_dict(&concrete),
+        None => false,
+    })
+}
+
+/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
+fn is_page_dict(obj: &Object) -> bool {
+    obj.as_dict()
+        .and_then(|d| d.get("Type"))
+        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
 }
 
 /// Minimal valid target: Catalog(1) + empty Pages(2). No placeholder page (so
