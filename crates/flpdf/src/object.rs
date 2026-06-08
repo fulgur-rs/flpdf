@@ -652,6 +652,36 @@ impl Dictionary {
         out.extend_from_slice(b" >>");
     }
 
+    /// Serialize a document trailer dictionary in qpdf's trailer key order,
+    /// appending to `out`.
+    ///
+    /// qpdf writes the trailer with every key in sorted (`BTreeMap`) order
+    /// **except `/ID`, which is pulled out and emitted last** — structurally the
+    /// same special-casing it applies to `/Length` in stream dictionaries (see
+    /// [`write_pdf_stream`](Self::write_pdf_stream)). Verified against
+    /// `qpdf --static-id` 11.9.0: `<< /Info .. /Root .. /Size N /ID [..] >>`.
+    /// Layout otherwise matches [`write_pdf`](Self::write_pdf) (compact, one
+    /// line). If `/ID` is absent the output is plain sorted order.
+    pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"<<");
+        let mut id_value: Option<&Object> = None;
+        for (key, value) in self.iter() {
+            if key == b"ID" {
+                id_value = Some(value);
+                continue;
+            }
+            out.extend_from_slice(b" /");
+            out.extend_from_slice(key);
+            out.push(b' ');
+            value.write_pdf(out);
+        }
+        if let Some(value) = id_value {
+            out.extend_from_slice(b" /ID ");
+            value.write_pdf(out);
+        }
+        out.extend_from_slice(b" >>");
+    }
+
     /// Serialize this dictionary in qpdf `--qdf` formatting: `<<` then one
     /// `  /Key value` entry per line (keys in lexicographic-by-raw-name order,
     /// which is qpdf's alphabetical sort, with exactly one ASCII space between
@@ -781,6 +811,39 @@ mod stream_dict_order_tests {
             out,
             b"<< /Filter /FlateDecode /Params << >> /Type /EmbeddedFile /Length 90 >>".to_vec()
         );
+    }
+
+    /// The document trailer serializes every key in sorted order with `/ID`
+    /// forced last, matching `qpdf --static-id`
+    /// (`trailer << /Info .. /Root .. /Size N /ID [..] >>`).
+    #[test]
+    fn trailer_emits_sorted_keys_with_id_last() {
+        let mut d = Dictionary::new();
+        // Inserted out of order; BTreeMap sorts, write_pdf_trailer pulls /ID last.
+        d.insert(b"Size", Object::Integer(8));
+        d.insert(
+            b"ID",
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+        );
+        d.insert(b"Info", Object::reference(ObjectRef::new(2, 0)));
+        d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
+        let mut out = Vec::new();
+        d.write_pdf_trailer(&mut out);
+        assert_eq!(
+            out,
+            b"<< /Info 2 0 R /Root 1 0 R /Size 8 /ID [ 1 2 ] >>".to_vec()
+        );
+    }
+
+    /// A trailer without `/ID` is plain sorted order (no special handling).
+    #[test]
+    fn trailer_without_id_is_sorted() {
+        let mut d = Dictionary::new();
+        d.insert(b"Size", Object::Integer(3));
+        d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
+        let mut out = Vec::new();
+        d.write_pdf_trailer(&mut out);
+        assert_eq!(out, b"<< /Root 1 0 R /Size 3 >>".to_vec());
     }
 
     /// Re-filtered multi-key dict: the other keys stay sorted, `/Filter` and

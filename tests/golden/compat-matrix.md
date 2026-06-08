@@ -32,18 +32,18 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 
 | fixture | flag | flpdf-sha | byte-equal | qpdf-json | structural |
 |---|---|---|---|---|---|
-| one-page.pdf | plain | 1b87f88903706506 | diverge | diverge | diverge |
-| one-page.pdf | static-id | 1b87f88903706506 | diverge | diverge | match |
+| one-page.pdf | plain | ac8ca6312f2a918e | diverge | diverge | diverge |
+| one-page.pdf | static-id | ac8ca6312f2a918e | diverge | diverge | match |
 | one-page.pdf | linearize | fb658663d4e0279b | diverge | diverge | diverge |
-| two-page.pdf | plain | f73e03cf89b29454 | diverge | diverge | diverge |
-| two-page.pdf | static-id | f73e03cf89b29454 | diverge | diverge | match |
+| two-page.pdf | plain | bad1dc13c53a93f8 | diverge | diverge | diverge |
+| two-page.pdf | static-id | bad1dc13c53a93f8 | diverge | diverge | match |
 | two-page.pdf | linearize | da753dfb99362045 | diverge | diverge | diverge |
-| three-page.pdf | plain | d4790f8a66c2f7b2 | diverge | diverge | diverge |
-| three-page.pdf | static-id | d4790f8a66c2f7b2 | diverge | diverge | match |
+| three-page.pdf | plain | 261c0e31280434aa | diverge | diverge | diverge |
+| three-page.pdf | static-id | 261c0e31280434aa | diverge | diverge | match |
 | three-page.pdf | linearize | dc33b6ebd71fcc28 | diverge | diverge | diverge |
-| linearized-one-page.pdf | plain | 1fd244b4e327ffbe | diverge | diverge | diverge |
-| attachment-two-page.pdf | plain | 69aa6fffab5efade | diverge | diverge | diverge |
-| attachment-two-page.pdf | static-id | 69aa6fffab5efade | diverge | diverge | match |
-| one-page.pdf | stream-data-uncompress | c6ea9deacd7b7786 | diverge | diverge | diverge |
-| two-page.pdf | stream-data-uncompress | d3c44246b4220167 | diverge | diverge | diverge |
-| three-page.pdf | stream-data-uncompress | 773b072825bd52e3 | diverge | diverge | diverge |
+| linearized-one-page.pdf | plain | 31180d37257abf16 | diverge | diverge | diverge |
+| attachment-two-page.pdf | plain | 90e0aad41c003854 | diverge | diverge | diverge |
+| attachment-two-page.pdf | static-id | 90e0aad41c003854 | diverge | diverge | match |
+| one-page.pdf | stream-data-uncompress | 2459b51d8e02a0ee | diverge | diverge | diverge |
+| two-page.pdf | stream-data-uncompress | 62b2ffa29d429247 | diverge | diverge | diverge |
+| three-page.pdf | stream-data-uncompress | 316464990dd79893 | diverge | diverge | diverge |

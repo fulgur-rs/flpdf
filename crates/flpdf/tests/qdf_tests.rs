@@ -1591,7 +1591,8 @@ fn passthrough_ccitt_stream_with_decode_parms_is_byte_identical_after_rewrite() 
 
 #[test]
 fn non_qdf_output_keeps_compact_dict_form() {
-    // Regression guard: this layer must not change any non-qdf serialization.
+    // Regression guard: non-qdf bodies stay compact single-line dicts, and the
+    // classic trailer matches qpdf (dict on the `trailer ` line, /ID last).
     let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
     let mut options = WriteOptions::default();
@@ -1610,8 +1611,19 @@ fn non_qdf_output_keeps_compact_dict_form() {
         text.contains("<< /Count 0 /Kids [ ] /Type /Pages >>"),
         "non-qdf full-rewrite must keep compact dicts and inline empty arrays"
     );
+    // The non-qdf classic trailer matches qpdf: the dict is on the `trailer `
+    // line (single space, not its own line) with keys sorted but /ID last
+    // (`trailer << /Root 1 0 R /Size 3 /ID [..] >>`).
     assert!(
-        text.contains("trailer\n<<"),
-        "non-qdf trailer must keep the 'trailer\\n<<' compact form"
+        text.contains("trailer << "),
+        "non-qdf trailer dict must sit on the 'trailer ' line (qpdf style)"
+    );
+    assert!(
+        !text.contains("trailer\n<<"),
+        "non-qdf trailer must not put the dict on its own line"
+    );
+    assert!(
+        text.contains("/Size 3 /ID ["),
+        "non-qdf trailer must emit /ID last (after /Size), matching qpdf"
     );
 }
