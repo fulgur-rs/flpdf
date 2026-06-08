@@ -3107,21 +3107,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 /// intentional: byte-identical agreement with qpdf is not a goal for this
 /// toggle.
 /// See [`CompressStreams`] for the full policy statement.
-/// Whether a stream's `/Filter` value is a lone `/FlateDecode` — either the
-/// bare name `/FlateDecode` or a single-element array `[ /FlateDecode ]`. PDF
-/// permits both forms (ISO 32000-1 §7.3.8.2), and qpdf preserves such streams
-/// (does not re-filter them), so the stream-dict key ordering must treat both
-/// the same way.
-fn is_lone_flate(filter: Option<&Object>) -> bool {
-    match filter {
-        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode",
-        Some(Object::Array(items)) => {
-            matches!(items.as_slice(), [Object::Name(name)] if name.as_slice() == b"FlateDecode")
-        }
-        _ => false,
-    }
-}
-
 pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
     // Decode the stream through whatever filters are declared in its dict.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
@@ -3176,6 +3161,21 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
             );
             Object::Stream(crate::Stream::new(new_dict, decoded))
         }
+    }
+}
+
+/// Whether a stream's `/Filter` value is a lone `/FlateDecode` — either the
+/// bare name `/FlateDecode` or a single-element array `[ /FlateDecode ]`. PDF
+/// permits both forms (ISO 32000-1 §7.3.8.2), and qpdf preserves such streams
+/// (does not re-filter them), so the stream-dict key ordering must treat both
+/// the same way.
+fn is_lone_flate(filter: Option<&Object>) -> bool {
+    match filter {
+        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode",
+        Some(Object::Array(items)) => {
+            matches!(items.as_slice(), [Object::Name(name)] if name.as_slice() == b"FlateDecode")
+        }
+        _ => false,
     }
 }
 
