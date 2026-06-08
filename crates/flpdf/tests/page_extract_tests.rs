@@ -1636,3 +1636,47 @@ fn bead_p_absent_page_is_neutralized() {
         "preserved bead /P must resolve to a /Type /Page"
     );
 }
+
+#[test]
+fn bead_p_absent_page_via_indirect_chain_is_neutralized() {
+    // The sibling bead (obj 11) is reached from the on-page bead's /N through an
+    // indirect-reference chain (obj 13 is itself `11 0 R`). The ring walk must
+    // normalize the link to the terminal bead, else bead 11's /P 4 0 R is never
+    // inspected and the sibling page leaks.
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [10 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [11 0 R] >>",
+            ),
+            // On-page bead 10 links to the sibling bead through obj 13, which is
+            // an indirect reference to bead 11 (a reference-to-reference chain).
+            (
+                10,
+                "<< /T 12 0 R /N 13 0 R /V 13 0 R /P 3 0 R /R [0 0 10 10] >>",
+            ),
+            (13, "11 0 R"),
+            (
+                11,
+                "<< /T 12 0 R /N 10 0 R /V 10 0 R /P 4 0 R /R [0 0 10 10] >>",
+            ),
+            (12, "<< /T (Article) /F 10 0 R >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "sibling reached via an indirect bead chain must be pruned"
+    );
+    let leaf = only_leaf(&mut out);
+    assert!(leaf.get("B").is_some(), "page /B must be retained");
+}

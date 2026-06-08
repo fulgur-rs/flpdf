@@ -467,7 +467,7 @@ git commit -m "fix: drop article-thread bead /P targeting absent pages on extrac
 
 The current text (lines 27-30) claims `/SD` is not inspected — now false. Replace:
 
-```
+```text
 //! Only explicit page destinations (`/D`) are neutralized. A GoTo action's
 //! structure destination (`/SD`, ISO 32000-2 §12.6.4.3) is not inspected, so a
 //! `/SD` pointing into another page's structure tree can keep that page
@@ -476,7 +476,7 @@ The current text (lines 27-30) claims `/SD` is not inspected — now false. Repl
 
 with:
 
-```
+```text
 //! Both explicit page destinations (`/D`) and a GoTo action's structure
 //! destination (`/SD`, ISO 32000-2 §12.6.4.3, resolved through its StructElem's
 //! `/Pg`) are neutralized. A malformed annotation `/P` and an article-thread

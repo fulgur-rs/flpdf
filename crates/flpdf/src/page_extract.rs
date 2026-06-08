@@ -228,6 +228,11 @@ fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRe
 /// ring is bounded by `visited` (each bead handled once). The `/B` array and
 /// the beads themselves are retained — only dangling `/P` keys are dropped,
 /// matching qpdf's single-page output.
+///
+/// `/B`, `/N`, and `/V` may each be an indirect-reference chain, so every link
+/// is normalized through [`resolve_ref_chain`] to the terminal bead object:
+/// this both reaches the bead body through a chain and ensures the write-back
+/// targets the real bead, not an intermediate reference holder.
 fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
     let b_val = {
         let page_obj = target.resolve_borrowed(page_ref)?;
@@ -236,20 +241,26 @@ fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) 
         };
         page_dict.get("B").cloned()
     };
-    let mut queue: Vec<ObjectRef> = match b_val {
-        Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
-        Some(Object::Reference(r)) => match target.resolve_borrowed(r)? {
-            Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
+    let Some(b_val) = b_val else {
+        return Ok(());
     };
+    // /B may itself be an indirect reference to the bead array; normalize it.
+    let (b_concrete, _) = resolve_ref_chain(target, &b_val)?;
+    let Object::Array(beads) = b_concrete else {
+        return Ok(());
+    };
+    let mut queue: Vec<ObjectRef> = beads.iter().filter_map(Object::as_ref_id).collect();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    while let Some(bead_ref) = queue.pop() {
+    while let Some(start_ref) = queue.pop() {
+        // Resolve the link to the terminal bead object so an indirect chain
+        // still reaches the bead, and so `set_object` below rewrites the real
+        // bead rather than an intermediate reference holder.
+        let (concrete, terminal) = resolve_ref_chain(target, &Object::Reference(start_ref))?;
+        let bead_ref = terminal.unwrap_or(start_ref);
         if !visited.insert(bead_ref) {
             continue;
         }
-        let Some(mut bead) = target.resolve_borrowed(bead_ref)?.as_dict().cloned() else {
+        let Some(mut bead) = concrete.into_dict() else {
             continue;
         };
         // Enqueue ring neighbours before mutating.
@@ -258,8 +269,11 @@ fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) 
                 queue.push(*r);
             }
         }
-        if let Some(p_val) = bead.remove("P") {
-            if p_targets_absent_page(target, &p_val, page_ref)? {
+        // Inspect `/P` first; only `remove` it and write the bead back when it
+        // is actually dropped, so a kept bead's stored `/P` is never rewritten.
+        if let Some(p_val) = bead.get("P") {
+            if p_targets_absent_page(target, p_val, page_ref)? {
+                bead.remove("P");
                 target.set_object(bead_ref, Object::Dictionary(bead));
             }
         }
