@@ -1,9 +1,14 @@
 //! Capstone integration tests for the flpdf document-helper public API.
 //!
 //! Layer 1 (smoke): each helper read API is cross-checked against an
-//! independent manual raw-`Object` extraction. Layer 2 (round-trip): each
-//! mutating helper produces byte-identical output to the equivalent direct
-//! `Object` manipulation, serialised with `full_rewrite + static_id`.
+//! independent manual raw-`Object` extraction.
+//!
+//! Layer 2 (round-trip): mutating helpers produce byte-identical output to the
+//! equivalent direct `Object` manipulation, serialised with `full_rewrite +
+//! static_id`. The keystone test here first establishes that this canonical
+//! serialisation is invariant to a caller's absolute object numbers (the
+//! `full_rewrite` writer renumbers Catalog-first), which is what makes the
+//! later helper-vs-raw byte comparisons meaningful.
 
 use std::collections::BTreeMap;
 
@@ -136,11 +141,11 @@ fn insert_page_at(pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>, new_num: u32) 
     );
     pdf.set_object(page_ref, Object::Dictionary(page));
     let mut pages = pdf.resolve(pages_ref).unwrap().as_dict().unwrap().clone();
-    let kids = pages.get("Kids").unwrap().as_array().unwrap().to_vec();
-    let mut new_kids = kids.clone();
+    let mut new_kids = pages.get("Kids").unwrap().as_array().unwrap().to_vec();
+    let new_count = new_kids.len() as i64 + 1;
     new_kids.insert(1, Object::Reference(page_ref));
     pages.insert("Kids", Object::Array(new_kids));
-    pages.insert("Count", Object::Integer(kids.len() as i64 + 1));
+    pages.insert("Count", Object::Integer(new_count));
     pdf.set_object(pages_ref, Object::Dictionary(pages));
 }
 
@@ -150,9 +155,45 @@ fn full_rewrite_converges_across_object_numbers() {
     let mut b = flpdf::Pdf::open(std::io::Cursor::new(build_n_page_pdf(2))).unwrap();
     insert_page_at(&mut a, 50);
     insert_page_at(&mut b, 80);
+    let bytes_a = write_canonical(&mut a);
     assert_eq!(
-        write_canonical(&mut a),
+        bytes_a,
         write_canonical(&mut b),
         "full_rewrite renumber must converge regardless of internal object number"
+    );
+
+    // Strengthen: confirm the canonical output is not merely equal but
+    // structurally correct — the inserted page sits at /Kids index 1.
+    let mut reopened = flpdf::Pdf::open(std::io::Cursor::new(bytes_a)).unwrap();
+    let root = reopened.root_ref().unwrap();
+    let pages_ref = reopened
+        .resolve(root)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get_ref("Pages")
+        .unwrap();
+    let pages = reopened.resolve(pages_ref).unwrap();
+    let kids = pages
+        .as_dict()
+        .unwrap()
+        .get("Kids")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .to_vec();
+    assert_eq!(kids.len(), 3, "2 original + 1 inserted page");
+    // The inserted page (index 1) must resolve to a /Page dict, pinning the
+    // order to [original page 1, NEW page, original page 2].
+    let mid_ref = kids[1].as_ref_id().unwrap();
+    let mid = reopened.resolve(mid_ref).unwrap();
+    assert_eq!(
+        mid.as_dict()
+            .unwrap()
+            .get("Type")
+            .unwrap()
+            .as_name()
+            .unwrap(),
+        b"Page"
     );
 }
