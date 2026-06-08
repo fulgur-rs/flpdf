@@ -250,8 +250,6 @@ fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) 
         if let Some(p_val) = bead.remove("P") {
             if p_targets_absent_page(target, &p_val, page_ref)? {
                 target.set_object(bead_ref, Object::Dictionary(bead));
-            } else {
-                bead.insert("P", p_val);
             }
         }
     }

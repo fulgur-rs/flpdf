@@ -1617,4 +1617,22 @@ fn bead_p_absent_page_is_neutralized() {
     // The kept page's /B is retained (qpdf keeps the ring).
     let leaf = only_leaf(&mut out);
     assert!(leaf.get("B").is_some(), "page /B must be retained");
+
+    // The kept page's own bead (obj 10) targets the kept page, so its /P must
+    // survive neutralization and still resolve to a /Type /Page dictionary.
+    let bead_ref = match leaf.get("B") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /B array, got {other:?}"),
+    };
+    let bead = out.resolve(bead_ref).unwrap().into_dict().unwrap();
+    let p_ref = bead
+        .get("P")
+        .and_then(flpdf::Object::as_ref_id)
+        .expect("kept bead /P must be preserved as a page reference");
+    let p_page = out.resolve(p_ref).unwrap().into_dict().unwrap();
+    assert_eq!(
+        p_page.get("Type"),
+        Some(&flpdf::Object::Name(b"Page".to_vec())),
+        "preserved bead /P must resolve to a /Type /Page"
+    );
 }
