@@ -302,13 +302,13 @@ fn acroform_helper_field_infos_match_manual_and_resolve_indirect_value() {
         Some(flpdf::Object::String(b"Paris".to_vec()))
     );
 
-    // NOTE: AcroFormDocumentHelper::field_value() does NOT resolve an indirect
-    // /V — it returns the raw Object::Reference(6 0) here (the underlying
-    // FormFieldObjectHelper::resolve_inherited_object returns /V verbatim). That
-    // contradicts review pattern #2 and the field_value doc example, which only
-    // matches Object::String/Object::Name. Tracked separately; this smoke test
-    // does not assert that (known-incorrect) raw-reference output. The resolve
-    // path is still guarded above through field_infos().
+    // Note: `AcroFormDocumentHelper::field_value()` returns `/V` WITHOUT
+    // dereferencing an indirect reference, so for F2 it yields
+    // `Object::Reference(6 0)` and the caller must resolve it themselves. This is
+    // an inconsistency with the auto-resolving `field_infos()` path (tracked
+    // separately as a P2 bug). We deliberately do not assert that raw-reference
+    // output; the indirect-/V resolve path is already guarded above via
+    // `field_infos()[1].value == Object::String(b"Paris")`.
 }
 
 // ---------------------------------------------------------------------------
