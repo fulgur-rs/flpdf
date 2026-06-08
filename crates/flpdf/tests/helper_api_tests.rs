@@ -324,6 +324,13 @@ fn acroform_helper_field_infos_match_manual_and_resolve_indirect_value() {
     assert_eq!(infos[0].full_name, "name");
     assert_eq!(infos[1].full_name, "city");
 
+    // F1's value is a direct string: verify direct /V retrieval works too,
+    // alongside the indirect resolution checked for F2 below.
+    assert_eq!(
+        infos[0].value,
+        Some(flpdf::Object::String(b"Alice".to_vec()))
+    );
+
     // F2's value must be the RESOLVED string, not the indirect reference:
     // field_infos() dereferences indirect /V via deref_leaf (review pattern #2).
     assert_eq!(
