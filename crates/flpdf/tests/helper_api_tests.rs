@@ -130,17 +130,19 @@ fn insert_page_at(pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>, new_num: u32) 
     let mut page = flpdf::Dictionary::new();
     page.insert("Type", Object::Name(b"Page".to_vec()));
     page.insert("Parent", Object::Reference(pages_ref));
+    // Distinguishable MediaBox so the inserted page is identifiable by content,
+    // making the index-1 assertion below non-tautological.
     page.insert(
         "MediaBox",
         Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
-            Object::Integer(612),
-            Object::Integer(792),
+            Object::Integer(200),
+            Object::Integer(200),
         ]),
     );
     pdf.set_object(page_ref, Object::Dictionary(page));
-    let mut pages = pdf.resolve(pages_ref).unwrap().as_dict().unwrap().clone();
+    let mut pages = pdf.resolve(pages_ref).unwrap().into_dict().unwrap();
     let mut new_kids = pages.get("Kids").unwrap().as_array().unwrap().to_vec();
     let new_count = new_kids.len() as i64 + 1;
     new_kids.insert(1, Object::Reference(page_ref));
@@ -183,18 +185,26 @@ fn full_rewrite_converges_across_object_numbers() {
         .unwrap()
         .to_vec();
     assert_eq!(kids.len(), 3, "2 original + 1 inserted page");
-    // The inserted page (index 1) must resolve to a /Page dict, pinning the
-    // order to [original page 1, NEW page, original page 2].
+    // The inserted page (index 1) carries the distinguishable MediaBox
+    // [0 0 200 200], whereas the originals use [0 0 612 792]. Asserting on it
+    // pins the order to [original page 1, NEW page, original page 2] — not
+    // merely "some /Page sits at index 1".
     let mid_ref = kids[1].as_ref_id().unwrap();
     let mid = reopened.resolve(mid_ref).unwrap();
+    let media_box: Vec<i64> = mid
+        .as_dict()
+        .unwrap()
+        .get("MediaBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_integer().unwrap())
+        .collect();
     assert_eq!(
-        mid.as_dict()
-            .unwrap()
-            .get("Type")
-            .unwrap()
-            .as_name()
-            .unwrap(),
-        b"Page"
+        media_box,
+        vec![0, 0, 200, 200],
+        "the inserted page (distinguishable MediaBox) must land at /Kids index 1"
     );
 }
 
@@ -538,7 +548,7 @@ fn manual_set_leaf_rotate(
     value: i64,
 ) {
     use flpdf::Object;
-    let mut leaf = pdf.resolve(page_ref).unwrap().as_dict().unwrap().clone();
+    let mut leaf = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
     leaf.insert("Rotate", Object::Integer(value));
     pdf.set_object(page_ref, Object::Dictionary(leaf));
 }
@@ -559,7 +569,7 @@ fn manual_set_pages_kids(
         .unwrap()
         .get_ref("Pages")
         .unwrap();
-    let mut pages = pdf.resolve(pages_ref).unwrap().as_dict().unwrap().clone();
+    let mut pages = pdf.resolve(pages_ref).unwrap().into_dict().unwrap();
     pages.insert(
         "Kids",
         Object::Array(kids.iter().map(|&r| Object::Reference(r)).collect()),
@@ -647,13 +657,16 @@ fn page_insert_matches_manual_splice() {
         let mut page = Dictionary::new();
         page.insert("Type", Object::Name(b"Page".to_vec()));
         page.insert("Parent", Object::Reference(pages_ref));
+        // Distinguishable MediaBox (originals use [0 0 612 792]) so the byte
+        // comparison itself pins the inserted page's position in /Kids: a
+        // reordering would change the bytes, not just the structure.
         page.insert(
             "MediaBox",
             Object::Array(vec![
                 Object::Integer(0),
                 Object::Integer(0),
-                Object::Integer(612),
-                Object::Integer(792),
+                Object::Integer(200),
+                Object::Integer(200),
             ]),
         );
         let page_ref = ObjectRef::new(num, 0);
