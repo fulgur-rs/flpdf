@@ -2623,6 +2623,14 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 }
                 _ => None,
             };
+            // qpdf re-filters (decode + re-encode to a single /FlateDecode, and
+            // emits /Length before the regenerated /Filter) only for streams
+            // whose source filter chain is NOT already a lone /FlateDecode. An
+            // already-Flate source is preserved by qpdf and keeps lexicographic
+            // dict order with /Length last. Capture that from the source filter
+            // so the output ordering tracks qpdf's re-filter decision rather
+            // than flpdf's unconditional decode/re-encode.
+            let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
             let mut reencoded = match effective_stream_policy(options) {
                 Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
                 // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
@@ -2721,7 +2729,24 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                     );
                 } else {
-                    write_stream_to_buf(&mut bytes, s, options.newline_before_endstream);
+                    // Emit qpdf's re-filtered stream-dict order (/Length, then a
+                    // regenerated /Filter /FlateDecode) only when all hold:
+                    //  - the compress policy re-encodes (CompressStreams::Yes),
+                    //  - the source was NOT already a lone /FlateDecode (qpdf
+                    //    preserves those, keeping /Length last), and
+                    //  - the *final* dict carries a lone /FlateDecode, so we
+                    //    never drop a /Crypt chain (encryption) or a fallback
+                    //    filter (decode/encode failure) by re-appending /Filter.
+                    let refiltered =
+                        matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
+                            && !source_filter_is_lone_flate
+                            && is_lone_flate(s.dict.get("Filter"));
+                    write_stream_to_buf_qpdf_order(
+                        &mut bytes,
+                        s,
+                        options.newline_before_endstream,
+                        refiltered,
+                    );
                 }
             } else if options.qdf {
                 reencoded.write_pdf_qdf(&mut bytes, 0);
@@ -3139,6 +3164,21 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
     }
 }
 
+/// Whether a stream's `/Filter` value is a lone `/FlateDecode` — either the
+/// bare name `/FlateDecode` or a single-element array `[ /FlateDecode ]`. PDF
+/// permits both forms (ISO 32000-1 §7.3.8.2), and qpdf preserves such streams
+/// (does not re-filter them), so the stream-dict key ordering must treat both
+/// the same way.
+fn is_lone_flate(filter: Option<&Object>) -> bool {
+    match filter {
+        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode",
+        Some(Object::Array(items)) => {
+            matches!(items.as_slice(), [Object::Name(name)] if name.as_slice() == b"FlateDecode")
+        }
+        _ => false,
+    }
+}
+
 /// Write a PDF stream to `buf`, applying the [`NewlineBeforeEndstream`] policy.
 ///
 /// This is the **single choke-point** through which all stream emission in the
@@ -3168,8 +3208,32 @@ pub fn write_stream_to_buf(
     policy: NewlineBeforeEndstream,
 ) {
     stream.dict.write_pdf(buf);
+    write_stream_payload(buf, &stream.data, policy);
+}
+
+/// Like [`write_stream_to_buf`] but serializes the stream dictionary in qpdf's
+/// stream-dictionary key order (see [`crate::object::Dictionary::write_pdf_stream`]):
+/// `/Length` is pulled out and written after the other (sorted) keys, and when
+/// `refiltered` is set, `/Filter`/`/DecodeParms` are dropped from the iteration
+/// and `/Filter /FlateDecode` is re-appended after `/Length`. Used by the
+/// full-rewrite path so re-encoded content streams match `qpdf --static-id`
+/// byte-for-byte (modulo the deflate-backend-dependent `/Length` value).
+fn write_stream_to_buf_qpdf_order(
+    buf: &mut Vec<u8>,
+    stream: &crate::Stream,
+    policy: NewlineBeforeEndstream,
+    refiltered: bool,
+) {
+    stream.dict.write_pdf_stream(buf, refiltered);
+    write_stream_payload(buf, &stream.data, policy);
+}
+
+/// Emit the `\nstream\n<payload><EOL>endstream` framing shared by
+/// [`write_stream_to_buf`] and [`write_stream_to_buf_qpdf_order`], applying the
+/// [`NewlineBeforeEndstream`] policy. The dictionary must already be written.
+fn write_stream_payload(buf: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEndstream) {
     buf.extend_from_slice(b"\nstream\n");
-    buf.extend_from_slice(&stream.data);
+    buf.extend_from_slice(data);
 
     match policy {
         NewlineBeforeEndstream::Yes => {
@@ -3178,8 +3242,7 @@ pub fn write_stream_to_buf(
         }
         NewlineBeforeEndstream::No => {
             // Only write a newline when the payload does not already end with one.
-            let ends_with_eol = stream
-                .data
+            let ends_with_eol = data
                 .last()
                 .map(|&b| b == b'\n' || b == b'\r')
                 .unwrap_or(false);
