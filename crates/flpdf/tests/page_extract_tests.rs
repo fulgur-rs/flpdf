@@ -1513,3 +1513,69 @@ fn action_goto_sd_named_dest_is_preserved() {
         "named structure destination /SD must be preserved"
     );
 }
+
+#[test]
+fn annot_p_absent_page_is_neutralized() {
+    // A malformed annotation /P points at the SIBLING page (obj 4); the closure
+    // copies the sibling as a stub. Dropping /P makes it unreachable.
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /P 4 0 R >>",
+            ),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        1,
+        "sibling reached via annotation /P must be pruned"
+    );
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    assert!(annot.get("P").is_none(), "absent-page /P must be dropped");
+}
+
+#[test]
+fn annot_p_self_page_is_preserved() {
+    // /P points at the extracted page itself: kept (remapped to the new ref).
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /P 3 0 R >>",
+            ),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    assert!(annot.get("P").is_some(), "self-page /P must be preserved");
+}

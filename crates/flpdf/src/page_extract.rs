@@ -257,6 +257,16 @@ fn neutralize_annot_if_absent(
         }
     }
 
+    // /P — the page this annotation belongs to. A malformed /P pointing at an
+    // absent (sibling) page keeps that page's stub reachable; drop it.
+    if let Some(p_val) = annot.remove("P") {
+        if p_targets_absent_page(target, &p_val, keep)? {
+            changed = true;
+        } else {
+            annot.insert("P", p_val);
+        }
+    }
+
     if changed {
         target.set_object(annot_ref, Object::Dictionary(annot));
     }
@@ -496,6 +506,22 @@ fn sd_targets_absent_page(
     // before treating it as a droppable cross-page destination.
     Ok(match pg_ref {
         Some(r) => r != keep && is_page_dict(&pg_concrete),
+        None => false,
+    })
+}
+
+/// `true` when `p` (an annotation's or bead's `/P`) resolves to a Page object
+/// other than `keep`. `/P` always denotes "the page this object belongs to"
+/// (ISO 32000-2); a `/P` pointing at an absent page is dangling and dropped.
+/// Non-Page / unresolvable / `keep` targets return `false` (kept).
+fn p_targets_absent_page(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    p: &Object,
+    keep: ObjectRef,
+) -> Result<bool> {
+    let (concrete, p_ref) = resolve_ref_chain(target, p)?;
+    Ok(match p_ref {
+        Some(r) => r != keep && is_page_dict(&concrete),
         None => false,
     })
 }
