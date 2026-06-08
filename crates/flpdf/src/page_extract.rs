@@ -490,6 +490,10 @@ fn sd_targets_absent_page(
         return Ok(false);
     };
     let (pg_concrete, pg_ref) = resolve_ref_chain(target, &pg)?;
+    // Unlike `dest_targets_absent_page`, where the `/D` array's first element IS
+    // the page ref, `/SD` reaches the page through an extra StructElem -> `/Pg`
+    // hop, so confirm the resolved `/Pg` target is actually a `/Type /Page`
+    // before treating it as a droppable cross-page destination.
     Ok(match pg_ref {
         Some(r) => r != keep && is_page_dict(&pg_concrete),
         None => false,

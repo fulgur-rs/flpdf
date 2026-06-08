@@ -1484,3 +1484,32 @@ fn action_goto_sd_self_page_is_preserved() {
         "self-page /SD must be preserved"
     );
 }
+
+#[test]
+fn action_goto_sd_named_dest_is_preserved() {
+    // A named structure destination (/SD is a name, not an array) carries no
+    // in-doc page ref, so it never pulled a sibling in; leave it untouched.
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"),
+            (5, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /GoTo /SD /SomeStructDest >> >>"),
+        ],
+        1,
+    );
+    let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    let mut out = extract_page(&mut src, 0).unwrap();
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf = only_leaf(&mut out);
+    let annot_ref = match leaf.get("Annots") {
+        Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let action = annot.get("A").unwrap().as_dict().unwrap();
+    assert!(
+        action.get("SD").is_some(),
+        "named structure destination /SD must be preserved"
+    );
+}
