@@ -356,7 +356,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Run: `cargo run --example walk_outline -p flpdf`
 Expected:
-```
+
+```text
 Chapter 1
   Section 1.1
 Chapter 2
@@ -621,6 +622,7 @@ for ex in inspect extract_page extract_pages extract_first_5_pages \
   echo "== $ex =="; cargo run --quiet --example "$ex" -p flpdf || exit 1
 done
 ```
+
 Expected: every example exits 0 (asserts pass).
 
 **Step 3: Lint + doctest**
