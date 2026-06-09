@@ -726,6 +726,90 @@ fn merge_failure_falls_back_to_linear_scan() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
+/// A free (`f`) xref-table entry whose 10-digit offset field exceeds
+/// `u32::MAX` must be rejected in strict mode. In `parse_xref_table`, a free
+/// entry's offset becomes the `Free { next }` value via `u32::try_from(offset)`;
+/// when `offset` is `9999999999` (> `u32::MAX`) that conversion fails and the
+/// function returns the "free xref next object does not fit u32" error (the
+/// `b'f'` arm's `map_err`). Object 0's free entry (`next = 65535`) fits and is
+/// accepted; the overflow is isolated to the second entry.
+#[test]
+fn rejects_xref_table_free_next_overflow() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 2\n");
+    // Object 0: free, next = 65535 (fits u32, accepted).
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    // Object 1: free, offset 9999999999 > u32::MAX -> overflow in the `f` arm.
+    bytes.extend_from_slice(b"9999999999 00000 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("free xref next overflowing u32 should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("free xref next object does not fit u32"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// An xref-table entry whose status byte is neither `f` nor `n` must be rejected
+/// in strict mode. In `parse_xref_table`, the `in_use` byte is matched against
+/// `b'f'` / `b'n'`; any other byte (here `x`) takes the `_ =>` arm and returns
+/// the "xref table entry status is not f or n" error.
+#[test]
+fn rejects_xref_table_bad_entry_status() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 2\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    // Object 1: status byte `x` is neither `f` nor `n` -> `_ =>` arm.
+    bytes.extend_from_slice(b"0000000009 00000 x \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("invalid xref entry status should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref table entry status is not f or n"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// Well-formed xref-table entries followed by a `trailer` keyword whose value is
+/// not a dictionary must be rejected in strict mode. In `parse_xref_table`, once
+/// the entry loop completes and the outer loop breaks on `trailer`, the trailer
+/// is parsed as an object; when that object is not `Object::Dictionary` the `_ =>`
+/// arm returns the "trailer is not a dictionary" error. Here a bare integer `42`
+/// follows the keyword.
+#[test]
+fn rejects_xref_table_trailer_not_dictionary() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    // `trailer` keyword followed by a bare integer instead of a `<<...>>` dict.
+    bytes.extend_from_slice(format!("trailer\n42\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("non-dictionary trailer should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("trailer is not a dictionary"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
 // The "succeeded but with accumulated parse errors" warning path in
 // `load_xref_and_trailer_with_repair` is exercised by
 // `with_repair_appends_diagnostic_when_stream_parse_succeeds`.
