@@ -218,13 +218,22 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 /// item for destination purposes (`/Dest` and `/A /GoTo /D`), so the same
 /// [`null_removed_item_targets`] + [`remap_item_dest`] pair applies: a removed
 /// target page is replaced with `null` (its `/Dest`/`/D` reference kept
-/// verbatim), a surviving target is remapped to its new ref. Both helpers are
-/// idempotent, so a page or annotation reached more than once is safe.
+/// verbatim), a surviving target is remapped to its new ref.
+///
+/// A duplicate-page selection (e.g. `--pages . 1,1`) produces several surviving
+/// pages that share the same indirect annotation object, so the same annotation
+/// reference can appear under more than one page. A shared annotation must be
+/// processed exactly once: under a non-identity surviving map, a second pass
+/// would resolve an already-remapped `/Dest` (now pointing at a *new* ref that
+/// is not a key of `surviving`) and misclassify it as a removed target, nulling
+/// a surviving page. A `visited` set (bounded-traversal guard, as in
+/// [`remap_outline_tree`] / [`remap_name_tree`]) deduplicates shared refs.
 fn remap_annot_dests<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in &result.new_kids {
         // /Annots may be an inline array or an indirect reference to one.
         let annots_val = {
@@ -238,12 +247,18 @@ fn remap_annot_dests<R: Read + Seek>(
             Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
             Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
                 Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
+                // Double-indirect /Annots (ref -> ref -> array) is not followed.
                 _ => Vec::new(),
             },
             // Inline-dict annotations have no object to rewrite; skip (rare).
             _ => Vec::new(),
         };
         for annot_ref in annot_refs {
+            // A shared indirect annot reachable from several duplicated pages
+            // must be processed once (see the doc comment above).
+            if !visited.insert(annot_ref) {
+                continue;
+            }
             null_removed_item_targets(pdf, annot_ref, surviving)?;
             remap_item_dest(pdf, annot_ref, surviving)?;
         }
@@ -2341,6 +2356,48 @@ mod tests {
             dest_array_first(&mut pdf, ObjectRef::new(50, 0), "Dest"),
             ObjectRef::new(99, 0),
             "annot /Dest to a surviving page should be remapped to its new ref"
+        );
+    }
+
+    #[test]
+    fn open_action_goto_to_surviving_page_is_remapped() {
+        // catalog /OpenAction << /S /GoTo /D [5 0 R /Fit] >> -> page3, which
+        // SURVIVES. The only case where remap_open_action_dest's catalog
+        // re-store actually changes the document: remap_or_null_dest returns a
+        // modified action dict and catalog.insert("OpenAction", ..) applies it.
+        // As in annot_dest_to_surviving_page_is_remapped, a hand-built
+        // RebuildResult maps obj5 -> a fresh ref (obj99) to exercise a genuine
+        // non-identity remap.
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
+            "/OpenAction << /S /GoTo /D [5 0 R /Fit] >>",
+            &[],
+        ));
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(3, 0)],
+            ref_map,
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // /OpenAction is a GoTo action dict; descend to /D and check its first
+        // element is the new ref.
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        let action = cat
+            .get("OpenAction")
+            .and_then(Object::as_dict)
+            .expect("catalog /OpenAction should be an action dict");
+        let d_first = action
+            .get("D")
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .and_then(Object::as_ref_id)
+            .expect("/OpenAction /D should be an array dest");
+        assert_eq!(
+            d_first,
+            ObjectRef::new(99, 0),
+            "/OpenAction /D to a surviving page should be remapped to its new ref"
         );
     }
 }
