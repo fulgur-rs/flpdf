@@ -31,9 +31,16 @@ pub(crate) struct IndirectStreamLength {
     /// Byte offset of the first stream payload byte (just past the `stream`
     /// keyword's EOL), relative to the `parse_indirect_object` input slice.
     pub data_start: usize,
-    /// Byte offset of the `endstream` keyword (the syntactic upper bound;
-    /// the authoritative length is clamped to not exceed this).
-    pub endstream_pos: usize,
+    /// Byte offset of the `endstream` keyword (the syntactic upper bound; the
+    /// authoritative length is clamped to not exceed this), when a line-anchored
+    /// `endstream` was located. `None` when no line-anchored `endstream` exists
+    /// — the only writer path that produces this is
+    /// [`NewlineBeforeEndstream::Never`](crate::NewlineBeforeEndstream::Never)
+    /// with a payload whose last byte is not an EOL, so `endstream` sits
+    /// immediately after the final content byte and is not line-anchored. In
+    /// that case the holder is the EXACT content length and the reader is
+    /// authoritative (there is no syntactic bound to clamp against).
+    pub endstream_pos: Option<usize>,
 }
 
 pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)> {
@@ -202,36 +209,69 @@ impl<'a> Parser<'a> {
             // payload boundary by locating the line-anchored `endstream`
             // keyword (what qpdf and conformant readers do). The indirect
             // holder value is advisory; `endstream` is authoritative.
-            _ => {
-                let endstream_pos =
-                    find_line_anchored_keyword(self.input, b"endstream", data_start)
-                        .ok_or_else(|| Error::parse(self.pos, "stream data exceeds input"))?;
-                // For an indirect /Length, surface the payload window so the
-                // reader can re-slice to the xref-resolved authoritative length
-                // (flpdf-9hc.27). The endstream-scan result here is only the
-                // last-resort fallback when the holder is unresolvable.
-                if let Some(holder) = length_ref {
-                    self.last_indirect_stream_len = Some(IndirectStreamLength {
-                        holder,
-                        data_start,
-                        endstream_pos,
-                    });
-                }
-                // Exclude exactly ONE framing EOL marker that the writer placed
-                // between the payload and `endstream`, so `stream.data` is the
-                // logical content. The writer then re-adds exactly one EOL,
-                // keeping QDF round-trip / idempotence byte-stable.
-                let mut end = endstream_pos;
-                if end > data_start && self.input[end - 1] == b'\n' {
-                    end -= 1;
-                    if end > data_start && self.input[end - 1] == b'\r' {
+            _ => match find_line_anchored_keyword(self.input, b"endstream", data_start) {
+                Some(endstream_pos) => {
+                    // For an indirect /Length, surface the payload window so the
+                    // reader can re-slice to the xref-resolved authoritative
+                    // length. The endstream-scan result here is only the
+                    // last-resort fallback when the holder is unresolvable.
+                    if let Some(holder) = length_ref {
+                        self.last_indirect_stream_len = Some(IndirectStreamLength {
+                            holder,
+                            data_start,
+                            endstream_pos: Some(endstream_pos),
+                        });
+                    }
+                    // Exclude exactly ONE framing EOL marker that the writer
+                    // placed between the payload and `endstream`, so
+                    // `stream.data` is the logical content. The writer then
+                    // re-adds exactly one EOL, keeping QDF round-trip /
+                    // idempotence byte-stable.
+                    let mut end = endstream_pos;
+                    if end > data_start && self.input[end - 1] == b'\n' {
+                        end -= 1;
+                        if end > data_start && self.input[end - 1] == b'\r' {
+                            end -= 1;
+                        }
+                    } else if end > data_start && self.input[end - 1] == b'\r' {
                         end -= 1;
                     }
-                } else if end > data_start && self.input[end - 1] == b'\r' {
-                    end -= 1;
+                    end - data_start
                 }
-                end - data_start
-            }
+                // No line-anchored `endstream` anywhere from `data_start`. The
+                // only writer path that produces this is
+                // `NewlineBeforeEndstream::Never` with a non-EOL-ending payload:
+                // `endstream` follows the last CONTENT byte directly, so it is
+                // not line-anchored and the byte-level scan cannot delimit the
+                // payload. (A naive non-anchored scan is wrong — the literal
+                // bytes "endstream" can occur inside the payload.)
+                None => match length_ref {
+                    // Indirect /Length AND a non-anchored `endstream` token
+                    // exists: this is the adjacent-`endstream` case. The holder
+                    // — which the reader resolves via the xref — is the EXACT
+                    // content length. Surface it with `endstream_pos: None` to
+                    // flag the authoritative path; `data` is an empty placeholder
+                    // the reader replaces. The presence gate keeps a genuinely
+                    // truncated stream (no `endstream` at all) on the error path
+                    // below; the reader, not this gate, fixes the boundary.
+                    Some(holder)
+                        if contains_keyword_token(self.input, b"endstream", data_start) =>
+                    {
+                        self.last_indirect_stream_len = Some(IndirectStreamLength {
+                            holder,
+                            data_start,
+                            endstream_pos: None,
+                        });
+                        return Ok(Object::Stream(Stream::new(dict, Vec::new())));
+                    }
+                    // No `endstream` anywhere (truncated), or no holder to
+                    // recover the boundary from: fail loudly. ISO 32000-1
+                    // §7.3.8.1 mandates the EOL before `endstream` precisely so a
+                    // direct/absent-length stream stays parseable; its absence
+                    // here is unrecoverable.
+                    _ => return Err(Error::parse(self.pos, "stream data exceeds input")),
+                },
+            },
         };
 
         let data = self.input[data_start..data_start + length].to_vec();
@@ -600,6 +640,34 @@ fn find_line_anchored_keyword(input: &[u8], keyword: &[u8], from: usize) -> Opti
     None
 }
 
+/// True when `keyword` appears anywhere in `input` at or after `from`, followed
+/// by EOF/whitespace/delimiter (a keyword-token boundary), WITHOUT requiring a
+/// line start.
+///
+/// Used ONLY as a presence gate to tell the adjacent-`endstream` case
+/// (`NewlineBeforeEndstream::Never`, non-EOL-ending payload — a non-anchored
+/// `endstream` exists, so the reader can resolve the indirect holder
+/// authoritatively) apart from a genuinely truncated stream (no `endstream` at
+/// all → unrecoverable). It never determines a payload boundary, so an
+/// `endstream` byte sequence that is merely incidental binary content cannot
+/// mis-slice the data.
+fn contains_keyword_token(input: &[u8], keyword: &[u8], from: usize) -> bool {
+    let mut i = from;
+    while i + keyword.len() <= input.len() {
+        if &input[i..i + keyword.len()] == keyword {
+            let after_ok = match input.get(i + keyword.len()) {
+                None => true,
+                Some(&c) => is_ws(c) || is_delimiter(c),
+            };
+            if after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(crate) fn is_ws(byte: u8) -> bool {
     matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
 }
@@ -723,5 +791,18 @@ mod stream_length_tests {
             parse_indirect_object(&bytes).is_err(),
             "an indirect-length stream with no endstream must error, not hang"
         );
+    }
+
+    #[test]
+    fn contains_keyword_token_boundaries() {
+        use super::contains_keyword_token;
+        // Token at EOF (nothing after the keyword) counts.
+        assert!(contains_keyword_token(b"xxendstream", b"endstream", 0));
+        // Token followed by whitespace counts.
+        assert!(contains_keyword_token(b"endstream\n", b"endstream", 0));
+        // No boundary after the keyword (a longer run of regular chars) does not.
+        assert!(!contains_keyword_token(b"endstreamX", b"endstream", 0));
+        // Absent keyword does not.
+        assert!(!contains_keyword_token(b"no keyword here", b"endstream", 0));
     }
 }

@@ -57,6 +57,15 @@ impl ObjectCache {
         self.entries.insert(object_ref, CacheEntry::Reserved);
     }
 
+    /// Restore `object_ref` to the unresolved (lazy) state at `offset`. Used to
+    /// undo a [`set_reserved`](Self::set_reserved) guard when a resolution
+    /// attempt fails hard, so the entry does not linger as `Reserved` (which a
+    /// later resolve would read as `Null`) and a retry re-errors consistently.
+    pub(crate) fn set_unresolved(&mut self, object_ref: ObjectRef, offset: u64) {
+        self.entries
+            .insert(object_ref, CacheEntry::Unresolved { offset });
+    }
+
     pub fn set_deleted(&mut self, object_ref: ObjectRef) {
         self.entries.insert(object_ref, CacheEntry::Deleted);
         self.deleted_refs.insert(object_ref);
