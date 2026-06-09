@@ -1401,45 +1401,46 @@ impl Pdf<Cursor<Vec<u8>>> {
     }
 }
 
-/// True when `bytes[pos..]` matches `keyword`; returns the offset just past it.
-fn match_keyword_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {
+/// `bytes[pos..]` matches `keyword` AND the byte after it is a PDF token
+/// boundary (whitespace, a delimiter, or EOF). Returns the offset just past the
+/// keyword. The boundary check prevents matching a prefix of a longer run of
+/// regular characters (e.g. `endstreamendobj`, `endobjXX`) as the keyword token.
+fn keyword_token_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {
     let end = pos.checked_add(keyword.len())?;
-    (bytes.get(pos..end) == Some(keyword)).then_some(end)
+    if bytes.get(pos..end) != Some(keyword) {
+        return None;
+    }
+    match bytes.get(end) {
+        None => Some(end),
+        Some(&c) if crate::parser::is_ws(c) || crate::parser::is_delimiter(c) => Some(end),
+        Some(_) => None,
+    }
 }
 
-/// True when a well-formed stream terminator begins at `pos` in `bytes`: an
-/// optional single EOL marker, the `endstream` keyword, optional whitespace,
-/// then the `endobj` keyword.
+/// True when a well-formed stream terminator begins exactly at `pos` in `bytes`:
+/// the `endstream` keyword token, optional whitespace, then the `endobj` keyword
+/// token.
 ///
 /// Used to validate an indirect `/Length` holder before trusting it as the
 /// authoritative payload boundary for the adjacent-`endstream` case
 /// (`NewlineBeforeEndstream::Never`, non-EOL-ending payload), where the parser
-/// could not delimit the stream syntactically. Requiring the trailing `endobj`
-/// — the indirect object terminator that always follows a stream's `endstream`
-/// — rejects a corrupt holder that points at an `endstream` byte sequence
-/// occurring INSIDE the payload (which would otherwise truncate the data).
+/// could not delimit the stream syntactically. `pos` is the holder-derived end
+/// of the content; by construction of that case there is no EOL before
+/// `endstream` (otherwise it would have been line-anchored and taken the other
+/// branch), so `endstream` must sit at `pos` directly. Requiring the trailing
+/// `endobj` — the indirect object terminator that always follows a stream's
+/// `endstream` — plus a PDF token boundary after each keyword rejects a corrupt
+/// holder that points at an `endstream`/`endobj` byte sequence occurring INSIDE
+/// the payload (e.g. `endstreamendobj`), which would otherwise truncate the data.
 fn stream_end_boundary_at(bytes: &[u8], pos: usize) -> bool {
-    let mut p = pos;
-    // Optional single EOL between the payload and `endstream`.
-    match bytes.get(p) {
-        Some(b'\r') => {
-            p += 1;
-            if bytes.get(p) == Some(&b'\n') {
-                p += 1;
-            }
-        }
-        Some(b'\n') => p += 1,
-        _ => {}
-    }
-    p = match match_keyword_at(bytes, p, b"endstream") {
-        Some(p) => p,
-        None => return false,
+    let Some(mut p) = keyword_token_at(bytes, pos, b"endstream") else {
+        return false;
     };
     // Whitespace between `endstream` and the `endobj` object terminator.
     while bytes.get(p).is_some_and(|&c| crate::parser::is_ws(c)) {
         p += 1;
     }
-    match_keyword_at(bytes, p, b"endobj").is_some()
+    keyword_token_at(bytes, p, b"endobj").is_some()
 }
 
 fn decrypt_object_strings(

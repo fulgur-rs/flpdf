@@ -16,12 +16,19 @@
 use flpdf::{Object, ObjectRef, Pdf};
 use std::io::Cursor;
 
-/// Build a PDF-1.4 (xref table) with one content stream whose `/Length` is the
-/// indirect holder `4 0 R`, the `holder_value` integer in object 4, and the
-/// stream's `endstream` written IMMEDIATELY after `payload` (no EOL — the
-/// adjacent form). The Catalog reaches the stream via `/Metadata` so it survives
-/// reachability walks and can be navigated by reference.
-fn build_pdf_indirect_len_adjacent(payload: &[u8], holder_value: i64) -> Vec<u8> {
+/// Build a PDF-1.4 (xref table) with one content stream (obj 3) carrying
+/// `/Length <length_ref>` and `framing` (`b""` = adjacent no-EOL `endstream`,
+/// `b"\r\n"` = CRLF-framed line-anchored `endstream`) between `payload` and
+/// `endstream`. When `holder_body` is `Some`, object 4 is emitted with that body
+/// (e.g. `b"18"` or `b"/Name"`); when `None`, no object 4 exists (e.g. a
+/// self-referential `/Length 3 0 R`). The Catalog reaches the stream via
+/// `/Metadata` so it survives reachability walks and is navigable by reference.
+fn build_pdf(
+    payload: &[u8],
+    length_ref: &[u8],
+    framing: &[u8],
+    holder_body: Option<&[u8]>,
+) -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
 
     let cat_offset = bytes.len();
@@ -32,25 +39,44 @@ fn build_pdf_indirect_len_adjacent(payload: &[u8], holder_value: i64) -> Vec<u8>
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
 
     let stream_offset = bytes.len();
-    bytes.extend_from_slice(b"3 0 obj\n<< /Length 4 0 R >>\nstream\n");
+    bytes.extend_from_slice(b"3 0 obj\n<< /Length ");
+    bytes.extend_from_slice(length_ref);
+    bytes.extend_from_slice(b" >>\nstream\n");
     bytes.extend_from_slice(payload);
-    // Adjacent: no EOL between the payload and `endstream`.
+    bytes.extend_from_slice(framing);
     bytes.extend_from_slice(b"endstream\nendobj\n");
 
     let holder_offset = bytes.len();
-    bytes.extend_from_slice(format!("4 0 obj\n{holder_value}\nendobj\n").as_bytes());
+    if let Some(body) = holder_body {
+        bytes.extend_from_slice(b"4 0 obj\n");
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
 
     let xref_offset = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 5\n");
+    let size = if holder_body.is_some() { 5 } else { 4 };
+    bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
     bytes.extend_from_slice(b"0000000000 65535 f \n");
     bytes.extend_from_slice(format!("{cat_offset:010} 00000 n \n").as_bytes());
     bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
     bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
-    bytes.extend_from_slice(format!("{holder_offset:010} 00000 n \n").as_bytes());
-    bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\n");
+    if holder_body.is_some() {
+        bytes.extend_from_slice(format!("{holder_offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R >>\n").as_bytes());
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
 
     bytes
+}
+
+/// Adjacent (no-EOL) `endstream` with indirect holder `4 0 R` = `holder_value`.
+fn build_pdf_indirect_len_adjacent(payload: &[u8], holder_value: i64) -> Vec<u8> {
+    build_pdf(
+        payload,
+        b"4 0 R",
+        b"",
+        Some(holder_value.to_string().as_bytes()),
+    )
 }
 
 /// Resolve the content stream referenced by the Catalog's `/Metadata`.
@@ -103,6 +129,119 @@ fn corrupt_holder_pointing_at_interior_endstream_errors() {
         result.is_err(),
         "a holder pointing at an interior endstream must error, not truncate; got {result:?}"
     );
+}
+
+/// (2b) A corrupt holder landing on `endstreamendobj` INSIDE the payload (no
+/// separator between the keywords) must be rejected. Without a token-boundary
+/// check after each keyword, the raw byte match would accept this interior
+/// sequence as the terminator and truncate the stream.
+#[test]
+fn corrupt_holder_pointing_at_interior_endstreamendobj_errors() {
+    // The bytes `endstreamendobj` start at offset 4 (`AAAA|endstreamendobj`).
+    let payload: &[u8] = b"AAAAendstreamendobj CCCC";
+    let bytes = build_pdf_indirect_len_adjacent(payload, 4);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    let result = metadata_stream_result(&mut pdf);
+    assert!(
+        result.is_err(),
+        "a holder pointing at an interior `endstreamendobj` (no token boundary) must error; got {result:?}"
+    );
+}
+
+/// (2c) The same payload with the CORRECT holder must round-trip in full — the
+/// interior `endstreamendobj` is not mistaken for the real terminator.
+#[test]
+fn correct_holder_reslices_payload_containing_endstreamendobj_bytes() {
+    let payload: &[u8] = b"AAAAendstreamendobj CCCC";
+    let bytes = build_pdf_indirect_len_adjacent(payload, payload.len() as i64);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
+        Object::Stream(stream) => assert_eq!(stream.data.as_slice(), payload),
+        other => panic!("expected a stream, got {other:?}"),
+    }
+}
+
+/// (2d) A self-referential `/Length 3 0 R` (the stream's own ref) with an
+/// adjacent `endstream` is unrecoverable — the holder cannot be resolved without
+/// the very length it provides — and must error, not surface the empty
+/// placeholder the parser returned.
+#[test]
+fn self_referential_holder_adjacent_endstream_errors() {
+    let bytes = build_pdf(b"AAAABBBB", b"3 0 R", b"", None);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    let result = metadata_stream_result(&mut pdf);
+    assert!(
+        result.is_err(),
+        "a self-referential indirect /Length with adjacent endstream must error; got {result:?}"
+    );
+}
+
+/// (2e) An indirect `/Length` holder that resolves to a NON-integer (here a
+/// name) for an adjacent `endstream` cannot yield a length and must error.
+#[test]
+fn non_integer_holder_adjacent_endstream_errors() {
+    let bytes = build_pdf(b"AAAABBBB", b"4 0 R", b"", Some(b"/NotALength"));
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    let result = metadata_stream_result(&mut pdf);
+    assert!(
+        result.is_err(),
+        "a non-integer indirect /Length holder with adjacent endstream must error; got {result:?}"
+    );
+}
+
+/// A CRLF-framed `endstream` (line-anchored) with an indirect `/Length` takes
+/// the parser's endstream-scan path; the holder then refines it within the
+/// syntactic window. The framing `\r\n` is trimmed so the data is the logical
+/// payload.
+#[test]
+fn crlf_framed_indirect_length_round_trips() {
+    let payload: &[u8] = b"crlf framed payload";
+    // Holder = payload length; with CRLF framing the parser's window is
+    // payload + 2, so the authoritative length lands strictly inside it.
+    let bytes = build_pdf(
+        payload,
+        b"4 0 R",
+        b"\r\n",
+        Some(payload.len().to_string().as_bytes()),
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
+        Object::Stream(stream) => assert_eq!(
+            stream.data.as_slice(),
+            payload,
+            "CRLF-framed stream data must be the payload without the framing EOL"
+        ),
+        other => panic!("expected a stream, got {other:?}"),
+    }
+}
+
+/// A bare-CR-framed `endstream` (line-anchored) with an indirect `/Length` is
+/// trimmed of its single `\r` framing byte, mirroring the CRLF case for the
+/// classic-Mac EOL convention.
+#[test]
+fn cr_framed_indirect_length_round_trips() {
+    let payload: &[u8] = b"cr framed payload";
+    let bytes = build_pdf(
+        payload,
+        b"4 0 R",
+        b"\r",
+        Some(payload.len().to_string().as_bytes()),
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
+        Object::Stream(stream) => assert_eq!(
+            stream.data.as_slice(),
+            payload,
+            "bare-CR-framed stream data must be the payload without the framing \\r"
+        ),
+        other => panic!("expected a stream, got {other:?}"),
+    }
 }
 
 /// (3) An ObjStm container whose own `/Length` is an indirect holder and whose
