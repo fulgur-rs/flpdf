@@ -542,10 +542,16 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 )));
             };
 
-            // Clone out the matched value and the /Parent link before any
+            // Extract the matched value and the /Parent reference before any
             // mutable resolve, releasing the borrow on `node_obj`/`self.pdf`.
+            // The value must be cloned (it may be returned as an owned Object);
+            // /Parent is always a reference, so only the copyable ObjectRef is
+            // taken to avoid cloning a whole Object.
             let found = dict.get(key).cloned();
-            let parent = dict.get("Parent").cloned();
+            let parent_ref = match dict.get("Parent") {
+                Some(Object::Reference(r)) => Some(*r),
+                _ => None,
+            };
 
             if let Some(val) = found {
                 match val {
@@ -564,12 +570,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 }
             }
 
-            match parent {
-                Some(Object::Reference(r)) => {
+            match parent_ref {
+                Some(r) => {
                     current = r;
                     depth += 1;
                 }
-                _ => return Ok(None),
+                None => return Ok(None),
             }
         }
     }
