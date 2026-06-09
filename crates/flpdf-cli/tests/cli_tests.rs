@@ -2042,11 +2042,14 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
     let output = temp.path().join("out.pdf");
     std::fs::write(&input, outline_dests_three_page_pdf()).unwrap();
 
-    // Extract only page 2 (the middle page). After the pipeline:
-    //  - outline Item1 (→ p1) and Item3 (→ p3) must be DROPPED; Item2 kept.
-    //  - named dests d1 and d3 must be DROPPED; d2 kept.
-    //  - fonts of dropped pages (Helvetica F1, Times-Roman F3) must be GC'd;
-    //    only Courier (F2, the kept page's font) survives.
+    // Extract only page 2 (the middle page). After the pipeline (qpdf null-out
+    // parity):
+    //  - every outline item is KEPT (Item1, Item2, Item3); Item1/Item3 point at
+    //    their removed pages, which become `null`.
+    //  - named dests d1/d2/d3 are all KEPT.
+    //  - the removed pages are nulled, so their /Resources fonts (Helvetica F1,
+    //    Times-Roman F3) become unreferenced and are GC'd; only Courier (F2, the
+    //    kept page's font) survives.
     Command::cargo_bin("flpdf")
         .unwrap()
         .arg(&input)
@@ -2062,7 +2065,8 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
         .success()
         .stdout(predicate::str::starts_with("1"));
 
-    // Outline: only Item2 survives (Item1/Item3 dropped with their pages).
+    // Outline: every item is kept (null-out keeps Item1/Item2/Item3 even though
+    // Item1/Item3 now point at removed, nulled pages).
     let outline = Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--show-outline", output.to_str().unwrap()])
@@ -2070,21 +2074,23 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
         .success();
     let outline_txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();
     assert!(
-        outline_txt.contains("Item2"),
-        "kept outline item missing: {outline_txt}"
+        outline_txt.contains("Item1")
+            && outline_txt.contains("Item2")
+            && outline_txt.contains("Item3"),
+        "all outline items must be kept (null-out): {outline_txt}"
     );
+
+    let raw = std::fs::read(&output).unwrap();
+    let txt = String::from_utf8_lossy(&raw);
+
+    // Named destinations: all three are kept (null-out keeps d1/d3 even though
+    // their target pages were removed and nulled).
     assert!(
-        !outline_txt.contains("Item1"),
-        "dropped outline Item1 leaked: {outline_txt}"
-    );
-    assert!(
-        !outline_txt.contains("Item3"),
-        "dropped outline Item3 leaked: {outline_txt}"
+        txt.contains("(d1)") && txt.contains("(d2)") && txt.contains("(d3)"),
+        "named destinations d1/d2/d3 must all be kept (null-out parity): {txt}"
     );
 
     // Resource prune + xref GC: dropped pages' fonts must not be in output.
-    let raw = std::fs::read(&output).unwrap();
-    let txt = String::from_utf8_lossy(&raw);
     assert!(
         txt.contains("Courier"),
         "kept page's font missing from output"
