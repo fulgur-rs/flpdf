@@ -2400,4 +2400,42 @@ mod tests {
             "/OpenAction /D to a surviving page should be remapped to its new ref"
         );
     }
+
+    #[test]
+    fn shared_annot_on_duplicated_page_processed_once() {
+        // Regression guard for the function-scope `visited` dedup set in
+        // remap_annot_dests (Step 4). Under a duplicate-page selection the same
+        // surviving page (obj3) appears twice in new_kids, so its shared indirect
+        // annotation (obj50) is reached twice. obj50 /Dest [5 0 R /Fit] targets
+        // obj5, which SURVIVES and remaps to obj3 (surviving = {obj5 -> obj3}).
+        //
+        // Without the guard, the first pass remaps the annot /Dest in place to
+        // [3 0 R]; the second pass then resolves that already-remapped dest to
+        // obj3, which is NOT a key of `surviving` (keys are OLD refs), and
+        // misclassifies it as a removed target -- nulling obj3, a SURVIVING page.
+        // The guard skips the already-processed annot so obj3 stays a dictionary.
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [5 0 R /Fit] >>",
+            "",
+            &[],
+        ));
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(3, 0)]);
+        let result = RebuildResult {
+            // Same surviving page listed twice, so the shared annot obj50 is
+            // reached from both clones (duplicate-page selection).
+            new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(3, 0)],
+            ref_map,
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            pdf.resolve(ObjectRef::new(3, 0))
+                .unwrap()
+                .as_dict()
+                .is_some(),
+            "surviving page obj3 must stay a dictionary; a shared annot reached \
+             from two duplicated pages must be processed once, never nulling it"
+        );
+    }
 }
