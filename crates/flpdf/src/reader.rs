@@ -1054,10 +1054,15 @@ impl<R: Read + Seek> Pdf<R> {
                                     stream.data = bytes[isl.data_start..end].to_vec();
                                 }
                                 _ => {
+                                    // Undo the `set_reserved` guard so the hard
+                                    // error stays loud on a retry (a lingering
+                                    // `Reserved` entry would otherwise resolve to
+                                    // `Null`).
+                                    self.cache.set_unresolved(object_ref, offset);
                                     return Err(Error::parse(
                                         isl.data_start,
                                         "stream data exceeds input",
-                                    ))
+                                    ));
                                 }
                             }
                         }
