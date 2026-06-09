@@ -220,6 +220,44 @@ fn crlf_framed_indirect_length_round_trips() {
     }
 }
 
+/// (2f) When resolving the indirect `/Length` holder itself fails (here the
+/// holder's xref offset points into another object's dictionary, so parsing it
+/// errors), the adjacent-`endstream` path must PROPAGATE that error rather than
+/// mask it as the generic "stream data exceeds input" parse error.
+#[test]
+fn holder_resolution_error_propagates() {
+    // Build the normal adjacent fixture, then corrupt object 4's xref offset to
+    // point at the Catalog's `<<` (8 bytes past `1 0 obj\n`), which is not a
+    // valid `N G obj` header, so resolving `4 0 R` errors.
+    let mut bytes = build_pdf(b"AAAABBBB", b"4 0 R", b"", Some(b"8"));
+    // `%PDF-1.4\n` (9 bytes) then `1 0 obj\n` (8 bytes): the Catalog dict starts
+    // at offset 17. Rewrite the 10-digit xref offset of object 4.
+    let bad_offset = b"0000000017";
+    let needle = b"4 0 obj\n8\nendobj\n";
+    // Locate object 4's real offset to find its xref entry value, then swap that
+    // entry's 10-digit field for `bad_offset`. The xref lists entries in object
+    // order; object 4 is the 5th entry (index 4). Find the xref table and patch.
+    let xref_tag = b"xref\n0 5\n";
+    let xref_pos = bytes
+        .windows(xref_tag.len())
+        .position(|w| w == xref_tag)
+        .expect("xref table present");
+    // Entry layout: each line is "{10} 00000 n \n" = 20 bytes; entry 0 is the
+    // free header. Object 4's entry starts after the header + 4 entries.
+    let entries_start = xref_pos + xref_tag.len();
+    let obj4_entry = entries_start + 4 * 20;
+    bytes[obj4_entry..obj4_entry + 10].copy_from_slice(bad_offset);
+    // Sanity: the stream object/holder bodies are untouched.
+    assert!(bytes.windows(needle.len()).any(|w| w == needle));
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let result = metadata_stream_result(&mut pdf);
+    assert!(
+        result.is_err(),
+        "a holder whose own resolution errors must propagate the error; got {result:?}"
+    );
+}
+
 /// A bare-CR-framed `endstream` (line-anchored) with an indirect `/Length` is
 /// trimmed of its single `\r` framing byte, mirroring the CRLF case for the
 /// classic-Mac EOL convention.
@@ -244,17 +282,17 @@ fn cr_framed_indirect_length_round_trips() {
     }
 }
 
-/// (3) An ObjStm container whose own `/Length` is an indirect holder and whose
-/// `endstream` is adjacent (no EOL) must still have its compressed members read.
-#[test]
-fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
+/// Build a PDF-1.5 with an uncompressed ObjStm (obj 3) holding one member
+/// (obj 2 = Pages) whose own `/Length` is the indirect holder `5 0 R` with body
+/// `holder_body`, and an adjacent (no-EOL) `endstream`. An XRef stream maps the
+/// member as compressed. Resolving obj 2 forces the container's indirect
+/// `/Length` to be recovered.
+fn build_objstm_pdf(holder_body: &[u8]) -> Vec<u8> {
     // Uncompressed ObjStm: header "2 0\n" (object 2 at body offset 0) then the
     // Pages dict. No trailing EOL, so `endstream` is adjacent.
-    let pages: &[u8] = b"<< /Type /Pages /Count 0 /Kids [] >>";
     let first = b"2 0\n".len();
     let mut objstm_payload = b"2 0\n".to_vec();
-    objstm_payload.extend_from_slice(pages);
-    let objstm_len = objstm_payload.len();
+    objstm_payload.extend_from_slice(b"<< /Type /Pages /Count 0 /Kids [] >>");
 
     let mut bytes = b"%PDF-1.5\n".to_vec();
 
@@ -270,7 +308,9 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
     bytes.extend_from_slice(b"endstream\nendobj\n"); // adjacent endstream
 
     let holder_offset = bytes.len();
-    bytes.extend_from_slice(format!("5 0 obj\n{objstm_len}\nendobj\n").as_bytes());
+    bytes.extend_from_slice(b"5 0 obj\n");
+    bytes.extend_from_slice(holder_body);
+    bytes.extend_from_slice(b"\nendobj\n");
 
     // XRef stream (W = [1 3 1]) covering objects 0..=5.
     fn append_entry(v: &mut Vec<u8>, t: u8, f1: u32, f2: u8) {
@@ -294,8 +334,23 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
         .as_bytes(),
     );
     bytes.extend_from_slice(&xe);
-    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    // Adjacent `endstream` here too (the xref stream uses a DIRECT /Length, so it
+    // re-opens fine): this guarantees NO line-anchored `endstream` exists in the
+    // file, forcing the ObjStm container (obj 3) onto the adjacent-endstream
+    // (`endstream_pos: None`) recovery path under test.
+    bytes.extend_from_slice(b"endstream\nendobj\n");
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    bytes
+}
+
+/// (3) An ObjStm container whose own `/Length` is an indirect holder and whose
+/// `endstream` is adjacent (no EOL) must still have its compressed members read.
+#[test]
+fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
+    // Holder = the ObjStm payload byte count.
+    let objstm_len = b"2 0\n".len() + b"<< /Type /Pages /Count 0 /Kids [] >>".len();
+    let bytes = build_objstm_pdf(objstm_len.to_string().as_bytes());
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     // Object 2 lives inside the ObjStm; resolving it forces the container's
@@ -311,4 +366,19 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
         ),
         other => panic!("expected the Pages dictionary, got {other:?}"),
     }
+}
+
+/// (3b) When an ObjStm container's indirect `/Length` is unrecoverable (here the
+/// holder resolves to a non-integer), the error must propagate out of the
+/// compressed-object resolution path rather than yield a silently-empty
+/// container.
+#[test]
+fn objstm_with_unrecoverable_indirect_length_errors() {
+    let bytes = build_objstm_pdf(b"/NotALength");
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let result = pdf.resolve(ObjectRef::new(2, 0));
+    assert!(
+        result.is_err(),
+        "an ObjStm with an unrecoverable indirect /Length must error; got {result:?}"
+    );
 }

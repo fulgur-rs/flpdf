@@ -958,17 +958,11 @@ impl<R: Read + Seek> Pdf<R> {
                         offset,
                     )?;
                 }
-                // Restore the lazy `Unresolved` entry on a decryption error so a
-                // `set_reserved` guard left by the re-slice above does not linger
-                // as `Reserved` (which a later resolve would read as `Null`,
-                // silently hiding this error).
-                let object = match self.decrypt_resolved_object(object_ref, object) {
-                    Ok(object) => object,
-                    Err(err) => {
-                        self.cache.set_unresolved(object_ref, offset);
-                        return Err(err);
-                    }
-                };
+                // `apply_indirect_stream_length` already restored the lazy
+                // `Unresolved` entry, so a decryption error here leaves it
+                // `Unresolved` (not `Reserved`) and the failure stays loud on a
+                // retry.
+                let object = self.decrypt_resolved_object(object_ref, object)?;
                 self.cache.set_resolved(object_ref, object);
                 Ok(true)
             }
@@ -988,8 +982,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// Apply a parser-recorded indirect `/Length` ([`IndirectStreamLength`]) to a
     /// freshly parsed stream `object`, re-slicing `stream.data` to the
     /// xref-resolved authoritative length read from `bytes` (the raw object
-    /// bytes). `offset` is the object's lazy-load offset, restored into the cache
-    /// before any hard `Err` so the failure stays loud on a retry.
+    /// bytes).
+    ///
+    /// The re-slice resolves the holder, which may mark `object_ref` `Reserved`
+    /// to guard against a cyclic length-holder chain. This wrapper ALWAYS
+    /// restores the lazy `Unresolved { offset }` entry afterwards, on both
+    /// success and error: on success the caller immediately overwrites it with
+    /// the resolved object; on error the failure stays loud on a retry (a
+    /// lingering `Reserved` entry would otherwise resolve to `Null`). The caller
+    /// therefore needs no manual cache restore on its own later error paths
+    /// (e.g. decryption).
     ///
     /// Shared by [`resolve_to_cache`](Self::resolve_to_cache) and
     /// [`resolve_compressed_entry`](Self::resolve_compressed_entry) so ObjStm
@@ -1001,6 +1003,21 @@ impl<R: Read + Seek> Pdf<R> {
         isl: crate::parser::IndirectStreamLength,
         bytes: &[u8],
         offset: u64,
+    ) -> Result<()> {
+        let result = self.reslice_indirect_stream_length(object_ref, object, isl, bytes);
+        self.cache.set_unresolved(object_ref, offset);
+        result
+    }
+
+    /// Inner half of [`apply_indirect_stream_length`](Self::apply_indirect_stream_length):
+    /// performs the holder resolution and re-slice. May leave `object_ref`
+    /// `Reserved`; the wrapper restores the cache entry.
+    fn reslice_indirect_stream_length(
+        &mut self,
+        object_ref: ObjectRef,
+        object: &mut Object,
+        isl: crate::parser::IndirectStreamLength,
+        bytes: &[u8],
     ) -> Result<()> {
         match isl.endstream_pos {
             // The parser located a line-anchored `endstream` and set a usable
@@ -1082,12 +1099,9 @@ impl<R: Read + Seek> Pdf<R> {
                         Ok(Object::Integer(n)) => usize::try_from(*n).ok(),
                         Ok(_) => None,
                         // A genuine resolution error (I/O, decryption, …) is more
-                        // informative than the generic parse error below: restore
-                        // the lazy entry and propagate it.
-                        Err(err) => {
-                            self.cache.set_unresolved(object_ref, offset);
-                            return Err(err);
-                        }
+                        // informative than the generic parse error below — the
+                        // wrapper restores the cache entry, so just propagate it.
+                        Err(err) => return Err(err),
                     }
                 };
                 let auth_end = resolved.and_then(|n| isl.data_start.checked_add(n));
@@ -1100,13 +1114,7 @@ impl<R: Read + Seek> Pdf<R> {
                         stream.data = bytes[isl.data_start..end].to_vec();
                         Ok(())
                     }
-                    _ => {
-                        // Undo the `set_reserved` guard so the hard error stays
-                        // loud on a retry (a lingering `Reserved` entry would
-                        // otherwise resolve to `Null`).
-                        self.cache.set_unresolved(object_ref, offset);
-                        Err(Error::parse(isl.data_start, "stream data exceeds input"))
-                    }
+                    _ => Err(Error::parse(isl.data_start, "stream data exceeds input")),
                 }
             }
         }
@@ -1144,13 +1152,9 @@ impl<R: Read + Seek> Pdf<R> {
                         offset,
                     )?;
                 }
-                let object = match self.decrypt_resolved_object(stream_ref, object) {
-                    Ok(object) => object,
-                    Err(err) => {
-                        self.cache.set_unresolved(stream_ref, offset);
-                        return Err(err);
-                    }
-                };
+                // `apply_indirect_stream_length` already restored the lazy entry,
+                // so a decryption error here leaves it `Unresolved`.
+                let object = self.decrypt_resolved_object(stream_ref, object)?;
                 self.cache.set_resolved(stream_ref, object.clone());
                 object
             }
@@ -2141,6 +2145,32 @@ fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::pages::page_refs;
+
+    #[test]
+    fn keyword_token_at_requires_token_boundary() {
+        // Keyword at EOF (nothing after) is a valid token.
+        assert_eq!(keyword_token_at(b"endobj", 0, b"endobj"), Some(6));
+        // Followed by whitespace / a delimiter is a valid token.
+        assert_eq!(keyword_token_at(b"endobj\n", 0, b"endobj"), Some(6));
+        assert_eq!(keyword_token_at(b"endobj/", 0, b"endobj"), Some(6));
+        // A longer run of regular chars (no boundary) is NOT the keyword token.
+        assert_eq!(keyword_token_at(b"endobjX", 0, b"endobj"), None);
+        // Non-match.
+        assert_eq!(keyword_token_at(b"endstream", 0, b"endobj"), None);
+    }
+
+    #[test]
+    fn stream_end_boundary_at_validates_terminator() {
+        // `endstream` + whitespace + `endobj`, then EOF/boundary: valid.
+        assert!(stream_end_boundary_at(b"endstream\nendobj", 0));
+        assert!(stream_end_boundary_at(b"endstream endobj\n", 0));
+        // `endstreamendobj` with no separator after `endstream`: rejected.
+        assert!(!stream_end_boundary_at(b"endstreamendobj", 0));
+        // `endstream` without the trailing `endobj`: rejected.
+        assert!(!stream_end_boundary_at(b"endstream more", 0));
+        // Not positioned on `endstream`: rejected.
+        assert!(!stream_end_boundary_at(b"xendstream\nendobj", 0));
+    }
 
     /// Minimal valid single-page PDF used across `open_mem` tests.
     ///

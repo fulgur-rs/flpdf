@@ -792,4 +792,17 @@ mod stream_length_tests {
             "an indirect-length stream with no endstream must error, not hang"
         );
     }
+
+    #[test]
+    fn contains_keyword_token_boundaries() {
+        use super::contains_keyword_token;
+        // Token at EOF (nothing after the keyword) counts.
+        assert!(contains_keyword_token(b"xxendstream", b"endstream", 0));
+        // Token followed by whitespace counts.
+        assert!(contains_keyword_token(b"endstream\n", b"endstream", 0));
+        // No boundary after the keyword (a longer run of regular chars) does not.
+        assert!(!contains_keyword_token(b"endstreamX", b"endstream", 0));
+        // Absent keyword does not.
+        assert!(!contains_keyword_token(b"no keyword here", b"endstream", 0));
+    }
 }
