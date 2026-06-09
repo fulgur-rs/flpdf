@@ -1,9 +1,10 @@
 //! Outline and named-destination remapping after page extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page tree
-//! for a subset extraction, this module updates the document's `/Outlines` tree
-//! and `/Names /Dests` name-tree (as well as the legacy `/Catalog /Dests` dictionary)
-//! to match qpdf's `--pages` behaviour:
+//! for a subset extraction, this module updates the document's `/Outlines` tree,
+//! `/Names /Dests` name-tree (and the legacy `/Catalog /Dests` dictionary), the
+//! link annotations (`/Dest`, `/A /GoTo /D`) on every surviving page, and the
+//! catalog `/OpenAction`, all to match qpdf's `--pages` behaviour:
 //!
 //! - Every outline item and named destination is **kept** — none are dropped.
 //!   Sibling `/Prev`/`/Next` links, parent `/First`/`/Last`, `/Count`, and name-tree
@@ -27,6 +28,15 @@
 //! where `10 0 R` resolves to `null`), and leaves `/Count` and the name-tree
 //! `/Limits` unchanged. A removed page referenced by no surviving destination is
 //! absent from the output. This module reproduces that behaviour.
+//!
+//! The same null-out also applies to a removed page reached only through a
+//! surviving page's link annotation (`/Dest`, or `/A /GoTo /D`) or the catalog
+//! `/OpenAction`: qpdf keeps the destination reference verbatim and replaces the
+//! target page object with `null`. An annotation is structurally identical to an
+//! outline item for destination purposes, so the same remap/null logic is reused.
+//! (A removed page reached only through a thread bead's `/P` or a structure
+//! element's `/Pg` belongs to a different, drop-and-garbage-collect family and is
+//! not handled here.)
 //!
 //! # String-form `/Dest`
 //!
@@ -191,6 +201,85 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         // If there is no /First, the outline root has no items → nothing to do.
     }
 
+    // --- Step 4: Link-annotation and /OpenAction destinations -------------
+    // qpdf nulls a removed page reached only via a surviving page's link
+    // annotation (/Dest or /A /GoTo /D) or the catalog /OpenAction, keeping the
+    // destination reference verbatim — the same null-out family as outlines and
+    // named destinations. (A removed page reached only via a thread-bead /P or a
+    // struct element /Pg is a different, drop-and-GC family handled separately.)
+    remap_annot_dests(pdf, result, &surviving)?;
+    remap_open_action_dest(pdf, catalog_ref, &surviving)?;
+
+    Ok(())
+}
+
+/// Null/remap link-annotation destinations on every surviving page (qpdf
+/// `--pages` parity). An annotation is structurally identical to an outline
+/// item for destination purposes (`/Dest` and `/A /GoTo /D`), so the same
+/// [`null_removed_item_targets`] + [`remap_item_dest`] pair applies: a removed
+/// target page is replaced with `null` (its `/Dest`/`/D` reference kept
+/// verbatim), a surviving target is remapped to its new ref. Both helpers are
+/// idempotent, so a page or annotation reached more than once is safe.
+fn remap_annot_dests<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    result: &RebuildResult,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    for &page_ref in &result.new_kids {
+        // /Annots may be an inline array or an indirect reference to one.
+        let annots_val = {
+            let page_obj = pdf.resolve_borrowed(page_ref)?;
+            let Some(page) = page_obj.as_dict() else {
+                continue;
+            };
+            page.get("Annots").cloned()
+        };
+        let annot_refs: Vec<ObjectRef> = match annots_val {
+            Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
+            Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
+                Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
+                _ => Vec::new(),
+            },
+            // Inline-dict annotations have no object to rewrite; skip (rare).
+            _ => Vec::new(),
+        };
+        for annot_ref in annot_refs {
+            null_removed_item_targets(pdf, annot_ref, surviving)?;
+            remap_item_dest(pdf, annot_ref, surviving)?;
+        }
+    }
+    Ok(())
+}
+
+/// Null/remap the catalog `/OpenAction` destination (qpdf `--pages` parity).
+/// `/OpenAction` is either a destination array `[page /Fit ...]` or a GoTo
+/// action dict `<< /S /GoTo /D [page /Fit] >>` (possibly indirect); both forms
+/// expose the page ref through [`remap_or_null_dest`] (array first element or
+/// dict `/D`). A surviving target is remapped, a removed target is nulled.
+fn remap_open_action_dest<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    catalog_ref: ObjectRef,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let oa = {
+        let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
+        let Some(catalog) = catalog_obj.as_dict() else {
+            return Ok(());
+        };
+        catalog.get("OpenAction").cloned()
+    };
+    let Some(oa) = oa else {
+        return Ok(());
+    };
+    // For an indirect /OpenAction, remap_or_null_dest rewrites the referenced
+    // object in place and returns it unchanged; re-storing the same value is a
+    // no-op. For a direct value this applies the remap/null result.
+    let updated = remap_or_null_dest(pdf, oa, surviving)?;
+    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
+    if let Some(mut catalog) = catalog_obj.as_dict().cloned() {
+        catalog.insert("OpenAction", updated);
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    }
     Ok(())
 }
 
@@ -2076,5 +2165,182 @@ mod tests {
         let i22 = dict_of(&mut pdf, ObjectRef::new(22, 0));
         assert_eq!(i22.get("Count"), Some(&Object::Integer(1)));
         assert_eq!(i22.get_ref("First"), Some(ObjectRef::new(24, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Link-annotation and /OpenAction destination null-out (qpdf --pages)
+    // -----------------------------------------------------------------------
+
+    /// Build a 3-page PDF (objs 3,4,5 = page1,2,3) where page1 carries a single
+    /// link annotation (obj 50) whose body is `annot_body`, plus optional extra
+    /// objects and catalog entries. Used by the annotation/OpenAction tests.
+    fn build_annot_pdf(
+        annot_body: &str,
+        catalog_extra: &str,
+        extra_objs: &[(u32, &str)],
+    ) -> Vec<u8> {
+        let mut objs: Vec<(u32, String)> = vec![
+            (
+                1,
+                format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+            ),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_string(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [50 0 R] >>"
+                    .to_string(),
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+            ),
+            (
+                5,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+            ),
+            (50, annot_body.to_string()),
+        ];
+        for (n, body) in extra_objs {
+            objs.push((*n, (*body).to_string()));
+        }
+        let refs: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
+        build_min_pdf(&refs, "")
+    }
+
+    /// First page-ref element of an array-form dest on an object.
+    fn dest_array_first(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef, key: &str) -> ObjectRef {
+        let d = dict_of(pdf, r);
+        d.get(key)
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .and_then(Object::as_ref_id)
+            .unwrap_or_else(|| panic!("{r} /{key} should be an array dest with a page ref"))
+    }
+
+    #[test]
+    fn annot_dest_to_removed_page_is_nulled() {
+        // page1 link annot /Dest [4 0 R /Fit] targets page2 (removed). No
+        // outline, no named dests. qpdf null-out: obj4 -> null, /Dest verbatim.
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>",
+            "",
+            &[],
+        ));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page2 (obj4) should be nulled"
+        );
+        assert_eq!(
+            dest_array_first(&mut pdf, ObjectRef::new(50, 0), "Dest"),
+            ObjectRef::new(4, 0),
+            "annot /Dest keeps the now-null page ref verbatim"
+        );
+    }
+
+    #[test]
+    fn annot_goto_action_to_removed_page_is_nulled() {
+        // page1 link annot /A << /S /GoTo /D [4 0 R /Fit] >> -> page2 (removed).
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] \
+             /A << /S /GoTo /D [4 0 R /Fit] >> >>",
+            "",
+            &[],
+        ));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page2 (obj4) should be nulled"
+        );
+        let annot = dict_of(&mut pdf, ObjectRef::new(50, 0));
+        let action = annot
+            .get("A")
+            .and_then(Object::as_dict)
+            .expect("annot /A should be an action dict");
+        let d_first = action
+            .get("D")
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .and_then(Object::as_ref_id)
+            .expect("/A /D should be an array dest");
+        assert_eq!(
+            d_first,
+            ObjectRef::new(4, 0),
+            "annot /A /D keeps the now-null page ref verbatim"
+        );
+    }
+
+    #[test]
+    fn open_action_goto_to_removed_page_is_nulled() {
+        // catalog /OpenAction << /S /GoTo /D [4 0 R /Fit] >> -> page2 (removed).
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
+            "/OpenAction << /S /GoTo /D [4 0 R /Fit] >>",
+            &[],
+        ));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page2 (obj4) reached only via /OpenAction should be nulled"
+        );
+    }
+
+    #[test]
+    fn open_action_dest_array_to_removed_page_is_nulled() {
+        // catalog /OpenAction [4 0 R /Fit] (destination-array form) -> page2.
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
+            "/OpenAction [4 0 R /Fit]",
+            &[],
+        ));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page2 (obj4) reached only via /OpenAction array should be nulled"
+        );
+    }
+
+    #[test]
+    fn annot_dest_to_surviving_page_is_remapped() {
+        // page1 link annot /Dest [5 0 R /Fit] -> page3, which SURVIVES. qpdf
+        // remaps a surviving dest to the page's new ref. In single-input
+        // --pages a first-materialized page keeps its original object number, so
+        // rebuild_page_tree only ever produces identity mappings; to exercise a
+        // genuine non-identity remap (regression guard) we hand-build a
+        // RebuildResult mapping obj5 -> a fresh ref (obj99), mirroring the
+        // synthetic-RebuildResult precedent in the all_pages_removed_* tests.
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [5 0 R /Fit] >>",
+            "",
+            &[],
+        ));
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(3, 0)],
+            ref_map,
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert_eq!(
+            dest_array_first(&mut pdf, ObjectRef::new(50, 0), "Dest"),
+            ObjectRef::new(99, 0),
+            "annot /Dest to a surviving page should be remapped to its new ref"
+        );
     }
 }
