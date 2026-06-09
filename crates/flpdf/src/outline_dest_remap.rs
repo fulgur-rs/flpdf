@@ -275,16 +275,19 @@ fn remap_annot_dests<R: Read + Seek>(
             // misclassify it as a removed target, nulling a surviving page —
             // the same hazard the dedup prevents for shared annot refs.
             Some(Object::Reference(r)) => {
-                if !visited.insert(r) {
+                // Follow the full reference chain (ref -> … -> array) so a
+                // double-indirect /Annots is not dropped, then dedup on the
+                // terminal array object so a shared array is processed once.
+                let (resolved, terminal) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+                let array_ref = terminal.unwrap_or(r);
+                if !visited.insert(array_ref) {
                     continue;
                 }
-                let arr = match pdf.resolve_borrowed(r)? {
-                    Object::Array(arr) => arr.clone(),
-                    // Double-indirect /Annots (ref -> ref -> array) is not followed.
-                    _ => continue,
+                let Object::Array(arr) = resolved else {
+                    continue;
                 };
                 if let Some(new_arr) = remap_annot_array(pdf, arr, surviving, &mut visited)? {
-                    pdf.set_object(r, Object::Array(new_arr));
+                    pdf.set_object(array_ref, Object::Array(new_arr));
                 }
             }
             _ => {}
@@ -382,13 +385,17 @@ fn remap_open_action_dest<R: Read + Seek>(
         return Ok(());
     };
     // For an indirect /OpenAction the referenced object is rewritten in place
-    // and the same value returned; re-storing it is a no-op. For a direct value
-    // this applies the remap/null result.
-    let updated = remap_or_null_action_dest(pdf, oa, surviving)?;
-    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-    if let Some(mut catalog) = catalog_obj.as_dict().cloned() {
-        catalog.insert("OpenAction", updated);
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    // and the same value returned; for a direct value a remapped destination
+    // comes back changed. Only rewrite the catalog when the value actually
+    // changed, so an unchanged (or in-place-updated indirect) /OpenAction does
+    // not needlessly mark the catalog dirty.
+    let updated = remap_or_null_action_dest(pdf, oa.clone(), surviving)?;
+    if updated != oa {
+        let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
+        if let Some(mut catalog) = catalog_obj.as_dict().cloned() {
+            catalog.insert("OpenAction", updated);
+            pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        }
     }
     Ok(())
 }

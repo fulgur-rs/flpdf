@@ -309,8 +309,8 @@ git commit -m "test(flpdf): qpdf 11.9.0 parity for link-annot/OpenAction null-ou
 ```bash
 cargo fmt --all                 # CI Quality gate (fmt --check が回る) — 必ず実行
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
 cargo test                      # 全 workspace（baseline からの回帰なし）
+cargo clippy --all-targets -- -D warnings
 ```
 
 Expected: すべて成功、0 failed、fmt 差分なし。

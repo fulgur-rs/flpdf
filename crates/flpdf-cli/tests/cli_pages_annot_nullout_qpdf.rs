@@ -45,27 +45,32 @@ fn qpdf_available() -> bool {
     }
 }
 
-/// Run qpdf with `args`; panic if it cannot spawn. Returns success flag.
-fn run_qpdf(args: &[&str]) -> bool {
-    let out = Shell::new(QPDF)
+/// Run qpdf with `args`; panic if it cannot spawn. Returns the process output
+/// so callers can surface the exit code and stderr in failure diagnostics.
+fn run_qpdf(args: &[&str]) -> std::process::Output {
+    Shell::new(QPDF)
         .args(args)
         .output()
-        .expect("qpdf should spawn");
-    out.status.success()
+        .expect("qpdf should spawn")
 }
 
 /// Normalize a PDF with qpdf's QDF mode into a stable, parseable text form and
 /// return its contents. Disables object streams and original object ids so the
 /// dictionaries and `N 0 obj` bodies appear as plain text.
 fn normalize_qdf(input: &Path, output: &Path) -> String {
-    let ok = run_qpdf(&[
+    let out = run_qpdf(&[
         "--qdf",
         "--object-streams=disable",
         "--no-original-object-ids",
         input.to_str().unwrap(),
         output.to_str().unwrap(),
     ]);
-    assert!(ok, "qpdf --qdf normalization should succeed for {input:?}");
+    assert!(
+        out.status.success(),
+        "qpdf --qdf normalization should succeed for {input:?} (exit {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     // QDF files start with a binary marker comment (`%`+high bytes), so the
     // file is not valid UTF-8 as a whole. We only ever parse ASCII lines
     // (`N 0 obj`, `/Dest [`, `null`, `%% Page`), so a lossy decode is safe.
@@ -233,7 +238,7 @@ fn assert_nullout_parity(variant: &str, key: &str) {
 
     // qpdf is the oracle; if it rejects our fixture the offset bookkeeping is
     // wrong, so fail loudly rather than skip.
-    let q_ok = run_qpdf(&[
+    let q_run = run_qpdf(&[
         src.to_str().unwrap(),
         "--pages",
         ".",
@@ -241,7 +246,12 @@ fn assert_nullout_parity(variant: &str, key: &str) {
         "--",
         q_out.to_str().unwrap(),
     ]);
-    assert!(q_ok, "qpdf --pages should succeed on the {variant} fixture");
+    assert!(
+        q_run.status.success(),
+        "qpdf --pages should succeed on the {variant} fixture (exit {:?}): {}",
+        q_run.status.code(),
+        String::from_utf8_lossy(&q_run.stderr)
+    );
 
     Command::cargo_bin("flpdf")
         .unwrap()
