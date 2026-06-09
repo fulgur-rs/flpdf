@@ -2080,9 +2080,17 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
         "all outline items must be kept (null-out): {outline_txt}"
     );
 
-    // Resource prune + xref GC: dropped pages' fonts must not be in output.
     let raw = std::fs::read(&output).unwrap();
     let txt = String::from_utf8_lossy(&raw);
+
+    // Named destinations: all three are kept (null-out keeps d1/d3 even though
+    // their target pages were removed and nulled).
+    assert!(
+        txt.contains("(d1)") && txt.contains("(d2)") && txt.contains("(d3)"),
+        "named destinations d1/d2/d3 must all be kept (null-out parity): {txt}"
+    );
+
+    // Resource prune + xref GC: dropped pages' fonts must not be in output.
     assert!(
         txt.contains("Courier"),
         "kept page's font missing from output"
