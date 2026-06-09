@@ -437,11 +437,10 @@ fn best_effort_recovers_objstm_compressed_entries() {
     bytes.extend_from_slice(
         format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
     );
-    let pos = bytes
-        .windows(4)
-        .rposition(|window| window == b"xref")
-        .expect("fixture should contain xref token");
-    bytes[pos + 2] = b'z';
+    // Corrupt the standalone `xref` table keyword (xref -> xrzf) at its known
+    // offset, leaving `startxref` intact so strict parsing reaches and rejects
+    // the malformed table rather than failing on a missing `startxref`.
+    bytes[start_xref + 2] = b'z';
 
     // Strict mode must reject the corrupt xref.
     load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
@@ -502,12 +501,10 @@ fn objstm_recovery_fixture(dict_body: &str, stream_payload: &[u8]) -> (Vec<u8>, 
     bytes.extend_from_slice(
         format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
     );
-    // Corrupt the `xref` keyword (xref -> xrez) so strict parsing fails.
-    let pos = bytes
-        .windows(4)
-        .rposition(|window| window == b"xref")
-        .expect("fixture should contain xref token");
-    bytes[pos + 2] = b'z';
+    // Corrupt the standalone `xref` table keyword (xref -> xrzf) at its known
+    // offset, leaving `startxref` intact so strict parsing reaches and rejects
+    // the malformed table rather than failing on a missing `startxref`.
+    bytes[start_xref + 2] = b'z';
 
     (bytes, objstm_obj_number)
 }
