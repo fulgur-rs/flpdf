@@ -23,6 +23,8 @@
 
 ---
 
+## Implementation Tasks
+
 ### Task 1: Repair-path recovery arms (best-effort / with-repair)
 
 **Files:**
@@ -59,6 +61,7 @@ Covers lines: `80-82, 114-115, 119-122, 168-169, 171, 252-258, 269-272, 334, 340
 **Step 2: Run to verify** — `cargo test -p flpdf --test xref_tests 2>&1 | tail -20`. Each new test must PASS (the production code already handles these branches; a failure means a real bug — stop and report).
 
 **Step 3: Commit**
+
 ```bash
 git add crates/flpdf/tests/xref_tests.rs
 git commit -m "test(flpdf): cover xref repair/recovery arms (flpdf-tq35)"
@@ -84,6 +87,7 @@ Reuse `corrupt_xref_pdf`'s table-building style but keep these as small standalo
 **Step 2: Run** — `cargo test -p flpdf --test xref_tests 2>&1 | tail -20`, all PASS.
 
 **Step 3: Commit**
+
 ```bash
 git add crates/flpdf/tests/xref_tests.rs
 git commit -m "test(flpdf): cover strict xref-table error arms (flpdf-tq35)"
@@ -125,6 +129,7 @@ Note: some target lines (e.g. 482, 376) are sub-expressions on otherwise-covered
 **Step 2: Run** — `cargo test -p flpdf --test xref_tests 2>&1 | tail -25`, all PASS.
 
 **Step 3: Commit**
+
 ```bash
 git add crates/flpdf/tests/xref_tests.rs
 git commit -m "test(flpdf): cover strict xref-stream error arms (flpdf-tq35)"
@@ -138,23 +143,28 @@ git commit -m "test(flpdf): cover strict xref-stream error arms (flpdf-tq35)"
 - Modify: `crates/flpdf/tests/xref_tests.rs` (only if backfill needed)
 
 **Step 1: Re-measure**
+
 ```bash
 cargo llvm-cov --workspace --summary-only 2>/dev/null | grep "flpdf/src/xref.rs"
 cargo llvm-cov report --show-missing-lines --color never 2>/dev/null | grep -A1 "src/xref.rs"
 ```
+
 Record before (74.60%) → after. Expect a substantial rise (target: meaningfully above 74.60%; the remaining gap should be only the documented-unreachable 64-bit arms plus any genuinely-unreachable defensive arms).
 
 **Step 2: Triage remaining uncovered lines.** For each still-red line decide: (a) genuine gap I can reach → add a fixture and re-run; (b) unreachable through public API on 64-bit → leave it, ensure there is a one-line comment in `xref.rs` OR in the test module documenting why (e.g. `// Lines 88-92 / 164-165: usize::try_from(u64) overflow — only reachable on 32-bit targets.`). Do NOT add `#[cfg]` hacks or alter production logic to chase lines.
 
 **Step 3: Full crate test + fmt**
+
 ```bash
 cargo test -p flpdf 2>&1 | tail -15
 cargo fmt --all
 cargo fmt --all --check
 ```
+
 (`cargo fmt --check` is a CI quality gate — must be clean before push.)
 
 **Step 4: Commit**
+
 ```bash
 git add -A
 git commit -m "test(flpdf): backfill + document unreachable xref arms; record coverage delta (flpdf-tq35)"
@@ -163,6 +173,7 @@ git commit -m "test(flpdf): backfill + document unreachable xref arms; record co
 ---
 
 ## Done criteria
+
 - `cargo test -p flpdf` green.
 - `cargo fmt --all --check` clean.
 - `cargo llvm-cov --workspace` shows `xref.rs` line% meaningfully above 74.60%, with the residual gap explained (documented-unreachable arms).

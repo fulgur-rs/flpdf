@@ -440,6 +440,11 @@ fn best_effort_recovers_objstm_compressed_entries() {
     // Corrupt the standalone `xref` table keyword (xref -> xrzf) at its known
     // offset, leaving `startxref` intact so strict parsing reaches and rejects
     // the malformed table rather than failing on a missing `startxref`.
+    assert_eq!(
+        &bytes[start_xref..start_xref + 4],
+        b"xref",
+        "fixture layout changed: start_xref must point at the table keyword"
+    );
     bytes[start_xref + 2] = b'z';
 
     // Strict mode must reject the corrupt xref.
@@ -504,6 +509,11 @@ fn objstm_recovery_fixture(dict_body: &str, stream_payload: &[u8]) -> (Vec<u8>, 
     // Corrupt the standalone `xref` table keyword (xref -> xrzf) at its known
     // offset, leaving `startxref` intact so strict parsing reaches and rejects
     // the malformed table rather than failing on a missing `startxref`.
+    assert_eq!(
+        &bytes[start_xref..start_xref + 4],
+        b"xref",
+        "fixture layout changed: start_xref must point at the table keyword"
+    );
     bytes[start_xref + 2] = b'z';
 
     (bytes, objstm_obj_number)
