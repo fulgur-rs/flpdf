@@ -147,12 +147,23 @@ fn collect_page_fonts<R: Read + Seek>(
     };
 
     for (font_name, value) in fonts_dict.iter() {
-        match value {
-            Object::Reference(font_ref) => {
-                if let Ok(font_obj) = pdf.resolve_borrowed(*font_ref) {
-                    fonts.insert(font_name.to_vec(), font_obj.clone());
-                }
-            }
+        // A font value may be inlined as a dictionary, embedded as a stream, or
+        // (most commonly) stored indirectly. Resolve references first, then
+        // normalize to the font dictionary: dictionaries are kept as-is and
+        // streams contribute their dictionary. PDF streams are always indirect
+        // objects, so a stream-valued font is only ever seen through the
+        // reference arm; the direct Object::Stream arm below mirrors it for
+        // completeness. Anything that is not a font dictionary is skipped.
+        //
+        // Resolution errors propagate via `?`, matching how /Resources and
+        // /Font are resolved above; a missing or deleted reference is not an
+        // error (it resolves to `Object::Null`) and is skipped by the match
+        // below.
+        let resolved = match value {
+            Object::Reference(font_ref) => pdf.resolve_borrowed(*font_ref)?,
+            other => other,
+        };
+        match resolved {
             Object::Dictionary(font_dict) => {
                 fonts.insert(font_name.to_vec(), Object::Dictionary(font_dict.clone()));
             }
