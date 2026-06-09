@@ -134,6 +134,8 @@ fn assert_dest_points_at_null(qdf: &str, key: &str, tool: &str) {
 ///   - `"dest"`   : page1 `/Annots [annot]`, annot `/Dest [page2 /Fit]`
 ///   - `"action"` : page1 `/Annots [annot]`, annot `/A /GoTo /D [page2 /Fit]`
 ///   - `"openaction"` : catalog `/OpenAction /GoTo /D [page2 /Fit]`, no annot
+///   - `"inline"` : page1 `/Annots [ << ...inline link... /Dest [page2 /Fit] >> ]`
+///     (a direct-dict annotation, no indirect annot object)
 fn nullout_fixture(variant: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
     // Object layout (page2 is always obj 4 = the removed dest target):
@@ -157,13 +159,20 @@ fn nullout_fixture(variant: &str) -> tempfile::NamedTempFile {
         &mut buf,
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n",
     );
-    let page1 = if variant == "openaction" {
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] /Resources << >> >>\nendobj\n"
-    } else {
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] \
-         /Resources << >> /Annots [6 0 R] >>\nendobj\n"
+    let page1 = match variant {
+        "openaction" => "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] \
+             /Resources << >> >>\nendobj\n"
+            .to_string(),
+        // Inline (direct-dict) annotation embedded directly in /Annots.
+        "inline" => "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] \
+             /Resources << >> /Annots [ << /Type /Annot /Subtype /Link \
+             /Rect [0 0 50 50] /Dest [4 0 R /Fit] >> ] >>\nendobj\n"
+            .to_string(),
+        _ => "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] \
+             /Resources << >> /Annots [6 0 R] >>\nendobj\n"
+            .to_string(),
     };
-    add(&mut buf, page1);
+    add(&mut buf, &page1);
     add(
         &mut buf,
         "4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> >>\nendobj\n",
@@ -183,7 +192,7 @@ fn nullout_fixture(variant: &str) -> tempfile::NamedTempFile {
             "6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [0 0 50 50] \
              /A << /Type /Action /S /GoTo /D [4 0 R /Fit] >> >>\nendobj\n",
         ),
-        "openaction" => {}
+        "openaction" | "inline" => {}
         other => panic!("unknown fixture variant: {other}"),
     }
 
@@ -289,4 +298,11 @@ fn open_action_goto_removed_page_becomes_null_like_qpdf() {
     // catalog `/OpenAction /GoTo /D [page2 /Fit]`; deleting page2 → page2 obj
     // is null, `/D` reference preserved. (qpdf 11.9.0 verified.)
     assert_nullout_parity("openaction", "/D");
+}
+
+#[test]
+fn inline_link_annot_dest_removed_page_becomes_null_like_qpdf() {
+    // page1 INLINE (direct-dict) link annot `/Dest [page2 /Fit]`; deleting page2
+    // → page2 obj is null, `/Dest` reference preserved. (qpdf 11.9.0 verified.)
+    assert_nullout_parity("inline", "/Dest");
 }
