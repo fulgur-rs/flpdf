@@ -234,8 +234,11 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 /// pass would resolve an already-remapped `/Dest` (now pointing at a *new* ref
 /// that is not a key of `surviving`) and misclassify it as a removed target,
 /// nulling a surviving page. A `visited` set (bounded-traversal guard, as in
-/// [`remap_outline_tree`] / [`remap_name_tree`]) deduplicates shared refs.
-/// Inline annotations cannot be shared by reference, so they need no dedup.
+/// [`remap_outline_tree`] / [`remap_name_tree`]) deduplicates both shared annot
+/// references and shared *indirect* `/Annots` array objects — a shared array's
+/// inline annotations would otherwise be re-remapped on the second pass with
+/// the same misclassification hazard. An *inline* `/Annots` array lives in a
+/// single page dict and cannot be shared by reference, so it needs no dedup.
 fn remap_annot_dests<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
@@ -265,8 +268,16 @@ fn remap_annot_dests<R: Read + Seek>(
                 }
             }
             // Indirect /Annots array: process elements, write the array back to
-            // the array object only if an inline annotation changed.
+            // the array object only if an inline annotation changed. A shared
+            // indirect array (duplicate-page selection) must be processed once:
+            // a second pass would re-remap an inline annot's already-remapped
+            // /Dest (now a new ref absent from `surviving`'s old-ref keys) and
+            // misclassify it as a removed target, nulling a surviving page —
+            // the same hazard the dedup prevents for shared annot refs.
             Some(Object::Reference(r)) => {
+                if !visited.insert(r) {
+                    continue;
+                }
                 let arr = match pdf.resolve_borrowed(r)? {
                     Object::Array(arr) => arr.clone(),
                     // Double-indirect /Annots (ref -> ref -> array) is not followed.
@@ -2531,6 +2542,50 @@ mod tests {
             d_first,
             ObjectRef::new(99, 0),
             "inline annot /Dest to a surviving page should be remapped to its new ref"
+        );
+    }
+
+    #[test]
+    fn shared_indirect_annot_array_processed_once() {
+        // Regression guard for the indirect-/Annots-array dedup. An INDIRECT
+        // /Annots array object (obj60) shared by a duplicated surviving page
+        // (obj3 twice in new_kids) holds an inline annot whose /Dest [5 0 R /Fit]
+        // targets obj5, which survives and remaps to obj3 (surviving = {obj5 ->
+        // obj3}). Without deduping the shared array object, the first pass remaps
+        // the inline /Dest to [3 0 R]; the second pass would resolve that to obj3
+        // -- not a key of `surviving` -- and null obj3, a SURVIVING page. The
+        // array-object dedup skips the second pass so obj3 stays a dictionary.
+        let mut pdf = open(build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots 60 0 R >>",
+                ),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    60,
+                    "[ << /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [5 0 R /Fit] >> ]",
+                ),
+            ],
+            "",
+        ));
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(3, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(3, 0)],
+            ref_map,
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            pdf.resolve(ObjectRef::new(3, 0))
+                .unwrap()
+                .as_dict()
+                .is_some(),
+            "surviving page obj3 must stay a dictionary (shared indirect /Annots array deduped)"
         );
     }
 
