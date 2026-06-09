@@ -1199,7 +1199,10 @@ fn rejects_xref_table_truncated_entry() {
     let err = load_xref_and_trailer(&mut Cursor::new(bytes))
         .expect_err("truncated xref table entry should fail strict parse");
     let message = format!("{err}");
-    assert!(message.contains("unexpected end of"), "got {message}");
+    assert!(
+        message.contains("unexpected end of fixed-width field"),
+        "got {message}"
+    );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
