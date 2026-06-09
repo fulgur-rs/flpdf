@@ -123,14 +123,14 @@ fn font_entries_collects_inline_font_dictionary() {
 }
 
 #[test]
-fn font_entries_indirect_stream_value_is_returned_as_stream() {
+fn font_entries_indirect_stream_value_is_normalized_to_dictionary() {
     // A /Font value that resolves (via an indirect reference) to a stream is
-    // returned as the resolved Object::Stream, NOT normalized to its
-    // dictionary. The module doc mentions normalizing streams to their font
-    // dictionary, but that only happens for a *direct* Object::Stream value
-    // (collect_page_fonts' Stream arm), which the parser never produces because
-    // PDF streams are always indirect objects. This test pins the reachable
-    // behaviour so the divergence is visible if either side changes.
+    // normalized to the stream's font dictionary, matching the documented
+    // contract ("for streams, the stream's font dictionary"). Because PDF
+    // streams are always stored as indirect objects, this is the only path on
+    // which a stream-valued font is ever observed, so normalization must happen
+    // here in the reference arm rather than only on a direct Object::Stream
+    // value (which the parser never produces).
     let bytes = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
@@ -146,11 +146,11 @@ fn font_entries_indirect_stream_value_is_returned_as_stream() {
     let mut pdf = open(bytes);
     let fonts = font_entries(&mut pdf).unwrap();
     let entry = fonts.get(b"F1".as_slice()).expect("F1 present");
-    let stream = entry
-        .as_stream()
-        .expect("indirect stream returned verbatim");
+    let dict = entry
+        .as_dict()
+        .expect("indirect stream normalized to its dictionary");
     assert_eq!(
-        stream.dict.get("BaseFont").and_then(Object::as_name),
+        dict.get("BaseFont").and_then(Object::as_name),
         Some(b"Embedded".as_slice())
     );
 }
