@@ -2340,6 +2340,79 @@ mod tests {
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
+    // -----------------------------------------------------------------------
+    // qpdf null-out parity: outline items / named dests are NEVER dropped;
+    // surviving-page dests are remapped; a removed page still referenced by a
+    // kept dest is emitted as `null`; /Count, /Limits, and sibling links are
+    // left unchanged. Oracle: qpdf 11.9.0
+    // `--static-id in.pdf --pages in.pdf 1,3 -- out.pdf`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nullout_named_dests_kept_removed_pages_nulled() {
+        let mut pdf = open(build_outline_pdf());
+        let pages = vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)];
+        let result = rebuild_page_tree(&mut pdf, &pages).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // ALL four named dests are still present (none dropped), in original
+        // order; /Limits not removed.
+        let leaf = dict_of(&mut pdf, ObjectRef::new(30, 0));
+        let Some(Object::Array(names)) = leaf.get("Names") else {
+            panic!("/Names array");
+        };
+        let keys: Vec<&[u8]> = names
+            .iter()
+            .step_by(2)
+            .filter_map(|o| match o {
+                Object::String(b) | Object::Name(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                b"dest_named_p4".as_slice(),
+                b"dest_p1",
+                b"dest_p2",
+                b"dest_p3"
+            ],
+            "all named dests kept in original order"
+        );
+        assert!(leaf.get("Limits").is_some(), "/Limits not removed");
+
+        // Surviving dests remapped; removed-page dests point at a now-null page.
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        let new_p3 = result.ref_map[&ObjectRef::new(5, 0)][0];
+        let dest_of = |names: &[Object], k: &[u8]| -> Object {
+            let i = names
+                .iter()
+                .step_by(2)
+                .position(|o| matches!(o, Object::String(b) | Object::Name(b) if b == k))
+                .unwrap();
+            names[i * 2 + 1].clone()
+        };
+        let arr_first = |o: &Object| -> ObjectRef {
+            o.as_array().unwrap().first().unwrap().as_ref_id().unwrap()
+        };
+        assert_eq!(arr_first(&dest_of(names, b"dest_p1")), new_p1);
+        assert_eq!(arr_first(&dest_of(names, b"dest_p3")), new_p3);
+        // dest_p2 -> obj4 (page 2 removed): kept, target nulled.
+        assert_eq!(
+            arr_first(&dest_of(names, b"dest_p2")),
+            ObjectRef::new(4, 0),
+            "removed-page dest keeps its original ref"
+        );
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page 2 (obj4) nulled"
+        );
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null),
+            "removed page 4 (obj6) nulled (referenced by dest_named_p4)"
+        );
+    }
+
     #[test]
     fn count_visible_descendants_saturates_on_hostile_count() {
         // Two items each claiming /Count i64::MAX. Summing them overflows i64
