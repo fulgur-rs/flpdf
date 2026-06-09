@@ -154,11 +154,13 @@ fn collect_page_fonts<R: Read + Seek>(
         // objects, so a stream-valued font is only ever seen through the
         // reference arm; the direct Object::Stream arm below mirrors it for
         // completeness. Anything that is not a font dictionary is skipped.
+        //
+        // Resolution errors propagate via `?`, matching how /Resources and
+        // /Font are resolved above; a missing or deleted reference is not an
+        // error (it resolves to `Object::Null`) and is skipped by the match
+        // below.
         let resolved = match value {
-            Object::Reference(font_ref) => match pdf.resolve_borrowed(*font_ref) {
-                Ok(resolved) => resolved,
-                Err(_) => continue,
-            },
+            Object::Reference(font_ref) => pdf.resolve_borrowed(*font_ref)?,
             other => other,
         };
         match resolved {

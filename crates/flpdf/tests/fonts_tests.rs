@@ -435,3 +435,27 @@ fn font_entries_missing_pages_key_errors() {
     let err = font_entries(&mut pdf).unwrap_err();
     assert!(matches!(err, Error::Missing("/Pages")), "got {err:?}");
 }
+
+#[test]
+fn font_entries_propagates_font_reference_resolution_error() {
+    // A /Font value referencing an object whose body fails to parse must make
+    // font_entries surface the error rather than silently returning an
+    // incomplete list. (A missing/deleted reference is not an error: it
+    // resolves to Null and is skipped.)
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 7 0 R >> >> >>".into(),
+            ),
+            // Truncated dictionary: parsing the object body hits EOF mid-dict.
+            (7, "<< /Type /Font /BaseFont".into()),
+        ],
+        1,
+    );
+    let mut pdf = open(bytes);
+    let result = font_entries(&mut pdf);
+    assert!(result.is_err(), "expected resolution error, got {result:?}");
+}
