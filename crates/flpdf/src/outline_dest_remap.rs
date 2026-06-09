@@ -111,13 +111,15 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
     let outlines_ref = catalog.get_ref("Outlines");
 
-    // --- Step 2: Prune named destinations ---------------------------------
-    // We need to know which named destinations survive before processing
-    // outline string-form /Dest references.
-    let mut surviving_names: BTreeSet<Vec<u8>> = BTreeSet::new();
+    // --- Step 2: Remap named destinations (qpdf null-out) -----------------
+    // qpdf keeps every named destination: a surviving-page dest is remapped to
+    // its new page ref; a removed-page dest is left verbatim and its target
+    // page object is replaced with `null` (an unreferenced removed page is then
+    // garbage-collected by the later subset sweep). /Names and /Dests are never
+    // removed from the catalog, and /Limits is never recomputed.
 
-    // 2a. /Names /Dests name-tree. /Names may be an indirect reference OR a
-    // direct dictionary on the catalog; /Dests inside it likewise.
+    // /Names may be an indirect reference OR a direct dictionary on the catalog;
+    // /Dests inside it likewise.
     enum NamesLoc {
         Indirect(ObjectRef),
         DirectInCatalog,
@@ -131,63 +133,31 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         _ => (None, crate::Dictionary::default()),
     };
     if let Some(names_loc) = names_loc {
-        let dests_empty = match names_dict.get("Dests").cloned() {
+        match names_dict.get("Dests").cloned() {
             Some(Object::Reference(dr)) => {
+                // /Dests is an indirect name-tree root: nodes are remapped in
+                // place, so the /Names holder needs no rewrite.
                 let mut nt_visited: BTreeSet<ObjectRef> = BTreeSet::new();
-                prune_name_tree(
-                    pdf,
-                    dr,
-                    &surviving,
-                    &mut surviving_names,
-                    0,
-                    max_depth,
-                    &mut nt_visited,
-                )?
+                remap_name_tree(pdf, dr, &surviving, 0, max_depth, &mut nt_visited)?;
             }
             Some(Object::Dictionary(node)) => {
-                let (new_node, empty) = prune_name_tree_node_dict(
-                    pdf,
-                    node,
-                    &surviving,
-                    &mut surviving_names,
-                    max_depth,
-                )?;
-                if !empty {
-                    names_dict.insert("Dests", Object::Dictionary(new_node));
-                }
-                empty
-            }
-            // No /Dests (other name-tree keys only) — nothing to prune here.
-            _ => false,
-        };
-        if dests_empty {
-            // All named dests pruned — drop /Dests so no dangling ref remains.
-            names_dict.remove("Dests");
-        }
-        let names_now_empty = names_dict.iter().next().is_none();
-        match names_loc {
-            NamesLoc::Indirect(r) => {
-                if names_now_empty {
-                    let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
-                    if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
-                        cat.remove("Names");
-                        pdf.set_object(catalog_ref, Object::Dictionary(cat));
+                // /Dests held as a direct dict: rebuild it and write the holder
+                // (the indirect /Names object, or the catalog) back.
+                let new_node = remap_name_tree_node_dict(pdf, node, &surviving, max_depth)?;
+                names_dict.insert("Dests", Object::Dictionary(new_node));
+                match names_loc {
+                    NamesLoc::Indirect(r) => pdf.set_object(r, Object::Dictionary(names_dict)),
+                    NamesLoc::DirectInCatalog => {
+                        let cat_obj = pdf.resolve_borrowed(catalog_ref)?;
+                        if let Some(mut cat) = cat_obj.as_dict().cloned() {
+                            cat.insert("Names", Object::Dictionary(names_dict));
+                            pdf.set_object(catalog_ref, Object::Dictionary(cat));
+                        }
                     }
-                } else {
-                    pdf.set_object(r, Object::Dictionary(names_dict));
                 }
             }
-            NamesLoc::DirectInCatalog => {
-                let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
-                if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
-                    if names_now_empty {
-                        cat.remove("Names");
-                    } else {
-                        cat.insert("Names", Object::Dictionary(names_dict));
-                    }
-                    pdf.set_object(catalog_ref, Object::Dictionary(cat));
-                }
-            }
+            // No /Dests (other name-tree keys only) — nothing to remap here.
+            _ => {}
         }
     }
 
@@ -198,11 +168,11 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     };
     match catalog2.get("Dests").cloned() {
         Some(Object::Reference(dests_obj_ref)) => {
-            prune_legacy_dests(pdf, dests_obj_ref, &surviving, &mut surviving_names)?;
+            remap_legacy_dests(pdf, dests_obj_ref, &surviving)?;
         }
         Some(Object::Dictionary(dests)) => {
             // Legacy /Dests held as a direct dictionary on the catalog.
-            let new_dests = prune_dests_dict(pdf, dests, &surviving, &mut surviving_names)?;
+            let new_dests = remap_dests_dict(pdf, dests, &surviving)?;
             let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
             if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
                 cat.insert("Dests", Object::Dictionary(new_dests));
@@ -212,55 +182,270 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         _ => {}
     }
 
-    // --- Step 3: Remap / drop the outline tree ----------------------------
+    // --- Step 3: Remap the outline tree (qpdf null-out) -------------------
+    // Every outline item is kept; only its destination page ref is remapped (or
+    // nulled when the target page was removed). Sibling links, /Count, and the
+    // /Outlines catalog entry are all left unchanged.
     if let Some(outlines_obj_ref) = outlines_ref {
-        let outline_root_obj = pdf.resolve_borrowed(outlines_obj_ref)?;
-        if let Some(outline_root) = outline_root_obj.as_dict() {
-            if let Some(first_ref) = outline_root.get_ref("First") {
-                // Walk the top-level items, collecting which to keep/drop.
-                let mut kept: Vec<ObjectRef> = Vec::new();
-                let mut dropped: BTreeSet<ObjectRef> = BTreeSet::new();
-
-                collect_siblings(
-                    pdf,
-                    first_ref,
-                    0,
-                    max_depth,
-                    &surviving,
-                    &surviving_names,
-                    &mut kept,
-                    &mut dropped,
-                )?;
-
-                if kept.is_empty() {
-                    // All top-level items dropped → remove /Outlines from catalog.
-                    let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
-                    if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
-                        cat.remove("Outlines");
-                        pdf.set_object(catalog_ref, Object::Dictionary(cat));
-                    }
-                } else {
-                    // Stitch surviving top-level items and update outline root /Count.
-                    stitch_siblings(pdf, &kept, outlines_obj_ref)?;
-
-                    // Recount visible descendants for the outline root.
-                    let new_count = count_visible_descendants(pdf, &kept, max_depth)?;
-                    let outline_root_obj2 = pdf.resolve_borrowed(outlines_obj_ref)?;
-                    if let Some(mut root_dict) = outline_root_obj2.as_dict().cloned() {
-                        // Preserve sign: root /Count is always positive (not closed),
-                        // but we re-set it anyway to be safe.
-                        root_dict.insert("Count", Object::Integer(new_count));
-                        root_dict.insert("First", Object::Reference(kept[0]));
-                        root_dict
-                            .insert("Last", Object::Reference(*kept.last().expect("non-empty")));
-                        pdf.set_object(outlines_obj_ref, Object::Dictionary(root_dict));
-                    }
-                }
-            }
-            // If there is no /First, the outline root has no items → nothing to do.
+        let first_ref = {
+            let outline_root_obj = pdf.resolve_borrowed(outlines_obj_ref)?;
+            outline_root_obj.as_dict().and_then(|d| d.get_ref("First"))
+        };
+        if let Some(first_ref) = first_ref {
+            let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+            remap_outline_tree(pdf, first_ref, 0, max_depth, &surviving, &mut visited)?;
         }
+        // If there is no /First, the outline root has no items → nothing to do.
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// qpdf null-out helpers: keep every entry, remap surviving-page dests, and
+// replace a removed page object with `null`.
+// ---------------------------------------------------------------------------
+
+/// Replace a removed page object with `null` in place (qpdf null-out).
+/// Idempotent: a page already nulled (e.g. referenced by several dests) stays
+/// null. The later subset sweep drops it iff nothing references it.
+fn null_page<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) {
+    pdf.set_object(page_ref, Object::Null);
+}
+
+/// Remap a `/Names`-leaf name tree (or descend its `/Kids`) in place, keeping
+/// every entry. A surviving-page dest is remapped; a removed-page dest is left
+/// verbatim and its target page is nulled. `/Limits` is never recomputed.
+fn remap_name_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node_ref: ObjectRef,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if depth >= max_depth {
+        return Err(Error::Unsupported(format!(
+            "outline_dest_remap: name-tree depth limit {max_depth} exceeded at {node_ref}"
+        )));
+    }
+    if !visited.insert(node_ref) {
+        return Ok(()); // Cycle: already processed.
+    }
+    let node_obj = pdf.resolve_borrowed(node_ref)?;
+    let Some(node) = node_obj.as_dict() else {
+        return Ok(()); // Malformed node.
+    };
+
+    if node.get("Names").is_some() {
+        if let Some(pairs) = node.get("Names").cloned().and_then(Object::into_array) {
+            let new_pairs = remap_name_pairs(pdf, pairs, surviving)?;
+            let node_obj2 = pdf.resolve_borrowed(node_ref)?;
+            if let Some(mut d) = node_obj2.as_dict().cloned() {
+                d.insert("Names", Object::Array(new_pairs));
+                pdf.set_object(node_ref, Object::Dictionary(d));
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
+        let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
+        for child_ref in child_refs {
+            remap_name_tree(pdf, child_ref, surviving, depth + 1, max_depth, visited)?;
+        }
+    }
+    Ok(())
+}
+
+/// Like [`remap_name_tree`] but for a name-tree root held as a *direct*
+/// dictionary on the catalog's `/Names`. Child `/Kids` (always indirect)
+/// delegate to [`remap_name_tree`]. Returns the rebuilt node dict.
+fn remap_name_tree_node_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node: crate::Dictionary,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    max_depth: usize,
+) -> Result<crate::Dictionary> {
+    if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
+        let new_pairs = remap_name_pairs(pdf, pairs, surviving)?;
+        let mut d = node;
+        d.insert("Names", Object::Array(new_pairs));
+        return Ok(d);
+    }
+    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
+        let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
+        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+        for child_ref in child_refs {
+            remap_name_tree(pdf, child_ref, surviving, 1, max_depth, &mut visited)?;
+        }
+    }
+    Ok(node)
+}
+
+/// Keep every `(name, dest)` pair of a flat name-pairs array, remapping a
+/// surviving-page dest and nulling a removed-page target. Returns the rebuilt
+/// array (same order as the input; a trailing odd orphan key is dropped).
+fn remap_name_pairs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    pairs: Vec<Object>,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Vec<Object>> {
+    let mut result: Vec<Object> = Vec::with_capacity(pairs.len());
+    let mut i = 0;
+    while i + 1 < pairs.len() {
+        let name_obj = pairs[i].clone();
+        let dest_obj = pairs[i + 1].clone();
+        i += 2;
+        result.push(name_obj);
+        result.push(remap_or_null_dest(pdf, dest_obj, surviving)?);
+    }
+    Ok(result)
+}
+
+/// Remap a single dest value, or null its target page if the page was removed.
+/// Returns the dest value to store back. Indirect dests are rewritten in place
+/// by [`remap_dest_value`], so the original value is returned unchanged.
+fn remap_or_null_dest<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest_obj: Object,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Object> {
+    match dest_page_ref_resolved(pdf, &dest_obj)? {
+        Some(page_ref) => {
+            if surviving.contains_key(&page_ref) {
+                Ok(remap_dest_value(pdf, &dest_obj, surviving)?.unwrap_or(dest_obj))
+            } else {
+                null_page(pdf, page_ref);
+                Ok(dest_obj)
+            }
+        }
+        // No resolvable page ref (named/external/malformed) — keep verbatim.
+        None => Ok(dest_obj),
+    }
+}
+
+/// Remap a legacy (PDF 1.1) `/Dests` dictionary held as an indirect object.
+fn remap_legacy_dests<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dests_ref: ObjectRef,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let dests_obj = pdf.resolve_borrowed(dests_ref)?;
+    let Some(dests) = dests_obj.as_dict().cloned() else {
+        return Ok(());
+    };
+    let new_dests = remap_dests_dict(pdf, dests, surviving)?;
+    pdf.set_object(dests_ref, Object::Dictionary(new_dests));
+    Ok(())
+}
+
+/// Keep every entry of a legacy `/Dests` dictionary, remapping surviving-page
+/// dests and nulling removed-page targets. Returns the rebuilt dictionary.
+fn remap_dests_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dests: crate::Dictionary,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<crate::Dictionary> {
+    let mut new_dests = dests.clone();
+    let keys: Vec<Vec<u8>> = dests.iter().map(|(k, _)| k.to_vec()).collect();
+    for key in keys {
+        let Some(val) = dests.get(&key).cloned() else {
+            continue;
+        };
+        let updated = remap_or_null_dest(pdf, val, surviving)?;
+        new_dests.insert(key, updated);
+    }
+    Ok(new_dests)
+}
+
+/// Walk the outline sibling chain from `first_ref`, recursing into children,
+/// keeping every item: remap each item's `/Dest` and `/A /GoTo /D`, nulling any
+/// removed target page. Sibling links and `/Count` are left unchanged. Bounded
+/// by `depth`/`max_depth` and a shared `visited` set (hostile-PDF guards).
+fn remap_outline_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    first_ref: ObjectRef,
+    depth: usize,
+    max_depth: usize,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    visited: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if depth >= max_depth {
+        return Err(Error::Unsupported(format!(
+            "outline_dest_remap: depth limit {max_depth} exceeded at {first_ref}"
+        )));
+    }
+    let mut current = Some(first_ref);
+    while let Some(item_ref) = current {
+        if !visited.insert(item_ref) {
+            break; // Cycle guard (/Next or /First back-edge).
+        }
+        let (next_ref, first_child) = {
+            let item_obj = pdf.resolve_borrowed(item_ref)?;
+            let Some(item) = item_obj.as_dict() else {
+                break; // Malformed — stop this chain.
+            };
+            (item.get_ref("Next"), item.get_ref("First"))
+        };
+
+        // Null any removed target page reached via /Dest or /A /GoTo /D, then
+        // remap surviving-page refs in place. The two operate on disjoint sets
+        // (removed vs surviving), so order is immaterial.
+        null_removed_item_targets(pdf, item_ref, surviving)?;
+        remap_item_dest(pdf, item_ref, surviving)?;
+
+        if let Some(child_first) = first_child {
+            remap_outline_tree(pdf, child_first, depth + 1, max_depth, surviving, visited)?;
+        }
+        current = next_ref;
+    }
+    Ok(())
+}
+
+/// Null the target page of an outline item's `/Dest` and `/A /GoTo /D` when the
+/// page was removed (not in `surviving`). Surviving targets are left for
+/// [`remap_item_dest`] to remap.
+fn null_removed_item_targets<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    item_ref: ObjectRef,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let (dest_val, action_val) = {
+        let item_obj = pdf.resolve_borrowed(item_ref)?;
+        let Some(item) = item_obj.as_dict() else {
+            return Ok(());
+        };
+        (item.get("Dest").cloned(), item.get("A").cloned())
+    };
+    if let Some(dest) = dest_val {
+        null_removed_dest_target(pdf, &dest, surviving)?;
+    }
+    if let Some(action) = action_val {
+        let (resolved, _) = resolve_ref_chain(pdf, &action)?;
+        if let Some(a) = resolved.as_dict() {
+            let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+            if is_goto {
+                if let Some(d) = a.get("D").cloned() {
+                    null_removed_dest_target(pdf, &d, surviving)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// If `dest` resolves to an explicit (removed) page ref, null that page.
+fn null_removed_dest_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest: &Object,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    if let Some(page_ref) = dest_page_ref_resolved(pdf, dest)? {
+        if !surviving.contains_key(&page_ref) {
+            null_page(pdf, page_ref);
+        }
+    }
     Ok(())
 }
 
@@ -379,72 +564,6 @@ fn prune_name_tree<R: Read + Seek>(
     Ok(true) // Node has neither /Names nor /Kids — treat as empty.
 }
 
-/// Like [`prune_name_tree`] but for a name-tree root held as a *direct*
-/// dictionary (e.g. a `/Names /Dests` value embedded directly rather than via
-/// an indirect reference). Returns the rebuilt node dict and whether it became
-/// empty. Child `/Kids` (always indirect) delegate to [`prune_name_tree`].
-fn prune_name_tree_node_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: crate::Dictionary,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    surviving_names: &mut BTreeSet<Vec<u8>>,
-    max_depth: usize,
-) -> Result<(crate::Dictionary, bool)> {
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
-        let filtered = prune_name_pairs(pdf, pairs, surviving, surviving_names)?;
-        if filtered.is_empty() {
-            return Ok((node, true));
-        }
-        let mut d = node.clone();
-        let limits = compute_limits(&filtered);
-        d.insert("Names", Object::Array(filtered));
-        if let Some(lim) = limits {
-            d.insert("Limits", lim);
-        } else {
-            d.remove("Limits");
-        }
-        return Ok((d, false));
-    }
-    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
-        let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
-        let mut surviving_kids: Vec<ObjectRef> = Vec::new();
-        for child_ref in child_refs {
-            if !prune_name_tree(
-                pdf,
-                child_ref,
-                surviving,
-                surviving_names,
-                1,
-                max_depth,
-                &mut visited,
-            )? {
-                surviving_kids.push(child_ref);
-            }
-        }
-        if surviving_kids.is_empty() {
-            return Ok((node, true));
-        }
-        let mut d = node.clone();
-        d.insert(
-            "Kids",
-            Object::Array(
-                surviving_kids
-                    .iter()
-                    .map(|&r| Object::Reference(r))
-                    .collect(),
-            ),
-        );
-        if let Some(lim) = merge_node_limits(pdf, &surviving_kids)? {
-            d.insert("Limits", lim);
-        } else {
-            d.remove("Limits");
-        }
-        return Ok((d, false));
-    }
-    Ok((node, true))
-}
-
 /// Filter a flat name-pairs array `[(name_str, dest_obj), ...]` keeping only
 /// entries whose dest resolves to a surviving page.  Adds kept names to
 /// `surviving_names`. Returns the filtered array.
@@ -503,62 +622,6 @@ fn prune_name_pairs<R: Read + Seek>(
         }
     }
     Ok(result)
-}
-
-/// Prune a legacy (PDF 1.1) `/Dests` dictionary held as an indirect object.
-fn prune_legacy_dests<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dests_ref: ObjectRef,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    surviving_names: &mut BTreeSet<Vec<u8>>,
-) -> Result<()> {
-    let dests_obj = pdf.resolve_borrowed(dests_ref)?;
-    let Some(dests) = dests_obj.as_dict().cloned() else {
-        return Ok(());
-    };
-    let new_dests = prune_dests_dict(pdf, dests, surviving, surviving_names)?;
-    pdf.set_object(dests_ref, Object::Dictionary(new_dests));
-    Ok(())
-}
-
-/// Prune/remap every entry of a legacy `/Dests` dictionary, returning the new
-/// dictionary. Used for both the indirect-object and the direct-in-catalog
-/// forms (a legacy `/Dests` may be a direct dictionary on the catalog).
-fn prune_dests_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dests: crate::Dictionary,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
-    surviving_names: &mut BTreeSet<Vec<u8>>,
-) -> Result<crate::Dictionary> {
-    let mut new_dests = dests.clone();
-    let keys: Vec<Vec<u8>> = dests.iter().map(|(k, _)| k.to_vec()).collect();
-    for key in keys {
-        let val = match dests.get(&key).cloned() {
-            Some(v) => v,
-            None => continue,
-        };
-        // A /Dests value may be inline, an indirect reference, or a dict
-        // whose /D is inline/indirect — all handled uniformly.
-        match dest_page_ref_resolved(pdf, &val)? {
-            Some(page_ref) => {
-                if surviving.contains_key(&page_ref) {
-                    surviving_names.insert(key.clone());
-                    if let Some(updated) = remap_dest_value(pdf, &val, surviving)? {
-                        new_dests.insert(key, updated);
-                    }
-                    // else: remapped in place (indirect) -> dict entry keeps
-                    // pointing at the same object.
-                } else {
-                    new_dests.remove(&key);
-                }
-            }
-            None => {
-                // Keep conservatively.
-                surviving_names.insert(key.clone());
-            }
-        }
-    }
-    Ok(new_dests)
 }
 
 // ---------------------------------------------------------------------------
@@ -2411,6 +2474,44 @@ mod tests {
             matches!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null),
             "removed page 4 (obj6) nulled (referenced by dest_named_p4)"
         );
+    }
+
+    #[test]
+    fn nullout_outline_items_all_kept_count_and_links_unchanged() {
+        let mut pdf = open(build_outline_pdf());
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // /Outlines retained; root /Count and First/Last unchanged.
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        let root = dict_of(&mut pdf, cat.get_ref("Outlines").expect("/Outlines retained"));
+        assert_eq!(
+            root.get("Count"),
+            Some(&Object::Integer(5)),
+            "root /Count unchanged"
+        );
+        assert_eq!(root.get_ref("First"), Some(ObjectRef::new(20, 0)));
+        assert_eq!(root.get_ref("Last"), Some(ObjectRef::new(23, 0)));
+
+        // Item 21 (GoTo action -> removed page 2/obj4): KEPT, links intact.
+        let i21 = dict_of(&mut pdf, ObjectRef::new(21, 0));
+        assert_eq!(i21.get_ref("Prev"), Some(ObjectRef::new(20, 0)));
+        assert_eq!(i21.get_ref("Next"), Some(ObjectRef::new(22, 0)));
+        assert!(matches!(
+            pdf.resolve(ObjectRef::new(4, 0)).unwrap(),
+            Object::Null
+        ));
+
+        // Item 23 (string /Dest to dest_named_p4 -> removed page): KEPT (qpdf
+        // does not drop string-dest items even when the named dest is nulled).
+        let i23 = dict_of(&mut pdf, ObjectRef::new(23, 0));
+        assert_eq!(i23.get_ref("Prev"), Some(ObjectRef::new(22, 0)));
+
+        // Item 22 (/Dest [5 0 R] surviving) keeps /Count 1 and its child 24.
+        let i22 = dict_of(&mut pdf, ObjectRef::new(22, 0));
+        assert_eq!(i22.get("Count"), Some(&Object::Integer(1)));
+        assert_eq!(i22.get_ref("First"), Some(ObjectRef::new(24, 0)));
     }
 
     #[test]
