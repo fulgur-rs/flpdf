@@ -697,11 +697,15 @@ fn merge_failure_falls_back_to_linear_scan() {
         .as_bytes(),
     );
 
-    // Strict mode propagates the merge error (line 115).
-    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+    // Strict mode propagates the merge-error from `merge_previous_xref_sections`,
+    // surfaced as the failure to parse the malformed `/Prev` target as an xref
+    // stream object.
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
         .expect_err("malformed /Prev target should fail strict parse");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    assert!(format!("{err}").contains("expected integer"), "got {err}");
 
-    // Best-effort records the error and recovers via linear scan (lines 112-113).
+    // Best-effort records the error and recovers via the linear object scan.
     let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true).unwrap();
     assert!(
         !loaded.repair_diagnostics.entries().is_empty(),
@@ -722,20 +726,21 @@ fn merge_failure_falls_back_to_linear_scan() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
-// Lines 118-123 (the "succeeded but with accumulated parse errors" warning) are
-// exercised by `with_repair_appends_diagnostic_when_stream_parse_succeeds`.
+// The "succeeded but with accumulated parse errors" warning path in
+// `load_xref_and_trailer_with_repair` is exercised by
+// `with_repair_appends_diagnostic_when_stream_parse_succeeds`.
 //
 // Unreachable arms via the public API (documented, not tested):
 //
-// * `format_repair_diagnostic` line 334 (the `0 =>` / empty `parse_errors`
-//   arm): every call site passes a non-empty `parse_errors`. Line 99 is
-//   preceded by the push at line 98; line 113 by the push at line 112; line 120
-//   is guarded by `!parse_errors.is_empty()`. So the length is never 0 at a call
-//   site.
+// * The empty-`parse_errors` (`0 =>`) arm of `format_repair_diagnostic`: every
+//   call site passes a non-empty `parse_errors`. Each call is either preceded by
+//   a push onto `parse_errors`, or guarded by `!parse_errors.is_empty()`, so the
+//   slice is never empty at a call site.
 //
-// * Lines 88-92 (the `startxref` offset does not fit `usize` repair/strict arms)
-//   are unreachable on 64-bit targets, where `usize::try_from(u64)` cannot
-//   overflow.
+// * The `startxref` `usize::try_from` overflow arm of
+//   `load_xref_and_trailer_with_repair` (both the repair and strict variants) is
+//   unreachable on 64-bit targets, where `usize::try_from(u64)` cannot overflow.
 //
-// * Lines 164-165 (`/Prev` `u64` -> `usize` overflow) are unreachable on 64-bit
-//   targets, where `usize::try_from(u64)` cannot overflow.
+// * The `/Prev` `usize::try_from` overflow arm of
+//   `merge_previous_xref_sections` is unreachable on 64-bit targets, where
+//   `usize::try_from(u64)` cannot overflow.
