@@ -731,15 +731,15 @@ fn merge_failure_falls_back_to_linear_scan() {
 /// entry's offset becomes the `Free { next }` value via `u32::try_from(offset)`;
 /// when `offset` is `9999999999` (> `u32::MAX`) that conversion fails and the
 /// function returns the "free xref next object does not fit u32" error (the
-/// `b'f'` arm's `map_err`). Object 0's free entry (`next = 65535`) fits and is
-/// accepted; the overflow is isolated to the second entry.
+/// `b'f'` arm's `map_err`). Object 0's free entry (generation 65535, `next = 0`)
+/// fits and is accepted; the overflow is isolated to the second entry.
 #[test]
 fn rejects_xref_table_free_next_overflow() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let xref_offset = bytes.len();
     bytes.extend_from_slice(b"xref\n0 2\n");
-    // Object 0: free, next = 65535 (fits u32, accepted).
+    // Object 0: free-list head, generation 65535, next = 0 (fits u32, accepted).
     bytes.extend_from_slice(b"0000000000 65535 f \n");
     // Object 1: free, offset 9999999999 > u32::MAX -> overflow in the `f` arm.
     bytes.extend_from_slice(b"9999999999 00000 f \n");
