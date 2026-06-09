@@ -391,6 +391,65 @@ fn qdf_never_emits_adjacent_endstream() {
     );
 }
 
+/// Re-open a qdf full-rewrite and return the content stream's data for the given
+/// raw payload and newline policy. qdf splits `/Length` into an indirect holder,
+/// exercising the indirect-`/Length` reader path.
+fn round_trip_qdf(raw: &[u8], policy: NewlineBeforeEndstream) -> Vec<u8> {
+    let source = build_minimal_pdf(raw);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.compress_streams = flpdf::CompressStreams::No;
+    options.newline_before_endstream = policy;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    resolve_metadata_stream(&mut reopened).data
+}
+
+/// qdf + `Never` must RE-OPEN, not just write. The payload is written with
+/// `endstream` immediately adjacent (no EOL) and an indirect `/Length` holder
+/// whose body is the exact content length. On re-open the byte-level parser
+/// cannot line-anchor the adjacent `endstream`, so the reader resolves the
+/// holder authoritatively and re-slices. (The payload deliberately ends in `.`,
+/// not an EOL, so it takes the adjacent-endstream path; it also contains the
+/// substring "endstream", proving the fix is not a naive keyword scan.)
+#[test]
+fn round_trip_qdf_never_mode() {
+    let raw: &[u8] = b"Round-trip payload for newline_before_endstream test.";
+    assert_eq!(
+        round_trip_qdf(raw, NewlineBeforeEndstream::Never).as_slice(),
+        raw,
+        "qdf+Never must re-open with the original payload intact"
+    );
+}
+
+/// Characterization test for the EOL-ending `Never` ambiguity.
+///
+/// A `Never` payload that ENDS in `\n` is written as `..\nendstream`: the
+/// `endstream` is line-anchored (preceded by the payload's own `\n`), so it
+/// takes the parser's endstream-scan path, which strips one framing EOL. The
+/// holder (raw length, EOL included) then equals the syntactic window, so the
+/// reader cannot tell this apart from a `Yes`-mode payload of "abc" plus the
+/// mandatory framing EOL — both emit byte-identical `abc\nendstream` with
+/// holder 4. The trailing `\n` therefore collapses into the framing EOL. This
+/// asserts the CURRENT (lossy) behavior and that re-open does NOT error (it does
+/// not reach the adjacent-endstream path). Disambiguating these is out of scope.
+#[test]
+fn round_trip_qdf_never_mode_eol_ending_payload_is_ambiguous() {
+    let raw: &[u8] = b"abc\n";
+    assert_eq!(
+        round_trip_qdf(raw, NewlineBeforeEndstream::Never).as_slice(),
+        b"abc",
+        "EOL-ending Never payload: trailing \\n collapses into the framing EOL \
+         (known ambiguity; must still re-open without error)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Verify /Length excludes the inserted newline in E2E output (raw bytes check)
 // ---------------------------------------------------------------------------

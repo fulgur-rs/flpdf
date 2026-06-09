@@ -943,79 +943,121 @@ impl<R: Read + Seek> Pdf<R> {
                 if parsed_ref != object_ref {
                     return Ok(false);
                 }
-                // flpdf-9hc.27: when the stream's /Length is an indirect
-                // reference, the parser fell back to endstream-scan (it has no
-                // xref). Resolve the holder via the xref and re-slice to the
-                // authoritative length. This MUST happen before decryption:
-                // `object`/`bytes` are still ciphertext here, and
+                // When the stream's /Length is an indirect reference, the parser
+                // has no xref so it recorded the payload window instead of a
+                // resolved length. Resolve the holder via the xref and re-slice
+                // to the authoritative length. This MUST happen before
+                // decryption: `object`/`bytes` are still ciphertext here, and
                 // `decrypt_resolved_object` decrypts in place afterwards.
                 if let Some(isl) = indirect_len {
-                    if isl.holder != object_ref {
-                        // Mark this object resolution in-progress before
-                        // recursing into the holder: a cyclic length-holder
-                        // chain (A's /Length -> B -> ... -> A) would otherwise
-                        // recurse forever (resolve() does not otherwise mark
-                        // in-progress). The cyclic re-entry now hits the
-                        // `Reserved => Null` arm and the holder simply reads
-                        // as non-Integer -> endstream-scan fallback. A holder
-                        // resolution error is likewise non-fatal: fall back
-                        // rather than failing the whole stream.
-                        self.cache.set_reserved(object_ref);
-                        if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
-                            if let (Ok(n), Object::Stream(stream)) =
-                                (usize::try_from(*n), &mut object)
-                            {
-                                let auth_end = isl.data_start.saturating_add(n);
-                                // Only override with the authoritative length
-                                // when it lands STRICTLY inside the payload
-                                // window — i.e. the resolved /Length is the
-                                // spec content length and `endstream` (plus
-                                // its mandatory preceding EOL) still follows.
-                                // Then the exact `n` content bytes are used
-                                // verbatim (no EOL trim), fixing non-QDF
-                                // streams whose data legitimately ends with a
-                                // newline (flpdf-9hc.27).
-                                //
-                                // The comparison is STRICT `<` by design.
-                                // `auth_end == endstream_pos` is ambiguous:
-                                // it is produced BOTH by flpdf's QDF holder
-                                // convention (n counts the whole window incl.
-                                // the framing EOL) AND by a non-conformant
-                                // PDF lacking the ISO 32000-1 §7.3.8.1
-                                // mandatory pre-`endstream` EOL. These want
-                                // opposite handling and are indistinguishable
-                                // from the object bytes alone. Treating the
-                                // exact-window case as QDF (keep the parser's
-                                // endstream-scan, which strips one framing
-                                // EOL) preserves the pinned QDF round-trip /
-                                // idempotence invariant; relaxing to `<=`
-                                // empirically regresses qdf_tests
-                                // `qdf_mode_round_trip_content_preserved` and
-                                // `qdf_output_is_idempotent` (verified). The
-                                // residual non-conformant exact-window case is
-                                // the spec-aligned edge documented in
-                                // flpdf-9hc.27; a whole-file QDF-detection
-                                // refinement is tracked as flpdf-9hc.28.
-                                // A too-large/garbage holder also lands here
-                                // → safe endstream-scan fallback.
-                                // flpdf-9hc.28: the exact-window case
-                                // (auth_end == endstream_pos) is ambiguous —
-                                // QDF holders count the framing EOL (keep the
-                                // parser's endstream-scan / one-EOL trim to
-                                // preserve QDF round-trip & idempotence),
-                                // whereas a non-QDF holder is the spec content
-                                // length and must be honoured verbatim (fixes
-                                // a non-conformant stream whose data ends with
-                                // a newline). Whole-file QDF detection picks
-                                // the correct branch: strict `<` for QDF,
-                                // inclusive `<=` for non-QDF.
-                                let within_window = if self.is_qdf {
-                                    auth_end < isl.endstream_pos
-                                } else {
-                                    auth_end <= isl.endstream_pos
-                                };
-                                if within_window && auth_end <= bytes.len() {
-                                    stream.data = bytes[isl.data_start..auth_end].to_vec();
+                    match isl.endstream_pos {
+                        // The parser located a line-anchored `endstream` and set
+                        // a usable `stream.data`; the holder only REFINES it,
+                        // overriding when the authoritative length lands within
+                        // the syntactic window. (Best-effort: a self-referential,
+                        // cyclic, unresolvable, or out-of-window holder keeps the
+                        // parser's endstream-scan value.)
+                        Some(endstream_pos) => {
+                            if isl.holder != object_ref {
+                                // Mark this object resolution in-progress before
+                                // recursing into the holder: a cyclic
+                                // length-holder chain (A's /Length -> B -> ... ->
+                                // A) would otherwise recurse forever (resolve()
+                                // does not otherwise mark in-progress). The
+                                // cyclic re-entry hits the `Reserved => Null` arm
+                                // and the holder reads as non-Integer ->
+                                // endstream-scan fallback. A holder resolution
+                                // error is likewise non-fatal: fall back rather
+                                // than failing the whole stream.
+                                self.cache.set_reserved(object_ref);
+                                if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
+                                    if let (Ok(n), Object::Stream(stream)) =
+                                        (usize::try_from(*n), &mut object)
+                                    {
+                                        let auth_end = isl.data_start.saturating_add(n);
+                                        // Override only when the authoritative
+                                        // length lands STRICTLY inside the
+                                        // window — i.e. the resolved /Length is
+                                        // the spec content length and `endstream`
+                                        // (plus its mandatory preceding EOL)
+                                        // still follows. Then the exact `n`
+                                        // content bytes are used verbatim (no EOL
+                                        // trim), fixing non-QDF streams whose
+                                        // data legitimately ends with a newline.
+                                        //
+                                        // STRICT `<` for QDF by design.
+                                        // `auth_end == endstream_pos` is
+                                        // ambiguous: produced BOTH by flpdf's QDF
+                                        // holder convention (n counts the whole
+                                        // window incl. the framing EOL) AND by a
+                                        // non-conformant PDF lacking the ISO
+                                        // 32000-1 §7.3.8.1 mandatory
+                                        // pre-`endstream` EOL. These want
+                                        // opposite handling and are
+                                        // indistinguishable from the object bytes
+                                        // alone. Treating the exact-window case
+                                        // as QDF (keep the parser's
+                                        // endstream-scan, which strips one
+                                        // framing EOL) preserves the pinned QDF
+                                        // round-trip / idempotence invariant;
+                                        // relaxing to `<=` empirically regresses
+                                        // qdf_tests
+                                        // `qdf_mode_round_trip_content_preserved`
+                                        // and `qdf_output_is_idempotent`. Whole-
+                                        // file QDF detection picks the branch:
+                                        // strict `<` for QDF, inclusive `<=` for
+                                        // non-QDF. A too-large/garbage holder
+                                        // also lands here → safe endstream-scan
+                                        // fallback.
+                                        let within_window = if self.is_qdf {
+                                            auth_end < endstream_pos
+                                        } else {
+                                            auth_end <= endstream_pos
+                                        };
+                                        if within_window && auth_end <= bytes.len() {
+                                            stream.data = bytes[isl.data_start..auth_end].to_vec();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // No line-anchored `endstream` existed: the writer used
+                        // `NewlineBeforeEndstream::Never` with a non-EOL-ending
+                        // payload, so `endstream` is adjacent to the last content
+                        // byte and the parser could not delimit the payload (it
+                        // returned an empty placeholder). The holder is the SOLE
+                        // authority and the EXACT content length — it must
+                        // resolve to a non-negative integer whose endpoint lands
+                        // on an `endstream` keyword. Anything else (self-
+                        // referential, unresolvable, out of bounds, or not
+                        // landing on `endstream`) is unrecoverable: fail loudly
+                        // rather than surface the empty placeholder as data.
+                        None => {
+                            let resolved = if isl.holder == object_ref {
+                                None
+                            } else {
+                                self.cache.set_reserved(object_ref);
+                                match self.resolve_borrowed(isl.holder) {
+                                    Ok(Object::Integer(n)) => usize::try_from(*n).ok(),
+                                    _ => None,
+                                }
+                            };
+                            let auth_end = resolved.and_then(|n| isl.data_start.checked_add(n));
+                            let valid = auth_end.is_some_and(|end| {
+                                end <= bytes.len() && endstream_keyword_follows(&bytes, end)
+                            });
+                            match (valid, &mut object) {
+                                (true, Object::Stream(stream)) => {
+                                    // `valid` guarantees `auth_end` is `Some` and
+                                    // in bounds.
+                                    let end = auth_end.unwrap();
+                                    stream.data = bytes[isl.data_start..end].to_vec();
+                                }
+                                _ => {
+                                    return Err(Error::parse(
+                                        isl.data_start,
+                                        "stream data exceeds input",
+                                    ))
                                 }
                             }
                         }
@@ -1051,6 +1093,12 @@ impl<R: Read + Seek> Pdf<R> {
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut bytes = Vec::new();
                 self.reader.read_to_end(&mut bytes)?;
+                // The plain wrapper discards any `IndirectStreamLength`, so an
+                // ObjStm container with an indirect `/Length` and an adjacent
+                // (no-EOL) `endstream` would not get the authoritative re-slice
+                // and would read as empty. flpdf never emits object streams in
+                // QDF mode (the only path that writes adjacent `endstream`), so
+                // this combination is unreachable in practice.
                 let (parsed_ref, object) = parse_indirect_object(&bytes)?;
                 if parsed_ref != stream_ref {
                     return Ok(false);
@@ -1304,6 +1352,39 @@ impl Pdf<Cursor<Vec<u8>>> {
         options: PdfOpenOptions,
     ) -> crate::Result<Self> {
         Self::open_with_options(Cursor::new(bytes), options)
+    }
+}
+
+/// True when an `endstream` keyword sits at `pos` in `bytes`, optionally after a
+/// single EOL marker, and is itself followed by whitespace, a delimiter, or EOF.
+///
+/// Used to validate an indirect `/Length` holder before trusting it as the
+/// authoritative payload boundary for the adjacent-`endstream` case
+/// (`NewlineBeforeEndstream::Never`, non-EOL-ending payload), where the parser
+/// could not delimit the stream syntactically.
+fn endstream_keyword_follows(bytes: &[u8], pos: usize) -> bool {
+    let mut p = pos;
+    match bytes.get(p) {
+        Some(b'\r') => {
+            p += 1;
+            if bytes.get(p) == Some(&b'\n') {
+                p += 1;
+            }
+        }
+        Some(b'\n') => p += 1,
+        _ => {}
+    }
+    const KEYWORD: &[u8] = b"endstream";
+    let end = match p.checked_add(KEYWORD.len()) {
+        Some(end) => end,
+        None => return false,
+    };
+    if bytes.get(p..end) != Some(KEYWORD) {
+        return false;
+    }
+    match bytes.get(end) {
+        None => true,
+        Some(&c) => crate::parser::is_ws(c) || crate::parser::is_delimiter(c),
     }
 }
 
