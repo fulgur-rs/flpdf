@@ -473,6 +473,135 @@ fn best_effort_recovers_objstm_compressed_entries() {
     );
 }
 
+/// Build a best-effort fixture whose only `/Type /ObjStm` object carries the
+/// given `dict_body` (between `<<` and `>>`) and `stream_payload`. The xref
+/// keyword is corrupted so strict parsing fails and best-effort falls into the
+/// linear scan, which detects the ObjStm and calls
+/// `recover_compressed_offsets_from_objstm`. A plain catalog object (number 1)
+/// is included so recovery always yields at least one entry and returns `Ok`.
+///
+/// Returns the assembled bytes plus the ObjStm object number (5) so callers can
+/// assert that NO compressed entry was produced (each error arm of
+/// `recover_compressed_offsets_from_objstm` returns early without inserting).
+fn objstm_recovery_fixture(dict_body: &str, stream_payload: &[u8]) -> (Vec<u8>, u32) {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let objstm_obj_number: u32 = 5;
+    let objstm_obj = format!(
+        "{objstm_obj_number} 0 obj\n<< /Type /ObjStm {dict_body} /Length {} >>\nstream\n",
+        stream_payload.len()
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&objstm_obj);
+    bytes.extend_from_slice(stream_payload);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    // Corrupt the `xref` keyword (xref -> xrez) so strict parsing fails.
+    let pos = bytes
+        .windows(4)
+        .rposition(|window| window == b"xref")
+        .expect("fixture should contain xref token");
+    bytes[pos + 2] = b'z';
+
+    (bytes, objstm_obj_number)
+}
+
+/// Assert the fixture recovers via best-effort (Ok) but produced NO compressed
+/// entry referencing the ObjStm: every error arm of
+/// `recover_compressed_offsets_from_objstm` returns early before inserting.
+fn assert_no_compressed_entry(bytes: Vec<u8>, objstm_obj_number: u32) {
+    // Strict mode must reject the corrupt xref first.
+    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("corrupt xref should fail in strict mode");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    // Recovery still produced the catalog as a normal offset entry.
+    assert!(
+        loaded.entries.contains_key(&ObjectRef::new(1, 0)),
+        "recovery should still yield the catalog object"
+    );
+    // But no compressed entry points at the (malformed) ObjStm.
+    assert!(
+        !loaded.entries.values().any(|entry| matches!(
+            entry,
+            XrefOffset::Compressed { stream, .. } if *stream == objstm_obj_number
+        )),
+        "malformed ObjStm must not yield a compressed entry"
+    );
+}
+
+/// `recover_compressed_offsets_from_objstm` decode-failure arm: an ObjStm whose
+/// `/Filter` cannot be decoded makes `decode_stream_data` return `Err`, so the
+/// routine returns early and emits no compressed entry.
+#[test]
+fn best_effort_objstm_undecodable_filter_yields_no_compressed_entry() {
+    // A bogus filter name `apply_single_filter_decode` does not recognize.
+    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 4 /Filter /NoSuchFilter", b"7 0 x");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
+/// `recover_compressed_offsets_from_objstm` `/N` parse arm: a negative `/N`
+/// makes `parse_non_negative_u64` return `Err`, so the routine returns early.
+#[test]
+fn best_effort_objstm_negative_n_yields_no_compressed_entry() {
+    let (bytes, objstm) = objstm_recovery_fixture("/N -1 /First 4", b"7 0 <</Foo 1>>");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
+/// `recover_compressed_offsets_from_objstm` object-number `parse_non_negative_i64`
+/// arm: a decoded object number that is negative makes the routine return early.
+#[test]
+fn best_effort_objstm_negative_object_number_yields_no_compressed_entry() {
+    // Decoded pairs lead with `-1 0`: the object number is negative.
+    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 6", b"-1 0 <</Foo 1>>");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
+/// `recover_compressed_offsets_from_objstm` object-number read arm: the decoded
+/// data does not begin with an integer where the object number is expected, so
+/// `integer_for_indirect` fails and the routine returns early.
+#[test]
+fn best_effort_objstm_non_integer_object_number_yields_no_compressed_entry() {
+    // `/N 1` but the payload is a name, not the expected leading integer.
+    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 4", b"/Foo 0 0");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
+/// `recover_compressed_offsets_from_objstm` `u32::try_from` arm: a decoded
+/// object number larger than `u32::MAX` overflows the `u32` conversion, so the
+/// routine returns early.
+#[test]
+fn best_effort_objstm_object_number_overflows_u32_yields_no_compressed_entry() {
+    // 5_000_000_000 > u32::MAX (4_294_967_295).
+    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 16", b"5000000000 0 <<>>");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
+/// `recover_compressed_offsets_from_objstm` offset `parse_non_negative_i64` arm:
+/// a negative intra-stream offset makes the routine return early.
+#[test]
+fn best_effort_objstm_negative_offset_yields_no_compressed_entry() {
+    // Object number 7 is valid, but its offset `-1` is negative.
+    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 6", b"7 -1 <</Foo 1>>");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
+/// `recover_compressed_offsets_from_objstm` offset read arm: after a valid
+/// object number, the offset slot is not an integer, so `integer_for_indirect`
+/// fails and the routine returns early.
+#[test]
+fn best_effort_objstm_non_integer_offset_yields_no_compressed_entry() {
+    // `7` parses as the object number, then `/Bar` is not the expected integer.
+    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 4", b"7 /Bar 0");
+    assert_no_compressed_entry(bytes, objstm);
+}
+
 /// When the linear scan finds no indirect objects at all, recovery must fail
 /// with the "unable to recover xref entries" error (`recover_xref_entries`
 /// empty-map branch).
@@ -1288,3 +1417,17 @@ fn rejects_xref_table_missing_object_count() {
 // * The `/Prev` `usize::try_from` overflow arm of
 //   `merge_previous_xref_sections` is unreachable on 64-bit targets, where
 //   `usize::try_from(u64)` cannot overflow.
+//
+// * The `/N` `usize::try_from` overflow arm of
+//   `recover_compressed_offsets_from_objstm` is likewise unreachable on 64-bit
+//   targets: `/N` is parsed as a non-negative `u64`, and `usize::try_from(u64)`
+//   cannot overflow when `usize` is 64-bit.
+//
+// * The `index == 0` true branch of `is_token_boundary` is unreachable via the
+//   public API. Its sole caller in `recover_xref_entries` is guarded by
+//   `bytes[cursor].is_ascii_digit() && is_token_boundary(cursor, bytes)`.
+//   `load_xref_and_trailer_with_repair` calls `parse_header(&bytes)?` before any
+//   path that reaches recovery, so a non-`%PDF-` header is a hard failure: by the
+//   time `recover_xref_entries` runs, byte 0 is always `%` (not a digit). The
+//   `is_ascii_digit` short-circuit therefore never calls `is_token_boundary` at
+//   index 0.
