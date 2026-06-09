@@ -1,6 +1,6 @@
 use flpdf::{
-    load_xref_and_trailer, load_xref_and_trailer_best_effort, Error, ObjectRef, XrefForm,
-    XrefOffset,
+    load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
+    Error, ObjectRef, XrefForm, XrefOffset,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -397,3 +397,292 @@ fn rejects_startxref_offset_exactly_at_eof_without_panic() {
     );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
+
+/// Best-effort recovery must detect a `/Type /ObjStm` object stream during the
+/// linear scan and emit `XrefOffset::Compressed` entries for the objects it
+/// packs (`recover_xref_entries` ObjStm branch + `recover_compressed_offsets_from_objstm`).
+///
+/// The ObjStm carries no `/Filter`, so `decode_stream_data` is a passthrough and
+/// its raw bytes are the cross-reference pairs header `objnum offset ...` that
+/// the recovery routine walks. We pack a single compressed object (number 7).
+#[test]
+fn best_effort_recovers_objstm_compressed_entries() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    // A plain catalog object so the linear scan also yields a normal entry.
+    let obj1 = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    bytes.extend_from_slice(&obj1);
+
+    // Object stream object number 5. Its payload begins with the pairs header
+    // `7 0` (compressed object 7 at intra-stream offset 0) followed by the
+    // object body that lives at `/First`. `recover_compressed_offsets_from_objstm`
+    // only reads the leading `/N` pairs, so the body is incidental here.
+    let objstm_obj_number: u32 = 5;
+    let compressed_obj_number: u32 = 7;
+    let objstm_data = b"7 0 <</Foo 1>>".to_vec();
+    let objstm_obj = format!(
+        "{objstm_obj_number} 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+        objstm_data.len()
+    )
+    .into_bytes();
+    let objstm_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&objstm_obj);
+    bytes.extend_from_slice(&objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // A valid xref + trailer, then corrupt the `xref` keyword so strict parsing
+    // fails and best-effort falls into the linear-scan recovery path.
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    let pos = bytes
+        .windows(4)
+        .rposition(|window| window == b"xref")
+        .expect("fixture should contain xref token");
+    bytes[pos + 2] = b'z';
+
+    // Strict mode must reject the corrupt xref.
+    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("corrupt xref should fail in strict mode");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    // The ObjStm object itself recovers as a normal offset entry.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(objstm_obj_number, 0)),
+        Some(&XrefOffset::Offset(objstm_offset))
+    );
+    // The packed object recovers as a compressed entry pointing at the ObjStm.
+    assert_eq!(
+        loaded
+            .entries
+            .get(&ObjectRef::new(compressed_obj_number, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: objstm_obj_number,
+            index: 0,
+        })
+    );
+    assert!(
+        loaded
+            .entries
+            .values()
+            .any(|entry| matches!(entry, XrefOffset::Compressed { stream, .. } if *stream == objstm_obj_number)),
+        "expected at least one compressed entry referencing the ObjStm"
+    );
+}
+
+/// When the linear scan finds no indirect objects at all, recovery must fail
+/// with the "unable to recover xref entries" error (`recover_xref_entries`
+/// empty-map branch).
+#[test]
+fn best_effort_errors_when_no_objects_to_recover() {
+    // Header + corrupt xref + trailer, but zero indirect objects to scan.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let err = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect_err("no recoverable objects should fail");
+    let message = format!("{err}");
+    assert!(
+        message.contains("unable to recover xref entries"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// When recovery finds objects but no `trailer` keyword exists, `recover_trailer`
+/// must fail with "trailer dictionary not found".
+#[test]
+fn best_effort_errors_when_trailer_missing() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    // A recoverable indirect object so `recover_xref_entries` succeeds.
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    // Corrupt xref keyword and rename the `trailer` keyword to `traile_` so the
+    // literal marker is absent.
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("traile_\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let err = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect_err("missing trailer keyword should fail");
+    let message = format!("{err}");
+    assert!(
+        message.contains("trailer dictionary not found"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// When the `trailer` keyword is present but followed by a non-dictionary token,
+/// `recover_trailer` must fail with "trailer dictionary is not a dictionary".
+#[test]
+fn best_effort_errors_when_trailer_not_dictionary() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    // A recoverable indirect object so `recover_xref_entries` succeeds.
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    // `trailer` followed by a bare integer rather than a `<<...>>` dictionary.
+    bytes.extend_from_slice(format!("trailer\n42\nstartxref\n{start_xref}\n%%EOF\n").as_bytes());
+
+    let err = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect_err("non-dictionary trailer should fail");
+    let message = format!("{err}");
+    assert!(
+        message.contains("trailer dictionary is not a dictionary"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// When `startxref` is absent, repair pushes a "missing startxref" error and
+/// retries `parse_xref_from_start` at offset 0, which fails at the header and
+/// pushes a second error. `format_repair_diagnostic` then takes its multi-error
+/// (`_ =>`) arm, joining both clauses with "; " into a single diagnostic.
+#[test]
+fn repair_diagnostic_aggregates_multiple_errors() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    // A recoverable object and a valid trailer so recovery itself succeeds.
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    // Note: NO `startxref` keyword at all.
+    bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n%%EOF\n");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    // A single Diagnostic carries the combined message.
+    assert_eq!(loaded.repair_diagnostics.entries().len(), 1);
+    let message = &loaded.repair_diagnostics.entries()[0].message;
+    assert!(
+        message.starts_with("xref parsing failed and was repaired by linear object scan: "),
+        "expected multi-error diagnostic prefix, got {message}"
+    );
+    assert!(
+        message.contains("; "),
+        "expected joined clauses, got {message}"
+    );
+    assert!(
+        message.contains("missing startxref"),
+        "expected first parse error, got {message}"
+    );
+    // Recovery still produced usable entries and a trailer.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(9))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+/// A `/Prev` chain that points back at itself is a circular reference: strict
+/// mode must reject it with "xref /Prev is circular", while best-effort must
+/// stop following the chain and return `Ok` with the entries seen so far.
+#[test]
+fn circular_prev_recovers_with_repair_and_rejected_strict() {
+    // Build a single valid xref table whose own offset we then feed into its
+    // trailer `/Prev`, so the chain revisits the same offset (a 1-node cycle).
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 2\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
+    // `/Prev` points back at this same xref section.
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R /Prev {xref_offset} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    // Strict mode rejects the cycle.
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("circular /Prev should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("xref /Prev is circular"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+
+    // Best-effort stops following the cycle and returns the entries it has.
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(obj1_offset as u64))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+/// A `/Prev` offset pointing at a malformed (non-circular) location makes
+/// `merge_previous_xref_sections` error. Strict mode propagates that error;
+/// best-effort records it as a diagnostic and falls back to the linear scan.
+#[test]
+fn merge_failure_falls_back_to_linear_scan() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    // A bogus location that is neither `xref` nor a valid xref stream object.
+    let bad_prev = bytes.len();
+    bytes.extend_from_slice(b"not-an-xref-section\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 2\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R /Prev {bad_prev} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    // Strict mode propagates the merge error (line 115).
+    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("malformed /Prev target should fail strict parse");
+
+    // Best-effort records the error and recovers via linear scan (lines 112-113).
+    let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true).unwrap();
+    assert!(
+        !loaded.repair_diagnostics.entries().is_empty(),
+        "expected a repair diagnostic from the merge fallback"
+    );
+    assert!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("repaired by linear object scan")),
+        "expected the linear-scan repair diagnostic"
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(obj1_offset as u64))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+// Unreachable arms via the public API (documented, not tested):
+//
+// * `format_repair_diagnostic` line 334 (the `0 =>` / empty `parse_errors`
+//   arm): every call site passes a non-empty `parse_errors`. Line 99 is
+//   preceded by the push at line 98; line 113 by the push at line 112; line 120
+//   is guarded by `!parse_errors.is_empty()`. So the length is never 0 at a call
+//   site.
+//
+// * Lines 118-123 (the "succeeded but with accumulated parse errors" warning):
+//   `parse_errors` only gains entries when `parse_startxref` fails or its offset
+//   does not fit `usize`. Both arms reset the retry position to offset 0, where
+//   the bytes are the `%PDF-` header rather than a valid `xref`/xref-stream, so
+//   `parse_xref_from_start` always fails and diverts into the linear scan before
+//   reaching line 118. The block is therefore unreachable through the public
+//   entry points and is not exercised here.
+//
+// * Lines 164-165 (`/Prev` `u64` -> `usize` overflow) are unreachable on 64-bit
+//   targets, where `usize::try_from(u64)` cannot overflow.
