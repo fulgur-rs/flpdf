@@ -502,6 +502,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 Some(Object::Reference(r)) => Some(*r),
                 _ => None,
             };
+            // The clones above copy what we need; drop the `node_obj` borrow
+            // here so `self.pdf.resolve` can run below (matches appearance.rs).
+            let _ = node_obj;
 
             if let Some(val) = found {
                 // The value may be stored as an indirect reference; resolve one
@@ -568,6 +571,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 Some(Object::Reference(r)) => Some(*r),
                 _ => None,
             };
+            // The clones above copy what we need; drop the `node_obj` borrow
+            // here so `self.pdf.resolve` can run below (matches appearance.rs).
+            let _ = node_obj;
 
             if let Some(val) = found {
                 match val {
@@ -631,6 +637,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 Some(Object::Reference(r)) => Some(*r),
                 _ => None,
             };
+            // The clones above copy what we need; drop the `node_obj` borrow
+            // here so `self.pdf.resolve` can run below (matches appearance.rs).
+            let _ = node_obj;
 
             if let Some(val) = found {
                 // Resolve one level if /Ff is stored as an indirect reference,
