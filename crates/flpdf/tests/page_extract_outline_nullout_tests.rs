@@ -196,16 +196,14 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
         "all four named dests survive the round trip"
     );
     let mut null_targets = 0;
-    let mut i = 1;
-    while i < pairs.len() {
-        if let Some(first) = pairs[i].as_array().and_then(|a| a.first()) {
+    for dest in pairs.iter().skip(1).step_by(2) {
+        if let Some(first) = dest.as_array().and_then(|a| a.first()) {
             if let Some(r) = first.as_ref_id() {
                 if matches!(re.resolve(r).unwrap(), Object::Null) {
                     null_targets += 1;
                 }
             }
         }
-        i += 2;
     }
     assert_eq!(
         null_targets, 2,
