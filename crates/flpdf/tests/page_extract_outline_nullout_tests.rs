@@ -145,7 +145,10 @@ fn outline_and_names_retained_all_entries_kept() {
         })
         .collect();
     assert_eq!(keys, vec![b"dp1".as_slice(), b"dp2", b"dp3", b"dp4"]);
-    assert!(leaf.get("Limits").is_some(), "/Limits not recomputed/removed");
+    assert!(
+        leaf.get("Limits").is_some(),
+        "/Limits not recomputed/removed"
+    );
 
     // Both outline items kept with their chain intact.
     let i20 = pdf.resolve(ObjectRef::new(20, 0)).unwrap();
@@ -169,7 +172,10 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
     let root = re.root_ref().expect("root");
     let cat = re.resolve(root).unwrap();
     let cat = cat.as_dict().expect("catalog dict").clone();
-    assert!(cat.get("Outlines").is_some(), "/Outlines survives round trip");
+    assert!(
+        cat.get("Outlines").is_some(),
+        "/Outlines survives round trip"
+    );
     let names_ref = cat.get_ref("Names").expect("/Names survives round trip");
 
     // The Dests leaf still holds four entries; at least one resolves to null
@@ -184,7 +190,11 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
         .and_then(Object::as_array)
         .unwrap()
         .to_vec();
-    assert_eq!(pairs.len(), 8, "all four named dests survive the round trip");
+    assert_eq!(
+        pairs.len(),
+        8,
+        "all four named dests survive the round trip"
+    );
     let mut null_targets = 0;
     let mut i = 1;
     while i < pairs.len() {

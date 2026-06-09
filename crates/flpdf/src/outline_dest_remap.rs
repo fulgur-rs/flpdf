@@ -3,49 +3,40 @@
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page tree
 //! for a subset extraction, this module updates the document's `/Outlines` tree
 //! and `/Names /Dests` name-tree (as well as the legacy `/Catalog /Dests` dictionary)
-//! so that:
+//! to match qpdf's `--pages` behaviour:
 //!
-//! - Outline items and named destinations whose target page **survived** the
-//!   extraction are remapped to their new `ObjectRef` (the first element of
-//!   `ref_map[old_ref]`, matching qpdf's duplicate-page rule).
-//! - Outline items and named destinations whose target page was **removed** are
-//!   dropped.  Sibling `/Prev`/`/Next` links, parent `/First`/`/Last`, and parent
-//!   `/Count` are all patched so no dangling references remain.
-//! - If the entire outline tree is dropped, `/Outlines` is removed from the
-//!   catalog (no dangling catalog ref).
+//! - Every outline item and named destination is **kept** — none are dropped.
+//!   Sibling `/Prev`/`/Next` links, parent `/First`/`/Last`, `/Count`, and name-tree
+//!   `/Limits` are all left unchanged, and `/Outlines`/`/Names` are never removed
+//!   from the catalog.
+//! - A destination whose target page **survived** is remapped to its new
+//!   `ObjectRef` (the first element of `ref_map[old_ref]`, matching qpdf's rule
+//!   that a destination resolves to the first occurrence of a duplicated page).
+//! - A destination whose target page was **removed** is left verbatim, and the
+//!   target page object is replaced with `null` in place. The subsequent subset
+//!   sweep ([`crate::subset_prune`]) keeps that null object only while a surviving
+//!   destination still references it; a removed page referenced by nothing is
+//!   garbage-collected entirely.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
-//! Tested with a 4-page PDF carrying an `/Outlines` tree (outline items for each
-//! page, including one GoTo-action form and one named-string `/Dest`) and a
-//! `/Names /Dests` name-tree with 4 entries.
+//! For `qpdf in.pdf --pages in.pdf 1,3 -- out.pdf` over a document with an
+//! `/Outlines` tree and a `/Names /Dests` name-tree, qpdf does not drop any
+//! outline item or named destination: it sets each removed page object to `null`,
+//! leaving destinations pointing at the now-null page (e.g. `[ 10 0 R /XYZ 0 792 0 ]`
+//! where `10 0 R` resolves to `null`), and leaves `/Count` and the name-tree
+//! `/Limits` unchanged. A removed page referenced by no surviving destination is
+//! absent from the output. This module reproduces that behaviour.
 //!
-//! Command: `qpdf in.pdf --pages in.pdf 1,3 -- out.pdf`
+//! # String-form `/Dest`
 //!
-//! Observed in the output:
-//! - qpdf **does not drop** outline items pointing at removed pages; instead it
-//!   sets the removed page objects to `null` in the xref, leaving outline `/Dest`
-//!   arrays with dangling null refs (e.g. `[ 10 0 R /XYZ 0 792 0 ]` where
-//!   `10 0 R` is null).
-//! - `/Count` on the outline root remains unchanged.
-//! - Named-dest entries in the name tree likewise retain null-page refs.
-//!
-//! **flpdf chooses DROP semantics** (per acceptance criteria: "dropped entries do
-//! not leave dangling refs; /First/Last/Count/Prev/Next intact"). This is stricter
-//! than qpdf; the divergence is intentional and documented here.
-//!
-//! # String-form `/Dest` resolution order
-//!
-//! `/Dest (name)` on an outline item is a named destination.  Named destinations
-//! are resolved (for the purpose of deciding keep-or-drop) by looking up the name
-//! in the surviving name-tree after pruning.  Therefore **named destinations are
-//! pruned before the outline tree** so that string-dest outline items can be
-//! correctly classified.
+//! `/Dest (name)` on an outline item is a named destination. Because no entry is
+//! dropped, such items are kept regardless of whether their named destination's
+//! page survived; only explicit page references are remapped or nulled.
 //!
 //! # Scope
 //!
-//! Single-document only.  Multi-input cross-document merge is a separate future
-//! layer (8.8 successor), not implemented here.
+//! Single-document only. Multi-input cross-document merge is a separate path.
 
 use crate::page_tree_rebuild::RebuildResult;
 use crate::{Error, Object, ObjectRef, Pdf, Result};
@@ -56,16 +47,18 @@ use std::io::{Read, Seek};
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Remap or drop outline items and named destinations after a page-tree rebuild.
+/// Remap outline items and named destinations after a page-tree rebuild,
+/// nulling removed-page targets (qpdf `--pages` parity).
 ///
 /// `result` is the [`RebuildResult`] returned by
 /// [`crate::page_tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
 /// old → new page reference mapping: a page absent from the map was removed;
 /// a page present maps to `ref_map[old][0]` (first new occurrence).
 ///
-/// The function mutates `pdf` in place (same convention as `rebuild_page_tree`)
-/// and succeeds silently when there is no `/Outlines` or named-destination
-/// structure to remap.
+/// Every outline item and named destination is kept: a surviving-page target is
+/// remapped, a removed-page target is replaced with `null` in place. The
+/// function mutates `pdf` in place (same convention as `rebuild_page_tree`) and
+/// succeeds silently when there is no `/Outlines` or named-destination structure.
 ///
 /// # Errors
 ///
@@ -85,7 +78,7 @@ pub fn remap_outline_and_dests<R: Read + Seek>(
 ///
 /// - Any error propagated from [`Pdf::resolve`].
 /// - [`Error::Unsupported`] when the name-tree or outline-tree depth exceeds
-///   `max_depth` while pruning or remapping.
+///   `max_depth` while remapping.
 pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
