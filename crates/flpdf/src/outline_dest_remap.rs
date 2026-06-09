@@ -334,12 +334,13 @@ fn remap_annot_array<R: Read + Seek>(
 
 /// Remap/null an inline (direct-dict) annotation's destinations.
 ///
-/// An inline annotation has no object identity, so its `/Dest` and `/A` GoTo
-/// destination are handled directly via [`remap_or_null_dest`] (which covers
-/// the array `[page /Fit]`, dict `/D`, and indirect forms): a removed target
-/// page is nulled (the destination value kept verbatim), a surviving target is
-/// remapped. Returns the (possibly updated) dict and whether a destination key
-/// was present and processed.
+/// An inline annotation has no object identity, so its `/Dest` and `/A` are
+/// handled directly: a removed target page is nulled (the destination value
+/// kept verbatim), a surviving target is remapped. `/Dest` is a destination
+/// value handled by [`remap_or_null_dest`]; `/A` is an action, processed by
+/// [`remap_or_null_action_dest`] so that only a `/S /GoTo` action's `/D` is
+/// treated as a local page destination. Returns the (possibly updated) dict and
+/// whether a destination key was present and processed.
 fn remap_or_null_inline_annot<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut annot: crate::Dictionary,
@@ -353,17 +354,18 @@ fn remap_or_null_inline_annot<R: Read + Seek>(
         changed = true;
     }
     if let Some(action) = annot.remove("A") {
-        annot.insert("A", remap_or_null_dest(pdf, action, surviving)?);
+        annot.insert("A", remap_or_null_action_dest(pdf, action, surviving)?);
         changed = true;
     }
     Ok((annot, changed))
 }
 
 /// Null/remap the catalog `/OpenAction` destination (qpdf `--pages` parity).
-/// `/OpenAction` is either a destination array `[page /Fit ...]` or a GoTo
-/// action dict `<< /S /GoTo /D [page /Fit] >>` (possibly indirect); both forms
-/// expose the page ref through [`remap_or_null_dest`] (array first element or
-/// dict `/D`). A surviving target is remapped, a removed target is nulled.
+/// `/OpenAction` is either a destination array `[page /Fit ...]` or an action
+/// dict (possibly indirect). [`remap_or_null_action_dest`] handles both: a
+/// `/S /GoTo` action's `/D` — or a bare destination array/dict — targeting a
+/// surviving page is remapped and a removed target is nulled, while a non-GoTo
+/// action is kept verbatim (its `/D` is not a local page destination).
 fn remap_open_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     catalog_ref: ObjectRef,
@@ -379,16 +381,43 @@ fn remap_open_action_dest<R: Read + Seek>(
     let Some(oa) = oa else {
         return Ok(());
     };
-    // For an indirect /OpenAction, remap_or_null_dest rewrites the referenced
-    // object in place and returns it unchanged; re-storing the same value is a
-    // no-op. For a direct value this applies the remap/null result.
-    let updated = remap_or_null_dest(pdf, oa, surviving)?;
+    // For an indirect /OpenAction the referenced object is rewritten in place
+    // and the same value returned; re-storing it is a no-op. For a direct value
+    // this applies the remap/null result.
+    let updated = remap_or_null_action_dest(pdf, oa, surviving)?;
     let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
     if let Some(mut catalog) = catalog_obj.as_dict().cloned() {
         catalog.insert("OpenAction", updated);
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     }
     Ok(())
+}
+
+/// Remap/null a GoTo destination carried by an action value (`/A` or
+/// `/OpenAction`).
+///
+/// Only a `/S /GoTo` action's `/D` is a local page destination, so a non-GoTo
+/// action (e.g. `/GoToR`, `/URI`, `/Launch`) is kept verbatim — its `/D`, when
+/// present, targets a remote or named destination and must never be mistaken
+/// for a local page ref. A bare destination value (an array `[page /Fit]` or a
+/// `<< /D … >>` dict with no `/S`) is passed through to [`remap_or_null_dest`].
+/// This mirrors the `/S /GoTo` check the indirect-annotation path performs in
+/// [`remap_item_dest`].
+fn remap_or_null_action_dest<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Object,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Object> {
+    // Resolve to inspect /S without losing the original value form for the
+    // write-back (remap_or_null_dest handles an indirect value in place).
+    let (concrete, _) = resolve_ref_chain(pdf, &value)?;
+    if let Some(dict) = concrete.as_dict() {
+        // A non-GoTo action: keep verbatim (its /D is not a local destination).
+        if matches!(dict.get("S"), Some(Object::Name(n)) if n != b"GoTo") {
+            return Ok(value);
+        }
+    }
+    remap_or_null_dest(pdf, value, surviving)
 }
 
 // ---------------------------------------------------------------------------
@@ -2628,6 +2657,50 @@ mod tests {
             d_first,
             ObjectRef::new(99, 0),
             "/OpenAction /D to a surviving page should be remapped to its new ref"
+        );
+    }
+
+    #[test]
+    fn inline_annot_non_goto_action_d_is_not_treated_as_dest() {
+        // An inline annot whose /A is a NON-GoTo action (/S /Launch) carrying a
+        // page-ref-shaped /D must NOT be treated as a local GoTo destination:
+        // only /S /GoTo carries a local /D. The removed target page (obj4) is
+        // therefore left untouched by Step 4 (a dict, not nulled).
+        let mut pdf = open(build_inline_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] \
+             /A << /S /Launch /D [4 0 R /Fit] >> >>",
+            "",
+        ));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+        assert!(
+            pdf.resolve(ObjectRef::new(4, 0))
+                .unwrap()
+                .as_dict()
+                .is_some(),
+            "obj4 reached only via a non-GoTo action /D must not be nulled by Step 4"
+        );
+    }
+
+    #[test]
+    fn open_action_non_goto_d_is_not_treated_as_dest() {
+        // catalog /OpenAction << /S /Launch /D [4 0 R /Fit] >>: a non-GoTo
+        // action's /D is not a local destination, so page2 (obj4) is not nulled.
+        let mut pdf = open(build_annot_pdf(
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
+            "/OpenAction << /S /Launch /D [4 0 R /Fit] >>",
+            &[],
+        ));
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+        assert!(
+            pdf.resolve(ObjectRef::new(4, 0))
+                .unwrap()
+                .as_dict()
+                .is_some(),
+            "obj4 reached only via a non-GoTo /OpenAction /D must not be nulled"
         );
     }
 
