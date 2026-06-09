@@ -810,11 +810,468 @@ fn rejects_xref_table_trailer_not_dictionary() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
+/// Build a minimal `%PDF` buffer whose `startxref` points at `xref_offset` and
+/// whose `xref_obj` bytes are appended at that offset. Used by the xref-stream
+/// error tests below that build a malformed stream object inline (because the
+/// shared `make_xref_stream_object` helper hardcodes `/W [1 4 2]` and
+/// `/Index [0 size]`, which several of these tests need to vary).
+fn pdf_with_xref_object(xref_obj: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(xref_obj);
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// `parse_xref_stream`: when `startxref` points at an indirect object that
+/// parses as a plain dictionary rather than a `stream`, the non-`Object::Stream`
+/// arm returns `Error::Unsupported("xref stream expected an indirect object
+/// stream")`.
+#[test]
+fn rejects_xref_stream_non_stream_object() {
+    // A dictionary indirect object (no `stream`/`endstream`) at the xref offset.
+    let xref_obj = b"3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R >>\nendobj\n";
+    let bytes = pdf_with_xref_object(xref_obj);
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("non-stream xref object should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref stream expected an indirect object stream"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
+/// `parse_xref_widths`: a `/W` whose value is not an array (here an integer)
+/// takes the non-`Object::Array` arm and returns `Error::Parse("/W must be
+/// array")`.
+#[test]
+fn rejects_xref_stream_w_not_array() {
+    let data = [1u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W 5 /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/W non-array should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("/W must be array"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_widths`: a `/W` array whose length is not exactly three takes the
+/// `values.len() != 3` arm and returns `Error::Parse("/W must contain three
+/// integers")`.
+#[test]
+fn rejects_xref_stream_w_wrong_length() {
+    let data = [1u8, 0x0A];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [1 1] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/W wrong length should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("/W must contain three integers"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_index`: an `/Index` array with an odd number of integers takes
+/// the `values.len() % 2 != 0` arm and returns `Error::Parse("/Index must
+/// contain an even number of integers")`.
+#[test]
+fn rejects_xref_stream_index_odd_length() {
+    let data = [1u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [1 3 1] /Index [0] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/Index odd length should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("/Index must contain an even number of integers"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_index`: an `/Index` whose value is neither absent nor an array
+/// (here an integer) takes the `_ =>` arm and returns `Error::Parse("/Index must
+/// be array")`.
+#[test]
+fn rejects_xref_stream_index_not_array() {
+    let data = [1u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [1 3 1] /Index 5 /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/Index non-array should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("/Index must be array"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_entries`: a `/W [0 0 0]` makes `entry_width == 0`, taking the
+/// zero-width guard and returning `Error::Parse("invalid cross-reference stream
+/// widths")`.
+#[test]
+fn rejects_xref_stream_zero_widths() {
+    // With all widths zero the decoded stream data is irrelevant; provide none.
+    let xref_obj =
+        b"3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [0 0 0] /Index [0 1] /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec();
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/W [0 0 0] should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("invalid cross-reference stream widths"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_entries`: when the entry width implied by `/W` requires more
+/// bytes than the decoded stream provides, the `cursor.pos + entry_width >
+/// len` guard returns `Error::Parse("xref stream data truncated")`. Here `/W
+/// [1 3 1]` needs 5 bytes per entry across two declared entries but only one
+/// entry's worth of data is present.
+#[test]
+fn rejects_xref_stream_truncated_data() {
+    // /Index declares 2 entries (10 bytes) but only 5 bytes of data are present.
+    let data = [1u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 2 /Root 1 0 R /W [1 3 1] /Index [0 2] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("truncated xref stream data should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref stream data truncated"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_entries`: a type field (`/W[0]`) wide enough to hold a value
+/// greater than 255 takes the `u8::try_from` failure arm and returns
+/// `Error::Parse("xref stream object type does not fit u8")`. Here `/W [2 1 1]`
+/// gives the type field two bytes and the data encodes type value `0x0100`.
+#[test]
+fn rejects_xref_stream_object_type_overflow() {
+    // One entry: type = 0x0100 (256, > u8::MAX), field1 = 0x0A, field2 = 0.
+    let data = [0x01u8, 0x00, 0x0A, 0x00];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [2 1 1] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("xref type > 255 should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref stream object type does not fit u8"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_entries`: a type-2 (compressed) entry whose field1 (the
+/// containing stream's object number) exceeds `u32::MAX` takes the
+/// `u32::try_from(field1)` failure arm and returns `Error::Parse("xref stream
+/// object number does not fit u32")`. This needs `w1 >= 5` bytes so field1 can
+/// hold a value above `u32::MAX`; `/W [1 5 1]` gives field1 five bytes encoding
+/// `0x01_0000_0000` (2^32).
+#[test]
+fn rejects_xref_stream_type2_stream_number_overflow() {
+    // type = 2, field1 = 0x01_00_00_00_00 (2^32, > u32::MAX), field2 = 0.
+    let data = [2u8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [1 5 1] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("type-2 stream number > u32 should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("xref stream object number does not fit u32"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_xref_entries`: an entry whose `object_type` is 3 (neither free, in-use,
+/// nor compressed) takes the `_ =>` arm and returns `Error::Unsupported(
+/// "unsupported xref entry type 3")`.
+#[test]
+fn rejects_xref_stream_unsupported_entry_type() {
+    // One entry with type byte 3.
+    let data = [3u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [1 3 1] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("unsupported xref entry type should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("unsupported xref entry type 3"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
+/// `parse_non_negative_u64` (via the `/Size` lookup in `parse_xref_stream`):
+/// a `/Size` that is not an integer (here a name) takes the non-`Object::Integer`
+/// arm and returns `Error::Parse("/Size is not integer")`.
+#[test]
+fn rejects_xref_stream_size_not_integer() {
+    let data = [1u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size /Big /Root 1 0 R /W [1 3 1] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/Size non-integer should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("/Size is not integer"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `parse_non_negative_u64` (via the `/Size` lookup in `parse_xref_stream`):
+/// a negative `/Size` takes the `*integer < 0` arm and returns
+/// `Error::Parse("/Size is negative")`.
+#[test]
+fn rejects_xref_stream_negative_size() {
+    let data = [1u8, 0, 0, 0x0A, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size -1 /Root 1 0 R /W [1 3 1] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/Size negative should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("/Size is negative"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `build_xref_ranges`: an `/Index` chunk with a zero count (`[0 0 1 1]`) takes
+/// the `chunk[1] == 0` skip arm, so that chunk contributes no range. Loading
+/// succeeds and only object 1 (from the `[1 1]` chunk) is present.
+#[test]
+fn xref_stream_index_zero_count_range_skipped() {
+    // Only the second chunk `1 1` yields a range: object 1 at offset 0x14.
+    let data = [1u8, 0, 0, 0x14, 0];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 2 /Root 1 0 R /W [1 3 1] /Index [0 0 1 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect("zero-count index chunk should be skipped, load should succeed");
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(0x14))
+    );
+    // Object 0 came only from the skipped zero-count chunk, so it is absent.
+    assert_eq!(loaded.entries.get(&ObjectRef::new(0, 0)), None);
+}
+
+/// `parse_xref_entries`: a `/W` with `w0 == 0` (`[0 3 1]`) takes the
+/// `object_type` default-to-1 arm, so every entry is treated as a type-1
+/// in-use entry yielding `XrefOffset::Offset`. Loading succeeds.
+#[test]
+fn loads_xref_stream_with_w0_zero_defaults_type_one() {
+    // w0 == 0: no type byte; field1 = offset (3 bytes), field2 = generation (1).
+    let data = [
+        0, 0, 0x0A, 0, // object 0 -> offset 0x0A
+        0, 0, 0x14, 0, // object 1 -> offset 0x14
+    ];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 2 /Root 1 0 R /W [0 3 1] /Index [0 2] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect("w0 == 0 should default to type 1, load should succeed");
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(0, 0)),
+        Some(&XrefOffset::Offset(0x0A))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(0x14))
+    );
+}
+
+/// `ByteCursor::read_fixed`: an xref table that declares more entries than the
+/// file actually contains ends mid-entry, so reading the missing entry's
+/// fixed-width offset field hits the `pos + width > len` guard and returns
+/// `Error::Parse` with an "unexpected end of" message. The `startxref` keyword
+/// is placed BEFORE the xref section (it is located by `rposition`, so its
+/// position in the file is irrelevant) so the file can end mid-table with no
+/// trailing tokens for the fixed-width reader to mistake for entry fields.
+#[test]
+fn rejects_xref_table_truncated_entry() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    // Emit `startxref` ahead of the xref section. Pad the offset to a fixed
+    // 10-digit width (leading zeros parse fine) so the marker length does not
+    // depend on the offset's decimal magnitude, making the offset a simple sum.
+    let xref_offset = bytes.len() + "startxref\n0000000000\n%%EOF\n".len();
+    bytes.extend_from_slice(format!("startxref\n{xref_offset:010}\n%%EOF\n").as_bytes());
+    assert_eq!(
+        bytes.len(),
+        xref_offset,
+        "xref must follow the startxref marker exactly"
+    );
+
+    // Declare 2 entries but provide only the first, then end the file: the
+    // second entry's 10-digit offset field runs off the end of the buffer.
+    bytes.extend_from_slice(b"xref\n0 2\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("truncated xref table entry should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("unexpected end of"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `ByteCursor::read_byte`: an xref table whose final entry supplies the
+/// 10-digit offset and 5-digit generation but ends before the in-use status
+/// byte drives `read_byte` to the `bytes.get(pos)` `None` arm, returning
+/// `Error::Parse("unexpected end of input")`. As in the truncated-entry test,
+/// `startxref` is placed before the xref section so the file can end mid-entry.
+#[test]
+fn rejects_xref_table_truncated_status_byte() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_offset = bytes.len() + "startxref\n0000000000\n%%EOF\n".len();
+    bytes.extend_from_slice(format!("startxref\n{xref_offset:010}\n%%EOF\n").as_bytes());
+    assert_eq!(
+        bytes.len(),
+        xref_offset,
+        "xref must follow the startxref marker exactly"
+    );
+
+    // One declared entry: offset + generation present, but the file ends before
+    // the status byte, so `read_byte` exhausts the buffer.
+    bytes.extend_from_slice(b"xref\n0 1\n");
+    bytes.extend_from_slice(b"0000000000 65535");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("xref entry missing status byte should fail strict parse");
+    let message = format!("{err}");
+    assert!(message.contains("unexpected end of input"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// `ByteCursor::read_unsigned` (via `read_u32` for the subsection count in
+/// `parse_xref_table`): a subsection header that supplies the start object
+/// number but no count integer makes `read_unsigned` find no digits at the
+/// `trailer` keyword, taking the `start == pos` arm and returning
+/// `Error::Parse("expected unsigned integer")`.
+#[test]
+fn rejects_xref_table_missing_object_count() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    // Subsection header `0` with no count integer; `trailer` follows directly,
+    // so reading the count finds no digits.
+    bytes.extend_from_slice(b"xref\n0\ntrailer\n<< /Size 1 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("missing xref subsection count should fail strict parse");
+    let message = format!("{err}");
+    assert!(
+        message.contains("expected unsigned integer"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
 // The "succeeded but with accumulated parse errors" warning path in
 // `load_xref_and_trailer_with_repair` is exercised by
 // `with_repair_appends_diagnostic_when_stream_parse_succeeds`.
 //
 // Unreachable arms via the public API (documented, not tested):
+//
+// * `ByteCursor::read_be_u64`'s own `pos + width > len` end-of-stream guard is
+//   shadowed in the xref-stream path: `parse_xref_entries` checks
+//   `cursor.pos + entry_width > len` (full entry width) BEFORE any
+//   `read_be_u64` call, and the per-field reads sum to exactly `entry_width`.
+//   Truncated stream data therefore surfaces as "xref stream data truncated"
+//   (see `rejects_xref_stream_truncated_data`), and `read_be_u64`'s guard is
+//   never the one that fires through `load_xref_and_trailer`.
 //
 // * The empty-`parse_errors` (`0 =>`) arm of `format_repair_diagnostic`: every
 //   call site passes a non-empty `parse_errors`. Each call is either preceded by
