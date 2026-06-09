@@ -495,8 +495,24 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 )));
             };
 
-            if let Some(val) = dict.get(key).cloned() {
-                match val {
+            // Extract the matched value and the /Parent reference before any
+            // mutable resolve, releasing the borrow on `node_obj`/`self.pdf`.
+            let found = dict.get(key).cloned();
+            let parent_ref = match dict.get("Parent") {
+                Some(Object::Reference(r)) => Some(*r),
+                _ => None,
+            };
+
+            if let Some(val) = found {
+                // The value may be stored as an indirect reference; resolve one
+                // level so an inherited /FT stored as a reference is not
+                // silently dropped (matches AcroFormDocumentHelper's deref_leaf).
+                // A reference resolving to Null is treated as absent.
+                let resolved = match val {
+                    Object::Reference(r) => self.pdf.resolve(r)?,
+                    other => other,
+                };
+                match resolved {
                     Object::Null => {} // treat as absent per §7.3.9
                     Object::Name(bytes) => return Ok(Some(bytes)),
                     _ => {} // unexpected type: skip silently, do not error
@@ -504,12 +520,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
 
             // Climb to /Parent.
-            match dict.get("Parent").cloned() {
-                Some(Object::Reference(r)) => {
+            match parent_ref {
+                Some(r) => {
                     current = r;
                     depth += 1;
                 }
-                _ => return Ok(None),
+                None => return Ok(None),
             }
         }
     }
@@ -608,20 +624,36 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 )));
             };
 
-            if let Some(val) = dict.get(key).cloned() {
-                match val {
+            // Extract the matched value and the /Parent reference before any
+            // mutable resolve, releasing the borrow on `node_obj`/`self.pdf`.
+            let found = dict.get(key).cloned();
+            let parent_ref = match dict.get("Parent") {
+                Some(Object::Reference(r)) => Some(*r),
+                _ => None,
+            };
+
+            if let Some(val) = found {
+                // Resolve one level if /Ff is stored as an indirect reference,
+                // so an inherited reference value is not silently dropped
+                // (matches AcroFormDocumentHelper's deref_leaf). A reference
+                // resolving to Null is treated as absent.
+                let resolved = match val {
+                    Object::Reference(r) => self.pdf.resolve(r)?,
+                    other => other,
+                };
+                match resolved {
                     Object::Null => {}
                     Object::Integer(n) => return Ok(Some(n)),
                     _ => {} // wrong type: skip
                 }
             }
 
-            match dict.get("Parent").cloned() {
-                Some(Object::Reference(r)) => {
+            match parent_ref {
+                Some(r) => {
                     current = r;
                     depth += 1;
                 }
-                _ => return Ok(None),
+                None => return Ok(None),
             }
         }
     }

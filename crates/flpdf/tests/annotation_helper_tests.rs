@@ -444,6 +444,78 @@ fn field_value_resolves_indirect_name() {
     }
 }
 
+#[test]
+fn field_type_resolves_indirect_reference() {
+    // /FT stored as an indirect reference must be dereferenced; otherwise the
+    // field type is silently dropped (inconsistent with field_infos()).
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Type /Annot /Subtype /Widget /FT 6 0 R >>".to_vec()),
+        (6, b"/Tx".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    assert_eq!(
+        field.field_type().expect("field_type()"),
+        Some(b"Tx".to_vec())
+    );
+}
+
+#[test]
+fn field_flags_resolves_indirect_reference() {
+    // /Ff stored as an indirect reference must be dereferenced.
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (
+            4,
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /Ff 6 0 R >>".to_vec(),
+        ),
+        (6, b"1".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    assert_eq!(field.field_flags().expect("field_flags()"), Some(1));
+}
+
+#[test]
+fn field_type_indirect_null_treated_as_absent_inherits_parent() {
+    // An indirect /FT resolving to null is absent (§7.3.9), so the /Parent
+    // chain is climbed and the parent's /FT is returned.
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 /MediaBox [ 0 0 612 792 ] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 5 0 R ] >>".to_vec(),
+        ),
+        (4, b"<< /Kids [ 5 0 R ] /FT /Tx >>".to_vec()),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /Parent 4 0 R /FT 6 0 R >>".to_vec(),
+        ),
+        (6, b"null".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(
+        child.field_type().expect("field_type()"),
+        Some(b"Tx".to_vec())
+    );
+}
+
 // ── FormFieldObjectHelper — /Parent chain inheritance ─────────────────────────
 //
 // Object layout:
