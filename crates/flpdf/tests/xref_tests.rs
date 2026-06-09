@@ -580,6 +580,60 @@ fn repair_diagnostic_aggregates_multiple_errors() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
+/// When `startxref` is absent but the FIRST indirect object in the file is
+/// itself a valid xref stream with no `/Prev`, repair pushes a single "missing
+/// startxref" error and resets the retry offset to 0. `parse_xref_from_start`
+/// then skips the `%PDF-` header comment and parses that xref stream
+/// successfully, so `merge_previous_xref_sections` is a no-op and the
+/// accumulated-error warning arm runs (the "succeeded but with parse errors"
+/// path), emitting exactly one diagnostic via `format_repair_diagnostic`'s
+/// single-error (`1 =>`) form. This is distinct from the linear-scan recovery
+/// path: the stream parse keeps `XrefForm::Stream`, whereas a linear scan would
+/// force `XrefForm::Table`.
+#[test]
+fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    // The xref stream is the FIRST indirect object (object number 1) so that,
+    // after `skip_ws` skips the `%PDF-` comment line, `parse_xref_from_start`
+    // parses it directly. It carries no `/Prev`.
+    let xref_offset = bytes.len() as u64;
+    let xref_entries = build_encoded_xref_stream_entries(&[(0, 0, 0), (1, xref_offset, 0)]);
+    let xref_object = make_xref_stream_object(1, 2, None, 1, &xref_entries);
+    bytes.extend_from_slice(&xref_object);
+
+    // Deliberately NO `startxref` keyword: only an `%%EOF` marker follows.
+    bytes.extend_from_slice(b"%%EOF\n");
+    assert!(
+        !bytes.windows(b"startxref".len()).any(|w| w == b"startxref"),
+        "fixture must not contain a startxref keyword"
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    // The xref STREAM parse succeeded (not a linear scan, which sets Table).
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+
+    // Exactly one diagnostic, built from the single "missing startxref" error.
+    assert_eq!(loaded.repair_diagnostics.entries().len(), 1);
+    let message = &loaded.repair_diagnostics.entries()[0].message;
+    assert!(
+        message.contains("missing startxref"),
+        "expected the missing-startxref clause, got {message}"
+    );
+    assert!(
+        message.contains("repaired by linear object scan"),
+        "expected the repair clause, got {message}"
+    );
+
+    // The stream's own entries are present (e.g. object 1 at its offset).
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(xref_offset))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
 /// A `/Prev` chain that points back at itself is a circular reference: strict
 /// mode must reject it with "xref /Prev is circular", while best-effort must
 /// stop following the chain and return `Ok` with the entries seen so far.
@@ -668,6 +722,9 @@ fn merge_failure_falls_back_to_linear_scan() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
+// Lines 118-123 (the "succeeded but with accumulated parse errors" warning) are
+// exercised by `with_repair_appends_diagnostic_when_stream_parse_succeeds`.
+//
 // Unreachable arms via the public API (documented, not tested):
 //
 // * `format_repair_diagnostic` line 334 (the `0 =>` / empty `parse_errors`
@@ -676,13 +733,9 @@ fn merge_failure_falls_back_to_linear_scan() {
 //   is guarded by `!parse_errors.is_empty()`. So the length is never 0 at a call
 //   site.
 //
-// * Lines 118-123 (the "succeeded but with accumulated parse errors" warning):
-//   `parse_errors` only gains entries when `parse_startxref` fails or its offset
-//   does not fit `usize`. Both arms reset the retry position to offset 0, where
-//   the bytes are the `%PDF-` header rather than a valid `xref`/xref-stream, so
-//   `parse_xref_from_start` always fails and diverts into the linear scan before
-//   reaching line 118. The block is therefore unreachable through the public
-//   entry points and is not exercised here.
+// * Lines 88-92 (the `startxref` offset does not fit `usize` repair/strict arms)
+//   are unreachable on 64-bit targets, where `usize::try_from(u64)` cannot
+//   overflow.
 //
 // * Lines 164-165 (`/Prev` `u64` -> `usize` overflow) are unreachable on 64-bit
 //   targets, where `usize::try_from(u64)` cannot overflow.
