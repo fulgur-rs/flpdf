@@ -718,6 +718,10 @@ fn repair_diagnostics_report_only_the_triggering_error() {
         Some(file_len),
         "expected the trigger warning to carry the parse error offset"
     );
+    // qpdf prints no offset for the surrounding warnings (#1 and #3); only
+    // the trigger warning carries one.
+    assert_eq!(loaded.repair_diagnostics.entries()[0].offset, None);
+    assert_eq!(loaded.repair_diagnostics.entries()[2].offset, None);
 
     // Recovery still produced usable entries and a trailer.
     assert_eq!(
@@ -767,6 +771,10 @@ fn repair_reports_non_parse_trigger_error_via_display() {
         Some(xref_offset),
         "expected the non-parse trigger warning to fall back to the startxref offset"
     );
+    // qpdf prints no offset for the surrounding warnings (#1 and #3); only
+    // the trigger warning carries one.
+    assert_eq!(loaded.repair_diagnostics.entries()[0].offset, None);
+    assert_eq!(loaded.repair_diagnostics.entries()[2].offset, None);
 
     // Recovery still produced usable entries and a trailer.
     assert_eq!(
@@ -829,6 +837,11 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
         !messages.iter().any(|m| m.contains("linear object scan")),
         "must not claim a linear scan ran: {messages:?}"
     );
+    // qpdf prints no offset for the surrounding warnings (#1 and #3); only
+    // the trigger warning carries one.
+    assert_eq!(loaded.repair_diagnostics.entries()[0].offset, None);
+    assert!(loaded.repair_diagnostics.entries()[1].offset.is_some());
+    assert_eq!(loaded.repair_diagnostics.entries()[2].offset, None);
 
     // The stream's own entries are present (e.g. object 1 at its offset).
     assert_eq!(
