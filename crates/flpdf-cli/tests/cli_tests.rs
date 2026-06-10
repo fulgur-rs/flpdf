@@ -74,7 +74,7 @@ fn check_allows_rc4_encrypted_input_with_warning_when_opted_in() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
-        .stderr(predicate::str::contains("warning"))
+        .stderr(predicate::str::contains("WARNING: "))
         .stderr(predicate::str::contains("weak crypto"));
 }
 
