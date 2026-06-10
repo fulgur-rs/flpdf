@@ -296,12 +296,15 @@ fn process_elem_dict<R: Read + Seek>(
         }
     }
 
-    // Recurse only into a real structure element's /K kids. The cheap /K
-    // presence check gates the (potentially I/O-bound) MCR/OBJR classification:
-    // a /K-less dictionary — which every MCR/OBJR is — has nothing to walk, so
-    // there is no need to resolve its /Type to find out.
-    if dict.get("K").is_some() && !is_mcr_or_objr(pdf, &dict)? {
-        if let Some(k) = dict.remove("K") {
+    // Recurse only into a real structure element's /K kids. Classifying a dict
+    // as MCR/OBJR resolves its /Type (possibly I/O-bound), so defer that check
+    // until a /K is actually present to walk: a /K-less dictionary — which every
+    // MCR/OBJR is — has nothing to recurse into regardless.
+    if let Some(k) = dict.remove("K") {
+        if is_mcr_or_objr(pdf, &dict)? {
+            // Not a structure element: keep /K verbatim, do not walk it.
+            dict.insert("K", k);
+        } else {
             let (new_k, k_changed) = walk_kids(pdf, k, surviving, depth + 1, max_depth, visited)?;
             dict.insert("K", new_k);
             changed |= k_changed;
