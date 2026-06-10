@@ -23,14 +23,19 @@
 //! is referenced only by a structure element's `/Pg`, qpdf drops that `/Pg`
 //! entry and the removed page is absent from the output (not emitted as
 //! `null`). The structure element itself — and the rest of the structure tree
-//! — is otherwise left unchanged.
+//! — is otherwise left unchanged. The same drop applies to a `/Pg` carried by a
+//! marked-content reference (`/Type /MCR`) or object reference (`/Type /OBJR`)
+//! kid: qpdf drops the dangling `/Pg` key (keeping an OBJR's `/Obj`), and the
+//! now-unreferenced page is garbage-collected.
 //!
 //! # Scope
 //!
-//! Only the `/Pg` entry of structure elements is handled. `/Pg` entries inside
-//! marked-content reference (`/Type /MCR`) and object reference
-//! (`/Type /OBJR`) dictionaries are left untouched, as are the page references
-//! inside `/ParentTree`.
+//! The `/Pg` entry of structure elements and of their marked-content reference
+//! (`/Type /MCR`) and object reference (`/Type /OBJR`) kids is handled. The
+//! number tree under `/ParentTree` carries no page references — its values are
+//! structure-element references (the structure parent tree, ISO 32000-2, 14.7),
+//! which survive via `/K` and are remapped by the writer — so it needs no
+//! handling here.
 
 use crate::page_tree_rebuild::RebuildResult;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
@@ -60,8 +65,9 @@ pub const DEFAULT_MAX_STRUCT_TREE_DEPTH: usize = 100;
 /// `pdf` in place (same convention as `rebuild_page_tree`) and succeeds
 /// silently when the document has no `/StructTreeRoot`.
 ///
-/// `/Pg` entries inside marked-content reference (`/Type /MCR`) and object
-/// reference (`/Type /OBJR`) dictionaries are left untouched.
+/// The same remap-or-drop is applied to a `/Pg` carried by a marked-content
+/// reference (`/Type /MCR`) or object reference (`/Type /OBJR`) kid; an OBJR's
+/// `/Obj` and an MCR's other entries are left unchanged.
 ///
 /// # Errors
 ///
@@ -256,9 +262,12 @@ fn walk_kid_ref<R: Read + Seek>(
 /// into its `/K` kids. Returns the (possibly rewritten) dictionary and whether
 /// it changed.
 ///
-/// Marked-content reference (`/Type /MCR`) and object reference
-/// (`/Type /OBJR`) dictionaries are not structure elements; they are returned
-/// unchanged and their kids (they have none) are not walked.
+/// The `/Pg` remap-or-drop applies uniformly to structure elements,
+/// marked-content references (`/Type /MCR`) and object references
+/// (`/Type /OBJR`): qpdf 11.9.0 drops a dangling `/Pg` on any of them. Only
+/// true structure elements carry struct-tree `/K` kids, so the `/K` recursion
+/// is restricted to non-MCR/OBJR dictionaries (an MCR's `/Stm`/`/StmOwn` and
+/// an OBJR's `/Obj` are not structure kids and must not be walked).
 fn process_elem_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut dict: Dictionary,
@@ -267,14 +276,11 @@ fn process_elem_dict<R: Read + Seek>(
     max_depth: usize,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<(Dictionary, bool)> {
-    if is_mcr_or_objr(pdf, &dict)? {
-        return Ok((dict, false));
-    }
-
     let mut changed = false;
 
     // /Pg is by spec an indirect reference to a page object; any other form is
-    // malformed and left unchanged.
+    // malformed and left unchanged. A surviving target is remapped to its new
+    // ref; a removed target has the key dropped so the page is garbage-collected.
     if let Some(Object::Reference(pg)) = dict.get("Pg") {
         match surviving.get(pg) {
             Some(&new) => {
@@ -290,10 +296,14 @@ fn process_elem_dict<R: Read + Seek>(
         }
     }
 
-    if let Some(k) = dict.remove("K") {
-        let (new_k, k_changed) = walk_kids(pdf, k, surviving, depth + 1, max_depth, visited)?;
-        dict.insert("K", new_k);
-        changed |= k_changed;
+    // MCR/OBJR dictionaries have no struct-tree /K kids to recurse into; only
+    // their /Pg (handled above) is in scope.
+    if !is_mcr_or_objr(pdf, &dict)? {
+        if let Some(k) = dict.remove("K") {
+            let (new_k, k_changed) = walk_kids(pdf, k, surviving, depth + 1, max_depth, visited)?;
+            dict.insert("K", new_k);
+            changed |= k_changed;
+        }
     }
 
     Ok((dict, changed))
@@ -430,10 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn mcr_and_objr_pg_left_untouched() {
+    fn mcr_and_objr_dangling_pg_dropped() {
         // StructElem 20 has an inline MCR kid and an indirect OBJR kid (21),
-        // both with /Pg pointing at the removed page 4. Their /Pg is out of
-        // scope and must be left untouched.
+        // both with /Pg pointing at the removed page 4. qpdf 11.9.0 drops a
+        // dangling /Pg on MCR/OBJR kids too (so the page is garbage-collected);
+        // an OBJR's /Obj is kept.
         let mut objs = base_objs();
         objs.insert(
             20,
@@ -450,14 +461,60 @@ mod tests {
         let kids = elem.get("K").and_then(|k| k.as_array()).expect("kids");
         let mcr = kids[0].as_dict().expect("inline MCR");
         assert!(
-            matches!(mcr.get("Pg"), Some(Object::Reference(r)) if r.number == 4),
-            "MCR /Pg is out of scope and must be untouched, got {:?}",
+            mcr.get("Pg").is_none(),
+            "MCR dangling /Pg must be dropped, got {:?}",
             mcr.get("Pg")
         );
         let objr = elem_dict(&mut pdf, 21);
         assert!(
-            matches!(objr.get("Pg"), Some(Object::Reference(r)) if r.number == 4),
-            "OBJR /Pg is out of scope and must be untouched, got {:?}",
+            objr.get("Pg").is_none(),
+            "OBJR dangling /Pg must be dropped, got {:?}",
+            objr.get("Pg")
+        );
+        assert!(
+            matches!(objr.get("Obj"), Some(Object::Reference(r)) if r.number == 5),
+            "OBJR /Obj must be kept, got {:?}",
+            objr.get("Obj")
+        );
+    }
+
+    #[test]
+    fn mcr_and_objr_surviving_pg_remapped() {
+        // The remap branch for MCR/OBJR kids: a /Pg pointing at a page that
+        // survives under a new ref is remapped, not dropped.
+        let mut objs = base_objs();
+        objs.insert(
+            20,
+            "<< /Type /StructElem /S /P /P 10 0 R \
+             /K [ << /Type /MCR /Pg 3 0 R /MCID 0 >> 21 0 R ] >>"
+                .into(),
+        );
+        objs.insert(21, "<< /Type /OBJR /Pg 3 0 R /Obj 5 0 R >>".into());
+        let mut pdf = open(&objs);
+
+        // Page 3 survives under a new ref (7 0 R); page 4 removed.
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(7, 0)]);
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(5, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(7, 0), ObjectRef::new(5, 0)],
+            ref_map,
+        };
+
+        drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg remap");
+
+        let elem = elem_dict(&mut pdf, 20);
+        let kids = elem.get("K").and_then(|k| k.as_array()).expect("kids");
+        let mcr = kids[0].as_dict().expect("inline MCR");
+        assert!(
+            matches!(mcr.get("Pg"), Some(Object::Reference(r)) if r.number == 7),
+            "MCR surviving /Pg must be remapped to the new ref, got {:?}",
+            mcr.get("Pg")
+        );
+        let objr = elem_dict(&mut pdf, 21);
+        assert!(
+            matches!(objr.get("Pg"), Some(Object::Reference(r)) if r.number == 7),
+            "OBJR surviving /Pg must be remapped to the new ref, got {:?}",
             objr.get("Pg")
         );
     }
@@ -583,15 +640,22 @@ mod tests {
     fn typeless_elem_processed_and_indirect_type_resolved() {
         // Elem 21 has no /Type (legal for structure elements): it must still be
         // processed and its dangling /Pg dropped. Elem 22's /Type is an
-        // *indirect reference* to /MCR: it must resolve and be skipped, leaving
-        // its /Pg untouched.
+        // *indirect reference* to /MCR: the indirect /Type must resolve so the
+        // dict is recognized as an MCR. Its own dangling /Pg is still dropped
+        // (drop applies to MCR/OBJR kids), but its /K is NOT walked — a
+        // (malformed) struct-elem kid 23 under it keeps its /Pg, proving the
+        // indirect /Type resolved to MCR and short-circuited the /K recursion.
         let mut objs = base_objs();
         objs.insert(
             20,
             "<< /Type /StructElem /S /Document /P 10 0 R /K [21 0 R 22 0 R] >>".into(),
         );
         objs.insert(21, "<< /S /P /P 20 0 R /Pg 4 0 R >>".into());
-        objs.insert(22, "<< /Type 30 0 R /Pg 4 0 R /MCID 0 >>".into());
+        objs.insert(22, "<< /Type 30 0 R /Pg 4 0 R /MCID 0 /K 23 0 R >>".into());
+        objs.insert(
+            23,
+            "<< /Type /StructElem /S /P /P 22 0 R /Pg 4 0 R >>".into(),
+        );
         objs.insert(30, "/MCR".into());
         let mut pdf = open(&objs);
 
@@ -605,9 +669,15 @@ mod tests {
         );
         let mcr = elem_dict(&mut pdf, 22);
         assert!(
-            matches!(mcr.get("Pg"), Some(Object::Reference(r)) if r.number == 4),
-            "MCR (indirect /Type) /Pg is out of scope and must be untouched, got {:?}",
+            mcr.get("Pg").is_none(),
+            "MCR (indirect /Type) dangling /Pg must be dropped, got {:?}",
             mcr.get("Pg")
+        );
+        let unwalked_kid = elem_dict(&mut pdf, 23);
+        assert!(
+            matches!(unwalked_kid.get("Pg"), Some(Object::Reference(r)) if r.number == 4),
+            "kid under an MCR (indirect /Type) must not be walked, so its /Pg stays, got {:?}",
+            unwalked_kid.get("Pg")
         );
     }
 

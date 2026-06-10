@@ -299,3 +299,219 @@ fn structelem_pg_to_removed_page_dropped_and_page_gced_like_qpdf() {
     assert_pg_drop_facts(&q_qdf, "qpdf");
     assert_pg_drop_facts(&f_qdf, "flpdf");
 }
+
+/// Build a 3-page PDF whose removed page 2 is referenced ONLY through a
+/// marked-content reference (`/Type /MCR`) `/Pg` and an object reference
+/// (`/Type /OBJR`) `/Pg`. The OBJR's `/Obj` points at an annotation that has
+/// no `/P` back-reference, so once both dangling `/Pg` are dropped the removed
+/// page has no inbound reference and is garbage-collected — isolating the
+/// MCR/OBJR `/Pg`-drop → page-GC behaviour from the annotation `/P` family.
+///
+/// Object layout: 1 catalog (/StructTreeRoot 10), 2 pages, 3 page1, 4 page2,
+/// 5 page3, 10 struct tree root (/K 20 /ParentTree 11), 11 parent tree,
+/// 20 document elem (/K [21 22 23]), 21 elem with an inline MCR kid `/Pg 4 0 R`,
+/// 22 elem with an inline OBJR kid `/Pg 4 0 R /Obj 31 0 R`, 23 elem with its own
+/// `/Pg 5 0 R` (surviving page) and MCID kid 9, 31 annotation (no `/P`).
+fn mcr_objr_fixture() -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut buf: Vec<u8> = b"%PDF-1.5\n".to_vec();
+    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    let mut add = |buf: &mut Vec<u8>, num: u32, body: &str| {
+        offsets.push((num, buf.len()));
+        buf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+    };
+
+    add(
+        &mut buf,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+    );
+    add(
+        &mut buf,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+    );
+    add(
+        &mut buf,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /StructParents 0 >>",
+    );
+    add(
+        &mut buf,
+        4,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> \
+         /StructParents 1 /Annots [31 0 R] >>",
+    );
+    add(
+        &mut buf,
+        5,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /StructParents 2 >>",
+    );
+    add(
+        &mut buf,
+        10,
+        "<< /Type /StructTreeRoot /K 20 0 R /ParentTree 11 0 R >>",
+    );
+    add(&mut buf, 11, "<< /Nums [0 21 0 R 1 22 0 R 2 23 0 R] >>");
+    add(
+        &mut buf,
+        20,
+        "<< /Type /StructElem /S /Document /P 10 0 R /K [21 0 R 22 0 R 23 0 R] >>",
+    );
+    add(
+        &mut buf,
+        21,
+        "<< /Type /StructElem /S /P /P 20 0 R /K << /Type /MCR /Pg 4 0 R /MCID 7 >> >>",
+    );
+    add(
+        &mut buf,
+        22,
+        "<< /Type /StructElem /S /P /P 20 0 R /K << /Type /OBJR /Pg 4 0 R /Obj 31 0 R >> >>",
+    );
+    add(
+        &mut buf,
+        23,
+        "<< /Type /StructElem /S /P /P 20 0 R /Pg 5 0 R /K 9 >>",
+    );
+    add(
+        &mut buf,
+        31,
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
+    );
+
+    let max_num = offsets.iter().map(|&(n, _)| n).max().unwrap();
+    let xref_pos = buf.len();
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_num + 1).as_bytes());
+    for i in 1..=max_num {
+        match offsets.iter().find(|&&(n, _)| n == i) {
+            Some(&(_, off)) => {
+                buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            None => buf.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+            max_num + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+    f.write_all(&buf).unwrap();
+    f.flush().unwrap();
+    f
+}
+
+/// Assert the MCR/OBJR drop-family facts on one tool's normalized output.
+fn assert_mcr_objr_pg_drop_facts(qdf: &str, tool: &str) {
+    // 1. Removed page garbage-collected: 2 pages and exactly 2 /Type /Page
+    //    objects (no null placeholder).
+    assert_eq!(qdf_page_count(qdf), 2, "{tool}: should drop to 2 pages");
+    let objects = qdf_objects(qdf);
+    let page_objs = objects
+        .iter()
+        .filter(|(_, body)| body.lines().any(|l| l.trim() == "/Type /Page"))
+        .count();
+    assert_eq!(
+        page_objs, 2,
+        "{tool}: removed page must be garbage-collected, not kept/nulled"
+    );
+
+    // 2. The element holding the MCR kid (located by its `/Type /MCR` line) has
+    //    no /Pg anywhere: the MCR's dangling /Pg was dropped (the holder itself
+    //    carries none).
+    let mcr_holder = find_elem(&objects, "/Type /MCR", tool);
+    assert!(
+        !mcr_holder.contains("/Pg"),
+        "{tool}: MCR dangling /Pg must be dropped, got:\n{mcr_holder}"
+    );
+
+    // 3. The element holding the OBJR kid has its OBJR's dangling /Pg dropped
+    //    but keeps /Obj.
+    let objr_holder = find_elem(&objects, "/Type /OBJR", tool);
+    assert!(
+        !objr_holder.contains("/Pg"),
+        "{tool}: OBJR dangling /Pg must be dropped, got:\n{objr_holder}"
+    );
+    assert!(
+        objr_holder.contains("/Obj "),
+        "{tool}: OBJR /Obj must be kept, got:\n{objr_holder}"
+    );
+
+    // 4. The element whose own /Pg points at a surviving page (MCID kid 9)
+    //    keeps it, resolving to a /Type /Page object.
+    let kept = find_elem(&objects, "/K 9", tool);
+    let pg_line = kept
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("/Pg "))
+        .unwrap_or_else(|| {
+            panic!("{tool}: StructElem with surviving-page /Pg must keep it, got:\n{kept}")
+        });
+    let target: u32 = pg_line
+        .strip_prefix("/Pg ")
+        .and_then(|r| r.strip_suffix(" 0 R"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{tool}: malformed /Pg line `{pg_line}`"));
+    let (_, target_body) = objects
+        .iter()
+        .find(|&&(num, _)| num == target)
+        .unwrap_or_else(|| panic!("{tool}: surviving /Pg target object {target} not found"));
+    assert!(
+        target_body.lines().any(|l| l.trim() == "/Type /Page"),
+        "{tool}: surviving /Pg must point at a page object, got:\n{target_body}"
+    );
+}
+
+#[test]
+fn mcr_objr_pg_to_removed_page_dropped_and_page_gced_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    eprintln!("qpdf {EXPECTED_QPDF_VERSION} present; running real MCR/OBJR /Pg assertions");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_file = mcr_objr_fixture();
+    let src = src_file.path();
+
+    let q_out = tmp.path().join("q.pdf");
+    let f_out = tmp.path().join("f.pdf");
+
+    // qpdf is the oracle; if it rejects our fixture the offset bookkeeping is
+    // wrong, so fail loudly rather than skip.
+    let q_run = run_qpdf(&[
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1,3",
+        "--",
+        q_out.to_str().unwrap(),
+    ]);
+    assert!(
+        q_run.status.success(),
+        "qpdf --pages should succeed on the MCR/OBJR fixture (exit {:?}): {}",
+        q_run.status.code(),
+        String::from_utf8_lossy(&q_run.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            src.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1,3",
+            "--",
+            f_out.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let q_qdf = normalize_qdf(&q_out, &tmp.path().join("q.qdf"));
+    let f_qdf = normalize_qdf(&f_out, &tmp.path().join("f.qdf"));
+
+    assert_mcr_objr_pg_drop_facts(&q_qdf, "qpdf");
+    assert_mcr_objr_pg_drop_facts(&f_qdf, "flpdf");
+}
