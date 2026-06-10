@@ -669,7 +669,7 @@ fn parse_startxref(bytes: &[u8]) -> Result<u64> {
         .windows(marker.len())
         .rposition(|window| window == marker)
     else {
-        return Err(Error::parse(bytes.len(), "missing startxref"));
+        return Err(Error::parse(bytes.len(), "can't find startxref"));
     };
 
     let mut cursor = ByteCursor::new(bytes, pos + marker.len());

@@ -679,7 +679,7 @@ fn best_effort_errors_when_trailer_not_dictionary() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
-/// When `startxref` is absent, repair pushes a "missing startxref" error and
+/// When `startxref` is absent, repair pushes a "can't find startxref" error and
 /// retries `parse_xref_from_start` at offset 0, which fails at the header and
 /// pushes a second error. `format_repair_diagnostic` then takes its multi-error
 /// (`_ =>`) arm, joining both clauses with "; " into a single diagnostic.
@@ -705,7 +705,7 @@ fn repair_diagnostic_aggregates_multiple_errors() {
         "expected joined clauses, got {message}"
     );
     assert!(
-        message.contains("missing startxref"),
+        message.contains("can't find startxref"),
         "expected first parse error, got {message}"
     );
     // Recovery still produced usable entries and a trailer.
@@ -717,8 +717,8 @@ fn repair_diagnostic_aggregates_multiple_errors() {
 }
 
 /// When `startxref` is absent but the FIRST indirect object in the file is
-/// itself a valid xref stream with no `/Prev`, repair pushes a single "missing
-/// startxref" error and resets the retry offset to 0. `parse_xref_from_start`
+/// itself a valid xref stream with no `/Prev`, repair pushes a single "can't
+/// find startxref" error and resets the retry offset to 0. `parse_xref_from_start`
 /// then skips the `%PDF-` header comment and parses that xref stream
 /// successfully, so `merge_previous_xref_sections` is a no-op and the
 /// accumulated-error warning arm runs (the "succeeded but with parse errors"
@@ -750,11 +750,11 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
     // The xref STREAM parse succeeded (not a linear scan, which sets Table).
     assert_eq!(loaded.last_xref_form, XrefForm::Stream);
 
-    // Exactly one diagnostic, built from the single "missing startxref" error.
+    // Exactly one diagnostic, built from the single "can't find startxref" error.
     assert_eq!(loaded.repair_diagnostics.entries().len(), 1);
     let message = &loaded.repair_diagnostics.entries()[0].message;
     assert!(
-        message.contains("missing startxref"),
+        message.contains("can't find startxref"),
         "expected the missing-startxref clause, got {message}"
     );
     assert!(
