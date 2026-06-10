@@ -116,10 +116,7 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     }
 
     if !parse_errors.is_empty() {
-        loaded.repair_diagnostics.push(Diagnostic::warning(
-            format_repair_diagnostic(parse_errors),
-            Some(startxref),
-        ));
+        push_repair_diagnostics(&mut loaded.repair_diagnostics, &parse_errors, startxref);
     }
 
     Ok(loaded)
@@ -206,10 +203,7 @@ fn recover_xref_from_linear_scan(
     let trailer = recover_trailer(bytes)?;
 
     let mut repair_diagnostics = Diagnostics::default();
-    repair_diagnostics.push(Diagnostic::warning(
-        format_repair_diagnostic(parse_errors),
-        Some(startxref),
-    ));
+    push_repair_diagnostics(&mut repair_diagnostics, &parse_errors, startxref);
 
     Ok(LoadedXref {
         version,
@@ -329,25 +323,28 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
     Ok(value as u64)
 }
 
-fn format_repair_diagnostic(parse_errors: Vec<Error>) -> String {
-    match parse_errors.len() {
-        0 => String::from("xref parsing failed and was repaired by linear object scan"),
-        1 => format!(
-            "xref parsing failed ({}) and was repaired by linear object scan",
-            parse_errors[0]
-        ),
-        _ => {
-            let mut message =
-                String::from("xref parsing failed and was repaired by linear object scan: ");
-            for (index, error) in parse_errors.iter().enumerate() {
-                if index > 0 {
-                    message.push_str("; ");
-                }
-                message.push_str(&error.to_string());
-            }
-            message
-        }
+/// Push the qpdf-compatible repair warning sequence onto `diagnostics`.
+///
+/// qpdf (`reconstruct_xref` in `QPDF_objects.cc`, observed with qpdf 11.9.0)
+/// emits the same three warnings regardless of how the damaged
+/// cross-reference data is ultimately recovered: `file is damaged`, the error
+/// that triggered recovery, and `Attempting to reconstruct cross-reference
+/// table`. Only the first accumulated error is reported: qpdf has no retry-at-
+/// offset-0 detour, so follow-up failures from that path have no qpdf
+/// counterpart on stderr.
+fn push_repair_diagnostics(diagnostics: &mut Diagnostics, parse_errors: &[Error], startxref: u64) {
+    diagnostics.push(Diagnostic::warning("file is damaged", Some(startxref)));
+    if let Some(error) = parse_errors.first() {
+        let message = match error {
+            Error::Parse { message, .. } => message.clone(),
+            other => other.to_string(),
+        };
+        diagnostics.push(Diagnostic::warning(message, Some(startxref)));
     }
+    diagnostics.push(Diagnostic::warning(
+        "Attempting to reconstruct cross-reference table",
+        Some(startxref),
+    ));
 }
 
 fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
