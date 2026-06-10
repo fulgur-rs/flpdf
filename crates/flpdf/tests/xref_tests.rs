@@ -691,6 +691,7 @@ fn repair_diagnostics_report_only_the_triggering_error() {
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     // Note: NO `startxref` keyword at all.
     bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n%%EOF\n");
+    let file_len = bytes.len() as u64;
 
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
 
@@ -708,6 +709,14 @@ fn repair_diagnostics_report_only_the_triggering_error() {
             "Attempting to reconstruct cross-reference table",
         ],
         "expected the qpdf warning sequence with only the first error"
+    );
+
+    // The triggering error's warning carries the parse error's own offset
+    // (end of file for a missing startxref), not the startxref fallback of 0.
+    assert_eq!(
+        loaded.repair_diagnostics.entries()[1].offset,
+        Some(file_len),
+        "expected the trigger warning to carry the parse error offset"
     );
 
     // Recovery still produced usable entries and a trailer.
