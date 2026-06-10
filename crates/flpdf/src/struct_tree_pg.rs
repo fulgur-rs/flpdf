@@ -465,21 +465,21 @@ mod tests {
         let elem = elem_dict(&mut pdf, 20);
         let kids = elem.get("K").and_then(|k| k.as_array()).expect("kids");
         let mcr = kids[0].as_dict().expect("inline MCR");
+        let mcr_pg = mcr.get("Pg");
         assert!(
-            mcr.get("Pg").is_none(),
-            "MCR dangling /Pg must be dropped, got {:?}",
-            mcr.get("Pg")
+            mcr_pg.is_none(),
+            "MCR dangling /Pg must be dropped, got {mcr_pg:?}"
         );
         let objr = elem_dict(&mut pdf, 21);
+        let objr_pg = objr.get("Pg");
         assert!(
-            objr.get("Pg").is_none(),
-            "OBJR dangling /Pg must be dropped, got {:?}",
-            objr.get("Pg")
+            objr_pg.is_none(),
+            "OBJR dangling /Pg must be dropped, got {objr_pg:?}"
         );
+        let objr_obj = objr.get("Obj");
         assert!(
-            matches!(objr.get("Obj"), Some(Object::Reference(r)) if r.number == 5),
-            "OBJR /Obj must be kept, got {:?}",
-            objr.get("Obj")
+            matches!(objr_obj, Some(Object::Reference(r)) if r.number == 5),
+            "OBJR /Obj must be kept, got {objr_obj:?}"
         );
     }
 
@@ -511,16 +511,16 @@ mod tests {
         let elem = elem_dict(&mut pdf, 20);
         let kids = elem.get("K").and_then(|k| k.as_array()).expect("kids");
         let mcr = kids[0].as_dict().expect("inline MCR");
+        let mcr_pg = mcr.get("Pg");
         assert!(
-            matches!(mcr.get("Pg"), Some(Object::Reference(r)) if r.number == 7),
-            "MCR surviving /Pg must be remapped to the new ref, got {:?}",
-            mcr.get("Pg")
+            matches!(mcr_pg, Some(Object::Reference(r)) if r.number == 7),
+            "MCR surviving /Pg must be remapped to the new ref, got {mcr_pg:?}"
         );
         let objr = elem_dict(&mut pdf, 21);
+        let objr_pg = objr.get("Pg");
         assert!(
-            matches!(objr.get("Pg"), Some(Object::Reference(r)) if r.number == 7),
-            "OBJR surviving /Pg must be remapped to the new ref, got {:?}",
-            objr.get("Pg")
+            matches!(objr_pg, Some(Object::Reference(r)) if r.number == 7),
+            "OBJR surviving /Pg must be remapped to the new ref, got {objr_pg:?}"
         );
     }
 
@@ -667,22 +667,22 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
 
         let typeless = elem_dict(&mut pdf, 21);
+        let typeless_pg = typeless.get("Pg");
         assert!(
-            typeless.get("Pg").is_none(),
-            "typeless StructElem must still have its dangling /Pg dropped, got {:?}",
-            typeless.get("Pg")
+            typeless_pg.is_none(),
+            "typeless StructElem must still have its dangling /Pg dropped, got {typeless_pg:?}"
         );
         let mcr = elem_dict(&mut pdf, 22);
+        let mcr_pg = mcr.get("Pg");
         assert!(
-            mcr.get("Pg").is_none(),
-            "MCR (indirect /Type) dangling /Pg must be dropped, got {:?}",
-            mcr.get("Pg")
+            mcr_pg.is_none(),
+            "MCR (indirect /Type) dangling /Pg must be dropped, got {mcr_pg:?}"
         );
         let unwalked_kid = elem_dict(&mut pdf, 23);
+        let unwalked_pg = unwalked_kid.get("Pg");
         assert!(
-            matches!(unwalked_kid.get("Pg"), Some(Object::Reference(r)) if r.number == 4),
-            "kid under an MCR (indirect /Type) must not be walked, so its /Pg stays, got {:?}",
-            unwalked_kid.get("Pg")
+            matches!(unwalked_pg, Some(Object::Reference(r)) if r.number == 4),
+            "kid under an MCR (indirect /Type) must not be walked, so its /Pg stays, got {unwalked_pg:?}"
         );
     }
 
