@@ -46,6 +46,27 @@
 //! its beads (each with `/P` dropped) — it never removes the thread itself. The
 //! same drop applies when the ring is reachable only through a surviving page's
 //! `/B` array rather than the catalog `/Threads`.
+//!
+//! ## Surviving page under a duplicate selection
+//!
+//! For `qpdf in.pdf --pages in.pdf 1,1,3 -- out.pdf` (page 1 selected twice,
+//! page 2 dropped) over the same article-thread document, qpdf emits two page
+//! dictionaries for page 1 but does **not** duplicate the bead: both page
+//! copies' `/B` arrays reference the **same** single bead object, and that
+//! bead's `/P` points at the **first** of the two page copies. The dropped
+//! page's bead loses its `/P` as above. So a duplicated page's bead `/P`
+//! resolves to the first occurrence of that page.
+//!
+//! This module's surviving-page rule matches that observation: it remaps a
+//! bead's `/P` to `ref_map[old]`'s first new occurrence. Note that
+//! [`crate::page_tree_rebuild::rebuild_page_tree`] keeps the **first**
+//! occurrence of a surviving page under its original [`ObjectRef`] (only the
+//! 2nd+ duplicate copies get fresh numbers), so for every surviving page the
+//! first new ref equals the original ref and the remap is an identity — the
+//! explicit "remap to a different ref" branch is a defensive invariant that a
+//! single-document rebuild never triggers. (This pass operates on a single
+//! document; cross-document merge — which could renumber a first occurrence —
+//! is out of scope here.)
 
 use crate::outline_dest_remap::resolve_ref_chain;
 use crate::page_tree_rebuild::RebuildResult;
@@ -420,8 +441,13 @@ mod tests {
 
     #[test]
     fn surviving_bead_p_remapped_to_new_ref() {
-        // Page 3 survives under a new ref (7 0 R), as a duplicate-page selection
-        // can produce: bead 11's /P must be remapped to the new ref, not dropped.
+        // Defensive invariant: when a surviving page's first new ref differs
+        // from its original (ref_map[old][0] != old), a bead /P pointing at it
+        // must be REMAPPED to that new ref, not dropped. A single-document
+        // `rebuild_page_tree` never produces this (it keeps the first occurrence
+        // under the original ref, page_tree_rebuild.rs), so this fixture builds
+        // the RebuildResult by hand to exercise the otherwise-unreachable remap
+        // arm and pin the qpdf first-occurrence rule for a future cross-doc path.
         let mut pdf = open(&base_objs());
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(7, 0)]);
@@ -445,6 +471,47 @@ mod tests {
         assert!(
             matches!(p13, Some(Object::Reference(r)) if r.number == 5),
             "bead 13 /P (surviving page, identity) must be kept, got {p13:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_selection_keeps_bead_p_at_first_occurrence() {
+        // The realistic shape a duplicate selection actually produces: page 3 is
+        // selected twice, so `rebuild_page_tree` keeps the first occurrence under
+        // its original ref and allocates a fresh ref (7 0 R) for the second copy,
+        // giving ref_map[3] = [3, 7]. qpdf 11.9.0 points the (single, shared)
+        // bead's /P at the FIRST occurrence, and `ref_map[old][0] == old` here, so
+        // bead 11's /P must stay at page 3 — the identity arm, never the remap.
+        let mut pdf = open(&base_objs());
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(
+            ObjectRef::new(3, 0),
+            vec![ObjectRef::new(3, 0), ObjectRef::new(7, 0)],
+        );
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(5, 0)]);
+        let result = RebuildResult {
+            // Selection order 3,3,5: first copy keeps ref 3, duplicate is 7.
+            new_kids: vec![
+                ObjectRef::new(3, 0),
+                ObjectRef::new(7, 0),
+                ObjectRef::new(5, 0),
+            ],
+            ref_map,
+        };
+
+        drop_thread_bead_dangling_p(&mut pdf, &result).expect("duplicate-page bead /P");
+
+        // Bead 11 (on the duplicated page 3) keeps its /P at the first occurrence
+        // (ref 3), not the duplicate ref 7 and not dropped — matching qpdf.
+        let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
+        assert!(
+            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            "a duplicated page's bead /P must stay at the first occurrence (page 3), got {p11:?}"
+        );
+        // Bead 12 (on the removed page 4) still loses its /P.
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_none(),
+            "the removed-page bead /P must still be dropped under a duplicate selection"
         );
     }
 
