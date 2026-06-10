@@ -846,4 +846,31 @@ mod tests {
             "a non-dict surviving page is skipped but the others are still walked"
         );
     }
+
+    #[test]
+    fn duplicate_surviving_page_ref_in_new_kids_is_deduped() {
+        // new_kids lists the same surviving page ref twice; the /B-seeding dedup
+        // must visit each page once. (No /Threads, so /B is the only entry.)
+        let mut objs = base_objs();
+        objs.insert(1, "<< /Type /Catalog /Pages 2 0 R >>".into());
+        let mut pdf = open(&objs);
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(3, 0)]);
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(5, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![
+                ObjectRef::new(3, 0),
+                ObjectRef::new(3, 0),
+                ObjectRef::new(5, 0),
+            ],
+            ref_map,
+        };
+
+        drop_thread_bead_dangling_p(&mut pdf, &result).expect("dedup");
+
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_none(),
+            "a duplicated page ref in new_kids must not break /B seeding"
+        );
+    }
 }
