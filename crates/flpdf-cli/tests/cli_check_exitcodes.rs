@@ -324,3 +324,23 @@ fn check_subcommand_corrupt_pdf_exits_2() {
         .assert()
         .code(2);
 }
+
+/// Repair warnings emitted while opening for any subcommand (here: rewrite)
+/// use the same qpdf shape as check.
+#[test]
+fn rewrite_repair_warnings_use_qpdf_stderr_format() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = tempfile::NamedTempFile::new().unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["rewrite", "--repair", &path, out.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {path}: file is damaged\n"
+        )))
+        .stderr(predicate::str::contains("warning: ").not());
+}

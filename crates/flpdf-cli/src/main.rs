@@ -3901,11 +3901,13 @@ fn open_pdf(
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
 
     for diagnostic in pdf.repair_diagnostics().entries() {
-        eprintln!("warning: {}", diagnostic.message);
+        let location = diagnostic_location(input, diagnostic.offset);
+        eprintln!("WARNING: {location}: {}", diagnostic.message);
     }
     if pdf.uses_weak_crypto() {
         eprintln!(
-            "warning: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied"
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied",
+            input.display()
         );
     }
 
@@ -3963,6 +3965,8 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
 
 /// Prefix a fatal error with the input path so main() renders the observed
 /// qpdf shape `<progname>: <file>: <msg>` for open failures.
+///
+/// This type-erases the error; do not downcast the result.
 fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
     format!("{}: {error}", input.display()).into()
 }
