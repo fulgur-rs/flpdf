@@ -727,6 +727,55 @@ fn repair_diagnostics_report_only_the_triggering_error() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
+/// When the triggering error is not `Error::Parse` (here: `Error::Missing`
+/// because the xref stream pointed to by `startxref` lacks the required `/W`
+/// entry), the trigger warning falls back to the error's `Display` form and
+/// the `startxref` offset, since a non-parse error carries no byte offset of
+/// its own.
+#[test]
+fn repair_reports_non_parse_trigger_error_via_display() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    // A recoverable object and a valid trailer so the linear scan succeeds.
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = bytes.len() as u64;
+    // An xref stream whose dictionary is missing the required /W entry.
+    bytes.extend_from_slice(
+        b"2 0 obj\n<< /Type /XRef /Size 3 /Root 1 0 R /Index [0 3] /Length 0 >>\nstream\n\nendstream\nendobj\n",
+    );
+    bytes.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    let messages: Vec<&str> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "file is damaged",
+            "missing required PDF entry: XRef stream /W",
+            "Attempting to reconstruct cross-reference table",
+        ],
+        "expected the qpdf warning sequence with the Display-formatted trigger"
+    );
+    assert_eq!(
+        loaded.repair_diagnostics.entries()[1].offset,
+        Some(xref_offset),
+        "expected the non-parse trigger warning to fall back to the startxref offset"
+    );
+
+    // Recovery still produced usable entries and a trailer.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(9))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
 /// When `startxref` is absent but the FIRST indirect object in the file is
 /// itself a valid xref stream with no `/Prev`, repair pushes a single "can't
 /// find startxref" error and resets the retry offset to 0. `parse_xref_from_start`

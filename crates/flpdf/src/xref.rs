@@ -95,8 +95,10 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     let mut loaded = match parse_xref_from_start(&bytes, xref_pos, startxref, &version) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
-            parse_errors.push(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, parse_errors);
+            // Report the first recorded failure; this parse error is only the
+            // trigger when the startxref stage itself succeeded.
+            let trigger = parse_errors.into_iter().next().unwrap_or(error);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
         }
         Err(error) => return Err(error),
     };
@@ -109,14 +111,14 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
         allow_repair,
     ) {
         if allow_repair {
-            parse_errors.push(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, parse_errors);
+            let trigger = parse_errors.into_iter().next().unwrap_or(error);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
         }
         return Err(error);
     }
 
-    if !parse_errors.is_empty() {
-        push_repair_diagnostics(&mut loaded.repair_diagnostics, &parse_errors, startxref);
+    if let Some(error) = parse_errors.into_iter().next() {
+        push_repair_diagnostics(&mut loaded.repair_diagnostics, &error, startxref);
     }
 
     Ok(loaded)
@@ -197,13 +199,13 @@ fn recover_xref_from_linear_scan(
     bytes: &[u8],
     version: String,
     startxref: u64,
-    parse_errors: Vec<Error>,
+    trigger_error: Error,
 ) -> Result<LoadedXref> {
     let entries = recover_xref_entries(bytes)?;
     let trailer = recover_trailer(bytes)?;
 
     let mut repair_diagnostics = Diagnostics::default();
-    push_repair_diagnostics(&mut repair_diagnostics, &parse_errors, startxref);
+    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
 
     Ok(LoadedXref {
         version,
@@ -329,20 +331,19 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 /// emits the same three warnings regardless of how the damaged
 /// cross-reference data is ultimately recovered: `file is damaged`, the error
 /// that triggered recovery, and `Attempting to reconstruct cross-reference
-/// table`. Only the first accumulated error is reported: qpdf has no retry-at-
-/// offset-0 detour, so subsequent failures from that path have no qpdf
-/// counterpart on stderr. The triggering error's warning carries that error's
-/// own byte offset when available; the surrounding warnings carry the
-/// `startxref` offset.
-fn push_repair_diagnostics(diagnostics: &mut Diagnostics, parse_errors: &[Error], startxref: u64) {
+/// table`. `trigger_error` is the first failure that initiated recovery;
+/// subsequent failures from the retry-at-offset-0 detour are not reported
+/// because qpdf has no such detour and they have no counterpart on its
+/// stderr. The triggering error's warning carries that error's own byte
+/// offset when available; the surrounding warnings carry the `startxref`
+/// offset.
+fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", Some(startxref)));
-    if let Some(error) = parse_errors.first() {
-        let (message, offset) = match error {
-            Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
-            other => (other.to_string(), Some(startxref)),
-        };
-        diagnostics.push(Diagnostic::warning(message, offset));
-    }
+    let (message, offset) = match trigger_error {
+        Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
+        other => (other.to_string(), Some(startxref)),
+    };
+    diagnostics.push(Diagnostic::warning(message, offset));
     diagnostics.push(Diagnostic::warning(
         "Attempting to reconstruct cross-reference table",
         Some(startxref),
