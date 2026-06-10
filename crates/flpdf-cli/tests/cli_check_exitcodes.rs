@@ -139,7 +139,7 @@ fn check_warnings_only_pdf_exits_3() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
-        .stderr(predicate::str::contains("warning"));
+        .stderr(predicate::str::contains("WARNING: "));
 }
 
 #[test]
@@ -152,7 +152,54 @@ fn check_subcommand_warnings_only_pdf_exits_3() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
-        .stderr(predicate::str::contains("warning"));
+        .stderr(predicate::str::contains("WARNING: "));
+}
+
+#[test]
+fn check_warnings_use_qpdf_stderr_format() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("PDF check succeeded"))
+        // qpdf shape: WARNING: <file>: <msg>, surrounding warnings without
+        // offset, then the trailing summary line.
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {path}: file is damaged\n"
+        )))
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table\n",
+        ))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ))
+        // The old lowercase `warning: <msg>` prefix must be gone.
+        .stderr(predicate::str::contains("warning: ").not());
+}
+
+/// The trigger warning (and only the trigger warning) carries `(offset N)`.
+#[test]
+fn check_trigger_warning_carries_offset() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stderr(
+            predicate::str::is_match(format!(
+                "WARNING: {} \\(offset \\d+\\): ",
+                regex::escape(&path)
+            ))
+            .unwrap(),
+        )
+        .stderr(predicate::str::contains(format!("WARNING: {path} (offset")).count(1));
 }
 
 // ---------------------------------------------------------------------------

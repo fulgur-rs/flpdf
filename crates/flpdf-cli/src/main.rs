@@ -40,7 +40,7 @@ use flpdf::{
 };
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -2001,16 +2001,16 @@ fn run_command(command: Commands) -> CliResult<()> {
 
 fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let file = File::open(input)?;
+    let file = File::open(&input)?;
     let options = pdf_open_options(repair, password)?;
     let report = check_reader_with_options(BufReader::new(file), options)
         .map_err(actionable_password_error)?;
     for diagnostic in report.diagnostics.entries() {
-        let label = match diagnostic.severity {
-            Severity::Warning => "warning",
-            Severity::Error => "error",
-        };
-        eprintln!("{label}: {}", diagnostic.message);
+        let location = diagnostic_location(&input, diagnostic.offset);
+        match diagnostic.severity {
+            Severity::Warning => eprintln!("WARNING: {location}: {}", diagnostic.message),
+            Severity::Error => eprintln!("error: {}", diagnostic.message),
+        }
     }
 
     // Map the check result to qpdf-compatible exit codes:
@@ -2039,6 +2039,8 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         // been printed above; pass an empty message so main() does not emit
         // a redundant "flpdf: ..." line.
         println!("PDF check succeeded");
+        // qpdf 11.9.0 ends the warning-bearing run with this stderr summary.
+        eprintln!("{}: operation succeeded with warnings", progname());
         return Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
             message: String::new(),
@@ -3934,6 +3936,24 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         allow_weak_crypto,
         password_is_hex_key,
     })
+}
+
+/// Program name used in qpdf-parity diagnostic prefixes.
+///
+/// `FLPDF_PROGNAME` overrides the default so the qpdf qtest harness shim can
+/// present flpdf as `qpdf`; unset, the prefix is always `flpdf`.
+fn progname() -> String {
+    std::env::var("FLPDF_PROGNAME").unwrap_or_else(|_| "flpdf".to_string())
+}
+
+/// Render the `<file>` / `<file> (offset N)` location part shared by the
+/// qpdf-shaped diagnostic lines (qpdf 11.9.0 observed format; qpdf
+/// suppresses the offset display when it is unknown).
+fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
+    match offset {
+        Some(offset) => format!("{} (offset {offset})", input.display()),
+        None => input.display().to_string(),
+    }
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
