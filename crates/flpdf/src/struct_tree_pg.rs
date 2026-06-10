@@ -106,9 +106,9 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
         // Usual form: /StructTreeRoot is an indirect dictionary. The root
         // itself carries no /Pg; only its /K kids are walked.
         Some(Object::Reference(root_ref)) => {
-            if !visited.insert(root_ref) {
-                return Ok(());
-            }
+            // Pre-mark the root so a malformed /K back-edge to the root object
+            // is not re-walked as if it were a structure element.
+            visited.insert(root_ref);
             let k = {
                 let root_obj = pdf.resolve_borrowed(root_ref)?;
                 let Some(root) = root_obj.as_dict() else {
@@ -180,26 +180,27 @@ fn walk_kids<R: Read + Seek>(
                 process_elem_dict(pdf, dict, surviving, depth, max_depth, visited)?;
             Ok((Object::Dictionary(dict), changed))
         }
-        Object::Array(mut items) => {
+        Object::Array(items) => {
             let mut changed = false;
-            for item in items.iter_mut() {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
                 match item {
                     Object::Reference(r) => {
-                        walk_kid_ref(pdf, *r, surviving, depth, max_depth, visited)?;
+                        walk_kid_ref(pdf, r, surviving, depth, max_depth, visited)?;
+                        new_items.push(Object::Reference(r));
                     }
                     Object::Dictionary(d) => {
-                        let owned = std::mem::take(d);
                         let (new_dict, dict_changed) =
-                            process_elem_dict(pdf, owned, surviving, depth, max_depth, visited)?;
-                        *d = new_dict;
+                            process_elem_dict(pdf, d, surviving, depth, max_depth, visited)?;
+                        new_items.push(Object::Dictionary(new_dict));
                         changed |= dict_changed;
                     }
                     // Integer kids are marked-content identifiers (MCIDs);
                     // anything else is malformed — both are left unchanged.
-                    _ => {}
+                    other => new_items.push(other),
                 }
             }
-            Ok((Object::Array(items), changed))
+            Ok((Object::Array(new_items), changed))
         }
         // An integer kid is an MCID; any other type is malformed. Unchanged.
         other => Ok((other, false)),
@@ -302,15 +303,14 @@ fn process_elem_dict<R: Read + Seek>(
 /// reference (`/Type /OBJR`) dictionary. `/Type` may itself be stored as an
 /// indirect reference, so it is resolved before matching.
 fn is_mcr_or_objr<R: Read + Seek>(pdf: &mut Pdf<R>, dict: &Dictionary) -> Result<bool> {
-    let name = match dict.get("Type") {
-        Some(Object::Reference(r)) => match pdf.resolve(*r)? {
-            Object::Name(n) => n,
-            _ => return Ok(false),
+    match dict.get("Type") {
+        Some(Object::Reference(r)) => match pdf.resolve_borrowed(*r)? {
+            Object::Name(n) => Ok(n == b"MCR" || n == b"OBJR"),
+            _ => Ok(false),
         },
-        Some(Object::Name(n)) => n.clone(),
-        _ => return Ok(false),
-    };
-    Ok(name == b"MCR" || name == b"OBJR")
+        Some(Object::Name(n)) => Ok(n == b"MCR" || n == b"OBJR"),
+        _ => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +538,112 @@ mod tests {
         assert!(
             elem.get("Pg").is_none(),
             "dangling /Pg dropped despite cycle"
+        );
+    }
+
+    #[test]
+    fn direct_struct_tree_root_on_catalog_written_back() {
+        // /StructTreeRoot held as a *direct* dictionary on the catalog: the
+        // dangling-/Pg drop in its direct kid must be persisted through the
+        // catalog object.
+        let mut objs = base_objs();
+        objs.insert(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot \
+             << /Type /StructTreeRoot /K << /Type /StructElem /S /P /Pg 4 0 R >> >> >>"
+                .into(),
+        );
+        objs.remove(&10);
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
+
+        let catalog = elem_dict(&mut pdf, 1);
+        let root = catalog
+            .get("StructTreeRoot")
+            .and_then(|r| r.as_dict())
+            .expect("direct root");
+        let kid = root.get("K").and_then(|k| k.as_dict()).expect("direct kid");
+        assert!(
+            kid.get("Pg").is_none(),
+            "dangling /Pg under a catalog-direct /StructTreeRoot must be dropped, got {:?}",
+            kid.get("Pg")
+        );
+    }
+
+    #[test]
+    fn non_dict_struct_tree_root_is_a_noop() {
+        let mut objs = base_objs();
+        objs.insert(10, "42".into());
+        let mut pdf = open(&objs);
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("noop");
+    }
+
+    #[test]
+    fn typeless_elem_processed_and_indirect_type_resolved() {
+        // Elem 21 has no /Type (legal for structure elements): it must still be
+        // processed and its dangling /Pg dropped. Elem 22's /Type is an
+        // *indirect reference* to /MCR: it must resolve and be skipped, leaving
+        // its /Pg untouched.
+        let mut objs = base_objs();
+        objs.insert(
+            20,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [21 0 R 22 0 R] >>".into(),
+        );
+        objs.insert(21, "<< /S /P /P 20 0 R /Pg 4 0 R >>".into());
+        objs.insert(22, "<< /Type 30 0 R /Pg 4 0 R /MCID 0 >>".into());
+        objs.insert(30, "/MCR".into());
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
+
+        let typeless = elem_dict(&mut pdf, 21);
+        assert!(
+            typeless.get("Pg").is_none(),
+            "typeless StructElem must still have its dangling /Pg dropped, got {:?}",
+            typeless.get("Pg")
+        );
+        let mcr = elem_dict(&mut pdf, 22);
+        assert!(
+            matches!(mcr.get("Pg"), Some(Object::Reference(r)) if r.number == 4),
+            "MCR (indirect /Type) /Pg is out of scope and must be untouched, got {:?}",
+            mcr.get("Pg")
+        );
+    }
+
+    #[test]
+    fn indirect_kid_array_with_direct_dict_kid_written_back() {
+        // /K is an indirect reference to an array holding a *direct* StructElem
+        // dict (plus non-kid noise entries): the drop must be persisted by
+        // rewriting the array object, and the noise must round-trip unchanged.
+        let mut objs = base_objs();
+        objs.insert(
+            20,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K 25 0 R >>".into(),
+        );
+        objs.insert(
+            25,
+            "[ << /Type /StructElem /S /P /Pg 4 0 R >> (noise) 26 0 R ]".into(),
+        );
+        objs.insert(26, "7".into()); // kid ref resolving to a non-dict, non-array
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
+
+        let arr = match pdf.resolve(ObjectRef::new(25, 0)).expect("array") {
+            Object::Array(items) => items,
+            other => panic!("object 25 is not an array: {other:?}"),
+        };
+        let kid = arr[0].as_dict().expect("direct kid");
+        assert!(
+            kid.get("Pg").is_none(),
+            "direct-dict kid in an indirect /K array must have /Pg dropped, got {:?}",
+            kid.get("Pg")
+        );
+        assert!(
+            matches!(&arr[1], Object::String(s) if s == b"noise"),
+            "non-kid array entry must round-trip unchanged, got {:?}",
+            arr[1]
         );
     }
 
