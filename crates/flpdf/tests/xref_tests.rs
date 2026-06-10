@@ -263,12 +263,12 @@ fn best_effort_recovers_from_corrupt_xref_data() {
 
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(loaded.version, "1.7");
-    assert_eq!(loaded.repair_diagnostics.entries().len(), 1);
+    assert_eq!(loaded.repair_diagnostics.entries().len(), 3);
     assert!(loaded
         .repair_diagnostics
         .entries()
         .iter()
-        .any(|entry| entry.message.contains("repaired by linear object scan")));
+        .any(|entry| entry.message == "Attempting to reconstruct cross-reference table"));
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
         Some(&XrefOffset::Offset(9))
@@ -679,35 +679,95 @@ fn best_effort_errors_when_trailer_not_dictionary() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
-/// When `startxref` is absent, repair pushes a "missing startxref" error and
-/// retries `parse_xref_from_start` at offset 0, which fails at the header and
-/// pushes a second error. `format_repair_diagnostic` then takes its multi-error
-/// (`_ =>`) arm, joining both clauses with "; " into a single diagnostic.
+/// When `startxref` is absent, repair pushes a "can't find startxref" error
+/// and retries `parse_xref_from_start` at offset 0, which fails at the header
+/// and pushes a second error. Only the first (triggering) error appears in the
+/// warning sequence: qpdf has no offset-0 retry, so the follow-up failure has
+/// no counterpart in qpdf's stderr for the same input.
 #[test]
-fn repair_diagnostic_aggregates_multiple_errors() {
+fn repair_diagnostics_report_only_the_triggering_error() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     // A recoverable object and a valid trailer so recovery itself succeeds.
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     // Note: NO `startxref` keyword at all.
     bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n%%EOF\n");
+    let file_len = bytes.len() as u64;
 
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
 
-    // A single Diagnostic carries the combined message.
-    assert_eq!(loaded.repair_diagnostics.entries().len(), 1);
-    let message = &loaded.repair_diagnostics.entries()[0].message;
-    assert!(
-        message.starts_with("xref parsing failed and was repaired by linear object scan: "),
-        "expected multi-error diagnostic prefix, got {message}"
+    let messages: Vec<&str> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "file is damaged",
+            "can't find startxref",
+            "Attempting to reconstruct cross-reference table",
+        ],
+        "expected the qpdf warning sequence with only the first error"
     );
-    assert!(
-        message.contains("; "),
-        "expected joined clauses, got {message}"
+
+    // The triggering error's warning carries the parse error's own offset
+    // (end of file for a missing startxref), not the startxref fallback of 0.
+    assert_eq!(
+        loaded.repair_diagnostics.entries()[1].offset,
+        Some(file_len),
+        "expected the trigger warning to carry the parse error offset"
     );
-    assert!(
-        message.contains("missing startxref"),
-        "expected first parse error, got {message}"
+
+    // Recovery still produced usable entries and a trailer.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(9))
     );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+/// When the triggering error is not `Error::Parse` (here: `Error::Missing`
+/// because the xref stream pointed to by `startxref` lacks the required `/W`
+/// entry), the trigger warning falls back to the error's `Display` form and
+/// the `startxref` offset, since a non-parse error carries no byte offset of
+/// its own.
+#[test]
+fn repair_reports_non_parse_trigger_error_via_display() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    // A recoverable object and a valid trailer so the linear scan succeeds.
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = bytes.len() as u64;
+    // An xref stream whose dictionary is missing the required /W entry.
+    bytes.extend_from_slice(
+        b"2 0 obj\n<< /Type /XRef /Size 3 /Root 1 0 R /Index [0 3] /Length 0 >>\nstream\n\nendstream\nendobj\n",
+    );
+    bytes.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    let messages: Vec<&str> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "file is damaged",
+            "missing required PDF entry: XRef stream /W",
+            "Attempting to reconstruct cross-reference table",
+        ],
+        "expected the qpdf warning sequence with the Display-formatted trigger"
+    );
+    assert_eq!(
+        loaded.repair_diagnostics.entries()[1].offset,
+        Some(xref_offset),
+        "expected the non-parse trigger warning to fall back to the startxref offset"
+    );
+
     // Recovery still produced usable entries and a trailer.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
@@ -717,15 +777,14 @@ fn repair_diagnostic_aggregates_multiple_errors() {
 }
 
 /// When `startxref` is absent but the FIRST indirect object in the file is
-/// itself a valid xref stream with no `/Prev`, repair pushes a single "missing
-/// startxref" error and resets the retry offset to 0. `parse_xref_from_start`
+/// itself a valid xref stream with no `/Prev`, repair pushes a single "can't
+/// find startxref" error and resets the retry offset to 0. `parse_xref_from_start`
 /// then skips the `%PDF-` header comment and parses that xref stream
-/// successfully, so `merge_previous_xref_sections` is a no-op and the
-/// accumulated-error warning arm runs (the "succeeded but with parse errors"
-/// path), emitting exactly one diagnostic via `format_repair_diagnostic`'s
-/// single-error (`1 =>`) form. This is distinct from the linear-scan recovery
-/// path: the stream parse keeps `XrefForm::Stream`, whereas a linear scan would
-/// force `XrefForm::Table`.
+/// successfully, so the accumulated-error warning arm runs. The emitted
+/// diagnostics are the same three-warning sequence qpdf produces for this
+/// input (qpdf does not distinguish recovery methods), and in particular must
+/// NOT claim a linear object scan ran: the stream parse keeps
+/// `XrefForm::Stream`, whereas a linear scan would force `XrefForm::Table`.
 #[test]
 fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -750,16 +809,25 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
     // The xref STREAM parse succeeded (not a linear scan, which sets Table).
     assert_eq!(loaded.last_xref_form, XrefForm::Stream);
 
-    // Exactly one diagnostic, built from the single "missing startxref" error.
-    assert_eq!(loaded.repair_diagnostics.entries().len(), 1);
-    let message = &loaded.repair_diagnostics.entries()[0].message;
-    assert!(
-        message.contains("missing startxref"),
-        "expected the missing-startxref clause, got {message}"
+    // The qpdf-compatible warning sequence, one diagnostic per line.
+    let messages: Vec<&str> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "file is damaged",
+            "can't find startxref",
+            "Attempting to reconstruct cross-reference table",
+        ],
+        "expected the qpdf warning sequence"
     );
     assert!(
-        message.contains("repaired by linear object scan"),
-        "expected the repair clause, got {message}"
+        !messages.iter().any(|m| m.contains("linear object scan")),
+        "must not claim a linear scan ran: {messages:?}"
     );
 
     // The stream's own entries are present (e.g. object 1 at its offset).
@@ -841,7 +909,8 @@ fn merge_failure_falls_back_to_linear_scan() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
     assert!(format!("{err}").contains("expected integer"), "got {err}");
 
-    // Best-effort records the error and recovers via the linear object scan.
+    // Best-effort records the error and recovers via the linear object scan,
+    // emitting the qpdf-compatible warning sequence.
     let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true).unwrap();
     assert!(
         !loaded.repair_diagnostics.entries().is_empty(),
@@ -852,8 +921,8 @@ fn merge_failure_falls_back_to_linear_scan() {
             .repair_diagnostics
             .entries()
             .iter()
-            .any(|entry| entry.message.contains("repaired by linear object scan")),
-        "expected the linear-scan repair diagnostic"
+            .any(|entry| entry.message == "Attempting to reconstruct cross-reference table"),
+        "expected the qpdf reconstruction warning"
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
@@ -1412,10 +1481,11 @@ fn rejects_xref_table_missing_object_count() {
 //   (see `rejects_xref_stream_truncated_data`), and `read_be_u64`'s guard is
 //   never the one that fires through `load_xref_and_trailer`.
 //
-// * The empty-`parse_errors` (`0 =>`) arm of `format_repair_diagnostic`: every
-//   call site passes a non-empty `parse_errors`. Each call is either preceded by
-//   a push onto `parse_errors`, or guarded by `!parse_errors.is_empty()`, so the
-//   slice is never empty at a call site.
+// * The empty-`parse_errors` (`first()` returning `None`) arm of
+//   `push_repair_diagnostics`: every call site passes a non-empty
+//   `parse_errors`. Each call is either preceded by a push onto `parse_errors`,
+//   or guarded by `!parse_errors.is_empty()`, so the slice is never empty at a
+//   call site.
 //
 // * The `startxref` `usize::try_from` overflow arm of
 //   `load_xref_and_trailer_with_repair` (both the repair and strict variants) is

@@ -95,8 +95,10 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     let mut loaded = match parse_xref_from_start(&bytes, xref_pos, startxref, &version) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
-            parse_errors.push(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, parse_errors);
+            // Report the first recorded failure; this parse error is only the
+            // trigger when the startxref stage itself succeeded.
+            let trigger = parse_errors.into_iter().next().unwrap_or(error);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
         }
         Err(error) => return Err(error),
     };
@@ -109,17 +111,14 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
         allow_repair,
     ) {
         if allow_repair {
-            parse_errors.push(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, parse_errors);
+            let trigger = parse_errors.into_iter().next().unwrap_or(error);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
         }
         return Err(error);
     }
 
-    if !parse_errors.is_empty() {
-        loaded.repair_diagnostics.push(Diagnostic::warning(
-            format_repair_diagnostic(parse_errors),
-            Some(startxref),
-        ));
+    if let Some(error) = parse_errors.into_iter().next() {
+        push_repair_diagnostics(&mut loaded.repair_diagnostics, &error, startxref);
     }
 
     Ok(loaded)
@@ -200,16 +199,13 @@ fn recover_xref_from_linear_scan(
     bytes: &[u8],
     version: String,
     startxref: u64,
-    parse_errors: Vec<Error>,
+    trigger_error: Error,
 ) -> Result<LoadedXref> {
     let entries = recover_xref_entries(bytes)?;
     let trailer = recover_trailer(bytes)?;
 
     let mut repair_diagnostics = Diagnostics::default();
-    repair_diagnostics.push(Diagnostic::warning(
-        format_repair_diagnostic(parse_errors),
-        Some(startxref),
-    ));
+    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
 
     Ok(LoadedXref {
         version,
@@ -329,25 +325,29 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
     Ok(value as u64)
 }
 
-fn format_repair_diagnostic(parse_errors: Vec<Error>) -> String {
-    match parse_errors.len() {
-        0 => String::from("xref parsing failed and was repaired by linear object scan"),
-        1 => format!(
-            "xref parsing failed ({}) and was repaired by linear object scan",
-            parse_errors[0]
-        ),
-        _ => {
-            let mut message =
-                String::from("xref parsing failed and was repaired by linear object scan: ");
-            for (index, error) in parse_errors.iter().enumerate() {
-                if index > 0 {
-                    message.push_str("; ");
-                }
-                message.push_str(&error.to_string());
-            }
-            message
-        }
-    }
+/// Push the qpdf-compatible repair warning sequence onto `diagnostics`.
+///
+/// qpdf (`reconstruct_xref` in `QPDF_objects.cc`, observed with qpdf 11.9.0)
+/// emits the same three warnings regardless of how the damaged
+/// cross-reference data is ultimately recovered: `file is damaged`, the error
+/// that triggered recovery, and `Attempting to reconstruct cross-reference
+/// table`. `trigger_error` is the first failure that initiated recovery;
+/// subsequent failures from the retry-at-offset-0 detour are not reported
+/// because qpdf has no such detour and they have no counterpart on its
+/// stderr. The triggering error's warning carries that error's own byte
+/// offset when available; the surrounding warnings carry the `startxref`
+/// offset.
+fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
+    diagnostics.push(Diagnostic::warning("file is damaged", Some(startxref)));
+    let (message, offset) = match trigger_error {
+        Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
+        other => (other.to_string(), Some(startxref)),
+    };
+    diagnostics.push(Diagnostic::warning(message, offset));
+    diagnostics.push(Diagnostic::warning(
+        "Attempting to reconstruct cross-reference table",
+        Some(startxref),
+    ));
 }
 
 fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
@@ -669,7 +669,7 @@ fn parse_startxref(bytes: &[u8]) -> Result<u64> {
         .windows(marker.len())
         .rposition(|window| window == marker)
     else {
-        return Err(Error::parse(bytes.len(), "missing startxref"));
+        return Err(Error::parse(bytes.len(), "can't find startxref"));
     };
 
     let mut cursor = ByteCursor::new(bytes, pos + marker.len());

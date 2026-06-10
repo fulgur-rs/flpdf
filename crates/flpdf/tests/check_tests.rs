@@ -138,7 +138,7 @@ fn check_reports_repaired_xref_warning() {
         .entries()
         .iter()
         .any(|entry| entry.severity == Severity::Warning
-            && entry.message.contains("repaired by linear object scan")));
+            && entry.message == "Attempting to reconstruct cross-reference table"));
 }
 
 fn corrupt_xref_pdf() -> Vec<u8> {
