@@ -251,10 +251,10 @@ mod tests {
     }
 
     fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> crate::Dictionary {
-        match pdf.resolve(ObjectRef::new(num, 0)).expect("resolve bead") {
-            Object::Dictionary(d) => d,
-            other => panic!("object {num} is not a dictionary: {other:?}"),
-        }
+        pdf.resolve(ObjectRef::new(num, 0))
+            .expect("resolve bead")
+            .into_dict()
+            .expect("bead object is a dictionary")
     }
 
     #[test]
@@ -265,37 +265,37 @@ mod tests {
         drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("bead /P drop");
 
         let bead12 = bead_dict(&mut pdf, 12);
+        let p12 = bead12.get("P");
         assert!(
-            bead12.get("P").is_none(),
-            "bead 12 /P (removed page) must be dropped, got {:?}",
-            bead12.get("P")
+            p12.is_none(),
+            "bead 12 /P (removed page) must be dropped, got {p12:?}"
         );
         // Ring links, thread back-pointer, and rectangle are retained.
+        let n12 = bead12.get("N");
         assert!(
-            matches!(bead12.get("N"), Some(Object::Reference(r)) if r.number == 13),
-            "bead 12 /N must be kept, got {:?}",
-            bead12.get("N")
+            matches!(n12, Some(Object::Reference(r)) if r.number == 13),
+            "bead 12 /N must be kept, got {n12:?}"
         );
+        let v12 = bead12.get("V");
         assert!(
-            matches!(bead12.get("V"), Some(Object::Reference(r)) if r.number == 11),
-            "bead 12 /V must be kept, got {:?}",
-            bead12.get("V")
+            matches!(v12, Some(Object::Reference(r)) if r.number == 11),
+            "bead 12 /V must be kept, got {v12:?}"
         );
         assert!(bead12.get("T").is_some(), "bead 12 /T must be kept");
         assert!(bead12.get("R").is_some(), "bead 12 /R must be kept");
 
         // Beads on surviving pages keep their /P.
         let bead11 = bead_dict(&mut pdf, 11);
+        let p11 = bead11.get("P");
         assert!(
-            matches!(bead11.get("P"), Some(Object::Reference(r)) if r.number == 3),
-            "bead 11 /P (surviving page 3) must be kept, got {:?}",
-            bead11.get("P")
+            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            "bead 11 /P (surviving page 3) must be kept, got {p11:?}"
         );
         let bead13 = bead_dict(&mut pdf, 13);
+        let p13 = bead13.get("P");
         assert!(
-            matches!(bead13.get("P"), Some(Object::Reference(r)) if r.number == 5),
-            "bead 13 /P (surviving page 5) must be kept, got {:?}",
-            bead13.get("P")
+            matches!(p13, Some(Object::Reference(r)) if r.number == 5),
+            "bead 13 /P (surviving page 5) must be kept, got {p13:?}"
         );
     }
 
@@ -315,17 +315,17 @@ mod tests {
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("bead /P remap");
 
         let bead11 = bead_dict(&mut pdf, 11);
+        let p11 = bead11.get("P");
         assert!(
-            matches!(bead11.get("P"), Some(Object::Reference(r)) if r.number == 7),
-            "bead 11 /P (surviving page under new ref) must be remapped, got {:?}",
-            bead11.get("P")
+            matches!(p11, Some(Object::Reference(r)) if r.number == 7),
+            "bead 11 /P (surviving page under new ref) must be remapped, got {p11:?}"
         );
         // The surviving page under its original ref is left unchanged.
         let bead13 = bead_dict(&mut pdf, 13);
+        let p13 = bead13.get("P");
         assert!(
-            matches!(bead13.get("P"), Some(Object::Reference(r)) if r.number == 5),
-            "bead 13 /P (surviving page, identity) must be kept, got {:?}",
-            bead13.get("P")
+            matches!(p13, Some(Object::Reference(r)) if r.number == 5),
+            "bead 13 /P (surviving page, identity) must be kept, got {p13:?}"
         );
     }
 
@@ -361,10 +361,10 @@ mod tests {
 
         for num in [11, 12, 13] {
             let bead = bead_dict(&mut pdf, num);
+            let p = bead.get("P");
             assert!(
-                bead.get("P").is_none(),
-                "bead {num} /P must be dropped (all dangling), got {:?}",
-                bead.get("P")
+                p.is_none(),
+                "bead {num} /P must be dropped (all dangling), got {p:?}"
             );
             // Ring links survive so the thread stays traversable.
             assert!(bead.get("N").is_some(), "bead {num} /N must be kept");
@@ -372,10 +372,10 @@ mod tests {
         }
         // The thread itself is retained with its /F first-bead pointer.
         let thread = bead_dict(&mut pdf, 10);
+        let f = thread.get("F");
         assert!(
-            matches!(thread.get("F"), Some(Object::Reference(r)) if r.number == 11),
-            "thread /F must be kept, got {:?}",
-            thread.get("F")
+            matches!(f, Some(Object::Reference(r)) if r.number == 11),
+            "thread /F must be kept, got {f:?}"
         );
     }
 
@@ -408,10 +408,10 @@ mod tests {
         drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("indirect /Threads");
 
         let bead12 = bead_dict(&mut pdf, 12);
+        let p12 = bead12.get("P");
         assert!(
-            bead12.get("P").is_none(),
-            "bead reached through an indirect /Threads array must have /P dropped, got {:?}",
-            bead12.get("P")
+            p12.is_none(),
+            "bead reached through an indirect /Threads array must have /P dropped, got {p12:?}"
         );
     }
 
@@ -479,10 +479,10 @@ mod tests {
         drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("malformed /P");
 
         let bead12 = bead_dict(&mut pdf, 12);
+        let p12 = bead12.get("P");
         assert!(
-            matches!(bead12.get("P"), Some(Object::Integer(999))),
-            "a non-reference /P must be left unchanged, got {:?}",
-            bead12.get("P")
+            matches!(p12, Some(Object::Integer(999))),
+            "a non-reference /P must be left unchanged, got {p12:?}"
         );
     }
 
@@ -508,5 +508,38 @@ mod tests {
             bead_dict(&mut pdf, 12).get("P").is_none(),
             "bead 12 dangling /P must be dropped despite a non-dict ring neighbour"
         );
+    }
+
+    #[test]
+    fn non_dict_catalog_is_a_noop() {
+        // /Root resolves to a non-dictionary object: the walk bails out cleanly
+        // before reaching any thread.
+        let mut objs = base_objs();
+        objs.insert(1, "42".into());
+        let mut pdf = open(&objs);
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("non-dict catalog noop");
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_some(),
+            "a non-dictionary catalog must leave beads untouched"
+        );
+    }
+
+    #[test]
+    fn no_root_in_trailer_is_a_noop() {
+        // A trailer without /Root: root_ref() is None, so the walk bails out.
+        let mut raw: Vec<u8> = b"%PDF-1.5\n".to_vec();
+        let off1 = raw.len();
+        raw.extend_from_slice(b"1 0 obj\n<< /Type /Bead /P 3 0 R >>\nendobj\n");
+        let xref_pos = raw.len();
+        raw.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \n\
+                 trailer\n<< /Size 2 >>\nstartxref\n{xref_pos}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("open no-root fixture");
+        assert!(pdf.root_ref().is_none(), "fixture must have no /Root");
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("no-root noop");
     }
 }
