@@ -17,6 +17,29 @@ Before writing or reviewing code, consult the review patterns in
 rustdoc 必須要素、intra-doc リンク／doctest の健全性、公開 doc の英語統一を
 5カテゴリで予防ルール化したもの。
 
+## Test Coverage（PR 作成前ゲート）
+
+PR を作成する**前**（beads「Session Completion」の品質ゲート手順の一部）に、
+**変更行のテストカバレッジ**を確認すること。
+
+1. 実行: `scripts/patch-coverage.sh [--base <親ブランチ>]`
+   （スタック PR では親ブランチを `--base` に渡す。直前に
+   `cargo llvm-cov --workspace --lcov --output-path <path>` を回した場合は
+   `--lcov <path>` で再利用すると、重い再ビルドを省ける。）
+2. **`flpdf`**: 変更行は 100% カバーが必須。スクリプトがゲートし、未カバー
+   変更行があれば `exit≠0`。未カバー行はテストを追加するか、真にテスト不能な
+   行のみ `// cov:ignore: <理由>`（行）または `// cov:ignore-start` …
+   `// cov:ignore-end`（ブロック）で除外し、除外理由を PR 説明に 1 行記す。
+3. **`flpdf-cli`**: 未カバー変更行は報告のみ（ブロックしない）。可能な範囲で
+   テストを追加する努力目標。
+4. **質的チェック（数値の後）**: 行カバレッジ 100% は「行が実行された」ことしか
+   保証しない。新規/変更した公開挙動の **エラーアーム・境界値・空/極端入力** に
+   対応するテストが実在するか（assertion が実質的か）を確認してから
+   `gh pr create` する。
+
+設計の根拠は
+[`docs/plans/2026-06-10-patch-coverage-gate-design.md`](docs/plans/2026-06-10-patch-coverage-gate-design.md)。
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
