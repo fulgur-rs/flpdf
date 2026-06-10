@@ -9,9 +9,9 @@
 # Coverage is measured over the WHOLE workspace (flpdf-cli tests drive flpdf,
 # so a crate-scoped run would under-count flpdf); only the diff/gate is scoped.
 #
-# Genuinely untestable lines can be excluded with markers that carry a reason:
-#     let _ = unreachable_defensive_arm(); // cov:ignore: defensive, see ISO ...
-#     // cov:ignore-start  (reason)
+# Genuinely untestable lines can be excluded with a `//` comment + a reason.
+#     if n < 0 { return 0; } // cov:ignore: unreachable defensive arm
+#     // cov:ignore-start: <reason>
 #     ...block...
 #     // cov:ignore-end
 #
@@ -134,11 +134,44 @@ with open(diff_path, encoding="utf-8", errors="replace") as fh:
                 new_ln += 1  # context (only with -U>0); keep cursor honest
             # other lines (e.g. "\ No newline at end of file") do not advance
 
-# 3. // cov:ignore markers (line + start/end block) read from source.
-#    Returns (excluded_line_set, marker_errors).  An unterminated block — or a
-#    stray -end — is an error, not a silent exclusion: leaving in_block true to
-#    EOF would drop every later changed line and let the gate pass over untested
-#    code.
+# 3. // cov:ignore markers, read strictly from source.
+#    A marker must be a real `//` line comment whose text is exactly
+#    `cov:ignore: <reason>`, `cov:ignore-start: <reason>`, or `cov:ignore-end`.
+#    Substring matching would let a string literal ("cov:ignore") or a
+#    reason-less marker silently drop changed lines and bypass the 100% gate,
+#    so anything that mentions the token but is not a well-formed marker is a
+#    marker error (fails the run), never a silent exclusion. Likewise an
+#    unterminated block, a stray -end, or a nested -start are errors.
+_MARKER_RE = re.compile(r"\s*cov:ignore(-start|-end)?\b\s*(:?)\s*(.*?)\s*$")
+
+def _comment_text(src):
+    """Return the text after the first real `//` line comment, or None.
+
+    Tracks double-quoted strings (with backslash escapes) so a `//` inside a
+    string literal — a URL, or a literal "// ..." — is not read as a comment.
+    Single quotes are left untracked so Rust lifetimes (`'a`) don't confuse it;
+    a char literal containing a quote is not handled (put the marker on its own
+    line in that rare case).
+    """
+    in_str = False
+    esc = False
+    i = 0
+    while i < len(src):
+        ch = src[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "/" and src[i + 1:i + 2] == "/":
+            return src[i + 2:]
+        i += 1
+    return None
+
 def excluded_lines(relpath):
     excl = set()
     errors = []
@@ -149,18 +182,35 @@ def excluded_lines(relpath):
     start_line = None
     with open(full, encoding="utf-8", errors="replace") as fh:
         for i, src in enumerate(fh, start=1):
-            if "cov:ignore-start" in src:
-                if in_block:
-                    errors.append((i, "nested cov:ignore-start"))
-                in_block = True
-                start_line = i
-                excl.add(i)
-            elif "cov:ignore-end" in src:
-                if not in_block:
-                    errors.append((i, "cov:ignore-end without matching start"))
-                in_block = False
-                excl.add(i)
-            elif in_block or "cov:ignore" in src:
+            has_token = "cov:ignore" in src
+            comment = _comment_text(src) if has_token else None
+            m = _MARKER_RE.match(comment) if comment is not None else None
+            if m:
+                kind, colon, rest = m.group(1), m.group(2), m.group(3).strip()
+                if kind == "-start":
+                    if not rest:
+                        errors.append((i, "cov:ignore-start requires a reason"))
+                    else:
+                        if in_block:
+                            errors.append((i, "nested cov:ignore-start"))
+                        in_block = True
+                        start_line = i
+                        excl.add(i)
+                elif kind == "-end":
+                    if rest:
+                        errors.append((i, "cov:ignore-end takes no text"))
+                    elif not in_block:
+                        errors.append((i, "cov:ignore-end without matching start"))
+                    else:
+                        in_block = False
+                        excl.add(i)
+                elif colon and rest:
+                    excl.add(i)
+                else:
+                    errors.append((i, "cov:ignore requires ': <reason>'"))
+            elif has_token:
+                errors.append((i, "cov:ignore must be a `// cov:ignore[-start|-end]` comment"))
+            elif in_block:
                 excl.add(i)
     if in_block:
         errors.append((start_line, "cov:ignore-start without matching end"))
