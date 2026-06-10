@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: RED — hazard reproduction test (shared action object, non-identity remap)
+## Task 1: RED — hazard reproduction test (shared action object, non-identity remap)
 
 **Files:**
 - Test: `crates/flpdf/src/outline_dest_remap.rs` (`mod tests`)
@@ -28,7 +28,7 @@ Expected: FAIL — Step 3 remaps obj50 `/D` to `[99 0 R]`, then Step 4 re-resolv
 
 ---
 
-### Task 2: GREEN — `Surviving` struct + values guard
+## Task 2: GREEN — `Surviving` struct + values guard
 
 **Files:**
 - Modify: `crates/flpdf/src/outline_dest_remap.rs`
@@ -48,7 +48,7 @@ Expected: Task 1 test now PASS; the existing 38 tests still PASS (fix the 4 inte
 
 ---
 
-### Task 3: GREEN — over-skip regression guard
+## Task 3: GREEN — over-skip regression guard
 
 **Files:**
 - Test: `crates/flpdf/src/outline_dest_remap.rs` (`mod tests`)
@@ -63,17 +63,19 @@ A destination targeting a genuinely removed page (`[7 0 R]`, where `7` is neithe
 
 ---
 
-### Task 4: Doc + lint + coverage gate
+## Task 4: Doc + lint + coverage gate
 
 **Files:**
 - Modify: `crates/flpdf/src/outline_dest_remap.rs` (module doc + `remap_annot_dests` doc)
 
 **Step 1:** Update public doc comments to state the invariant in present tense, English only, no beads IDs / internal-progress jargon: e.g. *"A destination already pointing at a surviving page's remapped new ref is left verbatim and never nulled."*
 
-**Step 2:** `cargo fmt`; `cargo clippy -p flpdf --all-targets`.
+**Step 2:** `cargo fmt`.
 
 **Step 3:** `cargo test -p flpdf --lib outline_dest_remap` (and full `cargo test -p flpdf --lib`).
 
-**Step 4:** Commit, then run `scripts/patch-coverage.sh --base main` (flpdf changed lines must be 100%). Qualitative arm: both predicate sides tested (Task 1 surviving-value side, Task 3 removed side).
+**Step 4:** `cargo clippy -p flpdf --all-targets`.
 
-**Step 5:** Commit any coverage follow-ups.
+**Step 5:** Commit, then run `scripts/patch-coverage.sh --base main` (flpdf changed lines must be 100%). Qualitative arm: both predicate sides tested (Task 1 surviving-value side, Task 3 removed side).
+
+**Step 6:** Commit any coverage follow-ups.
