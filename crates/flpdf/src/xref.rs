@@ -330,7 +330,7 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 /// cross-reference data is ultimately recovered: `file is damaged`, the error
 /// that triggered recovery, and `Attempting to reconstruct cross-reference
 /// table`. Only the first accumulated error is reported: qpdf has no retry-at-
-/// offset-0 detour, so follow-up failures from that path have no qpdf
+/// offset-0 detour, so subsequent failures from that path have no qpdf
 /// counterpart on stderr.
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, parse_errors: &[Error], startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", Some(startxref)));
