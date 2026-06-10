@@ -296,9 +296,11 @@ fn process_elem_dict<R: Read + Seek>(
         }
     }
 
-    // MCR/OBJR dictionaries have no struct-tree /K kids to recurse into; only
-    // their /Pg (handled above) is in scope.
-    if !is_mcr_or_objr(pdf, &dict)? {
+    // Recurse only into a real structure element's /K kids. The cheap /K
+    // presence check gates the (potentially I/O-bound) MCR/OBJR classification:
+    // a /K-less dictionary — which every MCR/OBJR is — has nothing to walk, so
+    // there is no need to resolve its /Type to find out.
+    if dict.get("K").is_some() && !is_mcr_or_objr(pdf, &dict)? {
         if let Some(k) = dict.remove("K") {
             let (new_k, k_changed) = walk_kids(pdf, k, surviving, depth + 1, max_depth, visited)?;
             dict.insert("K", new_k);
