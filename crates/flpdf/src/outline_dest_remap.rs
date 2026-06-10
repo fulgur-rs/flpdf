@@ -34,9 +34,10 @@
 //! `/OpenAction`: qpdf keeps the destination reference verbatim and replaces the
 //! target page object with `null`. An annotation is structurally identical to an
 //! outline item for destination purposes, so the same remap/null logic is reused.
-//! (A removed page reached only through a thread bead's `/P` or a structure
-//! element's `/Pg` belongs to a different, drop-and-garbage-collect family and is
-//! not handled here.)
+//! (A removed page reached only through a structure element's `/Pg` belongs to a
+//! different, drop-and-garbage-collect family handled by
+//! [`crate::struct_tree_pg`]; a thread bead's `/P` is in the same drop family
+//! and is not handled here.)
 //!
 //! # String-form `/Dest`
 //!
@@ -206,7 +207,8 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // annotation (/Dest or /A /GoTo /D) or the catalog /OpenAction, keeping the
     // destination reference verbatim — the same null-out family as outlines and
     // named destinations. (A removed page reached only via a thread-bead /P or a
-    // struct element /Pg is a different, drop-and-GC family handled separately.)
+    // struct element /Pg is a different, drop-and-GC family; struct elem /Pg is
+    // handled by crate::struct_tree_pg, after this pass in the pipeline.)
     remap_annot_dests(pdf, result, &surviving)?;
     remap_open_action_dest(pdf, catalog_ref, &surviving)?;
 

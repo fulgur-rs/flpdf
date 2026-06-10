@@ -90,6 +90,7 @@ pub mod rotate_spec;
 pub(crate) mod run_length;
 pub mod signatures;
 pub mod standard_font_metrics;
+pub mod struct_tree_pg;
 pub mod subset_prune;
 pub mod writer;
 pub mod xref;
@@ -169,6 +170,10 @@ pub use signatures::{
     DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 pub use standard_font_metrics::StandardFont;
+pub use struct_tree_pg::{
+    drop_struct_elem_dangling_pg, drop_struct_elem_dangling_pg_with_max_depth,
+    DEFAULT_MAX_STRUCT_TREE_DEPTH,
+};
 pub use subset_prune::prune_after_subset;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
