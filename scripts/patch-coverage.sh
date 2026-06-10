@@ -16,24 +16,30 @@
 #     // cov:ignore-end
 #
 # Usage:
-#   scripts/patch-coverage.sh [--base <ref>] [--lcov <path>]
+#   scripts/patch-coverage.sh [--base <ref>] [--lcov <path>] [--allow-dirty]
 #
 #   --base <ref>   Compare against this ref's merge-base (default: origin/main).
 #                  Stacked PRs pass the parent branch.
 #   --lcov <path>  Reuse an existing lcov report instead of running coverage
 #                  (skips the slow instrumented rebuild). Without it, the script
-#                  runs `cargo llvm-cov --workspace --lcov`.
+#                  runs `cargo llvm-cov --workspace --lcov`. The report MUST come
+#                  from the current commit; a stale report can mismeasure.
+#   --allow-dirty  Proceed on a dirty working tree (default: error). Coverage
+#                  measures the tree but the gate diffs HEAD, so a dirty tree can
+#                  produce a false pass — only override when you know it aligns.
 set -euo pipefail
 
 BASE="origin/main"
 LCOV=""
+ALLOW_DIRTY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base)  BASE="${2:?--base needs a ref}"; shift 2 ;;
-    --lcov)  LCOV="${2:?--lcov needs a path}"; shift 2 ;;
+    --base)         BASE="${2:?--base needs a ref}"; shift 2 ;;
+    --lcov)         LCOV="${2:?--lcov needs a path}"; shift 2 ;;
+    --allow-dirty)  ALLOW_DIRTY=1; shift ;;
     -h|--help)
-      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "patch-coverage: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -48,6 +54,25 @@ if ! MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
   exit 2
 fi
 
+# Coverage instruments the working tree, but the gate diffs HEAD vs the merge
+# base. On a dirty tree the two disagree (uncommitted lines measured but not
+# gated; uncommitted cov:ignore markers affecting committed lines), which could
+# print a false "OK". Fail before the expensive coverage run unless the caller
+# opts out. Diffing HEAD (not the tree) is deliberate: a working-tree diff would
+# instead silently drop untracked new files from the gate.
+if ! git diff --quiet HEAD -- 2>/dev/null \
+   || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  if [[ "$ALLOW_DIRTY" == 1 ]]; then
+    echo "[patch-coverage] warning: dirty working tree (--allow-dirty); coverage measures" >&2
+    echo "                 the tree but the gate diffs HEAD — results may misalign." >&2
+  else
+    echo "patch-coverage: working tree has uncommitted or untracked changes." >&2
+    echo "  The gate diffs HEAD vs '$BASE' while coverage measures the tree, so a dirty" >&2
+    echo "  tree can produce a false pass. Commit your work first, or pass --allow-dirty." >&2
+    exit 2
+  fi
+fi
+
 if [[ -z "$LCOV" ]]; then
   # Fresh, whole-workspace measurement: a gated file absent from the report is
   # genuinely non-executable. A user-supplied --lcov may be stale, so that case
@@ -58,6 +83,11 @@ if [[ -z "$LCOV" ]]; then
   cargo llvm-cov --workspace --lcov --output-path "$LCOV" >&2
 else
   LCOV_MODE="reused"
+  # Line-level staleness of an arbitrary report cannot be detected from lcov
+  # alone (it carries no commit/line provenance); the authoritative gate is the
+  # fresh default run. Surface the assumption rather than trust it silently.
+  echo "[patch-coverage] note: reusing '$LCOV' as-is; a report not generated from the" >&2
+  echo "                 current commit can mismeasure. The default (no --lcov) is authoritative." >&2
 fi
 
 if [[ ! -f "$LCOV" ]]; then
@@ -65,20 +95,16 @@ if [[ ! -f "$LCOV" ]]; then
   exit 2
 fi
 
-# Coverage instruments the working tree, but the diff is HEAD vs merge-base —
-# so the gate must run on a committed tree to stay aligned (see CLAUDE.md).
-# Diffing HEAD (not the working tree) is deliberate: a working-tree diff would
-# silently drop untracked new files from the gate. Warn instead when dirty.
-if ! git diff --quiet HEAD -- 2>/dev/null \
-   || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-  echo "[patch-coverage] warning: working tree has uncommitted or untracked changes." >&2
-  echo "                 The gate compares HEAD against '$BASE'; commit your work first" >&2
-  echo "                 so coverage and the diff line up." >&2
-fi
-
 DIFF_FILE="$(mktemp)"
 trap 'rm -f "$DIFF_FILE"' EXIT
-git diff --unified=0 "$MERGE_BASE" HEAD > "$DIFF_FILE"
+# Harden the diff against user git config: -c diff.external= and --no-ext-diff
+# disable an external differ (non-patch output); explicit --src-prefix/--dst-prefix
+# force the a/ b/ prefixes the parser expects, overriding diff.mnemonicPrefix
+# (w/ i/ c/ ...) and diff.noprefix; --no-color avoids color.diff=always.
+git -c diff.external= -c diff.noprefix=false -c diff.mnemonicPrefix=false \
+  diff --no-ext-diff --no-color --unified=0 \
+  --src-prefix=a/ --dst-prefix=b/ \
+  "$MERGE_BASE" HEAD > "$DIFF_FILE"
 
 python3 - "$LCOV" "$DIFF_FILE" "$REPO_ROOT" "$LCOV_MODE" <<'PYEOF'
 import os
