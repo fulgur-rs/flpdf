@@ -59,6 +59,17 @@ if [[ ! -f "$LCOV" ]]; then
   exit 2
 fi
 
+# Coverage instruments the working tree, but the diff is HEAD vs merge-base —
+# so the gate must run on a committed tree to stay aligned (see CLAUDE.md).
+# Diffing HEAD (not the working tree) is deliberate: a working-tree diff would
+# silently drop untracked new files from the gate. Warn instead when dirty.
+if ! git diff --quiet HEAD -- 2>/dev/null \
+   || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  echo "[patch-coverage] warning: working tree has uncommitted or untracked changes." >&2
+  echo "                 The gate compares HEAD against '$BASE'; commit your work first" >&2
+  echo "                 so coverage and the diff line up." >&2
+fi
+
 DIFF_FILE="$(mktemp)"
 trap 'rm -f "$DIFF_FILE"' EXIT
 git diff --unified=0 "$MERGE_BASE" HEAD > "$DIFF_FILE"
@@ -78,7 +89,7 @@ REPORT_PREFIX = "crates/flpdf-cli/src/"  # report-only
 #    not counted as uncovered.
 cov = {}
 cur = None
-with open(lcov_path, errors="replace") as fh:
+with open(lcov_path, encoding="utf-8", errors="replace") as fh:
     for line in fh:
         if line.startswith("SF:"):
             cur = os.path.relpath(line[3:].strip(), repo_root)
@@ -94,16 +105,22 @@ added = {}
 cur = None
 new_ln = None
 hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-with open(diff_path, errors="replace") as fh:
+with open(diff_path, encoding="utf-8", errors="replace") as fh:
     for line in fh:
-        if line.startswith("+++ "):
+        if line.startswith("diff --git "):
+            # New file block: reset so a later "+++ " is read as the header.
+            cur = None
+            new_ln = None
+        elif line.startswith("+++ ") and new_ln is None:
+            # Only a header before any hunk; inside a hunk new_ln is set, so an
+            # added line whose content starts with "++ " (diff: "+++ ...") falls
+            # through to the added-line branch below instead of being misread.
             path = line[4:].strip()
             if path == "/dev/null":
                 cur = None
             else:
                 cur = path[2:] if path[:2] in ("a/", "b/") else path
                 added.setdefault(cur, set())
-            new_ln = None
         elif line.startswith("@@"):
             m = hunk_re.match(line)
             new_ln = int(m.group(1)) if m else None
@@ -118,26 +135,40 @@ with open(diff_path, errors="replace") as fh:
             # other lines (e.g. "\ No newline at end of file") do not advance
 
 # 3. // cov:ignore markers (line + start/end block) read from source.
+#    Returns (excluded_line_set, marker_errors).  An unterminated block — or a
+#    stray -end — is an error, not a silent exclusion: leaving in_block true to
+#    EOF would drop every later changed line and let the gate pass over untested
+#    code.
 def excluded_lines(relpath):
     excl = set()
+    errors = []
     full = os.path.join(repo_root, relpath)
     if not os.path.isfile(full):
-        return excl
+        return excl, errors
     in_block = False
-    with open(full, errors="replace") as fh:
+    start_line = None
+    with open(full, encoding="utf-8", errors="replace") as fh:
         for i, src in enumerate(fh, start=1):
             if "cov:ignore-start" in src:
+                if in_block:
+                    errors.append((i, "nested cov:ignore-start"))
                 in_block = True
+                start_line = i
                 excl.add(i)
             elif "cov:ignore-end" in src:
+                if not in_block:
+                    errors.append((i, "cov:ignore-end without matching start"))
                 in_block = False
                 excl.add(i)
             elif in_block or "cov:ignore" in src:
                 excl.add(i)
-    return excl
+    if in_block:
+        errors.append((start_line, "cov:ignore-start without matching end"))
+    return excl, errors
 
 # 4. Classify changed lines per crate group.
 groups = {"gate": {}, "report": {}}
+marker_errors = {}
 for relpath, lines in added.items():
     if relpath.startswith(GATE_PREFIX):
         grp = "gate"
@@ -146,11 +177,22 @@ for relpath, lines in added.items():
     else:
         continue
     file_cov = cov.get(relpath, {})
-    excl = excluded_lines(relpath)
+    excl, errs = excluded_lines(relpath)
+    if errs:
+        marker_errors[relpath] = errs
     changed_exec = [n for n in lines if n in file_cov and n not in excl]
     uncovered = sorted(n for n in changed_exec if file_cov[n] == 0)
     if changed_exec:
         groups[grp][relpath] = (len(changed_exec), uncovered)
+
+# Malformed markers corrupt the gate — fail loudly before reporting coverage.
+if marker_errors:
+    print("== patch coverage ==")
+    print("ERROR: malformed // cov:ignore markers (each -start needs an -end):")
+    for relpath in sorted(marker_errors):
+        for ln, msg in marker_errors[relpath]:
+            print(f"  {relpath}:{ln}: {msg}")
+    sys.exit(2)
 
 def render(label, grp, gated):
     files = groups[grp]

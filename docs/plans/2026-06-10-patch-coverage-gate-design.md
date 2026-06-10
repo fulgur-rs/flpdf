@@ -38,9 +38,10 @@ Lists the changed lines in the PR that are not executed by any test, and gates
 
 Processing:
 1. **Coverage**: by default run
-   `cargo llvm-cov --workspace --json --output-path target/patch-cov.json`
-   (codecov JSON format = per-file `line → hit count`). `--json <path>` reuses an
-   existing report to skip the expensive instrumented rebuild.
+   `cargo llvm-cov --workspace --lcov --output-path target/patch-cov.lcov`
+   (LCOV `DA:<line>,<hits>` records = per-file `line → hit count`; matches the
+   format CI already produces). `--lcov <path>` reuses an existing report to skip
+   the expensive instrumented rebuild.
 2. **Changed lines**: `git diff --unified=0 <base>...HEAD` added-line ranges.
    Base defaults to `origin/main`; `--base <ref>` overrides it (stacked PRs pass
    the parent branch).
@@ -102,4 +103,4 @@ a single line (`run scripts/patch-coverage.sh`).
   changed lines are correctly listed and that `flpdf` gaps fail while `flpdf-cli`
   gaps only report.
 - Confirm `// cov:ignore` line and block markers are subtracted.
-- Confirm `--base` and `--json` options behave as specified.
+- Confirm `--base` and `--lcov` options behave as specified.
