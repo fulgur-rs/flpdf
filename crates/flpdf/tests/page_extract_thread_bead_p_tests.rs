@@ -1,17 +1,19 @@
 //! End-to-end `--pages` article-thread bead `/P` drop parity with qpdf.
 //!
-//! Drives the subset pipeline (`rebuild_page_tree` -> `remap_outline_and_dests`
-//! -> `drop_struct_elem_dangling_pg` -> `drop_thread_bead_dangling_p` ->
-//! `prune_after_subset` -> inspection) and asserts the qpdf 11.9.0 behaviour for
-//! the structural-reference *drop* family: a bead whose `/P` points at a removed
-//! page has the `/P` key dropped (not nulled), the bead and its ring links are
-//! kept, and the page — once unreferenced — is garbage-collected entirely. This
-//! is the opposite of the annotation/outline null-out family, where the
-//! reference is kept verbatim and the page object becomes `null`.
+//! Drives the subset pipeline in the production order used by
+//! `run_page_extraction` (`rebuild_page_tree` -> `remap_outline_and_dests` ->
+//! `drop_struct_elem_dangling_pg` -> `drop_thread_bead_dangling_p` ->
+//! `prune_after_subset` -> `prune_acroform_after_subset` -> inspection) and
+//! asserts the qpdf 11.9.0 behaviour for the structural-reference *drop* family:
+//! a bead whose `/P` points at a removed page has the `/P` key dropped (not
+//! nulled), the bead and its ring links are kept, and the page — once
+//! unreferenced — is garbage-collected entirely. This is the opposite of the
+//! annotation/outline null-out family, where the reference is kept verbatim and
+//! the page object becomes `null`.
 
 use flpdf::{
-    drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, prune_after_subset,
-    rebuild_page_tree, remap_outline_and_dests, Object, ObjectRef, Pdf,
+    drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, prune_acroform_after_subset,
+    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, Object, ObjectRef, Pdf,
     RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
@@ -24,11 +26,23 @@ use std::io::Cursor;
 /// 11→12→13 (via `/N`): bead 11 on p1, bead 12 on p2, bead 13 on p3. Page 2's
 /// only non-page-tree reference is bead 12's `/P`.
 fn build_fixture() -> Vec<u8> {
+    build_fixture_inner(true)
+}
+
+/// Like [`build_fixture`] but with no catalog `/Threads`, so the bead ring is
+/// reachable only through the surviving pages' `/B` arrays.
+fn build_fixture_b_only() -> Vec<u8> {
+    build_fixture_inner(false)
+}
+
+fn build_fixture_inner(with_threads: bool) -> Vec<u8> {
     let mut objs: BTreeMap<u32, String> = BTreeMap::new();
-    objs.insert(
-        1,
-        "<< /Type /Catalog /Pages 2 0 R /Threads [10 0 R] >>".into(),
-    );
+    let catalog = if with_threads {
+        "<< /Type /Catalog /Pages 2 0 R /Threads [10 0 R] >>"
+    } else {
+        "<< /Type /Catalog /Pages 2 0 R >>"
+    };
+    objs.insert(1, catalog.into());
     objs.insert(
         2,
         "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".into(),
@@ -86,12 +100,17 @@ fn build_fixture() -> Vec<u8> {
 }
 
 fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
-    let mut pdf = Pdf::open(Cursor::new(build_fixture())).expect("open fixture");
+    run_subset_bytes(build_fixture(), pages)
+}
+
+fn run_subset_bytes(bytes: Vec<u8>, pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open fixture");
     let result = rebuild_page_tree(&mut pdf, pages).expect("rebuild");
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
     drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg drop");
     drop_thread_bead_dangling_p(&mut pdf, &result).expect("bead /P drop");
     prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+    prune_acroform_after_subset(&mut pdf, &result).expect("acroform prune");
     pdf
 }
 
@@ -136,5 +155,36 @@ fn dangling_bead_p_dropped_and_page_gced() {
         matches!(bead.get("P"), Some(Object::Reference(r)) if r.number == 3),
         "bead 11 /P (surviving page 1) must be kept, got {:?}",
         bead.get("P")
+    );
+}
+
+#[test]
+fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
+    // Same parity, but the catalog has no /Threads: the bead ring is reachable
+    // only through the surviving pages' /B arrays. Without dropping the
+    // removed-page bead's /P here, the removed page would stay reachable via the
+    // kept page's /B ring and the prune could not collect it (qpdf 11.9.0
+    // garbage-collects it).
+    let mut pdf = run_subset_bytes(
+        build_fixture_b_only(),
+        &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
+    );
+
+    let bead = pdf.resolve(ObjectRef::new(12, 0)).expect("bead 12");
+    let bead = bead.as_dict().expect("bead 12 is a dict");
+    assert!(
+        bead.get("P").is_none(),
+        "bead 12 /P (removed page) must be dropped via /B seeding, got {:?}",
+        bead.get("P")
+    );
+
+    let live = pdf.live_object_refs();
+    assert!(
+        !live.contains(&ObjectRef::new(4, 0)),
+        "removed page 2 must be garbage-collected after the /B-seeded bead /P drop"
+    );
+    assert!(
+        live.contains(&ObjectRef::new(12, 0)),
+        "bead 12 must stay live in the ring after its /P drop"
     );
 }

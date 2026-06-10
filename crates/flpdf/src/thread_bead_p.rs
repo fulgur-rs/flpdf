@@ -1,10 +1,9 @@
 //! Article-thread bead `/P` reference drop after page extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page
-//! tree for a subset extraction, this module walks the article threads (catalog
-//! `/Threads` → thread `/F` → bead ring, ISO 32000-2 §12.4.3) and updates each
-//! bead's `/P` (the page the bead belongs to) to match qpdf's `--pages`
-//! behaviour:
+//! tree for a subset extraction, this module walks the article-thread beads
+//! (ISO 32000-2 §12.4.3) and updates each bead's `/P` (the page the bead
+//! belongs to) to match qpdf's `--pages` behaviour:
 //!
 //! - A bead whose `/P` points at a **surviving** page keeps the entry, remapped
 //!   to the page's new [`ObjectRef`] when the rebuild changed it.
@@ -19,6 +18,24 @@
 //! than replaced with `null` (the opposite of the outline / named-destination /
 //! annotation null-out family in [`crate::outline_dest_remap`]).
 //!
+//! # Reaching the beads
+//!
+//! qpdf reaches a bead ring through **either** entry point, so this pass seeds
+//! its walk from both:
+//!
+//! - the catalog `/Threads` article list (`/Threads` → thread `/F` → ring), and
+//! - each surviving page's `/B` bead array.
+//!
+//! A removed page kept alive only through a sibling bead reachable via a
+//! surviving page's `/B` (with no usable `/Threads`) must still have that
+//! bead's `/P` dropped, or the prune cannot collect the page. Indirection is
+//! normalized through [`crate::outline_dest_remap::resolve_ref_chain`] at every
+//! link (`/Threads`, the thread entry, `/F`, `/N`, `/V`, `/B`, and `/P`), so a
+//! reference-to-reference chain, a direct (inline) thread dictionary, or a
+//! chained `/P` is handled the same way the single-page extraction path
+//! ([`crate::page_extract`]) handles them. The walk is bounded by a visited set
+//! keyed on the terminal bead ref (a thread's beads form a cycle).
+//!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
 //! For `qpdf in.pdf --pages in.pdf 1,3 -- out.pdf` over a document whose page 2
@@ -26,17 +43,13 @@
 //! and the removed page is absent from the output (not emitted as `null`). The
 //! bead stays in the thread ring with its `/N`/`/V`/`/T`/`/R` intact. Even when
 //! every bead of a thread targets a removed page, qpdf keeps the thread and all
-//! its beads (each with `/P` dropped) — it never removes the thread itself.
-//!
-//! # Scope
-//!
-//! Only the page-valued bead `/P` is handled. The ring links (`/N`, `/V`), the
-//! thread back-pointer (`/T`), the bead rectangle (`/R`), the thread `/F`, and
-//! the surviving pages' `/B` arrays carry no removed-page reference that needs
-//! dropping and are left unchanged.
+//! its beads (each with `/P` dropped) — it never removes the thread itself. The
+//! same drop applies when the ring is reachable only through a surviving page's
+//! `/B` array rather than the catalog `/Threads`.
 
+use crate::outline_dest_remap::resolve_ref_chain;
 use crate::page_tree_rebuild::RebuildResult;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -48,20 +61,23 @@ use std::io::{Read, Seek};
 /// old → new page reference mapping: a page absent from the map was removed; a
 /// page present maps to `ref_map[old][0]` (first new occurrence).
 ///
-/// Walks the article threads from the catalog `/Threads` array: each thread's
-/// `/F` seeds a bead ring whose neighbours are followed through `/N` and `/V`
-/// (bounded by a visited set, since a thread's beads form a cycle). Each bead's
-/// `/P` is remapped when its target page survived and removed when its target
-/// page was dropped, so that a removed page referenced by nothing else is
-/// garbage-collected by the subsequent subset sweep
-/// ([`crate::subset_prune::prune_after_subset`]). The function mutates `pdf` in
-/// place (same convention as `rebuild_page_tree`) and succeeds silently when
-/// the document has no `/Threads`.
+/// The walk is seeded from both the catalog `/Threads` article list and every
+/// surviving page's `/B` bead array, then follows the ring through `/N` and
+/// `/V` (bounded by a visited set, since a thread's beads form a cycle). Each
+/// bead's `/P` is remapped when its target page survived and removed when its
+/// target page was dropped, so that a removed page referenced by nothing else
+/// is garbage-collected by the subsequent subset sweep
+/// ([`crate::subset_prune::prune_after_subset`]). Reference-to-reference chains
+/// at every link are normalized via
+/// [`crate::outline_dest_remap::resolve_ref_chain`]. The function mutates `pdf`
+/// in place (same convention as `rebuild_page_tree`) and succeeds silently when
+/// the document has no article beads.
 ///
 /// # Errors
 ///
 /// Any error propagated from [`Pdf::resolve`] / [`Pdf::resolve_borrowed`] while
-/// resolving the catalog, the `/Threads` array, the threads, or the beads.
+/// resolving the catalog, the `/Threads` array, the threads, the surviving
+/// pages, or the beads.
 pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
@@ -72,9 +88,48 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
 
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(()), // No catalog, nothing to do.
+    // Seed the bead walk from every entry point qpdf reaches a ring through:
+    // the catalog /Threads article list and each surviving page's /B array.
+    let mut queue: Vec<ObjectRef> = Vec::new();
+    seed_from_threads(pdf, &mut queue)?;
+    seed_from_surviving_pages(pdf, result, &mut queue)?;
+
+    // Walk the ring(s). resolve_ref_chain normalizes /N//V/F indirection so the
+    // visited key and the write-back target are the terminal bead ref (never an
+    // intermediate reference holder).
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    while let Some(start_ref) = queue.pop() {
+        let (concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(start_ref))?;
+        let bead_ref = terminal.unwrap_or(start_ref);
+        if !visited.insert(bead_ref) {
+            continue;
+        }
+        let Some(mut bead) = concrete.into_dict() else {
+            continue;
+        };
+        // Enqueue ring neighbours before any mutation; they are chain-resolved
+        // when popped.
+        for key in ["N", "V"] {
+            if let Some(Object::Reference(r)) = bead.get(key) {
+                queue.push(*r);
+            }
+        }
+        if remap_or_drop_bead_p(pdf, &mut bead, &surviving)? {
+            pdf.set_object(bead_ref, Object::Dictionary(bead));
+        }
+    }
+    Ok(())
+}
+
+/// Push every catalog-`/Threads` thread's first bead (`/F`) onto `queue`.
+///
+/// `/Threads` (an array of thread dictionaries) may be stored as an indirect
+/// reference; each entry may be an indirect reference to a thread dictionary or
+/// a direct (inline) one. Returns silently when there is no catalog or no
+/// `/Threads`.
+fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef>) -> Result<()> {
+    let Some(catalog_ref) = pdf.root_ref() else {
+        return Ok(()); // No catalog.
     };
     let threads_val = {
         let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
@@ -87,73 +142,116 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     let Some(threads_val) = threads_val else {
         return Ok(()); // No article threads.
     };
-    // /Threads is an array of thread dictionaries; it may itself be stored as
-    // an indirect reference to that array.
-    let threads = match threads_val {
-        Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(arr) => arr,
-            _ => return Ok(()),
-        },
-        _ => return Ok(()),
+    // /Threads may be an indirect (possibly multi-hop) reference to the array.
+    let (threads_concrete, _) = resolve_ref_chain(pdf, &threads_val)?;
+    let Object::Array(threads) = threads_concrete else {
+        return Ok(());
     };
-
-    // Seed the walk with each thread's /F (first bead). The ring is then
-    // traversed through /N and /V; a thread's beads form a cycle, so the
-    // visited set is what bounds the walk (beads are always indirect objects).
-    let mut queue: Vec<ObjectRef> = Vec::new();
     for thread in &threads {
-        let Some(thread_ref) = thread.as_ref_id() else {
-            continue;
-        };
-        let first_bead = {
-            let thread_obj = pdf.resolve_borrowed(thread_ref)?;
-            thread_obj
-                .as_dict()
-                .and_then(|d| d.get("F"))
-                .and_then(Object::as_ref_id)
-        };
-        if let Some(first_bead) = first_bead {
+        if let Some(first_bead) = thread_first_bead(pdf, thread)? {
             queue.push(first_bead);
         }
     }
+    Ok(())
+}
 
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    while let Some(bead_ref) = queue.pop() {
-        if !visited.insert(bead_ref) {
+/// Resolve a `/Threads` entry to its thread dictionary and return the terminal
+/// ref of its `/F` (first bead), if any.
+///
+/// The entry may be an indirect reference (chain) to a thread dictionary or a
+/// direct (inline) dictionary; `/F` may itself be a reference chain.
+fn thread_first_bead<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    thread: &Object,
+) -> Result<Option<ObjectRef>> {
+    let (concrete, _) = resolve_ref_chain(pdf, thread)?;
+    let Some(dict) = concrete.as_dict() else {
+        return Ok(None);
+    };
+    let Some(f_val) = dict.get("F") else {
+        return Ok(None);
+    };
+    let (_, terminal) = resolve_ref_chain(pdf, f_val)?;
+    Ok(terminal)
+}
+
+/// Push the beads listed in each surviving page's `/B` array onto `queue`.
+///
+/// The surviving pages are `result.new_kids` (deduplicated, since a duplicated
+/// selection lists a page more than once). `/B` may be an indirect reference to
+/// the array. Beads on removed pages are still reached from here through the
+/// ring's `/N`/`/V` links during the walk.
+fn seed_from_surviving_pages<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    result: &RebuildResult,
+    queue: &mut Vec<ObjectRef>,
+) -> Result<()> {
+    let mut seen_pages: BTreeSet<ObjectRef> = BTreeSet::new();
+    for &page_ref in &result.new_kids {
+        if !seen_pages.insert(page_ref) {
             continue;
         }
-        // `resolve` returns an owned object; move out its dictionary (a non-dict
-        // /N/V neighbour is malformed and skipped).
-        let Some(mut bead) = pdf.resolve(bead_ref)?.into_dict() else {
+        let b_val = {
+            let page_obj = pdf.resolve_borrowed(page_ref)?;
+            page_obj.as_dict().and_then(|p| p.get("B")).cloned()
+        };
+        let Some(b_val) = b_val else {
             continue;
         };
-        // Enqueue ring neighbours before any mutation.
-        for key in ["N", "V"] {
-            if let Some(Object::Reference(r)) = bead.get(key) {
-                queue.push(*r);
-            }
-        }
-        // /P is by spec an indirect reference to the page the bead belongs to;
-        // any other form is malformed and left unchanged. A surviving target is
-        // remapped to its new ref; a removed target has the key dropped so the
-        // page is garbage-collected. Only a changed bead is rewritten (a kept,
-        // unchanged bead's body is never re-serialized).
-        if let Some(Object::Reference(pg)) = bead.get("P") {
-            match surviving.get(pg) {
-                Some(&new) if new != *pg => {
-                    bead.insert("P", Object::Reference(new));
-                    pdf.set_object(bead_ref, Object::Dictionary(bead));
-                }
-                Some(_) => {} // Surviving under the same ref: nothing to change.
-                None => {
-                    bead.remove("P");
-                    pdf.set_object(bead_ref, Object::Dictionary(bead));
+        let (b_concrete, _) = resolve_ref_chain(pdf, &b_val)?;
+        if let Object::Array(beads) = b_concrete {
+            for bead in &beads {
+                if let Some(r) = bead.as_ref_id() {
+                    queue.push(r);
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Remap-or-drop a bead's `/P`. Returns `true` when `bead` was modified (so the
+/// caller writes it back).
+///
+/// `/P` is by spec an indirect reference to the page the bead belongs to,
+/// possibly through a reference chain. The chain is resolved to its terminal
+/// page ref; a `/P` that does not resolve to a `/Type /Page` object (a
+/// non-reference, or a non-page target) is malformed and left unchanged. A
+/// surviving target is remapped to its new ref when the rebuild changed it; a
+/// removed target has the key dropped so the page is garbage-collected.
+fn remap_or_drop_bead_p<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    bead: &mut Dictionary,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<bool> {
+    let Some(p_val) = bead.get("P").cloned() else {
+        return Ok(false);
+    };
+    let (p_concrete, p_terminal) = resolve_ref_chain(pdf, &p_val)?;
+    let Some(page_ref) = p_terminal else {
+        return Ok(false); // Non-reference /P: malformed, left unchanged.
+    };
+    if !is_page_dict(&p_concrete) {
+        return Ok(false); // /P does not resolve to a page: left unchanged.
+    }
+    match surviving.get(&page_ref) {
+        Some(&new) if new != page_ref => {
+            bead.insert("P", Object::Reference(new));
+            Ok(true)
+        }
+        Some(_) => Ok(false), // Surviving under the same ref: nothing to change.
+        None => {
+            bead.remove("P");
+            Ok(true)
+        }
+    }
+}
+
+/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
+fn is_page_dict(obj: &Object) -> bool {
+    obj.as_dict()
+        .and_then(|d| d.get("Type"))
+        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
 }
 
 #[cfg(test)]
@@ -166,6 +264,12 @@ mod tests {
     /// Serialize `objs` (object number → body) into a classic-xref PDF with
     /// `/Root 1 0 R`.
     fn build_pdf(objs: &BTreeMap<u32, String>) -> Vec<u8> {
+        build_pdf_inner(objs, true)
+    }
+
+    /// Like [`build_pdf`] but writes a trailer with no `/Root` when
+    /// `with_root` is false (so `root_ref()` is `None`).
+    fn build_pdf_inner(objs: &BTreeMap<u32, String>, with_root: bool) -> Vec<u8> {
         let mut raw: Vec<u8> = b"%PDF-1.5\n".to_vec();
         let mut offs: BTreeMap<u32, usize> = BTreeMap::new();
         for (n, body) in objs {
@@ -182,9 +286,10 @@ mod tests {
                 raw.extend_from_slice(b"0000000000 65535 f \n");
             }
         }
+        let root = if with_root { " /Root 1 0 R" } else { "" };
         raw.extend_from_slice(
             format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+                "trailer\n<< /Size {}{root} >>\nstartxref\n{xref_pos}\n%%EOF\n",
                 max_num + 1
             )
             .as_bytes(),
@@ -234,6 +339,20 @@ mod tests {
         objs
     }
 
+    /// [`base_objs`] with the pages' `/B` arrays removed, so the only way to
+    /// reach the bead ring is through the catalog `/Threads`. Used to isolate
+    /// the `/Threads`-seeding branches from the `/B`-seeding fallback.
+    fn base_objs_no_b() -> BTreeMap<u32, String> {
+        let mut objs = base_objs();
+        for n in 3..=5 {
+            objs.insert(
+                n,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            );
+        }
+        objs
+    }
+
     fn open(objs: &BTreeMap<u32, String>) -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture")
     }
@@ -250,7 +369,7 @@ mod tests {
         }
     }
 
-    fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> crate::Dictionary {
+    fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
         pdf.resolve(ObjectRef::new(num, 0))
             .expect("resolve bead")
             .into_dict()
@@ -380,77 +499,134 @@ mod tests {
     }
 
     #[test]
-    fn no_threads_is_a_noop() {
-        // A catalog without /Threads: nothing to walk, succeeds silently.
+    fn seeds_from_surviving_page_b_without_threads() {
+        // No catalog /Threads, but the kept pages' /B arrays reach the ring. The
+        // removed-page bead must still lose its /P (qpdf 11.9.0 parity), or the
+        // removed page would stay reachable via the kept page's /B ring.
         let mut objs = base_objs();
         objs.insert(1, "<< /Type /Catalog /Pages 2 0 R >>".into());
         let mut pdf = open(&objs);
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("noop");
-        // Beads are untouched (no thread root reached them).
-        let bead12 = bead_dict(&mut pdf, 12);
-        assert!(
-            bead12.get("P").is_some(),
-            "without /Threads no bead /P is touched"
-        );
-    }
 
-    #[test]
-    fn indirect_threads_array_is_walked() {
-        // /Threads stored as an indirect reference to the array object.
-        let mut objs = base_objs();
-        objs.insert(
-            1,
-            "<< /Type /Catalog /Pages 2 0 R /Threads 14 0 R >>".into(),
-        );
-        objs.insert(14, "[10 0 R]".into());
-        let mut pdf = open(&objs);
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("/B seeding");
 
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("indirect /Threads");
-
-        let bead12 = bead_dict(&mut pdf, 12);
-        let p12 = bead12.get("P");
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
         assert!(
             p12.is_none(),
-            "bead reached through an indirect /Threads array must have /P dropped, got {p12:?}"
+            "bead reached only via a surviving page's /B must have its dangling /P dropped, got {p12:?}"
         );
-    }
-
-    #[test]
-    fn non_array_threads_is_a_noop() {
-        // A malformed /Threads (not an array, not a ref to one) is ignored.
-        let mut objs = base_objs();
-        objs.insert(1, "<< /Type /Catalog /Pages 2 0 R /Threads 42 >>".into());
-        let mut pdf = open(&objs);
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("noop");
+        // A surviving bead reached the same way keeps its /P.
+        let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
         assert!(
-            bead_dict(&mut pdf, 12).get("P").is_some(),
-            "a non-array /Threads must leave beads untouched"
+            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            "surviving bead /P reached via /B must be kept, got {p11:?}"
         );
     }
 
     #[test]
-    fn indirect_threads_ref_to_non_array_is_a_noop() {
-        // /Threads is an indirect reference, but the target is not an array.
-        let mut objs = base_objs();
+    fn direct_thread_dict_in_threads_is_processed() {
+        // /Threads holds a DIRECT (inline) thread dictionary, and the pages have
+        // no /B, so the only entry point is the direct dict. Its ring's
+        // removed-page bead must still lose its /P.
+        let mut objs = base_objs_no_b();
+        objs.insert(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Threads [ << /Type /Thread /F 11 0 R >> ] >>".into(),
+        );
+        objs.remove(&10); // the inline thread replaces the indirect one
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("direct thread dict");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
+        assert!(
+            p12.is_none(),
+            "a direct (inline) thread dictionary's dangling bead /P must be dropped, got {p12:?}"
+        );
+    }
+
+    #[test]
+    fn bead_p_reference_chain_is_resolved() {
+        // Bead 12's /P is a reference-to-reference chain to the removed page 4;
+        // bead 11's /P is a chain to the surviving page 3. The chain must be
+        // resolved before classifying: 12 dropped, 11 kept.
+        let mut objs = base_objs_no_b();
+        objs.insert(
+            11,
+            "<< /Type /Bead /T 10 0 R /N 12 0 R /V 13 0 R /P 21 0 R /R [0 0 100 100] >>".into(),
+        );
+        objs.insert(
+            12,
+            "<< /Type /Bead /T 10 0 R /N 13 0 R /V 11 0 R /P 20 0 R /R [0 0 100 100] >>".into(),
+        );
+        objs.insert(20, "4 0 R".into()); // chain → removed page 4
+        objs.insert(21, "3 0 R".into()); // chain → surviving page 3
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("/P chain");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
+        assert!(
+            p12.is_none(),
+            "a chained /P to a removed page must be dropped, got {p12:?}"
+        );
+        let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
+        assert!(
+            matches!(p11, Some(Object::Reference(r)) if r.number == 21),
+            "a chained /P to a surviving page must be kept verbatim, got {p11:?}"
+        );
+    }
+
+    #[test]
+    fn ring_neighbour_reference_chain_is_followed() {
+        // Bead 11's /N points at object 22, whose value is the real bead 12
+        // reference (a ref-to-ref ring link). With no /B fallback the removed
+        // bead 12 is reachable only through this chained /N; it must still be
+        // processed.
+        let mut objs = base_objs_no_b();
+        objs.insert(
+            11,
+            "<< /Type /Bead /T 10 0 R /N 22 0 R /V 13 0 R /P 3 0 R /R [0 0 100 100] >>".into(),
+        );
+        objs.insert(22, "12 0 R".into());
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("/N chain");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
+        assert!(
+            p12.is_none(),
+            "a bead reached only through a chained /N must have its dangling /P dropped, got {p12:?}"
+        );
+    }
+
+    #[test]
+    fn threads_multi_hop_reference_chain_is_resolved() {
+        // /Threads → 14 → 15 → [10 0 R] (two-hop chain). No /B fallback, so the
+        // removed-page bead is reachable only by resolving the chain.
+        let mut objs = base_objs_no_b();
         objs.insert(
             1,
             "<< /Type /Catalog /Pages 2 0 R /Threads 14 0 R >>".into(),
         );
-        objs.insert(14, "42".into());
+        objs.insert(14, "15 0 R".into());
+        objs.insert(15, "[10 0 R]".into());
         let mut pdf = open(&objs);
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("noop");
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("multi-hop /Threads");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
         assert!(
-            bead_dict(&mut pdf, 12).get("P").is_some(),
-            "an indirect /Threads resolving to a non-array must leave beads untouched"
+            p12.is_none(),
+            "a thread reached through a multi-hop /Threads chain must be walked, got {p12:?}"
         );
     }
 
     #[test]
-    fn non_ref_thread_entry_and_thread_without_f_skipped() {
-        // /Threads holds a direct (non-reference) entry — skipped — plus a real
-        // thread 10 whose first bead is processed, and a second thread 15 with
-        // no /F — skipped without error.
-        let mut objs = base_objs();
+    fn non_dict_thread_entry_and_thread_without_f_skipped() {
+        // /Threads holds a direct non-dictionary entry (42 — skipped), the real
+        // thread 10, and a second thread 15 with no /F (skipped). No /B, so only
+        // thread 10 reaches the ring.
+        let mut objs = base_objs_no_b();
         objs.insert(
             1,
             "<< /Type /Catalog /Pages 2 0 R /Threads [42 10 0 R 15 0 R] >>".into(),
@@ -460,9 +636,75 @@ mod tests {
 
         drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("mixed /Threads");
 
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
         assert!(
-            bead_dict(&mut pdf, 12).get("P").is_none(),
-            "the real thread's dangling bead /P must still be dropped"
+            p12.is_none(),
+            "the real thread's dangling bead /P must still be dropped, got {p12:?}"
+        );
+    }
+
+    #[test]
+    fn thread_f_non_reference_is_skipped() {
+        // Thread 10's /F is a non-reference (integer): no first bead, skipped.
+        // No /B, so nothing reaches the ring and beads are untouched.
+        let mut objs = base_objs_no_b();
+        objs.insert(10, "<< /Type /Thread /F 0 >>".into());
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("non-ref /F");
+
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_some(),
+            "a thread whose /F is not a reference yields no first bead"
+        );
+    }
+
+    #[test]
+    fn non_array_threads_with_no_b_is_a_noop() {
+        // A malformed /Threads (not an array, not a ref to one) and no /B: no
+        // entry point, so beads are untouched.
+        let mut objs = base_objs_no_b();
+        objs.insert(1, "<< /Type /Catalog /Pages 2 0 R /Threads 42 >>".into());
+        let mut pdf = open(&objs);
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("noop");
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_some(),
+            "a non-array /Threads with no /B must leave beads untouched"
+        );
+    }
+
+    #[test]
+    fn no_threads_no_b_is_a_noop() {
+        // No /Threads and no /B: nothing is seeded, so beads are untouched.
+        let mut objs = base_objs_no_b();
+        objs.insert(1, "<< /Type /Catalog /Pages 2 0 R >>".into());
+        let mut pdf = open(&objs);
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("noop");
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_some(),
+            "with neither /Threads nor /B, beads are untouched"
+        );
+    }
+
+    #[test]
+    fn surviving_page_b_non_array_is_skipped() {
+        // A surviving page's /B is not an array (malformed) and there is no
+        // /Threads: nothing is seeded.
+        let mut objs = base_objs();
+        objs.insert(1, "<< /Type /Catalog /Pages 2 0 R >>".into());
+        objs.insert(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B 99 >>".into(),
+        );
+        objs.insert(
+            5,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B 99 >>".into(),
+        );
+        let mut pdf = open(&objs);
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("noop");
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_some(),
+            "a non-array /B must be ignored"
         );
     }
 
@@ -478,8 +720,7 @@ mod tests {
 
         drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("malformed /P");
 
-        let bead12 = bead_dict(&mut pdf, 12);
-        let p12 = bead12.get("P");
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
         assert!(
             matches!(p12, Some(Object::Integer(999))),
             "a non-reference /P must be left unchanged, got {p12:?}"
@@ -487,11 +728,54 @@ mod tests {
     }
 
     #[test]
+    fn p_resolving_to_non_page_left_unchanged() {
+        // Bead 12's /P points at a non-page object (not in `surviving`, but not
+        // a page either): it must be left unchanged, not dropped.
+        let mut objs = base_objs();
+        objs.insert(
+            12,
+            "<< /Type /Bead /T 10 0 R /N 13 0 R /V 11 0 R /P 30 0 R /R [0 0 100 100] >>".into(),
+        );
+        objs.insert(30, "<< /Type /Whatever >>".into());
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("non-page /P");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
+        assert!(
+            matches!(p12, Some(Object::Reference(r)) if r.number == 30),
+            "a /P resolving to a non-page object must be left unchanged, got {p12:?}"
+        );
+    }
+
+    #[test]
+    fn bead_without_p_is_left_unchanged() {
+        // A bead that carries no /P at all is walked (for its ring links) but
+        // needs no change.
+        let mut objs = base_objs();
+        objs.insert(
+            12,
+            "<< /Type /Bead /T 10 0 R /N 13 0 R /V 11 0 R /R [0 0 100 100] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("bead without /P");
+
+        let bead12 = bead_dict(&mut pdf, 12);
+        assert!(bead12.get("P").is_none(), "bead 12 still has no /P");
+        // The rest of the ring is still processed (bead 11 kept, 13 kept).
+        assert!(
+            bead_dict(&mut pdf, 11).get("P").is_some(),
+            "the rest of the ring is still walked"
+        );
+    }
+
+    #[test]
     fn non_dict_bead_in_ring_skipped() {
         // A /N neighbour that resolves to a non-dictionary is skipped without
-        // error; the rest of the ring is still processed.
-        let mut objs = base_objs();
-        // Bead 11's /N points at object 16, which is not a dictionary.
+        // error; the rest of the ring is still processed. No /B, so the chained
+        // entry is the thread /F.
+        let mut objs = base_objs_no_b();
         objs.insert(
             11,
             "<< /Type /Bead /T 10 0 R /N 16 0 R /V 13 0 R /P 3 0 R /R [0 0 100 100] >>".into(),
@@ -511,35 +795,55 @@ mod tests {
     }
 
     #[test]
-    fn non_dict_catalog_is_a_noop() {
-        // /Root resolves to a non-dictionary object: the walk bails out cleanly
-        // before reaching any thread.
+    fn non_dict_catalog_still_seeds_from_b() {
+        // /Root resolves to a non-dictionary: the /Threads walk bails out, but
+        // the /B seeding (independent of the catalog) still drops the dangling
+        // bead /P.
         let mut objs = base_objs();
         objs.insert(1, "42".into());
         let mut pdf = open(&objs);
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("non-dict catalog noop");
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("non-dict catalog");
         assert!(
-            bead_dict(&mut pdf, 12).get("P").is_some(),
-            "a non-dictionary catalog must leave beads untouched"
+            bead_dict(&mut pdf, 12).get("P").is_none(),
+            "a non-dictionary catalog still permits /B-seeded bead /P drop"
         );
     }
 
     #[test]
-    fn no_root_in_trailer_is_a_noop() {
-        // A trailer without /Root: root_ref() is None, so the walk bails out.
-        let mut raw: Vec<u8> = b"%PDF-1.5\n".to_vec();
-        let off1 = raw.len();
-        raw.extend_from_slice(b"1 0 obj\n<< /Type /Bead /P 3 0 R >>\nendobj\n");
-        let xref_pos = raw.len();
-        raw.extend_from_slice(
-            format!(
-                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \n\
-                 trailer\n<< /Size 2 >>\nstartxref\n{xref_pos}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
+    fn no_root_still_seeds_from_b() {
+        // A trailer without /Root: root_ref() is None, so the /Threads walk
+        // bails out, but /B seeding (driven by the rebuild result, not the
+        // catalog) still drops the dangling bead /P.
+        let mut objs = base_objs();
+        objs.remove(&1); // drop the catalog
+        let raw = build_pdf_inner(&objs, false);
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("open no-root fixture");
         assert!(pdf.root_ref().is_none(), "fixture must have no /Root");
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("no-root noop");
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("no-root /B seeding");
+
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_none(),
+            "a missing catalog still permits /B-seeded bead /P drop"
+        );
+    }
+
+    #[test]
+    fn non_dict_surviving_page_is_skipped() {
+        // A surviving page ref that resolves to a non-dictionary (malformed
+        // selection) is skipped during /B seeding without error.
+        let mut objs = base_objs();
+        objs.insert(1, "<< /Type /Catalog /Pages 2 0 R >>".into());
+        objs.insert(3, "42".into()); // surviving "page" is not a dict
+        let mut pdf = open(&objs);
+
+        // new_kids lists page 3 (now a non-dict) and page 5; only 5 has a /B.
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("non-dict surviving page");
+
+        // Page 5's /B still reaches the ring and drops bead 12's dangling /P.
+        assert!(
+            bead_dict(&mut pdf, 12).get("P").is_none(),
+            "a non-dict surviving page is skipped but the others are still walked"
+        );
     }
 }

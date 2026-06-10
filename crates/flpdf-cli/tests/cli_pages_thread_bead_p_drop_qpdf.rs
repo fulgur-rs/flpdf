@@ -135,6 +135,16 @@ fn is_page(objects: &[(u32, String)], num: u32) -> bool {
 /// 5 page3 (each with a /B bead array), 10 thread (/F 11), 11/12/13 a 3-bead
 /// ring 11→12→13 with bead 11 on page1, bead 12 on page2, bead 13 on page3.
 fn thread_fixture() -> tempfile::NamedTempFile {
+    thread_fixture_inner(true)
+}
+
+/// Same layout as [`thread_fixture`] but with no catalog `/Threads`, so the bead
+/// ring is reachable only through the surviving pages' `/B` arrays.
+fn thread_fixture_b_only() -> tempfile::NamedTempFile {
+    thread_fixture_inner(false)
+}
+
+fn thread_fixture_inner(with_threads: bool) -> tempfile::NamedTempFile {
     use std::io::Write;
     let mut buf: Vec<u8> = b"%PDF-1.5\n".to_vec();
     let mut offsets: Vec<(u32, usize)> = Vec::new();
@@ -146,7 +156,11 @@ fn thread_fixture() -> tempfile::NamedTempFile {
     add(
         &mut buf,
         1,
-        "<< /Type /Catalog /Pages 2 0 R /Threads [10 0 R] >>",
+        if with_threads {
+            "<< /Type /Catalog /Pages 2 0 R /Threads [10 0 R] >>"
+        } else {
+            "<< /Type /Catalog /Pages 2 0 R >>"
+        },
     );
     add(
         &mut buf,
@@ -281,19 +295,11 @@ fn assert_bead_p_drop_facts(qdf: &str, tool: &str) {
     }
 }
 
-#[test]
-fn bead_p_to_removed_page_dropped_and_page_gced_like_qpdf() {
-    if !qpdf_available() {
-        return;
-    }
-    eprintln!(
-        "qpdf {EXPECTED_QPDF_VERSION} present; running real article-thread bead /P assertions"
-    );
-
+/// Run the same `--pages . 1,3` through qpdf and flpdf over `src_file`, then
+/// assert both outputs satisfy the bead `/P` drop-family facts.
+fn assert_parity(src_file: &tempfile::NamedTempFile) {
     let tmp = tempfile::tempdir().unwrap();
-    let src_file = thread_fixture();
     let src = src_file.path();
-
     let q_out = tmp.path().join("q.pdf");
     let f_out = tmp.path().join("f.pdf");
 
@@ -309,7 +315,7 @@ fn bead_p_to_removed_page_dropped_and_page_gced_like_qpdf() {
     ]);
     assert!(
         q_run.status.success(),
-        "qpdf --pages should succeed on the thread fixture (exit {:?}): {}",
+        "qpdf --pages should succeed on the fixture (exit {:?}): {}",
         q_run.status.code(),
         String::from_utf8_lossy(&q_run.stderr)
     );
@@ -332,4 +338,26 @@ fn bead_p_to_removed_page_dropped_and_page_gced_like_qpdf() {
 
     assert_bead_p_drop_facts(&q_qdf, "qpdf");
     assert_bead_p_drop_facts(&f_qdf, "flpdf");
+}
+
+#[test]
+fn bead_p_to_removed_page_dropped_and_page_gced_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    eprintln!(
+        "qpdf {EXPECTED_QPDF_VERSION} present; running real article-thread bead /P assertions"
+    );
+    assert_parity(&thread_fixture());
+}
+
+#[test]
+fn bead_p_drop_via_b_array_without_threads_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    eprintln!("qpdf {EXPECTED_QPDF_VERSION} present; running real /B-seeded bead /P assertions");
+    // No catalog /Threads: qpdf still reaches the ring through the surviving
+    // pages' /B arrays, drops the removed-page bead's /P, and GCs the page.
+    assert_parity(&thread_fixture_b_only());
 }
