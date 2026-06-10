@@ -297,6 +297,24 @@ fn flpdf_progname_env_swaps_prefix() {
         .stderr(predicate::str::contains("flpdf:").not());
 }
 
+/// An empty FLPDF_PROGNAME falls back to the default prefix instead of
+/// rendering a broken `: <message>` line.
+#[test]
+fn flpdf_progname_empty_env_falls_back_to_default() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_PROGNAME", "")
+        .args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ));
+}
+
 /// Same prefix swap on the fatal-open-error path, which is rendered by
 /// main()'s result handler rather than run_check itself.
 #[test]

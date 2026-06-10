@@ -3948,9 +3948,12 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
 /// Program name used in qpdf-parity diagnostic prefixes.
 ///
 /// `FLPDF_PROGNAME` overrides the default so the qpdf qtest harness shim can
-/// present flpdf as `qpdf`; unset, the prefix is always `flpdf`.
+/// present flpdf as `qpdf`; unset or empty, the prefix is always `flpdf`.
 fn progname() -> String {
-    std::env::var("FLPDF_PROGNAME").unwrap_or_else(|_| "flpdf".to_string())
+    std::env::var("FLPDF_PROGNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "flpdf".to_string())
 }
 
 /// Render the `<file>` / `<file> (offset N)` location part shared by the
