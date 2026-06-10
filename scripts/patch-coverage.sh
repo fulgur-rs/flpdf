@@ -49,9 +49,15 @@ if ! MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null)"; then
 fi
 
 if [[ -z "$LCOV" ]]; then
+  # Fresh, whole-workspace measurement: a gated file absent from the report is
+  # genuinely non-executable. A user-supplied --lcov may be stale, so that case
+  # is checked (see LCOV_MODE below).
+  LCOV_MODE="fresh"
   LCOV="target/patch-cov.lcov"
   echo "[patch-coverage] running 'cargo llvm-cov --workspace' (slow; pass --lcov <path> to reuse a report)..." >&2
   cargo llvm-cov --workspace --lcov --output-path "$LCOV" >&2
+else
+  LCOV_MODE="reused"
 fi
 
 if [[ ! -f "$LCOV" ]]; then
@@ -74,12 +80,13 @@ DIFF_FILE="$(mktemp)"
 trap 'rm -f "$DIFF_FILE"' EXIT
 git diff --unified=0 "$MERGE_BASE" HEAD > "$DIFF_FILE"
 
-python3 - "$LCOV" "$DIFF_FILE" "$REPO_ROOT" <<'PYEOF'
+python3 - "$LCOV" "$DIFF_FILE" "$REPO_ROOT" "$LCOV_MODE" <<'PYEOF'
 import os
 import re
 import sys
 
 lcov_path, diff_path, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
+lcov_mode = sys.argv[4] if len(sys.argv) > 4 else "fresh"
 
 GATE_PREFIX = "crates/flpdf/src/"        # 100% gate
 REPORT_PREFIX = "crates/flpdf-cli/src/"  # report-only
@@ -219,6 +226,7 @@ def excluded_lines(relpath):
 # 4. Classify changed lines per crate group.
 groups = {"gate": {}, "report": {}}
 marker_errors = {}
+missing_cov = []  # gated files with added lines but no coverage entry at all
 for relpath, lines in added.items():
     if relpath.startswith(GATE_PREFIX):
         grp = "gate"
@@ -226,6 +234,12 @@ for relpath, lines in added.items():
         grp = "report"
     else:
         continue
+    # A reused --lcov report may predate this file; if a gated file has added
+    # lines but no coverage entry at all, the new code was never measured and
+    # the 100% gate would pass vacuously. Treat that as an error. (A fresh
+    # whole-workspace run instead means the file is genuinely non-executable.)
+    if grp == "gate" and lines and relpath not in cov and lcov_mode == "reused":
+        missing_cov.append(relpath)
     file_cov = cov.get(relpath, {})
     excl, errs = excluded_lines(relpath)
     if errs:
@@ -235,13 +249,19 @@ for relpath, lines in added.items():
     if changed_exec:
         groups[grp][relpath] = (len(changed_exec), uncovered)
 
-# Malformed markers corrupt the gate — fail loudly before reporting coverage.
-if marker_errors:
+# Malformed markers or unmeasured gated files corrupt the gate — fail loudly.
+if marker_errors or missing_cov:
     print("== patch coverage ==")
-    print("ERROR: malformed // cov:ignore markers (each -start needs an -end):")
-    for relpath in sorted(marker_errors):
-        for ln, msg in marker_errors[relpath]:
-            print(f"  {relpath}:{ln}: {msg}")
+    if marker_errors:
+        print("ERROR: malformed // cov:ignore markers (each -start needs an -end):")
+        for relpath in sorted(marker_errors):
+            for ln, msg in marker_errors[relpath]:
+                print(f"  {relpath}:{ln}: {msg}")
+    if missing_cov:
+        print("ERROR: no coverage data for changed flpdf files (stale/incomplete --lcov?):")
+        for relpath in sorted(missing_cov):
+            print(f"  {relpath}")
+        print("  Regenerate coverage (omit --lcov to measure a fresh workspace run).")
     sys.exit(2)
 
 def render(label, grp, gated):
