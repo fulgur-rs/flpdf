@@ -2009,7 +2009,9 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         let location = diagnostic_location(&input, diagnostic.offset);
         match diagnostic.severity {
             Severity::Warning => eprintln!("WARNING: {location}: {}", diagnostic.message),
-            Severity::Error => eprintln!("error: {}", diagnostic.message),
+            Severity::Error => {
+                eprintln!("{}: {location}: {}", progname(), diagnostic.message)
+            }
         }
     }
 
@@ -2027,10 +2029,11 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         .any(|d| d.severity == Severity::Warning);
 
     if !report.valid {
-        // Errors found — exit 2.
+        // Errors found — exit 2.  The error diagnostics above are already in
+        // qpdf shape; qpdf prints no extra summary line in this case.
         return Err(Box::new(CliExitError {
             code: ExitCode::Errors,
-            message: "PDF check failed".to_string(),
+            message: String::new(),
         }));
     }
 

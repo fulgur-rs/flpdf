@@ -93,6 +93,26 @@ fn corrupt_pdf_bytes() -> Vec<u8> {
     b"%PDF-1.4\nthis is not a valid pdf at all\n%%EOF\n".to_vec()
 }
 
+/// Valid xref but the trailer lacks /Root — opens fine, check reports an
+/// error-severity diagnostic → exit 2.
+fn missing_root_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n")
+            .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 3 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 // ---------------------------------------------------------------------------
 // Tests: exit 0 — clean PDF
 // ---------------------------------------------------------------------------
@@ -215,6 +235,27 @@ fn check_corrupt_pdf_exits_2() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(2);
+}
+
+/// qpdf prints check errors as a single `<progname>: <file>: <msg>` line and
+/// no extra "check failed" summary (observed with qpdf 11.9.0 on the same
+/// fixture: `qpdf: noroot.pdf: unable to find /Root dictionary`).
+#[test]
+fn check_error_diagnostics_use_qpdf_stderr_format() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&missing_root_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!(
+            "flpdf: {path}: trailer is missing /Root\n"
+        )))
+        .stderr(predicate::str::contains("PDF check failed").not())
+        .stderr(predicate::str::contains("error: ").not());
 }
 
 #[test]
