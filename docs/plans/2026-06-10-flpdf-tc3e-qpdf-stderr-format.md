@@ -12,7 +12,7 @@
 
 **qpdf 11.9.0 golden（実機観測済み）:**
 
-```
+```text
 # 修復警告（exit 3）— トリガー警告のみ (offset N) 付き
 WARNING: broken-startxref.pdf: file is damaged
 WARNING: broken-startxref.pdf (offset 999): xref not found
@@ -31,7 +31,7 @@ qpdf: notpdf.pdf: unable to find trailer dictionary while recovering damaged fil
 
 ---
 
-### Task 1: library — repair 3 警告の offset を qpdf に合わせる
+## Task 1: library — repair 3 警告の offset を qpdf に合わせる
 
 qpdf は `file is damaged`（#1）と `Attempting to reconstruct...`（#3）に offset を表示しない（内部 offset 0 = 非表示）。flpdf は現在 3 警告すべてに `Some(startxref)` を付けている。#1/#3 を `None` に変更する。
 
@@ -81,7 +81,7 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
 
 doc コメント末尾の「the surrounding warnings carry the `startxref` offset.」を更新:
 
-```
+```text
 /// offset when available; the surrounding warnings carry no offset, matching
 /// qpdf, which reports them at offset 0 and suppresses the display.
 ```
@@ -103,7 +103,7 @@ git commit -m "fix(flpdf): omit offset on surrounding xref-repair warnings (flpd
 
 ---
 
-### Task 2: CLI — progname()/diagnostic_location() + run_check 警告レンダリング + 末尾サマリ行
+## Task 2: CLI — progname()/diagnostic_location() + run_check 警告レンダリング + 末尾サマリ行
 
 **Files:**
 - Modify: `crates/flpdf-cli/tests/cli_check_exitcodes.rs`
@@ -229,7 +229,7 @@ git commit -m "feat(cli): qpdf-format WARNING lines and trailing summary in chec
 
 ---
 
-### Task 3: CLI — check 中の Error severity を qpdf 形式に + "PDF check failed" 行の削除
+## Task 3: CLI — check 中の Error severity を qpdf 形式に + "PDF check failed" 行の削除
 
 qpdf golden（/Root 欠落）: `qpdf: noroot.pdf: unable to find /Root dictionary` のみ、exit 2。
 
@@ -325,7 +325,7 @@ git commit -m "feat(cli): qpdf-format error lines in check, drop 'PDF check fail
 
 ---
 
-### Task 4: CLI — 致命的 open エラーへのファイル名挿入 + main() の progname + FLPDF_PROGNAME 切替
+## Task 4: CLI — 致命的 open エラーへのファイル名挿入 + main() の progname + FLPDF_PROGNAME 切替
 
 qpdf golden: `qpdf: notpdf.pdf: unable to find trailer dictionary while recovering damaged file`。現行 flpdf: `flpdf: parse error at byte 999: ...`（ファイル名なし）。
 
@@ -427,7 +427,7 @@ git commit -m "feat(cli): filename in fatal open errors, FLPDF_PROGNAME prefix o
 
 ---
 
-### Task 5: CLI — open_pdf（rewrite 等の全サブコマンド）の警告を qpdf 形式に
+## Task 5: CLI — open_pdf（rewrite 等の全サブコマンド）の警告を qpdf 形式に
 
 **Files:**
 - Modify: `crates/flpdf-cli/tests/cli_check_exitcodes.rs`（または既存の repair 警告を assert している統合テスト）
@@ -502,7 +502,7 @@ git commit -m "feat(cli): qpdf-format repair warnings in open_pdf path (flpdf-tc
 
 ---
 
-### Task 6: 仕上げ — 全テスト・fmt・clippy・patch-coverage ゲート・qpdf 実機突き合わせ
+## Task 6: 仕上げ — 全テスト・fmt・clippy・patch-coverage ゲート・qpdf 実機突き合わせ
 
 **Step 1: qpdf 実機との形式突き合わせ（手動 smoke）**
 
