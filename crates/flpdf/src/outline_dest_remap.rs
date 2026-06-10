@@ -55,6 +55,53 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
+// Surviving-page map
+// ---------------------------------------------------------------------------
+
+/// The surviving-page map for a page-tree rebuild, paired with the set of every
+/// rebuilt output page ref.
+///
+/// `map` sends each surviving source page ref to its first new occurrence
+/// (`ref_map[old][0]`); a source ref absent from `map` was removed. `new_refs`
+/// holds every ref in the rebuilt `/Pages` tree, so a destination already
+/// pointing at a remapped new ref is recognised as a surviving target — not a
+/// removed page — and is never nulled by the null-pass.
+#[derive(Default)]
+struct Surviving {
+    /// Surviving source page ref → its first new occurrence.
+    map: BTreeMap<ObjectRef, ObjectRef>,
+    /// Every page ref present in the rebuilt `/Pages` tree.
+    new_refs: BTreeSet<ObjectRef>,
+}
+
+impl Surviving {
+    /// Build from a [`RebuildResult`]: `map` from `ref_map`'s first occurrences,
+    /// `new_refs` from every rebuilt page ref (`new_kids`).
+    fn from_rebuild(result: &RebuildResult) -> Self {
+        let map = result
+            .ref_map
+            .iter()
+            .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
+            .collect();
+        let new_refs = result.new_kids.iter().copied().collect();
+        Surviving { map, new_refs }
+    }
+
+    /// The new (first-occurrence) ref a surviving source page remaps to, or
+    /// `None` when `old` is not a surviving source ref.
+    fn remap(&self, old: ObjectRef) -> Option<ObjectRef> {
+        self.map.get(&old).copied()
+    }
+
+    /// Whether `page_ref` denotes a surviving page: either a surviving source
+    /// ref (a remap key) or a rebuilt output ref (an already-remapped target).
+    /// The null-pass nulls only a page ref for which this is `false`.
+    fn is_surviving_target(&self, page_ref: ObjectRef) -> bool {
+        self.map.contains_key(&page_ref) || self.new_refs.contains(&page_ref)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -95,13 +142,11 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     result: &RebuildResult,
     max_depth: usize,
 ) -> Result<()> {
-    // Step 1: collect the set of surviving page refs (keys of ref_map).
-    // We compute the first-new-ref for each old ref.
-    let surviving: BTreeMap<ObjectRef, ObjectRef> = result
-        .ref_map
-        .iter()
-        .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
-        .collect();
+    // Step 1: build the surviving-page map (first new ref per surviving source)
+    // together with the set of all rebuilt output refs, so a destination already
+    // remapped to a surviving page's new ref is never mistaken for a removed
+    // target by the null-pass.
+    let surviving = Surviving::from_rebuild(result);
 
     // Locate the catalog.
     let catalog_ref = match pdf.root_ref() {
@@ -231,20 +276,20 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 ///
 /// A duplicate-page selection (e.g. `--pages . 1,1`) produces several surviving
 /// pages that share the same indirect annotation object, so the same annotation
-/// reference can appear under more than one page. A shared indirect annotation
-/// must be processed exactly once: under a non-identity surviving map, a second
-/// pass would resolve an already-remapped `/Dest` (now pointing at a *new* ref
-/// that is not a key of `surviving`) and misclassify it as a removed target,
-/// nulling a surviving page. A `visited` set (bounded-traversal guard, as in
-/// [`remap_outline_tree`] / [`remap_name_tree`]) deduplicates both shared annot
-/// references and shared *indirect* `/Annots` array objects — a shared array's
-/// inline annotations would otherwise be re-remapped on the second pass with
-/// the same misclassification hazard. An *inline* `/Annots` array lives in a
-/// single page dict and cannot be shared by reference, so it needs no dedup.
+/// reference can appear under more than one page. A `visited` set (bounded-
+/// traversal guard, as in [`remap_outline_tree`] / [`remap_name_tree`]) processes
+/// each shared annot reference — and each shared *indirect* `/Annots` array
+/// object — exactly once, so a shared destination is not re-remapped on a later
+/// pass (avoiding redundant rewrites). Correctness does not rest on the dedup
+/// alone: a destination already pointing at a rebuilt output ref is recognised as
+/// a surviving target by [`Surviving::is_surviving_target`] and is never nulled,
+/// so even a re-resolved already-remapped `/Dest` cannot null a surviving page.
+/// An *inline* `/Annots` array lives in a single page dict and cannot be shared
+/// by reference, so it needs no dedup.
 fn remap_annot_dests<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<()> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in &result.new_kids {
@@ -271,11 +316,11 @@ fn remap_annot_dests<R: Read + Seek>(
             }
             // Indirect /Annots array: process elements, write the array back to
             // the array object only if an inline annotation changed. A shared
-            // indirect array (duplicate-page selection) must be processed once:
-            // a second pass would re-remap an inline annot's already-remapped
-            // /Dest (now a new ref absent from `surviving`'s old-ref keys) and
-            // misclassify it as a removed target, nulling a surviving page —
-            // the same hazard the dedup prevents for shared annot refs.
+            // indirect array (duplicate-page selection) is processed once: a
+            // second pass would re-remap an inline annot's already-remapped /Dest
+            // (redundant work). Nulling a surviving page on that second pass is
+            // independently prevented by the surviving-target guard (a rebuilt
+            // output ref is never treated as a removed target).
             Some(Object::Reference(r)) => {
                 // Follow the full reference chain (ref -> … -> array) so a
                 // double-indirect /Annots is not dropped, then dedup on the
@@ -310,7 +355,7 @@ fn remap_annot_dests<R: Read + Seek>(
 fn remap_annot_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     arr: Vec<Object>,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<Option<Vec<Object>>> {
     let mut out: Vec<Object> = Vec::with_capacity(arr.len());
@@ -349,7 +394,7 @@ fn remap_annot_array<R: Read + Seek>(
 fn remap_or_null_inline_annot<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut annot: crate::Dictionary,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<(crate::Dictionary, bool)> {
     let mut changed = false;
     // `annot` is owned: take each value by `remove` and re-insert the processed
@@ -374,7 +419,7 @@ fn remap_or_null_inline_annot<R: Read + Seek>(
 fn remap_open_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     catalog_ref: ObjectRef,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<()> {
     let oa = {
         let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
@@ -415,7 +460,7 @@ fn remap_open_action_dest<R: Read + Seek>(
 fn remap_or_null_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<Object> {
     // Resolve to inspect /S without losing the original value form for the
     // write-back (remap_or_null_dest handles an indirect value in place).
@@ -447,7 +492,7 @@ fn null_page<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) {
 fn remap_name_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
     depth: usize,
     max_depth: usize,
     visited: &mut BTreeSet<ObjectRef>,
@@ -492,7 +537,7 @@ fn remap_name_tree<R: Read + Seek>(
 fn remap_name_tree_node_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node: crate::Dictionary,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
     max_depth: usize,
 ) -> Result<crate::Dictionary> {
     if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
@@ -517,7 +562,7 @@ fn remap_name_tree_node_dict<R: Read + Seek>(
 fn remap_name_pairs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pairs: Vec<Object>,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<Vec<Object>> {
     let mut result: Vec<Object> = Vec::with_capacity(pairs.len());
     let mut i = 0;
@@ -537,11 +582,14 @@ fn remap_name_pairs<R: Read + Seek>(
 fn remap_or_null_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest_obj: Object,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<Object> {
     match dest_page_ref_resolved(pdf, &dest_obj)? {
         Some(page_ref) => {
-            if surviving.contains_key(&page_ref) {
+            if surviving.is_surviving_target(page_ref) {
+                // A surviving source ref is remapped to its new ref; a ref that
+                // is already a rebuilt output ref stays verbatim (remap is a
+                // no-op, so `remap_dest_value` returns `None`).
                 Ok(remap_dest_value(pdf, &dest_obj, surviving)?.unwrap_or(dest_obj))
             } else {
                 null_page(pdf, page_ref);
@@ -557,7 +605,7 @@ fn remap_or_null_dest<R: Read + Seek>(
 fn remap_legacy_dests<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dests_ref: ObjectRef,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<()> {
     let dests_obj = pdf.resolve_borrowed(dests_ref)?;
     let Some(dests) = dests_obj.as_dict().cloned() else {
@@ -573,7 +621,7 @@ fn remap_legacy_dests<R: Read + Seek>(
 fn remap_dests_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dests: crate::Dictionary,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<crate::Dictionary> {
     let mut new_dests = dests.clone();
     let keys: Vec<Vec<u8>> = dests.iter().map(|(k, _)| k.to_vec()).collect();
@@ -596,7 +644,7 @@ fn remap_outline_tree<R: Read + Seek>(
     first_ref: ObjectRef,
     depth: usize,
     max_depth: usize,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if depth >= max_depth {
@@ -637,7 +685,7 @@ fn remap_outline_tree<R: Read + Seek>(
 fn null_removed_item_targets<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     item_ref: ObjectRef,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<()> {
     let (dest_val, action_val) = {
         let item_obj = pdf.resolve_borrowed(item_ref)?;
@@ -667,10 +715,10 @@ fn null_removed_item_targets<R: Read + Seek>(
 fn null_removed_dest_target<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest: &Object,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<()> {
     if let Some(page_ref) = dest_page_ref_resolved(pdf, dest)? {
-        if !surviving.contains_key(&page_ref) {
+        if !surviving.is_surviving_target(page_ref) {
             null_page(pdf, page_ref);
         }
     }
@@ -708,7 +756,7 @@ pub(crate) fn resolve_ref_chain<R: Read + Seek>(
 fn remap_item_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     item_ref: ObjectRef,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<()> {
     let item_obj = pdf.resolve_borrowed(item_ref)?;
     let Some(mut d) = item_obj.as_dict().cloned() else {
@@ -774,7 +822,7 @@ fn remap_item_dest<R: Read + Seek>(
 fn remap_dest_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest: &Object,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
 ) -> Result<Option<Object>> {
     remap_dest_value_depth(pdf, dest, surviving, MAX_DEST_RESOLVE_DEPTH)
 }
@@ -788,7 +836,7 @@ const MAX_DEST_RESOLVE_DEPTH: usize = 64;
 fn remap_dest_value_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest: &Object,
-    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    surviving: &Surviving,
     depth: usize,
 ) -> Result<Option<Object>> {
     if depth == 0 {
@@ -808,7 +856,7 @@ fn remap_dest_value_depth<R: Read + Seek>(
         // Array form `[pageRef /Fit ...]`.
         Object::Array(arr) => {
             if let Some(old) = arr.first().and_then(Object::as_ref_id) {
-                if let Some(&new_ref) = surviving.get(&old) {
+                if let Some(new_ref) = surviving.remap(old) {
                     let mut a = arr.clone();
                     a[0] = Object::Reference(new_ref);
                     return Ok(Some(Object::Array(a)));
@@ -1204,7 +1252,9 @@ mod tests {
         // objects (obj3,4,5,6) are nulled in place.
         let mut pdf = open(build_outline_pdf());
         let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(3, 0)],
+            // No page survives, so the rebuilt /Pages tree is empty too (a page
+            // present in `new_kids` would, by definition, have survived).
+            new_kids: vec![],
             ref_map: BTreeMap::new(), // empty -> no old page survives
         };
         remap_outline_and_dests(&mut pdf, &result).unwrap();
@@ -1415,7 +1465,8 @@ mod tests {
         // is nulled.
         let mut pdf = open(build_outline_pdf());
         let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(3, 0)],
+            // No page survives, so the rebuilt /Pages tree is empty too.
+            new_kids: vec![],
             ref_map: BTreeMap::new(), // all pages removed
         };
         remap_outline_and_dests(&mut pdf, &result).unwrap();
@@ -2091,7 +2142,7 @@ mod tests {
             "",
         );
         let mut pdf = open(bytes);
-        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         remap_outline_tree(
             &mut pdf,
@@ -2123,7 +2174,7 @@ mod tests {
             "",
         );
         let mut pdf = open(bytes);
-        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         let err = remap_outline_tree(
             &mut pdf,
@@ -2153,7 +2204,7 @@ mod tests {
             "",
         );
         let mut pdf = open(bytes);
-        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         remap_name_tree(
             &mut pdf,
@@ -2185,7 +2236,7 @@ mod tests {
             "",
         );
         let mut pdf = open(bytes);
-        let surviving: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         let err = remap_name_tree(
             &mut pdf,
@@ -2748,6 +2799,190 @@ mod tests {
                 .is_some(),
             "surviving page obj3 must stay a dictionary; a shared annot reached \
              from two duplicated pages must be processed once, never nulling it"
+        );
+    }
+
+    #[test]
+    fn shared_goto_action_across_outline_and_annot_does_not_null_remapped_page() {
+        // Cross-pass hazard guard. An indirect GoTo action object (obj50) is
+        // shared by an outline item (obj20, Step 3) and a link annotation (obj60
+        // on the surviving page, Step 4). Its /D [3 0 R /Fit] targets obj3, which
+        // SURVIVES and remaps to a fresh ref obj99 (a non-identity remap, built
+        // by hand because single-input rebuild_page_tree only ever yields an
+        // identity map).
+        //
+        // Step 3 rewrites the shared action's /D in place to [99 0 R]. Step 4
+        // then re-resolves the SAME action and, keying "removed?" on `surviving`'s
+        // OLD refs alone, would see obj99 (a NEW ref, absent from the keys) and
+        // null it -- the surviving output page. The Step-3 and Step-4 `visited`
+        // sets are independent and neither ever holds the shared action object,
+        // so traversal dedup cannot prevent this; only treating a rebuilt output
+        // ref as surviving does. obj99 must stay a dictionary.
+        let mut pdf = open(build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+                (2, "<< /Type /Pages /Kids [99 0 R] /Count 1 >>"),
+                (
+                    99,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [60 0 R] >>",
+                ),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+                ),
+                (20, "<< /Title (Shared) /Parent 10 0 R /A 50 0 R >>"),
+                (
+                    60,
+                    "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A 50 0 R >>",
+                ),
+                (50, "<< /S /GoTo /D [3 0 R /Fit] >>"),
+            ],
+            "",
+        ));
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(99, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(99, 0)],
+            ref_map,
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            pdf.resolve(ObjectRef::new(99, 0))
+                .unwrap()
+                .as_dict()
+                .is_some(),
+            "surviving remapped page obj99 must stay a dictionary; a GoTo action \
+             shared by an outline item and an annotation must not let the Step-4 \
+             null-pass null an already-remapped (new-ref) destination"
+        );
+    }
+
+    #[test]
+    fn genuinely_removed_page_is_still_nulled_under_surviving_target_guard() {
+        // The surviving-target guard must not over-skip: a destination whose
+        // target page is neither a surviving source ref (a remap key) nor a
+        // rebuilt output ref (a `new_kids` member) is genuinely removed and must
+        // still be nulled. obj99 survives (identity remap) and obj7 is referenced
+        // only by an outline item; obj7 is absent from both the ref_map keys and
+        // new_kids, so it is nulled in place while obj99 is untouched.
+        let mut pdf = open(build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+                (2, "<< /Type /Pages /Kids [99 0 R] /Count 1 >>"),
+                (
+                    99,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+                ),
+                (
+                    20,
+                    "<< /Title (Removed) /Parent 10 0 R /Dest [7 0 R /Fit] >>",
+                ),
+                (7, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            "",
+        ));
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(99, 0), vec![ObjectRef::new(99, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(99, 0)],
+            ref_map,
+        };
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(7, 0)).unwrap(), Object::Null),
+            "a removed page (neither a remap key nor a rebuilt output ref) must \
+             still be nulled by the null-pass"
+        );
+        assert!(
+            pdf.resolve(ObjectRef::new(99, 0))
+                .unwrap()
+                .as_dict()
+                .is_some(),
+            "the surviving page obj99 must be untouched"
+        );
+    }
+
+    #[test]
+    fn direct_dict_dests_node_under_names_remapped_and_nulled() {
+        // /Names is indirect (obj11) but its /Dests is held as a DIRECT name-tree
+        // leaf dict (not an indirect node root), exercising the
+        // `remap_name_tree_node_dict` path. Keep page1 (obj3), remove page2
+        // (obj4): d1 is remapped to the new page1 ref; d2 is kept verbatim and
+        // obj4 is nulled.
+        let mut pdf = open(build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    11,
+                    "<< /Dests << /Names [(d1) [3 0 R /Fit] (d2) [4 0 R /Fit]] >> >>",
+                ),
+            ],
+            "",
+        ));
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // obj11 /Dests is rewritten in place; read its leaf /Names pairs.
+        let names_dict = dict_of(&mut pdf, ObjectRef::new(11, 0));
+        let dests = names_dict
+            .get("Dests")
+            .and_then(Object::as_dict)
+            .expect("/Dests direct dict retained");
+        let pairs = dests
+            .get("Names")
+            .and_then(Object::as_array)
+            .expect("/Dests leaf /Names array expected");
+        assert_eq!(
+            pairs[1]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Object::as_ref_id),
+            Some(new_p1),
+            "d1 dest should be remapped to the new page1 ref"
+        );
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page2 (obj4) should be nulled"
+        );
+    }
+
+    #[test]
+    fn legacy_indirect_catalog_dests_remapped_and_nulled() {
+        // Legacy (PDF 1.1) /Catalog /Dests held as an INDIRECT reference (obj30),
+        // exercising the `remap_legacy_dests` path. Keep page1 (obj3), remove
+        // page2 (obj4).
+        let mut pdf = open(build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Dests 30 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (30, "<< /d1 [3 0 R /Fit] /d2 [4 0 R /Fit] >>"),
+            ],
+            "",
+        ));
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert_eq!(
+            dest_array_first(&mut pdf, ObjectRef::new(30, 0), "d1"),
+            new_p1,
+            "legacy /Dests d1 should be remapped to the new page1 ref"
+        );
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page2 (obj4) should be nulled"
         );
     }
 }
