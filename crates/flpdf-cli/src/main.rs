@@ -1548,9 +1548,11 @@ fn main() {
         if let Some(exit_err) = error.downcast_ref::<CliExitError>() {
             // Only print a message when there is one; the caller may have
             // already printed its own summary (e.g. run_check prints
-            // "PDF check succeeded" before returning exit 3 for warnings).
+            // "PDF check succeeded" before returning exit 3 for warnings,
+            // and its exit-2 path passes an empty message because the error
+            // diagnostics were already printed in qpdf shape).
             if !exit_err.message.is_empty() {
-                eprintln!("flpdf: {}", exit_err.message);
+                eprintln!("{}: {}", progname(), exit_err.message);
             }
             std::process::exit(exit_err.code.as_i32());
         }
@@ -1562,10 +1564,10 @@ fn main() {
         // the generic fallback below would produce. Exit 2 matches qpdf's
         // "error" convention (same code the fallback uses).
         if let Some(flpdf::Error::Signed { message, .. }) = error.downcast_ref::<flpdf::Error>() {
-            eprintln!("flpdf: {message}");
+            eprintln!("{}: {message}", progname());
             std::process::exit(2);
         }
-        eprintln!("flpdf: {error}");
+        eprintln!("{}: {error}", progname());
         std::process::exit(2);
     }
 }
@@ -2001,10 +2003,10 @@ fn run_command(command: Commands) -> CliResult<()> {
 
 fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let file = File::open(&input)?;
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let report = check_reader_with_options(BufReader::new(file), options)
-        .map_err(actionable_password_error)?;
+        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     for diagnostic in report.diagnostics.entries() {
         let location = diagnostic_location(&input, diagnostic.offset);
         match diagnostic.severity {
@@ -3894,9 +3896,9 @@ fn open_pdf(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    let file = File::open(input)?;
+    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
     let pdf = Pdf::open_with_options(BufReader::new(file), pdf_open_options(repair, password)?)
-        .map_err(actionable_password_error)?;
+        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
 
     for diagnostic in pdf.repair_diagnostics().entries() {
         eprintln!("warning: {}", diagnostic.message);
@@ -3957,6 +3959,12 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
         Some(offset) => format!("{} (offset {offset})", input.display()),
         None => input.display().to_string(),
     }
+}
+
+/// Prefix a fatal error with the input path so main() renders the observed
+/// qpdf shape `<progname>: <file>: <msg>` for open failures.
+fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    format!("{}: {error}", input.display()).into()
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {

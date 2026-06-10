@@ -182,7 +182,8 @@ fn check_warnings_use_qpdf_stderr_format() {
     let path = f.path().to_str().unwrap().to_string();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--check", "--repair", &path])
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--repair", &path])
         .assert()
         .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
@@ -255,7 +256,62 @@ fn check_error_diagnostics_use_qpdf_stderr_format() {
             "flpdf: {path}: trailer is missing /Root\n"
         )))
         .stderr(predicate::str::contains("PDF check failed").not())
-        .stderr(predicate::str::contains("error: ").not());
+        .stderr(predicate::str::contains("error: ").not())
+        // exit 2 prints no success line on stdout.
+        .stdout(predicate::str::contains("PDF check succeeded").not());
+}
+
+/// Fatal open errors carry the input path: `<progname>: <file>: <msg>`
+/// (observed qpdf shape: `qpdf: notpdf.pdf: unable to find trailer
+/// dictionary while recovering damaged file`).
+#[test]
+fn fatal_open_error_includes_filename() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&corrupt_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!("flpdf: {path}: ")));
+}
+
+/// FLPDF_PROGNAME swaps the program-name prefix (the qpdf qtest harness shim
+/// sets FLPDF_PROGNAME=qpdf); diagnostics are otherwise identical.
+#[test]
+fn flpdf_progname_env_swaps_prefix() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "qpdf: operation succeeded with warnings\n",
+        ))
+        .stderr(predicate::str::contains("flpdf:").not());
+}
+
+/// Same prefix swap on the fatal-open-error path, which is rendered by
+/// main()'s result handler rather than run_check itself.
+#[test]
+fn flpdf_progname_env_swaps_prefix_on_fatal_error() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&corrupt_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", &path])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!("qpdf: {path}: ")))
+        .stderr(predicate::str::contains("flpdf:").not());
 }
 
 #[test]
