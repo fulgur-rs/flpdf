@@ -92,6 +92,7 @@ pub mod signatures;
 pub mod standard_font_metrics;
 pub mod struct_tree_pg;
 pub mod subset_prune;
+pub mod thread_bead_p;
 pub mod writer;
 pub mod xref;
 
@@ -175,6 +176,7 @@ pub use struct_tree_pg::{
     DEFAULT_MAX_STRUCT_TREE_DEPTH,
 };
 pub use subset_prune::prune_after_subset;
+pub use thread_bead_p::drop_thread_bead_dangling_p;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
     write_pdf_with_options, write_qdf, write_stream_to_buf, CompressStreams,
