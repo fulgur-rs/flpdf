@@ -4,8 +4,8 @@ use flpdf::{
     acroform_field_prune::prune_acroform_after_subset, outline_dest_remap::remap_outline_and_dests,
     page_collate::collate, page_combine::CombinedPlan, page_rotate::apply_rotate_to_pages,
     page_split::split_pages, page_tree_rebuild::rebuild_page_tree,
-    struct_tree_pg::drop_struct_elem_dangling_pg, subset_prune::prune_after_subset, InputSpec,
-    PageRange, RotateSpec,
+    struct_tree_pg::drop_struct_elem_dangling_pg, subset_prune::prune_after_subset,
+    thread_bead_p::drop_thread_bead_dangling_p, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
     acroform_sig_flags, clear_sig_flags, strip_signature_values, SIG_FLAGS_APPEND_ONLY,
@@ -2976,9 +2976,10 @@ fn parse_collate_n(raw: &str) -> CliResult<usize> {
 ///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)
 ///   4. outline_dest_remap::remap_outline_and_dests
 ///   5. struct_tree_pg::drop_struct_elem_dangling_pg
-///   6. subset_prune::prune_after_subset (Auto/Yes/No)
-///   7. acroform_field_prune::prune_acroform_after_subset
-///   8. write (or split_pages when --split-pages is set)
+///   6. thread_bead_p::drop_thread_bead_dangling_p
+///   7. subset_prune::prune_after_subset (Auto/Yes/No)
+///   8. acroform_field_prune::prune_acroform_after_subset
+///   9. write (or split_pages when --split-pages is set)
 ///
 /// SCOPE BOUNDARY (single document only):
 /// `rebuild_page_tree` and the post-rebuild passes operate on ONE [`Pdf`].
@@ -3108,15 +3109,21 @@ fn run_page_extraction(
     // must run before the prune so the now-unreferenced page is swept).
     drop_struct_elem_dangling_pg(&mut pdf, &result)?;
 
-    // Step 6: unreferenced-resource prune + xref GC (8.9).
+    // Step 6: article-thread bead /P drop (same structural-reference drop
+    // family). A bead whose /P targets a removed page has the /P dropped (the
+    // bead and its ring are kept); must also run before the prune so the
+    // now-unreferenced page is swept.
+    drop_thread_bead_dangling_p(&mut pdf, &result)?;
+
+    // Step 7: unreferenced-resource prune + xref GC (8.9).
     prune_after_subset(&mut pdf, remove_unref.into())?;
 
-    // Step 7: AcroForm field/widget prune (8.11). The single-document API
+    // Step 8: AcroForm field/widget prune (8.11). The single-document API
     // boundary makes the cross-doc field-collision case unreachable here;
     // any Unsupported it returns is propagated, not swallowed.
     prune_acroform_after_subset(&mut pdf, &result)?;
 
-    // Step 8: serialize. Extraction always implies a full document rewrite.
+    // Step 9: serialize. Extraction always implies a full document rewrite.
     let mut options = options;
     options.full_rewrite = true;
     let mut bytes: Vec<u8> = Vec::new();
