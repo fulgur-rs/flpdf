@@ -178,10 +178,13 @@ Expected: FAIL（現行は `warning: <msg>` 形式・末尾行なし）
 /// Program name used in qpdf-parity diagnostic prefixes.
 ///
 /// `FLPDF_PROGNAME` overrides the default so the qpdf qtest harness shim can
-/// present flpdf as `qpdf` (the shim exports `FLPDF_PROGNAME=qpdf`); unset,
-/// the prefix is always `flpdf`.
+/// present flpdf as `qpdf` (the shim exports `FLPDF_PROGNAME=qpdf`); unset
+/// or empty, the prefix is always `flpdf`.
 fn progname() -> String {
-    std::env::var("FLPDF_PROGNAME").unwrap_or_else(|_| "flpdf".to_string())
+    std::env::var("FLPDF_PROGNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "flpdf".to_string())
 }
 
 /// Render the `<file>` / `<file> (offset N)` location part shared by the
@@ -517,12 +520,13 @@ FLPDF_PROGNAME=qpdf target/debug/flpdf --check --repair /tmp/broken-startxref.pd
 **Step 2: 品質ゲート**
 
 ```bash
-cargo fmt --all && cargo fmt --all --check
-cargo clippy --workspace --all-targets -q 2>&1 | tail -5
+cargo check --workspace
 cargo test --workspace -q 2>&1 | grep -E "test result: FAILED|failures" ; echo "done"
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all && cargo fmt --all --check
 ```
 
-Expected: fmt clean / clippy 警告なし / テスト全件 ok
+Expected: check ok / テスト全件 ok / clippy 警告なし / fmt clean
 
 **Step 3: commit してから patch-coverage ゲート**（dirty tree はエラーになる）
 
