@@ -158,7 +158,8 @@ pub fn extract_page<R: Read + Seek>(
     // cross-page /Dest keeps the copied sibling-page stub (and its ancestor
     // /Pages) reachable, so the sweep below cannot prune them. qpdf-aligned:
     // the annotation is retained, only the dead destination is removed.
-    neutralize_absent_dests(&mut target, copied_page_ref)?;
+    let keep = BTreeSet::from([copied_page_ref]);
+    neutralize_absent_dests(&mut target, copied_page_ref, &keep)?;
 
     // Drop the copied ancestor /Pages node(s) and any objects only they
     // referenced: they are unreachable from the new catalog now that the leaf
@@ -172,12 +173,16 @@ pub fn extract_page<R: Read + Seek>(
 }
 
 /// Drop cross-page `/GoTo` destinations from any annotation on `page_ref`, and
-/// from the page's own `/AA`. A destination targeting a page other than
-/// `page_ref` (i.e. a page absent from the single-page output) has its `/D`
-/// dropped (annotation `/Dest`: the whole `/Dest` key); the action and chain
-/// structure are otherwise retained. Named / string / `/URI` / `/GoToR`
-/// destinations carry no in-document page reference and are left untouched.
-fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
+/// from the page's own `/AA`. A destination targeting a page not in `keep`
+/// (i.e. a page absent from the output) has its `/D` dropped (annotation
+/// `/Dest`: the whole `/Dest` key); the action and chain structure are
+/// otherwise retained. Named / string / `/URI` / `/GoToR` destinations carry
+/// no in-document page reference and are left untouched.
+fn neutralize_absent_dests(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    page_ref: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
+) -> Result<()> {
     // Detach everything we need from the immutable page borrow before any
     // `&mut target` call: the raw /Annots value and the page's own /AA value.
     let (annots_val, page_aa): (Option<Object>, Option<Object>) = {
@@ -204,21 +209,21 @@ fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRe
     };
 
     for annot_ref in annot_refs {
-        neutralize_annot_if_absent(target, annot_ref, page_ref)?;
+        neutralize_annot_if_absent(target, annot_ref, keep)?;
     }
 
     // Page-level /AA (open/close etc.). An inline /AA dict is rewritten back
     // onto the page; an indirect /AA is mutated in place via its own ref, so
     // the page needs no change in that case.
     if let Some(aa_val) = page_aa {
-        if let Some(new_aa) = neutralize_aa_if_absent(target, &aa_val, page_ref)? {
+        if let Some(new_aa) = neutralize_aa_if_absent(target, &aa_val, keep)? {
             let mut page = resolve_dict(target, page_ref, "extracted page is not a dictionary")?;
             page.insert("AA", new_aa);
             target.set_object(page_ref, Object::Dictionary(page));
         }
     }
 
-    neutralize_bead_ring(target, page_ref)?;
+    neutralize_bead_ring(target, page_ref, keep)?;
     Ok(())
 }
 
@@ -233,7 +238,11 @@ fn neutralize_absent_dests(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRe
 /// is normalized through [`resolve_ref_chain`] to the terminal bead object:
 /// this both reaches the bead body through a chain and ensures the write-back
 /// targets the real bead, not an intermediate reference holder.
-fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Result<()> {
+fn neutralize_bead_ring(
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    page_ref: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
+) -> Result<()> {
     let b_val = {
         let page_obj = target.resolve_borrowed(page_ref)?;
         let Some(page_dict) = page_obj.as_dict() else {
@@ -272,7 +281,7 @@ fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) 
         // Inspect `/P` first; only `remove` it and write the bead back when it
         // is actually dropped, so a kept bead's stored `/P` is never rewritten.
         if let Some(p_val) = bead.get("P") {
-            if p_targets_absent_page(target, p_val, page_ref)? {
+            if p_targets_absent_page(target, p_val, keep)? {
                 bead.remove("P");
                 target.set_object(bead_ref, Object::Dictionary(bead));
             }
@@ -282,11 +291,11 @@ fn neutralize_bead_ring(target: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) 
 }
 
 /// Inspect one annotation; drop the cross-page destination from `/Dest`, `/A`,
-/// and `/AA` when it resolves to a page other than `keep`.
+/// and `/AA` when it resolves to a page not in `keep`.
 fn neutralize_annot_if_absent(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     annot_ref: ObjectRef,
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let Some(mut annot) = target.resolve_borrowed(annot_ref)?.as_dict().cloned() else {
         return Ok(());
@@ -356,7 +365,7 @@ fn neutralize_annot_if_absent(
 fn neutralize_aa_if_absent(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     aa_value: &Object,
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
 ) -> Result<Option<Object>> {
     let (concrete, terminal_ref) = resolve_ref_chain(target, aa_value)?;
     let Some(mut aa) = concrete.into_dict() else {
@@ -398,7 +407,7 @@ fn neutralize_aa_if_absent(
 }
 
 /// Walk an action value (`/A`, an `/AA` subaction, or a `/Next` element),
-/// dropping the `/D` of every GoTo whose destination targets a page other than
+/// dropping the `/D` of every GoTo whose destination targets a page not in
 /// `keep`. Follows the `/A`->action indirection chain and `/Next` chains
 /// (single action or array). Indirect cycles are bounded by `visited`; inline
 /// `/Next` nesting by `depth`. Returns `Some(updated)` when an INLINE action
@@ -408,7 +417,7 @@ fn neutralize_aa_if_absent(
 fn neutralize_action_chain(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     action_value: &Object,
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
     visited: &mut BTreeSet<ObjectRef>,
     depth: usize,
 ) -> Result<Option<Object>> {
@@ -516,7 +525,7 @@ fn neutralize_action_chain(
 fn neutralize_action_array(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     elems: &mut [Object],
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
     visited: &mut BTreeSet<ObjectRef>,
     depth: usize,
 ) -> Result<bool> {
@@ -530,32 +539,32 @@ fn neutralize_action_array(
     Ok(any)
 }
 
-/// `true` when `dest` resolves to an explicit page reference other than `keep`.
+/// `true` when `dest` resolves to an explicit page reference not in `keep`.
 /// Named / string / external destinations (no resolvable in-doc page ref) and
-/// self-links (`== keep`) return `false` — they are not neutralized.
+/// links to kept pages return `false` — they are not neutralized.
 fn dest_targets_absent_page(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     dest: &Object,
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
     Ok(match dest_page_ref_resolved(target, dest)? {
-        Some(page_ref) => page_ref != keep,
+        Some(page_ref) => !keep.contains(&page_ref),
         None => false,
     })
 }
 
-/// `true` when a GoTo `/SD` structure destination resolves to a page other than
+/// `true` when a GoTo `/SD` structure destination resolves to a page not in
 /// `keep`. An `/SD` value is `[structElemRef /Fit ...]` (or an indirect ref to
 /// one); the first element is a *structure element*, whose `/Pg` is the target
 /// page (ISO 32000-2 §12.6.4.3). Named structure destinations (a name/string,
 /// resolved via the structure tree) carry no in-document page ref and return
 /// `false`. A missing / unresolvable / non-Page `/Pg`, or a `/Pg` pointing at
-/// `keep`, returns `false` (kept conservatively). Each level may be indirect;
-/// `resolve_ref_chain` bounds the indirection.
+/// a kept page, returns `false` (kept conservatively). Each level may be
+/// indirect; `resolve_ref_chain` bounds the indirection.
 fn sd_targets_absent_page(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     sd: &Object,
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
     let (concrete, _) = resolve_ref_chain(target, sd)?;
     let Object::Array(arr) = concrete else {
@@ -577,25 +586,25 @@ fn sd_targets_absent_page(
     // hop, so confirm the resolved `/Pg` target is actually a `/Type /Page`
     // before treating it as a droppable cross-page destination.
     Ok(match pg_ref {
-        Some(r) => r != keep && is_page_dict(&pg_concrete),
+        Some(r) => !keep.contains(&r) && is_page_dict(&pg_concrete),
         None => false,
     })
 }
 
 /// `true` when `p` (an annotation's or bead's `/P`) resolves to a Page object
-/// other than `keep`. On an annotation (ISO 32000-2 §12.5.2, Table 166) or an
+/// not in `keep`. On an annotation (ISO 32000-2 §12.5.2, Table 166) or an
 /// article bead (§12.4.3), `/P` denotes the page the object belongs to, so a
 /// `/P` pointing at an absent page is dangling and dropped. Non-Page /
-/// unresolvable / `keep` targets return `false` (kept) — the `is_page_dict`
+/// unresolvable / kept-page targets return `false` (kept) — the `is_page_dict`
 /// gate also keeps any non-page `/P` (e.g. a StructElem's parent `/P`).
 fn p_targets_absent_page(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     p: &Object,
-    keep: ObjectRef,
+    keep: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
     let (concrete, p_ref) = resolve_ref_chain(target, p)?;
     Ok(match p_ref {
-        Some(r) => r != keep && is_page_dict(&concrete),
+        Some(r) => !keep.contains(&r) && is_page_dict(&concrete),
         None => false,
     })
 }
