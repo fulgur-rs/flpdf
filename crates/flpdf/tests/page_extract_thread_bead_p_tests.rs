@@ -12,9 +12,9 @@
 //! the page object becomes `null`.
 
 use flpdf::{
-    drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, prune_acroform_after_subset,
-    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, Object, ObjectRef, Pdf,
-    RemoveUnreferencedResources,
+    drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, extract_pages, pages,
+    prune_acroform_after_subset, prune_after_subset, rebuild_page_tree, remap_outline_and_dests,
+    Object, ObjectRef, Pdf, RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -155,6 +155,47 @@ fn dangling_bead_p_dropped_and_page_gced() {
         matches!(bead.get("P"), Some(Object::Reference(r)) if r.number == 3),
         "bead 11 /P (surviving page 1) must be kept, got {:?}",
         bead.get("P")
+    );
+}
+
+#[test]
+fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
+    // extract_pages(&[0, 0]): page 0 (obj 3) carries /B [11 0 R] and bead 11's
+    // /P points back at that page. The duplicate is a shallow clone, so both
+    // copies share the SAME bead object, and the single bead's /P must be the
+    // FIRST occurrence's ref — not the duplicate's, not dropped (qpdf 11.9.0
+    // duplicate-page bead /P parity).
+    let mut src = Pdf::open(Cursor::new(build_fixture())).expect("open fixture");
+    let mut out = extract_pages(&mut src, &[0, 0]).expect("extract duplicate selection");
+
+    let page_refs = pages::page_refs(&mut out).expect("output page refs");
+    assert_eq!(page_refs.len(), 2, "duplicate selection yields two pages");
+    assert_ne!(
+        page_refs[0], page_refs[1],
+        "duplicate kids must be distinct page objects"
+    );
+
+    // Both copies' /B reference the same bead object (shallow clone shares /B).
+    let bead_ref_of = |doc: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef| -> ObjectRef {
+        let page = doc.resolve(r).expect("page").into_dict().expect("dict");
+        match page.get("B") {
+            Some(Object::Array(a)) => a[0].as_ref_id().expect("/B[0] is an indirect ref"),
+            other => panic!("expected /B array, got {other:?}"),
+        }
+    };
+    let bead0 = bead_ref_of(&mut out, page_refs[0]);
+    let bead1 = bead_ref_of(&mut out, page_refs[1]);
+    assert_eq!(
+        bead0, bead1,
+        "both duplicate pages must share the SAME bead object"
+    );
+
+    // The single shared bead's /P targets the FIRST occurrence.
+    let bead = out.resolve(bead0).expect("bead").into_dict().expect("dict");
+    assert_eq!(
+        bead.get("P"),
+        Some(&Object::Reference(page_refs[0])),
+        "shared bead /P must point at the first occurrence's page ref"
     );
 }
 

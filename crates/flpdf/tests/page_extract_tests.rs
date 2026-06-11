@@ -1919,6 +1919,145 @@ fn extract_pages_duplicate_index_shallow_clones_page() {
     );
 }
 
+/// Page 3 carries two link annotations: one to page 4 (/Dest [4 0 R /Fit]),
+/// one to page 5 (/Dest [5 0 R /Fit]).
+fn three_page_linked_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R 7 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                6,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>",
+            ),
+            (
+                7,
+                "<< /Type /Annot /Subtype /Link /Rect [20 0 30 10] /Dest [5 0 R /Fit] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn extract_pages_keeps_dest_between_selected_pages() {
+    // A /Dest from one selected page to ANOTHER selected page is remapped and
+    // kept (the target is present in the output); a /Dest to a NON-selected
+    // page is neutralized and its stub pruned.
+    let src = three_page_linked_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2, "two selected pages enumerated");
+    let second_page_ref = page_refs[1];
+
+    let leaf = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
+    let annot_refs: Vec<flpdf::ObjectRef> = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a.iter().filter_map(Object::as_ref_id).collect(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    assert_eq!(annot_refs.len(), 2, "both annotations retained");
+
+    let mut kept = 0;
+    let mut neutralized = 0;
+    for annot_ref in annot_refs {
+        let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+        match annot.get("Dest") {
+            Some(Object::Array(arr)) => {
+                assert_eq!(
+                    arr.first(),
+                    Some(&Object::Reference(second_page_ref)),
+                    "kept /Dest must be remapped to the second output page"
+                );
+                kept += 1;
+            }
+            None => neutralized += 1,
+            other => panic!("unexpected /Dest shape: {other:?}"),
+        }
+    }
+    assert_eq!(kept, 1, "the link to selected page 4 must survive");
+    assert_eq!(
+        neutralized, 1,
+        "the link to non-selected page 5 must lose its /Dest"
+    );
+
+    // Page 5's copied stub becomes unreachable after neutralization and is
+    // swept: exactly the two selected pages remain.
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        2,
+        "non-selected page stub must be pruned"
+    );
+}
+
+#[test]
+fn extract_pages_materializes_inherited_attrs_per_parent() {
+    // Two leaves under DIFFERENT intermediate /Pages parents: each leaf must
+    // materialize the attributes inherited from ITS OWN parent chain, not the
+    // other leaf's.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /MediaBox [0 0 100 200] /Rotate 90 >>"),
+            (4, "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 /MediaBox [0 0 300 400] >>"),
+            (5, "<< /Type /Page /Parent 3 0 R >>"),
+            (6, "<< /Type /Page /Parent 4 0 R >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&bytes).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2);
+
+    let leaf0 = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
+    assert_eq!(
+        leaf0.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(200),
+        ])),
+        "leaf 0 inherits /MediaBox from its own parent (obj 3)"
+    );
+    assert_eq!(
+        leaf0.get("Rotate"),
+        Some(&Object::Integer(90)),
+        "leaf 0 inherits /Rotate 90 from its own parent (obj 3)"
+    );
+
+    let leaf1 = out.resolve(page_refs[1]).unwrap().into_dict().unwrap();
+    assert_eq!(
+        leaf1.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(300),
+            Object::Integer(400),
+        ])),
+        "leaf 1 inherits /MediaBox from its own parent (obj 4), not leaf 0's"
+    );
+    // flpdf materializes /Rotate explicitly on every extracted leaf; with no
+    // /Rotate anywhere in leaf 1's parent chain, the default 0 is written out.
+    assert_eq!(
+        leaf1.get("Rotate"),
+        Some(&Object::Integer(0)),
+        "leaf 1 must NOT inherit leaf 0's /Rotate 90; the default 0 is materialized"
+    );
+}
+
 #[test]
 fn bead_p_absent_page_via_indirect_chain_is_neutralized() {
     // The sibling bead (obj 11) is reached from the on-page bead's /N through an
