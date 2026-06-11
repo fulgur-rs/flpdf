@@ -15,6 +15,23 @@ use std::io::{Read, Seek};
 pub struct CheckReport {
     pub valid: bool,
     pub diagnostics: Diagnostics,
+    /// Document summary, or `None` when the open path failed before a document
+    /// object existed (e.g. an unrecoverable parse error).
+    pub summary: Option<CheckSummary>,
+}
+
+/// Document-level summary captured by [`check_reader`] when the input opened.
+///
+/// Backs a `qpdf --check`-style banner (header version, encryption and
+/// linearization status) without re-opening the document.
+#[derive(Debug, Clone)]
+pub struct CheckSummary {
+    /// PDF version from the file header, e.g. `"1.7"` (no `%PDF-` prefix).
+    pub version: String,
+    /// Whether the document authenticated an `/Encrypt` dictionary on open.
+    pub encrypted: bool,
+    /// Whether the document carries a linearization hint object.
+    pub linearized: bool,
 }
 
 /// Validate the document behind `reader` using the repair-enabled open path.
@@ -111,6 +128,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
                 return Ok(CheckReport {
                     valid: false,
                     diagnostics,
+                    summary: None,
                 });
             }
         }
@@ -128,19 +146,81 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     if pdf.trailer().get_ref("Root").is_none() {
         diagnostics.push(Diagnostic::error("trailer is missing /Root", None));
     }
-    if is_linearized_pdf(&mut pdf)? {
+    let linearized = is_linearized_pdf(&mut pdf)?;
+    if linearized {
         diagnostics.push(Diagnostic::warning(
             "linearized PDF detected: rewrite support preserves hint object but does not recompute linearization tables",
             None,
         ));
     }
 
+    let summary = CheckSummary {
+        version: pdf.version().to_string(),
+        encrypted: pdf.is_encrypted(),
+        linearized,
+    };
+
     Ok(CheckReport {
         valid: !diagnostics.has_errors(),
         diagnostics,
+        summary: Some(summary),
     })
 }
 
 fn is_linearized_pdf<R: Read + Seek>(reader: &mut Pdf<R>) -> crate::Result<bool> {
     reader.linearized_hint_ref().map(|hint| hint.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Minimal valid single-page PDF (`%PDF-1.4`), not encrypted, not linearized.
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn summary_present_for_clean_document() {
+        let report = check_reader_strict(Cursor::new(minimal_pdf_bytes())).unwrap();
+        assert!(report.valid);
+        let summary = report.summary.expect("summary present when document opens");
+        assert_eq!(summary.version, "1.4");
+        assert!(!summary.encrypted);
+        assert!(!summary.linearized);
+    }
+
+    #[test]
+    fn summary_none_when_open_fails() {
+        // Header present but no recoverable structure: the repair-enabled open
+        // path fails and is downgraded to an error diagnostic, so no document
+        // object is available to summarise.
+        let report =
+            check_reader(Cursor::new(b"%PDF-1.4\nthis is not a valid pdf at all\n%%EOF\n".to_vec()))
+                .unwrap();
+        assert!(!report.valid);
+        assert!(report.summary.is_none());
+    }
 }
