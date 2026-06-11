@@ -1,4 +1,4 @@
-use flpdf::{parse_object, Dictionary, Object, ObjectRef};
+use flpdf::{parse_object, Dictionary, Error, Object, ObjectRef};
 
 #[test]
 fn parses_dictionary_with_reference() {
@@ -125,5 +125,85 @@ fn skips_comments_between_tokens() {
             Object::Integer(2),
             Object::Integer(3)
         ])
+    );
+}
+
+// Nesting-depth limit (qpdf CVE-2018-9918 class). The recursive descent parser
+// (`object` -> `dictionary`/`array` -> `object`) would otherwise overflow the
+// stack and abort — an uncatchable failure — on adversarially deep input. The
+// limit (`MAX_PARSE_DEPTH`, 500, matching qpdf's `parser_max_nesting` region)
+// must reject such input with a catchable `Error::Parse`.
+
+/// An array nested exactly at the depth limit still parses. Guards against an
+/// off-by-one that would reject legitimate (if deep) documents.
+#[test]
+fn accepts_array_nesting_at_limit() {
+    let depth = 500;
+    let mut input = vec![b'['; depth];
+    input.extend(std::iter::repeat_n(b']', depth));
+
+    assert!(
+        parse_object(&input).is_ok(),
+        "array nested {depth} deep (at the limit) must parse"
+    );
+}
+
+/// An array nested one level past the limit is rejected with a catchable
+/// `Error::Parse`, not a panic or abort.
+#[test]
+fn rejects_array_nesting_over_limit() {
+    let depth = 501;
+    let mut input = vec![b'['; depth];
+    input.extend(std::iter::repeat_n(b']', depth));
+
+    let err = parse_object(&input).expect_err("over-limit array nesting must error");
+    assert!(
+        matches!(err, Error::Parse { .. }),
+        "expected Error::Parse, got {err:?}"
+    );
+}
+
+/// Pathologically deep array nesting returns an error instead of overflowing
+/// the stack (which would abort the process, uncatchable by callers).
+#[test]
+fn rejects_deeply_nested_arrays_without_stack_overflow() {
+    let depth = 100_000;
+    let mut input = vec![b'['; depth];
+    input.extend(std::iter::repeat_n(b']', depth));
+
+    assert!(
+        parse_object(&input).is_err(),
+        "deeply nested arrays must error, not abort"
+    );
+}
+
+/// A dictionary nested well within the depth limit parses normally, confirming
+/// the limit does not regress ordinary nested documents.
+#[test]
+fn accepts_dictionary_nesting_within_limit() {
+    let depth = 100;
+    let mut input = b"<</K ".repeat(depth);
+    input.extend_from_slice(b"0");
+    input.extend(b">>".repeat(depth));
+
+    assert!(
+        parse_object(&input).is_ok(),
+        "dictionary nested {depth} deep (within the limit) must parse"
+    );
+}
+
+/// Pathologically deep dictionary nesting returns an error instead of
+/// overflowing the stack. `dictionary` is a distinct recursion site from
+/// `array`, so it needs its own deep-nesting guard.
+#[test]
+fn rejects_deeply_nested_dictionaries_without_stack_overflow() {
+    let depth = 100_000;
+    let mut input = b"<</K ".repeat(depth);
+    input.extend_from_slice(b"0");
+    input.extend(b">>".repeat(depth));
+
+    assert!(
+        parse_object(&input).is_err(),
+        "deeply nested dictionaries must error, not abort"
     );
 }

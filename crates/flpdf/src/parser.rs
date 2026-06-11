@@ -84,7 +84,18 @@ pub(crate) struct Parser<'a> {
     /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
     /// can surface the payload window for xref-based resolution.
     last_indirect_stream_len: Option<IndirectStreamLength>,
+    /// Current object-nesting recursion depth, maintained by [`object`](Self::object)
+    /// to bound recursion against adversarially deep input.
+    depth: usize,
 }
+
+// Maximum object-nesting depth the recursive-descent parser will accept before
+// returning an error. Without this bound, deeply nested input (`[[[[…` or
+// `<</A <</A …`) recurses until the stack overflows and the process aborts —
+// the qpdf CVE-2018-9918 class of denial of service. 500 matches the region of
+// qpdf's `parser_max_nesting` (default 499); real documents never nest this
+// deep, so only adversarial input is rejected.
+const MAX_PARSE_DEPTH: usize = 500;
 
 impl<'a> Parser<'a> {
     pub(crate) fn new(input: &'a [u8]) -> Self {
@@ -93,6 +104,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             no_reference: false,
             last_indirect_stream_len: None,
+            depth: 0,
         }
     }
 
@@ -104,6 +116,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             no_reference: true,
             last_indirect_stream_len: None,
+            depth: 0,
         }
     }
 
@@ -119,6 +132,24 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn object(&mut self) -> Result<Object> {
+        // `object` is the sole recursion hub: `dictionary` values and `array`
+        // elements recurse only through it, and leaf parsers do not recurse.
+        // A symmetric increment/decrement here therefore bounds every nesting
+        // path. Decrementing on the error early-return AND on the normal return
+        // keeps `depth` balanced across both, so repeated `parse_one_object`
+        // calls from the content-stream tokenizer (which reuse one parser) do
+        // not accumulate depth.
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(Error::parse(self.pos, "object nesting too deep"));
+        }
+        let result = self.object_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn object_inner(&mut self) -> Result<Object> {
         self.skip_ws();
         if self.starts_with(b"<<") {
             return self.dictionary();
