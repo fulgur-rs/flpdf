@@ -113,6 +113,67 @@ fn missing_root_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// Clean PDF whose catalog declares an Adobe extension level
+/// (`/Extensions /ADBE /ExtensionLevel 8`). qpdf appends `extension level 8` to
+/// its `PDF Version:` banner.
+fn extension_level_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >> >>\nendobj\n",
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+/// Valid PDF whose first object (object 1) carries `/Linearized 1`. flpdf's
+/// structural detector (`Pdf::linearized_hint_ref`, object (1,0)) reports this
+/// as linearized, which pushes the "linearized PDF detected" advisory warning
+/// → exit 3. (Full qpdf-accurate linearization parity is tracked in flpdf-u1ro.)
+fn linearized_obj1_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Linearized 1 /L 0 /H [ 0 0 ] /O 4 /E 0 /N 1 /T 0 >>\nendobj\n",
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 // ---------------------------------------------------------------------------
 // Tests: exit 0 — clean PDF
 // ---------------------------------------------------------------------------
@@ -126,7 +187,8 @@ fn check_clean_pdf_exits_0() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("PDF check succeeded").not())
         .stderr(predicate::str::is_empty());
 }
 
@@ -139,8 +201,91 @@ fn check_subcommand_clean_pdf_exits_0() {
     cmd.args(["check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("PDF check succeeded").not())
         .stderr(predicate::str::is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Tests: qpdf-compatible stdout "checking" block
+// ---------------------------------------------------------------------------
+
+/// A clean plaintext PDF prints qpdf's full check block: the `checking <file>`
+/// banner, header version, encryption + linearization status, and the trailing
+/// reassurance note. The subject of that note is `progname()` (here `flpdf`).
+#[test]
+fn check_clean_pdf_emits_qpdf_block() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&clean_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains(format!("checking {path}\n")))
+        .stdout(predicate::str::contains("PDF Version: 1.4\n"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("File is not linearized\n"))
+        .stdout(predicate::str::contains(
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+        ))
+        .stdout(predicate::str::contains("PDF check succeeded").not());
+}
+
+/// On exit 3 (warnings, no errors) the block is still printed, but qpdf omits
+/// the trailing "No syntax ..." reassurance note (warnings go to stderr).
+#[test]
+fn check_warnings_emit_block_without_trailing_line() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--repair", f.path().to_str().unwrap()])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("File is not linearized\n"))
+        .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
+        .stdout(predicate::str::contains("PDF check succeeded").not());
+}
+
+/// A catalog `/Extensions /ADBE /ExtensionLevel` is appended to the version
+/// banner, matching qpdf (`PDF Version: 1.7 extension level 8`).
+#[test]
+fn check_appends_adobe_extension_level_to_version() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&extension_level_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", f.path().to_str().unwrap()])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains(
+            "PDF Version: 1.7 extension level 8\n",
+        ));
+}
+
+/// A file whose first object is a `/Linearized` dictionary prints
+/// `File is linearized`. flpdf's structural detector also pushes the
+/// linearization advisory warning, so the run exits 3 (and therefore omits the
+/// trailing reassurance note). Full qpdf-accurate behaviour is tracked in
+/// flpdf-u1ro.
+#[test]
+fn check_linearized_pdf_reports_linearized_line() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&linearized_obj1_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", f.path().to_str().unwrap()])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("File is linearized\n"))
+        .stdout(predicate::str::contains("File is not linearized").not());
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +303,7 @@ fn check_warnings_only_pdf_exits_3() {
     cmd.args(["--check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
         .stderr(predicate::str::contains("WARNING: "));
 }
 
@@ -171,7 +316,7 @@ fn check_subcommand_warnings_only_pdf_exits_3() {
     cmd.args(["check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
         .stderr(predicate::str::contains("WARNING: "));
 }
 
@@ -186,7 +331,7 @@ fn check_warnings_use_qpdf_stderr_format() {
         .args(["--check", "--repair", &path])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
         // qpdf shape: WARNING: <file>: <msg>, surrounding warnings without
         // offset, then the trailing summary line.
         .stderr(predicate::str::contains(format!(
@@ -257,8 +402,10 @@ fn check_error_diagnostics_use_qpdf_stderr_format() {
         )))
         .stderr(predicate::str::contains("PDF check failed").not())
         .stderr(predicate::str::contains("error: ").not())
-        // exit 2 prints no success line on stdout.
-        .stdout(predicate::str::contains("PDF check succeeded").not());
+        // exit 2 emits no stdout block at all: qpdf throws during document init
+        // (missing /Root) before printing the `checking` banner, and flpdf
+        // matches by gating the block on a valid report.
+        .stdout(predicate::str::is_empty());
 }
 
 /// Fatal open errors carry the input path: `<progname>: <file>: <msg>`

@@ -1547,10 +1547,10 @@ fn main() {
         // convention for "error", unchanged from before this change).
         if let Some(exit_err) = error.downcast_ref::<CliExitError>() {
             // Only print a message when there is one; the caller may have
-            // already printed its own summary (e.g. run_check prints
-            // "PDF check succeeded" before returning exit 3 for warnings,
-            // and its exit-2 path passes an empty message because the error
-            // diagnostics were already printed in qpdf shape).
+            // already printed its own summary (e.g. run_check prints the qpdf
+            // "checking" block before returning exit 3 for warnings, and its
+            // exit-2 path passes an empty message because the error diagnostics
+            // were already printed in qpdf shape).
             if !exit_err.message.is_empty() {
                 eprintln!("{}: {}", progname(), exit_err.message);
             }
@@ -2039,11 +2039,17 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         }));
     }
 
+    // Valid document (exit 0 or 3): emit qpdf's stdout "checking" block. The
+    // summary is present whenever the document opened, which is implied by
+    // `report.valid`; the `if let` is a defensive match.
+    if let Some(summary) = &report.summary {
+        print_check_block(&input, summary);
+    }
+
     if has_warnings {
-        // Warnings without errors — exit 3.  The success message has already
-        // been printed above; pass an empty message so main() does not emit
-        // a redundant "flpdf: ..." line.
-        println!("PDF check succeeded");
+        // Warnings without errors — exit 3. qpdf still prints the block above,
+        // but omits the trailing "No syntax ..." note. Pass an empty message so
+        // main() does not emit a redundant "flpdf: ..." line.
         // qpdf 11.9.0 ends the warning-bearing run with this stderr summary.
         eprintln!("{}: operation succeeded with warnings", progname());
         return Err(Box::new(CliExitError {
@@ -2052,9 +2058,48 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         }));
     }
 
-    // Clean — exit 0.
-    println!("PDF check succeeded");
+    // Clean — exit 0. qpdf closes a clean check with this two-line note; the
+    // subject mirrors progname() so it is byte-identical under FLPDF_PROGNAME=qpdf.
+    println!("No syntax or stream encoding errors found; the file may still contain");
+    println!("errors that {} cannot detect", progname());
     Ok(())
+}
+
+/// Print qpdf's `--check` document summary block to stdout.
+///
+/// Mirrors qpdf 11.9.0's stdout for a successfully-opened document: the
+/// `checking <file>` banner, header version, encryption status and
+/// linearization status. `<file>` is echoed verbatim as supplied on the command
+/// line (qpdf prints the argument, not a canonicalised path).
+fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) {
+    println!("checking {}", input.display());
+    // qpdf appends "extension level N" to the version when the catalog declares
+    // an Adobe extension level (`/Extensions /ADBE /ExtensionLevel`).
+    match summary.extension_level {
+        Some(level) => println!("PDF Version: {} extension level {level}", summary.version),
+        None => println!("PDF Version: {}", summary.version),
+    }
+    // Interim: encrypted files emit a single line. The detailed qpdf
+    // `R = / P = / permission / method` block is tracked in flpdf-oox1.
+    println!(
+        "{}",
+        if summary.encrypted {
+            "File is encrypted"
+        } else {
+            "File is not encrypted"
+        }
+    );
+    // The linearization status reflects the structural detector (object (1,0)
+    // only). qpdf-accurate detection — plus the entangled warning / exit-code /
+    // trailing-line behaviour — is tracked in flpdf-u1ro.
+    println!(
+        "{}",
+        if summary.linearized {
+            "File is linearized"
+        } else {
+            "File is not linearized"
+        }
+    );
 }
 
 /// Wire `--encrypt` / `--copy-encryption-from` onto `options`, shared by the
