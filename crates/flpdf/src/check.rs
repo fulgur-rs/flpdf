@@ -4,7 +4,7 @@
 //! enabled), report parser warnings, and flag a few high-level invariants that would
 //! cause downstream tools to fail.
 
-use crate::{Diagnostic, Diagnostics, Error, Pdf, PdfOpenOptions};
+use crate::{Diagnostic, Diagnostics, Error, Object, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
 /// Result of [`check_reader`].
@@ -34,6 +34,10 @@ pub struct CheckSummary {
     pub encrypted: bool,
     /// Whether the document carries a linearization hint object.
     pub linearized: bool,
+    /// Adobe extension level from the catalog's `/Extensions /ADBE
+    /// /ExtensionLevel`, when present. qpdf appends this to the version banner
+    /// (e.g. `PDF Version: 1.7 extension level 8`).
+    pub extension_level: Option<i64>,
 }
 
 /// Validate the document behind `reader` using the repair-enabled open path.
@@ -175,6 +179,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
         version: pdf.version().to_string(),
         encrypted: pdf.is_encrypted(),
         linearized,
+        extension_level: adobe_extension_level(&mut pdf),
     };
 
     Ok(CheckReport {
@@ -186,6 +191,28 @@ fn check_reader_inner_with_options<R: Read + Seek>(
 
 fn is_linearized_pdf<R: Read + Seek>(reader: &mut Pdf<R>) -> crate::Result<bool> {
     reader.linearized_hint_ref().map(|hint| hint.is_some())
+}
+
+/// Read the Adobe extension level from the catalog's `/Extensions /ADBE
+/// /ExtensionLevel`, resolving indirect references at each step. Returns `None`
+/// when any link in that chain is absent or not the expected type. qpdf only
+/// honours the `/ADBE` developer prefix for its `--check` version banner.
+fn adobe_extension_level<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<i64> {
+    let root_ref = pdf.trailer().get_ref("Root")?;
+    let catalog = pdf.resolve(root_ref).ok()?;
+    let extensions = resolve_value(pdf, catalog.as_dict()?.get("Extensions")?.clone())?;
+    let adbe = resolve_value(pdf, extensions.as_dict()?.get("ADBE")?.clone())?;
+    let level = resolve_value(pdf, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
+    level.as_integer()
+}
+
+/// Resolve `value` one level: follow an [`Object::Reference`] through `pdf`,
+/// or return a non-reference value unchanged.
+fn resolve_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
+    match value {
+        Object::Reference(reference) => pdf.resolve(reference).ok(),
+        other => Some(other),
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +255,49 @@ mod tests {
         assert_eq!(summary.version, "1.4");
         assert!(!summary.encrypted);
         assert!(!summary.linearized);
+        assert_eq!(summary.extension_level, None);
+    }
+
+    /// `%PDF-1.7` document whose catalog reaches an Adobe extension level via an
+    /// *indirect* `/Extensions` reference (object 4), with an inline `/ADBE`
+    /// dictionary and an inline integer `/ExtensionLevel`.
+    fn extension_level_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>\nendobj\n",
+        );
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn summary_reports_adobe_extension_level() {
+        let report = check_reader_strict(Cursor::new(extension_level_pdf_bytes())).unwrap();
+        let summary = report.summary.expect("summary present");
+        assert_eq!(summary.version, "1.7");
+        assert_eq!(summary.extension_level, Some(8));
     }
 
     #[test]

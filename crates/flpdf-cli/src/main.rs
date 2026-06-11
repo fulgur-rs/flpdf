@@ -2073,7 +2073,12 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
 /// line (qpdf prints the argument, not a canonicalised path).
 fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) {
     println!("checking {}", input.display());
-    println!("PDF Version: {}", summary.version);
+    // qpdf appends "extension level N" to the version when the catalog declares
+    // an Adobe extension level (`/Extensions /ADBE /ExtensionLevel`).
+    match summary.extension_level {
+        Some(level) => println!("PDF Version: {} extension level {level}", summary.version),
+        None => println!("PDF Version: {}", summary.version),
+    }
     // Interim: encrypted files emit a single line. The detailed qpdf
     // `R = / P = / permission / method` block is tracked in flpdf-oox1.
     println!(

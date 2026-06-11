@@ -113,6 +113,35 @@ fn missing_root_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// Clean PDF whose catalog declares an Adobe extension level
+/// (`/Extensions /ADBE /ExtensionLevel 8`). qpdf appends `extension level 8` to
+/// its `PDF Version:` banner.
+fn extension_level_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >> >>\nendobj\n",
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 /// Valid PDF whose first object (object 1) carries `/Linearized 1`. flpdf's
 /// structural detector (`Pdf::linearized_hint_ref`, object (1,0)) reports this
 /// as linearized, which pushes the "linearized PDF detected" advisory warning
@@ -221,6 +250,23 @@ fn check_warnings_emit_block_without_trailing_line() {
         .stdout(predicate::str::contains("File is not linearized\n"))
         .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
         .stdout(predicate::str::contains("PDF check succeeded").not());
+}
+
+/// A catalog `/Extensions /ADBE /ExtensionLevel` is appended to the version
+/// banner, matching qpdf (`PDF Version: 1.7 extension level 8`).
+#[test]
+fn check_appends_adobe_extension_level_to_version() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&extension_level_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", f.path().to_str().unwrap()])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains(
+            "PDF Version: 1.7 extension level 8\n",
+        ));
 }
 
 /// A file whose first object is a `/Linearized` dictionary prints
