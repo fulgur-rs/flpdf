@@ -146,7 +146,7 @@ pub use page_annotation_flatten::{flatten_annotations, flatten_annotations_on_pa
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
-pub use page_extract::extract_page;
+pub use page_extract::{extract_page, extract_pages};
 pub use page_label_document_helper::{LabelRange, LabelStyle, PageLabelDocumentHelper};
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};

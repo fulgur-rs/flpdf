@@ -1,6 +1,8 @@
-//! Integration tests for [`flpdf::extract_page`].
+//! Integration tests for [`flpdf::extract_page`] / [`flpdf::extract_pages`].
 
-use flpdf::{extract_page, pages, write_pdf_with_options, Object, Pdf, WriteOptions};
+use flpdf::{
+    extract_page, extract_pages, pages, write_pdf_with_options, Object, Pdf, WriteOptions,
+};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -202,6 +204,95 @@ fn materializes_inherited_cropbox() {
             Object::Integer(5),
             Object::Integer(590),
             Object::Integer(770),
+        ]))
+    );
+}
+
+/// The leaf carries its OWN /CropBox while the ancestor /Pages offers a
+/// different inheritable one; the leaf's own value must win (no inherited
+/// overwrite).
+fn own_cropbox_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /CropBox [5 5 590 770] >>",
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [1 1 400 500] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn own_cropbox_is_preserved() {
+    let src = own_cropbox_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    // The leaf's own /CropBox wins over the ancestor's inheritable one.
+    assert_eq!(
+        leaf.get("CropBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(1),
+            Object::Integer(400),
+            Object::Integer(500),
+        ]))
+    );
+}
+
+/// Two-level page tree: root /Pages (obj 2) -> intermediate /Pages (obj 5)
+/// carrying both /MediaBox and /CropBox -> leaf (obj 3) with neither. Both
+/// boxes must be materialized onto the extracted leaf through the
+/// intermediate node.
+fn intermediate_boxes_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [5 0 R] /Count 1 >>"),
+            (
+                5,
+                "<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /CropBox [10 10 600 780] >>",
+            ),
+            (3, "<< /Type /Page /Parent 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn materializes_intermediate_mediabox_and_cropbox() {
+    let src = intermediate_boxes_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0]).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    // Inherited /MediaBox materialized onto the leaf.
+    assert_eq!(
+        leaf.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]))
+    );
+    // Inherited /CropBox materialized onto the leaf.
+    assert_eq!(
+        leaf.get("CropBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(10),
+            Object::Integer(10),
+            Object::Integer(600),
+            Object::Integer(780),
         ]))
     );
 }
@@ -1634,6 +1725,336 @@ fn bead_p_absent_page_is_neutralized() {
         p_page.get("Type"),
         Some(&flpdf::Object::Name(b"Page".to_vec())),
         "preserved bead /P must resolve to a /Type /Page"
+    );
+}
+
+// --- extract_pages: multi-page extraction (dedup, ordering, duplicates) ---
+
+/// Three-page document; pages 3 and 4 SHARE font 7; page 5 has its own font 8.
+fn three_page_shared_font_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F2 8 0 R >> >> >>"),
+            (6, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (8, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+        ],
+        1,
+    )
+}
+
+/// Count objects whose dict is `/Type /Font` with the given `/BaseFont`.
+fn count_font_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, base: &[u8]) -> usize {
+    let mut n = 0;
+    for r in doc.object_refs() {
+        if let Ok(obj) = doc.resolve(r) {
+            if let Some(d) = obj.as_dict() {
+                if d.get("Type").and_then(|o| o.as_name()) == Some(&b"Font"[..])
+                    && d.get("BaseFont").and_then(|o| o.as_name()) == Some(base)
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Resolve a leaf page's inline /Resources -> /Font -> first entry's
+/// reference -> /BaseFont name.
+fn leaf_font_basefont(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, leaf: flpdf::ObjectRef) -> Vec<u8> {
+    let leaf = doc
+        .resolve_borrowed(leaf)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let font_ref = leaf
+        .get("Resources")
+        .and_then(|o| o.as_dict())
+        .and_then(|r| r.get("Font"))
+        .and_then(|o| o.as_dict())
+        .and_then(|f| f.iter().next().map(|(_, v)| v.clone()))
+        .and_then(|v| v.as_ref_id())
+        .expect("leaf /Resources /Font first entry must be an indirect ref");
+    let font = doc.resolve(font_ref).unwrap().into_dict().unwrap();
+    font.get("BaseFont")
+        .and_then(|o| o.as_name())
+        .expect("/BaseFont")
+        .to_vec()
+}
+
+#[test]
+fn extract_pages_copies_shared_resource_once() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2, "extracted doc must have two pages");
+    let root = pages_dict(&mut out);
+    assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+
+    assert_eq!(
+        count_font_objects(&mut out, b"Helvetica"),
+        1,
+        "the shared font must be copied exactly once"
+    );
+    assert_eq!(
+        count_font_objects(&mut out, b"Courier"),
+        0,
+        "page 3's exclusive font must not leak in"
+    );
+}
+
+#[test]
+fn extract_pages_object_count_sublinear_vs_per_page_extracts() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let combined = extract_pages(&mut source, &[0, 1])
+        .unwrap()
+        .object_refs()
+        .len();
+    let separate = extract_page(&mut source, 0).unwrap().object_refs().len()
+        + extract_page(&mut source, 1).unwrap().object_refs().len();
+    assert!(
+        combined < separate,
+        "single-map extract must dedup shared objects: {combined} >= {separate}"
+    );
+}
+
+#[test]
+fn extract_pages_preserves_selection_order() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[2, 0]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2);
+    assert_eq!(
+        leaf_font_basefont(&mut out, page_refs[0]),
+        b"Courier".to_vec(),
+        "first output page must be source page 2 (Courier font)"
+    );
+    assert_eq!(
+        leaf_font_basefont(&mut out, page_refs[1]),
+        b"Helvetica".to_vec(),
+        "second output page must be source page 0 (Helvetica font)"
+    );
+}
+
+#[test]
+fn extract_pages_empty_selection_errors() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let err = match extract_pages(&mut source, &[]) {
+        Ok(_) => panic!("empty selection should error, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, flpdf::Error::Unsupported(msg) if msg == "empty page selection"),
+        "empty selection should yield Error::Unsupported(\"empty page selection\"), got {err:?}"
+    );
+}
+
+#[test]
+fn extract_pages_out_of_range_index_errors() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let err = match extract_pages(&mut source, &[0, 3]) {
+        Ok(_) => panic!("index 3 out of range should error, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, flpdf::Error::Unsupported(msg)
+            if msg == "page index 3 out of range (document has 3 pages)"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn extract_pages_duplicate_index_shallow_clones_page() {
+    // qpdf-compatible duplicate selection: the second occurrence becomes a
+    // fresh page object whose sub-objects (/Contents, /Resources) stay shared
+    // with the first copy.
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 0]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2, "duplicate selection yields two kids");
+    assert_ne!(
+        page_refs[0], page_refs[1],
+        "duplicate kids must be distinct page objects"
+    );
+    let root = pages_dict(&mut out);
+    assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+
+    // Sub-objects stay SHARED: both kids reference the same /Contents stream.
+    let contents_ref = |doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, r: flpdf::ObjectRef| {
+        doc.resolve_borrowed(r)
+            .unwrap()
+            .as_dict()
+            .and_then(|d| d.get("Contents"))
+            .and_then(Object::as_ref_id)
+            .expect("/Contents ref")
+    };
+    assert_eq!(
+        contents_ref(&mut out, page_refs[0]),
+        contents_ref(&mut out, page_refs[1]),
+        "duplicate pages must share the same /Contents object"
+    );
+    assert_eq!(
+        count_font_objects(&mut out, b"Helvetica"),
+        1,
+        "the shared font is still copied exactly once"
+    );
+}
+
+/// Page 3 carries two link annotations: one to page 4 (/Dest [4 0 R /Fit]),
+/// one to page 5 (/Dest [5 0 R /Fit]).
+fn three_page_linked_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R 7 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                6,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>",
+            ),
+            (
+                7,
+                "<< /Type /Annot /Subtype /Link /Rect [20 0 30 10] /Dest [5 0 R /Fit] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn extract_pages_keeps_dest_between_selected_pages() {
+    // A /Dest from one selected page to ANOTHER selected page is remapped and
+    // kept (the target is present in the output); a /Dest to a NON-selected
+    // page is neutralized and its stub pruned.
+    let src = three_page_linked_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2, "two selected pages enumerated");
+    let second_page_ref = page_refs[1];
+
+    let leaf = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
+    let annot_refs: Vec<flpdf::ObjectRef> = match leaf.get("Annots") {
+        Some(Object::Array(a)) => a.iter().filter_map(Object::as_ref_id).collect(),
+        other => panic!("expected /Annots array, got {other:?}"),
+    };
+    assert_eq!(annot_refs.len(), 2, "both annotations retained");
+
+    let mut kept = 0;
+    let mut neutralized = 0;
+    for annot_ref in annot_refs {
+        let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+        match annot.get("Dest") {
+            Some(Object::Array(arr)) => {
+                assert_eq!(
+                    arr.first(),
+                    Some(&Object::Reference(second_page_ref)),
+                    "kept /Dest must be remapped to the second output page"
+                );
+                kept += 1;
+            }
+            None => neutralized += 1,
+            other => panic!("unexpected /Dest shape: {other:?}"),
+        }
+    }
+    assert_eq!(kept, 1, "the link to selected page 4 must survive");
+    assert_eq!(
+        neutralized, 1,
+        "the link to non-selected page 5 must lose its /Dest"
+    );
+
+    // Page 5's copied stub becomes unreachable after neutralization and is
+    // swept: exactly the two selected pages remain.
+    assert_eq!(
+        count_type(&mut out, b"Page"),
+        2,
+        "non-selected page stub must be pruned"
+    );
+}
+
+#[test]
+fn extract_pages_materializes_inherited_attrs_per_parent() {
+    // Two leaves under DIFFERENT intermediate /Pages parents: each leaf must
+    // materialize the attributes inherited from ITS OWN parent chain, not the
+    // other leaf's.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /MediaBox [0 0 100 200] /Rotate 90 >>"),
+            (4, "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 /MediaBox [0 0 300 400] >>"),
+            (5, "<< /Type /Page /Parent 3 0 R >>"),
+            (6, "<< /Type /Page /Parent 4 0 R >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem(&bytes).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2);
+
+    let leaf0 = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
+    assert_eq!(
+        leaf0.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(200),
+        ])),
+        "leaf 0 inherits /MediaBox from its own parent (obj 3)"
+    );
+    assert_eq!(
+        leaf0.get("Rotate"),
+        Some(&Object::Integer(90)),
+        "leaf 0 inherits /Rotate 90 from its own parent (obj 3)"
+    );
+
+    let leaf1 = out.resolve(page_refs[1]).unwrap().into_dict().unwrap();
+    assert_eq!(
+        leaf1.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(300),
+            Object::Integer(400),
+        ])),
+        "leaf 1 inherits /MediaBox from its own parent (obj 4), not leaf 0's"
+    );
+    // flpdf materializes /Rotate explicitly on every extracted leaf; with no
+    // /Rotate anywhere in leaf 1's parent chain, the default 0 is written out.
+    assert_eq!(
+        leaf1.get("Rotate"),
+        Some(&Object::Integer(0)),
+        "leaf 1 must NOT inherit leaf 0's /Rotate 90; the default 0 is materialized"
     );
 }
 
