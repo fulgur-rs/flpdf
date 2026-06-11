@@ -208,6 +208,95 @@ fn materializes_inherited_cropbox() {
     );
 }
 
+/// The leaf carries its OWN /CropBox while the ancestor /Pages offers a
+/// different inheritable one; the leaf's own value must win (no inherited
+/// overwrite).
+fn own_cropbox_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /CropBox [5 5 590 770] >>",
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [1 1 400 500] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn own_cropbox_is_preserved() {
+    let src = own_cropbox_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    // The leaf's own /CropBox wins over the ancestor's inheritable one.
+    assert_eq!(
+        leaf.get("CropBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(1),
+            Object::Integer(400),
+            Object::Integer(500),
+        ]))
+    );
+}
+
+/// Two-level page tree: root /Pages (obj 2) -> intermediate /Pages (obj 5)
+/// carrying both /MediaBox and /CropBox -> leaf (obj 3) with neither. Both
+/// boxes must be materialized onto the extracted leaf through the
+/// intermediate node.
+fn intermediate_boxes_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [5 0 R] /Count 1 >>"),
+            (
+                5,
+                "<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /CropBox [10 10 600 780] >>",
+            ),
+            (3, "<< /Type /Page /Parent 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn materializes_intermediate_mediabox_and_cropbox() {
+    let src = intermediate_boxes_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0]).unwrap();
+    let leaf = only_leaf(&mut out);
+
+    // Inherited /MediaBox materialized onto the leaf.
+    assert_eq!(
+        leaf.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]))
+    );
+    // Inherited /CropBox materialized onto the leaf.
+    assert_eq!(
+        leaf.get("CropBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(10),
+            Object::Integer(10),
+            Object::Integer(600),
+            Object::Integer(780),
+        ]))
+    );
+}
+
 /// Ancestor /Pages stores /MediaBox as an INDIRECT reference (obj 6), the qpdf
 /// shared-array pattern. The leaf (obj 3) inherits it. Exercises rewrite_refs'
 /// Object::Reference branch: the extracted leaf's /MediaBox must resolve to a

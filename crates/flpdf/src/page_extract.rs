@@ -85,7 +85,7 @@ struct InheritedAttrs {
 /// page become shallow clones of its first copy: each duplicate gets its own
 /// page object, while indirectly referenced sub-objects (`/Contents`,
 /// `/Resources`, `/Annots`, `/B`) stay shared between the duplicates,
-/// matching qpdf's observed duplicate-page output.
+/// matching qpdf 11.9.0's observed duplicate-page output.
 ///
 /// The returned document is already minimal: copied ancestor `/Pages` nodes
 /// left over from the closure are pruned (mark-and-sweep from the new
@@ -167,7 +167,7 @@ pub fn extract_pages<R: Read + Seek>(
             &mut target,
             copied_page_ref,
             "copied page is not a dictionary",
-        )?;
+        )?; // cov:ignore: Err arm unreachable — page_refs yields only /Type /Page dicts and copy_objects preserves the source page dict
 
         if !has_own(&leaf, "Resources") {
             if let Some(res) = attrs.resources {
@@ -233,18 +233,20 @@ pub fn extract_pages<R: Read + Seek>(
                 // cov:ignore-start: unreachable in practice — copy_objects
                 // renumbers the freshly built target sequentially from a small
                 // base, so hitting u32::MAX would need ~2^32 copied objects.
+                // The `})?;` terminator carries the Err-propagation region of
+                // this same arm, so the block extends through it.
                 Error::Unsupported(
                     "page extract: object-number overflow allocating duplicate page".to_string(),
                 )
-                // cov:ignore-end
             })?;
+            // cov:ignore-end
             let clone_ref = ObjectRef::new(next_num, 0);
             // The one intentional copy: the duplicate kid's own dictionary.
             let dict = resolve_dict(
                 &mut target,
                 copied_page_ref,
                 "copied page is not a dictionary",
-            )?;
+            )?; // cov:ignore: Err arm unreachable — the first copy of this page resolved to a dictionary in the materialize loop above
             target.set_object(clone_ref, Object::Dictionary(dict));
             clone_ref
         };
