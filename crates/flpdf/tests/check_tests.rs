@@ -35,6 +35,9 @@ fn check_reports_linearized_pdf_warning() {
         .entries()
         .iter()
         .any(|entry| entry.severity == Severity::Warning && entry.message.contains("linearized")));
+    // The summary mirrors the structural detector: an object-(1,0) `/Linearized`
+    // dictionary is reported as linearized.
+    assert!(report.summary.expect("summary present").linearized);
 }
 
 #[test]
