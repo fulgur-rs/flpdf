@@ -98,6 +98,26 @@ struct InheritedAttrs {
 /// form, and the [module documentation](self) for how cross-page
 /// destinations on the extracted pages are neutralized.
 ///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{extract_pages, write_pdf_with_options, Pdf, WriteOptions};
+///
+/// let file = BufReader::new(File::open("input.pdf")?);
+/// let mut pdf = Pdf::open(file)?;
+///
+/// // First and third page (0-based), in selection order.
+/// let mut extracted = extract_pages(&mut pdf, &[0, 2])?;
+///
+/// let mut options = WriteOptions::default();
+/// options.full_rewrite = true;
+/// let mut out = File::create("extracted.pdf")?;
+/// write_pdf_with_options(&mut extracted, &mut out, &options)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
 /// # Errors
 ///
 /// - [`Error::Unsupported`] if `page_indices` is empty or any index is out of

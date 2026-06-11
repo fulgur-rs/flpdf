@@ -29,10 +29,10 @@
 //! A removed page kept alive only through a sibling bead reachable via a
 //! surviving page's `/B` (with no usable `/Threads`) must still have that
 //! bead's `/P` dropped, or the prune cannot collect the page. Indirection is
-//! normalized through [`crate::outline_dest_remap::resolve_ref_chain`] at every
+//! normalized through an internal reference-chain resolver at every
 //! link (`/Threads`, the thread entry, `/F`, `/N`, `/V`, `/B`, and `/P`), so a
 //! reference-to-reference chain, a direct (inline) thread dictionary, or a
-//! chained `/P` is handled the same way the single-page extraction path
+//! chained `/P` is handled the same way the page extraction path
 //! ([`crate::page_extract`]) handles them. The walk is bounded by a visited set
 //! keyed on the terminal bead ref (a thread's beads form a cycle).
 //!
@@ -89,8 +89,8 @@ use std::io::{Read, Seek};
 /// target page was dropped, so that a removed page referenced by nothing else
 /// is garbage-collected by the subsequent subset sweep
 /// ([`crate::subset_prune::prune_after_subset`]). Reference-to-reference chains
-/// at every link are normalized via
-/// [`crate::outline_dest_remap::resolve_ref_chain`]. The function mutates `pdf`
+/// at every link are normalized through an internal reference-chain resolver
+/// before each step is inspected. The function mutates `pdf`
 /// in place (same convention as `rebuild_page_tree`) and succeeds silently when
 /// the document has no article beads.
 ///
