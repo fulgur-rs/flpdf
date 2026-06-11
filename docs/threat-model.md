@@ -107,8 +107,10 @@ are not treated as vulnerabilities on their own:
   feature, not a bypass.
 - **Strength of legacy PDF cryptography.** Reading RC4- and MD5-based
   encryption (V=1/2/4, R=2/3/4) is required for compatibility and is not a
-  vulnerability. *Creating* weakly encrypted output is gated behind an
-  explicit `--allow-weak-crypto` opt-in. AES-CBC without integrity
+  vulnerability. *Creating* RC4-weak output is gated behind an explicit
+  `--allow-weak-crypto` opt-in; that gate is not yet enforced on the CLI
+  R=5 (AES-256) *write* path, although the read path already requires the
+  opt-in for R=5 (tracked as `flpdf-hn1g.8`). AES-CBC without integrity
   protection, MD5 in key derivation, etc. are properties of the PDF standard
   security handler, not of flpdf.
 - **Bugs inside dependencies** (`flate2`, RustCrypto crates, …). These should
@@ -166,7 +168,7 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | Object parser recursion (`Parser::object` → `dictionary`/`array`) has no depth limit; deeply nested input (`<</A <</B …>>>>`, `[[[…]]]`) can overflow the stack and abort. Same shape as qpdf CVE-2018-9918. | (b) no panic/abort | `flpdf-hn1g.1` |
 | Object-stream `/Extends` chains are followed by recursive `collect_object_stream_chain` (`reader.rs`) guarded by a visited set (cycle detection) but no depth cap; a deep *acyclic* `/Extends` chain can overflow the stack and abort before a cycle is ever detected. Same class as the parser-recursion gap above. | (b) no panic/abort | `flpdf-hn1g.7` |
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
-| `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) hardening | `flpdf-hn1g.3` |
+| `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
 | No opt-in decode-output limits and no `/Filter` chain length cap (compression bombs covered by §4, but mitigations are worth offering). | §4 mitigation | `flpdf-hn1g.4` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
