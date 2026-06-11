@@ -217,9 +217,10 @@ mod tests {
         // Header present but no recoverable structure: the repair-enabled open
         // path fails and is downgraded to an error diagnostic, so no document
         // object is available to summarise.
-        let report =
-            check_reader(Cursor::new(b"%PDF-1.4\nthis is not a valid pdf at all\n%%EOF\n".to_vec()))
-                .unwrap();
+        let report = check_reader(Cursor::new(
+            b"%PDF-1.4\nthis is not a valid pdf at all\n%%EOF\n".to_vec(),
+        ))
+        .unwrap();
         assert!(!report.valid);
         assert!(report.summary.is_none());
     }

@@ -85,7 +85,7 @@ fn assert_plaintext_pdf_is_readable(output: &Path, file_name: &str) {
         .arg(output)
         .assert()
         .success()
-        .stdout(predicates::str::contains("PDF check succeeded"));
+        .stdout(predicates::str::contains("File is not encrypted\n"));
 
     let bytes = std::fs::read(output).unwrap();
     assert!(
@@ -217,7 +217,7 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
         .arg(&output)
         .assert()
         .success()
-        .stdout(predicates::str::contains("PDF check succeeded"));
+        .stdout(predicates::str::contains("File is not encrypted\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ fn decrypt_on_unencrypted_input_is_a_silent_noop_rewrite() {
         .arg(&output)
         .assert()
         .success()
-        .stdout(predicates::str::contains("PDF check succeeded"));
+        .stdout(predicates::str::contains("File is not encrypted\n"));
 }
 
 #[test]

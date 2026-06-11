@@ -16,7 +16,7 @@ fn check_valid_fixture_exits_successfully() {
     cmd.args(["--check", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("PDF check succeeded"));
+        .stdout(predicate::str::contains("File is not encrypted\n"));
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn check_encrypted_fixture_accepts_correct_empty_password_flag() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("PDF check succeeded"));
+    .stdout(predicate::str::contains("File is encrypted\n"));
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn check_allows_rc4_encrypted_input_with_warning_when_opted_in() {
         .arg(&input)
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is encrypted\n"))
         .stderr(predicate::str::contains("WARNING: "))
         .stderr(predicate::str::contains("weak crypto"));
 }
@@ -111,7 +111,7 @@ fn rewrite_encrypted_fixture_writes_plaintext_output() {
         .args(["--check", output.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("PDF check succeeded"));
+        .stdout(predicate::str::contains("File is not encrypted\n"));
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn check_encrypted_fixture_uses_empty_default_password() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("PDF check succeeded"));
+    .stdout(predicate::str::contains("File is encrypted\n"));
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn check_encrypted_fixture_reads_password_file_and_strips_newline() {
         .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
         .assert()
         .success()
-        .stdout(predicate::str::contains("PDF check succeeded"));
+        .stdout(predicate::str::contains("File is encrypted\n"));
 }
 
 #[test]
@@ -326,7 +326,7 @@ fn check_subcommand_succeeds() {
     cmd.args(["check", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("PDF check succeeded"));
+        .stdout(predicate::str::contains("File is not encrypted\n"));
 }
 
 #[test]
@@ -772,7 +772,7 @@ fn check_with_repair_accepts_corrupt_xref() {
     cmd.args(["--repair", "--check", input.to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"));
+        .stdout(predicate::str::contains("File is not encrypted\n"));
 }
 
 #[test]

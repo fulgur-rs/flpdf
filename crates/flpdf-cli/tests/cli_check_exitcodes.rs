@@ -126,7 +126,8 @@ fn check_clean_pdf_exits_0() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("PDF check succeeded").not())
         .stderr(predicate::str::is_empty());
 }
 
@@ -139,8 +140,55 @@ fn check_subcommand_clean_pdf_exits_0() {
     cmd.args(["check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("PDF check succeeded").not())
         .stderr(predicate::str::is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Tests: qpdf-compatible stdout "checking" block
+// ---------------------------------------------------------------------------
+
+/// A clean plaintext PDF prints qpdf's full check block: the `checking <file>`
+/// banner, header version, encryption + linearization status, and the trailing
+/// reassurance note. The subject of that note is `progname()` (here `flpdf`).
+#[test]
+fn check_clean_pdf_emits_qpdf_block() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&clean_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains(format!("checking {path}\n")))
+        .stdout(predicate::str::contains("PDF Version: 1.4\n"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("File is not linearized\n"))
+        .stdout(predicate::str::contains(
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+        ))
+        .stdout(predicate::str::contains("PDF check succeeded").not());
+}
+
+/// On exit 3 (warnings, no errors) the block is still printed, but qpdf omits
+/// the trailing "No syntax ..." reassurance note (warnings go to stderr).
+#[test]
+fn check_warnings_emit_block_without_trailing_line() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--repair", f.path().to_str().unwrap()])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains("File is not linearized\n"))
+        .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
+        .stdout(predicate::str::contains("PDF check succeeded").not());
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +206,7 @@ fn check_warnings_only_pdf_exits_3() {
     cmd.args(["--check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
         .stderr(predicate::str::contains("WARNING: "));
 }
 
@@ -171,7 +219,7 @@ fn check_subcommand_warnings_only_pdf_exits_3() {
     cmd.args(["check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
         .stderr(predicate::str::contains("WARNING: "));
 }
 
@@ -186,7 +234,7 @@ fn check_warnings_use_qpdf_stderr_format() {
         .args(["--check", "--repair", &path])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("PDF check succeeded"))
+        .stdout(predicate::str::contains("File is not encrypted\n"))
         // qpdf shape: WARNING: <file>: <msg>, surrounding warnings without
         // offset, then the trailing summary line.
         .stderr(predicate::str::contains(format!(
@@ -257,8 +305,10 @@ fn check_error_diagnostics_use_qpdf_stderr_format() {
         )))
         .stderr(predicate::str::contains("PDF check failed").not())
         .stderr(predicate::str::contains("error: ").not())
-        // exit 2 prints no success line on stdout.
-        .stdout(predicate::str::contains("PDF check succeeded").not());
+        // exit 2 emits no stdout block at all: qpdf throws during document init
+        // (missing /Root) before printing the `checking` banner, and flpdf
+        // matches by gating the block on a valid report.
+        .stdout(predicate::str::is_empty());
 }
 
 /// Fatal open errors carry the input path: `<progname>: <file>: <msg>`

@@ -75,7 +75,10 @@ fn hex_key_v5_r6_check_succeeds_with_recovered_key() {
         ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("PDF check succeeded"));
+        // The recovered key opens the encrypted file, so the check block reports
+        // it as encrypted (interim single line; the detailed qpdf R/P block is
+        // tracked separately).
+        .stdout(predicates::str::contains("File is encrypted\n"));
 }
 
 #[test]
