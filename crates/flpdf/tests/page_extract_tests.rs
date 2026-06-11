@@ -1,6 +1,8 @@
-//! Integration tests for [`flpdf::extract_page`].
+//! Integration tests for [`flpdf::extract_page`] / [`flpdf::extract_pages`].
 
-use flpdf::{extract_page, pages, write_pdf_with_options, Object, Pdf, WriteOptions};
+use flpdf::{
+    extract_page, extract_pages, pages, write_pdf_with_options, Object, Pdf, WriteOptions,
+};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -1634,6 +1636,197 @@ fn bead_p_absent_page_is_neutralized() {
         p_page.get("Type"),
         Some(&flpdf::Object::Name(b"Page".to_vec())),
         "preserved bead /P must resolve to a /Type /Page"
+    );
+}
+
+// --- extract_pages: multi-page extraction (dedup, ordering, duplicates) ---
+
+/// Three-page document; pages 3 and 4 SHARE font 7; page 5 has its own font 8.
+fn three_page_shared_font_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F2 8 0 R >> >> >>"),
+            (6, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (8, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+        ],
+        1,
+    )
+}
+
+/// Count objects whose dict is `/Type /Font` with the given `/BaseFont`.
+fn count_font_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, base: &[u8]) -> usize {
+    let mut n = 0;
+    for r in doc.object_refs() {
+        if let Ok(obj) = doc.resolve(r) {
+            if let Some(d) = obj.as_dict() {
+                if d.get("Type").and_then(|o| o.as_name()) == Some(&b"Font"[..])
+                    && d.get("BaseFont").and_then(|o| o.as_name()) == Some(base)
+                {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Resolve a leaf page's inline /Resources -> /Font -> first entry's
+/// reference -> /BaseFont name.
+fn leaf_font_basefont(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, leaf: flpdf::ObjectRef) -> Vec<u8> {
+    let leaf = doc
+        .resolve_borrowed(leaf)
+        .unwrap()
+        .as_dict()
+        .cloned()
+        .unwrap();
+    let font_ref = leaf
+        .get("Resources")
+        .and_then(|o| o.as_dict())
+        .and_then(|r| r.get("Font"))
+        .and_then(|o| o.as_dict())
+        .and_then(|f| f.iter().next().map(|(_, v)| v.clone()))
+        .and_then(|v| v.as_ref_id())
+        .expect("leaf /Resources /Font first entry must be an indirect ref");
+    let font = doc.resolve(font_ref).unwrap().into_dict().unwrap();
+    font.get("BaseFont")
+        .and_then(|o| o.as_name())
+        .expect("/BaseFont")
+        .to_vec()
+}
+
+#[test]
+fn extract_pages_copies_shared_resource_once() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2, "extracted doc must have two pages");
+    let root = pages_dict(&mut out);
+    assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+
+    assert_eq!(
+        count_font_objects(&mut out, b"Helvetica"),
+        1,
+        "the shared font must be copied exactly once"
+    );
+    assert_eq!(
+        count_font_objects(&mut out, b"Courier"),
+        0,
+        "page 3's exclusive font must not leak in"
+    );
+}
+
+#[test]
+fn extract_pages_object_count_sublinear_vs_per_page_extracts() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let combined = extract_pages(&mut source, &[0, 1])
+        .unwrap()
+        .object_refs()
+        .len();
+    let separate = extract_page(&mut source, 0).unwrap().object_refs().len()
+        + extract_page(&mut source, 1).unwrap().object_refs().len();
+    assert!(
+        combined < separate,
+        "single-map extract must dedup shared objects: {combined} >= {separate}"
+    );
+}
+
+#[test]
+fn extract_pages_preserves_selection_order() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[2, 0]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2);
+    assert_eq!(
+        leaf_font_basefont(&mut out, page_refs[0]),
+        b"Courier".to_vec(),
+        "first output page must be source page 2 (Courier font)"
+    );
+    assert_eq!(
+        leaf_font_basefont(&mut out, page_refs[1]),
+        b"Helvetica".to_vec(),
+        "second output page must be source page 0 (Helvetica font)"
+    );
+}
+
+#[test]
+fn extract_pages_empty_selection_errors() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let err = match extract_pages(&mut source, &[]) {
+        Ok(_) => panic!("empty selection should error, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, flpdf::Error::Unsupported(msg) if msg == "empty page selection"),
+        "empty selection should yield Error::Unsupported(\"empty page selection\"), got {err:?}"
+    );
+}
+
+#[test]
+fn extract_pages_out_of_range_index_errors() {
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+    let err = match extract_pages(&mut source, &[0, 3]) {
+        Ok(_) => panic!("index 3 out of range should error, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, flpdf::Error::Unsupported(msg)
+            if msg == "page index 3 out of range (document has 3 pages)"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn extract_pages_duplicate_index_shallow_clones_page() {
+    // qpdf-compatible duplicate selection: the second occurrence becomes a
+    // fresh page object whose sub-objects (/Contents, /Resources) stay shared
+    // with the first copy.
+    let src = three_page_shared_font_pdf();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 0]).unwrap();
+
+    let page_refs = pages::page_refs(&mut out).unwrap();
+    assert_eq!(page_refs.len(), 2, "duplicate selection yields two kids");
+    assert_ne!(
+        page_refs[0], page_refs[1],
+        "duplicate kids must be distinct page objects"
+    );
+    let root = pages_dict(&mut out);
+    assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+
+    // Sub-objects stay SHARED: both kids reference the same /Contents stream.
+    let contents_ref = |doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, r: flpdf::ObjectRef| {
+        doc.resolve_borrowed(r)
+            .unwrap()
+            .as_dict()
+            .and_then(|d| d.get("Contents"))
+            .and_then(Object::as_ref_id)
+            .expect("/Contents ref")
+    };
+    assert_eq!(
+        contents_ref(&mut out, page_refs[0]),
+        contents_ref(&mut out, page_refs[1]),
+        "duplicate pages must share the same /Contents object"
+    );
+    assert_eq!(
+        count_font_objects(&mut out, b"Helvetica"),
+        1,
+        "the shared font is still copied exactly once"
     );
 }
 
