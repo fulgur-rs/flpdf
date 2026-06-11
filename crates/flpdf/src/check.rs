@@ -12,6 +12,7 @@ use std::io::{Read, Seek};
 /// `valid` is `true` when no [`Diagnostic`] of severity `Error` was produced. Warnings
 /// alone (e.g. linearization advisories) do not flip the flag.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CheckReport {
     pub valid: bool,
     pub diagnostics: Diagnostics,
@@ -25,6 +26,7 @@ pub struct CheckReport {
 /// Backs a `qpdf --check`-style banner (header version, encryption and
 /// linearization status) without re-opening the document.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CheckSummary {
     /// PDF version from the file header, e.g. `"1.7"` (no `%PDF-` prefix).
     pub version: String,
@@ -44,8 +46,9 @@ pub struct CheckSummary {
 ///
 /// - [`Error::Encrypted`] when the document is encrypted and cannot be opened; unlike
 ///   other open failures, this is propagated rather than downgraded to a diagnostic.
-/// - Propagates errors from [`Pdf::linearized_hint_ref`] (resolving object `(1, 0)`)
-///   raised while probing for linearization.
+/// - A failed linearization probe (resolving object `(1, 0)` via
+///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
+///   document is treated as non-linearized; the error is not propagated.
 ///
 /// Other failures from the repair-enabled open path are turned into an error
 /// [`Diagnostic`] and returned inside an `Ok(CheckReport)`.
@@ -77,8 +80,9 @@ pub fn check_reader<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
 ///   failures become an error [`Diagnostic`] inside an `Ok(CheckReport)`.
 /// - When `options.repair` is clear, any error from [`Pdf::open_with_options`] is
 ///   propagated unchanged (e.g. [`Error::Io`], [`Error::Parse`], [`Error::Encrypted`]).
-/// - Propagates errors from [`Pdf::linearized_hint_ref`] (resolving object `(1, 0)`)
-///   raised while probing for linearization.
+/// - A failed linearization probe (resolving object `(1, 0)` via
+///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
+///   document is treated as non-linearized; the error is not propagated.
 pub fn check_reader_with_options<R: Read + Seek>(
     reader: R,
     options: PdfOpenOptions,
@@ -97,8 +101,9 @@ pub fn check_reader_with_options<R: Read + Seek>(
 /// - Propagates any error from [`Pdf::open_with_options`] unchanged, since the
 ///   recovery heuristics are disabled (e.g. [`Error::Io`], [`Error::Parse`],
 ///   [`Error::Encrypted`]).
-/// - Propagates errors from [`Pdf::linearized_hint_ref`] (resolving object `(1, 0)`)
-///   raised while probing for linearization.
+/// - A failed linearization probe (resolving object `(1, 0)` via
+///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
+///   document is treated as non-linearized; the error is not propagated.
 pub fn check_reader_strict<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, false)
 }
@@ -146,7 +151,19 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     if pdf.trailer().get_ref("Root").is_none() {
         diagnostics.push(Diagnostic::error("trailer is missing /Root", None));
     }
-    let linearized = is_linearized_pdf(&mut pdf)?;
+    // The document already opened, so a failed linearization probe must not
+    // sink the whole check. Downgrade the error to a warning and treat the file
+    // as non-linearized rather than propagating a hard error.
+    let linearized = match is_linearized_pdf(&mut pdf) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(Diagnostic::warning(
+                format!("failed to inspect linearization hint: {error}"),
+                None,
+            ));
+            false
+        }
+    };
     if linearized {
         diagnostics.push(Diagnostic::warning(
             "linearized PDF detected: rewrite support preserves hint object but does not recompute linearization tables",
@@ -174,6 +191,7 @@ fn is_linearized_pdf<R: Read + Seek>(reader: &mut Pdf<R>) -> crate::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Severity;
     use std::io::Cursor;
 
     /// Minimal valid single-page PDF (`%PDF-1.4`), not encrypted, not linearized.
@@ -223,5 +241,51 @@ mod tests {
         .unwrap();
         assert!(!report.valid);
         assert!(report.summary.is_none());
+    }
+
+    /// A document whose object 1 has a malformed body. The file opens (its
+    /// `/Root` is object 2), but resolving object `(1, 0)` while probing for
+    /// linearization fails to parse — exercising the probe-error downgrade.
+    fn malformed_object1_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\nthis is not a valid object\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn linearization_probe_error_downgraded_to_warning() {
+        // The probe resolves object (1,0), whose body is malformed. The parse
+        // failure must be downgraded to a warning rather than propagating out of
+        // `check_reader` (the document already opened), so the caller still
+        // receives a report with `linearized = false`.
+        let report = check_reader_strict(Cursor::new(malformed_object1_pdf_bytes())).unwrap();
+        let summary = report
+            .summary
+            .expect("summary present: the document opened");
+        assert!(!summary.linearized);
+        assert!(report.diagnostics.entries().iter().any(|d| {
+            d.severity == Severity::Warning && d.message.contains("linearization hint")
+        }));
     }
 }
