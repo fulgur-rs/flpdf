@@ -62,8 +62,8 @@ For **any** input byte sequence, flpdf aims to guarantee:
   document; recovery never silently fabricates success on input it could not
   actually interpret.
 
-These guarantees describe the contract we hold ourselves to. One known
-deviation currently exists; it is tracked in §8 rather than silently
+These guarantees describe the contract we hold ourselves to. Known
+deviations currently exist; they are tracked in §8 rather than silently
 excluded from the contract.
 
 ## 3. What we consider a vulnerability
@@ -79,7 +79,7 @@ of the following:
 - **Non-termination** — an infinite loop while parsing or traversing.
   qpdf precedent: CVE-2017-9209 / CVE-2017-9210.
 - **A violation of the signed-PDF integrity policy**
-  ([docs/signed-pdf.md](signed-pdf.md)): an edit that silently invalidates or
+  ([signed-pdf.md](signed-pdf.md)): an edit that silently invalidates or
   strips signature protection without the documented opt-in.
 - **Accepting a wrong password as valid** (authentication bypass in the
   standard security handler).
@@ -130,7 +130,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
 | Weak-crypto write gate (weakly encrypted output requires explicit opt-in) | `Error::Encrypted(WeakCryptoNotAllowed)`, CLI `--allow-weak-crypto` |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `security/` |
-| Signed-PDF preserve-by-default policy (edits that would invalidate signatures are rejected unless explicitly opted in) | [docs/signed-pdf.md](signed-pdf.md), `signatures.rs` |
+| Signed-PDF preserve-by-default policy (edits that would invalidate signatures are rejected unless explicitly opted in) | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Traversal boundaries per review rules (stop at other `Page`/`Catalog` dicts, skip `/Parent` during closure walks, no brute-force scans of all live objects) | [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
 
 ## 6. Verification
@@ -164,10 +164,10 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | Gap | Guarantee affected | Tracking |
 | --- | --- | --- |
 | Object parser recursion (`Parser::object` → `dictionary`/`array`) has no depth limit; deeply nested input (`<</A <</B …>>>>`, `[[[…]]]`) can overflow the stack and abort. Same shape as qpdf CVE-2018-9918. | (b) no panic/abort | `flpdf-hn1g.1` |
+| Object-stream `/Extends` chains are followed by recursive `collect_object_stream_chain` (`reader.rs`) guarded by a visited set (cycle detection) but no depth cap; a deep *acyclic* `/Extends` chain can overflow the stack and abort before a cycle is ever detected. Same class as the parser-recursion gap above. | (b) no panic/abort | `flpdf-hn1g.7` |
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) hardening | `flpdf-hn1g.3` |
 | No opt-in decode-output limits and no `/Filter` chain length cap (compression bombs covered by §4, but mitigations are worth offering). | §4 mitigation | `flpdf-hn1g.4` |
-| GitHub private vulnerability reporting not yet enabled on the repository. | reporting | `flpdf-hn1g.5` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
 ## Appendix A: attack surface inventory
