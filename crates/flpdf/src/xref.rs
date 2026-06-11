@@ -335,10 +335,11 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 /// subsequent failures from the retry-at-offset-0 detour are not reported
 /// because qpdf has no such detour and they have no counterpart on its
 /// stderr. The triggering error's warning carries that error's own byte
-/// offset when available; the surrounding warnings carry the `startxref`
-/// offset.
+/// offset when available (falling back to the `startxref` offset); the
+/// surrounding warnings carry no offset, matching qpdf, which reports them
+/// at offset 0 and suppresses the display.
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
-    diagnostics.push(Diagnostic::warning("file is damaged", Some(startxref)));
+    diagnostics.push(Diagnostic::warning("file is damaged", None));
     let (message, offset) = match trigger_error {
         Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
         other => (other.to_string(), Some(startxref)),
@@ -346,7 +347,7 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
     diagnostics.push(Diagnostic::warning(message, offset));
     diagnostics.push(Diagnostic::warning(
         "Attempting to reconstruct cross-reference table",
-        Some(startxref),
+        None,
     ));
 }
 

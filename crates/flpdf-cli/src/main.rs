@@ -40,7 +40,7 @@ use flpdf::{
 };
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1548,9 +1548,11 @@ fn main() {
         if let Some(exit_err) = error.downcast_ref::<CliExitError>() {
             // Only print a message when there is one; the caller may have
             // already printed its own summary (e.g. run_check prints
-            // "PDF check succeeded" before returning exit 3 for warnings).
+            // "PDF check succeeded" before returning exit 3 for warnings,
+            // and its exit-2 path passes an empty message because the error
+            // diagnostics were already printed in qpdf shape).
             if !exit_err.message.is_empty() {
-                eprintln!("flpdf: {}", exit_err.message);
+                eprintln!("{}: {}", progname(), exit_err.message);
             }
             std::process::exit(exit_err.code.as_i32());
         }
@@ -1562,10 +1564,10 @@ fn main() {
         // the generic fallback below would produce. Exit 2 matches qpdf's
         // "error" convention (same code the fallback uses).
         if let Some(flpdf::Error::Signed { message, .. }) = error.downcast_ref::<flpdf::Error>() {
-            eprintln!("flpdf: {message}");
+            eprintln!("{}: {message}", progname());
             std::process::exit(2);
         }
-        eprintln!("flpdf: {error}");
+        eprintln!("{}: {error}", progname());
         std::process::exit(2);
     }
 }
@@ -2001,16 +2003,18 @@ fn run_command(command: Commands) -> CliResult<()> {
 
 fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let file = File::open(input)?;
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let report = check_reader_with_options(BufReader::new(file), options)
-        .map_err(actionable_password_error)?;
+        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     for diagnostic in report.diagnostics.entries() {
-        let label = match diagnostic.severity {
-            Severity::Warning => "warning",
-            Severity::Error => "error",
-        };
-        eprintln!("{label}: {}", diagnostic.message);
+        let location = diagnostic_location(&input, diagnostic.offset);
+        match diagnostic.severity {
+            Severity::Warning => eprintln!("WARNING: {location}: {}", diagnostic.message),
+            Severity::Error => {
+                eprintln!("{}: {location}: {}", progname(), diagnostic.message)
+            }
+        }
     }
 
     // Map the check result to qpdf-compatible exit codes:
@@ -2027,10 +2031,11 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         .any(|d| d.severity == Severity::Warning);
 
     if !report.valid {
-        // Errors found — exit 2.
+        // Errors found — exit 2.  The error diagnostics above are already in
+        // qpdf shape; qpdf prints no extra summary line in this case.
         return Err(Box::new(CliExitError {
             code: ExitCode::Errors,
-            message: "PDF check failed".to_string(),
+            message: String::new(),
         }));
     }
 
@@ -2039,6 +2044,8 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         // been printed above; pass an empty message so main() does not emit
         // a redundant "flpdf: ..." line.
         println!("PDF check succeeded");
+        // qpdf 11.9.0 ends the warning-bearing run with this stderr summary.
+        eprintln!("{}: operation succeeded with warnings", progname());
         return Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
             message: String::new(),
@@ -3896,16 +3903,18 @@ fn open_pdf(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    let file = File::open(input)?;
+    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
     let pdf = Pdf::open_with_options(BufReader::new(file), pdf_open_options(repair, password)?)
-        .map_err(actionable_password_error)?;
+        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
 
     for diagnostic in pdf.repair_diagnostics().entries() {
-        eprintln!("warning: {}", diagnostic.message);
+        let location = diagnostic_location(input, diagnostic.offset);
+        eprintln!("WARNING: {location}: {}", diagnostic.message);
     }
     if pdf.uses_weak_crypto() {
         eprintln!(
-            "warning: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied"
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied",
+            input.display()
         );
     }
 
@@ -3941,6 +3950,35 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         allow_weak_crypto,
         password_is_hex_key,
     })
+}
+
+/// Program name used in qpdf-parity diagnostic prefixes.
+///
+/// `FLPDF_PROGNAME` overrides the default so the qpdf qtest harness shim can
+/// present flpdf as `qpdf`; unset or empty, the prefix is always `flpdf`.
+fn progname() -> String {
+    std::env::var("FLPDF_PROGNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "flpdf".to_string())
+}
+
+/// Render the `<file>` / `<file> (offset N)` location part shared by the
+/// qpdf-shaped diagnostic lines (qpdf 11.9.0 observed format; qpdf
+/// suppresses the offset display when it is unknown).
+fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
+    match offset {
+        Some(offset) => format!("{} (offset {offset})", input.display()),
+        None => input.display().to_string(),
+    }
+}
+
+/// Prefix a fatal error with the input path so main() renders the observed
+/// qpdf shape `<progname>: <file>: <msg>` for open failures.
+///
+/// This type-erases the error; do not downcast the result.
+fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    format!("{}: {error}", input.display()).into()
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {

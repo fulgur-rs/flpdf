@@ -93,6 +93,26 @@ fn corrupt_pdf_bytes() -> Vec<u8> {
     b"%PDF-1.4\nthis is not a valid pdf at all\n%%EOF\n".to_vec()
 }
 
+/// Valid xref but the trailer lacks /Root — opens fine, check reports an
+/// error-severity diagnostic → exit 2.
+fn missing_root_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n")
+            .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 3 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 // ---------------------------------------------------------------------------
 // Tests: exit 0 — clean PDF
 // ---------------------------------------------------------------------------
@@ -139,7 +159,7 @@ fn check_warnings_only_pdf_exits_3() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
-        .stderr(predicate::str::contains("warning"));
+        .stderr(predicate::str::contains("WARNING: "));
 }
 
 #[test]
@@ -152,7 +172,55 @@ fn check_subcommand_warnings_only_pdf_exits_3() {
         .assert()
         .code(3)
         .stdout(predicate::str::contains("PDF check succeeded"))
-        .stderr(predicate::str::contains("warning"));
+        .stderr(predicate::str::contains("WARNING: "));
+}
+
+#[test]
+fn check_warnings_use_qpdf_stderr_format() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("PDF check succeeded"))
+        // qpdf shape: WARNING: <file>: <msg>, surrounding warnings without
+        // offset, then the trailing summary line.
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {path}: file is damaged\n"
+        )))
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table\n",
+        ))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ))
+        // The old lowercase `warning: <msg>` prefix must be gone.
+        .stderr(predicate::str::contains("warning: ").not());
+}
+
+/// The trigger warning (and only the trigger warning) carries `(offset N)`.
+#[test]
+fn check_trigger_warning_carries_offset() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stderr(
+            predicate::str::is_match(format!(
+                "WARNING: {} \\(offset \\d+\\): ",
+                regex::escape(&path)
+            ))
+            .unwrap(),
+        )
+        .stderr(predicate::str::contains(format!("WARNING: {path} (offset")).count(1));
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +238,100 @@ fn check_corrupt_pdf_exits_2() {
         .code(2);
 }
 
+/// qpdf prints check errors as a single `<progname>: <file>: <msg>` line and
+/// no extra "check failed" summary (observed with qpdf 11.9.0 on the same
+/// fixture: `qpdf: noroot.pdf: unable to find /Root dictionary`).
+#[test]
+fn check_error_diagnostics_use_qpdf_stderr_format() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&missing_root_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!(
+            "flpdf: {path}: trailer is missing /Root\n"
+        )))
+        .stderr(predicate::str::contains("PDF check failed").not())
+        .stderr(predicate::str::contains("error: ").not())
+        // exit 2 prints no success line on stdout.
+        .stdout(predicate::str::contains("PDF check succeeded").not());
+}
+
+/// Fatal open errors carry the input path: `<progname>: <file>: <msg>`
+/// (observed qpdf shape: `qpdf: notpdf.pdf: unable to find trailer
+/// dictionary while recovering damaged file`).
+#[test]
+fn fatal_open_error_includes_filename() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&corrupt_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!("flpdf: {path}: ")));
+}
+
+/// FLPDF_PROGNAME swaps the program-name prefix (the qpdf qtest harness shim
+/// sets FLPDF_PROGNAME=qpdf); diagnostics are otherwise identical.
+#[test]
+fn flpdf_progname_env_swaps_prefix() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "qpdf: operation succeeded with warnings\n",
+        ))
+        .stderr(predicate::str::contains("flpdf:").not());
+}
+
+/// An empty FLPDF_PROGNAME falls back to the default prefix instead of
+/// rendering a broken `: <message>` line.
+#[test]
+fn flpdf_progname_empty_env_falls_back_to_default() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_PROGNAME", "")
+        .args(["--check", "--repair", &path])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ));
+}
+
+/// Same prefix swap on the fatal-open-error path, which is rendered by
+/// main()'s result handler rather than run_check itself.
+#[test]
+fn flpdf_progname_env_swaps_prefix_on_fatal_error() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&corrupt_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", &path])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!("qpdf: {path}: ")))
+        .stderr(predicate::str::contains("flpdf:").not());
+}
+
 #[test]
 fn check_subcommand_corrupt_pdf_exits_2() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -179,4 +341,24 @@ fn check_subcommand_corrupt_pdf_exits_2() {
     cmd.args(["check", f.path().to_str().unwrap()])
         .assert()
         .code(2);
+}
+
+/// Repair warnings emitted while opening for any subcommand (here: rewrite)
+/// use the same qpdf shape as check.
+#[test]
+fn rewrite_repair_warnings_use_qpdf_stderr_format() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+    let out = tempfile::NamedTempFile::new().unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["rewrite", "--repair", &path, out.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {path}: file is damaged\n"
+        )))
+        .stderr(predicate::str::contains("warning: ").not());
 }

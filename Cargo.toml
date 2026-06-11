@@ -20,6 +20,7 @@ flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 assert_cmd = "2"
 predicates = "3"
+regex = "1"
 tempfile = "3"
 rc4 = "0.1"
 aes = "0.8"
