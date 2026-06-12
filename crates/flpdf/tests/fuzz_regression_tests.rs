@@ -39,11 +39,11 @@ fn regressions_dir() -> PathBuf {
 #[test]
 fn fuzz_regressions_do_not_panic() {
     let dir = regressions_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        // No corpus yet is a valid state (nothing to replay); don't fail setup.
-        Err(_) => return,
-    };
+    // The directory is committed (seeded with `minimal.pdf`), so it always
+    // exists. Fail loudly if it is missing/renamed rather than returning early
+    // and passing silently, which would defeat the `replayed > 0` check below.
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read fuzz regression dir {}: {e}", dir.display()));
 
     let mut replayed = 0usize;
     for entry in entries {
