@@ -210,6 +210,15 @@ fn collect_dest_target<R: Read + Seek>(
     removed: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if let Some(target) = dest_page_ref_resolved(source, dest)? {
+        // `dest_page_ref_resolved` returns the dest array's LEADING ref as-is; that
+        // ref may be a holder chain (a ref to a ref to the page). `selected` holds
+        // terminal page refs (from `page_refs`), and the copy map keys pages by
+        // their terminal, so normalize the leading ref to its terminal before the
+        // membership check and before recording it — otherwise a holder ref to a
+        // SELECTED page is wrongly treated as removed (and nulled).
+        let target = resolve_ref_chain(source, &Object::Reference(target))?
+            .1
+            .unwrap_or(target);
         if !selected.contains(&target) {
             removed.insert(target);
         }
@@ -671,8 +680,13 @@ fn collect_outline_doc_dests<R: Read + Seek>(
 ) -> Result<()> {
     let first = match (doc.outlines, &doc.outlines_inline) {
         (Some(outlines_ref), _) => {
-            let obj = source.resolve_borrowed(outlines_ref)?;
-            obj.as_dict().and_then(|d| d.get_ref("First"))
+            // The /Outlines root may sit behind a holder chain (a ref to a ref to
+            // the root dict); follow the whole chain (not a one-hop resolve) so the
+            // root's /First is read and its removed-page dests are collected. The
+            // captured first-hop ref is kept verbatim for closure-folding; only this
+            // scan-side deref chains to the terminal.
+            let (root, _) = resolve_ref_chain(source, &Object::Reference(outlines_ref))?;
+            root.as_dict().and_then(|d| d.get_ref("First"))
         }
         // A direct (inline) root holds its `/First` item ref inline on the catalog.
         (None, Some(inline)) => inline.get_ref("First"),
@@ -1182,8 +1196,16 @@ fn source_top_level_field_names<R: Read + Seek>(
     let top_fields = source.acroform().top_level_fields()?;
     let mut out = Vec::with_capacity(top_fields.len());
     for field_ref in top_fields {
-        let name = resolve_field_partial_name(source, field_ref)?;
-        out.push((field_ref, name));
+        // A top-level `/Fields` element may be a holder chain (a ref to a ref to
+        // the field dict). The copy map keys the field by its TERMINAL ref, so
+        // normalize to the terminal before recording it — otherwise `map.get` on
+        // the holder ref misses and the field is dropped from the merged form. The
+        // terminal also feeds the `/T` lookup so a name behind a holder is read.
+        let terminal = resolve_ref_chain(source, &Object::Reference(field_ref))?
+            .1
+            .unwrap_or(field_ref);
+        let name = resolve_field_partial_name(source, terminal)?;
+        out.push((terminal, name));
     }
     Ok(out)
 }
@@ -1319,7 +1341,7 @@ fn field_kid_refs<R: Read + Seek>(
             // compares the same ref that retained-`/Annots` membership records.
             let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
             refs.push(terminal.unwrap_or(r));
-        }
+        } // cov:ignore: llvm-cov gap-region artifact on the brace closing a `?`-bearing block; the body (the `refs.push`) is covered
     }
     Ok(Some(refs))
 }

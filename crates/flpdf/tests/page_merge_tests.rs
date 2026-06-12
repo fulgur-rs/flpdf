@@ -4393,3 +4393,141 @@ fn merge_inherits_direct_outline_root() {
         "the inline outline item's surviving /Dest must be remapped to a live page"
     );
 }
+
+// === codex L1-L3: holder-chain (ref -> ref) normalization at the remaining merge
+// comparison sites. The copy path keys the renumber map by a ref's TERMINAL, so a
+// merge site that compares a NON-terminal (holder) ref against `selected` / the
+// copy map mismatches when the value is a holder chain. Each test isolates one
+// site that previous rounds did not cover.
+
+/// L1 — indirect `/Outlines` ROOT holder chain. `/Outlines 10 0 R` where obj 10
+/// is itself a reference (`11 0 R`) to the outline root dict (obj 11). The root's
+/// `/First` item targets the UNSELECTED page 1, so selecting page 0 must null that
+/// off-tree outline dest. A single-hop deref of obj 10 yields the holder ref (a
+/// non-dict), never finds `/First`, and leaves page 1 live off-tree.
+fn outline_root_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (10, "11 0 R"),
+            (
+                11,
+                "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+            ),
+            (20, "<< /Title (x) /Parent 11 0 R /Dest [4 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_nulls_removed_outline_dest_behind_root_chain() {
+    let mut a = Pdf::open_mem_owned(outline_root_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "a removed outline dest behind an indirect /Outlines ROOT holder chain must be nulled"
+    );
+}
+
+/// L2 — top-level `/Fields` ELEMENT holder chain. `/AcroForm /Fields [20 0 R]`
+/// where obj 20 is a reference (`4 0 R`) to the real field/widget (obj 4) listed
+/// in the selected page 0's `/Annots`. The copy map keys obj 4 (the terminal),
+/// so recording the holder ref 20 drops the field from the merged form: a
+/// single-hop record stores 20, `map.get(&20)` misses, and the field vanishes.
+fn top_field_element_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                8,
+                "<< /Fields [20 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (20, "4 0 R"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_keeps_top_level_field_behind_element_chain() {
+    let mut a = Pdf::open_mem_owned(top_field_element_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let names = acroform_field_names(&mut doc);
+    assert_eq!(
+        names,
+        vec![b"f1".to_vec()],
+        "a selected top-level field behind a /Fields element holder chain must survive in the merged form"
+    );
+}
+
+/// L3 — destination page ref holder chain. Page 0's link annotation's
+/// `/Dest [20 0 R /Fit]` where obj 20 is a reference (`3 0 R`) to the SELECTED
+/// page object (obj 3). `dest_page_ref_resolved` returns the leading ref (obj 20,
+/// the holder); comparing that against `selected` (which holds the terminal page
+/// ref) treats it as removed, so the dest is wrongly nulled. After normalization
+/// the dest must remap to the surviving page, not resolve to null.
+fn dest_page_ref_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] >>",
+            ),
+            (
+                6,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [20 0 R /Fit] >>",
+            ),
+            (20, "3 0 R"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_keeps_surviving_dest_behind_page_ref_chain() {
+    let mut a = Pdf::open_mem_owned(dest_page_ref_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    // The annotation's /Dest leading ref (a holder chain to the surviving page)
+    // must remap to a live page, not be treated as removed and nulled.
+    let page0 = pages::page_refs(&mut doc).unwrap()[0];
+    let annot_ref = annot_refs(&mut doc, page0)[0];
+    let annot = doc.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let dest = match annot.get("Dest") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected the copied annot's /Dest array, got {other:?}"),
+    };
+    let (_dref, d_null) = dest_array_first(&mut doc, &dest);
+    assert!(
+        !d_null,
+        "a /Dest whose leading page ref is a holder chain to a SELECTED page must remap to a live page, not null"
+    );
+}
