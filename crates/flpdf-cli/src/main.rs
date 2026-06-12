@@ -2485,15 +2485,30 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
     }
 
     // RC4 outputs are weak; qpdf refuses to write them without
-    // --allow-weak-crypto, so apply the same gate here.
+    // --allow-weak-crypto, so apply the same gate here. Deprecated R=5
+    // (AES-256) output is also gated: unlike qpdf — which gates only RC4 and
+    // happily writes R=5 — flpdf rejects reading R=5 input without
+    // --allow-weak-crypto, so it refuses to *create* R=5 without the same
+    // opt-in to keep the read and write paths symmetric (see the threat model,
+    // §4 weak-crypto write gate).
     let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {
-        if params.is_weak_rc4() && !allow_weak_crypto {
-            return Err(
-                "refusing to write a file with RC4, a weak cryptographic algorithm. \
-                 Please use 256-bit keys for better security. Pass --allow-weak-crypto \
-                 to enable writing insecure files."
-                    .into(),
-            );
+        if !allow_weak_crypto {
+            if params.is_weak_rc4() {
+                return Err(
+                    "refusing to write a file with RC4, a weak cryptographic algorithm. \
+                     Please use 256-bit keys for better security. Pass --allow-weak-crypto \
+                     to enable writing insecure files."
+                        .into(),
+                );
+            }
+            if params.is_deprecated_r5() {
+                return Err(
+                    "refusing to write a deprecated revision 5 (R=5) encrypted file. \
+                     256-bit revision 6 (the default without --force-R5) is preferred. \
+                     Pass --allow-weak-crypto to enable writing R=5 files."
+                        .into(),
+                );
+            }
         }
         Ok(params)
     };
@@ -2578,7 +2593,9 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
             if cleartext_metadata {
                 params.encrypt_metadata = false;
             }
-            Ok(params)
+            // R=6 (the default) passes through; --force-R5 selects deprecated
+            // R=5, which guard_weak gates behind --allow-weak-crypto.
+            guard_weak(params)
         }
         _ => unreachable!("key_len validated to 40/128/256 above"),
     }

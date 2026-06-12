@@ -1347,6 +1347,8 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
+            // R=5 is deprecated weak crypto; creating it requires the opt-in.
+            "--allow-weak-crypto",
             "--encrypt",
             "user-pw",
             "owner-pw",
@@ -1438,6 +1440,67 @@ fn encrypt_force_r5_rejects_value_form() {
         .stderr(predicates::str::contains("does not take a value"));
 }
 
+/// Creating deprecated R=5 (AES-256) output is gated behind
+/// `--allow-weak-crypto`, symmetric with the reader (which rejects R=5 input
+/// without the same opt-in). Without the flag the write is refused, and the
+/// diagnostic names the flag the user must add.
+#[test]
+fn encrypt_force_r5_rejected_without_allow_weak_crypto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("r5-gated.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        // Non-empty owner password keeps the --allow-insecure gate out of the
+        // way, so this isolates the weak-crypto (R=5) gate.
+        .args([
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "256",
+            "--force-R5",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--allow-weak-crypto"));
+    assert!(
+        !output.exists(),
+        "no output file must be written when the R=5 weak-crypto gate fires"
+    );
+}
+
+/// The default 256-bit method is R=6 (not weak), so `--encrypt … 256 --`
+/// without `--force-R5` must NOT require `--allow-weak-crypto`. Guards against
+/// the R=5 gate accidentally catching the R=6 default.
+#[test]
+fn encrypt_r6_default_not_gated_without_allow_weak_crypto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("r6.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "user-pw", "owner-pw", "256", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    // The output is genuinely R=6 (not R=5), confirming the default path is
+    // unchanged. R=6 is not weak crypto, so reading it needs no opt-in.
+    let show = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["show-encryption", "--password=user-pw"])
+        .arg(&output)
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("R = 6"),
+        "default 256-bit output must be R=6: {stdout}"
+    );
+}
+
 /// `--force-R5` produces V=5 R=5 AES-256 output that qpdf authenticates with
 /// both user and owner passwords (cross-implementation gate for
 /// flpdf-9hc.4.15).
@@ -1452,6 +1515,8 @@ fn encrypt_force_r5_round_trips_via_qpdf() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
+            // R=5 is deprecated weak crypto; creating it requires the opt-in.
+            "--allow-weak-crypto",
             "--encrypt",
             "user-pw",
             "owner-pw",
