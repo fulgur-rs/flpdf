@@ -101,6 +101,27 @@ fn form_direct_field_da_pdf() -> Vec<u8> {
     )
 }
 
+fn form_dr_p_font_pdf() -> Vec<u8> {
+    // A /DR/Font resource is legitimately named /P (the same key the field-tree
+    // walk skips as a widget's /P page back-pointer). Font 6 is reachable ONLY
+    // through /DR — no field references it — so the copy walk must traverse the
+    // resource dict without applying the /P skip, or the font is dropped.
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Fields [5 0 R] /DA (/P 10 Tf 0 g) /DR << /Font << /P 6 0 R >> >> >>",
+            ),
+            (5, "<< /T (field) /FT /Tx /V (val) >>"),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ],
+        1,
+    )
+}
+
 fn empty_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -913,6 +934,51 @@ fn copy_fields_from_copies_acroform_da_and_dr_defaults() {
     assert_eq!(
         font_dict.get("BaseFont"),
         Some(&Object::Name(b"Helvetica".to_vec()))
+    );
+}
+
+#[test]
+fn copy_fields_from_preserves_dr_resource_named_p() {
+    // Regression for flpdf-4ue7: a /DR/Font resource named /P (reachable only via
+    // the inherited resource dict) must survive the field copy. The field-tree /P
+    // back-pointer skip must not apply when collecting the /DR closure, or the font
+    // is dropped from the copy set and remapped to Null.
+    let source_bytes = form_dr_p_font_pdf();
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    target.acroform().copy_fields_from(&mut source).unwrap();
+
+    let catalog = target.resolve(ObjectRef::new(1, 0)).unwrap();
+    let Object::Dictionary(catalog_dict) = catalog else {
+        panic!("catalog should be a dictionary");
+    };
+    let acroform_ref = catalog_dict
+        .get_ref("AcroForm")
+        .expect("target catalog should reference AcroForm");
+    let Object::Dictionary(acroform_dict) = target.resolve(acroform_ref).unwrap() else {
+        panic!("AcroForm should be a dictionary");
+    };
+    let Object::Dictionary(dr) = acroform_dict.get("DR").expect("copied /DR") else {
+        panic!("/DR should be a direct dictionary");
+    };
+    let Object::Dictionary(fonts) = dr.get("Font").expect("/DR/Font") else {
+        panic!("/DR/Font should be a dictionary");
+    };
+    let Object::Reference(font_ref) = fonts
+        .get("P")
+        .expect("/DR/Font/P must survive the copy, not be dropped")
+    else {
+        panic!("/DR/Font/P should be a live reference, not Null (the /P font was dropped)");
+    };
+    let Object::Dictionary(font_dict) = target.resolve(*font_ref).unwrap() else {
+        panic!("copied /P font should resolve to a font dictionary");
+    };
+    assert_eq!(
+        font_dict.get("BaseFont"),
+        Some(&Object::Name(b"Helvetica".to_vec())),
+        "the /P-named font must survive the field copy with its data intact"
     );
 }
 
