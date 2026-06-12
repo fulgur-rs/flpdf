@@ -3327,3 +3327,372 @@ fn merge_dr_resource_named_p_survives() {
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// codex G1 / G2 / G4 regression tests.
+// ---------------------------------------------------------------------------
+
+/// Primary whose inline (on-catalog) `/OpenAction` is a non-destination action
+/// `<< /S /JavaScript /JS 9 0 R >>`, where obj 9 is an indirect operand (a
+/// JavaScript string) reachable nowhere else. Selecting page 0 must fold obj 9
+/// into the primary copy closure and remap the `/JS` reference, so the output
+/// `/OpenAction /JS` resolves to the string rather than dangling to `Null`.
+fn inline_open_action_js_operand_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /JavaScript /JS 9 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (9, "(app.alert\\('hi'\\);)"),
+        ],
+        1,
+    )
+}
+
+// codex G1: an inline `/OpenAction` non-destination action's indirect operand
+// (`/JS 9 0 R`) must be folded into the primary closure and remapped, not left
+// dangling. Pre-fix the inline action path remapped only `/D`//`/Next`, so obj 9
+// was never copied and `/JS` resolved to `Null` in the output.
+#[test]
+fn merge_inline_open_action_js_operand_folded_and_remapped() {
+    let mut a = Pdf::open_mem_owned(inline_open_action_js_operand_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    let js_ref = match oa.get("JS") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected /OpenAction /JS indirect reference, got {other:?}"),
+    };
+    let resolved = doc.resolve(js_ref).unwrap();
+    assert!(
+        !matches!(resolved, Object::Null),
+        "the inline /OpenAction /JS operand must be folded and remapped, not dangling"
+    );
+    assert_eq!(
+        resolved.as_string(),
+        Some(&b"app.alert('hi');"[..]),
+        "the remapped /JS operand must resolve to the JavaScript string"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Single-page form whose top-level NON-TERMINAL field (obj 7) has two widget
+/// `/Kids`: widget 4 on the selected page 0 carrying NO `/P` back-pointer (`/P`
+/// is optional in PDF), and widget 9 on the unselected page 1. Widget 4 IS a
+/// member of page 0's `/Annots`, so it is a retained widget and the field must
+/// survive with `/Kids` trimmed to widget 4.
+fn nonterminal_field_pless_widget_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            // Widget 4 omits /P (optional back-pointer) but IS in page 0's /Annots.
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /Parent 7 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [9 0 R] >>",
+            ),
+            (7, "<< /FT /Tx /T (parent) /Kids [4 0 R 9 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (
+                9,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 6 0 R /Parent 7 0 R >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// codex G2 (F4 regression): a non-terminal field's selected-page widget that
+// omits the optional `/P` back-pointer must still survive — survival is decided
+// by membership in a selected page's `/Annots`, not by `/P` presence. Pre-fix
+// the `/P`-less widget hit `widget_page_ref` → `None` → neither kept nor
+// orphaned, so it was silently dropped; being the field's only surviving widget,
+// the whole top-level field was wrongly dropped from `/AcroForm /Fields`.
+#[test]
+fn merge_keeps_pless_widget_in_selected_page_annots() {
+    let mut a = Pdf::open_mem_owned(nonterminal_field_pless_widget_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // The parent field must survive (its /P-less widget is in page 0's /Annots).
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"parent".to_vec()],
+        "a /P-less widget in a selected page's /Annots keeps its field alive"
+    );
+    // /Kids trimmed to the single surviving widget.
+    assert_eq!(
+        sole_field_kids_count(&mut doc),
+        1,
+        "field /Kids must keep the /P-less selected-page widget and drop the off-page one"
+    );
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "the unselected page's widget must not leave an orphan /Type /Page object"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Three-page primary whose inline `/OpenAction` is a destination dictionary
+/// with NO `/S` key: `<< /D [3 0 R /Fit] >>` (obj 3 is page 0). With no `/S`, a
+/// `<< /D … >>` is a bare destination, so its `/D` page ref must be remapped to
+/// the copied page 0 — not treated as an opaque action and left stale.
+fn inline_open_action_no_s_dest_dict_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /OpenAction << /D [3 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+/// Like [`inline_open_action_no_s_dest_dict_pdf`] but the no-`/S` `/D` targets
+/// the REMOVED page 1 (obj 4). Selecting page 0 must collect that target and
+/// null it, so `/OpenAction /D[0]` resolves to `Null` (qpdf `--pages` parity).
+fn inline_open_action_no_s_dest_dict_removed_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /OpenAction << /D [4 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+// codex G4: an inline `/OpenAction` destination dictionary with NO `/S` key
+// (`<< /D [page /Fit] >>`) is a bare destination, not an opaque action. Its `/D`
+// page ref must be remapped (surviving target) or nulled (removed target),
+// mirroring outline_dest_remap::remap_or_null_action_dest. Pre-fix the `is_goto`
+// gate classified a no-/S dict as a non-GoTo action, so `/D` was left in stale
+// source numbering and a removed target was never collected/nulled.
+#[test]
+fn merge_inline_open_action_no_s_dest_dict_remapped_and_nulled() {
+    // Surviving target: /D[0] remaps to the copied page 0.
+    let mut a = Pdf::open_mem_owned(inline_open_action_no_s_dest_dict_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let refs = pages::page_refs(&mut doc).unwrap();
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    let d_ref = match oa.get("D") {
+        Some(Object::Array(arr)) => arr[0].as_ref_id().expect("/D[0] ref"),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    assert_eq!(
+        d_ref, refs[0],
+        "no-/S /OpenAction /D[0] must remap to the copied page 0"
+    );
+
+    // Removed target: /D[0] points at page 1, which is not selected → nulled.
+    let mut b = Pdf::open_mem_owned(inline_open_action_no_s_dest_dict_removed_pdf()).unwrap();
+    let mut inputs2 = [MergeInput {
+        source: &mut b,
+        pages: vec![0],
+    }];
+    let mut doc2 = merge_documents(&mut inputs2).unwrap();
+    let cat2 = catalog_dict(&mut doc2);
+    let oa2 = match cat2.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    let d2_ref = match oa2.get("D") {
+        Some(Object::Array(arr)) => arr[0].as_ref_id().expect("/D[0] ref"),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    assert!(
+        matches!(doc2.resolve(d2_ref).unwrap(), Object::Null),
+        "no-/S /OpenAction /D[0] to a removed page must resolve to null"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc2, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Primary whose inline `/OpenAction` is an OPAQUE non-GoTo action carrying a
+/// `/D`: `<< /S /GoToR /D [3 0 R /Fit] >>` (obj 3 is the selected page 0). A
+/// non-GoTo action's `/D` is a remote/named destination, not a local page
+/// destination — but any indirect refs in it must still be remapped to the
+/// copied objects (the inline counterpart to F5's indirect non-GoTo path).
+fn inline_open_action_goto_r_with_d_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoToR /D [3 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+// An opaque (non-GoTo) inline /OpenAction's /D is not treated as a local page
+// destination, but its indirect refs are still remapped to the copied objects
+// (never left in stale source numbering). Here `/S /GoToR /D [3 0 R /Fit]` with
+// page 0 selected: /D[0] is remapped to the copied page-0 ref and resolves to a
+// live page, not nulled and not the stale source ref.
+#[test]
+fn merge_inline_non_goto_open_action_d_remapped_not_nulled() {
+    let mut a = Pdf::open_mem_owned(inline_open_action_goto_r_with_d_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let refs = pages::page_refs(&mut doc).unwrap();
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    assert_eq!(
+        oa.get("S").and_then(|o| o.as_name()),
+        Some(&b"GoToR"[..]),
+        "the opaque action's /S is kept verbatim"
+    );
+    let d_ref = match oa.get("D") {
+        Some(Object::Array(arr)) => arr[0].as_ref_id().expect("/D[0] ref"),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    assert_eq!(
+        d_ref, refs[0],
+        "the opaque action's /D[0] indirect ref must be remapped to the copied page 0"
+    );
+    assert!(
+        !matches!(doc.resolve(d_ref).unwrap(), Object::Null),
+        "the opaque action's /D[0] target must remain a live page, not be nulled"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Two-page form whose selected page 0 carries the top-level non-terminal field
+/// ref (obj 7) DIRECTLY in its `/Annots` (a malformed shape — `/Annots` should
+/// list widgets, not the field). The field's `/Kids` are two widgets that are
+/// NOT themselves listed in any page `/Annots`, so neither is "retained" and the
+/// `/P`-fallback in the trim is exercised: widget 4 has `/P 3 0 R` (selected page
+/// 0) and survives via the fallback; widget 9 omits `/P` and is dropped.
+fn nonterminal_field_in_annots_pless_kids_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            // The FIELD ref (obj 7), not its widgets, sits in /Annots (malformed).
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>",
+            ),
+            // Widget 4: has /P → selected page 0, but is NOT in any /Annots.
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 3 0 R /Parent 7 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (7, "<< /FT /Tx /T (parent) /Kids [4 0 R 9 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            // Widget 9: omits /P and is NOT in any /Annots → dropped by the trim.
+            (
+                9,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /Parent 7 0 R >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// Exercises the trim's `/P`-fallback arms for widgets reached through the field
+// tree but absent from any scanned `/Annots` (a malformed shape where the FIELD
+// sits in `/Annots` instead of its widgets). Widget 4's `/P` names the selected
+// page 0 → kept via the fallback; widget 9 omits `/P` → dropped. The field
+// survives, trimmed to widget 4.
+#[test]
+fn merge_trims_field_via_p_fallback_when_widgets_absent_from_annots() {
+    let mut a = Pdf::open_mem_owned(nonterminal_field_in_annots_pless_kids_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"parent".to_vec()],
+        "the field survives via its /P-fallback widget on the selected page"
+    );
+    assert_eq!(
+        sole_field_kids_count(&mut doc),
+        1,
+        "only the /P-on-selected-page widget is kept; the /P-less widget is dropped"
+    );
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "no orphan page object from the dropped widget"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}

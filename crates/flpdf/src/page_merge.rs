@@ -425,6 +425,69 @@ fn fold_doc_level_closure<R: Read + Seek>(
     {
         closure.extend(page_object_closure(source, root)?);
     }
+    // An INLINE (on-catalog) `/OpenAction` is not an indirect root, so its
+    // operand objects (e.g. a `/JavaScript` action's `/JS` string) are not pulled
+    // in by the loop above. Fold them explicitly — the indirect `open_action_ref`
+    // path got them for free via page_object_closure.
+    if let Some(inline) = &doc.open_action_inline {
+        fold_inline_action_operands(source, inline, closure, MAX_ACTION_CHAIN_DEPTH)?;
+    }
+    Ok(())
+}
+
+/// Action-operand keys that carry a *destination* (or a structural/back-pointer)
+/// rather than a plain operand object. These are owned by the destination
+/// null-out machinery ([`collect_doc_level_removed_targets`] /
+/// [`remap_inline_action`]) and by the `/Next`-chain walk, so the operand fold
+/// below must NOT descend them — descending `/D` would pull a destination page's
+/// content (and, via `/Parent`, its siblings) into the primary closure.
+const ACTION_DEST_KEYS: [&[u8]; 5] = [b"D", b"SD", b"Dest", b"Next", b"Parent"];
+
+/// Fold every indirect *operand* object reachable from an inline action graph
+/// (the action dict plus its `/Next` continuation chain) into `closure`, so a
+/// non-destination operand such as a `/JavaScript` action's `/JS` string is
+/// copied into the output. Destination/structural keys ([`ACTION_DEST_KEYS`]) are
+/// skipped — their pages are handled by the destination null-out path, mirroring
+/// what the indirect-`/OpenAction` root gets for free from [`page_object_closure`]
+/// (which stops at `Page`/`Catalog` boundaries). Bounded by `depth` (inline
+/// `/Next` nesting) and [`resolve_ref_chain`] (reference indirection); the
+/// `collect_refs_in_object` operand walk is itself depth- and cycle-bounded.
+fn fold_inline_action_operands<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action: &Object,
+    closure: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+) -> Result<()> {
+    if depth == 0 {
+        return Ok(()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
+    }
+    let (concrete, _) = resolve_ref_chain(source, action)?;
+    let Some(dict) = concrete.into_dict() else {
+        return Ok(()); // cov:ignore: a bare-dest array /OpenAction has no operand objects to fold
+    };
+    // Fold each non-destination operand's indirect refs into the closure. `/D`,
+    // `/SD`, `/Dest`, `/Next`, `/Parent` are skipped here (see ACTION_DEST_KEYS).
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    for (key, value) in dict.iter() {
+        if ACTION_DEST_KEYS.contains(&key) {
+            continue;
+        }
+        // `skip_parent_key: true` so a `/P` operand (if any) is treated as a
+        // back-pointer, matching the field-tree closure discipline.
+        collect_refs_in_object(source, value, closure, &mut seen, 0, true)?;
+    }
+    // Follow the `/Next` continuation chain (single action or array) so a
+    // continuation's operands are folded too.
+    if let Some(next_val) = dict.get("Next") {
+        match next_val {
+            Object::Array(elems) => {
+                for elem in elems {
+                    fold_inline_action_operands(source, elem, closure, depth - 1)?;
+                }
+            }
+            single => fold_inline_action_operands(source, single, closure, depth - 1)?,
+        }
+    }
     Ok(())
 }
 
@@ -486,18 +549,39 @@ fn collect_doc_level_removed_targets<R: Read + Seek>(
             &mut visited,
             MAX_ACTION_CHAIN_DEPTH,
         )?; // cov:ignore: `?` Err arm — action walk cannot fail on an already-opened source
-            // A bare `[page /Fit]` /OpenAction is a destination, not an action dict.
-            // Gate the bare-dest fallback on the RESOLVED concrete shape being an
-            // array (resolving handles an indirect /OpenAction holding a bare dest
-            // array): an action dict — even a non-GoTo one such as `/S /GoToR` whose
-            // /D is a [localRef /Fit] array — must NOT be treated as a removed local
-            // destination here. (Residual: a non-GoTo /D with a local ref is
-            // malformed remote-dest input; page_object_closure still folds that page
-            // as a copied orphan rather than nulling it. Not fixed here — touching
-            // the shared page_object_closure primitive is out of scope.)
+            // Beyond the `/S /GoTo` action chain above, an /OpenAction may itself
+            // be a BARE destination: a `[page /Fit]` array, or a `<< /D … >>`
+            // destination dictionary with no `/S` (or `/S /GoTo`). Resolve the
+            // concrete shape and collect such a removed-page `/D`/array target so
+            // its placeholder is nulled. An action dict with `/S` present AND
+            // != GoTo (e.g. `/GoToR`, `/URI`) is opaque — its `/D` is a remote/named
+            // destination, not a local page ref — so it is left alone, mirroring
+            // outline_dest_remap::remap_or_null_action_dest. (Residual: a non-GoTo
+            // /D with a local ref is malformed remote-dest input; page_object_closure
+            // still folds that page as a copied orphan rather than nulling it. Not
+            // fixed here — touching the shared page_object_closure primitive is out
+            // of scope.)
         let (concrete, _) = resolve_ref_chain(source, oa)?;
-        if matches!(concrete, Object::Array(_)) {
-            collect_dest_target(source, oa, selected, removed)?;
+        match concrete {
+            // A bare `[page /Fit]` destination array.
+            Object::Array(_) => collect_dest_target(source, oa, selected, removed)?,
+            // A no-/S (or /S /GoTo) `<< /D … >>` destination dictionary: its `/D`
+            // is a bare destination. (`/S /GoTo`'s /D was already collected by the
+            // action-chain walk above; re-collecting an already-recorded removed
+            // target is idempotent.)
+            // A no-/S (or /S /GoTo) dict's /D is a bare destination; an opaque
+            // action dict (`/S` present and != GoTo) has no /D. `get("D")` yields
+            // `&Object::Null` for the latter, which carries no page ref, so
+            // collecting it unconditionally is correct and avoids an uncovered
+            // `if let` else-arm.
+            Object::Dictionary(ref d) if !matches!(d.get("S"), Some(Object::Name(n)) if n != b"GoTo") =>
+            {
+                let d_val = d.get("D").unwrap_or(&Object::Null);
+                collect_dest_target(source, d_val, selected, removed)?; // cov:ignore: `?` Err arm — collect cannot fail on an already-opened source
+            }
+            // A bare-name /OpenAction, or an opaque action dict (`/S` present and
+            // != GoTo) — no local-page bare destination to collect.
+            _ => {}
         }
     }
 
@@ -823,17 +907,42 @@ fn remap_inline_action_depth<R: Read + Seek>(
     match concrete {
         Object::Array(arr) => remap_inline_dest(source, &Object::Array(arr), map),
         Object::Dictionary(mut out) => {
-            let is_goto = matches!(out.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-            // Only a /S /GoTo action's /D is a local page destination; a non-GoTo
-            // action (or a GoTo with no /D) leaves its own /D unchanged.
-            if is_goto {
-                if let Some(dest) = out.remove("D") {
-                    out.insert("D", remap_inline_dest(source, &dest, map)?);
-                }
+            // Detach the two keys whose values need dest-aware / recursive
+            // remapping (`/D`, `/Next`) before remapping the remaining operands, so
+            // a page ref under `/D` is never remapped twice.
+            let dest = out.remove("D");
+            let next = out.remove("Next");
+
+            // Remap every other indirect operand (e.g. a `/JavaScript` action's
+            // `/JS` string ref) through the copy map. The catalog is never copied,
+            // so an inline action's operand objects (folded into the primary
+            // closure by fold_inline_action_operands) are remapped only here.
+            out = match remap_refs_in_object(Object::Dictionary(out), map) {
+                Object::Dictionary(d) => d,
+                other => return Ok(other), // cov:ignore: remap_refs_in_object preserves the Dictionary variant
+            };
+
+            // A dict is an opaque non-destination action ONLY when `/S` is present
+            // AND != GoTo (e.g. `/GoToR`, `/URI`, `/JavaScript`); its `/D`, when
+            // present, is a remote/named destination, not a local page ref. A dict
+            // with no `/S` (a bare `<< /D … >>` destination dictionary) or `/S
+            // /GoTo` has a local-page `/D` to remap. Mirrors
+            // outline_dest_remap::remap_or_null_action_dest.
+            let dest_bearing = !matches!(out.get("S"), Some(Object::Name(n)) if n != b"GoTo");
+            if let Some(dest) = dest {
+                let remapped = if dest_bearing {
+                    // A local-page destination: remap its leading page ref.
+                    remap_inline_dest(source, &dest, map)?
+                } else {
+                    // An opaque action's /D (remote/named): remap any indirect
+                    // holder/operand refs but do not treat it as a local page dest.
+                    remap_refs_in_object(dest, map)
+                };
+                out.insert("D", remapped);
             }
             // /Next — a single action or an array of actions. Recurse into each
             // at `depth - 1` so a continuation's /D is remapped too.
-            if let Some(next) = out.remove("Next") {
+            if let Some(next) = next {
                 let remapped_next = match next {
                     Object::Array(elems) => {
                         let mut rebuilt = Vec::with_capacity(elems.len());
@@ -1070,6 +1179,48 @@ fn field_kid_refs<R: Read + Seek>(
     Ok(Some(refs))
 }
 
+/// Collect the widget annotation refs that appear directly in the selected
+/// pages' `/Annots` arrays (the "retained widget refs"). A widget that is a
+/// member of a selected page's `/Annots` is on a surviving page and must be kept
+/// by [`trim_field_kids`], whether or not it carries the optional `/P`
+/// back-pointer (`/P` is not required by ISO 32000-2 §12.5.2 — it is a
+/// convenience pointer, so it cannot be the survival signal).
+///
+/// `/Annots` may be an inline array or an indirect reference to one; each element
+/// is an indirect reference to (or an inline) annotation dict. Only the direct
+/// annotation refs are recorded — that is what extract uses to decide a widget
+/// survives. References are bounded by [`resolve_ref_chain`].
+fn collect_retained_widget_refs<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    selected_pages: &BTreeSet<ObjectRef>,
+    retained: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    for &page_ref in selected_pages {
+        let annots_val = {
+            let page_obj = source.resolve_borrowed(page_ref)?;
+            let Some(page_dict) = page_obj.as_dict() else {
+                continue; // cov:ignore: a selected page ref always resolves to a dictionary
+            };
+            page_dict.get("Annots").cloned()
+        };
+        let Some(annots_val) = annots_val else {
+            continue;
+        };
+        // /Annots: an inline array or an indirect reference to one (mirrors
+        // collect_removed_dest_targets's /Annots resolution).
+        let (concrete, _) = resolve_ref_chain(source, &annots_val)?;
+        let Object::Array(elems) = concrete else {
+            continue; // cov:ignore: a non-array /Annots is malformed
+        };
+        for elem in elems {
+            if let Object::Reference(r) = elem {
+                retained.insert(r);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a widget's `/P` page reference (review rule 2: `/P` may be indirect),
 /// returning the final page `ObjectRef` of the reference chain, or `None` when
 /// the widget carries no `/P`.
@@ -1083,7 +1234,10 @@ fn widget_page_ref<R: Read + Seek>(
         };
         match widget.get("P") {
             Some(value) => value.clone(),
-            None => return Ok(None), // cov:ignore: a form widget always carries a /P page back-pointer
+            // `/P` is optional (ISO 32000-2 §12.5.2): a widget may omit it. Such
+            // a widget's survival is decided by retained-`/Annots` membership in
+            // trim_field_kids, not by this back-pointer.
+            None => return Ok(None),
         }
     };
     let (_, last_ref) = resolve_ref_chain(source, &p_value)?;
@@ -1098,15 +1252,23 @@ fn widget_page_ref<R: Read + Seek>(
 ///   caller leaves it untouched. This is what protects flat-form fields and the
 ///   `+N` rename tests, whose widgets carry no `/Kids`.
 /// - `Some(survivors)` — the trimmed list of direct kid source-refs to keep. A
-///   leaf-widget kid is kept iff its `/P` is in `surviving_pages`; an
-///   intermediate sub-field kid is kept iff it has at least one surviving
-///   descendant (recursion). An empty `survivors` means no widget survived, so
-///   the field should be dropped (top level) or pruned from its parent's `/Kids`
-///   (nested).
+///   leaf-widget kid is kept iff it is a `retained_widgets` member (it appears in
+///   a selected page's `/Annots`) OR its `/P` resolves to a page in
+///   `surviving_pages`; an intermediate sub-field kid is kept iff it has at least
+///   one surviving descendant (recursion). An empty `survivors` means no widget
+///   survived, so the field should be dropped (top level) or pruned from its
+///   parent's `/Kids` (nested).
+///
+/// The retained-`/Annots` membership is the primary survival signal because a
+/// widget's `/P` page back-pointer is optional (ISO 32000-2 §12.5.2); a
+/// selected-page widget that omits `/P` must still be kept. The `/P` path is a
+/// fallback for a widget reachable through the field tree but not directly listed
+/// in a scanned `/Annots`.
 ///
 /// Side effects: rewrites each kept intermediate sub-field's `/Kids` in `target`
 /// (mapped through `map`), and records each dropped widget's unselected `/P`
-/// page (source-space) into `orphan_pages` so the caller can null it.
+/// page (source-space) into `orphan_pages` so the caller can null it (a dropped
+/// widget that also omits `/P` carries no page to null).
 ///
 /// Bounded by `DEFAULT_MAX_ACROFORM_DEPTH` and a `visited` cycle guard (review
 /// rule 4): a hostile field tree cannot drive unbounded recursion.
@@ -1116,6 +1278,7 @@ fn trim_field_kids<R: Read + Seek>(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     field_ref: ObjectRef,
     surviving_pages: &BTreeSet<ObjectRef>,
+    retained_widgets: &BTreeSet<ObjectRef>,
     map: &BTreeMap<ObjectRef, ObjectRef>,
     orphan_pages: &mut BTreeSet<ObjectRef>,
     depth: usize,
@@ -1142,6 +1305,7 @@ fn trim_field_kids<R: Read + Seek>(
             target,
             kid_ref,
             surviving_pages,
+            retained_widgets,
             map,
             orphan_pages,
             depth + 1,
@@ -1159,15 +1323,28 @@ fn trim_field_kids<R: Read + Seek>(
                 rewrite_field_kids(target, kid_ref, &sub_survivors, map)?;
                 survivors.push(kid_ref);
             }
-            // The kid is a leaf widget (no `/Kids`): keep it iff its `/P` page
-            // survived; otherwise its page is an off-tree orphan to null.
-            None => match widget_page_ref(source, kid_ref)? {
-                Some(page_ref) if surviving_pages.contains(&page_ref) => survivors.push(kid_ref),
-                Some(page_ref) => {
-                    orphan_pages.insert(page_ref);
+            // The kid is a leaf widget (no `/Kids`). It survives iff it is a
+            // retained widget (a member of a selected page's `/Annots`) — the
+            // signal extract uses — OR its optional `/P` resolves to a surviving
+            // page (a fallback for a widget reached through the field tree but not
+            // directly in a scanned `/Annots`). A non-surviving widget's `/P`
+            // page, if any, is an off-tree orphan to null; a `/P`-less dropped
+            // widget carries no page to null.
+            None => {
+                if retained_widgets.contains(&kid_ref) {
+                    survivors.push(kid_ref);
+                } else {
+                    match widget_page_ref(source, kid_ref)? {
+                        Some(page_ref) if surviving_pages.contains(&page_ref) => {
+                            survivors.push(kid_ref)
+                        }
+                        Some(page_ref) => {
+                            orphan_pages.insert(page_ref);
+                        }
+                        None => {} // cov:ignore: a dropped widget that also omits /P carries no page to null
+                    }
                 }
-                None => {} // cov:ignore: a form widget always carries a /P page back-pointer
-            },
+            }
         }
     }
     Ok(Some(survivors))
@@ -1244,10 +1421,12 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// at a page not selected from its input keeps its reference, which resolves to
 /// a `null` page object in the output.
 ///
-/// A page reached only through a thread bead's `/P` or a structure element's
-/// `/Pg` from an unselected page is not yet pruned: it stays out of the output
-/// page tree (`/Pages` `/Kids`) but remains a live object in the output,
-/// reachable through that surviving bead or structure reference.
+/// A page reached only through a back-pointer from an unselected page — a thread
+/// bead's `/P`, a structure element's `/Pg`, or (on malformed input) an
+/// annotation's `/P` that names an unselected page rather than the page it sits
+/// on — is not yet pruned: it stays out of the output page tree (`/Pages`
+/// `/Kids`) but remains a live object in the output, reachable through that
+/// surviving back-pointer.
 ///
 /// Interactive form (AcroForm) fields are merged: the primary's `/AcroForm`
 /// `/DR` default resources and `/DA` default appearance are the base, and every
@@ -1482,6 +1661,12 @@ pub fn merge_documents<R: Read + Seek>(
         // dropped widget's unselected page is collected and nulled below, so the
         // output never carries a live orphan `/Type /Page` outside `/Kids`.
         let mut orphan_pages: BTreeSet<ObjectRef> = BTreeSet::new();
+        // A widget survives the field-tree trim iff it is a member of a selected
+        // page's `/Annots` (or its optional `/P` resolves to a surviving page).
+        // Build that retained-widget set once per input from the selected pages'
+        // `/Annots`, in source space, so a `/P`-less selected-page widget is kept.
+        let mut retained_widgets: BTreeSet<ObjectRef> = BTreeSet::new();
+        collect_retained_widget_refs(input.source, &unique_set, &mut retained_widgets)?;
         for (src_field_ref, partial_name) in source_fields {
             if let Some(&target_ref) = map.get(&src_field_ref) {
                 let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -1490,6 +1675,7 @@ pub fn merge_documents<R: Read + Seek>(
                     &mut target,
                     src_field_ref,
                     &unique_set,
+                    &retained_widgets,
                     &map,
                     &mut orphan_pages,
                     0,
