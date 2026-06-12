@@ -810,34 +810,15 @@ fn p_targets_absent_page(
     p: &Object,
     keep: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
-    Ok(match p_target_page_ref(target, p)? {
-        Some(r) => !keep.contains(&r),
+    let (concrete, p_ref) = resolve_ref_chain(target, p)?;
+    Ok(match p_ref {
+        Some(r) => !keep.contains(&r) && is_page_dict(&concrete),
         None => false,
     })
 }
 
-/// Resolve an annotation's or bead's `/P` to its target Page reference, or
-/// `None` when `/P` does not resolve to a `/Type /Page` object.
-///
-/// On an annotation (ISO 32000-2 §12.5.2, Table 166) or an article bead
-/// (§12.4.3), `/P` denotes the page the object belongs to. The `is_page_dict`
-/// gate keeps any non-page `/P` (e.g. a StructElem's parent `/P`) out of scope.
-/// Each level may be indirect; [`resolve_ref_chain`] bounds the indirection.
-///
-/// Shared by extract's neutralize-drop path and merge's collect path.
-pub(crate) fn p_target_page_ref<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    p: &Object,
-) -> Result<Option<ObjectRef>> {
-    let (concrete, p_ref) = resolve_ref_chain(pdf, p)?;
-    Ok(match p_ref {
-        Some(r) if is_page_dict(&concrete) => Some(r),
-        _ => None,
-    })
-}
-
 /// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
-pub(crate) fn is_page_dict(obj: &Object) -> bool {
+fn is_page_dict(obj: &Object) -> bool {
     obj.as_dict()
         .and_then(|d| d.get("Type"))
         .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))

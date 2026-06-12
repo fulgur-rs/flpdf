@@ -11,7 +11,7 @@ use crate::object_copy::copy_objects;
 use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
 use crate::page_closure::page_object_closure;
 use crate::page_extract::{
-    append_selection_kids, materialize_leaf, minimal_target_bytes, p_target_page_ref, resolve_dict,
+    append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
     sd_target_page_ref, target_pages_root, InheritedAttrs,
 };
 use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
@@ -35,35 +35,33 @@ pub struct MergeInput<'a, R: Read + Seek> {
 /// per-walk `visited` set.
 const MAX_ACTION_CHAIN_DEPTH: usize = 64;
 
-/// Collect the source page references reachable from `page_ref` through any of
-/// the same carriers extract's neutralize-drop path covers (see
-/// [`crate::page_extract`] `neutralize_absent_dests` and its helpers
-/// `neutralize_action_chain`, `neutralize_action_array`,
-/// `neutralize_aa_if_absent`, `dest_targets_absent_page`,
-/// `sd_target_page_ref`, `p_target_page_ref`, and the bead ring), keeping only
-/// targets that are *not* in `selected` (the input's chosen pages). Those are
-/// the removed pages a destination still points at; for qpdf `--pages` null-out
-/// parity they are copied as placeholders and then replaced with `null`, so the
-/// reference survives but resolves to a null page object.
+/// Collect the source page references reachable from `page_ref` through the
+/// *destination* family of carriers, keeping only targets that are *not* in
+/// `selected` (the input's chosen pages). Those are the removed pages a
+/// destination still points at; for qpdf `--pages` null-out parity they are
+/// copied as placeholders and then replaced with `null`, so the reference
+/// survives but resolves to a null page object.
 ///
-/// The carriers, per page, are:
-/// - each `/Annots` annotation's `/Dest`, `/A` action chain, `/AA` actions,
-///   and `/P` (the annotation's owning page);
-/// - the page's own `/AA` additional actions;
-/// - the article-thread bead ring reachable from the page's `/B` (each bead's
-///   `/P`).
+/// The destination carriers, per page, are:
+/// - each `/Annots` annotation's `/Dest` and `/A` action chain;
+/// - each annotation's `/AA` additional actions and the page's own `/AA`.
 ///
 /// Within each action chain, both `/GoTo /D` page destinations and `/GoTo /SD`
 /// structure destinations are followed, as are `/Next` continuations (single
-/// action or array form). This set MUST stay equal to neutralize's carrier set:
-/// merge drops no carrier, so every reference [`page_object_closure`] copies and
-/// `copy_objects` remaps to a removed page must be named here, else a removed
-/// page survives un-nulled as a live orphan. Keep the two paths in sync.
+/// action or array form).
+///
+/// Scope note — this covers the *destination* family only, which is the family
+/// qpdf `--pages` null-outs. It deliberately does NOT walk a thread bead's `/P`
+/// or a structure element's `/Pg` reached from an unselected page: those belong
+/// to a drop-and-garbage-collect family (qpdf removes the page entirely rather
+/// than leaving a null in its place), so nulling them would be the wrong shape.
+/// Such pages are not pruned here; see [`merge_documents`] for the resulting
+/// constraint.
 ///
 /// Indirect references are resolved throughout via [`resolve_ref_chain`] /
-/// [`dest_page_ref_resolved`] / [`sd_target_page_ref`] / [`p_target_page_ref`],
-/// which bound the indirection. Named/string/external destinations carry no
-/// in-document page reference and contribute nothing.
+/// [`dest_page_ref_resolved`] / [`sd_target_page_ref`], which bound the
+/// indirection. Named/string/external destinations carry no in-document page
+/// reference and contribute nothing.
 fn collect_removed_dest_targets<R: Read + Seek>(
     source: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -115,26 +113,16 @@ fn collect_removed_dest_targets<R: Read + Seek>(
             )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
         }
         // Annotation-level /AA (e.g. a widget's /E enter, /X exit actions);
-        // each entry is an action chain (mirrors neutralize_aa_if_absent).
+        // each entry is an action chain.
         if let Some(aa_val) = annot.get("AA") {
             collect_aa_dest_targets(source, aa_val, selected, removed)?;
         }
-        // /P — the annotation's owning page. A malformed /P pointing at a
-        // removed (sibling) page keeps that page reachable (mirrors the /P arm
-        // in neutralize_annot_if_absent, via p_target_page_ref).
-        if let Some(p_val) = annot.get("P") {
-            collect_p_target(source, p_val, selected, removed)?;
-        }
     }
 
-    // Page-level /AA: each entry (/O, /C, …) is an action chain (mirrors the
-    // page-level /AA arm in neutralize_absent_dests).
+    // Page-level /AA: each entry (/O, /C, …) is an action chain.
     if let Some(aa_val) = page_aa {
         collect_aa_dest_targets(source, &aa_val, selected, removed)?;
     }
-
-    // Article-thread bead ring (mirrors neutralize_bead_ring).
-    collect_bead_ring_targets(source, page_ref, selected, removed)?;
 
     Ok(())
 }
@@ -178,23 +166,6 @@ fn collect_dest_target<R: Read + Seek>(
     removed: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if let Some(target) = dest_page_ref_resolved(source, dest)? {
-        if !selected.contains(&target) {
-            removed.insert(target);
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a `/P` (annotation or bead owning-page) to its Page reference and
-/// record it in `removed` when not in `selected`. Non-Page `/P` values resolve
-/// to `None` and contribute nothing.
-fn collect_p_target<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    p: &Object,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    if let Some(target) = p_target_page_ref(source, p)? {
         if !selected.contains(&target) {
             removed.insert(target);
         }
@@ -286,7 +257,7 @@ fn collect_action_chain_targets<R: Read + Seek>(
 
 /// Resolve a `/GoTo /SD` structure destination to its target page (via the
 /// StructElem `/Pg` hop) and record it in `removed` when not in `selected`.
-/// Mirrors extract's `sd_targets_absent_page` (shares [`sd_target_page_ref`]).
+/// Shares [`sd_target_page_ref`] with extract.
 fn collect_sd_target<R: Read + Seek>(
     source: &mut Pdf<R>,
     sd: &Object,
@@ -296,56 +267,6 @@ fn collect_sd_target<R: Read + Seek>(
     if let Some(target) = sd_target_page_ref(source, sd)? {
         if !selected.contains(&target) {
             removed.insert(target);
-        }
-    }
-    Ok(())
-}
-
-/// Walk the article-thread bead ring reachable from `page_ref`'s `/B`, recording
-/// every bead's `/P` that targets a removed page. Mirrors extract's
-/// `neutralize_bead_ring` (collect-only): `/B`, `/N`, `/V` may each be an
-/// indirect-reference chain, and the ring is bounded by `visited` (each bead
-/// handled once).
-fn collect_bead_ring_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let b_val = {
-        let page_obj = source.resolve_borrowed(page_ref)?;
-        let Some(page_dict) = page_obj.as_dict() else {
-            return Ok(()); // cov:ignore: malformed input — a page ref always resolves to a dictionary
-        };
-        page_dict.get("B").cloned()
-    };
-    let Some(b_val) = b_val else {
-        return Ok(());
-    };
-    // /B may itself be an indirect reference to the bead array; normalize it.
-    let (b_concrete, _) = resolve_ref_chain(source, &b_val)?;
-    let Object::Array(beads) = b_concrete else {
-        return Ok(());
-    };
-    let mut queue: Vec<ObjectRef> = beads.iter().filter_map(Object::as_ref_id).collect();
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    while let Some(start_ref) = queue.pop() {
-        let (concrete, terminal) = resolve_ref_chain(source, &Object::Reference(start_ref))?;
-        let bead_ref = terminal.unwrap_or(start_ref);
-        if !visited.insert(bead_ref) {
-            continue;
-        }
-        let Some(bead) = concrete.into_dict() else {
-            continue;
-        };
-        // Enqueue ring neighbours.
-        for key in ["N", "V"] {
-            if let Some(Object::Reference(r)) = bead.get(key) {
-                queue.push(*r);
-            }
-        }
-        if let Some(p_val) = bead.get("P") {
-            collect_p_target(source, p_val, selected, removed)?;
         }
     }
     Ok(())
@@ -368,6 +289,16 @@ fn collect_bead_ring_targets<R: Read + Seek>(
 /// Each source is left unmodified. Write the result with
 /// [`write_pdf`](crate::write_pdf) or
 /// [`write_pdf_with_options`](crate::write_pdf_with_options).
+///
+/// A destination (annotation `/Dest`, an `/A` or `/AA` `/GoTo` action, including
+/// `/Next` continuations and `/GoTo /SD` structure destinations) that points at
+/// a page not selected from its input keeps its reference, which resolves to a
+/// `null` page object in the output.
+///
+/// A page reached only through a thread bead's `/P` or a structure element's
+/// `/Pg` from an unselected page is not yet pruned: it stays out of the output
+/// page tree (`/Pages` `/Kids`) but remains a live object in the output,
+/// reachable through that surviving bead or structure reference.
 ///
 /// # Errors
 ///

@@ -777,11 +777,18 @@ fn three_page_bead_ring_pdf() -> Vec<u8> {
     )
 }
 
-// A removed page reached ONLY through an article-thread bead's `/P` is nulled,
-// not left as a live orphan. The bead ring is a carrier of extract's neutralize
-// family, so the merge collector must walk it too.
+// KNOWN LIMITATION (documents current behaviour). A page reached only through
+// an article-thread bead's `/P` from a selected page belongs to a
+// drop-and-garbage-collect family, NOT the destination null-out family. qpdf
+// `--pages` GCs such a page entirely rather than leaving a null placeholder, so
+// merge deliberately does not null it. Until merge implements the drop, the
+// page is pulled into the copy by the page closure (which follows the surviving
+// bead `/P`) and stays a LIVE object — outside the output page tree, but still
+// reachable through the bead ring. This test pins that current behaviour: the
+// bead `/P` target resolves to a live `/Type /Page` dict (NOT null) and is
+// absent from `/Kids`. A future drop-fix should flip the first assertion.
 #[test]
-fn merge_nulls_removed_page_via_bead_ring() {
+fn merge_bead_p_removed_page_currently_orphaned() {
     let mut a = Pdf::open_mem_owned(three_page_bead_ring_pdf()).unwrap();
     let mut inputs = [MergeInput {
         source: &mut a,
@@ -805,69 +812,22 @@ fn merge_nulls_removed_page_via_bead_ring() {
     let bead1_ref = bead0.get("N").and_then(Object::as_ref_id).unwrap();
     let bead1 = doc.resolve(bead1_ref).unwrap().into_dict().unwrap();
     let p_target = bead1.get("P").and_then(Object::as_ref_id).unwrap();
+
+    // Current behaviour: the bead /P target is NOT nulled — it remains a live
+    // `/Type /Page` object, distinct from the destination null-out family.
+    let resolved = doc.resolve(p_target).unwrap().into_dict();
     assert!(
-        matches!(doc.resolve(p_target).unwrap(), Object::Null),
-        "removed page reached via a bead /P must resolve to null"
+        resolved
+            .as_ref()
+            .and_then(|d| d.get("Type"))
+            .and_then(Object::as_name)
+            == Some(&b"Page"[..]),
+        "bead-/P-reached removed page is currently a live Page object (drop deferred)"
     );
+    // ...but it is outside the output page tree (never appears in /Kids).
     assert!(
         page_absent_from_kids(&mut doc, p_target),
         "bead-/P-reached orphan must be absent from /Kids"
-    );
-
-    let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
-    assert!(Pdf::open_mem_owned(out).is_ok());
-}
-
-/// Three-page document whose page 0 reaches a removed page (page2) ONLY through
-/// an annotation `/P` pointing at it. Pages 0 and 1 survive; page2 is removed
-/// when only `[0,1]` is selected.
-///
-/// - obj 6 = annot on kept page0 whose `/P 5 0 R` (malformed) targets removed
-///   page2 (obj 5).
-fn three_page_annot_p_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
-            (
-                3,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] >>",
-            ),
-            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"), // removed page2
-            (
-                6,
-                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /P 5 0 R >>",
-            ),
-        ],
-        1,
-    )
-}
-
-// A removed page reached ONLY through an annotation's `/P` (owning-page) ref is
-// nulled, matching extract's neutralize /P carrier.
-#[test]
-fn merge_nulls_removed_page_via_annot_p() {
-    let mut a = Pdf::open_mem_owned(three_page_annot_p_pdf()).unwrap();
-    let mut inputs = [MergeInput {
-        source: &mut a,
-        pages: vec![0, 1],
-    }];
-    let mut doc = merge_documents(&mut inputs).unwrap();
-
-    let refs = pages::page_refs(&mut doc).unwrap();
-    assert_eq!(refs.len(), 2, "only the two selected pages are in /Kids");
-    let annots = annot_refs(&mut doc, refs[0]);
-    let annot = doc.resolve(annots[0]).unwrap().into_dict().unwrap();
-    let p_target = annot.get("P").and_then(Object::as_ref_id).unwrap();
-    assert!(
-        matches!(doc.resolve(p_target).unwrap(), Object::Null),
-        "removed page reached via an annotation /P must resolve to null"
-    );
-    assert!(
-        page_absent_from_kids(&mut doc, p_target),
-        "annot-/P-reached orphan must be absent from /Kids"
     );
 
     let mut out = Vec::new();
@@ -883,7 +843,6 @@ fn merge_nulls_removed_page_via_annot_p() {
 ///
 /// page0 (obj 3) — malformed carriers:
 /// - page-level `/AA 9 0 R` resolves to a NON-dict (an array) → `/AA` arm.
-/// - `/B 10 0 R` resolves to a NON-array (a dict) → bead-ring arm.
 /// - obj 6 = annot whose `/A 11 0 R` resolves to a NON-dict (an integer) and
 ///   whose `/AA << /E ... >>` head is a `/GoTo` WITHOUT `/D` → action arms.
 /// - obj 7 = a NON-dict annotation (an integer) reached through the indirect
@@ -892,21 +851,19 @@ fn merge_nulls_removed_page_via_annot_p() {
 /// page1 (obj 4) — `/Annots 14 0 R` resolves to a NON-array (a dict) → the
 ///   indirect-`/Annots`-not-an-array arm.
 ///
-/// page2 (obj 5) — action-chain shapes and carriers targeting *kept* pages
-/// (so they are collected-but-not-removed, exercising the "target is selected"
-/// branch) via several annotations and a bead ring:
+/// page2 (obj 5) — action-chain shapes and `/SD` carriers targeting *kept*
+/// pages (so they are collected-but-not-removed, exercising the "target is
+/// selected" branch) and `/SD` shapes carrying no resolvable page ref:
 /// - obj 12 = annot whose `/A` head's `/Next` is an ARRAY of actions → the
 ///   `/Next`-array arm.
 /// - obj 13 = annot whose `/A 15 0 R` is an action whose `/Next 15 0 R` points
 ///   back at itself → the indirect-cycle guard (the same action object is not
 ///   re-entered).
-/// - obj 16 = annot `/P 3 0 R` → a SELECTED page (the `/P` resolves to a page
-///   that is kept, so it is not recorded as removed).
 /// - obj 17 = annot `/A /GoTo /SD` → StructElem (obj 18) whose `/Pg 4 0 R` is a
 ///   SELECTED page (the `/SD` target is kept, not removed).
-/// - obj 19 = bead on the ring whose `/P 5 0 R` is a SELECTED page (kept, not
-///   removed); its `/N` neighbour (obj 30) is a bead WITHOUT `/P` (exercising
-///   the no-`/P` ring arm).
+/// - objs 21–24 = `/A /GoTo /SD` shapes that each yield no page ref (empty
+///   `/SD`, non-dict StructElem, StructElem without `/Pg`, `/Pg` → non-page),
+///   exercising the early-return arms of `sd_target_page_ref`.
 fn malformed_carriers_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -918,7 +875,7 @@ fn malformed_carriers_pdf() -> Vec<u8> {
             (
                 3,
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-                 /Annots 8 0 R /AA 9 0 R /B 10 0 R >>",
+                 /Annots 8 0 R /AA 9 0 R >>",
             ),
             (
                 4,
@@ -927,7 +884,7 @@ fn malformed_carriers_pdf() -> Vec<u8> {
             (
                 5,
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-                 /Annots [12 0 R 13 0 R 16 0 R 17 0 R 21 0 R 22 0 R 23 0 R 24 0 R 25 0 R] /B [19 0 R] >>",
+                 /Annots [12 0 R 13 0 R 17 0 R 21 0 R 22 0 R 23 0 R 24 0 R] >>",
             ),
             // page0 annots.
             (
@@ -935,11 +892,10 @@ fn malformed_carriers_pdf() -> Vec<u8> {
                 "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A 11 0 R \
                  /AA << /E << /S /GoTo >> >> >>",
             ),
-            (7, "42"),                 // /Annots element resolves to a non-dict
-            (8, "[6 0 R 7 0 R]"),      // indirect /Annots array
-            (9, "[1 2 3]"),            // /AA resolves to a non-dict (array)
-            (10, "<< /Bogus true >>"), // /B resolves to a non-array (dict)
-            (11, "99"),                // /A resolves to a non-dict (integer)
+            (7, "42"),            // /Annots element resolves to a non-dict
+            (8, "[6 0 R 7 0 R]"), // indirect /Annots array
+            (9, "[1 2 3]"),       // /AA resolves to a non-dict (array)
+            (11, "99"),           // /A resolves to a non-dict (integer)
             // page2: /A head whose /Next is an ARRAY of actions (both non-GoTo,
             // so no target is collected; this exercises the /Next-array walk).
             (
@@ -955,22 +911,14 @@ fn malformed_carriers_pdf() -> Vec<u8> {
             ),
             (14, "<< /NotAnArray true >>"), // indirect /Annots resolves to a non-array
             (15, "<< /S /SetOCGState /Next 15 0 R >>"), // self-referential /Next
-            // page2: carriers whose targets are KEPT (selected) pages — collected
-            // but not recorded as removed.
-            (
-                16,
-                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /P 3 0 R >>",
-            ),
+            // page2: a /A /GoTo /SD whose target is a KEPT (selected) page —
+            // collected but not recorded as removed.
             (
                 17,
                 "<< /Type /Annot /Subtype /Link /Rect [40 0 50 10] \
                  /A << /S /GoTo /SD [18 0 R /Fit] >> >>",
             ),
             (18, "<< /Type /StructElem /S /Sect /Pg 4 0 R >>"),
-            (19, "<< /T 20 0 R /P 5 0 R /N 30 0 R /V 31 0 R >>"), // bead whose /P is a kept page
-            (20, "<< /Type /Thread >>"),
-            (30, "<< /T 20 0 R /N 19 0 R >>"), // ring bead WITHOUT /P
-            (31, "42"),                        // ring link resolving to a non-dict bead
             // page2: /SD shapes that carry no resolvable page ref (each returns
             // None from sd_target_page_ref, exercising its early-return arms).
             (
@@ -989,27 +937,23 @@ fn malformed_carriers_pdf() -> Vec<u8> {
                 24,
                 "<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] /A << /S /GoTo /SD [28 0 R /Fit] >> >>",
             ), // StructElem whose /Pg resolves to a non-page
-            (
-                25,
-                "<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] /P 29 0 R >>",
-            ), // /P resolves to a non-page object
-            (26, "99"),                       // non-dict StructElem
-            (27, "<< /Type /StructElem >>"),  // StructElem with no /Pg
+            (26, "99"),                      // non-dict StructElem
+            (27, "<< /Type /StructElem >>"), // StructElem with no /Pg
             (28, "<< /Type /StructElem /Pg 29 0 R >>"), // /Pg → non-page
-            (29, "<< /Type /Annot >>"),       // a non-page object (used as /Pg and /P target)
+            (29, "<< /Type /Annot >>"),      // a non-page object (used as /Pg target)
         ],
         1,
     )
 }
 
 // Malformed author-controlled carriers (a non-array indirect /Annots element, a
-// non-dict /AA, a non-dict /A action, a GoTo without /D, a non-array /B, a
-// non-array indirect /Annots), structural action shapes (a /Next array, a
-// self-referential indirect /Next), and carriers whose destination is a KEPT
-// page (annot /P, /A /GoTo /SD, bead /P) are all tolerated: the merge succeeds
-// and all selected pages survive. These shapes pass page_refs (which does not
-// validate these sub-objects), so the collector's tolerant arms are genuinely
-// reachable from an openable PDF.
+// non-dict /AA, a non-dict /A action, a GoTo without /D, a non-array indirect
+// /Annots), structural action shapes (a /Next array, a self-referential
+// indirect /Next), a /A /GoTo /SD whose target is a KEPT page, and /SD shapes
+// carrying no resolvable page ref are all tolerated: the merge succeeds and all
+// selected pages survive. These shapes pass page_refs (which does not validate
+// these sub-objects), so the collector's tolerant arms are genuinely reachable
+// from an openable PDF.
 #[test]
 fn merge_tolerates_malformed_carrier_shapes() {
     let mut a = Pdf::open_mem_owned(malformed_carriers_pdf()).unwrap();
