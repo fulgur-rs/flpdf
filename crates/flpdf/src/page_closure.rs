@@ -106,9 +106,9 @@ pub fn page_object_closure<R: Read + Seek>(
 /// from ancestor `/Pages` nodes.
 fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
     if depth >= MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(
-            "page closure: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "page closure: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
     }
     match obj {
         Object::Reference(r) => out.push(*r),

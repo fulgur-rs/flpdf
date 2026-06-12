@@ -1456,9 +1456,10 @@ fn decrypt_strings_in_value(
     depth: usize,
 ) -> Result<()> {
     if depth >= crate::object::MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(
-            "decrypt: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "decrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
     }
     match object {
         Object::String(bytes) => decrypt_cipher_bytes(bytes, cipher),
@@ -1702,9 +1703,10 @@ where
     F: FnMut() -> [u8; 16],
 {
     if depth >= crate::object::MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(
-            "encrypt: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "encrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
     }
     match object {
         Object::String(bytes) => {

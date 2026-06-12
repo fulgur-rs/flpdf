@@ -107,9 +107,9 @@ impl SharedObjectHintEntry {
 /// responsible for cycle detection and transitive expansion.
 fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
     if depth >= MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(
-            "linearization plan: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
     }
     match obj {
         Object::Reference(r) => out.push(*r),

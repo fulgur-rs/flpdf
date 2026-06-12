@@ -121,9 +121,9 @@ pub(crate) fn rewrite_refs(
     map: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
     if depth >= MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(
-            "cross-document copy: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(Error::Unsupported(format!(
+            "cross-document copy: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
     }
     match obj {
         Object::Reference(r) => {

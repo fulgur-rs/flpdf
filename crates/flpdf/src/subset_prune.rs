@@ -215,9 +215,9 @@ fn collect_reachable<R: Read + Seek>(
 /// caller drives resolution in the BFS/DFS loop.
 fn walk_refs(obj: &Object, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
     if depth >= MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(
-            "subset prune: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
     }
     match obj {
         Object::Reference(r) => {

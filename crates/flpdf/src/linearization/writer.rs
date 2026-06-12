@@ -377,9 +377,9 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
 fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Result<Object> {
     if depth >= MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(
-            "linearization writer: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(crate::Error::Unsupported(format!(
+            "linearization writer: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
     }
     match object {
         Object::Reference(r) => match renumber.new_for_original(*r) {

@@ -762,9 +762,9 @@ fn collect_refs_in_object<R: Read + Seek>(
     inline_depth: usize,
 ) -> Result<()> {
     if inline_depth >= MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(
-            "AcroForm: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
-        ));
+        return Err(Error::Unsupported(format!(
+            "AcroForm: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
     }
     match obj {
         Object::Reference(object_ref) => {
