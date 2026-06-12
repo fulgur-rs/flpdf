@@ -1689,17 +1689,23 @@ where
     if Some(object_ref) == encrypt_ref {
         return Ok(());
     }
-    encrypt_strings_in_value(object, cipher, iv_gen)
+    encrypt_strings_in_value(object, cipher, iv_gen, 0)
 }
 
 fn encrypt_strings_in_value<F>(
     object: &mut Object,
     cipher: StringEncryptCipher<'_>,
     iv_gen: &mut F,
+    depth: usize,
 ) -> Result<()>
 where
     F: FnMut() -> [u8; 16],
 {
+    if depth >= crate::object::MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(
+            "encrypt: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
+        ));
+    }
     match object {
         Object::String(bytes) => {
             // Only allocate an IV for cipher variants that consume one.
@@ -1711,13 +1717,13 @@ where
         }
         Object::Array(values) => {
             for value in values {
-                encrypt_strings_in_value(value, cipher, iv_gen)?;
+                encrypt_strings_in_value(value, cipher, iv_gen, depth + 1)?;
             }
             Ok(())
         }
         Object::Dictionary(dict) => {
             for value in dict.values_mut() {
-                encrypt_strings_in_value(value, cipher, iv_gen)?;
+                encrypt_strings_in_value(value, cipher, iv_gen, depth + 1)?;
             }
             Ok(())
         }
@@ -1725,7 +1731,7 @@ where
             // Walk the stream dictionary only — stream payload bytes are
             // handled separately by the stream-encryption pass.
             for value in stream.dict.values_mut() {
-                encrypt_strings_in_value(value, cipher, iv_gen)?;
+                encrypt_strings_in_value(value, cipher, iv_gen, depth + 1)?;
             }
             Ok(())
         }
@@ -1998,6 +2004,25 @@ mod tests {
     fn decrypt_strings_in_value_accepts_nesting_up_to_the_limit() {
         let mut object = nested_arrays(MAX_INLINE_DEPTH - 1);
         decrypt_strings_in_value(&mut object, StringCipher::Identity, 0).unwrap();
+    }
+
+    #[test]
+    fn encrypt_strings_in_value_errors_on_excessive_nesting() {
+        // No strings live in the nested arrays, so the depth guard fires before
+        // any cipher work — Identity needs no key setup and the IV is never used.
+        let mut object = nested_arrays(MAX_INLINE_DEPTH + 5);
+        let mut iv_gen = || [0u8; 16];
+        let err =
+            encrypt_strings_in_value(&mut object, StringEncryptCipher::Identity, &mut iv_gen, 0);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn encrypt_strings_in_value_accepts_nesting_up_to_the_limit() {
+        let mut object = nested_arrays(MAX_INLINE_DEPTH - 1);
+        let mut iv_gen = || [0u8; 16];
+        encrypt_strings_in_value(&mut object, StringEncryptCipher::Identity, &mut iv_gen, 0)
+            .unwrap();
     }
 
     #[test]
