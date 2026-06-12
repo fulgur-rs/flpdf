@@ -2842,3 +2842,152 @@ fn merge_shared_goto_action_resolves_to_single_correct_page() {
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
+
+/// Two-page document whose selected page 0 carries a DIRECT (inline)
+/// annotation dictionary in its `/Annots` array — not an indirect reference —
+/// whose `/Dest` targets the unselected page 1. qpdf `--pages` null-out parity
+/// requires the removed page's reference to resolve to `Null`, even when the
+/// destination is reached through an inline annotation dict.
+///
+/// - obj 3 = page 0, `/Annots [ << inline link /Dest [4 0 R /Fit] >> ]`.
+/// - obj 4 = page 1 (removed).
+fn inline_annot_removed_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Annots [ << /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >> ] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+/// Reproduction for codex F3: an inline (direct) annotation dict whose `/Dest`
+/// targets a removed page must be null-out'd, like an indirect annotation.
+/// Pre-fix the inline annot is skipped by the removed-target scan, so the copied
+/// removed page is left as a LIVE `/Type /Page` orphan instead of `Null`.
+#[test]
+fn merge_inline_annot_removed_dest_nulled() {
+    let mut a = Pdf::open_mem_owned(inline_annot_removed_dest_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1, "only page 0 is selected");
+    let page0_ref = refs[0];
+
+    // The inline annot is a direct dict on /Annots (NOT an indirect ref), so it
+    // cannot go through the `annot_refs` helper.
+    let page = doc.resolve(page0_ref).unwrap().into_dict().unwrap();
+    let annots = match page.get("Annots") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected inline /Annots array, got {other:?}"),
+    };
+    let annot = match annots.first() {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected an inline annotation dict at /Annots[0], got {other:?}"),
+    };
+    let dest = match annot.get("Dest") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected inline annot /Dest array, got {other:?}"),
+    };
+    let dest_ref = match dest.first() {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected /Dest[0] to be an indirect reference, got {other:?}"),
+    };
+    assert!(
+        matches!(doc.resolve(dest_ref).unwrap(), Object::Null),
+        "removed-target inline annot /Dest must resolve to Null, not a live page orphan"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Single-page document whose primary `/AcroForm` carries a `/DR` default
+/// resource dictionary with a font literally named `/P` referenced by the
+/// `/DA` default appearance string `(/P 12 Tf)`. The font object (obj 5) is NOT
+/// referenced by any page, so it survives only if `/DR/Font/P` is included in
+/// the primary copy closure.
+fn dr_font_named_p_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> >>",
+            ),
+            (4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+            (
+                6,
+                "<< /Fields [] /DR << /Font << /P 5 0 R >> >> /DA (/P 12 Tf) >>",
+            ),
+        ],
+        1,
+    )
+}
+
+/// Reproduction for codex F6: an `/AcroForm /DR` resource named `/P` (a legal
+/// resource name) must survive the merge. Pre-fix the `/DR` closure seed skips
+/// every dict key named `/P` (a field-tree-only guard), so the default
+/// appearance font `/DR/Font/P` is dropped and resolves to `Null` in the output.
+#[test]
+fn merge_dr_resource_named_p_survives() {
+    let mut a = Pdf::open_mem_owned(dr_font_named_p_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let acroform_ref = catalog_dict(&mut doc)
+        .get("AcroForm")
+        .and_then(Object::as_ref_id)
+        .expect("merged output must carry an /AcroForm reference");
+    let acroform = match doc.resolve(acroform_ref).unwrap() {
+        Object::Dictionary(d) => d,
+        other => panic!("expected /AcroForm dict, got {other:?}"),
+    };
+    let dr = match acroform.get("DR") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /DR dict, got {other:?}"),
+    };
+    let font = match dr.get("Font") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /DR /Font dict, got {other:?}"),
+    };
+    let p_ref = match font.get("P") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected /DR /Font /P indirect reference, got {other:?}"),
+    };
+    let resolved = doc.resolve(p_ref).unwrap();
+    assert!(
+        !matches!(resolved, Object::Null),
+        "the /DA-referenced /DR /Font /P font must survive the merge, not be nulled"
+    );
+    let font_dict = resolved
+        .into_dict()
+        .expect("/DR /Font /P must be a font dict");
+    assert_eq!(
+        font_dict.get("BaseFont"),
+        Some(&Object::Name(b"Courier".to_vec())),
+        "the surviving /P font must be the Courier default-appearance font"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}

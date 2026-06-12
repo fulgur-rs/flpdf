@@ -85,40 +85,35 @@ fn collect_removed_dest_targets<R: Read + Seek>(
     };
 
     // /Annots may be an inline array or an indirect reference to one (mirrors
-    // neutralize_absent_dests).
-    let annot_refs: Vec<ObjectRef> = match annots_val {
-        Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
+    // neutralize_absent_dests). Each array element is either an indirect
+    // reference to an annotation dict OR a direct (inline) annotation dict; both
+    // carry destinations and must be scanned (an inline annot whose /Dest points
+    // at a removed page is otherwise missed, leaving a live orphan instead of a
+    // null target).
+    let annot_elems: Vec<Object> = match annots_val {
+        Some(Object::Array(arr)) => arr,
         Some(Object::Reference(r)) => match source.resolve_borrowed(r)? {
-            Object::Array(arr) => arr.iter().filter_map(Object::as_ref_id).collect(),
+            Object::Array(arr) => arr.clone(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
     };
-    for annot_ref in annot_refs {
-        let Some(annot) = source.resolve_borrowed(annot_ref)?.as_dict().cloned() else {
-            continue;
-        };
-        // /Dest — explicit array/dict destination (mirrors
-        // neutralize_annot_if_absent's /Dest arm).
-        if let Some(dest) = annot.get("Dest") {
-            collect_dest_target(source, dest, selected, removed)?;
-        }
-        // /A — an action chain (mirrors the /A arm via neutralize_action_chain).
-        if let Some(a_val) = annot.get("A") {
-            let mut visited = BTreeSet::new();
-            collect_action_chain_targets(
-                source,
-                a_val,
-                selected,
-                removed,
-                &mut visited,
-                MAX_ACTION_CHAIN_DEPTH,
-            )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
-        }
-        // Annotation-level /AA (e.g. a widget's /E enter, /X exit actions);
-        // each entry is an action chain.
-        if let Some(aa_val) = annot.get("AA") {
-            collect_aa_dest_targets(source, aa_val, selected, removed)?;
+    for elem in annot_elems {
+        // Resolve an indirect element to its annotation dict (releasing the
+        // source borrow via `.cloned()`); an inline dict is scanned directly,
+        // borrowing the owned array element rather than `source`.
+        match elem {
+            Object::Reference(annot_ref) => {
+                let Some(annot) = source.resolve_borrowed(annot_ref)?.as_dict().cloned() else {
+                    continue;
+                };
+                scan_annotation(source, &annot, selected, removed)?;
+            }
+            Object::Dictionary(annot) => {
+                scan_annotation(source, &annot, selected, removed)?;
+            }
+            // A non-ref, non-dict /Annots element is malformed; skip it.
+            _ => {} // cov:ignore: malformed /Annots element (neither reference nor dict)
         }
     }
 
@@ -127,6 +122,41 @@ fn collect_removed_dest_targets<R: Read + Seek>(
         collect_aa_dest_targets(source, &aa_val, selected, removed)?;
     }
 
+    Ok(())
+}
+
+/// Scan one annotation dictionary's destination carriers (`/Dest`, the `/A`
+/// action chain, and the annotation-level `/AA`) for targets pointing at a
+/// removed page. Shared by the indirect-reference and inline (direct) `/Annots`
+/// element paths so both kinds of annotation are null-out'd identically.
+fn scan_annotation<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    annot: &Dictionary,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    // /Dest — explicit array/dict destination (mirrors
+    // neutralize_annot_if_absent's /Dest arm).
+    if let Some(dest) = annot.get("Dest") {
+        collect_dest_target(source, dest, selected, removed)?;
+    }
+    // /A — an action chain (mirrors the /A arm via neutralize_action_chain).
+    if let Some(a_val) = annot.get("A") {
+        let mut visited = BTreeSet::new();
+        collect_action_chain_targets(
+            source,
+            a_val,
+            selected,
+            removed,
+            &mut visited,
+            MAX_ACTION_CHAIN_DEPTH,
+        )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
+    }
+    // Annotation-level /AA (e.g. a widget's /E enter, /X exit actions);
+    // each entry is an action chain.
+    if let Some(aa_val) = annot.get("AA") {
+        collect_aa_dest_targets(source, aa_val, selected, removed)?;
+    }
     Ok(())
 }
 
@@ -881,7 +911,10 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
     // stream dicts transitively.
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
     for (key, value) in entries {
-        collect_refs_in_object(source, &value, &mut out.closure_seed, &mut seen, 0)?;
+        // `/DR` is a resource dictionary: pass `skip_parent_key: false` so a
+        // resource legitimately named `/P` (e.g. a `/DA`-referenced font) is
+        // collected rather than dropped as a field-tree back-pointer.
+        collect_refs_in_object(source, &value, &mut out.closure_seed, &mut seen, 0, false)?;
         match key.as_slice() {
             b"DR" => out.dr = Some(value),
             b"DA" => out.da = Some(value),
