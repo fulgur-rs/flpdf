@@ -23,11 +23,18 @@ cargo install cargo-fuzz
 
 # Fuzz the whole-document target (Ctrl-C to stop). `-timeout` flags a
 # non-terminating input as a hang; without it libFuzzer's default is 1200s.
-cargo +nightly fuzz run roundtrip fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
+#
+# `--target x86_64-unknown-linux-gnu` is pinned because cargo-fuzz defaults its
+# build target to the triple it was itself built for; a musl-built cargo-fuzz
+# (e.g. from `cargo binstall`) would otherwise build for musl, whose static
+# libc is incompatible with -Zsanitizer=address.
+cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
+  fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
   -- -timeout=10 -rss_limit_mb=2048
 
 # Reproduce a crash artifact.
-cargo +nightly fuzz run roundtrip fuzz/artifacts/roundtrip/crash-<hash>
+cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip \
+  fuzz/artifacts/roundtrip/crash-<hash>
 ```
 
 The first positional dir (`fuzz/corpus/roundtrip`, gitignored) is the writable

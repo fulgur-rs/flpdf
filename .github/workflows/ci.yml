@@ -232,9 +232,17 @@ jobs:
       # guarantee testable (libFuzzer's default per-input timeout is 1200s, which
       # would let a single hang silently eat the whole time budget). A crash,
       # abort, OOM, or hang writes an artifact and exits non-zero, failing CI.
+      #
+      # --target is pinned to the gnu triple: cargo-fuzz defaults its build
+      # target to the triple it was itself compiled for, and cargo-binstall
+      # fetches the musl build of cargo-fuzz, which would otherwise build for
+      # musl. musl is statically-linked libc (incompatible with
+      # -Zsanitizer=address) and its std/ASan runtime isn't installed. The gnu
+      # target ships the prebuilt sanitizer runtime with the host nightly.
       - name: Short fuzz (roundtrip, 60s)
         run: |
           set -euo pipefail
           mkdir -p fuzz/corpus/roundtrip
-          cargo fuzz run roundtrip fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
+          cargo fuzz run --target x86_64-unknown-linux-gnu roundtrip \
+            fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
             -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
