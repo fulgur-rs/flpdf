@@ -47,19 +47,22 @@ distributed across:
 
 Three audits of `crates/flpdf/src/` were run to ground the document:
 
-- **Panic paths**: the panic-free guarantee currently fails in exactly one
-  place — `Parser::object()`/`dictionary()`/`array()` recursion has no depth
-  limit, so deeply nested dicts/arrays overflow the stack (abort). Same shape
-  as qpdf CVE-2018-9918. All `unwrap`/`expect`/`unreachable!`/indexing sites
-  in production code were found to be guarded by invariants. →
-  `flpdf-hn1g.1`.
-- **Termination**: all graph walks terminate. Recursive tree walks carry
-  `DEFAULT_MAX_*_DEPTH = 100` limits (7 constants) plus visited sets;
-  iterative chains (xref `/Prev`, ObjStm `/Extends`, outline `/Next`,
-  dest/action chains) carry visited sets and/or 64-step caps. Two
-  `inherited_field_value()` walks (signatures.rs, json_inspect.rs) have
-  visited sets but no depth cap — terminating, hardening only. →
-  `flpdf-hn1g.3`.
+- **Panic paths**: the panic-free guarantee currently fails in two places,
+  both uncapped native recursion. (1) `Parser::object()`/`dictionary()`/
+  `array()` has no depth limit, so deeply nested dicts/arrays overflow the
+  stack (abort) — same shape as qpdf CVE-2018-9918 → `flpdf-hn1g.1`.
+  (2) ObjStm `/Extends` recursion (detailed under Termination) →
+  `flpdf-hn1g.7`. All `unwrap`/`expect`/`unreachable!`/indexing sites in
+  production code were found to be guarded by invariants.
+- **Termination**: graph walks terminate except where native recursion is
+  uncapped. Recursive tree walks carry `DEFAULT_MAX_*_DEPTH = 100` limits
+  (7 constants) plus visited sets; iterative chains (xref `/Prev`, outline
+  `/Next`, dest/action chains) carry visited sets and/or 64-step caps. Gaps:
+  ObjStm `/Extends` is followed by *recursive* `collect_object_stream_chain`
+  with a visited set but no depth cap, so a deep acyclic chain overflows the
+  stack (abort) → `flpdf-hn1g.7`; and two `inherited_field_value()` walks
+  (signatures.rs, json_inspect.rs) have visited sets but no depth cap —
+  terminating, hardening only → `flpdf-hn1g.3`.
 - **Resource limits**: none, matching qpdf's normal-operation posture.
   FlateDecode/LZW output is unbounded, `/Filter` chains have no length cap,
   some paths read whole files into memory. Documented as out of scope in §4
@@ -77,6 +80,8 @@ Three audits of `crates/flpdf/src/` were run to ground the document:
 | flpdf-hn1g.4 | 2 | opt-in decode limits + filter-chain length cap |
 | flpdf-hn1g.5 | 2 | enable GitHub private vulnerability reporting (manual) |
 | flpdf-hn1g.6 | 2 | add `#![forbid(unsafe_code)]` |
+| flpdf-hn1g.7 | 1 | depth cap / iterative rewrite for ObjStm `/Extends` recursion |
+| flpdf-hn1g.8 | 1 | gate R=5 (AES-256) write output behind `--allow-weak-crypto` |
 
 ## Alternatives considered
 

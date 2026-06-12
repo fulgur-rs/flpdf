@@ -113,9 +113,11 @@ are not treated as vulnerabilities on their own:
   opt-in for R=5 (tracked as `flpdf-hn1g.8`). AES-CBC without integrity
   protection, MD5 in key derivation, etc. are properties of the PDF standard
   security handler, not of flpdf.
-- **Bugs inside dependencies** (`flate2`, RustCrypto crates, …). These should
-  be reported upstream; flpdf's responsibility is to update promptly and to
-  not amplify them.
+- **Bugs inside dependencies** (`flate2`, RustCrypto crates, …) that flpdf
+  does not reach or amplify with attacker-controlled input. These should be
+  reported upstream; flpdf's responsibility is to update promptly. A
+  dependency bug that a malformed PDF *can* drive through flpdf — e.g. memory
+  unsafety in a decoder — stays in scope per §3, not excluded here.
 - **Side channels.** Timing or memory-access side channels in password
   checking and decryption are out of scope.
 
@@ -139,8 +141,11 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 
 Current:
 
-- Unit and integration tests across both crates; a 100% patch-coverage gate
-  on `crates/flpdf` for every PR (`scripts/patch-coverage.sh`).
+- Unit and integration tests across both crates. Contributors are required
+  to run a 100% changed-line coverage gate on `crates/flpdf` before opening a
+  PR (`scripts/patch-coverage.sh`); this is a local contribution-process
+  gate, not yet CI-enforced. CI separately runs whole-workspace
+  `cargo llvm-cov` and uploads the report to Codecov.
 - Code review against the recurring-pitfall rules (unresolved indirect
   references, unsigned casts, unbounded graph traversal) in
   [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md).
