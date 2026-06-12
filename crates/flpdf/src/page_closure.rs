@@ -5,6 +5,7 @@
 //! result is the minimal set of objects needed to reproduce the page's content
 //! and resources in isolation.
 
+use crate::object::MAX_INLINE_DEPTH;
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Seek};
@@ -82,7 +83,7 @@ pub fn page_object_closure<R: Read + Seek>(
             }
         }
 
-        collect_refs_in_object(obj, &mut refs_found);
+        collect_refs_in_object(obj, 0, &mut refs_found)?;
         for r in refs_found.drain(..) {
             if visited.insert(r) {
                 queue.push_back(r);
@@ -103,12 +104,17 @@ pub fn page_object_closure<R: Read + Seek>(
 /// hierarchy, while still allowing the BFS to follow `/Parent` references
 /// upward and collect inherited resources (e.g. `/Resources`, `/MediaBox`)
 /// from ancestor `/Pages` nodes.
-fn collect_refs_in_object(obj: &Object, out: &mut Vec<ObjectRef>) {
+fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
+    if depth >= MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(
+            "page closure: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
+        ));
+    }
     match obj {
         Object::Reference(r) => out.push(*r),
         Object::Array(items) => {
             for item in items {
-                collect_refs_in_object(item, out);
+                collect_refs_in_object(item, depth + 1, out)?;
             }
         }
         Object::Dictionary(dict) => {
@@ -121,12 +127,12 @@ fn collect_refs_in_object(obj: &Object, out: &mut Vec<ObjectRef>) {
                 if is_pages_node && key == b"Kids" {
                     continue;
                 }
-                collect_refs_in_object(value, out);
+                collect_refs_in_object(value, depth + 1, out)?;
             }
         }
         Object::Stream(stream) => {
             for (_key, value) in stream.dict.iter() {
-                collect_refs_in_object(value, out);
+                collect_refs_in_object(value, depth + 1, out)?;
             }
         }
         // Scalar types carry no references.
@@ -136,5 +142,40 @@ fn collect_refs_in_object(obj: &Object, out: &mut Vec<ObjectRef>) {
         | Object::Real(_)
         | Object::Name(_)
         | Object::String(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::MAX_INLINE_DEPTH;
+
+    fn nested_arrays(depth: usize) -> Object {
+        let mut o = Object::Null;
+        for _ in 0..depth {
+            o = Object::Array(vec![o]);
+        }
+        o
+    }
+
+    #[test]
+    fn collect_refs_in_object_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_refs_in_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &mut out);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_refs_in_object_accepts_nesting_up_to_the_limit() {
+        let mut out = Vec::new();
+        // Bury one Reference just within the limit; it must be collected, not errored.
+        let leaf = Object::Array(vec![Object::Reference(ObjectRef::new(7, 0))]);
+        let mut o = leaf;
+        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+            o = Object::Array(vec![o]);
+        }
+        collect_refs_in_object(&o, 0, &mut out).unwrap();
+        assert_eq!(out, vec![ObjectRef::new(7, 0)]);
     }
 }
