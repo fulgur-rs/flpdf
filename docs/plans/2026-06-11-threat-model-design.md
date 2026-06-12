@@ -52,8 +52,9 @@ Three audits of `crates/flpdf/src/` were run to ground the document:
   `array()` has no depth limit, so deeply nested dicts/arrays overflow the
   stack (abort) — same shape as qpdf CVE-2018-9918 → `flpdf-hn1g.1`.
   (2) ObjStm `/Extends` recursion (detailed under Termination) →
-  `flpdf-hn1g.7`. (3) page-closure `collect_refs_in_object` recurses over
-  direct structure with no depth cap, unlike `rewrite_renumber`'s
+  `flpdf-hn1g.7`. (3) the structural ref-walkers
+  `page_closure::collect_refs_in_object` and `subset_prune::walk_refs` recurse
+  over direct structure with no depth cap, unlike `rewrite_renumber`'s
   `MAX_INLINE_DEPTH`-bounded `collect_refs` → `flpdf-hn1g.9`. All
   `unwrap`/`expect`/`unreachable!`/indexing sites in production code were
   found to be guarded by invariants.
@@ -85,7 +86,7 @@ Three audits of `crates/flpdf/src/` were run to ground the document:
 | flpdf-hn1g.6 | 2 | add `#![forbid(unsafe_code)]` |
 | flpdf-hn1g.7 | 1 | depth cap / iterative rewrite for ObjStm `/Extends` recursion |
 | flpdf-hn1g.8 | 1 | gate R=5 (AES-256) write output behind `--allow-weak-crypto` |
-| flpdf-hn1g.9 | 1 | depth cap for page-closure `collect_refs_in_object` recursion |
+| flpdf-hn1g.9 | 1 | shared depth-capped structural ref-walk (`collect_refs_in_object`, `subset_prune::walk_refs`) |
 
 ## Alternatives considered
 

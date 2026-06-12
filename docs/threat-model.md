@@ -73,9 +73,12 @@ of the following:
 
 - **Undefined behavior or memory unsafety** (only possible via dependencies
   or future `unsafe` code, but in scope regardless).
-- **A panic or abort**, including stack overflow from unbounded recursion.
-  qpdf precedent: CVE-2018-9918 (stack overflow on deeply nested direct
-  objects, fixed with a nesting depth limit).
+- **A panic or abort** from a *logic* fault — `panic!`, `unwrap()` on
+  attacker-reachable values, out-of-bounds indexing, arithmetic overflow, or
+  stack overflow from unbounded recursion. qpdf precedent: CVE-2018-9918
+  (stack overflow on deeply nested direct objects, fixed with a nesting depth
+  limit). Resource-exhaustion aborts (e.g. an allocation failure on a
+  compression bomb) are out of scope per §4, not security bugs.
 - **Non-termination** — an infinite loop while parsing or traversing.
   qpdf precedent: CVE-2017-9209 / CVE-2017-9210.
 - **A violation of the signed-PDF integrity policy**
@@ -132,7 +135,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Cycle detection (visited sets) on iterative chain following: xref `/Prev` chains, outline `/Next` chains, field `/Parent` chains (an iterative `while`-loop with a visited set — terminating; the missing depth cap is hardening only, `flpdf-hn1g.3`) | `xref.rs` (`merge_previous_xref_sections`), `outline.rs` (`walk_outline`), `annotation_helper.rs`, `signatures.rs`, `json_inspect.rs` |
 | Checked arithmetic and non-negative validation on parser-derived sizes (`/Length` bounds, PNG-predictor row math, LZW table size cap of 4096 entries) | `parser.rs`, `filters.rs` |
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
-| Weak-crypto write gate (weakly encrypted output requires explicit opt-in) | `Error::Encrypted(WeakCryptoNotAllowed)`, CLI `--allow-weak-crypto` |
+| Weak-crypto write gate: RC4 output requires the explicit `--allow-weak-crypto` opt-in (the R=5 AES-256 write path is not yet gated — see `flpdf-hn1g.8`) | `Error::Encrypted(WeakCryptoNotAllowed)`, CLI `--allow-weak-crypto` |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `security/` |
 | Signed-PDF preserve-by-default policy (edits that would invalidate signatures are rejected unless explicitly opted in) | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Traversal boundaries on page closures: stop at other `Page`/`Catalog` dicts and skip `/Kids` on `/Pages` nodes; `/Parent` is intentionally followed upward for inherited resources, bounded by the `Page`/`Catalog` stop; no brute-force scans of all live objects | `page_closure.rs`, [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
@@ -172,7 +175,7 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | --- | --- | --- |
 | Object parser recursion (`Parser::object` → `dictionary`/`array`) has no depth limit; deeply nested input (`<</A <</B …>>>>`, `[[[…]]]`) can overflow the stack and abort. Same shape as qpdf CVE-2018-9918. | (b) no panic/abort | `flpdf-hn1g.1` |
 | Object-stream `/Extends` chains are followed by recursive `collect_object_stream_chain` (`reader.rs`) guarded by a visited set (cycle detection) but no depth cap; a deep *acyclic* `/Extends` chain can overflow the stack and abort before a cycle is ever detected. Same class as the parser-recursion gap above. | (b) no panic/abort | `flpdf-hn1g.7` |
-| Page-closure `collect_refs_in_object` (`page_closure.rs`) recurses over direct array/dictionary/stream-dictionary structure with no depth cap, unlike `rewrite_renumber`'s `MAX_INLINE_DEPTH`-bounded `collect_refs`; a resolved object with deeply nested direct structure can overflow the stack. Currently shadowed by the parser gap (`flpdf-hn1g.1`) but an independent uncapped path. | (b) no panic/abort | `flpdf-hn1g.9` |
+| Structural ref-walkers recurse over direct array/dictionary/stream-dictionary structure with no depth cap (e.g. `page_closure::collect_refs_in_object`, `subset_prune::walk_refs`), unlike `rewrite_renumber`'s `MAX_INLINE_DEPTH`-bounded `collect_refs`; a resolved object with deeply nested direct structure can overflow the stack during page-closure copy or `--pages`/attachment GC. Currently shadowed by the parser gap (`flpdf-hn1g.1`) but independent uncapped paths; the fix is a single shared bounded walk. | (b) no panic/abort | `flpdf-hn1g.9` |
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
 | No opt-in decode-output limits and no `/Filter` chain length cap (compression bombs covered by §4, but mitigations are worth offering). | §4 mitigation | `flpdf-hn1g.4` |
