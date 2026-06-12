@@ -1,7 +1,8 @@
 //! Integration tests for [`flpdf::merge_documents`].
 
 use flpdf::{
-    merge_documents, pages, write_pdf_with_options, MergeInput, Object, Pdf, WriteOptions,
+    merge_documents, pages, write_pdf, write_pdf_with_options, MergeInput, Object, Pdf,
+    WriteOptions,
 };
 use std::collections::BTreeMap;
 
@@ -47,6 +48,59 @@ fn three_page_shared_font_pdf() -> Vec<u8> {
         ],
         1,
     )
+}
+
+/// One-page document whose single page uses a single named font with the given
+/// `BaseFont`.
+fn single_font_pdf(base: &[u8]) -> Vec<u8> {
+    let base = std::str::from_utf8(base).expect("BaseFont must be valid UTF-8");
+    let font_obj = format!("<< /Type /Font /Subtype /Type1 /BaseFont /{base} >>");
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            ),
+            (4, font_obj.as_str()),
+            (5, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
+        ],
+        1,
+    )
+}
+
+/// Resolve the `/BaseFont` name of the single font on the leaf page at index
+/// `page_idx` in `doc`, following its `/Resources /Font` dictionary.
+fn leaf_base_font(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, page_idx: usize) -> Vec<u8> {
+    let leaf_ref = pages::page_refs(doc).unwrap()[page_idx];
+    let leaf = doc.resolve(leaf_ref).unwrap().as_dict().cloned().unwrap();
+    let resources = resolve_dict_entry(doc, &leaf, "Resources");
+    let fonts = resolve_dict_entry(doc, &resources, "Font");
+    // The single font entry (named /F1 in the fixture); resolve its /BaseFont.
+    let (_, font_obj) = fonts.iter().next().expect("page has one font");
+    let font = match font_obj {
+        Object::Reference(r) => doc.resolve(*r).unwrap().as_dict().cloned().unwrap(),
+        Object::Dictionary(d) => d.clone(),
+        _ => panic!("font entry is not a dict"),
+    };
+    font.get("BaseFont")
+        .and_then(|o| o.as_name())
+        .expect("font has /BaseFont")
+        .to_vec()
+}
+
+/// Resolve `dict[key]` (which may be a reference) into an owned dictionary.
+fn resolve_dict_entry(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    dict: &flpdf::Dictionary,
+    key: &str,
+) -> flpdf::Dictionary {
+    match dict.get(key).expect("dict has key") {
+        Object::Reference(r) => doc.resolve(*r).unwrap().as_dict().cloned().unwrap(),
+        Object::Dictionary(d) => d.clone(),
+        _ => panic!("entry {key} is not a dict"),
+    }
 }
 
 /// Resolve the catalog's /Pages dict from a freshly-merged document.
@@ -138,6 +192,37 @@ fn merge_rejects_empty_inputs() {
         Ok(_) => panic!("empty inputs must error"),
         Err(err) => assert!(matches!(err, flpdf::Error::Unsupported(_)), "got {err:?}"),
     }
+}
+
+// Two inputs concatenate in input order: page 1 from input A, page 2 from
+// input B, each carrying its own independent font.
+#[test]
+fn merge_two_inputs_concatenates_in_order() {
+    let mut a = Pdf::open_mem_owned(single_font_pdf(b"Helvetica")).unwrap();
+    let mut b = Pdf::open_mem_owned(single_font_pdf(b"Courier")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2);
+    // Both fonts present independently, exactly once each.
+    assert_eq!(count_font_objects(&mut doc, b"Helvetica"), 1);
+    assert_eq!(count_font_objects(&mut doc, b"Courier"), 1);
+    // Concat ORDER: page 1 is input A's font, page 2 is input B's font.
+    assert_eq!(leaf_base_font(&mut doc, 0), b"Helvetica".to_vec());
+    assert_eq!(leaf_base_font(&mut doc, 1), b"Courier".to_vec());
+    // Round-trip valid.
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
 // An out-of-range page index is rejected.

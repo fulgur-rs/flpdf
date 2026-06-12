@@ -113,7 +113,19 @@ pub fn merge_documents<R: Read + Seek>(
         for &page_ref in &unique {
             closure.extend(page_object_closure(input.source, page_ref)?);
         }
+        // Renumbering-disjointness invariant: copy_objects allocates fresh
+        // target object numbers starting one past the current maximum, so the
+        // refs it returns never collide with objects already surviving in the
+        // target (prior inputs' copied pages, or the seed catalog/pages root).
+        // This is the structural guard that makes a shared-destination
+        // double-remap unreachable; capture the surviving set BEFORE copying.
+        let surviving_before: BTreeSet<ObjectRef> = target.object_refs().into_iter().collect();
         let map = copy_objects(input.source, &mut target, &closure)?;
+        debug_assert!(
+            map.values().all(|new| !surviving_before.contains(new)),
+            "copy_objects must allocate refs disjoint from surviving target refs \
+             (renumbering-disjointness invariant; guards against shared-destination double-remap)"
+        );
 
         // Materialize inherited attrs onto each copied leaf and reparent it to
         // the fresh /Pages root.
