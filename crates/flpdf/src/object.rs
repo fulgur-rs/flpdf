@@ -2,6 +2,27 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+/// Maximum inline structural nesting depth any operation walks when descending
+/// into a single resolved object's `Array` / `Dictionary` / `Stream`-dictionary
+/// structure. Indirect references are followed iteratively (a caller-driven
+/// BFS/DFS with a visited set), so this bounds only inline nesting within one
+/// object and guards every post-parse structural walker against stack overflow
+/// on adversarial input.
+///
+/// Exceeding it is a hard error, never a silent stop: a walker that returned
+/// early would under-collect or under-rewrite references and corrupt its output
+/// (garbage collection would delete still-reachable objects; renumbering would
+/// emit mixed old/new object numbers). Returning [`crate::Error::Unsupported`]
+/// preserves the no-panic/no-abort core guarantee even for parser-accepted but
+/// pathological objects.
+///
+/// Independent of (and may be lower than) the parser's `MAX_PARSE_DEPTH`:
+/// operations cap inline traversal more tightly than parsing. Real PDFs never
+/// nest inline structures this deeply — deep hierarchies use indirect
+/// references, which travel through the iterative queue rather than this
+/// recursion.
+pub(crate) const MAX_INLINE_DEPTH: usize = 256;
+
 /// Indirect-object reference (`N G R` in PDF syntax).
 ///
 /// `ObjectRef` is a thin value type: it identifies an object by `(number, generation)`

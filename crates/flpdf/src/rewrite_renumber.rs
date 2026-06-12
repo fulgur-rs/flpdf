@@ -26,18 +26,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek};
 
-use crate::object::{Object, ObjectRef};
+use crate::object::{Object, ObjectRef, MAX_INLINE_DEPTH};
 use crate::reader::Pdf;
 use crate::Error;
-
-/// Maximum inline structural nesting depth walked when collecting or rewriting
-/// references inside a single resolved object. Indirect references are enqueued
-/// rather than recursed, so this only bounds inline dictionary/array nesting and
-/// guards against stack overflow on adversarial input. Exceeding it is a hard
-/// error (not a silent stop): a reference past the limit would be left
-/// uncollected/un-rewritten and corrupt the renumbered output. Real PDFs never
-/// nest inline structures this deeply.
-const MAX_INLINE_DEPTH: usize = 256;
 
 /// A map from original object references to their qpdf-style Catalog-first
 /// numbers, plus the visitation order that produced them.
