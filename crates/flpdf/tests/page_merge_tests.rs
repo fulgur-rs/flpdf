@@ -2234,3 +2234,119 @@ fn merge_appends_unnamed_secondary_field() {
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Regression guard: a single indirect /GoTo action shared by an outline item
+// AND a page annotation, under a non-identity page remap, must remain ONE object
+// whose destination resolves to a single correct page (no double remap).
+// ---------------------------------------------------------------------------
+
+/// Primary document with page A (obj 3) and page B (obj 4). One INDIRECT `/GoTo`
+/// action object (obj 7, `<< /S /GoTo /D [4 0 R /Fit] >>`) is shared by BOTH the
+/// outline item's `/A` (obj 21) AND page A's link annotation's `/A` (obj 6):
+/// both carriers literally reference `7 0 R`. The action's `/D` targets page B
+/// (obj 4) via an indirect page reference. Because the action is one indirect
+/// object referenced from two carriers, the merge closure contains it exactly
+/// once and copy_objects rewrites its `/D` page ref a single time.
+fn shared_goto_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 20 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                6,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A 7 0 R >>",
+            ),
+            (7, "<< /S /GoTo /D [4 0 R /Fit] >>"),
+            (
+                20,
+                "<< /Type /Outlines /First 21 0 R /Last 21 0 R /Count 1 >>",
+            ),
+            (21, "<< /Title (to B) /Parent 20 0 R /A 7 0 R >>"),
+        ],
+        1,
+    )
+}
+
+// flpdf-ygoj regression guard. A shared indirect /GoTo action (referenced by both
+// an outline item and a page annotation) must, under a non-identity remap caused
+// by duplicate page selection, be copied as a SINGLE object whose /D destination
+// resolves to a SINGLE correct page (page B). The discriminating property is the
+// shared-object identity: both carriers must point at the SAME copied action ref
+// (proving copy dedup held — a reintroduced per-carrier remap pass would deep-copy
+// the action twice and split them), and that action's /D[0] must remap to page B's
+// new ref exactly once (a double remap would misdirect it to a wrong/extra ref).
+#[test]
+fn merge_shared_goto_action_resolves_to_single_correct_page() {
+    let mut p = Pdf::open_mem_owned(shared_goto_pdf()).unwrap();
+    // Duplicate page selection (0,1,0) forces a non-identity remap: page A is
+    // duplicated, so its 2nd+ occurrence is shallow-cloned at a fresh number.
+    let mut inputs = [MergeInput {
+        source: &mut p,
+        pages: vec![0, 1, 0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 3, "A, B, A(clone)");
+    let page_a = refs[0];
+    let page_b = refs[1];
+
+    // Reach the shared action via the OUTLINE item's /A.
+    let cat = catalog_dict(&mut doc);
+    let outlines_ref = cat.get_ref("Outlines").expect("output has /Outlines");
+    let items = outline_item_refs(&mut doc, outlines_ref);
+    assert_eq!(items.len(), 1, "single outline item inherited");
+    let item = doc.resolve(items[0]).unwrap().into_dict().unwrap();
+    let g_from_outline = match item.get("A") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("outline item /A must be an indirect reference, got {other:?}"),
+    };
+
+    // Reach the SAME action via page A's annotation /A (clean first-occurrence
+    // page A, not the shallow clone).
+    let annots = annot_refs(&mut doc, page_a);
+    assert_eq!(annots.len(), 1, "page A carries one annotation");
+    let annot = doc.resolve(annots[0]).unwrap().into_dict().unwrap();
+    let g_from_annot = match annot.get("A") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("annotation /A must be an indirect reference, got {other:?}"),
+    };
+
+    // Strongest guard: both carriers point at the SAME copied action object. A
+    // reintroduced separate remap pass that deep-copies per carrier would split
+    // these into two distinct refs and fail here.
+    assert_eq!(
+        g_from_outline, g_from_annot,
+        "shared /GoTo action must remain a single object (copy dedup held)"
+    );
+
+    // The shared action's /D[0] must resolve to page B's new ref — a SINGLE
+    // correct page, remapped exactly once (no double remap, not null).
+    let action = doc.resolve(g_from_outline).unwrap().into_dict().unwrap();
+    let d = match action.get("D") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("shared action /D must be an array, got {other:?}"),
+    };
+    let dest_ref = match d.first() {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("shared action /D[0] must be an indirect reference, got {other:?}"),
+    };
+    assert_eq!(
+        dest_ref, page_b,
+        "shared /GoTo dest must resolve to page B's single new ref (no double remap)"
+    );
+    assert!(
+        !matches!(doc.resolve(dest_ref).unwrap(), Object::Null),
+        "page B is selected, so its dest target must not be nulled"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
