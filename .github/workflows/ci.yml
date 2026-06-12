@@ -196,3 +196,53 @@ jobs:
           files: lcov.info
           use_oidc: true
           fail_ci_if_error: false
+
+  fuzz:
+    name: Fuzz (short)
+    needs: quality
+    runs-on: ubuntu-latest
+    # Backstop in case `cargo fuzz build` hangs or -max_total_time is not
+    # honored; the run itself should finish in a few minutes (build + 60s).
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # cargo-fuzz needs nightly (libFuzzer / -Zsanitizer=address). Pin a known-
+      # good nightly rather than floating `nightly` so a bad nightly can't break
+      # unrelated PRs through this blocking gate.
+      - name: Set up Rust (pinned nightly)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly-2026-05-24
+          components: rust-src
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          shared-key: ubuntu-latest-flpdf-fuzz
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@88ada01c46e65c47040a0ae865537cc76fcd0e1c # cargo-fuzz
+        with:
+          tool: cargo-fuzz
+
+      # Short whole-document fuzz. -timeout=10 makes the "traversal terminates"
+      # guarantee testable (libFuzzer's default per-input timeout is 1200s, which
+      # would let a single hang silently eat the whole time budget). A crash,
+      # abort, OOM, or hang writes an artifact and exits non-zero, failing CI.
+      #
+      # --target is pinned to the gnu triple: cargo-fuzz defaults its build
+      # target to the triple it was itself compiled for, and cargo-binstall
+      # fetches the musl build of cargo-fuzz, which would otherwise build for
+      # musl. musl is statically-linked libc (incompatible with
+      # -Zsanitizer=address) and its std/ASan runtime isn't installed. The gnu
+      # target ships the prebuilt sanitizer runtime with the host nightly.
+      - name: Short fuzz (roundtrip, 60s)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus/roundtrip
+          cargo fuzz run --target x86_64-unknown-linux-gnu roundtrip \
+            fuzz/corpus/roundtrip fuzz/seeds/roundtrip \
+            -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
