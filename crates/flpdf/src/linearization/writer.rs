@@ -67,6 +67,7 @@ use crate::linearization::hint_stream::encode_hint_stream;
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap};
+use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
@@ -264,7 +265,7 @@ fn build_objstm_container_object<R: Read + Seek>(
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
         let object = pdf.resolve_borrowed(orig)?;
-        let renumbered = renumber_object(object, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
         resolved.push((new_ref, renumbered));
     }
     let body = emit_objstm_body_from_resolved(&resolved)?;
@@ -374,7 +375,12 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 /// describe, silently corrupting the linearized output.
 ///
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
-fn renumber_object(object: &Object, renumber: &RenumberMap) -> Result<Object> {
+fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Result<Object> {
+    if depth >= MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(
+            "linearization writer: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
+        ));
+    }
     match object {
         Object::Reference(r) => match renumber.new_for_original(*r) {
             Some(new_ref) => Ok(Object::Reference(new_ref)),
@@ -387,14 +393,14 @@ fn renumber_object(object: &Object, renumber: &RenumberMap) -> Result<Object> {
         Object::Array(elements) => {
             let mut renumbered = Vec::with_capacity(elements.len());
             for e in elements {
-                renumbered.push(renumber_object(e, renumber)?);
+                renumbered.push(renumber_object(e, depth + 1, renumber)?);
             }
             Ok(Object::Array(renumbered))
         }
         Object::Dictionary(dict) => {
             let mut new_dict = Dictionary::new();
             for (key, value) in dict.iter() {
-                new_dict.insert(key, renumber_object(value, renumber)?);
+                new_dict.insert(key, renumber_object(value, depth + 1, renumber)?);
             }
             Ok(Object::Dictionary(new_dict))
         }
@@ -402,7 +408,7 @@ fn renumber_object(object: &Object, renumber: &RenumberMap) -> Result<Object> {
             // Renumber the dictionary; leave the stream data bytes alone.
             let mut new_dict = Dictionary::new();
             for (key, value) in stream.dict.iter() {
-                new_dict.insert(key, renumber_object(value, renumber)?);
+                new_dict.insert(key, renumber_object(value, depth + 1, renumber)?);
             }
             Ok(Object::Stream(Stream::new(new_dict, stream.data.clone())))
         }
@@ -1029,7 +1035,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1052,7 +1058,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1086,7 +1092,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
         let offset = append_object(&mut bytes, new_ref, &renumbered);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1828,6 +1834,7 @@ pub fn write_linearized<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
+    use crate::object::MAX_INLINE_DEPTH;
     use crate::writer::WriteOptions;
     use crate::Pdf;
     use std::io::Cursor;
@@ -2246,5 +2253,61 @@ mod tests {
         assert_eq!(lengths.get(&1).copied(), Some(100));
         // Obj 6 runs from offset 200 to last_xref_offset 400.
         assert_eq!(lengths.get(&6).copied(), Some(200));
+    }
+
+    // -----------------------------------------------------------------------
+    // renumber_object bounds inline structural nesting depth
+    // -----------------------------------------------------------------------
+    fn nested_arrays(depth: usize) -> Object {
+        let mut o = Object::Null;
+        for _ in 0..depth {
+            o = Object::Array(vec![o]);
+        }
+        o
+    }
+
+    #[test]
+    fn renumber_object_errors_on_excessive_nesting() {
+        // The deep object contains no Reference, so the RenumberMap is never
+        // consulted — the inline-depth guard must fire before the Null leaf.
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        let err = renumber_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn renumber_object_accepts_nesting_up_to_the_limit() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        // The catalog (1 0 R) is in the plan, so it has a renumber entry.
+        let original = ObjectRef::new(1, 0);
+        let expected = renumber
+            .new_for_original(original)
+            .expect("catalog must have a renumber entry");
+
+        // Bury that Reference just within the limit; it must be remapped, not errored.
+        let mut obj = Object::Array(vec![Object::Reference(original)]);
+        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+            obj = Object::Array(vec![obj]);
+        }
+        let out = renumber_object(&obj, 0, &renumber).expect("in-limit nesting must succeed");
+
+        // Unwrap the nested arrays down to the deepest element and confirm the
+        // in-limit Reference was renumbered to its mapped target.
+        let mut cur = &out;
+        loop {
+            match cur {
+                Object::Array(items) if items.len() == 1 => cur = &items[0],
+                other => {
+                    assert_eq!(other, &Object::Reference(expected));
+                    break;
+                }
+            }
+        }
     }
 }
