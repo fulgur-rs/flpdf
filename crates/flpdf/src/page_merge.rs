@@ -7,6 +7,7 @@
 //! input are de-duplicated; form-field name collisions are resolved by qpdf's
 //! `<name>+<N>` renaming rule.
 
+use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::object_copy::copy_objects;
 use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
@@ -725,6 +726,191 @@ fn remap_inline_action(action: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) ->
     }
 }
 
+/// Resolve qpdf's `--pages` form-field name collision: return `base` when it is
+/// not yet present in `used`, otherwise the first unused `base+1`, `base+2`, …
+///
+/// This reproduces qpdf 11.9.0's observed renaming: `name`+`name` →
+/// `name`, `name+1`; a three-way collision → `name`, `name+1`, `name+2`; and a
+/// candidate that itself collides is re-resolved (a field originally named
+/// `name+1` whose `name+1` is already taken becomes `name+1+1`).
+pub(crate) fn unique_field_name(base: &[u8], used: &BTreeSet<Vec<u8>>) -> Vec<u8> {
+    if !used.contains(base) {
+        return base.to_vec();
+    }
+    for n in 1u32.. {
+        let mut candidate = base.to_vec();
+        candidate.extend_from_slice(format!("+{n}").as_bytes());
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 candidate space exhausted") // cov:ignore: 2^32 colliding names is unreachable
+}
+
+/// A top-level AcroForm field copied into the target, paired with the partial
+/// name (`/T`) read from its source. `partial_name` is `None` for a field with
+/// no direct `/T` (such a field is appended without a name-collision check).
+struct KeptField {
+    /// The field's object ref in the merged target document.
+    target_ref: ObjectRef,
+    /// The field's `/T` partial name as read from the source (resolved).
+    partial_name: Option<Vec<u8>>,
+    /// Whether the field came from the primary input (`inputs[0]`).
+    is_primary: bool,
+}
+
+/// The primary input's inherited `/AcroForm` defaults, captured before copying
+/// and remapped onto the merged output's `/AcroForm`.
+#[derive(Default)]
+struct PrimaryAcroForm {
+    /// Remapped `/DR` default-resources value (fonts the primary's `/DA`
+    /// references), or `None` when the primary has no `/DR`.
+    dr: Option<Object>,
+    /// The primary's `/DA` default-appearance value, or `None`.
+    da: Option<Object>,
+    /// Indirect refs reachable from `/DR` / `/DA`, folded into the primary copy
+    /// closure so the referenced fonts are copied into the output.
+    closure_seed: BTreeSet<ObjectRef>,
+}
+
+/// Read the primary input's `/AcroForm /DR` and `/DA`, returning them with the
+/// set of indirect objects they reach (to fold into the primary copy closure).
+/// The `/DR` / `/DA` values are returned verbatim (still in the source's
+/// numbering); [`finalize_primary_acroform`] remaps them after the copy.
+fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryAcroForm> {
+    let entries = source.acroform().acroform_inherited_entries()?;
+    let mut out = PrimaryAcroForm::default();
+    // One shared `seen` across /DR and /DA so a font referenced by both is
+    // resolved once. `collect_refs_in_object` bounds the reference chain by
+    // `DEFAULT_MAX_ACROFORM_DEPTH` (review rule 4) and follows arrays, dicts, and
+    // stream dicts transitively.
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    for (key, value) in entries {
+        collect_refs_in_object(source, &value, &mut out.closure_seed, &mut seen, 0)?;
+        match key.as_slice() {
+            b"DR" => out.dr = Some(value),
+            b"DA" => out.da = Some(value),
+            _ => {} // cov:ignore: acroform_inherited_entries yields only /DR and /DA
+        }
+    }
+    Ok(out)
+}
+
+/// Read the partial names (`/T`, resolved) of `source`'s top-level AcroForm
+/// fields, in `/Fields` order, paired with the source field ref so a caller can
+/// map the ref through that input's copy map. A field whose `/T` is absent
+/// yields `None`.
+fn source_top_level_field_names<R: Read + Seek>(
+    source: &mut Pdf<R>,
+) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
+    let top_fields = source.acroform().top_level_fields()?;
+    let mut out = Vec::with_capacity(top_fields.len());
+    for field_ref in top_fields {
+        let name = resolve_field_partial_name(source, field_ref)?;
+        out.push((field_ref, name));
+    }
+    Ok(out)
+}
+
+/// Resolve a field's `/T` partial name. `/T` may be an indirect reference
+/// (review rule 2); a resolved non-string or absent `/T` yields `None`.
+fn resolve_field_partial_name<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    field_ref: ObjectRef,
+) -> Result<Option<Vec<u8>>> {
+    let t_value = {
+        let Some(field) = source.resolve_borrowed(field_ref)?.as_dict() else {
+            return Ok(None); // cov:ignore: a top-level field ref always resolves to a dictionary
+        };
+        field.get("T").cloned()
+    };
+    let resolved = match t_value {
+        Some(Object::Reference(r)) => source.resolve(r)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    Ok(resolved.as_string().map(<[u8]>::to_vec))
+}
+
+/// Build the merged output's `/AcroForm` from the primary's inherited `/DR` /
+/// `/DA` base plus every kept top-level field, applying qpdf's `+N` name
+/// collision renaming to fields from later inputs.
+///
+/// Primary fields keep their names verbatim (they seed the `used` set); a later
+/// input's field name is resolved through [`unique_field_name`] and written
+/// back onto the copied field as a direct `/T` string. No `/AcroForm` is created
+/// when there are no kept fields and the primary carried no `/DR` / `/DA`, so a
+/// form-free merge gains no empty `/AcroForm`.
+fn build_merged_acroform<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    primary: &PrimaryAcroForm,
+    kept: &[KeptField],
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    if kept.is_empty() && primary.dr.is_none() && primary.da.is_none() {
+        return Ok(());
+    }
+
+    let acroform_ref = target.acroform().ensure_acroform_ref()?;
+    let mut acroform = match target.resolve_borrowed(acroform_ref)?.as_dict().cloned() {
+        Some(dict) => dict,
+        None => return Ok(()), // cov:ignore: ensure_acroform_ref always yields a dictionary
+    };
+
+    // Inherit the primary's /DR and /DA, remapping any indirect refs to the
+    // copied objects. `/DA` is usually a direct string (a no-op under remap),
+    // but per ISO 32000-2 any value may be stored as an indirect reference; a
+    // verbatim copy would leave a source object number dangling in the output.
+    if let Some(dr) = &primary.dr {
+        acroform.insert("DR", remap_refs_in_object(dr.clone(), map));
+    }
+    if let Some(da) = &primary.da {
+        acroform.insert("DA", remap_refs_in_object(da.clone(), map));
+    }
+
+    // Seed `used` with the primary's field names (verbatim — the primary is the
+    // base document and is never renamed), then append every kept field, in
+    // order, renaming later inputs' colliding names via the qpdf `+N` rule.
+    let mut used: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for field in kept {
+        if field.is_primary {
+            if let Some(name) = &field.partial_name {
+                used.insert(name.clone());
+            }
+        }
+    }
+
+    let mut fields: Vec<Object> = Vec::with_capacity(kept.len());
+    for field in kept {
+        if !field.is_primary {
+            if let Some(name) = &field.partial_name {
+                let unique = unique_field_name(name, &used);
+                used.insert(unique.clone());
+                rename_field(target, field.target_ref, unique)?;
+            }
+        }
+        fields.push(Object::Reference(field.target_ref));
+    }
+    acroform.insert("Fields", Object::Array(fields));
+
+    target.set_object(acroform_ref, Object::Dictionary(acroform));
+    Ok(())
+}
+
+/// Overwrite the copied field's `/T` with `name` as a direct string.
+fn rename_field<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    name: Vec<u8>,
+) -> Result<()> {
+    let Some(mut field) = target.resolve_borrowed(field_ref)?.as_dict().cloned() else {
+        return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
+    };
+    field.insert("T", Object::String(name));
+    target.set_object(field_ref, Object::Dictionary(field));
+    Ok(())
+}
+
 /// Merge selected pages from N sources into one fresh document.
 ///
 /// Returns an owned in-memory [`Pdf`] whose catalog has a single-level
@@ -761,6 +947,19 @@ fn remap_inline_action(action: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) ->
 /// page tree (`/Pages` `/Kids`) but remains a live object in the output,
 /// reachable through that surviving bead or structure reference.
 ///
+/// Interactive form (AcroForm) fields are merged: the primary's `/AcroForm`
+/// `/DR` default resources and `/DA` default appearance are the base, and every
+/// selected page's top-level field (reached from its widget annotations) is
+/// added to the output `/AcroForm /Fields`. A field whose widget is on an
+/// unselected page is dropped (qpdf form subset). Top-level field-name (`/T`)
+/// collisions are resolved by qpdf's `<name>+<N>` rule: the primary keeps its
+/// names and a later input's colliding name becomes the first unused
+/// `<name>+1`, `<name>+2`, … . Collision handling is limited to **top-level
+/// partial names** (flat forms where the partial name equals the fully-qualified
+/// name); nested field-tree fully-qualified-path collisions, and merging later
+/// inputs' `/DR` resources, are not handled. A merge of form-free inputs adds no
+/// `/AcroForm`.
+///
 /// # Errors
 ///
 /// - [`Error::Unsupported`] if `inputs` is empty, or if a requested page index
@@ -788,6 +987,15 @@ pub fn merge_documents<R: Read + Seek>(
     // and absent-destination handling added by later merge stages.
     let mut all_new_pages: BTreeSet<ObjectRef> = BTreeSet::new();
 
+    // AcroForm merge state. `kept_fields` accumulates each input's kept
+    // top-level fields (orphan fields on unselected pages are absent from the
+    // copy map and so never appear). `primary_acroform` holds the primary's
+    // inherited `/DR` / `/DA`, remapped onto the output `/AcroForm` after the
+    // primary copy renumbers its fonts.
+    let mut kept_fields: Vec<KeptField> = Vec::new();
+    let mut primary_acroform = PrimaryAcroForm::default();
+    let mut primary_map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+
     let depth = DEFAULT_MAX_PAGE_TREE_DEPTH;
     for (input_index, input) in inputs.iter_mut().enumerate() {
         // Document-level structures (outlines, named dests, /OpenAction) are
@@ -798,6 +1006,16 @@ pub fn merge_documents<R: Read + Seek>(
         } else {
             PrimaryDocLevel::default()
         };
+
+        // The primary's `/AcroForm /DR` and `/DA` are the merged form's base; a
+        // later input contributes form fields only (its `/DR` / `/DA` are not
+        // merged). Read them now and fold their fonts into the primary closure.
+        if is_primary {
+            primary_acroform = discover_primary_acroform(input.source)?;
+        }
+        // Source top-level field names, read before the copy severs numbering;
+        // each is mapped through this input's copy map below.
+        let source_fields = source_top_level_field_names(input.source)?;
 
         let all = page_refs(input.source)?;
         // Resolve the selected source page refs (range-checked, duplicates
@@ -843,6 +1061,11 @@ pub fn merge_documents<R: Read + Seek>(
         // the same single copy pass copies and remaps them — no separate
         // post-copy remap. A no-op for secondary inputs (empty doc_level).
         fold_doc_level_closure(input.source, &doc_level, &mut closure)?;
+
+        // Fold the primary's `/AcroForm /DR` / `/DA` fonts into the closure so a
+        // `/DA` resource (e.g. `/Helv`) is copied and the output `/DR` can point
+        // at it after the remap. A no-op for secondary inputs.
+        closure.extend(primary_acroform.closure_seed.iter().copied());
 
         // qpdf `--pages` null-out parity: a destination (annotation `/Dest`,
         // `/A /GoTo /D`, or page `/AA`) targeting a page NOT selected from this
@@ -913,6 +1136,23 @@ pub fn merge_documents<R: Read + Seek>(
             wire_doc_level(&mut target, &doc_level, &map)?;
         }
 
+        // Record this input's kept top-level fields (those whose source ref was
+        // copied — orphan fields on unselected pages are absent from `map` and
+        // so dropped, matching qpdf's form subset). The primary's `map` also
+        // remaps its inherited `/DR` fonts in `build_merged_acroform`.
+        for (src_field_ref, partial_name) in source_fields {
+            if let Some(&target_ref) = map.get(&src_field_ref) {
+                kept_fields.push(KeptField {
+                    target_ref,
+                    partial_name,
+                    is_primary,
+                });
+            }
+        }
+        if is_primary {
+            primary_map = map.clone();
+        }
+
         // Materialize inherited attrs onto each copied leaf and reparent it to
         // the fresh /Pages root.
         for (&src_ref, attrs) in unique.iter().zip(inherited) {
@@ -941,10 +1181,62 @@ pub fn merge_documents<R: Read + Seek>(
     root.insert("Count", Object::Integer(kids.len() as i64));
     target.set_object(pages_root_ref, Object::Dictionary(root));
 
+    // Build the merged `/AcroForm`: the primary's `/DR` / `/DA` base plus every
+    // kept top-level field, with later inputs' colliding `/T` names renamed by
+    // qpdf's `+N` rule. Done BEFORE the sweep so the `/DR` fonts (reachable only
+    // through `/AcroForm`) are not garbage-collected.
+    build_merged_acroform(&mut target, &primary_acroform, &kept_fields, &primary_map)?;
+
     // Drop the copied ancestor /Pages node(s) and any objects only they
     // referenced: they are unreachable now that each leaf /Parent points at the
     // fresh root. full_rewrite does NOT garbage-collect, so prune here.
     sweep_unreachable_objects(&mut target)?;
 
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_field_name;
+    use std::collections::BTreeSet;
+
+    fn used(names: &[&[u8]]) -> BTreeSet<Vec<u8>> {
+        names.iter().map(|n| n.to_vec()).collect()
+    }
+
+    #[test]
+    fn unique_field_name_keeps_unused_base() {
+        assert_eq!(unique_field_name(b"name", &used(&[])), b"name".to_vec());
+        assert_eq!(
+            unique_field_name(b"name", &used(&[b"email"])),
+            b"name".to_vec()
+        );
+    }
+
+    #[test]
+    fn unique_field_name_appends_plus_one_on_collision() {
+        assert_eq!(
+            unique_field_name(b"name", &used(&[b"name"])),
+            b"name+1".to_vec()
+        );
+    }
+
+    #[test]
+    fn unique_field_name_finds_first_unused_in_sequence() {
+        // name, name+1 taken → name+2 (the three-way collision tail).
+        assert_eq!(
+            unique_field_name(b"name", &used(&[b"name", b"name+1"])),
+            b"name+2".to_vec()
+        );
+    }
+
+    #[test]
+    fn unique_field_name_reresolves_colliding_candidate() {
+        // A field originally named `name+1` whose `name+1` is already used must
+        // re-resolve to `name+1+1` (qpdf 11.9.0 observed behaviour).
+        assert_eq!(
+            unique_field_name(b"name+1", &used(&[b"name", b"name+1"])),
+            b"name+1+1".to_vec()
+        );
+    }
 }

@@ -1774,3 +1774,463 @@ fn merge_tolerates_empty_outline_root() {
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Task 5: AcroForm form-field merge with qpdf `+N` name-collision renaming.
+// ---------------------------------------------------------------------------
+
+/// One-page form whose single page carries a widget that IS the field (flat
+/// form): `/Subtype /Widget /FT /Tx /T (<field_name>)`. The catalog has an
+/// `/AcroForm` with that widget in `/Fields`, a `/DR /Font /Helv`, and a `/DA`.
+fn form_pdf(field_name: &[u8]) -> Vec<u8> {
+    let widget = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T ({}) /Rect [0 0 100 20] /P 3 0 R >>",
+        std::str::from_utf8(field_name).expect("field name is valid UTF-8")
+    );
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (4, widget.as_str()),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Fields [4 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+        ],
+        1,
+    )
+}
+
+/// Two-page form: page 0 carries field `f1` (obj 4), page 1 carries field `f2`
+/// (obj 7). `/AcroForm /Fields` lists both. Selecting page 0 only must keep f1
+/// and drop the orphan f2.
+fn two_page_form_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>",
+            ),
+            (
+                7,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f2) /Rect [0 0 100 20] /P 6 0 R >>",
+            ),
+            (
+                8,
+                "<< /Fields [4 0 R 7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+        ],
+        1,
+    )
+}
+
+/// Resolve the output `/AcroForm /Fields`, returning each field's `/T` partial
+/// name (resolving an indirect `/T`). A field without `/T` yields an empty Vec.
+fn acroform_field_names(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<Vec<u8>> {
+    let cat = catalog_dict(doc);
+    let acroform = match cat.get("AcroForm") {
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /AcroForm, got {other:?}"),
+    };
+    let fields = match acroform.get("Fields") {
+        Some(Object::Array(arr)) => arr.clone(),
+        Some(Object::Reference(r)) => match doc.resolve(*r).unwrap() {
+            Object::Array(arr) => arr,
+            other => panic!("expected indirect /Fields array, got {other:?}"),
+        },
+        other => panic!("expected /Fields array, got {other:?}"),
+    };
+    let mut names = Vec::new();
+    for item in fields {
+        let field_ref = match item {
+            Object::Reference(r) => r,
+            other => panic!("expected field ref, got {other:?}"),
+        };
+        let field = doc.resolve(field_ref).unwrap().into_dict().unwrap();
+        let name = match field.get("T") {
+            Some(Object::String(s)) => s.clone(),
+            Some(Object::Reference(r)) => doc
+                .resolve(*r)
+                .unwrap()
+                .as_string()
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        names.push(name);
+    }
+    names
+}
+
+// Two documents whose only field is named `name` → output keeps `name` (the
+// primary) and renames the second to `name+1` (qpdf 11.9.0 observed rule).
+#[test]
+fn merge_renames_colliding_form_fields() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), b"name+1".to_vec()]
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// A three-way collision renames the second and third occurrences `name+1`,
+// `name+2`.
+#[test]
+fn merge_renames_three_way_collision() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut c = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut c,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), b"name+1".to_vec(), b"name+2".to_vec()]
+    );
+}
+
+// A later input whose field is named `name+1` re-resolves to `name+1+1` when the
+// `name+1` candidate is already taken by an earlier rename: `name` + `name`
+// (primary, second) + a `name+1` field → `name`, `name+1`, `name+1+1`.
+#[test]
+fn merge_rename_skips_taken_candidate() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut c = Pdf::open_mem_owned(form_pdf(b"name+1")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut c,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), b"name+1".to_vec(), b"name+1+1".to_vec()]
+    );
+}
+
+// Distinct field names pass through unchanged.
+#[test]
+fn merge_keeps_distinct_field_names() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"email")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), b"email".to_vec()]
+    );
+}
+
+// A form field whose widget is on an UNSELECTED page is dropped from the output
+// `/Fields` (qpdf form subset): selecting page 0 of a two-field, two-page form
+// keeps only f1.
+#[test]
+fn merge_drops_orphan_field_of_unselected_page() {
+    let mut a = Pdf::open_mem_owned(two_page_form_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(acroform_field_names(&mut doc), vec![b"f1".to_vec()]);
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// The primary's `/AcroForm /DR` / `/DA` are the merged form's base: the output
+// `/AcroForm` carries `/DA` and a `/DR /Font /Helv` pointing at the copied
+// (remapped) Helvetica font object.
+#[test]
+fn merge_inherits_primary_acroform_dr_and_da() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let acroform = match cat.get("AcroForm") {
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected indirect /AcroForm, got {other:?}"),
+    };
+    // /DA inherited verbatim from the primary.
+    assert_eq!(
+        acroform.get("DA").and_then(Object::as_string),
+        Some(&b"/Helv 0 Tf 0 g"[..]),
+        "primary /DA must be inherited"
+    );
+    // /DR /Font /Helv points at a copied Helvetica font object (remapped).
+    let dr = resolve_dict_entry(&mut doc, &acroform, "DR");
+    let font = resolve_dict_entry(&mut doc, &dr, "Font");
+    let helv_ref = font.get_ref("Helv").expect("/DR /Font /Helv ref");
+    let helv = doc.resolve(helv_ref).unwrap().into_dict().unwrap();
+    assert_eq!(
+        helv.get("BaseFont").and_then(Object::as_name),
+        Some(&b"Helvetica"[..]),
+        "/DR font must resolve to the copied Helvetica"
+    );
+}
+
+// The primary's `/AcroForm /DA` stored as an INDIRECT reference must be remapped
+// to the copied object, not copied verbatim (which would leave a source object
+// number dangling). The output `/DA` must resolve to the original string.
+#[test]
+fn merge_remaps_indirect_primary_da() {
+    let mut a = Pdf::open_mem_owned(form_pdf_indirect_da(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"other")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let acroform = match cat.get("AcroForm") {
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected indirect /AcroForm, got {other:?}"),
+    };
+    // The indirect /DA must point at a copied object that resolves to the
+    // original string — never a dangling source ref nor /Null.
+    let da_ref = acroform
+        .get_ref("DA")
+        .expect("indirect /DA must survive as a (remapped) reference");
+    assert_eq!(
+        doc.resolve(da_ref).unwrap().as_string(),
+        Some(&b"/Helv 0 Tf 0 g"[..]),
+        "remapped indirect /DA must resolve to the primary's appearance string"
+    );
+}
+
+// A merge of form-free inputs gains no `/AcroForm` (the merged catalog stays
+// form-free rather than growing an empty `/AcroForm`).
+#[test]
+fn merge_form_free_inputs_have_no_acroform() {
+    let mut a = Pdf::open_mem_owned(single_font_pdf(b"Helvetica")).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    assert!(
+        cat.get("AcroForm").is_none(),
+        "form-free merge must not add an /AcroForm"
+    );
+}
+
+/// One-page form whose field's `/T` is an INDIRECT reference (obj 7) rather than
+/// a direct string, exercising the indirect-`/T` resolve path (review rule 2).
+fn form_pdf_indirect_t(field_name: &[u8]) -> Vec<u8> {
+    let name = std::str::from_utf8(field_name).expect("field name is valid UTF-8");
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T 7 0 R /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Fields [4 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (7, &format!("({name})")),
+        ],
+        1,
+    )
+}
+
+/// One-page form whose `/AcroForm /DA` is an INDIRECT reference (obj 20) rather
+/// than a direct string, exercising the indirect-`/DA` remap path (review rule
+/// 2). Obj 20 holds the default-appearance string. The source number is high and
+/// sparse on purpose: the fresh target compacts object numbers, so a verbatim
+/// (un-remapped) `/DA 20 0 R` would dangle, while a correctly remapped ref still
+/// resolves — letting the regression test discriminate the two paths.
+fn form_pdf_indirect_da(field_name: &[u8]) -> Vec<u8> {
+    let widget = format!(
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T ({}) /Rect [0 0 100 20] /P 3 0 R >>",
+        std::str::from_utf8(field_name).expect("field name is valid UTF-8")
+    );
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (4, widget.as_str()),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Fields [4 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA 20 0 R >>",
+            ),
+            (20, "(/Helv 0 Tf 0 g)"),
+        ],
+        1,
+    )
+}
+
+/// One-page form whose top-level field carries NO `/T` (an unnamed widget on a
+/// selected page). The field is still copied and appended, but contributes no
+/// name to the collision set.
+fn form_pdf_no_t() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Fields [4 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// A field name stored as an INDIRECT `/T` reference is resolved and used for
+// collision detection: `name` (indirect, primary) + `name` (direct, secondary)
+// renames the second to `name+1`.
+#[test]
+fn merge_resolves_indirect_field_name() {
+    let mut a = Pdf::open_mem_owned(form_pdf_indirect_t(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), b"name+1".to_vec()]
+    );
+}
+
+// A secondary input's unnamed top-level field (no `/T`) is appended to the
+// output `/Fields` without a name and without disturbing the named field's
+// collision resolution.
+#[test]
+fn merge_appends_unnamed_secondary_field() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf_no_t()).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    // The primary's named field, then the unnamed secondary field (empty name).
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), Vec::new()]
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}

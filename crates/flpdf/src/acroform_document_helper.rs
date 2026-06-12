@@ -340,7 +340,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
     }
 
-    fn ensure_acroform_ref(&mut self) -> Result<ObjectRef> {
+    pub(crate) fn ensure_acroform_ref(&mut self) -> Result<ObjectRef> {
         if let Some(existing_ref) = self.acroform_ref()? {
             return Ok(existing_ref);
         }
@@ -700,7 +700,7 @@ fn source_field_copy_set<RS: Read + Seek>(
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
-    fn top_level_fields(&mut self) -> Result<Vec<ObjectRef>> {
+    pub(crate) fn top_level_fields(&mut self) -> Result<Vec<ObjectRef>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
@@ -716,7 +716,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .collect())
     }
 
-    fn acroform_inherited_entries(&mut self) -> Result<Vec<(Vec<u8>, Object)>> {
+    pub(crate) fn acroform_inherited_entries(&mut self) -> Result<Vec<(Vec<u8>, Object)>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
@@ -732,7 +732,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 }
 
-fn collect_reachable_refs<R: Read + Seek>(
+pub(crate) fn collect_reachable_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object_ref: ObjectRef,
     out: &mut BTreeSet<ObjectRef>,
@@ -762,7 +762,7 @@ fn collect_reachable_refs<R: Read + Seek>(
     collect_refs_in_object(pdf, &obj, out, seen, depth, 0, skip_parent_key)
 }
 
-fn collect_refs_in_object<R: Read + Seek>(
+pub(crate) fn collect_refs_in_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     obj: &Object,
     out: &mut BTreeSet<ObjectRef>,
@@ -903,7 +903,7 @@ fn materialize_acroform_dr<R: Read + Seek>(
     Ok(())
 }
 
-fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
+pub(crate) fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
     match obj {
         Object::Reference(object_ref) => map
             .get(&object_ref)
