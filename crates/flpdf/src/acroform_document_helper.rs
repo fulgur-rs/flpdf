@@ -5,6 +5,7 @@
 //! [`crate::FormFieldObjectHelper`] for inherited value lookup and on
 //! [`crate::copy_objects`] for cross-document field copying.
 
+use crate::object::MAX_INLINE_DEPTH;
 use crate::{
     copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, FormFieldObjectHelper,
     Object, ObjectRef, Pdf, Result, DEFAULT_MAX_ACROFORM_DEPTH,
@@ -685,7 +686,7 @@ fn source_field_copy_set<RS: Read + Seek>(
         collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen, 0)?;
     }
     for (_, value) in &inherited_entries {
-        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen, 0)?;
+        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen, 0, 0)?;
     }
     Ok((top_fields, inherited_entries, copy_set))
 }
@@ -732,9 +733,12 @@ fn collect_reachable_refs<R: Read + Seek>(
 ) -> Result<()> {
     // The `seen` cycle guard cannot stop a long *acyclic* indirect-reference chain
     // (obj1 -> obj2 -> ... -> objN), where recursion depth grows with the chain length.
-    // Bound the reference chain to avoid stack overflow on hostile source PDFs. Only the
-    // indirect-reference axis is unbounded; intra-object nesting is already capped by the
-    // parser, so `depth` increments per resolved reference (see `collect_refs_in_object`).
+    // Bound the reference chain to avoid stack overflow on hostile source PDFs. Two
+    // independent recursion axes are bounded separately: the `depth` parameter bounds the
+    // indirect-reference-hop axis (`DEFAULT_MAX_ACROFORM_DEPTH`), incremented once per
+    // resolved reference; inline structural nesting within a single resolved object is
+    // bounded by the `inline_depth`/`MAX_INLINE_DEPTH` axis (see `collect_refs_in_object`),
+    // reset to 0 at each ref hop because a freshly resolved object starts a new inline walk.
     if depth > DEFAULT_MAX_ACROFORM_DEPTH {
         return Err(Error::Unsupported(format!(
             "AcroForm reference chain depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
@@ -746,7 +750,7 @@ fn collect_reachable_refs<R: Read + Seek>(
     out.insert(object_ref);
 
     let obj = pdf.resolve(object_ref)?;
-    collect_refs_in_object(pdf, &obj, out, seen, depth)
+    collect_refs_in_object(pdf, &obj, out, seen, depth, 0)
 }
 
 fn collect_refs_in_object<R: Read + Seek>(
@@ -755,19 +759,31 @@ fn collect_refs_in_object<R: Read + Seek>(
     out: &mut BTreeSet<ObjectRef>,
     seen: &mut BTreeSet<ObjectRef>,
     depth: usize,
+    inline_depth: usize,
 ) -> Result<()> {
+    if inline_depth >= MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(
+            "AcroForm: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
+        ));
+    }
     match obj {
         Object::Reference(object_ref) => {
+            // Ref hop: bump the ref-hop axis; `collect_reachable_refs` resets
+            // `inline_depth` to 0 for the freshly resolved object.
             collect_reachable_refs(pdf, *object_ref, out, seen, depth + 1)
         }
         Object::Array(items) => {
             for item in items {
-                collect_refs_in_object(pdf, item, out, seen, depth)?;
+                collect_refs_in_object(pdf, item, out, seen, depth, inline_depth + 1)?;
             }
             Ok(())
         }
-        Object::Dictionary(dict) => collect_refs_in_dict(pdf, dict, out, seen, depth),
-        Object::Stream(stream) => collect_refs_in_dict(pdf, &stream.dict, out, seen, depth),
+        Object::Dictionary(dict) => {
+            collect_refs_in_dict(pdf, dict, out, seen, depth, inline_depth + 1)
+        }
+        Object::Stream(stream) => {
+            collect_refs_in_dict(pdf, &stream.dict, out, seen, depth, inline_depth + 1)
+        }
         Object::Null
         | Object::Boolean(_)
         | Object::Integer(_)
@@ -783,12 +799,16 @@ fn collect_refs_in_dict<R: Read + Seek>(
     out: &mut BTreeSet<ObjectRef>,
     seen: &mut BTreeSet<ObjectRef>,
     depth: usize,
+    inline_depth: usize,
 ) -> Result<()> {
     for (key, value) in dict.iter() {
         if key == b"P" {
             continue;
         }
-        collect_refs_in_object(pdf, value, out, seen, depth)?;
+        // Forward the same `inline_depth`: the caller incremented it when
+        // descending into this dict, and each value re-enters
+        // `collect_refs_in_object` where the guard re-checks.
+        collect_refs_in_object(pdf, value, out, seen, depth, inline_depth)?;
     }
     Ok(())
 }
@@ -1016,6 +1036,7 @@ fn is_pdf_name_delimiter(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{Stream, MAX_INLINE_DEPTH};
 
     fn dict(entries: &[(&str, Object)]) -> Dictionary {
         let mut dict = Dictionary::new();
@@ -1023,6 +1044,62 @@ mod tests {
             dict.insert(*key, value.clone());
         }
         dict
+    }
+
+    /// Build `depth` levels of single-element arrays wrapping `Object::Null`.
+    /// Contains no `Reference`, so walking it never reaches the resolve path.
+    fn nested_arrays(depth: usize) -> Object {
+        let mut o = Object::Null;
+        for _ in 0..depth {
+            o = Object::Array(vec![o]);
+        }
+        o
+    }
+
+    /// Minimal valid `Pdf` for tests that walk a `Reference`-free object. The
+    /// `pdf` argument is required by the walker signature but is never touched
+    /// because pure inline structure never reaches `pdf.resolve`.
+    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
+        Pdf::open_mem_owned(bytes.to_vec()).expect("open")
+    }
+
+    #[test]
+    fn collect_refs_in_object_errors_on_excessive_inline_nesting() {
+        let mut pdf = minimal_pdf();
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let deep = nested_arrays(MAX_INLINE_DEPTH + 5);
+        // arg order: (pdf, obj, out, seen, depth, inline_depth)
+        let err = collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_refs_in_object_accepts_inline_nesting_within_limit() {
+        let mut pdf = minimal_pdf();
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        // Deepest array entry sits at inline_depth = MAX_INLINE_DEPTH - 1 < limit.
+        let deep = nested_arrays(MAX_INLINE_DEPTH - 1);
+        collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_refs_in_object_walks_dict_and_stream_arms_within_limit() {
+        let mut pdf = minimal_pdf();
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        // Shallow object exercising the Dictionary and Stream arms (no Reference,
+        // so the resolve path is never hit and `pdf` stays unused by the walk).
+        let stream = Object::Stream(Stream::new(
+            dict(&[("Length", Object::Integer(0))]),
+            Vec::new(),
+        ));
+        let obj = Object::Dictionary(dict(&[("S", stream), ("N", Object::Integer(1))]));
+        collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
