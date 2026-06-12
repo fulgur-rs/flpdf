@@ -47,13 +47,16 @@ distributed across:
 
 Three audits of `crates/flpdf/src/` were run to ground the document:
 
-- **Panic paths**: the panic-free guarantee currently fails in two places,
-  both uncapped native recursion. (1) `Parser::object()`/`dictionary()`/
+- **Panic paths**: the panic-free guarantee currently fails in three places,
+  all uncapped native recursion. (1) `Parser::object()`/`dictionary()`/
   `array()` has no depth limit, so deeply nested dicts/arrays overflow the
   stack (abort) — same shape as qpdf CVE-2018-9918 → `flpdf-hn1g.1`.
   (2) ObjStm `/Extends` recursion (detailed under Termination) →
-  `flpdf-hn1g.7`. All `unwrap`/`expect`/`unreachable!`/indexing sites in
-  production code were found to be guarded by invariants.
+  `flpdf-hn1g.7`. (3) page-closure `collect_refs_in_object` recurses over
+  direct structure with no depth cap, unlike `rewrite_renumber`'s
+  `MAX_INLINE_DEPTH`-bounded `collect_refs` → `flpdf-hn1g.9`. All
+  `unwrap`/`expect`/`unreachable!`/indexing sites in production code were
+  found to be guarded by invariants.
 - **Termination**: graph walks terminate except where native recursion is
   uncapped. Recursive tree walks carry `DEFAULT_MAX_*_DEPTH = 100` limits
   (7 constants) plus visited sets; iterative chains (xref `/Prev`, outline
@@ -82,6 +85,7 @@ Three audits of `crates/flpdf/src/` were run to ground the document:
 | flpdf-hn1g.6 | 2 | add `#![forbid(unsafe_code)]` |
 | flpdf-hn1g.7 | 1 | depth cap / iterative rewrite for ObjStm `/Extends` recursion |
 | flpdf-hn1g.8 | 1 | gate R=5 (AES-256) write output behind `--allow-weak-crypto` |
+| flpdf-hn1g.9 | 1 | depth cap for page-closure `collect_refs_in_object` recursion |
 
 ## Alternatives considered
 
