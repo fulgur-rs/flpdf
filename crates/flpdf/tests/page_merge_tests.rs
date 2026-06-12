@@ -2236,6 +2236,147 @@ fn merge_appends_unnamed_secondary_field() {
 }
 
 // ---------------------------------------------------------------------------
+// Task 7: remaining error/boundary arms (empty selection, duplicate selection,
+// --empty blank-primary base).
+// ---------------------------------------------------------------------------
+
+/// A minimal blank base document: a catalog over an empty `/Pages` tree (no
+/// pages). This is the `--empty` analog — passing it as `inputs[0]` with an
+/// empty page selection contributes zero pages and no document-level structures.
+fn blank_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+        ],
+        1,
+    )
+}
+
+// An input with an empty page selection (`pages: vec![]`) is NOT an error: it
+// contributes zero pages, leaving only the other inputs' pages. This is the
+// per-input policy that makes the `--empty` base (a blank primary with an empty
+// selection) expressible — only an empty `inputs` SLICE is rejected.
+#[test]
+fn merge_empty_page_selection_for_an_input_contributes_no_pages() {
+    let mut a = Pdf::open_mem_owned(single_font_pdf(b"Helvetica")).unwrap();
+    let mut b = Pdf::open_mem_owned(single_font_pdf(b"Courier")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        // Secondary input selects NO pages: a no-op, not an error.
+        MergeInput {
+            source: &mut b,
+            pages: vec![],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1, "only input A's single page is in the output");
+    assert_eq!(leaf_base_font(&mut doc, 0), b"Helvetica".to_vec());
+    // The empty-selection input contributed nothing — its font is absent.
+    assert_eq!(count_font_objects(&mut doc, b"Courier"), 0);
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// A page index selected more than once within one input yields one output page
+// per occurrence: distinct page dictionaries, but their indirectly referenced
+// children (here `/Contents`) stay SHARED (shallow clone, matching
+// extract_pages and qpdf 11.9.0's duplicate-page output).
+#[test]
+fn merge_duplicate_page_selection_clones_dict_shares_children() {
+    let mut a = Pdf::open_mem_owned(single_font_pdf(b"Helvetica")).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2, "two output pages, one per selection");
+    assert_ne!(
+        refs[0], refs[1],
+        "duplicate selection yields distinct page dictionaries (shallow clone)"
+    );
+
+    // The shared child (/Contents) is the SAME ref on both copied pages.
+    let contents_ref = |doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, page_ref: flpdf::ObjectRef| {
+        doc.resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap()
+            .get_ref("Contents")
+            .expect("page has an indirect /Contents")
+    };
+    let c0 = contents_ref(&mut doc, refs[0]);
+    let c1 = contents_ref(&mut doc, refs[1]);
+    assert_eq!(
+        c0, c1,
+        "duplicate pages share their /Contents child (shallow clone, not deep copy)"
+    );
+    // The shared font is copied once, not duplicated.
+    assert_eq!(count_font_objects(&mut doc, b"Helvetica"), 1);
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// `--empty` analog: a blank primary (`inputs[0]` = empty document, empty page
+// selection) plus a real secondary contributes the secondary's pages and gains
+// NO document-level structures (the blank primary has none to inherit, and a
+// secondary's document-level structures are never inherited).
+#[test]
+fn merge_empty_primary_starts_from_blank_base() {
+    let mut empty = Pdf::open_mem_owned(blank_pdf()).unwrap();
+    let mut b = Pdf::open_mem_owned(single_font_pdf(b"Courier")).unwrap();
+    let mut inputs = [
+        // Blank primary: no pages selected (the `--empty` base).
+        MergeInput {
+            source: &mut empty,
+            pages: vec![],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // The secondary's single page is the whole output.
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1, "blank primary contributes no pages");
+    assert_eq!(leaf_base_font(&mut doc, 0), b"Courier".to_vec());
+
+    // A blank primary has no /Outlines, /Names, or /OpenAction, and the
+    // secondary's document-level structures are NOT inherited — so the output
+    // catalog carries none of them.
+    let cat = catalog_dict(&mut doc);
+    assert!(
+        cat.get("Outlines").is_none(),
+        "blank primary contributes no /Outlines"
+    );
+    assert!(
+        cat.get("Names").is_none(),
+        "blank primary contributes no /Names"
+    );
+    assert!(
+        cat.get("OpenAction").is_none(),
+        "blank primary contributes no /OpenAction"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // Regression guard: a single indirect /GoTo action shared by an outline item
 // AND a page annotation, under a non-identity page remap, must remain ONE object
 // whose destination resolves to a single correct page (no double remap).

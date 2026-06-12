@@ -913,8 +913,10 @@ fn rename_field<R: Read + Seek>(
 
 /// Merge selected pages from N sources into one fresh document.
 ///
-/// Returns an owned in-memory [`Pdf`] whose catalog has a single-level
-/// `/Pages` tree containing the selected pages from every input, concatenated
+/// Each [`MergeInput`] pairs an opened source document with the page indices to
+/// take from it. Returns an owned in-memory [`Pdf`] whose catalog has a
+/// single-level `/Pages` tree containing the selected pages from every input,
+/// concatenated
 /// in input order and, within each input, in the order given by that input's
 /// `pages`. Each input is copied in a single pass with one renumbering map, so
 /// objects shared between selected pages of the same input (fonts, images,
@@ -925,16 +927,26 @@ fn rename_field<R: Read + Seek>(
 /// tree, and a page selected more than once within an input becomes a shallow
 /// clone of its first copy, matching [`extract_pages`](crate::extract_pages).
 ///
-/// Each source is left unmodified. Write the result with
-/// [`write_pdf`](crate::write_pdf) or
+/// Each source is left unmodified. Each input is copied with
+/// [`copy_objects`]; the result mirrors
+/// [`extract_pages`](crate::extract_pages) for a single input. Write the result
+/// with [`write_pdf`](crate::write_pdf) or
 /// [`write_pdf_with_options`](crate::write_pdf_with_options).
+///
+/// An input may select **no pages** (`pages: vec![]`): it contributes nothing
+/// and is not an error. A blank document passed as `inputs[0]` with an empty
+/// selection is the qpdf `--empty` analog — the merge then starts from an empty
+/// base and inherits no document-level information (a blank primary has none).
 ///
 /// Document-level information is inherited from the **primary** input
 /// (`inputs[0]`) only: its `/Outlines` tree, `/Names /Dests` named destinations
 /// (and the legacy `/Catalog /Dests` dictionary), and `/OpenAction` are copied
 /// into the output and their destinations remapped to the copied page refs.
 /// Later inputs contribute pages only — their outlines and named destinations
-/// are not merged.
+/// are not merged. A direct (inline) `/Names /Dests` name-tree root is remapped
+/// only at its own leaf: an inline root with indirect `/Kids` sub-leaves is not
+/// remapped beyond that leaf (such a root is pathological — producers inline a
+/// `/Dests` root precisely because it is a small single leaf).
 ///
 /// A destination (annotation `/Dest`, an `/A` or `/AA` `/GoTo` action, including
 /// `/Next` continuations and `/GoTo /SD` structure destinations, plus the
@@ -960,10 +972,31 @@ fn rename_field<R: Read + Seek>(
 /// inputs' `/DR` resources, are not handled. A merge of form-free inputs adds no
 /// `/AcroForm`.
 ///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{merge_documents, write_pdf, MergeInput, Pdf};
+///
+/// let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
+/// let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
+/// let mut inputs = [
+///     MergeInput { source: &mut a, pages: vec![0, 1] }, // a's first two pages
+///     MergeInput { source: &mut b, pages: vec![0] },    // then b's first page
+/// ];
+/// let mut merged = merge_documents(&mut inputs)?;
+///
+/// let mut out = File::create("merged.pdf")?;
+/// write_pdf(&mut merged, &mut out)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] if `inputs` is empty, or if a requested page index
-///   is out of range for its input.
+/// - [`Error::Unsupported`] if the `inputs` slice is empty (an *input* with an
+///   empty page selection is permitted; see above), or if a requested page
+///   index is out of range for its input.
 /// - Propagates resolve/copy errors from the underlying primitives.
 pub fn merge_documents<R: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
