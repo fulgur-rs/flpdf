@@ -1015,10 +1015,6 @@ pub fn merge_documents<R: Read + Seek>(
     // Copied page objects already placed in `kids`, so a page selected more
     // than once becomes a shallow clone rather than a duplicated reference.
     let mut used: BTreeSet<ObjectRef> = BTreeSet::new();
-    // Every page object copied into the target (the keep set). Unused in this
-    // single-pass copy, but accumulated for the cross-input disjointness check
-    // and absent-destination handling added by later merge stages.
-    let mut all_new_pages: BTreeSet<ObjectRef> = BTreeSet::new();
 
     // AcroForm merge state. `kept_fields` accumulates each input's kept
     // top-level fields (orphan fields on unselected pages are absent from the
@@ -1199,7 +1195,6 @@ pub fn merge_documents<R: Read + Seek>(
                 .get(&src_ref)
                 .ok_or(Error::Missing("merged page missing from copy map"))?;
             materialize_leaf(&mut target, copied_page_ref, attrs, &map, pages_root_ref)?;
-            all_new_pages.insert(copied_page_ref);
         }
 
         // Append this input's pages to /Kids in selection order, with each
