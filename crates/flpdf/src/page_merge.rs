@@ -455,10 +455,19 @@ fn collect_doc_level_removed_targets<R: Read + Seek>(
             &mut visited,
             MAX_ACTION_CHAIN_DEPTH,
         )?; // cov:ignore: `?` Err arm — action walk cannot fail on an already-opened source
-            // A bare `[page /Fit]` /OpenAction is a destination, not an action dict;
-            // collect_action_chain_targets handles only the action-dict/array shape,
-            // so cover the array form here too.
-        collect_dest_target(source, oa, selected, removed)?;
+            // A bare `[page /Fit]` /OpenAction is a destination, not an action dict.
+            // Gate the bare-dest fallback on the RESOLVED concrete shape being an
+            // array (resolving handles an indirect /OpenAction holding a bare dest
+            // array): an action dict — even a non-GoTo one such as `/S /GoToR` whose
+            // /D is a [localRef /Fit] array — must NOT be treated as a removed local
+            // destination here. (Residual: a non-GoTo /D with a local ref is
+            // malformed remote-dest input; page_object_closure still folds that page
+            // as a copied orphan rather than nulling it. Not fixed here — touching
+            // the shared page_object_closure primitive is out of scope.)
+        let (concrete, _) = resolve_ref_chain(source, oa)?;
+        if matches!(concrete, Object::Array(_)) {
+            collect_dest_target(source, oa, selected, removed)?;
+        }
     }
 
     Ok(())
@@ -587,8 +596,9 @@ fn collect_name_tree_removed_targets<R: Read + Seek>(
 /// from `map`. `copy_objects` already remapped every destination *inside* the
 /// copied objects, so this only sets catalog keys — it does not re-walk or
 /// re-remap any destination (avoiding a double remap).
-fn wire_doc_level<R: Read + Seek>(
-    target: &mut Pdf<R>,
+fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
+    source: &mut Pdf<RSrc>,
+    target: &mut Pdf<RTgt>,
     doc: &PrimaryDocLevel,
     map: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
@@ -617,7 +627,7 @@ fn wire_doc_level<R: Read + Seek>(
             catalog.insert("Names", Object::Dictionary(names));
         }
     } else if let Some(inline) = &doc.names_dests_inline {
-        let rebuilt = remap_inline_name_tree_root(inline, map);
+        let rebuilt = remap_inline_name_tree_root(source, inline, map)?;
         let mut names = Dictionary::new();
         names.insert("Dests", Object::Dictionary(rebuilt));
         catalog.insert("Names", Object::Dictionary(names));
@@ -631,7 +641,7 @@ fn wire_doc_level<R: Read + Seek>(
     } else if let Some(inline) = &doc.legacy_dests_inline {
         let mut rebuilt = Dictionary::new();
         for (key, dest) in inline.iter() {
-            rebuilt.insert(key, remap_inline_dest(dest, map));
+            rebuilt.insert(key, remap_inline_dest(source, dest, map)?);
         }
         catalog.insert("Dests", Object::Dictionary(rebuilt));
     }
@@ -641,31 +651,74 @@ fn wire_doc_level<R: Read + Seek>(
             catalog.insert("OpenAction", Object::Reference(new_ref));
         }
     } else if let Some(inline) = &doc.open_action_inline {
-        catalog.insert("OpenAction", remap_inline_action(inline, map));
+        catalog.insert("OpenAction", remap_inline_action(source, inline, map)?);
     }
 
     target.set_object(catalog_ref, Object::Dictionary(catalog));
     Ok(())
 }
 
-/// Remap the first element (the page reference) of an inline `[page /Fit ...]`
-/// destination array through `map`, leaving every other element unchanged. A
-/// page absent from `map` (the destination's target was removed) keeps its
+/// Inline-destination nesting bound: how deep an inline `/Dests` value's
+/// `/D` chain (dict → `/D` → dict → …) is followed before stopping. Mirrors
+/// [`MAX_ACTION_CHAIN_DEPTH`] so a pathological inline structure terminates;
+/// [`resolve_ref_chain`] independently bounds *reference* chains.
+const MAX_INLINE_DEST_DEPTH: usize = 64;
+
+/// Remap an inline (on-catalog) destination value to the copied page refs in
+/// `map`, resolving any indirect holder first so the leading page reference is
+/// reached and remapped regardless of how the destination is shaped:
+/// - an `[page /Fit …]` array → its leading page ref is remapped;
+/// - a `<< /D <dest> >>` destination dictionary → its `/D` is remapped (recursed);
+/// - an indirect reference to either → resolved (against `source`) then remapped,
+///   so the un-copied intermediate holder is sidestepped (the catalog is never
+///   copied, so an indirect holder named only from it is absent from the output);
+/// - any other shape (a name/string named destination) is returned unchanged.
+///
+/// A page absent from `map` (the destination's target was removed) keeps its
 /// source reference, which has been copied as a placeholder and nulled — so it
 /// resolves to `null` in the output, matching the indirect-carrier null-out.
-/// Non-array values are returned unchanged.
-fn remap_inline_dest(dest: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
-    match dest {
-        Object::Array(arr) => {
-            let mut out = arr.clone();
-            if let Some(Object::Reference(r)) = out.first() {
+/// Inline `/D` nesting is bounded by [`MAX_INLINE_DEST_DEPTH`] and reference
+/// indirection by [`resolve_ref_chain`].
+fn remap_inline_dest<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    dest: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Object> {
+    remap_inline_dest_depth(source, dest, map, MAX_INLINE_DEST_DEPTH)
+}
+
+fn remap_inline_dest_depth<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    dest: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Object> {
+    if depth == 0 {
+        return Ok(dest.clone()); // cov:ignore: inline /D nesting deeper than MAX_INLINE_DEST_DEPTH (DoS bound)
+    }
+    // Resolve an indirect holder to its concrete array/dict form (the holder
+    // itself is named only from the never-copied catalog, so inlining the
+    // resolved value is what reaches the page ref present in `map`).
+    let (concrete, _) = resolve_ref_chain(source, dest)?;
+    match concrete {
+        Object::Array(mut arr) => {
+            if let Some(Object::Reference(r)) = arr.first() {
                 if let Some(&new_ref) = map.get(r) {
-                    out[0] = Object::Reference(new_ref);
+                    arr[0] = Object::Reference(new_ref);
                 }
             }
-            Object::Array(out)
+            Ok(Object::Array(arr))
         }
-        other => other.clone(),
+        // `<< /D <dest> >>` destination dictionary: remap its `/D` and keep the
+        // rest of the dict verbatim.
+        Object::Dictionary(mut d) => {
+            if let Some(d_val) = d.remove("D") {
+                let remapped = remap_inline_dest_depth(source, &d_val, map, depth - 1)?;
+                d.insert("D", remapped);
+            }
+            Ok(Object::Dictionary(d))
+        }
+        other => Ok(other),
     }
 }
 
@@ -680,49 +733,91 @@ fn remap_inline_dest(dest: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Obj
 /// copied, so their refs are left untouched. Removed targets carried anywhere in
 /// the tree are still nulled — [`collect_name_tree_removed_targets`] enumerates
 /// leaf and `/Kids` dests when collecting the null-out set.
-fn remap_inline_name_tree_root(
+fn remap_inline_name_tree_root<R: Read + Seek>(
+    source: &mut Pdf<R>,
     leaf: &Dictionary,
     map: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Dictionary {
+) -> Result<Dictionary> {
     let mut out = leaf.clone();
     // A leaf with no /Names array (e.g. a /Kids-only intermediate node used
     // directly as the root) has no own dests to remap; its /Kids refs are left
     // untouched (see the doc note above), so only the /Names-array arm acts.
     let Some(Object::Array(names)) = leaf.get("Names") else {
-        return out; // cov:ignore: inline root is always a single /Names leaf in practice; /Kids-only direct root is pathological
+        return Ok(out); // cov:ignore: inline root is always a single /Names leaf in practice; /Kids-only direct root is pathological
     };
     let mut rebuilt = names.clone();
     let mut i = 1;
     while i < rebuilt.len() {
-        rebuilt[i] = remap_inline_dest(&rebuilt[i], map);
+        rebuilt[i] = remap_inline_dest(source, &rebuilt[i], map)?;
         i += 2;
     }
     out.insert("Names", Object::Array(rebuilt));
-    out
+    Ok(out)
 }
 
 /// Remap an inline `/OpenAction` value: a bare `[page /Fit]` destination array
 /// (via [`remap_inline_dest`]) or a `/S /GoTo` action dict whose `/D` is such an
-/// array. A non-GoTo action dict is returned unchanged (its `/D` is not a local
-/// page destination). The primary catalog is never copied, so this is the only
-/// place an inline `/OpenAction`'s destination is remapped (not a re-pass over a
-/// copied object).
-fn remap_inline_action(action: &Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
-    match action {
-        Object::Array(_) => remap_inline_dest(action, map),
-        Object::Dictionary(d) => {
-            let is_goto = matches!(d.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-            let mut out = d.clone();
+/// array, following the `/Next` continuation chain (a single action or an array
+/// of actions) so every `/GoTo /D` along the chain is remapped — matching the
+/// destinations [`collect_action_chain_targets`] walks. A non-GoTo action dict's
+/// own `/D` is returned unchanged (its `/D` is not a local page destination), but
+/// its `/Next` is still followed. An indirect action holder (the `/OpenAction`
+/// itself or an indirect `/Next`) is resolved via [`resolve_ref_chain`] before
+/// classification, so its concrete destinations are reached. The primary catalog
+/// is never copied, so this is the only place an inline `/OpenAction`'s
+/// destinations are remapped (not a re-pass over a copied object). Inline `/Next`
+/// nesting is bounded by [`MAX_ACTION_CHAIN_DEPTH`].
+fn remap_inline_action<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Object> {
+    remap_inline_action_depth(source, action, map, MAX_ACTION_CHAIN_DEPTH)
+}
+
+fn remap_inline_action_depth<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Object> {
+    if depth == 0 {
+        return Ok(action.clone()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
+    }
+    // Resolve an indirect action holder (the whole `/OpenAction` or an indirect
+    // `/Next` continuation) so its concrete shape is reached and remapped, like
+    // collect_action_chain_targets. The catalog is never copied, so an indirect
+    // holder named only from it would otherwise dangle unremapped in the output.
+    let (concrete, _) = resolve_ref_chain(source, action)?;
+    match concrete {
+        Object::Array(arr) => remap_inline_dest(source, &Object::Array(arr), map),
+        Object::Dictionary(mut out) => {
+            let is_goto = matches!(out.get("S"), Some(Object::Name(n)) if n == b"GoTo");
             // Only a /S /GoTo action's /D is a local page destination; a non-GoTo
-            // action (or a GoTo with no /D) is returned unchanged.
+            // action (or a GoTo with no /D) leaves its own /D unchanged.
             if is_goto {
-                if let Some(dest) = d.get("D") {
-                    out.insert("D", remap_inline_dest(dest, map));
+                if let Some(dest) = out.remove("D") {
+                    out.insert("D", remap_inline_dest(source, &dest, map)?);
                 }
             }
-            Object::Dictionary(out)
+            // /Next — a single action or an array of actions. Recurse into each
+            // at `depth - 1` so a continuation's /D is remapped too.
+            if let Some(next) = out.remove("Next") {
+                let remapped_next = match next {
+                    Object::Array(elems) => {
+                        let mut rebuilt = Vec::with_capacity(elems.len());
+                        for elem in &elems {
+                            rebuilt.push(remap_inline_action_depth(source, elem, map, depth - 1)?);
+                        }
+                        Object::Array(rebuilt)
+                    }
+                    single => remap_inline_action_depth(source, &single, map, depth - 1)?,
+                };
+                out.insert("Next", remapped_next);
+            }
+            Ok(Object::Dictionary(out))
         }
-        other => other.clone(),
+        other => Ok(other),
     }
 }
 
@@ -1168,7 +1263,7 @@ pub fn merge_documents<R: Read + Seek>(
         // outline / name-tree / action objects, so this only sets catalog keys.
         // A no-op for secondary inputs (empty doc_level).
         if is_primary {
-            wire_doc_level(&mut target, &doc_level, &map)?;
+            wire_doc_level(input.source, &mut target, &doc_level, &map)?;
         }
 
         // Record this input's kept top-level fields (those whose source ref was

@@ -1775,6 +1775,287 @@ fn merge_tolerates_empty_outline_root() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
+// F1: an inline (on-catalog) legacy /Dests whose entries are NON-array dests —
+// a dictionary destination `<< /D [page /Fit] >>` and an INDIRECT reference to a
+// `[page /Fit]` array — must have their leading page ref remapped/resolved, just
+// like a bare array dest. The pre-fix `remap_inline_dest` rewrote only the array
+// shape (every other shape hit `other => other.clone()`), so:
+//   - the dict dest kept the SOURCE page ref (dangling in the output), and
+//   - the indirect-holder dest kept a source object number that was never copied
+//     (resolving to Null).
+// Both target a SURVIVING page0, so a correct fix yields the new page0 ref and a
+// non-null resolve. A destination dictionary with NO /D (`/d_nod`) carries no
+// page ref and passes through unchanged (the dict arm's no-/D fall-through).
+#[test]
+fn merge_inline_legacy_dests_non_array_remapped() {
+    let pdf = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /Dests << /d_dict << /D [3 0 R /Fit] >> /d_ref 31 0 R \
+                 /d_nod << /Foo (x) >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (31, "[3 0 R /Fit]"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(pdf).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1);
+    let page0 = refs[0];
+    let cat = catalog_dict(&mut doc);
+    let legacy = match cat.get("Dests") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline legacy /Dests, got {other:?}"),
+    };
+
+    // Dict dest `<< /D [page /Fit] >>`: its /D array's leading ref must remap to
+    // the new page0 (pre-fix: stayed source ref 3, dangling).
+    let d_dict = match legacy.get("d_dict") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /d_dict dict dest, got {other:?}"),
+    };
+    let d_dict_arr = match d_dict.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /d_dict /D array, got {other:?}"),
+    };
+    let (dict_ref, dict_null) = dest_array_first(&mut doc, &d_dict_arr);
+    assert_eq!(dict_ref, page0, "dict dest /D[0] remaps to new page0");
+    assert!(!dict_null, "surviving dict dest must not resolve to null");
+
+    // Indirect-holder dest `31 0 R -> [page /Fit]`: resolving first sidesteps the
+    // un-copied holder, and the resolved array's leading ref remaps to page0
+    // (pre-fix: stayed source ref 31, which was never copied -> Null).
+    let d_ref_arr = match legacy.get("d_ref") {
+        Some(Object::Array(a)) => a.clone(),
+        Some(Object::Reference(r)) => match doc.resolve(*r).unwrap() {
+            Object::Array(a) => a,
+            other => panic!("expected /d_ref to resolve to array, got {other:?}"),
+        },
+        other => panic!("expected /d_ref dest, got {other:?}"),
+    };
+    let (ref_page, ref_null) = dest_array_first(&mut doc, &d_ref_arr);
+    assert_eq!(ref_page, page0, "indirect-holder dest remaps to new page0");
+    assert!(!ref_null, "indirect-holder dest must not resolve to null");
+
+    // No-/D dict dest: carries no page ref, passed through unchanged.
+    let d_nod = match legacy.get("d_nod") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /d_nod dict dest, got {other:?}"),
+    };
+    assert_eq!(
+        d_nod.get("Foo").and_then(|o| o.as_string()),
+        Some(&b"x"[..]),
+        "no-/D dict dest passed through verbatim"
+    );
+    assert!(d_nod.get("D").is_none(), "no-/D dict dest stays without /D");
+}
+
+// F2: an inline (on-catalog) /OpenAction GoTo action whose /Next continuation is
+// itself a GoTo to a different page must have BOTH /D destinations remapped. The
+// pre-fix `remap_inline_action` rewrote only the top-level /D and never recursed
+// /Next, so the /Next/D[0] kept its source ref and silently resolved to the WRONG
+// page. Both pages are selected (surviving); a correct fix maps /D[0] -> page0
+// and /Next/D[0] -> page1.
+#[test]
+fn merge_inline_open_action_next_chain_remapped() {
+    let pdf = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoTo /D [3 0 R /Fit] \
+                 /Next << /S /GoTo /D [4 0 R /Fit] >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(pdf).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2);
+    let (page0, page1) = (refs[0], refs[1]);
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+
+    // Top-level /D → page0 (this already worked pre-fix).
+    let top_d = match oa.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    let (top_ref, _) = dest_array_first(&mut doc, &top_d);
+    assert_eq!(top_ref, page0, "/OpenAction /D[0] remaps to page0");
+
+    // /Next /D → page1 (pre-fix: kept source ref, resolved to the WRONG page).
+    let next = match oa.get("Next") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /OpenAction /Next dict, got {other:?}"),
+    };
+    let next_d = match next.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /Next /D array, got {other:?}"),
+    };
+    let (next_ref, _) = dest_array_first(&mut doc, &next_d);
+    assert_eq!(next_ref, page1, "/OpenAction /Next /D[0] remaps to page1");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// F2 (array /Next form): a /Next that is an ARRAY of actions — including an
+// INDIRECT action element — must have each element's /D remapped. This exercises
+// the /Next-array arm of remap_inline_action and the indirect-action resolution
+// (resolve_ref_chain) added for symmetry with collect_action_chain_targets. Three
+// pages are selected; /D → page0, /Next[0]/D → page1, /Next[1] (indirect) /D →
+// page2.
+#[test]
+fn merge_inline_open_action_next_array_remapped() {
+    let pdf = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoTo /D [3 0 R /Fit] \
+                 /Next [ << /S /GoTo /D [4 0 R /Fit] >> 40 0 R ] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (40, "<< /S /GoTo /D [5 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(pdf).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1, 2],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 3);
+    let (page0, page1, page2) = (refs[0], refs[1], refs[2]);
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+
+    let top_d = match oa.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    assert_eq!(dest_array_first(&mut doc, &top_d).0, page0);
+
+    let next_arr = match oa.get("Next") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /Next array, got {other:?}"),
+    };
+    assert_eq!(next_arr.len(), 2, "/Next array has two action elements");
+
+    // /Next[0]: inline GoTo dict → page1.
+    let n0 = match &next_arr[0] {
+        Object::Dictionary(d) => d.clone(),
+        o => panic!("/Next[0]: {o:?}"),
+    };
+    let n0_d = match n0.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        o => panic!("/Next[0] /D: {o:?}"),
+    };
+    assert_eq!(
+        dest_array_first(&mut doc, &n0_d).0,
+        page1,
+        "/Next[0] /D remaps to page1"
+    );
+
+    // /Next[1]: indirect GoTo action → resolved, inlined, /D → page2.
+    let n1 = match &next_arr[1] {
+        Object::Dictionary(d) => d.clone(),
+        Object::Reference(r) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        o => panic!("/Next[1]: {o:?}"),
+    };
+    let n1_d = match n1.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        o => panic!("/Next[1] /D: {o:?}"),
+    };
+    assert_eq!(
+        dest_array_first(&mut doc, &n1_d).0,
+        page2,
+        "/Next[1] (indirect) /D remaps to page2"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// F5: an indirect /OpenAction that is a NON-GoTo action dict (here /S /GoToR, a
+// remote-go-to) whose /D is an array with a leading LOCAL page ref must NOT be
+// treated as a removed destination. The pre-fix `collect_doc_level_removed_targets`
+// called the bare-dest fallback unconditionally, so the /D[0] page was wrongly
+// added to the removed set and nulled. With the gate, the unselected page1 is not
+// nulled by this carrier, and /OpenAction /D[0] does not resolve to null.
+#[test]
+fn merge_non_goto_open_action_d_not_treated_as_removed_dest() {
+    let pdf = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /OpenAction 20 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (20, "<< /S /GoToR /D [4 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(pdf).unwrap();
+    // Select only page0; page1 (obj 4) is unselected. The /GoToR /D names a local
+    // ref to page1, but a non-GoTo action's /D must not drive the null-out.
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+
+    // /OpenAction is inherited (indirect, copied) and its /D[0] is NOT nulled.
+    let oa_ref = cat
+        .get_ref("OpenAction")
+        .expect("indirect /OpenAction inherited onto output catalog");
+    let oa = doc.resolve(oa_ref).unwrap().into_dict().unwrap();
+    let oa_d = match oa.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    let (_d_ref, d_null) = dest_array_first(&mut doc, &oa_d);
+    assert!(
+        !d_null,
+        "non-GoTo /OpenAction /D[0] must not be nulled (bare-dest fallback gated)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 5: AcroForm form-field merge with qpdf `+N` name-collision renaming.
 // ---------------------------------------------------------------------------
