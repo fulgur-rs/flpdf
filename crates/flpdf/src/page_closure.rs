@@ -105,7 +105,7 @@ pub fn page_object_closure<R: Read + Seek>(
 /// upward and collect inherited resources (e.g. `/Resources`, `/MediaBox`)
 /// from ancestor `/Pages` nodes.
 fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
-    if depth >= MAX_INLINE_DEPTH {
+    if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "page closure: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
@@ -169,13 +169,25 @@ mod tests {
     #[test]
     fn collect_refs_in_object_accepts_nesting_up_to_the_limit() {
         let mut out = Vec::new();
-        // Bury one Reference just within the limit; it must be collected, not errored.
+        // Bury one Reference so it is visited at exactly inline depth
+        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
+        // guard); it must be collected, not errored.
         let leaf = Object::Array(vec![Object::Reference(ObjectRef::new(7, 0))]);
         let mut o = leaf;
-        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+        for _ in 0..(MAX_INLINE_DEPTH - 1) {
             o = Object::Array(vec![o]);
         }
         collect_refs_in_object(&o, 0, &mut out).unwrap();
         assert_eq!(out, vec![ObjectRef::new(7, 0)]);
+    }
+
+    #[test]
+    fn collect_refs_in_object_rejects_one_past_the_limit() {
+        let mut out = Vec::new();
+        // The Null leaf of nested_arrays(MAX_INLINE_DEPTH + 1) is visited at
+        // inline depth MAX_INLINE_DEPTH + 1 — one past the deepest accepted
+        // level — so the strict `>` guard must reject it.
+        let err = collect_refs_in_object(&nested_arrays(MAX_INLINE_DEPTH + 1), 0, &mut out);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 }

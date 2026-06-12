@@ -376,7 +376,7 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 ///
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
 fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Result<Object> {
-    if depth >= MAX_INLINE_DEPTH {
+    if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization writer: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
@@ -2290,9 +2290,11 @@ mod tests {
             .new_for_original(original)
             .expect("catalog must have a renumber entry");
 
-        // Bury that Reference just within the limit; it must be remapped, not errored.
+        // Bury that Reference so it is visited at exactly inline depth
+        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
+        // guard); it must be remapped, not errored.
         let mut obj = Object::Array(vec![Object::Reference(original)]);
-        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+        for _ in 0..(MAX_INLINE_DEPTH - 1) {
             obj = Object::Array(vec![obj]);
         }
         let out = renumber_object(&obj, 0, &renumber).expect("in-limit nesting must succeed");

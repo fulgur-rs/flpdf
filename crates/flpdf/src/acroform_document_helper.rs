@@ -761,7 +761,7 @@ fn collect_refs_in_object<R: Read + Seek>(
     depth: usize,
     inline_depth: usize,
 ) -> Result<()> {
-    if inline_depth >= MAX_INLINE_DEPTH {
+    if inline_depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(format!(
             "AcroForm: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
@@ -1080,8 +1080,9 @@ mod tests {
         let mut pdf = minimal_pdf();
         let mut out = BTreeSet::new();
         let mut seen = BTreeSet::new();
-        // Deepest array entry sits at inline_depth = MAX_INLINE_DEPTH - 1 < limit.
-        let deep = nested_arrays(MAX_INLINE_DEPTH - 1);
+        // Null leaf sits at inline_depth = MAX_INLINE_DEPTH, the deepest level
+        // accepted under the strict `>` guard.
+        let deep = nested_arrays(MAX_INLINE_DEPTH);
         collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0).unwrap();
         assert!(out.is_empty());
     }

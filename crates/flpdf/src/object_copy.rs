@@ -120,7 +120,7 @@ pub(crate) fn rewrite_refs(
     depth: usize,
     map: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
-    if depth >= MAX_INLINE_DEPTH {
+    if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(format!(
             "cross-document copy: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
@@ -218,9 +218,11 @@ mod tests {
     fn rewrite_refs_accepts_nesting_up_to_the_limit() {
         let mut map = BTreeMap::new();
         map.insert(ObjectRef::new(3, 0), ObjectRef::new(99, 0));
-        // Bury one Reference just within the limit; it must be remapped, not errored.
+        // Bury one Reference so it is visited at exactly inline depth
+        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
+        // guard); it must be remapped, not errored.
         let mut obj = Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]);
-        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+        for _ in 0..(MAX_INLINE_DEPTH - 1) {
             obj = Object::Array(vec![obj]);
         }
         rewrite_refs(&mut obj, 0, &map).unwrap();

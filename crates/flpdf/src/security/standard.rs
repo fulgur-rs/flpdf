@@ -1455,7 +1455,7 @@ fn decrypt_strings_in_value(
     cipher: StringCipher<'_>,
     depth: usize,
 ) -> Result<()> {
-    if depth >= crate::object::MAX_INLINE_DEPTH {
+    if depth > crate::object::MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "decrypt: inline object nesting exceeds maximum of {}",
             crate::object::MAX_INLINE_DEPTH
@@ -1702,7 +1702,7 @@ fn encrypt_strings_in_value<F>(
 where
     F: FnMut() -> [u8; 16],
 {
-    if depth >= crate::object::MAX_INLINE_DEPTH {
+    if depth > crate::object::MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "encrypt: inline object nesting exceeds maximum of {}",
             crate::object::MAX_INLINE_DEPTH
@@ -2004,7 +2004,9 @@ mod tests {
 
     #[test]
     fn decrypt_strings_in_value_accepts_nesting_up_to_the_limit() {
-        let mut object = nested_arrays(MAX_INLINE_DEPTH - 1);
+        // Null leaf sits at depth MAX_INLINE_DEPTH, the deepest level accepted
+        // under the strict `>` guard.
+        let mut object = nested_arrays(MAX_INLINE_DEPTH);
         decrypt_strings_in_value(&mut object, StringCipher::Identity, 0).unwrap();
     }
 
@@ -2021,7 +2023,9 @@ mod tests {
 
     #[test]
     fn encrypt_strings_in_value_accepts_nesting_up_to_the_limit() {
-        let mut object = nested_arrays(MAX_INLINE_DEPTH - 1);
+        // Null leaf sits at depth MAX_INLINE_DEPTH, the deepest level accepted
+        // under the strict `>` guard.
+        let mut object = nested_arrays(MAX_INLINE_DEPTH);
         let mut iv_gen = || [0u8; 16];
         encrypt_strings_in_value(&mut object, StringEncryptCipher::Identity, &mut iv_gen, 0)
             .unwrap();

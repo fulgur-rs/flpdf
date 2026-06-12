@@ -214,7 +214,7 @@ fn collect_reachable<R: Read + Seek>(
 /// This is a pure structural walk — it does not resolve any references; the
 /// caller drives resolution in the BFS/DFS loop.
 fn walk_refs(obj: &Object, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
-    if depth >= MAX_INLINE_DEPTH {
+    if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
@@ -281,8 +281,11 @@ mod tests {
     #[test]
     fn walk_refs_accepts_nesting_up_to_the_limit() {
         let mut queue = Vec::new();
+        // Bury one Reference so it is visited at exactly inline depth
+        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
+        // guard); it must be collected, not errored.
         let mut o = Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]);
-        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+        for _ in 0..(MAX_INLINE_DEPTH - 1) {
             o = Object::Array(vec![o]);
         }
         walk_refs(&o, 0, &mut queue).unwrap();
