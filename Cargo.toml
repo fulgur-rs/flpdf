@@ -3,6 +3,13 @@ members = [
     "crates/flpdf",
     "crates/flpdf-cli",
 ]
+# `fuzz/` is a standalone cargo-fuzz workspace (its own `[workspace]` table). It
+# requires a nightly toolchain (libFuzzer / `-Zsanitizer`) and must never be
+# pulled into stable `cargo build/test/clippy --workspace`. Excluding it makes
+# that boundary explicit even though it is already non-member.
+exclude = [
+    "fuzz",
+]
 resolver = "2"
 
 [workspace.package]
