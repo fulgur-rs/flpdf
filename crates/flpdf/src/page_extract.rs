@@ -761,7 +761,7 @@ fn is_page_dict(obj: &Object) -> bool {
 
 /// Minimal valid target: Catalog(1) + empty Pages(2). No placeholder page (so
 /// there is no orphan to delete after copying).
-fn minimal_target_bytes() -> Vec<u8> {
+pub(crate) fn minimal_target_bytes() -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
     let off1 = out.len() as u64;
     out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
@@ -779,7 +779,7 @@ fn minimal_target_bytes() -> Vec<u8> {
 }
 
 /// Resolve the target catalog's `/Pages` root ref.
-fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<ObjectRef> {
+pub(crate) fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<ObjectRef> {
     let catalog_ref = target.root_ref().ok_or(Error::Missing("/Root"))?;
     let catalog = resolve_dict(target, catalog_ref, "/Root is not a dictionary")?;
     catalog
