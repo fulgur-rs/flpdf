@@ -179,6 +179,7 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
 | No opt-in decode-output limits and no `/Filter` chain length cap (compression bombs covered by §4, but mitigations are worth offering). | §4 mitigation | `flpdf-hn1g.4` |
+| The CLI R=5 (AES-256) write path (`--encrypt … 256 --force-R5`) creates deprecated R=5 output without the `--allow-weak-crypto` opt-in: `parse_encrypt_segment` returns `EncryptParams::v5_r5(...)` without the RC4-only `guard_weak`, although the read path already gates R=5 and §4 states weak-output creation is gated. | §4 weak-crypto gate | `flpdf-hn1g.8` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
 ## Appendix A: attack surface inventory
