@@ -2586,6 +2586,342 @@ fn merge_appends_unnamed_secondary_field() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
+/// Count live `/Type /Page` objects in `doc` (reachable or not — every object
+/// still present after the merge's `sweep_unreachable_objects`). Used to assert
+/// that a non-terminal field's unselected-page widget did not leave an orphan
+/// page object behind.
+fn count_live_page_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
+    doc.live_object_refs()
+        .into_iter()
+        .filter(|&r| {
+            matches!(
+                doc.resolve(r),
+                Ok(Object::Dictionary(ref d))
+                    if d.get("Type").and_then(Object::as_name) == Some(&b"Page"[..])
+            )
+        })
+        .count()
+}
+
+/// Resolve `doc`'s sole `/AcroForm /Fields` entry and return its `/Kids` length
+/// (panicking if the field has no `/Kids`). Used to assert a non-terminal field
+/// kept exactly the widgets whose page survived.
+fn sole_field_kids_count(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
+    let cat = catalog_dict(doc);
+    let acroform = match cat.get("AcroForm") {
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected indirect /AcroForm, got {other:?}"),
+    };
+    let fields = match acroform.get("Fields") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected /Fields array, got {other:?}"),
+    };
+    assert_eq!(fields.len(), 1, "expected exactly one top-level field");
+    let field_ref = match &fields[0] {
+        Object::Reference(r) => *r,
+        other => panic!("expected field ref, got {other:?}"),
+    };
+    let field = doc.resolve(field_ref).unwrap().into_dict().unwrap();
+    match field.get("Kids") {
+        Some(Object::Array(arr)) => arr.len(),
+        other => panic!("expected field /Kids array, got {other:?}"),
+    }
+}
+
+/// Two-page form with a NON-TERMINAL top-level field (obj 7) whose `/Kids` are
+/// two widget annotations on DIFFERENT pages: widget 4 on page 0 (obj 3) and
+/// widget 9 on page 1 (obj 6). The field carries `/T` and `/FT`; its widgets do
+/// not (they are pure widgets, not widget-as-field). `/AcroForm /Fields` lists
+/// the single parent field. Selecting page 0 only must keep the field, trim its
+/// `/Kids` to just widget 4, and leave no orphan `/Type /Page` object for the
+/// unselected page 1.
+fn nonterminal_field_multi_page_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 3 0 R /Parent 7 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [9 0 R] >>",
+            ),
+            (7, "<< /FT /Tx /T (parent) /Kids [4 0 R 9 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (
+                9,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 6 0 R /Parent 7 0 R >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// codex F4: a non-terminal AcroForm field whose widget `/Kids` span multiple
+// pages must NOT expose off-tree orphans when only some of those pages are
+// selected. Selecting page 0 only: the parent field is kept (one of its widgets
+// survives), but its `/Kids` must be trimmed to that single surviving widget,
+// and the unselected page's widget + page object must not survive. Pre-fix the
+// sibling widget's `/P` pulled the unselected page into the copy via the
+// page-closure Page-guard, leaving a second live `/Type /Page` object outside
+// `/Kids` and a `/Kids` array referencing an off-tree page.
+#[test]
+fn merge_trims_nonterminal_field_kids_to_selected_pages() {
+    let mut a = Pdf::open_mem_owned(nonterminal_field_multi_page_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // The parent field is kept with its name.
+    assert_eq!(acroform_field_names(&mut doc), vec![b"parent".to_vec()]);
+    // Its /Kids is trimmed to the single surviving widget (page 0).
+    assert_eq!(
+        sole_field_kids_count(&mut doc),
+        1,
+        "non-terminal field /Kids must be trimmed to the surviving-page widget"
+    );
+    // Only one live /Type /Page object survives — no off-tree orphan for the
+    // unselected page 1.
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "the unselected page's widget must not leave an orphan /Type /Page object"
+    );
+    // The output page tree carries exactly the one selected page.
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1, "only the selected page is in /Kids");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// codex F4 nested-subfield prune: a non-terminal field (`keep`, obj 7) kept via
+// its surviving widget (obj 4 on selected page 0) has an intermediate sub-field
+// kid (`gone`, obj 10) whose own widgets (objs 11, 12) are ALL on the unselected
+// page 1. The recursive trim drops `gone` from `keep`'s `/Kids` (zero surviving
+// descendants), keeping only widget 4, and leaves no orphan page object.
+#[test]
+fn merge_prunes_nested_subfield_with_all_unselected_widgets() {
+    let mut a = Pdf::open_mem_owned(nonterminal_field_nested_unselected_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    assert_eq!(acroform_field_names(&mut doc), vec![b"keep".to_vec()]);
+    // `keep` keeps only widget 4 (the `gone` sub-field is pruned entirely).
+    assert_eq!(
+        sole_field_kids_count(&mut doc),
+        1,
+        "the all-unselected-widget sub-field must be pruned from /Kids"
+    );
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "no orphan page from the pruned sub-field's unselected-page widgets"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Two-page form. Top-level non-terminal field `keep` (obj 7) has `/Kids`
+/// `[widget4(page0), gone(obj10)]`, where `gone` is an intermediate sub-field
+/// (obj 10) whose two widgets (objs 11, 12) both sit on the unselected page 1.
+/// After the trim, `gone` has zero surviving descendants and is pruned from
+/// `keep`'s `/Kids`; `keep` retains its page-0 widget 4.
+fn nonterminal_field_nested_unselected_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 3 0 R /Parent 7 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [11 0 R 12 0 R] >>",
+            ),
+            (7, "<< /FT /Tx /T (keep) /Kids [4 0 R 10 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (10, "<< /T (gone) /Parent 7 0 R /Kids [11 0 R 12 0 R] >>"),
+            (
+                11,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 6 0 R /Parent 10 0 R >>",
+            ),
+            (
+                12,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 6 0 R /Parent 10 0 R >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// codex F4 nested-subfield kept-and-trimmed: a top-level field (`keep`, obj 7)
+// whose only kid is an intermediate sub-field (`mid`, obj 10) that itself has
+// widgets on BOTH pages. Selecting page 0 keeps `mid` (its page-0 widget 4
+// survives) with `/Kids` trimmed to widget 4, and `keep` keeps `mid`. Exercises
+// the recursion's kept-sub-field branch (a non-empty sub-field is rewritten and
+// retained, not pruned).
+#[test]
+fn merge_keeps_and_trims_nested_subfield_with_surviving_widget() {
+    let mut a = Pdf::open_mem_owned(nonterminal_nested_subfield_mixed_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    assert_eq!(acroform_field_names(&mut doc), vec![b"keep".to_vec()]);
+    // `keep` retains its single kid: the `mid` sub-field (still present).
+    assert_eq!(
+        sole_field_kids_count(&mut doc),
+        1,
+        "the surviving sub-field is retained in /Kids"
+    );
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "no orphan page from the sub-field's unselected-page widget"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Two-page form. Top-level field `keep` (obj 7) `/Kids [mid(obj10)]`; the
+/// intermediate sub-field `mid` (obj 10) `/Kids [widget4(page0), widget9(page1)]`
+/// spans both pages. Selecting page 0: `mid`'s widget 4 survives, so `mid` is
+/// kept (trimmed to widget 4) and `keep` retains `mid`; widget 9's page is an
+/// off-tree orphan to null.
+fn nonterminal_nested_subfield_mixed_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 3 0 R /Parent 10 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [9 0 R] >>",
+            ),
+            (7, "<< /FT /Tx /T (keep) /Kids [10 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (
+                9,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 6 0 R /Parent 10 0 R >>",
+            ),
+            (10, "<< /T (mid) /Parent 7 0 R /Kids [4 0 R 9 0 R] >>"),
+        ],
+        1,
+    )
+}
+
+// codex F4 top-level drop (malformed-input guard): a top-level field ref placed
+// DIRECTLY in a selected page's `/Annots` (rather than reached widget→/Parent)
+// enters the copy map even though its only widget is on the UNSELECTED page. The
+// trim leaves zero surviving widgets, so the whole field is dropped from the
+// merged `/AcroForm /Fields`. Well-formed input cannot reach this (a top-level
+// field is normally in the copy map only via a selected-page widget in its
+// subtree, which always survives the trim); this fixture mirrors the
+// `merge_tolerates_malformed_carrier_shapes` philosophy of guarding odd shapes.
+#[test]
+fn merge_drops_top_level_field_with_no_surviving_widget() {
+    let mut a = Pdf::open_mem_owned(top_level_field_in_annots_unselected_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // The field's only widget is on the unselected page, so the trim drops the
+    // field entirely. The primary still carries a `/DR`, so an `/AcroForm` IS
+    // built (with `/DR` / `/DA` and an empty `/Fields`) — assert its `/Fields`
+    // lists no field.
+    assert!(
+        acroform_field_names(&mut doc).is_empty(),
+        "a field with no surviving widget must be dropped from /Fields"
+    );
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "no orphan page from the dropped field's unselected-page widget"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Two-page form whose selected page 0 carries the top-level non-terminal field
+/// ref (obj 7) DIRECTLY in its `/Annots` (a malformed shape — a page `/Annots`
+/// should hold widgets, not the field). The field's single widget (obj 9) sits
+/// on the unselected page 1, so after the trim the field has zero surviving
+/// widgets and is dropped.
+fn top_level_field_in_annots_unselected_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [9 0 R] >>",
+            ),
+            (7, "<< /FT /Tx /T (gone) /Kids [9 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (
+                9,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /P 6 0 R /Parent 7 0 R >>",
+            ),
+        ],
+        1,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Task 7: remaining error/boundary arms (empty selection, duplicate selection,
 // --empty blank-primary base).

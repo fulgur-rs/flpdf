@@ -8,6 +8,7 @@
 //! `<name>+<N>` renaming rule.
 
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
+use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::object_copy::copy_objects;
 use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
@@ -1039,6 +1040,167 @@ fn rename_field<R: Read + Seek>(
     Ok(())
 }
 
+/// Read a field's direct `/Kids` as the source-space refs they point at, or
+/// `None` when the field has no `/Kids` (a terminal field — the widget IS the
+/// field). `/Kids` itself may be an indirect reference (review rule 2); a
+/// resolved non-array yields an empty list (treated as "no widget kids").
+fn field_kid_refs<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    field_ref: ObjectRef,
+) -> Result<Option<Vec<ObjectRef>>> {
+    let kids_value = {
+        let Some(field) = source.resolve_borrowed(field_ref)?.as_dict() else {
+            return Ok(None); // cov:ignore: a field ref always resolves to a dictionary
+        };
+        match field.get("Kids") {
+            Some(value) => value.clone(),
+            None => return Ok(None),
+        }
+    };
+    let (resolved, _) = resolve_ref_chain(source, &kids_value)?;
+    let Object::Array(items) = resolved else {
+        return Ok(Some(Vec::new())); // cov:ignore: a /Kids value resolves to an array in practice
+    };
+    let mut refs = Vec::with_capacity(items.len());
+    for item in items {
+        if let Object::Reference(r) = item {
+            refs.push(r);
+        }
+    }
+    Ok(Some(refs))
+}
+
+/// Resolve a widget's `/P` page reference (review rule 2: `/P` may be indirect),
+/// returning the final page `ObjectRef` of the reference chain, or `None` when
+/// the widget carries no `/P`.
+fn widget_page_ref<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    let p_value = {
+        let Some(widget) = source.resolve_borrowed(widget_ref)?.as_dict() else {
+            return Ok(None); // cov:ignore: a widget ref always resolves to a dictionary
+        };
+        match widget.get("P") {
+            Some(value) => value.clone(),
+            None => return Ok(None), // cov:ignore: a form widget always carries a /P page back-pointer
+        }
+    };
+    let (_, last_ref) = resolve_ref_chain(source, &p_value)?;
+    Ok(last_ref)
+}
+
+/// Trim a non-terminal AcroForm field's widget `/Kids` to only the widgets whose
+/// `/P` page survived into the output (is in `surviving_pages`), recursing into
+/// intermediate sub-fields (fields that themselves carry `/Kids`). Returns:
+///
+/// - `None` — the field is terminal (no `/Kids`, the widget IS the field); the
+///   caller leaves it untouched. This is what protects flat-form fields and the
+///   `+N` rename tests, whose widgets carry no `/Kids`.
+/// - `Some(survivors)` — the trimmed list of direct kid source-refs to keep. A
+///   leaf-widget kid is kept iff its `/P` is in `surviving_pages`; an
+///   intermediate sub-field kid is kept iff it has at least one surviving
+///   descendant (recursion). An empty `survivors` means no widget survived, so
+///   the field should be dropped (top level) or pruned from its parent's `/Kids`
+///   (nested).
+///
+/// Side effects: rewrites each kept intermediate sub-field's `/Kids` in `target`
+/// (mapped through `map`), and records each dropped widget's unselected `/P`
+/// page (source-space) into `orphan_pages` so the caller can null it.
+///
+/// Bounded by `DEFAULT_MAX_ACROFORM_DEPTH` and a `visited` cycle guard (review
+/// rule 4): a hostile field tree cannot drive unbounded recursion.
+#[allow(clippy::too_many_arguments)]
+fn trim_field_kids<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    field_ref: ObjectRef,
+    surviving_pages: &BTreeSet<ObjectRef>,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    orphan_pages: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+) -> Result<Option<Vec<ObjectRef>>> {
+    // cov:ignore-start: depth guard against a hostile >100-deep field tree (matches the acroform helper's depth caps); not driven by well-formed input
+    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+        )));
+    }
+    // cov:ignore-end
+    if !visited.insert(field_ref) {
+        return Ok(Some(Vec::new())); // cov:ignore: a /Kids cycle is malformed; treat as no survivors
+    }
+    let Some(kids) = field_kid_refs(source, field_ref)? else {
+        return Ok(None); // terminal field — nothing to trim
+    };
+
+    let mut survivors: Vec<ObjectRef> = Vec::with_capacity(kids.len());
+    for kid_ref in kids {
+        let kid_kind = trim_field_kids(
+            source,
+            target,
+            kid_ref,
+            surviving_pages,
+            map,
+            orphan_pages,
+            depth + 1,
+            visited,
+        )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
+        match kid_kind {
+            // The kid is itself a non-terminal sub-field.
+            Some(sub_survivors) => {
+                if sub_survivors.is_empty() {
+                    // Whole sub-field is off-tree — prune it from this field's
+                    // `/Kids`. Its widgets' orphan pages were recorded by the
+                    // recursive call.
+                    continue;
+                }
+                rewrite_field_kids(target, kid_ref, &sub_survivors, map)?;
+                survivors.push(kid_ref);
+            }
+            // The kid is a leaf widget (no `/Kids`): keep it iff its `/P` page
+            // survived; otherwise its page is an off-tree orphan to null.
+            None => match widget_page_ref(source, kid_ref)? {
+                Some(page_ref) if surviving_pages.contains(&page_ref) => survivors.push(kid_ref),
+                Some(page_ref) => {
+                    orphan_pages.insert(page_ref);
+                }
+                None => {} // cov:ignore: a form widget always carries a /P page back-pointer
+            },
+        }
+    }
+    Ok(Some(survivors))
+}
+
+/// Overwrite the copied field's `/Kids` with the surviving source kid-refs
+/// mapped through this input's copy map. A survivor missing from `map` is
+/// skipped (it was not copied); the rewrite never inserts a dangling ref.
+fn rewrite_field_kids<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    src_field_ref: ObjectRef,
+    survivors: &[ObjectRef],
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let Some(target_field_ref) = map.get(&src_field_ref).copied() else {
+        return Ok(()); // cov:ignore: a survivor's parent field is always in the copy map
+    };
+    let Some(mut field) = target
+        .resolve_borrowed(target_field_ref)?
+        .as_dict()
+        .cloned()
+    else {
+        return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
+    };
+    let kids: Vec<Object> = survivors
+        .iter()
+        .filter_map(|src| map.get(src).map(|&t| Object::Reference(t)))
+        .collect();
+    field.insert("Kids", Object::Array(kids));
+    target.set_object(target_field_ref, Object::Dictionary(field));
+    Ok(())
+}
+
 /// Merge selected pages from N sources into one fresh document.
 ///
 /// Each [`MergeInput`] pairs an opened source document with the page indices to
@@ -1091,7 +1253,10 @@ fn rename_field<R: Read + Seek>(
 /// `/DR` default resources and `/DA` default appearance are the base, and every
 /// selected page's top-level field (reached from its widget annotations) is
 /// added to the output `/AcroForm /Fields`. A field whose widget is on an
-/// unselected page is dropped (qpdf form subset). Top-level field-name (`/T`)
+/// unselected page is dropped (qpdf form subset). A non-terminal field whose
+/// widget `/Kids` span several pages keeps only the widgets whose page is
+/// selected — its `/Kids` are trimmed to those, and the field is dropped
+/// entirely only if no widget survives. Top-level field-name (`/T`)
 /// collisions are resolved by qpdf's `<name>+<N>` rule: the primary keeps its
 /// names and a later input's colliding name becomes the first unused
 /// `<name>+1`, `<name>+2`, … . Collision handling is limited to **top-level
@@ -1303,13 +1468,58 @@ pub fn merge_documents<R: Read + Seek>(
         // copied — orphan fields on unselected pages are absent from `map` and
         // so dropped, matching qpdf's form subset). The primary's `map` also
         // remaps its inherited `/DR` fonts in `build_merged_acroform`.
+        //
+        // A NON-TERMINAL field (whose `/Kids` are widget annotations, possibly
+        // on different pages) reaches the copy map whenever any one of its
+        // widgets is on a selected page; the page-closure's `/Parent` →
+        // sibling-`/Kids` traversal then pulls in the field's widgets on
+        // UNSELECTED pages too (and, via each such widget's `/P`, those pages as
+        // off-tree orphans). Trim the field's `/Kids` to only the widgets whose
+        // `/P` page survived; a field left with zero surviving widgets is
+        // dropped entirely (the surrounding `map.get` guard already drops fields
+        // never reached, so a zero-survivor trim only happens for malformed
+        // shapes where a field ref sits directly in a page `/Annots`). Each
+        // dropped widget's unselected page is collected and nulled below, so the
+        // output never carries a live orphan `/Type /Page` outside `/Kids`.
+        let mut orphan_pages: BTreeSet<ObjectRef> = BTreeSet::new();
         for (src_field_ref, partial_name) in source_fields {
             if let Some(&target_ref) = map.get(&src_field_ref) {
+                let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+                let trimmed = trim_field_kids(
+                    input.source,
+                    &mut target,
+                    src_field_ref,
+                    &unique_set,
+                    &map,
+                    &mut orphan_pages,
+                    0,
+                    &mut visited,
+                )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
+                if let Some(survivors) = trimmed {
+                    if survivors.is_empty() {
+                        // No widget survived: drop the whole field (do not record
+                        // it). Its widgets' orphan pages are nulled below.
+                        continue;
+                    }
+                    rewrite_field_kids(&mut target, src_field_ref, &survivors, &map)?;
+                }
                 kept_fields.push(KeptField {
                     target_ref,
                     partial_name,
                     is_primary,
                 });
+            }
+        }
+
+        // Null the copied placeholder body of each off-tree orphan page reached
+        // only through a dropped widget's `/P`. This mirrors the removed-dest
+        // null-out above: the page never appears in `/Kids`, and nulling its
+        // body (rather than leaving a live `/Type /Page`) keeps the merged form
+        // internally consistent. `sweep_unreachable_objects` later GCs the
+        // placeholder once no surviving reference points at it.
+        for src_page_ref in &orphan_pages {
+            if let Some(&new_ref) = map.get(src_page_ref) {
+                target.set_object(new_ref, Object::Null);
             }
         }
         if is_primary {
