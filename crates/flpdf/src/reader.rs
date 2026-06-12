@@ -216,6 +216,18 @@ pub struct PdfOpenOptions {
     pub password_is_hex_key: bool,
 }
 
+// Maximum number of object streams an `/Extends` chain may link before
+// `collect_object_stream_chain` rejects it. The chain is followed by self
+// recursion (one stack frame per link), so without this bound an adversarial
+// non-cyclic chain — each object stream pointing at a distinct parent — recurses
+// until the stack overflows and the process aborts (the no-panic/no-abort
+// guarantee's failure mode, same class as the parser-nesting bound). Cycle
+// detection alone does not help here because every link is a fresh reference.
+// `/Extends` (ISO 32000-2 §7.5.7) chains object streams; real documents go at
+// most one or two deep, so 100 only rejects pathological input and matches the
+// crate's other tree-walk depth limits.
+const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
+
 impl<R: Read + Seek> Pdf<R> {
     /// Open a document strictly: parse the cross-reference and trailer, but do not run
     /// the recovery heuristics. Returns an [`Error`] if the document is malformed.
@@ -1279,6 +1291,14 @@ impl<R: Read + Seek> Pdf<R> {
         streams: &mut Vec<(ObjectRef, crate::Stream)>,
         seen: &mut BTreeSet<ObjectRef>,
     ) -> Result<()> {
+        // `seen` starts empty at the entry call and grows by one per `/Extends`
+        // hop, so `seen.len()` is the current recursion depth. Bound it before
+        // descending another level to keep the stack from overflowing on a long
+        // non-cyclic chain. Checked before the cycle insert below so a too-deep
+        // chain and a cyclic one surface as distinct errors.
+        if seen.len() >= MAX_OBJECT_STREAM_CHAIN_DEPTH {
+            return Err(Error::parse(0, "object stream /Extends chain too deep"));
+        }
         if !seen.insert(stream_ref) {
             return Err(Error::parse(0, "object stream /Extends cycle"));
         }
@@ -2316,5 +2336,98 @@ mod tests {
         let mut pdf = Pdf::open_mem_with_options(&bytes, opts).expect("open_mem_with_options");
         let refs = page_refs(&mut pdf).expect("page_refs");
         assert_eq!(refs.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // collect_object_stream_chain: /Extends chain depth bound
+    // ------------------------------------------------------------------
+
+    /// Builds a classic-xref PDF whose object streams form an `/Extends` chain
+    /// of `chain_len` links: objects `4..4+chain_len`, each linking to the next
+    /// and the last without `/Extends`. The head object stream is object 4.
+    ///
+    /// The streams are empty (`/N 0`); `collect_object_stream_chain` only walks
+    /// `/Extends` and never parses members, so empty streams exercise the depth
+    /// guard fully without needing real compressed payloads.
+    fn objstm_extends_chain_pdf(chain_len: usize) -> Vec<u8> {
+        let mut bodies: Vec<Vec<u8>> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+        ];
+        let first_objstm = 4u32;
+        for i in 0..chain_len {
+            let obj_num = first_objstm + i as u32;
+            let extends = if i + 1 < chain_len {
+                format!(" /Extends {} 0 R", obj_num + 1)
+            } else {
+                String::new()
+            };
+            bodies.push(
+                format!(
+                    "{obj_num} 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0{extends} >>\nstream\n\nendstream\nendobj\n"
+                )
+                .into_bytes(),
+            );
+        }
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offsets = Vec::with_capacity(bodies.len());
+        for body in &bodies {
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(body);
+        }
+
+        let size = bodies.len() + 1; // +1 for the free object 0
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A chain exactly at the limit is collected in full (the depth guard's
+    /// non-error path).
+    #[test]
+    fn collect_object_stream_chain_accepts_chain_at_limit() {
+        let bytes = objstm_extends_chain_pdf(MAX_OBJECT_STREAM_CHAIN_DEPTH);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let head = ObjectRef::new(4, 0);
+        let resolved = pdf.resolve(head).expect("resolve head");
+        let head_stream = resolved.as_stream().expect("head object must be a stream");
+        let mut streams = Vec::new();
+        pdf.collect_object_stream_chain(head, head_stream, &mut streams, &mut BTreeSet::new())
+            .expect("a chain at the depth limit must be accepted");
+        assert_eq!(streams.len(), MAX_OBJECT_STREAM_CHAIN_DEPTH);
+    }
+
+    /// One link past the limit aborts with a catchable parse error rather than
+    /// recursing until the stack overflows.
+    #[test]
+    fn collect_object_stream_chain_rejects_overlong_extends_chain() {
+        let bytes = objstm_extends_chain_pdf(MAX_OBJECT_STREAM_CHAIN_DEPTH + 1);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let head = ObjectRef::new(4, 0);
+        let resolved = pdf.resolve(head).expect("resolve head");
+        let head_stream = resolved.as_stream().expect("head object must be a stream");
+        let mut streams = Vec::new();
+        let err = pdf
+            .collect_object_stream_chain(head, head_stream, &mut streams, &mut BTreeSet::new())
+            .expect_err("a chain past the depth limit must be rejected");
+        assert!(
+            matches!(err, Error::Parse { .. }),
+            "expected a parse error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("too deep"),
+            "expected a depth error, got: {err}"
+        );
     }
 }
