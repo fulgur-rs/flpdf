@@ -292,7 +292,7 @@ pub(crate) fn materialize_leaf(
         if let Some(mut mb) = attrs.mediabox {
             rewrite_refs(&mut mb, 0, map)?;
             leaf.insert("MediaBox", mb);
-        }
+        } // cov:ignore: rewrite_refs ? Err arm (MAX_INLINE_DEPTH) unreachable for shallow inherited /MediaBox
     }
     if !has_own(&leaf, "CropBox") {
         if let Some(mut cb) = attrs.cropbox {

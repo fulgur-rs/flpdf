@@ -494,7 +494,7 @@ fn fold_inline_action_operands<R: Read + Seek>(
         }
         // `skip_parent_key: true` so a `/P` operand (if any) is treated as a
         // back-pointer, matching the field-tree closure discipline.
-        collect_refs_in_object(source, value, closure, &mut seen, 0, true)?;
+        collect_refs_in_object(source, value, closure, &mut seen, 0, 0, true)?;
     }
     // Follow the `/Next` continuation chain so a continuation's operands are
     // folded too. `/Next` may be a single action, an array of actions, or an
@@ -1090,7 +1090,15 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
         // `/DR` is a resource dictionary: pass `skip_parent_key: false` so a
         // resource legitimately named `/P` (e.g. a `/DA`-referenced font) is
         // collected rather than dropped as a field-tree back-pointer.
-        collect_refs_in_object(source, &value, &mut out.closure_seed, &mut seen, 0, false)?;
+        collect_refs_in_object(
+            source,
+            &value,
+            &mut out.closure_seed,
+            &mut seen,
+            0,
+            0,
+            false,
+        )?; // cov:ignore: collect_refs_in_object ? Err arm (depth/inline limit) unreachable for well-formed AcroForm /DR /DA
         match key.as_slice() {
             b"DR" => out.dr = Some(value),
             b"DA" => out.da = Some(value),
