@@ -746,40 +746,56 @@ fn dest_targets_absent_page(
 }
 
 /// `true` when a GoTo `/SD` structure destination resolves to a page not in
-/// `keep`. An `/SD` value is `[structElemRef /Fit ...]` (or an indirect ref to
-/// one); the first element is a *structure element*, whose `/Pg` is the target
-/// page (ISO 32000-2 §12.6.4.3). Named structure destinations (a name/string,
-/// resolved via the structure tree) carry no in-document page ref and return
-/// `false`. A missing / unresolvable / non-Page `/Pg`, or a `/Pg` pointing at
-/// a kept page, returns `false` (kept conservatively). Each level may be
-/// indirect; `resolve_ref_chain` bounds the indirection.
+/// `keep`. Thin predicate over [`sd_target_page_ref`].
 fn sd_targets_absent_page(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     sd: &Object,
     keep: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
-    let (concrete, _) = resolve_ref_chain(target, sd)?;
+    Ok(match sd_target_page_ref(target, sd)? {
+        Some(r) => !keep.contains(&r),
+        None => false,
+    })
+}
+
+/// Resolve a GoTo `/SD` structure destination to its target page reference, or
+/// `None` when it carries no in-document page ref.
+///
+/// An `/SD` value is `[structElemRef /Fit ...]` (or an indirect ref to one);
+/// the first element is a *structure element*, whose `/Pg` is the target page
+/// (ISO 32000-2 §12.6.4.3). Named structure destinations (a name/string,
+/// resolved via the structure tree) carry no in-document page ref and return
+/// `None`. A missing / unresolvable / non-Page `/Pg` also returns `None`. Each
+/// level may be indirect; [`resolve_ref_chain`] bounds the indirection.
+///
+/// Shared by extract's neutralize-drop path and merge's collect path so both
+/// reach the `/SD` target page through the identical StructElem -> `/Pg` hop.
+pub(crate) fn sd_target_page_ref<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    sd: &Object,
+) -> Result<Option<ObjectRef>> {
+    let (concrete, _) = resolve_ref_chain(pdf, sd)?;
     let Object::Array(arr) = concrete else {
-        return Ok(false); // named structure destination or malformed
+        return Ok(None); // named structure destination or malformed
     };
     let Some(struct_elem) = arr.into_iter().next() else {
-        return Ok(false);
+        return Ok(None);
     };
-    let (se, _) = resolve_ref_chain(target, &struct_elem)?;
+    let (se, _) = resolve_ref_chain(pdf, &struct_elem)?;
     let Some(se_dict) = se.into_dict() else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(pg) = se_dict.get("Pg").cloned() else {
-        return Ok(false);
+        return Ok(None);
     };
-    let (pg_concrete, pg_ref) = resolve_ref_chain(target, &pg)?;
-    // Unlike `dest_targets_absent_page`, where the `/D` array's first element IS
+    let (pg_concrete, pg_ref) = resolve_ref_chain(pdf, &pg)?;
+    // Unlike `dest_page_ref_resolved`, where the `/D` array's first element IS
     // the page ref, `/SD` reaches the page through an extra StructElem -> `/Pg`
     // hop, so confirm the resolved `/Pg` target is actually a `/Type /Page`
-    // before treating it as a droppable cross-page destination.
+    // before treating it as a page destination.
     Ok(match pg_ref {
-        Some(r) => !keep.contains(&r) && is_page_dict(&pg_concrete),
-        None => false,
+        Some(r) if is_page_dict(&pg_concrete) => Some(r),
+        _ => None,
     })
 }
 
@@ -794,15 +810,34 @@ fn p_targets_absent_page(
     p: &Object,
     keep: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
-    let (concrete, p_ref) = resolve_ref_chain(target, p)?;
-    Ok(match p_ref {
-        Some(r) => !keep.contains(&r) && is_page_dict(&concrete),
+    Ok(match p_target_page_ref(target, p)? {
+        Some(r) => !keep.contains(&r),
         None => false,
     })
 }
 
+/// Resolve an annotation's or bead's `/P` to its target Page reference, or
+/// `None` when `/P` does not resolve to a `/Type /Page` object.
+///
+/// On an annotation (ISO 32000-2 §12.5.2, Table 166) or an article bead
+/// (§12.4.3), `/P` denotes the page the object belongs to. The `is_page_dict`
+/// gate keeps any non-page `/P` (e.g. a StructElem's parent `/P`) out of scope.
+/// Each level may be indirect; [`resolve_ref_chain`] bounds the indirection.
+///
+/// Shared by extract's neutralize-drop path and merge's collect path.
+pub(crate) fn p_target_page_ref<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    p: &Object,
+) -> Result<Option<ObjectRef>> {
+    let (concrete, p_ref) = resolve_ref_chain(pdf, p)?;
+    Ok(match p_ref {
+        Some(r) if is_page_dict(&concrete) => Some(r),
+        _ => None,
+    })
+}
+
 /// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
-fn is_page_dict(obj: &Object) -> bool {
+pub(crate) fn is_page_dict(obj: &Object) -> bool {
     obj.as_dict()
         .and_then(|d| d.get("Type"))
         .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
