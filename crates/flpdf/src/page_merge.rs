@@ -1,0 +1,1983 @@
+//! Multi-document page merge (qpdf `--pages` parity).
+//!
+//! [`merge_documents`] copies selected pages from N source documents into one
+//! fresh target. `inputs[0]` is the primary: its document-level information
+//! (outlines, named destinations, AcroForm `/DR` `/DA`) is inherited; later
+//! inputs contribute pages and form fields only. Shared resources within one
+//! input are de-duplicated; form-field name collisions are resolved by qpdf's
+//! `<name>+<N>` renaming rule.
+
+use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
+use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
+use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
+use crate::object_copy::copy_objects;
+use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
+use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
+use crate::page_closure::page_object_closure;
+use crate::page_extract::{
+    append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
+    sd_target_page_ref, target_pages_root, InheritedAttrs,
+};
+use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::subset_prune::sweep_unreachable_objects;
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read, Seek};
+
+/// One merge input: an opened source document and the 0-based page indices to
+/// take from it (arbitrary order, duplicates allowed).
+pub struct MergeInput<'a, R: Read + Seek> {
+    /// The opened source document.
+    pub source: &'a mut Pdf<R>,
+    /// 0-based page indices to copy, in output order.
+    pub pages: Vec<usize>,
+}
+
+/// Inline-`/Next`-nesting bound for action-chain traversal, mirroring extract's
+/// `MAX_ACTION_CHAIN_DEPTH` so a cyclic or pathologically deep inline `/Next`
+/// chain terminates. Indirect `/Next` cycles are additionally bounded by a
+/// per-walk `visited` set.
+const MAX_ACTION_CHAIN_DEPTH: usize = 64;
+
+/// Collect the source page references reachable from `page_ref` through the
+/// *destination* family of carriers, keeping only targets that are *not* in
+/// `selected` (the input's chosen pages). Those are the removed pages a
+/// destination still points at; for qpdf `--pages` null-out parity they are
+/// copied as placeholders and then replaced with `null`, so the reference
+/// survives but resolves to a null page object.
+///
+/// The destination carriers, per page, are:
+/// - each `/Annots` annotation's `/Dest` and `/A` action chain;
+/// - each annotation's `/AA` additional actions and the page's own `/AA`.
+///
+/// Within each action chain, both `/GoTo /D` page destinations and `/GoTo /SD`
+/// structure destinations are followed, as are `/Next` continuations (single
+/// action or array form).
+///
+/// Scope note — this covers the *destination* family only, which is the family
+/// qpdf `--pages` null-outs. It deliberately does NOT walk a thread bead's `/P`
+/// or a structure element's `/Pg` reached from an unselected page: those belong
+/// to a drop-and-garbage-collect family (qpdf removes the page entirely rather
+/// than leaving a null in its place), so nulling them would be the wrong shape.
+/// Such pages are not pruned here; see [`merge_documents`] for the resulting
+/// constraint.
+///
+/// Indirect references are resolved throughout via [`resolve_ref_chain`] /
+/// [`dest_page_ref_resolved`] / [`sd_target_page_ref`], which bound the
+/// indirection. Named/string/external destinations carry no in-document page
+/// reference and contribute nothing.
+fn collect_removed_dest_targets<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    // Detach the values that need a `&mut source` resolve before mutating the
+    // borrow: the raw /Annots value and the page's own /AA value.
+    let (annots_val, page_aa): (Option<Object>, Option<Object>) = {
+        let page_obj = source.resolve_borrowed(page_ref)?;
+        let Some(page_dict) = page_obj.as_dict() else {
+            return Ok(()); // cov:ignore: malformed input — a page ref always resolves to a dictionary
+        };
+        (
+            page_dict.get("Annots").cloned(),
+            page_dict.get("AA").cloned(),
+        )
+    };
+
+    // /Annots may be an inline array or an indirect reference to one (mirrors
+    // neutralize_absent_dests). Each array element is either an indirect
+    // reference to an annotation dict OR a direct (inline) annotation dict; both
+    // carry destinations and must be scanned (an inline annot whose /Dest points
+    // at a removed page is otherwise missed, leaving a live orphan instead of a
+    // null target).
+    let annot_elems: Vec<Object> = match annots_val {
+        Some(Object::Array(arr)) => arr,
+        // /Annots may be reached through a multi-hop indirect chain (a ref to a
+        // ref to the array); follow the whole chain via resolve_ref_chain so the
+        // terminal array is reached (a one-level resolve would stop on an
+        // intermediate Reference and miss the annotations). resolve_ref_chain
+        // returns an owned Object, so no clone is needed.
+        Some(r @ Object::Reference(_)) => match resolve_ref_chain(source, &r)?.0 {
+            Object::Array(arr) => arr,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for elem in annot_elems {
+        // Resolve an indirect element to its annotation dict (releasing the
+        // source borrow via `.cloned()`); an inline dict is scanned directly,
+        // borrowing the owned array element rather than `source`.
+        match elem {
+            Object::Reference(annot_ref) => {
+                // The element may be a reference to a reference to the annotation;
+                // follow the whole chain so a multi-hop annotation is scanned (a
+                // one-hop resolve would stop on an intermediate Reference and miss
+                // its removed-page destinations).
+                let (concrete, _) = resolve_ref_chain(source, &Object::Reference(annot_ref))?;
+                let Some(annot) = concrete.into_dict() else {
+                    continue;
+                };
+                scan_annotation(source, &annot, selected, removed)?;
+            }
+            Object::Dictionary(annot) => {
+                scan_annotation(source, &annot, selected, removed)?;
+            }
+            // A non-ref, non-dict /Annots element is malformed; skip it.
+            _ => {} // cov:ignore: malformed /Annots element (neither reference nor dict)
+        }
+    }
+
+    // Page-level /AA: each entry (/O, /C, …) is an action chain.
+    if let Some(aa_val) = page_aa {
+        collect_aa_dest_targets(source, &aa_val, selected, removed)?;
+    }
+
+    Ok(())
+}
+
+/// Scan one annotation dictionary's destination carriers (`/Dest`, the `/A`
+/// action chain, and the annotation-level `/AA`) for targets pointing at a
+/// removed page. Shared by the indirect-reference and inline (direct) `/Annots`
+/// element paths so both kinds of annotation are null-out'd identically.
+fn scan_annotation<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    annot: &Dictionary,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    // /Dest — explicit array/dict destination (mirrors
+    // neutralize_annot_if_absent's /Dest arm).
+    if let Some(dest) = annot.get("Dest") {
+        collect_dest_target(source, dest, selected, removed)?;
+    }
+    // /A — an action chain (mirrors the /A arm via neutralize_action_chain).
+    if let Some(a_val) = annot.get("A") {
+        let mut visited = BTreeSet::new();
+        collect_action_chain_targets(
+            source,
+            a_val,
+            selected,
+            removed,
+            &mut visited,
+            MAX_ACTION_CHAIN_DEPTH,
+        )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
+    }
+    // Annotation-level /AA (e.g. a widget's /E enter, /X exit actions);
+    // each entry is an action chain.
+    if let Some(aa_val) = annot.get("AA") {
+        collect_aa_dest_targets(source, aa_val, selected, removed)?;
+    }
+    Ok(())
+}
+
+/// Scan every entry of an additional-actions (`/AA`) value for destinations
+/// targeting a removed page. The value may be an inline dict or an indirect
+/// reference to one ([`resolve_ref_chain`] bounds the indirection). Mirrors
+/// extract's `neutralize_aa_if_absent` (collect-only).
+fn collect_aa_dest_targets<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    aa_value: &Object,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    let (concrete, _) = resolve_ref_chain(source, aa_value)?;
+    // A non-dictionary /AA is malformed; nothing to scan.
+    if let Some(aa) = concrete.into_dict() {
+        for (_key, sub) in aa.iter() {
+            // Each subaction is an independent chain; reset `visited` per entry,
+            // matching neutralize_aa_if_absent.
+            let mut visited = BTreeSet::new();
+            collect_action_chain_targets(
+                source,
+                sub,
+                selected,
+                removed,
+                &mut visited,
+                MAX_ACTION_CHAIN_DEPTH,
+            )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `dest` to its target page reference and record it in `removed` when
+/// it is not in `selected`.
+fn collect_dest_target<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    dest: &Object,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if let Some(target) = dest_page_ref_resolved(source, dest)? {
+        // `dest_page_ref_resolved` returns the dest array's LEADING ref as-is; that
+        // ref may be a holder chain (a ref to a ref to the page). `selected` holds
+        // terminal page refs (from `page_refs`), and the copy map keys pages by
+        // their terminal, so normalize the leading ref to its terminal before the
+        // membership check and before recording it — otherwise a holder ref to a
+        // SELECTED page is wrongly treated as removed (and nulled).
+        let target = resolve_ref_chain(source, &Object::Reference(target))?
+            .1
+            .unwrap_or(target);
+        if !selected.contains(&target) {
+            removed.insert(target);
+        }
+    }
+    Ok(())
+}
+
+/// Walk an action value (`/A`, an `/AA` subaction, or a `/Next` element),
+/// recording the target page of every `/GoTo /D` and `/GoTo /SD` whose
+/// destination is a removed page, and following `/Next` continuations (single
+/// action or array). Mirrors extract's `neutralize_action_chain` /
+/// `neutralize_action_array` (collect-only): indirect cycles are bounded by
+/// `visited`, inline `/Next` nesting by `depth`.
+fn collect_action_chain_targets<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action_value: &Object,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+    visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+) -> Result<()> {
+    if depth == 0 {
+        return Ok(()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
+    }
+
+    let (concrete, terminal_ref) = resolve_ref_chain(source, action_value)?;
+    // Indirect-cycle guard: stop if we have already entered this action object.
+    if let Some(r) = terminal_ref {
+        if !visited.insert(r) {
+            return Ok(());
+        }
+    }
+
+    // An action value may be an ARRAY of actions (ISO 32000-1 §12.6.3: `/Next`
+    // may be a single action or an array). Handle it before the dict path so an
+    // array stored as a separate object is not silently skipped.
+    if let Object::Array(elems) = concrete {
+        for elem in &elems {
+            collect_action_chain_targets(source, elem, selected, removed, visited, depth - 1)?;
+        }
+        return Ok(());
+    }
+
+    let Some(action) = concrete.into_dict() else {
+        return Ok(());
+    };
+    let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+    if is_goto {
+        if let Some(d_val) = action.get("D") {
+            collect_dest_target(source, d_val, selected, removed)?;
+        }
+        if let Some(sd_val) = action.get("SD") {
+            collect_sd_target(source, sd_val, selected, removed)?;
+        }
+    }
+
+    // /Next — a single action or an array of actions. Recurse into each.
+    if let Some(next_val) = action.get("Next") {
+        match next_val {
+            Object::Array(elems) => {
+                // Each array element is an independent action chain, recursed at
+                // `depth - 1` (matching extract's neutralize_action_array so the
+                // inline-nesting bound stays identical across the two paths).
+                for elem in elems {
+                    collect_action_chain_targets(
+                        source,
+                        elem,
+                        selected,
+                        removed,
+                        visited,
+                        depth - 1,
+                    )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
+                }
+            }
+            single => {
+                collect_action_chain_targets(
+                    source,
+                    single,
+                    selected,
+                    removed,
+                    visited,
+                    depth - 1,
+                )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a `/GoTo /SD` structure destination to its target page (via the
+/// StructElem `/Pg` hop) and record it in `removed` when not in `selected`.
+/// Shares [`sd_target_page_ref`] with extract.
+fn collect_sd_target<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    sd: &Object,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if let Some(target) = sd_target_page_ref(source, sd)? {
+        if !selected.contains(&target) {
+            removed.insert(target);
+        }
+    }
+    Ok(())
+}
+
+/// Primary-only document-level structures discovered on `inputs[0]`'s catalog,
+/// to be inherited by the merged output (qpdf `--pages` takes outlines, named
+/// destinations, and `/OpenAction` from the primary input only).
+///
+/// Each field captures how the structure is held so it can be wired onto the
+/// fresh output catalog after the primary copy renumbers it:
+/// - an *indirect* root (`/Outlines`, an indirect `/Names /Dests` name-tree
+///   root, an indirect legacy `/Catalog /Dests`, an indirect `/OpenAction`) is
+///   folded into the primary's copy closure and wired to its new ref via the
+///   renumber map;
+/// - an *inline-on-catalog* value (a direct `/Names /Dests` name-tree root, a
+///   direct legacy `/Dests` dict, or a direct `/OpenAction` array/dict) is held
+///   only by the primary catalog, which is never copied, so its destinations
+///   are reconstructed from the renumber map once.
+#[derive(Default)]
+struct PrimaryDocLevel {
+    /// Indirect `/Outlines` root ref, if present.
+    outlines: Option<ObjectRef>,
+    /// Direct (inline-on-catalog) `/Outlines` root dictionary. ISO 32000 permits
+    /// the catalog `/Outlines` to be a direct dict, like the other catalog-level
+    /// carriers; its item refs are indirect and are folded/wired the same way as
+    /// the inline `/Names /Dests` and legacy `/Dests` roots.
+    outlines_inline: Option<Dictionary>,
+    /// Indirect name-tree root held under the catalog's `/Names /Dests`.
+    names_dests: Option<ObjectRef>,
+    /// Direct `/Names /Dests` name-tree root (inline on the catalog). ISO 32000
+    /// permits a name-tree root to be a direct dictionary — it is referenced
+    /// only from `/Names /Dests`, so a producer may inline it; an indirect root
+    /// is a producer convention, not a spec rule. The root may be a `/Names`
+    /// leaf or a `/Kids` node (§7.9.6); both shapes are handled.
+    names_dests_inline: Option<Dictionary>,
+    /// Indirect legacy `/Catalog /Dests` dictionary ref.
+    legacy_dests_ref: Option<ObjectRef>,
+    /// Direct legacy `/Catalog /Dests` dictionary (inline on the catalog).
+    legacy_dests_inline: Option<Dictionary>,
+    /// Indirect `/OpenAction` object ref (an action dict).
+    open_action_ref: Option<ObjectRef>,
+    /// Direct `/OpenAction` value (an inline `[page /Fit]` array or action dict).
+    open_action_inline: Option<Object>,
+}
+
+/// Read the primary catalog and classify its document-level destination
+/// carriers into a [`PrimaryDocLevel`]. Indirect carriers are returned by ref
+/// (to fold into the copy closure); inline-on-catalog carriers are cloned out
+/// (to reconstruct from the renumber map after copy).
+fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryDocLevel> {
+    let Some(catalog_ref) = source.root_ref() else {
+        return Ok(PrimaryDocLevel::default()); // cov:ignore: an opened Pdf always has a /Root
+    };
+    let catalog_obj = source.resolve_borrowed(catalog_ref)?;
+    let Some(catalog) = catalog_obj.as_dict() else {
+        return Ok(PrimaryDocLevel::default()); // cov:ignore: a /Root always resolves to a dictionary catalog
+    };
+
+    let mut doc = PrimaryDocLevel::default();
+    // /Outlines — an indirect root ref, or a direct (inline) root dict on the
+    // catalog (ISO 32000 permits either, like the other catalog-level carriers).
+    match catalog.get("Outlines") {
+        Some(Object::Reference(r)) => doc.outlines = Some(*r),
+        Some(Object::Dictionary(d)) => doc.outlines_inline = Some(d.clone()),
+        _ => {}
+    }
+
+    // /Names /Dests — the catalog's /Names is an indirect ref or an inline dict.
+    // Its /Dests name-tree root may be an indirect ref OR a direct dictionary:
+    // ISO 32000 permits a name-tree root to be inline (it is referenced only
+    // from /Names /Dests). Both forms are captured here. Only /Dests is
+    // inherited; sibling name trees (/JavaScript, /EmbeddedFiles) are left to
+    // their own document-level handling and are not merged here.
+    let names_val = catalog.get("Names").cloned();
+    let names_dict = match names_val {
+        // /Names may sit behind a holder chain (a ref to a ref to the dict); follow
+        // it so the inherited /Dests name tree is not dropped.
+        Some(value @ Object::Reference(_)) => resolve_ref_chain(source, &value)?.0.into_dict(),
+        Some(Object::Dictionary(d)) => Some(d),
+        _ => None,
+    };
+    if let Some(names) = names_dict {
+        if let Some(Object::Reference(r)) = names.get("Dests") {
+            doc.names_dests = Some(*r);
+        } else if let Some(Object::Dictionary(d)) = names.get("Dests") {
+            doc.names_dests_inline = Some(d.clone());
+        }
+    }
+
+    // Re-resolve the catalog: the /Names resolve above borrowed `source`.
+    let catalog_obj = source.resolve_borrowed(catalog_ref)?;
+    let Some(catalog) = catalog_obj.as_dict() else {
+        return Ok(doc); // cov:ignore: catalog was a dict moments ago; cannot change
+    };
+
+    // Legacy /Catalog /Dests — indirect dict or inline dict on the catalog.
+    match catalog.get("Dests") {
+        Some(Object::Reference(r)) => doc.legacy_dests_ref = Some(*r),
+        Some(Object::Dictionary(d)) => doc.legacy_dests_inline = Some(d.clone()),
+        _ => {}
+    }
+
+    // /OpenAction — an indirect action object, or an inline action dict / dest
+    // array on the catalog.
+    match catalog.get("OpenAction") {
+        Some(Object::Reference(r)) => doc.open_action_ref = Some(*r),
+        Some(other) => doc.open_action_inline = Some(other.clone()),
+        None => {}
+    }
+
+    Ok(doc)
+}
+
+/// Fold every indirect document-level carrier of `doc` into `closure` via the
+/// complete transitive [`page_object_closure`] (which stops at `Page`/`Catalog`
+/// dicts, collecting a destination page as a leaf reference without descending).
+/// This makes the primary's single `copy_objects` pass copy the whole outline /
+/// name-tree / action graph and remap every destination in one rewrite — no
+/// separate post-copy remap pass is needed (or wanted).
+fn fold_doc_level_closure<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    doc: &PrimaryDocLevel,
+    closure: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    for root in [
+        doc.outlines,
+        doc.names_dests,
+        doc.legacy_dests_ref,
+        doc.open_action_ref,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        closure.extend(page_object_closure(source, root)?);
+    }
+    // An INLINE (on-catalog) `/OpenAction` is not an indirect root, so its
+    // operand objects (e.g. a `/JavaScript` action's `/JS` string) are not pulled
+    // in by the loop above. Fold them explicitly — the indirect `open_action_ref`
+    // path got them for free via page_object_closure.
+    if let Some(inline) = &doc.open_action_inline {
+        fold_inline_action_operands(source, inline, closure, MAX_ACTION_CHAIN_DEPTH)?;
+    }
+    // An INLINE (on-catalog) `/Names /Dests` name-tree root is likewise not an
+    // indirect root. When such a root is a `/Kids` node (ISO 32000-2 §7.9.6: a
+    // name-tree root may carry `/Kids` instead of `/Names`), its sub-leaf
+    // objects are not pulled in by the loop above. Fold each kid ref through the
+    // transitive closure so the sub-leaves (and their destinations) are copied,
+    // mirroring what the indirect `names_dests` root gets for free.
+    if let Some(inline) = &doc.names_dests_inline {
+        if let Some(Object::Array(kids)) = inline.get("Kids") {
+            let kid_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
+            for kid in kid_refs {
+                closure.extend(page_object_closure(source, kid)?);
+            }
+        }
+    }
+    // An INLINE (on-catalog) `/Outlines` root is likewise not an indirect root;
+    // fold its item chain through the `/First` and `/Last` child refs so the
+    // outline items (and their destination pages) are copied, mirroring what the
+    // indirect `outlines` root gets for free.
+    if let Some(inline) = &doc.outlines_inline {
+        let child_refs: Vec<ObjectRef> = ["First", "Last"]
+            .into_iter()
+            .filter_map(|key| inline.get_ref(key))
+            .collect();
+        for child in child_refs {
+            closure.extend(page_object_closure(source, child)?);
+        }
+    }
+    Ok(())
+}
+
+/// Action-operand keys that carry a *destination* (or a structural/back-pointer)
+/// rather than a plain operand object. These are owned by the destination
+/// null-out machinery ([`collect_doc_level_removed_targets`] /
+/// [`remap_inline_action`]) and by the `/Next`-chain walk, so the operand fold
+/// below must NOT descend them — descending `/D` would pull a destination page's
+/// content (and, via `/Parent`, its siblings) into the primary closure.
+const ACTION_DEST_KEYS: [&[u8]; 5] = [b"D", b"SD", b"Dest", b"Next", b"Parent"];
+
+/// Fold every indirect *operand* object reachable from an inline action graph
+/// (the action dict plus its `/Next` continuation chain) into `closure`, so a
+/// non-destination operand such as a `/JavaScript` action's `/JS` string is
+/// copied into the output. Destination/structural keys ([`ACTION_DEST_KEYS`]) are
+/// skipped — their pages are handled by the destination null-out path, mirroring
+/// what the indirect-`/OpenAction` root gets for free from [`page_object_closure`]
+/// (which stops at `Page`/`Catalog` boundaries). Bounded by `depth` (inline
+/// `/Next` nesting) and [`resolve_ref_chain`] (reference indirection); the
+/// `collect_refs_in_object` operand walk is itself depth- and cycle-bounded.
+fn fold_inline_action_operands<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action: &Object,
+    closure: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+) -> Result<()> {
+    if depth == 0 {
+        return Ok(()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
+    }
+    let (concrete, _) = resolve_ref_chain(source, action)?;
+    let Some(dict) = concrete.into_dict() else {
+        return Ok(()); // cov:ignore: a bare-dest array /OpenAction has no operand objects to fold
+    };
+    // An action's `/D` is a *local* page destination (owned by the null-out path)
+    // only for a bare-dest dict (no `/S`) or `/S /GoTo`. For an opaque action
+    // (`/S` present and != GoTo, e.g. `/GoToR`, `/URI`), `/D` is a remote/named
+    // destination operand object that must be folded like any other operand, so it
+    // is copied and the remapper (`remap_inline_action_depth`, opaque arm) can wire
+    // its refs instead of dropping the unmapped ref to `Null`. Mirror the
+    // remapper's `dest_bearing` predicate exactly so fold and remap agree on `/D`.
+    let dest_bearing = !matches!(dict.get("S"), Some(Object::Name(n)) if n != b"GoTo");
+    // Fold each non-destination operand's indirect refs into the closure. `/SD`,
+    // `/Dest`, `/Next`, `/Parent` are always skipped (see ACTION_DEST_KEYS); `/D`
+    // is skipped only when it is a local/GoTo destination (`dest_bearing`).
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    for (key, value) in dict.iter() {
+        let skip_key = if key == b"D" {
+            dest_bearing
+        } else {
+            ACTION_DEST_KEYS.contains(&key)
+        };
+        if skip_key {
+            continue;
+        }
+        // `skip_parent_key: true` so a `/P` operand (if any) is treated as a
+        // back-pointer, matching the field-tree closure discipline.
+        collect_refs_in_object(source, value, closure, &mut seen, 0, 0, true)?;
+    }
+    // Follow the `/Next` continuation chain so a continuation's operands are
+    // folded too. `/Next` may be a single action, an array of actions, or an
+    // indirect ref to either; resolve the chain first so an indirect `/Next`
+    // resolving to an array is folded as actions (each element recursed), not
+    // skipped as a bare-dest array (which would hit the `into_dict()` early
+    // return). Mirrors remap_next_continuation on the remap side.
+    if let Some(next_val) = dict.get("Next") {
+        let (concrete, _) = resolve_ref_chain(source, next_val)?;
+        match concrete {
+            Object::Array(elems) => {
+                for elem in &elems {
+                    fold_inline_action_operands(source, elem, closure, depth - 1)?;
+                }
+            }
+            single => fold_inline_action_operands(source, &single, closure, depth - 1)?,
+        }
+    }
+    Ok(())
+}
+
+/// Collect every removed-page destination target reachable from the primary's
+/// document-level carriers (outline tree, `/Names /Dests` name tree, legacy
+/// `/Catalog /Dests`, and `/OpenAction`), adding them to `removed`. A removed
+/// target is a destination page that is not in `selected`; folding it into the
+/// closure and nulling its copied body reproduces qpdf's `--pages` null-out
+/// (the destination keeps its reference, which resolves to `null`). Reuses the
+/// Task 3 leaf collectors ([`collect_dest_target`] / [`collect_action_chain_targets`]).
+fn collect_doc_level_removed_targets<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    doc: &PrimaryDocLevel,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    collect_outline_doc_dests(source, doc, selected, removed)?;
+
+    // /Names /Dests name tree — its root is an indirect ref or a direct dict;
+    // read_name_tree accepts either as its `root: Object`, enumerating leaf and
+    // /Kids dests so removed targets (incl. those carried by an inline root) are
+    // collected for null-out.
+    let names_root = match (doc.names_dests, &doc.names_dests_inline) {
+        (Some(r), _) => Some(Object::Reference(r)),
+        (None, Some(d)) => Some(Object::Dictionary(d.clone())),
+        (None, None) => None,
+    };
+    if let Some(root) = names_root {
+        collect_name_tree_removed_targets(source, root, selected, removed)?;
+    }
+
+    // Legacy /Dests: each value is a destination; reached as an indirect dict or
+    // an inline dict on the catalog.
+    let legacy = match (doc.legacy_dests_ref, &doc.legacy_dests_inline) {
+        // The legacy /Dests carrier may sit behind a holder chain (a ref to a ref
+        // to the dict); follow it so its entries are scanned for removed targets.
+        (Some(r), _) => resolve_ref_chain(source, &Object::Reference(r))?
+            .0
+            .into_dict(),
+        (None, Some(d)) => Some(d.clone()),
+        (None, None) => None,
+    };
+    if let Some(dests) = legacy {
+        for (_key, dest) in dests.iter() {
+            collect_dest_target(source, dest, selected, removed)?;
+        }
+    }
+
+    // /OpenAction: an action chain (indirect or inline) or a bare dest array.
+    // The indirect form is walked through its ref; the inline form is borrowed
+    // from `doc` (no clone) and walked in place.
+    let open_action_owned = doc.open_action_ref.map(Object::Reference);
+    if let Some(oa) = open_action_owned
+        .as_ref()
+        .or(doc.open_action_inline.as_ref())
+    {
+        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+        collect_action_chain_targets(
+            source,
+            oa,
+            selected,
+            removed,
+            &mut visited,
+            MAX_ACTION_CHAIN_DEPTH,
+        )?; // cov:ignore: `?` Err arm — action walk cannot fail on an already-opened source
+            // Beyond the `/S /GoTo` action chain above, an /OpenAction may itself
+            // be a BARE destination: a `[page /Fit]` array, or a `<< /D … >>`
+            // destination dictionary with no `/S` (or `/S /GoTo`). Resolve the
+            // concrete shape and collect such a removed-page `/D`/array target so
+            // its placeholder is nulled. An action dict with `/S` present AND
+            // != GoTo (e.g. `/GoToR`, `/URI`) is opaque — its `/D` is a remote/named
+            // destination, not a local page ref — so it is left alone, mirroring
+            // outline_dest_remap::remap_or_null_action_dest. (Residual: a non-GoTo
+            // /D with a local ref is malformed remote-dest input; page_object_closure
+            // still folds that page as a copied orphan rather than nulling it. Not
+            // fixed here — touching the shared page_object_closure primitive is out
+            // of scope.)
+        let (concrete, _) = resolve_ref_chain(source, oa)?;
+        match concrete {
+            // A bare `[page /Fit]` destination array.
+            Object::Array(_) => collect_dest_target(source, oa, selected, removed)?,
+            // A no-/S (or /S /GoTo) `<< /D … >>` destination dictionary: its `/D`
+            // is a bare destination. (`/S /GoTo`'s /D was already collected by the
+            // action-chain walk above; re-collecting an already-recorded removed
+            // target is idempotent.)
+            // A no-/S (or /S /GoTo) dict's /D is a bare destination; an opaque
+            // action dict (`/S` present and != GoTo) has no /D. `get("D")` yields
+            // `&Object::Null` for the latter, which carries no page ref, so
+            // collecting it unconditionally is correct and avoids an uncovered
+            // `if let` else-arm.
+            Object::Dictionary(ref d) if !matches!(d.get("S"), Some(Object::Name(n)) if n != b"GoTo") =>
+            {
+                let d_val = d.get("D").unwrap_or(&Object::Null);
+                collect_dest_target(source, d_val, selected, removed)?; // cov:ignore: `?` Err arm — collect cannot fail on an already-opened source
+            }
+            // A bare-name /OpenAction, or an opaque action dict (`/S` present and
+            // != GoTo) — no local-page bare destination to collect.
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect the primary outline tree's removed-page destination targets, if the
+/// primary has an `/Outlines` root with a `/First` item. A thin wrapper that
+/// locates the first item then delegates to [`collect_outline_removed_targets`].
+fn collect_outline_doc_dests<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    doc: &PrimaryDocLevel,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    let first = match (doc.outlines, &doc.outlines_inline) {
+        (Some(outlines_ref), _) => {
+            // The /Outlines root may sit behind a holder chain (a ref to a ref to
+            // the root dict); follow the whole chain (not a one-hop resolve) so the
+            // root's /First is read and its removed-page dests are collected. The
+            // captured first-hop ref is kept verbatim for closure-folding; only this
+            // scan-side deref chains to the terminal.
+            let (root, _) = resolve_ref_chain(source, &Object::Reference(outlines_ref))?;
+            root.as_dict().and_then(|d| d.get_ref("First"))
+        }
+        // A direct (inline) root holds its `/First` item ref inline on the catalog.
+        (None, Some(inline)) => inline.get_ref("First"),
+        (None, None) => return Ok(()),
+    };
+    let Some(first) = first else {
+        // An /Outlines root with no /First is an empty outline tree — nothing to
+        // collect (mirrors crate::outline_dest_remap's empty-root handling).
+        return Ok(());
+    };
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    collect_outline_removed_targets(
+        source,
+        first,
+        selected,
+        removed,
+        &mut visited,
+        DEFAULT_MAX_OUTLINE_DEPTH,
+    )
+}
+
+/// Walk the outline sibling chain from `first`, descending `/First` children,
+/// recording every removed-page target reached via an item's `/Dest` or
+/// `/A /GoTo /D`. Bounded by `depth` and a shared `visited` set (outline trees
+/// can be cyclic or deeply nested), mirroring
+/// [`crate::outline_dest_remap`]'s traversal structure but collect-only.
+///
+/// On depth exhaustion the walk stops conservatively (matching the inline
+/// `/Next`-chain bound in [`collect_action_chain_targets`]): a destination below
+/// the nesting bound is simply not collected, rather than rejecting the whole
+/// merge. The deepest such targets stay copied-but-not-nulled, the same tolerant
+/// outcome already accepted for pathological input elsewhere in this module.
+fn collect_outline_removed_targets<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    first: ObjectRef,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+    visited: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+) -> Result<()> {
+    if depth == 0 {
+        return Ok(()); // cov:ignore: outline nesting deeper than DEFAULT_MAX_OUTLINE_DEPTH (DoS bound)
+    }
+    let mut current = Some(first);
+    while let Some(item_ref) = current {
+        // /First and /Next may point through holder chains (a ref to a ref to the
+        // item); resolve to the terminal item and key the cycle guard on the
+        // terminal ref so a destination below a holder is still reached.
+        let (item_obj, terminal) = resolve_ref_chain(source, &Object::Reference(item_ref))?;
+        if !visited.insert(terminal.unwrap_or(item_ref)) {
+            break; // Cycle guard (/Next or /First back-edge).
+        }
+        let (dest_val, action_val, next_ref, first_child) = {
+            let Some(item) = item_obj.as_dict() else {
+                break; // Malformed — stop this chain.
+            };
+            (
+                item.get("Dest").cloned(),
+                item.get("A").cloned(),
+                item.get_ref("Next"),
+                item.get_ref("First"),
+            )
+        };
+        if let Some(dest) = dest_val {
+            collect_dest_target(source, &dest, selected, removed)?;
+        }
+        if let Some(action) = action_val {
+            let mut a_visited: BTreeSet<ObjectRef> = BTreeSet::new();
+            collect_action_chain_targets(
+                source,
+                &action,
+                selected,
+                removed,
+                &mut a_visited,
+                MAX_ACTION_CHAIN_DEPTH,
+            )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened outline action objects
+        }
+        if let Some(child) = first_child {
+            collect_outline_removed_targets(source, child, selected, removed, visited, depth - 1)?;
+        }
+        current = next_ref;
+    }
+    Ok(())
+}
+
+/// Record every removed-page target carried by a `/Names /Dests` name tree.
+/// `root` is the name-tree root — an `Object::Reference` to an indirect root or
+/// an `Object::Dictionary` for a direct (inline) root; [`read_name_tree`]
+/// accepts either. Uses it (depth- and cycle-bounded) to enumerate the verbatim
+/// dest value of each entry, then resolves it through [`collect_dest_target`].
+fn collect_name_tree_removed_targets<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    root: Object,
+    selected: &BTreeSet<ObjectRef>,
+    removed: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    // The name-tree root may sit behind a holder chain (a ref to a ref to the root
+    // node); resolve it so read_name_tree walks the concrete root rather than
+    // stopping on an intermediate Reference and enumerating nothing.
+    let (root, _) = resolve_ref_chain(source, &root)?;
+    let entries = read_name_tree(
+        source,
+        root,
+        |_pdf, value| Ok(Some(value)),
+        DEFAULT_MAX_TREE_DEPTH,
+    )?; // cov:ignore: `?` Err arm — name-tree depth-limit / resolve failure not reachable from these fixtures
+    for (_name, dest) in entries {
+        collect_dest_target(source, &dest, selected, removed)?;
+    }
+    Ok(())
+}
+
+/// Wire the primary's inherited document-level structures onto the fresh output
+/// catalog after the primary copy. Indirect roots are wired to their copied ref
+/// via the renumber `map`; inline-on-catalog `/OpenAction` and legacy `/Dests`
+/// (never copied because the primary catalog is not copied) are reconstructed
+/// from `map`. `copy_objects` already remapped every destination *inside* the
+/// copied objects, so this only sets catalog keys — it does not re-walk or
+/// re-remap any destination (avoiding a double remap).
+fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
+    source: &mut Pdf<RSrc>,
+    target: &mut Pdf<RTgt>,
+    doc: &PrimaryDocLevel,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let Some(catalog_ref) = target.root_ref() else {
+        return Ok(()); // cov:ignore: the seed target always has a /Root catalog
+    };
+    let catalog_obj = target.resolve_borrowed(catalog_ref)?;
+    let Some(mut catalog) = catalog_obj.as_dict().cloned() else {
+        return Ok(()); // cov:ignore: the seed catalog is always a dict
+    };
+
+    if let Some(outlines) = doc.outlines {
+        if let Some(&new_ref) = map.get(&outlines) {
+            catalog.insert("Outlines", Object::Reference(new_ref));
+        }
+    } else if let Some(inline) = &doc.outlines_inline {
+        // The inline root dict lived on the primary catalog (never copied);
+        // rebuild it with its item refs (`/First`, `/Last`) remapped to the copied
+        // items, mirroring the inline `/Names` and legacy `/Dests` reconstruction.
+        catalog.insert(
+            "Outlines",
+            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
+        );
+    }
+    // /Names /Dests: indirect root → wire copied ref; inline root → reconstruct
+    // it from the renumber map (the catalog is never copied, so an inline root's
+    // dest page refs and `/Kids` sub-leaf refs are remapped here, like inline
+    // legacy /Dests). Either way a minimal /Names holder carries only the
+    // inherited /Dests name tree (sibling name trees are not merged).
+    if let Some(dests) = doc.names_dests {
+        if let Some(&new_ref) = map.get(&dests) {
+            let mut names = Dictionary::new();
+            names.insert("Dests", Object::Reference(new_ref));
+            catalog.insert("Names", Object::Dictionary(names));
+        }
+    } else if let Some(inline) = &doc.names_dests_inline {
+        let rebuilt = remap_inline_name_tree_root(source, inline, map)?;
+        let mut names = Dictionary::new();
+        names.insert("Dests", Object::Dictionary(rebuilt));
+        catalog.insert("Names", Object::Dictionary(names));
+    }
+    // Legacy /Catalog /Dests: indirect → wire copied ref; inline → reconstruct
+    // each entry's destination from the renumber map.
+    if let Some(legacy) = doc.legacy_dests_ref {
+        if let Some(&new_ref) = map.get(&legacy) {
+            catalog.insert("Dests", Object::Reference(new_ref));
+        }
+    } else if let Some(inline) = &doc.legacy_dests_inline {
+        let mut rebuilt = Dictionary::new();
+        for (key, dest) in inline.iter() {
+            rebuilt.insert(key, remap_inline_dest(source, dest, map)?);
+        }
+        catalog.insert("Dests", Object::Dictionary(rebuilt));
+    }
+    // /OpenAction: indirect → wire copied ref; inline → reconstruct from the map.
+    if let Some(oa_ref) = doc.open_action_ref {
+        if let Some(&new_ref) = map.get(&oa_ref) {
+            catalog.insert("OpenAction", Object::Reference(new_ref));
+        }
+    } else if let Some(inline) = &doc.open_action_inline {
+        catalog.insert("OpenAction", remap_inline_action(source, inline, map)?);
+    }
+
+    target.set_object(catalog_ref, Object::Dictionary(catalog));
+    Ok(())
+}
+
+/// Inline-destination nesting bound: how deep an inline `/Dests` value's
+/// `/D` chain (dict → `/D` → dict → …) is followed before stopping. Mirrors
+/// [`MAX_ACTION_CHAIN_DEPTH`] so a pathological inline structure terminates;
+/// [`resolve_ref_chain`] independently bounds *reference* chains.
+const MAX_INLINE_DEST_DEPTH: usize = 64;
+
+/// Remap an inline (on-catalog) destination value to the copied page refs in
+/// `map`, resolving any indirect holder first so the leading page reference is
+/// reached and remapped regardless of how the destination is shaped:
+/// - an `[page /Fit …]` array → its leading page ref is remapped;
+/// - a `<< /D <dest> >>` destination dictionary → its `/D` is remapped (recursed);
+/// - an indirect reference to either → resolved (against `source`) then remapped,
+///   so the un-copied intermediate holder is sidestepped (the catalog is never
+///   copied, so an indirect holder named only from it is absent from the output);
+/// - any other shape (a name/string named destination) is returned unchanged.
+///
+/// A page absent from `map` (the destination's target was removed) keeps its
+/// source reference, which has been copied as a placeholder and nulled — so it
+/// resolves to `null` in the output, matching the indirect-carrier null-out.
+/// Inline `/D` nesting is bounded by [`MAX_INLINE_DEST_DEPTH`] and reference
+/// indirection by [`resolve_ref_chain`].
+fn remap_inline_dest<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    dest: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Object> {
+    remap_inline_dest_depth(source, dest, map, MAX_INLINE_DEST_DEPTH)
+}
+
+fn remap_inline_dest_depth<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    dest: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Object> {
+    if depth == 0 {
+        return Ok(dest.clone()); // cov:ignore: inline /D nesting deeper than MAX_INLINE_DEST_DEPTH (DoS bound)
+    }
+    // Resolve an indirect holder to its concrete array/dict form (the holder
+    // itself is named only from the never-copied catalog, so inlining the
+    // resolved value is what reaches the page ref present in `map`).
+    let (concrete, _) = resolve_ref_chain(source, dest)?;
+    match concrete {
+        Object::Array(mut arr) => {
+            if let Some(Object::Reference(r)) = arr.first() {
+                if let Some(&new_ref) = map.get(r) {
+                    arr[0] = Object::Reference(new_ref);
+                }
+            }
+            Ok(Object::Array(arr))
+        }
+        // `<< /D <dest> >>` destination dictionary: remap its `/D` and keep the
+        // rest of the dict verbatim.
+        Object::Dictionary(mut d) => {
+            if let Some(d_val) = d.remove("D") {
+                let remapped = remap_inline_dest_depth(source, &d_val, map, depth - 1)?;
+                d.insert("D", remapped);
+            }
+            Ok(Object::Dictionary(d))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Reconstruct an inline (direct-dictionary) `/Names /Dests` name-tree root,
+/// remapping each destination in its `/Names` `[(key) dest (key) dest …]` array
+/// (the dests are the odd-indexed elements) through `map` via
+/// [`remap_inline_dest`], and remapping each `/Kids` sub-leaf reference through
+/// `map` to its copied object. Other keys (`/Limits`) are kept verbatim.
+///
+/// Per ISO 32000-2 §7.9.6 a name-tree root may carry `/Names`, `/Kids`, or both.
+/// A `/Kids` root is the normal shape once there are more entries than fit one
+/// leaf; whether the root is inline-on-catalog or indirect is purely a
+/// serialization choice. The kid sub-leaves are folded into the copy closure (so
+/// they are copied) by [`fold_doc_level_closure`], and `copy_objects` remaps the
+/// destinations *inside* each copied leaf; this function only rewrites the top
+/// `/Kids` refs to point at those copies. A kid absent from `map` keeps its
+/// source ref (which was copied as a placeholder and nulled), matching the
+/// destination null-out. Removed targets carried anywhere in the tree are nulled
+/// — [`collect_name_tree_removed_targets`] enumerates leaf and `/Kids` dests when
+/// collecting the null-out set.
+fn remap_inline_name_tree_root<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    leaf: &Dictionary,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Dictionary> {
+    let mut out = leaf.clone();
+    // A leaf root: remap its own `/Names` array dests (the odd-indexed elements).
+    if let Some(Object::Array(names)) = leaf.get("Names") {
+        let mut rebuilt = names.clone();
+        let mut i = 1;
+        while i < rebuilt.len() {
+            rebuilt[i] = remap_inline_dest(source, &rebuilt[i], map)?;
+            i += 2;
+        }
+        out.insert("Names", Object::Array(rebuilt));
+    }
+    // A `/Kids` root: remap each sub-leaf ref to its copied object (mirroring the
+    // `arr[0]` page-ref remap in remap_inline_dest_depth). Every kid ref was
+    // folded into the copy closure by fold_doc_level_closure, so it is always
+    // present in `map`; an unmapped ref (or a malformed non-ref element) is left
+    // verbatim by falling back to its current value.
+    if let Some(Object::Array(kids)) = leaf.get("Kids") {
+        let mut rebuilt = kids.clone();
+        for kid in &mut rebuilt {
+            if let Object::Reference(r) = kid {
+                *kid = Object::Reference(map.get(r).copied().unwrap_or(*r));
+            }
+        }
+        out.insert("Kids", Object::Array(rebuilt));
+    }
+    Ok(out)
+}
+
+/// Remap an inline `/OpenAction` value: a bare `[page /Fit]` destination array
+/// (via [`remap_inline_dest`]) or a `/S /GoTo` action dict whose `/D` is such an
+/// array, following the `/Next` continuation chain (a single action or an array
+/// of actions) so every `/GoTo /D` along the chain is remapped — matching the
+/// destinations [`collect_action_chain_targets`] walks. A non-GoTo action dict's
+/// own `/D` is returned unchanged (its `/D` is not a local page destination), but
+/// its `/Next` is still followed. An indirect action holder (the `/OpenAction`
+/// itself or an indirect `/Next`) is resolved via [`resolve_ref_chain`] before
+/// classification, so its concrete destinations are reached. The primary catalog
+/// is never copied, so this is the only place an inline `/OpenAction`'s
+/// destinations are remapped (not a re-pass over a copied object). Inline `/Next`
+/// nesting is bounded by [`MAX_ACTION_CHAIN_DEPTH`].
+fn remap_inline_action<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<Object> {
+    remap_inline_action_depth(source, action, map, MAX_ACTION_CHAIN_DEPTH)
+}
+
+fn remap_inline_action_depth<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    action: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Object> {
+    if depth == 0 {
+        return Ok(action.clone()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
+    }
+    // Resolve an indirect action holder (the whole `/OpenAction` or an indirect
+    // `/Next` continuation) so its concrete shape is reached and remapped, like
+    // collect_action_chain_targets. The catalog is never copied, so an indirect
+    // holder named only from it would otherwise dangle unremapped in the output.
+    let (concrete, _) = resolve_ref_chain(source, action)?;
+    match concrete {
+        Object::Array(arr) => remap_inline_dest(source, &Object::Array(arr), map),
+        Object::Dictionary(mut out) => {
+            // Detach the two keys whose values need dest-aware / recursive
+            // remapping (`/D`, `/Next`) before remapping the remaining operands, so
+            // a page ref under `/D` is never remapped twice.
+            let dest = out.remove("D");
+            let next = out.remove("Next");
+
+            // Remap every other indirect operand (e.g. a `/JavaScript` action's
+            // `/JS` string ref) through the copy map. The catalog is never copied,
+            // so an inline action's operand objects (folded into the primary
+            // closure by fold_inline_action_operands) are remapped only here.
+            out = match remap_refs_in_object(Object::Dictionary(out), map) {
+                Object::Dictionary(d) => d,
+                other => return Ok(other), // cov:ignore: remap_refs_in_object preserves the Dictionary variant
+            };
+
+            // A dict is an opaque non-destination action ONLY when `/S` is present
+            // AND != GoTo (e.g. `/GoToR`, `/URI`, `/JavaScript`); its `/D`, when
+            // present, is a remote/named destination, not a local page ref. A dict
+            // with no `/S` (a bare `<< /D … >>` destination dictionary) or `/S
+            // /GoTo` has a local-page `/D` to remap. Mirrors
+            // outline_dest_remap::remap_or_null_action_dest.
+            let dest_bearing = !matches!(out.get("S"), Some(Object::Name(n)) if n != b"GoTo");
+            if let Some(dest) = dest {
+                let remapped = if dest_bearing {
+                    // A local-page destination: remap its leading page ref.
+                    remap_inline_dest(source, &dest, map)?
+                } else {
+                    // An opaque action's /D (remote/named): remap any indirect
+                    // holder/operand refs but do not treat it as a local page dest.
+                    remap_refs_in_object(dest, map)
+                };
+                out.insert("D", remapped);
+            }
+            // /Next — a single action, an array of actions, or an indirect ref to
+            // either. Recurse into each at `depth - 1` so a continuation's /D is
+            // remapped too. An indirect ref that resolves to an array is an array
+            // OF ACTIONS (not a destination array), so resolve the chain first and
+            // route an array through the per-element action recursion — mirroring
+            // collect_action_chain_targets / the inline-array arm. (The top-level
+            // Object::Array arm above is for a bare-dest `/OpenAction` array, which
+            // `/Next` is never.)
+            if let Some(next) = next {
+                let remapped_next = remap_next_continuation(source, &next, map, depth)?;
+                out.insert("Next", remapped_next);
+            }
+            Ok(Object::Dictionary(out))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Remap a `/Next` continuation value: a single action, an array of actions, or
+/// an indirect reference resolving to either. The chain is resolved via
+/// [`resolve_ref_chain`] so an indirect `/Next` is reached; if it resolves to an
+/// array, the array is treated as a list of actions (each element recursed as an
+/// action through [`remap_inline_action_depth`]) — NOT as a destination array,
+/// since a `/Next` continuation always carries actions (ISO 32000-2 §12.6.3). A
+/// non-array continuation is recursed directly. Bounded by `depth` (inline
+/// nesting) and [`resolve_ref_chain`] (reference indirection).
+fn remap_next_continuation<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    next: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Object> {
+    let (concrete, _) = resolve_ref_chain(source, next)?;
+    match concrete {
+        Object::Array(elems) => {
+            let mut rebuilt = Vec::with_capacity(elems.len());
+            for elem in &elems {
+                rebuilt.push(remap_inline_action_depth(source, elem, map, depth - 1)?);
+            }
+            Ok(Object::Array(rebuilt))
+        }
+        single => remap_inline_action_depth(source, &single, map, depth - 1),
+    }
+}
+
+/// Resolve qpdf's `--pages` form-field name collision: return `base` when it is
+/// not yet present in `used`, otherwise the first unused `base+1`, `base+2`, …
+///
+/// This reproduces qpdf 11.9.0's observed renaming: `name`+`name` →
+/// `name`, `name+1`; a three-way collision → `name`, `name+1`, `name+2`; and a
+/// candidate that itself collides is re-resolved (a field originally named
+/// `name+1` whose `name+1` is already taken becomes `name+1+1`).
+pub(crate) fn unique_field_name(base: &[u8], used: &BTreeSet<Vec<u8>>) -> Vec<u8> {
+    if !used.contains(base) {
+        return base.to_vec();
+    }
+    for n in 1u32.. {
+        let mut candidate = base.to_vec();
+        candidate.extend_from_slice(format!("+{n}").as_bytes());
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 candidate space exhausted") // cov:ignore: 2^32 colliding names is unreachable
+}
+
+/// A top-level AcroForm field copied into the target, paired with the partial
+/// name (`/T`) read from its source. `partial_name` is `None` for a field with
+/// no direct `/T` (such a field is appended without a name-collision check).
+struct KeptField {
+    /// The field's object ref in the merged target document.
+    target_ref: ObjectRef,
+    /// The field's `/T` partial name as read from the source (resolved).
+    partial_name: Option<Vec<u8>>,
+    /// Whether the field came from the primary input (`inputs[0]`).
+    is_primary: bool,
+}
+
+/// The primary input's inherited `/AcroForm` defaults, captured before copying
+/// and remapped onto the merged output's `/AcroForm`.
+#[derive(Default)]
+struct PrimaryAcroForm {
+    /// Remapped `/DR` default-resources value (fonts the primary's `/DA`
+    /// references), or `None` when the primary has no `/DR`.
+    dr: Option<Object>,
+    /// The primary's `/DA` default-appearance value, or `None`.
+    da: Option<Object>,
+    /// Indirect refs reachable from `/DR` / `/DA`, folded into the primary copy
+    /// closure so the referenced fonts are copied into the output.
+    closure_seed: BTreeSet<ObjectRef>,
+}
+
+/// Read the primary input's `/AcroForm /DR` and `/DA`, returning them with the
+/// set of indirect objects they reach (to fold into the primary copy closure).
+/// The `/DR` / `/DA` values are returned verbatim (still in the source's
+/// numbering); [`finalize_primary_acroform`] remaps them after the copy.
+fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryAcroForm> {
+    let entries = source.acroform().acroform_inherited_entries()?;
+    let mut out = PrimaryAcroForm::default();
+    // One shared `seen` across /DR and /DA so a font referenced by both is
+    // resolved once. `collect_refs_in_object` bounds the reference chain by
+    // `DEFAULT_MAX_ACROFORM_DEPTH` (review rule 4) and follows arrays, dicts, and
+    // stream dicts transitively.
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    for (key, value) in entries {
+        // `/DR` is a resource dictionary: pass `skip_parent_key: false` so a
+        // resource legitimately named `/P` (e.g. a `/DA`-referenced font) is
+        // collected rather than dropped as a field-tree back-pointer.
+        collect_refs_in_object(
+            source,
+            &value,
+            &mut out.closure_seed,
+            &mut seen,
+            0,
+            0,
+            false,
+        )?; // cov:ignore: collect_refs_in_object ? Err arm (depth/inline limit) unreachable for well-formed AcroForm /DR /DA
+        match key.as_slice() {
+            b"DR" => out.dr = Some(value),
+            b"DA" => out.da = Some(value),
+            _ => {} // cov:ignore: acroform_inherited_entries yields only /DR and /DA
+        }
+    }
+    Ok(out)
+}
+
+/// Read the partial names (`/T`, resolved) of `source`'s top-level AcroForm
+/// fields, in `/Fields` order, paired with the source field ref so a caller can
+/// map the ref through that input's copy map. A field whose `/T` is absent
+/// yields `None`.
+fn source_top_level_field_names<R: Read + Seek>(
+    source: &mut Pdf<R>,
+) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
+    let top_fields = source.acroform().top_level_fields()?;
+    let mut out = Vec::with_capacity(top_fields.len());
+    for field_ref in top_fields {
+        // A top-level `/Fields` element may be a holder chain (a ref to a ref to
+        // the field dict). The copy map keys the field by its TERMINAL ref, so
+        // normalize to the terminal before recording it — otherwise `map.get` on
+        // the holder ref misses and the field is dropped from the merged form. The
+        // terminal also feeds the `/T` lookup so a name behind a holder is read.
+        let terminal = resolve_ref_chain(source, &Object::Reference(field_ref))?
+            .1
+            .unwrap_or(field_ref);
+        let name = resolve_field_partial_name(source, terminal)?;
+        out.push((terminal, name));
+    }
+    Ok(out)
+}
+
+/// Resolve a field's `/T` partial name. `/T` may be an indirect reference
+/// (review rule 2); a resolved non-string or absent `/T` yields `None`.
+fn resolve_field_partial_name<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    field_ref: ObjectRef,
+) -> Result<Option<Vec<u8>>> {
+    let t_value = {
+        let Some(field) = source.resolve_borrowed(field_ref)?.as_dict() else {
+            return Ok(None); // cov:ignore: a top-level field ref always resolves to a dictionary
+        };
+        field.get("T").cloned()
+    };
+    let resolved = match t_value {
+        // `/T` may be stored through more than one indirect hop; follow the whole
+        // chain (not a one-hop resolve) so a multi-hop name string is read and
+        // used for collision renaming rather than yielding `None`.
+        Some(value @ Object::Reference(_)) => resolve_ref_chain(source, &value)?.0,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    Ok(resolved.as_string().map(<[u8]>::to_vec))
+}
+
+/// Build the merged output's `/AcroForm` from the primary's inherited `/DR` /
+/// `/DA` base plus every kept top-level field, applying qpdf's `+N` name
+/// collision renaming to fields from later inputs.
+///
+/// Primary fields keep their names verbatim (they seed the `used` set); a later
+/// input's field name is resolved through [`unique_field_name`] and written
+/// back onto the copied field as a direct `/T` string. No `/AcroForm` is created
+/// when there are no kept fields and the primary carried no `/DR` / `/DA`, so a
+/// form-free merge gains no empty `/AcroForm`.
+fn build_merged_acroform<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    primary: &PrimaryAcroForm,
+    kept: &[KeptField],
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    if kept.is_empty() && primary.dr.is_none() && primary.da.is_none() {
+        return Ok(());
+    }
+
+    let acroform_ref = target.acroform().ensure_acroform_ref()?;
+    let mut acroform = match target.resolve_borrowed(acroform_ref)?.as_dict().cloned() {
+        Some(dict) => dict,
+        None => return Ok(()), // cov:ignore: ensure_acroform_ref always yields a dictionary
+    };
+
+    // Inherit the primary's /DR and /DA, remapping any indirect refs to the
+    // copied objects. `/DA` is usually a direct string (a no-op under remap),
+    // but per ISO 32000-2 any value may be stored as an indirect reference; a
+    // verbatim copy would leave a source object number dangling in the output.
+    if let Some(dr) = &primary.dr {
+        acroform.insert("DR", remap_refs_in_object(dr.clone(), map));
+    }
+    if let Some(da) = &primary.da {
+        acroform.insert("DA", remap_refs_in_object(da.clone(), map));
+    }
+
+    // Seed `used` with the primary's field names (verbatim — the primary is the
+    // base document and is never renamed), then append every kept field, in
+    // order, renaming later inputs' colliding names via the qpdf `+N` rule.
+    let mut used: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for field in kept {
+        if field.is_primary {
+            if let Some(name) = &field.partial_name {
+                used.insert(name.clone());
+            }
+        }
+    }
+
+    let mut fields: Vec<Object> = Vec::with_capacity(kept.len());
+    for field in kept {
+        if !field.is_primary {
+            if let Some(name) = &field.partial_name {
+                let unique = unique_field_name(name, &used);
+                used.insert(unique.clone());
+                rename_field(target, field.target_ref, unique)?;
+            }
+        }
+        fields.push(Object::Reference(field.target_ref));
+    }
+    acroform.insert("Fields", Object::Array(fields));
+
+    target.set_object(acroform_ref, Object::Dictionary(acroform));
+    Ok(())
+}
+
+/// Overwrite the copied field's `/T` with `name` as a direct string.
+fn rename_field<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    name: Vec<u8>,
+) -> Result<()> {
+    let Some(mut field) = target.resolve_borrowed(field_ref)?.as_dict().cloned() else {
+        return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
+    };
+    field.insert("T", Object::String(name));
+    target.set_object(field_ref, Object::Dictionary(field));
+    Ok(())
+}
+
+/// Read a field's direct `/Kids` as the source-space refs they point at, or
+/// `None` when the field has no `/Kids` (a terminal field — the widget IS the
+/// field). `/Kids` itself may be an indirect reference (review rule 2); a
+/// resolved non-array yields an empty list (treated as "no widget kids").
+fn field_kid_refs<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    field_ref: ObjectRef,
+) -> Result<Option<Vec<ObjectRef>>> {
+    let kids_value = {
+        let Some(field) = source.resolve_borrowed(field_ref)?.as_dict() else {
+            return Ok(None); // cov:ignore: a field ref always resolves to a dictionary
+        };
+        match field.get("Kids") {
+            Some(value) => value.clone(),
+            None => return Ok(None),
+        }
+    };
+    let (resolved, _) = resolve_ref_chain(source, &kids_value)?;
+    let Object::Array(items) = resolved else {
+        return Ok(Some(Vec::new())); // cov:ignore: a /Kids value resolves to an array in practice
+    };
+    let mut refs = Vec::with_capacity(items.len());
+    for item in items {
+        if let Object::Reference(r) = item {
+            // A `/Kids` element may be a reference to a reference to the field/
+            // widget; resolve the holder chain to the terminal ref so trimming
+            // compares the same ref that retained-`/Annots` membership records.
+            let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
+            refs.push(terminal.unwrap_or(r));
+        } // cov:ignore: llvm-cov gap-region artifact on the brace closing a `?`-bearing block; the body (the `refs.push`) is covered
+    }
+    Ok(Some(refs))
+}
+
+/// Collect the widget annotation refs that appear directly in the selected
+/// pages' `/Annots` arrays (the "retained widget refs"). A widget that is a
+/// member of a selected page's `/Annots` is on a surviving page and must be kept
+/// by [`trim_field_kids`], whether or not it carries the optional `/P`
+/// back-pointer (`/P` is not required by ISO 32000-2 §12.5.2 — it is a
+/// convenience pointer, so it cannot be the survival signal).
+///
+/// `/Annots` may be an inline array or an indirect reference to one; each element
+/// is an indirect reference to (or an inline) annotation dict. Only the direct
+/// annotation refs are recorded — that is what extract uses to decide a widget
+/// survives. References are bounded by [`resolve_ref_chain`].
+fn collect_retained_widget_refs<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    selected_pages: &BTreeSet<ObjectRef>,
+    retained: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    for &page_ref in selected_pages {
+        let annots_val = {
+            let page_obj = source.resolve_borrowed(page_ref)?;
+            let Some(page_dict) = page_obj.as_dict() else {
+                continue; // cov:ignore: a selected page ref always resolves to a dictionary
+            };
+            page_dict.get("Annots").cloned()
+        };
+        let Some(annots_val) = annots_val else {
+            continue;
+        };
+        // /Annots: an inline array or an indirect reference to one (mirrors
+        // collect_removed_dest_targets's /Annots resolution).
+        let (concrete, _) = resolve_ref_chain(source, &annots_val)?;
+        let Object::Array(elems) = concrete else {
+            continue; // cov:ignore: a non-array /Annots is malformed
+        };
+        for elem in elems {
+            if let Object::Reference(r) = elem {
+                // An `/Annots` element may be a reference to a reference to the
+                // widget; resolve the holder chain to the terminal widget ref so it
+                // matches the field-tree kid ref recorded by `field_kid_refs`.
+                let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
+                retained.insert(terminal.unwrap_or(r));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a widget's `/P` page reference (review rule 2: `/P` may be indirect),
+/// returning the final page `ObjectRef` of the reference chain, or `None` when
+/// the widget carries no `/P`.
+fn widget_page_ref<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    let p_value = {
+        let Some(widget) = source.resolve_borrowed(widget_ref)?.as_dict() else {
+            return Ok(None); // cov:ignore: a widget ref always resolves to a dictionary
+        };
+        match widget.get("P") {
+            Some(value) => value.clone(),
+            // `/P` is optional (ISO 32000-2 §12.5.2): a widget may omit it. Such
+            // a widget's survival is decided by retained-`/Annots` membership in
+            // trim_field_kids, not by this back-pointer.
+            None => return Ok(None),
+        }
+    };
+    let (_, last_ref) = resolve_ref_chain(source, &p_value)?;
+    Ok(last_ref)
+}
+
+/// Trim a non-terminal AcroForm field's widget `/Kids` to only the widgets whose
+/// `/P` page survived into the output (is in `surviving_pages`), recursing into
+/// intermediate sub-fields (fields that themselves carry `/Kids`). Returns:
+///
+/// - `None` — the field is terminal (no `/Kids`, the widget IS the field); the
+///   caller leaves it untouched. This is what protects flat-form fields and the
+///   `+N` rename tests, whose widgets carry no `/Kids`.
+/// - `Some(survivors)` — the trimmed list of direct kid source-refs to keep. A
+///   leaf-widget kid is kept iff it is a `retained_widgets` member (it appears in
+///   a selected page's `/Annots`) OR its `/P` resolves to a page in
+///   `surviving_pages`; an intermediate sub-field kid is kept iff it has at least
+///   one surviving descendant (recursion). An empty `survivors` means no widget
+///   survived, so the field should be dropped (top level) or pruned from its
+///   parent's `/Kids` (nested).
+///
+/// The retained-`/Annots` membership is the primary survival signal because a
+/// widget's `/P` page back-pointer is optional (ISO 32000-2 §12.5.2); a
+/// selected-page widget that omits `/P` must still be kept. The `/P` path is a
+/// fallback for a widget reachable through the field tree but not directly listed
+/// in a scanned `/Annots`.
+///
+/// Side effects: rewrites each kept intermediate sub-field's `/Kids` in `target`
+/// (mapped through `map`), and records each dropped widget's unselected `/P`
+/// page (source-space) into `orphan_pages` so the caller can null it (a dropped
+/// widget that also omits `/P` carries no page to null).
+///
+/// Bounded by `DEFAULT_MAX_ACROFORM_DEPTH` and a `visited` cycle guard (review
+/// rule 4): a hostile field tree cannot drive unbounded recursion.
+#[allow(clippy::too_many_arguments)]
+fn trim_field_kids<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    target: &mut Pdf<Cursor<Vec<u8>>>,
+    field_ref: ObjectRef,
+    surviving_pages: &BTreeSet<ObjectRef>,
+    retained_widgets: &BTreeSet<ObjectRef>,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    orphan_pages: &mut BTreeSet<ObjectRef>,
+    depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+) -> Result<Option<Vec<ObjectRef>>> {
+    // cov:ignore-start: depth guard against a hostile >100-deep field tree (matches the acroform helper's depth caps); not driven by well-formed input
+    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
+        )));
+    }
+    // cov:ignore-end
+    if !visited.insert(field_ref) {
+        return Ok(Some(Vec::new())); // cov:ignore: a /Kids cycle is malformed; treat as no survivors
+    }
+    let Some(kids) = field_kid_refs(source, field_ref)? else {
+        return Ok(None); // terminal field — nothing to trim
+    };
+
+    let mut survivors: Vec<ObjectRef> = Vec::with_capacity(kids.len());
+    for kid_ref in kids {
+        let kid_kind = trim_field_kids(
+            source,
+            target,
+            kid_ref,
+            surviving_pages,
+            retained_widgets,
+            map,
+            orphan_pages,
+            depth + 1,
+            visited,
+        )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
+        match kid_kind {
+            // The kid is itself a non-terminal sub-field.
+            Some(sub_survivors) => {
+                if sub_survivors.is_empty() {
+                    // Whole sub-field is off-tree — prune it from this field's
+                    // `/Kids`. Its widgets' orphan pages were recorded by the
+                    // recursive call.
+                    continue;
+                }
+                rewrite_field_kids(target, kid_ref, &sub_survivors, map)?;
+                survivors.push(kid_ref);
+            }
+            // The kid is a leaf widget (no `/Kids`). It survives iff it is a
+            // retained widget (a member of a selected page's `/Annots`) — the
+            // signal extract uses — OR its optional `/P` resolves to a surviving
+            // page (a fallback for a widget reached through the field tree but not
+            // directly in a scanned `/Annots`). A non-surviving widget's `/P`
+            // page, if any, is an off-tree orphan to null; a `/P`-less dropped
+            // widget carries no page to null.
+            None => {
+                if retained_widgets.contains(&kid_ref) {
+                    survivors.push(kid_ref);
+                } else {
+                    match widget_page_ref(source, kid_ref)? {
+                        Some(page_ref) if surviving_pages.contains(&page_ref) => {
+                            survivors.push(kid_ref)
+                        }
+                        Some(page_ref) => {
+                            orphan_pages.insert(page_ref);
+                        }
+                        None => {} // cov:ignore: a dropped widget that also omits /P carries no page to null
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(survivors))
+}
+
+/// Overwrite the copied field's `/Kids` with the surviving source kid-refs
+/// mapped through this input's copy map. A survivor missing from `map` is
+/// skipped (it was not copied); the rewrite never inserts a dangling ref.
+fn rewrite_field_kids<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    src_field_ref: ObjectRef,
+    survivors: &[ObjectRef],
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let Some(target_field_ref) = map.get(&src_field_ref).copied() else {
+        return Ok(()); // cov:ignore: a survivor's parent field is always in the copy map
+    };
+    let Some(mut field) = target
+        .resolve_borrowed(target_field_ref)?
+        .as_dict()
+        .cloned()
+    else {
+        return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
+    };
+    let kids: Vec<Object> = survivors
+        .iter()
+        .filter_map(|src| map.get(src).map(|&t| Object::Reference(t)))
+        .collect();
+    field.insert("Kids", Object::Array(kids));
+    target.set_object(target_field_ref, Object::Dictionary(field));
+    Ok(())
+}
+
+/// Merge selected pages from N sources into one fresh document.
+///
+/// Each [`MergeInput`] pairs an opened source document with the page indices to
+/// take from it. Returns an owned in-memory [`Pdf`] whose catalog has a
+/// single-level `/Pages` tree containing the selected pages from every input,
+/// concatenated
+/// in input order and, within each input, in the order given by that input's
+/// `pages`. Each input is copied in a single pass with one renumbering map, so
+/// objects shared between selected pages of the same input (fonts, images,
+/// content streams) appear once per input in the output.
+///
+/// Inherited page attributes (`/Resources`, `/MediaBox`, `/CropBox`,
+/// `/Rotate`) are materialized onto each copied page from its source page
+/// tree, and a page selected more than once within an input becomes a shallow
+/// clone of its first copy, matching [`extract_pages`](crate::extract_pages).
+///
+/// Each source is left unmodified. Each input is copied with
+/// [`copy_objects`]; the result mirrors
+/// [`extract_pages`](crate::extract_pages) for a single input. Write the result
+/// with [`write_pdf`](crate::write_pdf) or
+/// [`write_pdf_with_options`](crate::write_pdf_with_options).
+///
+/// An input may select **no pages** (`pages: vec![]`): it contributes nothing
+/// and is not an error. A blank document passed as `inputs[0]` with an empty
+/// selection is the qpdf `--empty` analog — the merge then starts from an empty
+/// base and inherits no document-level information (a blank primary has none).
+///
+/// Document-level information is inherited from the **primary** input
+/// (`inputs[0]`) only: its `/Outlines` tree, `/Names /Dests` named destinations
+/// (and the legacy `/Catalog /Dests` dictionary), and `/OpenAction` are copied
+/// into the output and their destinations remapped to the copied page refs.
+/// Later inputs contribute pages only — their outlines and named destinations
+/// are not merged. A direct (inline) `/Names /Dests` name-tree root is inherited
+/// in either ISO 32000-2 §7.9.6 shape: a `/Names` leaf has its destinations
+/// remapped, and a `/Kids` root has its sub-leaves copied and its `/Kids`
+/// references remapped to those copies, so the named destinations survive in
+/// both forms.
+///
+/// A destination (annotation `/Dest`, an `/A` or `/AA` `/GoTo` action, including
+/// `/Next` continuations and `/GoTo /SD` structure destinations, plus the
+/// primary's inherited outline / named / `/OpenAction` destinations) that points
+/// at a page not selected from its input keeps its reference, which resolves to
+/// a `null` page object in the output.
+///
+/// A page reached only through a back-pointer from an unselected page — a thread
+/// bead's `/P`, a structure element's `/Pg`, or (on malformed input) an
+/// annotation's `/P` that names an unselected page rather than the page it sits
+/// on — is not yet pruned: it stays out of the output page tree (`/Pages`
+/// `/Kids`) but remains a live object in the output, reachable through that
+/// surviving back-pointer.
+///
+/// Interactive form (AcroForm) fields are merged: the primary's `/AcroForm`
+/// `/DR` default resources and `/DA` default appearance are the base, and every
+/// selected page's top-level field (reached from its widget annotations) is
+/// added to the output `/AcroForm /Fields`. A field whose widget is on an
+/// unselected page is dropped (qpdf form subset). A non-terminal field whose
+/// widget `/Kids` span several pages keeps only the widgets whose page is
+/// selected — its `/Kids` are trimmed to those, and the field is dropped
+/// entirely only if no widget survives. Top-level field-name (`/T`)
+/// collisions are resolved by qpdf's `<name>+<N>` rule: the primary keeps its
+/// names and a later input's colliding name becomes the first unused
+/// `<name>+1`, `<name>+2`, … . Collision handling is limited to **top-level
+/// partial names** (flat forms where the partial name equals the fully-qualified
+/// name); nested field-tree fully-qualified-path collisions, and merging later
+/// inputs' `/DR` resources, are not handled. A merge of form-free inputs adds no
+/// `/AcroForm`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::{merge_documents, write_pdf, MergeInput, Pdf};
+///
+/// let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
+/// let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
+/// let mut inputs = [
+///     MergeInput { source: &mut a, pages: vec![0, 1] }, // a's first two pages
+///     MergeInput { source: &mut b, pages: vec![0] },    // then b's first page
+/// ];
+/// let mut merged = merge_documents(&mut inputs)?;
+///
+/// let mut out = File::create("merged.pdf")?;
+/// write_pdf(&mut merged, &mut out)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if the `inputs` slice is empty (an *input* with an
+///   empty page selection is permitted; see above), or if a requested page
+///   index is out of range for its input.
+/// - Propagates resolve/copy errors from the underlying primitives.
+pub fn merge_documents<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    if inputs.is_empty() {
+        return Err(Error::Unsupported(
+            "merge requires at least one input".to_string(),
+        ));
+    }
+
+    let mut target = Pdf::open_mem_owned(minimal_target_bytes())?;
+    let pages_root_ref = target_pages_root(&mut target)?;
+
+    // Output `/Kids`, accumulated across inputs in input/selection order.
+    let mut kids: Vec<ObjectRef> = Vec::new();
+    // Copied page objects already placed in `kids`, so a page selected more
+    // than once becomes a shallow clone rather than a duplicated reference.
+    let mut used: BTreeSet<ObjectRef> = BTreeSet::new();
+
+    // AcroForm merge state. `kept_fields` accumulates each input's kept
+    // top-level fields (orphan fields on unselected pages are absent from the
+    // copy map and so never appear). `primary_acroform` holds the primary's
+    // inherited `/DR` / `/DA`, remapped onto the output `/AcroForm` after the
+    // primary copy renumbers its fonts.
+    let mut kept_fields: Vec<KeptField> = Vec::new();
+    let mut primary_acroform = PrimaryAcroForm::default();
+    let mut primary_map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+
+    let depth = DEFAULT_MAX_PAGE_TREE_DEPTH;
+    for (input_index, input) in inputs.iter_mut().enumerate() {
+        // Document-level structures (outlines, named dests, /OpenAction) are
+        // inherited from the PRIMARY input only (qpdf `--pages` parity).
+        let is_primary = input_index == 0;
+
+        // A non-primary input that selects no pages contributes nothing (it adds
+        // no pages and, with no selected pages, no fields). Skip it before any
+        // source read so a malformed but unused secondary (e.g. a broken
+        // `/AcroForm /Fields` or `/Pages` tree) cannot abort the whole merge.
+        // The primary is always processed: it carries the inherited document-level
+        // state even when it contributes no pages of its own.
+        if !is_primary && input.pages.is_empty() {
+            continue;
+        }
+
+        let doc_level = if is_primary {
+            discover_primary_doc_level(input.source)?
+        } else {
+            PrimaryDocLevel::default()
+        };
+
+        // The primary's `/AcroForm /DR` and `/DA` are the merged form's base; a
+        // later input contributes form fields only (its `/DR` / `/DA` are not
+        // merged). Read them now and fold their fonts into the primary closure.
+        if is_primary {
+            primary_acroform = discover_primary_acroform(input.source)?;
+        }
+        // Source top-level field names, read before the copy severs numbering;
+        // each is mapped through this input's copy map below.
+        let source_fields = source_top_level_field_names(input.source)?;
+
+        let all = page_refs(input.source)?;
+        // Resolve the selected source page refs (range-checked, duplicates
+        // allowed), in selection order.
+        let mut selected: Vec<ObjectRef> = Vec::with_capacity(input.pages.len());
+        for &idx in &input.pages {
+            let page_ref = *all.get(idx).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "page index {idx} out of range (input document has {} pages)",
+                    all.len()
+                ))
+            })?;
+            selected.push(page_ref);
+        }
+
+        // Unique source pages in first-occurrence order; duplicates re-use the
+        // same copied object and are shallow-cloned when building /Kids.
+        let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+        let mut unique: Vec<ObjectRef> = Vec::with_capacity(selected.len());
+        for &page_ref in &selected {
+            if seen.insert(page_ref) {
+                unique.push(page_ref);
+            }
+        }
+
+        // Resolve inherited attributes from the SOURCE before copying severs
+        // the /Parent chain.
+        let mut inherited: Vec<InheritedAttrs> = Vec::with_capacity(unique.len());
+        for &page_ref in &unique {
+            inherited.push(InheritedAttrs::resolve(input.source, page_ref, depth)?);
+        }
+
+        // UNION of the per-page transitive closures, then ONE deep-copy pass
+        // into the growing target: a single renumbering map means an object
+        // shared by several selected pages of this input is copied once.
+        let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
+        for &page_ref in &unique {
+            closure.extend(page_object_closure(input.source, page_ref)?);
+        }
+
+        // Fold the primary's document-level carriers (outline tree, name-tree
+        // /Dests, legacy /Dests, /OpenAction) into the closure BEFORE copying so
+        // the same single copy pass copies and remaps them — no separate
+        // post-copy remap. A no-op for secondary inputs (empty doc_level).
+        fold_doc_level_closure(input.source, &doc_level, &mut closure)?;
+
+        // Fold the primary's `/AcroForm /DR` / `/DA` fonts into the closure so a
+        // `/DA` resource (e.g. `/Helv`) is copied and the output `/DR` can point
+        // at it after the remap. Gated on the primary input: `primary_acroform`
+        // is read from the primary's source and its `closure_seed` holds the
+        // primary's object refs, which are meaningless against a secondary's
+        // numbering — folding them into a secondary's closure would resolve
+        // those refs against the wrong document.
+        if is_primary {
+            closure.extend(primary_acroform.closure_seed.iter().copied());
+        }
+
+        // qpdf `--pages` null-out parity: a destination (annotation `/Dest`,
+        // `/A /GoTo /D`, or page `/AA`) targeting a page NOT selected from this
+        // input keeps its reference but resolves to `null`. Collect those
+        // removed targets, fold them into the closure so `copy_objects`'s single
+        // rewrite pass remaps each destination to the removed page's NEW ref
+        // (instead of inline-`null`-ing the array element), then null the copied
+        // placeholder body below. Folding the remap into the copy pass — rather
+        // than a separate post-copy remap — keeps a destination shared by
+        // several carriers from being rewritten twice. (page_object_closure
+        // already pulls these pages in via the same `/Annots`/`/AA` traversal;
+        // adding them explicitly keeps the remap correct independent of that
+        // traversal's reach and names the removed set for the null-out.)
+        let unique_set: BTreeSet<ObjectRef> = unique.iter().copied().collect();
+        let mut removed_targets: BTreeSet<ObjectRef> = BTreeSet::new();
+        for &page_ref in &unique {
+            // cov:ignore-start: the `?` error path propagates a resolve failure not reachable from a well-formed source page
+            collect_removed_dest_targets(
+                input.source,
+                page_ref,
+                &unique_set,
+                &mut removed_targets,
+            )?;
+            // cov:ignore-end
+        }
+        // Primary document-level dests targeting an unselected page are removed
+        // targets too: collect them so their copied placeholder is nulled (same
+        // null-out mechanism). A no-op for secondary inputs.
+        collect_doc_level_removed_targets(
+            input.source,
+            &doc_level,
+            &unique_set,
+            &mut removed_targets,
+        )?; // cov:ignore: `?` Err arm — doc-level collect cannot fail on an already-opened source
+        closure.extend(removed_targets.iter().copied());
+        // Renumbering-disjointness invariant: copy_objects allocates fresh
+        // target object numbers starting one past the current maximum, so the
+        // refs it returns never collide with objects already surviving in the
+        // target (prior inputs' copied pages, or the seed catalog/pages root).
+        // This is the structural guard that makes a shared-destination
+        // double-remap unreachable; capture the surviving set BEFORE copying.
+        let surviving_before: BTreeSet<ObjectRef> = target.object_refs().into_iter().collect();
+        let map = copy_objects(input.source, &mut target, &closure)?;
+        debug_assert!(
+            map.values().all(|new| !surviving_before.contains(new)),
+            "copy_objects must allocate refs disjoint from surviving target refs \
+             (renumbering-disjointness invariant; guards against shared-destination double-remap)"
+        );
+
+        // Null the copied placeholder body of each removed destination target.
+        // These pages are referenced only by a surviving destination, never
+        // appear in /Kids, and are not materialized as leaves; replacing the
+        // body with `null` makes the kept destination resolve to a null page
+        // (qpdf `--pages` parity). sweep_unreachable_objects later GCs any
+        // placeholder no surviving destination still references.
+        for src_ref in &removed_targets {
+            if let Some(&new_ref) = map.get(src_ref) {
+                target.set_object(new_ref, Object::Null);
+            }
+        }
+
+        // Wire the primary's inherited document-level structures onto the output
+        // catalog (obj 1, distinct from the /Pages root obj 2 rebuilt below).
+        // copy_objects already remapped every destination inside the copied
+        // outline / name-tree / action objects, so this only sets catalog keys.
+        // A no-op for secondary inputs (empty doc_level).
+        if is_primary {
+            wire_doc_level(input.source, &mut target, &doc_level, &map)?;
+        }
+
+        // Record this input's kept top-level fields (those whose source ref was
+        // copied — orphan fields on unselected pages are absent from `map` and
+        // so dropped, matching qpdf's form subset). The primary's `map` also
+        // remaps its inherited `/DR` fonts in `build_merged_acroform`.
+        //
+        // A NON-TERMINAL field (whose `/Kids` are widget annotations, possibly
+        // on different pages) reaches the copy map whenever any one of its
+        // widgets is on a selected page; the page-closure's `/Parent` →
+        // sibling-`/Kids` traversal then pulls in the field's widgets on
+        // UNSELECTED pages too (and, via each such widget's `/P`, those pages as
+        // off-tree orphans). Trim the field's `/Kids` to only the widgets whose
+        // `/P` page survived; a field left with zero surviving widgets is
+        // dropped entirely (the surrounding `map.get` guard already drops fields
+        // never reached, so a zero-survivor trim only happens for malformed
+        // shapes where a field ref sits directly in a page `/Annots`). Each
+        // dropped widget's unselected page is collected and nulled below, so the
+        // output never carries a live orphan `/Type /Page` outside `/Kids`.
+        let mut orphan_pages: BTreeSet<ObjectRef> = BTreeSet::new();
+        // A widget survives the field-tree trim iff it is a member of a selected
+        // page's `/Annots` (or its optional `/P` resolves to a surviving page).
+        // Build that retained-widget set once per input from the selected pages'
+        // `/Annots`, in source space, so a `/P`-less selected-page widget is kept.
+        let mut retained_widgets: BTreeSet<ObjectRef> = BTreeSet::new();
+        collect_retained_widget_refs(input.source, &unique_set, &mut retained_widgets)?;
+        for (src_field_ref, partial_name) in source_fields {
+            if let Some(&target_ref) = map.get(&src_field_ref) {
+                let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+                let trimmed = trim_field_kids(
+                    input.source,
+                    &mut target,
+                    src_field_ref,
+                    &unique_set,
+                    &retained_widgets,
+                    &map,
+                    &mut orphan_pages,
+                    0,
+                    &mut visited,
+                )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
+                if let Some(survivors) = trimmed {
+                    if survivors.is_empty() {
+                        // No widget survived: drop the whole field (do not record
+                        // it). Its widgets' orphan pages are nulled below.
+                        continue;
+                    }
+                    rewrite_field_kids(&mut target, src_field_ref, &survivors, &map)?;
+                }
+                kept_fields.push(KeptField {
+                    target_ref,
+                    partial_name,
+                    is_primary,
+                });
+            }
+        }
+
+        // Null the copied placeholder body of each off-tree orphan page reached
+        // only through a dropped widget's `/P`. This mirrors the removed-dest
+        // null-out above: the page never appears in `/Kids`, and nulling its
+        // body (rather than leaving a live `/Type /Page`) keeps the merged form
+        // internally consistent. `sweep_unreachable_objects` later GCs the
+        // placeholder once no surviving reference points at it.
+        for src_page_ref in &orphan_pages {
+            if let Some(&new_ref) = map.get(src_page_ref) {
+                target.set_object(new_ref, Object::Null);
+            }
+        }
+        if is_primary {
+            primary_map = map.clone();
+        }
+
+        // Materialize inherited attrs onto each copied leaf and reparent it to
+        // the fresh /Pages root.
+        for (&src_ref, attrs) in unique.iter().zip(inherited) {
+            let copied_page_ref = *map
+                .get(&src_ref)
+                .ok_or(Error::Missing("merged page missing from copy map"))?;
+            materialize_leaf(&mut target, copied_page_ref, attrs, &map, pages_root_ref)?;
+        }
+
+        // Append this input's pages to /Kids in selection order, with each
+        // input resolved through its own copy map.
+        append_selection_kids(&mut target, &selected, &map, &mut used, &mut kids)?;
+    }
+
+    // Build the fresh single-level /Pages root over the accumulated kids.
+    let mut root = resolve_dict(
+        &mut target,
+        pages_root_ref,
+        "target /Pages is not a dictionary",
+    )?; // cov:ignore: Err arm unreachable — minimal_target_bytes creates /Pages as a dict, and nothing since overwrites it (copy_objects renumbers into fresh numbers; materialize_leaf/append_selection_kids touch only copied leaves)
+    root.insert(
+        "Kids",
+        Object::Array(kids.iter().map(|&r| Object::Reference(r)).collect()),
+    );
+    root.insert("Count", Object::Integer(kids.len() as i64));
+    target.set_object(pages_root_ref, Object::Dictionary(root));
+
+    // Build the merged `/AcroForm`: the primary's `/DR` / `/DA` base plus every
+    // kept top-level field, with later inputs' colliding `/T` names renamed by
+    // qpdf's `+N` rule. Done BEFORE the sweep so the `/DR` fonts (reachable only
+    // through `/AcroForm`) are not garbage-collected.
+    build_merged_acroform(&mut target, &primary_acroform, &kept_fields, &primary_map)?;
+
+    // Drop the copied ancestor /Pages node(s) and any objects only they
+    // referenced: they are unreachable now that each leaf /Parent points at the
+    // fresh root. full_rewrite does NOT garbage-collect, so prune here.
+    sweep_unreachable_objects(&mut target)?;
+
+    Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_field_name;
+    use std::collections::BTreeSet;
+
+    fn used(names: &[&[u8]]) -> BTreeSet<Vec<u8>> {
+        names.iter().map(|n| n.to_vec()).collect()
+    }
+
+    #[test]
+    fn unique_field_name_keeps_unused_base() {
+        assert_eq!(unique_field_name(b"name", &used(&[])), b"name".to_vec());
+        assert_eq!(
+            unique_field_name(b"name", &used(&[b"email"])),
+            b"name".to_vec()
+        );
+    }
+
+    #[test]
+    fn unique_field_name_appends_plus_one_on_collision() {
+        assert_eq!(
+            unique_field_name(b"name", &used(&[b"name"])),
+            b"name+1".to_vec()
+        );
+    }
+
+    #[test]
+    fn unique_field_name_finds_first_unused_in_sequence() {
+        // name, name+1 taken → name+2 (the three-way collision tail).
+        assert_eq!(
+            unique_field_name(b"name", &used(&[b"name", b"name+1"])),
+            b"name+2".to_vec()
+        );
+    }
+
+    #[test]
+    fn unique_field_name_reresolves_colliding_candidate() {
+        // A field originally named `name+1` whose `name+1` is already used must
+        // re-resolve to `name+1+1` (qpdf 11.9.0 observed behaviour).
+        assert_eq!(
+            unique_field_name(b"name+1", &used(&[b"name", b"name+1"])),
+            b"name+1+1".to_vec()
+        );
+    }
+}
