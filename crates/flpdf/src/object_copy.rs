@@ -28,7 +28,7 @@
 //! Each call uses a fresh map, so copying the same source set twice produces
 //! independent, non-shared target copies.
 
-use crate::object::Dictionary;
+use crate::object::{Dictionary, MAX_INLINE_DEPTH};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -105,7 +105,7 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     // a second deep clone of (potentially large) stream payloads.
     for &src_ref in refs {
         let mut obj = source.resolve(src_ref)?;
-        rewrite_refs(&mut obj, &map);
+        rewrite_refs(&mut obj, 0, &map)?;
         target.set_object(map[&src_ref], obj);
     }
 
@@ -115,7 +115,16 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
 /// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
 /// `map` are remapped, refs outside `map` become [`Object::Null`].  Stream byte
 /// payloads are left untouched (never cloned); scalars are unchanged.
-pub(crate) fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef>) {
+pub(crate) fn rewrite_refs(
+    obj: &mut Object,
+    depth: usize,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    if depth >= MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(
+            "cross-document copy: inline object nesting exceeds MAX_INLINE_DEPTH".to_string(),
+        ));
+    }
     match obj {
         Object::Reference(r) => {
             let replacement = match map.get(r) {
@@ -126,11 +135,11 @@ pub(crate) fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef
         }
         Object::Array(items) => {
             for item in items.iter_mut() {
-                rewrite_refs(item, map);
+                rewrite_refs(item, depth + 1, map)?;
             }
         }
-        Object::Dictionary(dict) => rewrite_dict(dict, map),
-        Object::Stream(stream) => rewrite_dict(&mut stream.dict, map),
+        Object::Dictionary(dict) => rewrite_dict(dict, depth + 1, map)?,
+        Object::Stream(stream) => rewrite_dict(&mut stream.dict, depth + 1, map)?,
         Object::Null
         | Object::Boolean(_)
         | Object::Integer(_)
@@ -138,13 +147,24 @@ pub(crate) fn rewrite_refs(obj: &mut Object, map: &BTreeMap<ObjectRef, ObjectRef
         | Object::Name(_)
         | Object::String(_) => {}
     }
+    Ok(())
 }
 
 /// Rewrite every value of `dict` via [`rewrite_refs`] in place, preserving keys.
-fn rewrite_dict(dict: &mut Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) {
+///
+/// This one-level fan-out helper forwards the **same** `depth` it received to
+/// each value: its caller [`rewrite_refs`] already incremented `depth` when
+/// descending into the dictionary, and each value re-enters [`rewrite_refs`]
+/// where the shared depth guard is re-checked.
+fn rewrite_dict(
+    dict: &mut Dictionary,
+    depth: usize,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
     for value in dict.values_mut() {
-        rewrite_refs(value, map);
+        rewrite_refs(value, depth, map)?;
     }
+    Ok(())
 }
 
 /// Compute the target object number for the `offset`-th member of the copy set,
@@ -163,7 +183,16 @@ fn alloc_target_number(base: u32, offset: usize) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::alloc_target_number;
+    use super::*;
+    use crate::object::MAX_INLINE_DEPTH;
+
+    fn nested_arrays(depth: usize) -> Object {
+        let mut o = Object::Null;
+        for _ in 0..depth {
+            o = Object::Array(vec![o]);
+        }
+        o
+    }
 
     #[test]
     fn alloc_target_number_counts_up_from_base() {
@@ -175,5 +204,37 @@ mod tests {
     fn alloc_target_number_errors_on_overflow() {
         assert!(alloc_target_number(u32::MAX, 1).is_err());
         assert!(alloc_target_number(u32::MAX - 2, 5).is_err());
+    }
+
+    #[test]
+    fn rewrite_refs_errors_on_excessive_nesting() {
+        let map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let mut obj = nested_arrays(MAX_INLINE_DEPTH + 5);
+        let err = rewrite_refs(&mut obj, 0, &map);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn rewrite_refs_accepts_nesting_up_to_the_limit() {
+        let mut map = BTreeMap::new();
+        map.insert(ObjectRef::new(3, 0), ObjectRef::new(99, 0));
+        // Bury one Reference just within the limit; it must be remapped, not errored.
+        let mut obj = Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]);
+        for _ in 0..(MAX_INLINE_DEPTH - 2) {
+            obj = Object::Array(vec![obj]);
+        }
+        rewrite_refs(&mut obj, 0, &map).unwrap();
+        // Unwrap the nested arrays down to the deepest element and confirm the
+        // in-limit Reference was remapped to 99 0 R (not replaced with Null).
+        let mut cur = &obj;
+        loop {
+            match cur {
+                Object::Array(items) if items.len() == 1 => cur = &items[0],
+                other => {
+                    assert_eq!(other, &Object::Reference(ObjectRef::new(99, 0)));
+                    break;
+                }
+            }
+        }
     }
 }

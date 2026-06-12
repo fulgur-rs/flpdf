@@ -192,19 +192,19 @@ pub fn extract_pages<R: Read + Seek>(
         if !has_own(&leaf, "Resources") {
             if let Some(res) = attrs.resources {
                 let mut value = Object::Dictionary(res);
-                rewrite_refs(&mut value, &map);
+                rewrite_refs(&mut value, 0, &map)?;
                 leaf.insert("Resources", value);
             }
         }
         if !has_own(&leaf, "MediaBox") {
             if let Some(mut mb) = attrs.mediabox {
-                rewrite_refs(&mut mb, &map);
+                rewrite_refs(&mut mb, 0, &map)?;
                 leaf.insert("MediaBox", mb);
             }
         }
         if !has_own(&leaf, "CropBox") {
             if let Some(mut cb) = attrs.cropbox {
-                rewrite_refs(&mut cb, &map);
+                rewrite_refs(&mut cb, 0, &map)?;
                 leaf.insert("CropBox", cb);
             }
         }
