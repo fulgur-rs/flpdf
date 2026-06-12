@@ -240,6 +240,47 @@ fn merge_rejects_out_of_range_index() {
     }
 }
 
+/// A one-page document whose `/AcroForm` is an indirect reference to a non-dict
+/// object (obj 9). The document opens, but reading its AcroForm fields aborts —
+/// used to prove an unused secondary input is never read.
+fn malformed_acroform_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 9 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (9, "42"),
+        ],
+        1,
+    )
+}
+
+// A non-primary input that selects no pages contributes nothing, so its source
+// trees are never read — a malformed but unused secondary cannot abort the merge.
+#[test]
+fn merge_skips_empty_non_primary_input_without_reading_its_trees() {
+    let mut primary = Pdf::open_mem_owned(single_font_pdf(b"Helvetica")).unwrap();
+    let mut secondary = Pdf::open_mem_owned(malformed_acroform_pdf()).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut secondary,
+            pages: vec![],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(
+        refs.len(),
+        1,
+        "only the primary page is merged; the empty secondary is skipped"
+    );
+    assert_eq!(leaf_base_font(&mut doc, 0), b"Helvetica".to_vec());
+}
+
 /// Three-page document whose page 0 carries inter-page destinations reaching
 /// both a surviving page (page 1) and a removed page (page 2) through every
 /// destination carrier: an annotation `/Dest`, an annotation `/A /GoTo /D`, an
@@ -1355,6 +1396,48 @@ fn merge_inline_openaction_dest_array_remapped_and_nulled() {
     let (oa2_ref, oa2_null) = dest_array_first(&mut doc2, &oa2);
     assert!(!oa2_null, "surviving inline /OpenAction must not be nulled");
     assert_eq!(oa2_ref, refs2[0], "inline /OpenAction remaps to new page0");
+}
+
+// An inline /OpenAction that is an OPAQUE action (/S != /GoTo, e.g. /GoToR) whose
+// /D is an indirect operand object (a remote/named destination, not a local page
+// ref) must have that /D object folded into the copy closure and remapped to the
+// copied object — not dropped to Null. The /D-skip in the operand fold applies
+// only to local GoTo / bare-dest actions.
+#[test]
+fn merge_opaque_openaction_d_operand_is_copied_and_remapped() {
+    let src = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoToR /F (remote.pdf) /D 9 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (9, "(NamedDest)"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(src).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    let d_ref = match oa.get("D") {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("opaque /GoToR /D operand must be a live copied reference, got {other:?}"),
+    };
+    assert_eq!(
+        doc.resolve(d_ref).unwrap(),
+        Object::String(b"NamedDest".to_vec()),
+        "the /D operand object must be folded into the closure and copied"
+    );
 }
 
 /// Three-page primary whose document-level carriers are held INLINE on the

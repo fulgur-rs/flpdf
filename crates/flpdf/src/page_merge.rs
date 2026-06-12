@@ -485,11 +485,25 @@ fn fold_inline_action_operands<R: Read + Seek>(
     let Some(dict) = concrete.into_dict() else {
         return Ok(()); // cov:ignore: a bare-dest array /OpenAction has no operand objects to fold
     };
-    // Fold each non-destination operand's indirect refs into the closure. `/D`,
-    // `/SD`, `/Dest`, `/Next`, `/Parent` are skipped here (see ACTION_DEST_KEYS).
+    // An action's `/D` is a *local* page destination (owned by the null-out path)
+    // only for a bare-dest dict (no `/S`) or `/S /GoTo`. For an opaque action
+    // (`/S` present and != GoTo, e.g. `/GoToR`, `/URI`), `/D` is a remote/named
+    // destination operand object that must be folded like any other operand, so it
+    // is copied and the remapper (`remap_inline_action_depth`, opaque arm) can wire
+    // its refs instead of dropping the unmapped ref to `Null`. Mirror the
+    // remapper's `dest_bearing` predicate exactly so fold and remap agree on `/D`.
+    let dest_bearing = !matches!(dict.get("S"), Some(Object::Name(n)) if n != b"GoTo");
+    // Fold each non-destination operand's indirect refs into the closure. `/SD`,
+    // `/Dest`, `/Next`, `/Parent` are always skipped (see ACTION_DEST_KEYS); `/D`
+    // is skipped only when it is a local/GoTo destination (`dest_bearing`).
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
     for (key, value) in dict.iter() {
-        if ACTION_DEST_KEYS.contains(&key) {
+        let skip_key = if key == b"D" {
+            dest_bearing
+        } else {
+            ACTION_DEST_KEYS.contains(&key)
+        };
+        if skip_key {
             continue;
         }
         // `skip_parent_key: true` so a `/P` operand (if any) is treated as a
@@ -1577,6 +1591,17 @@ pub fn merge_documents<R: Read + Seek>(
         // Document-level structures (outlines, named dests, /OpenAction) are
         // inherited from the PRIMARY input only (qpdf `--pages` parity).
         let is_primary = input_index == 0;
+
+        // A non-primary input that selects no pages contributes nothing (it adds
+        // no pages and, with no selected pages, no fields). Skip it before any
+        // source read so a malformed but unused secondary (e.g. a broken
+        // `/AcroForm /Fields` or `/Pages` tree) cannot abort the whole merge.
+        // The primary is always processed: it carries the inherited document-level
+        // state even when it contributes no pages of its own.
+        if !is_primary && input.pages.is_empty() {
+            continue;
+        }
+
         let doc_level = if is_primary {
             discover_primary_doc_level(input.source)?
         } else {
