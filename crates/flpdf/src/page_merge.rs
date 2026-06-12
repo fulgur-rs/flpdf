@@ -110,7 +110,12 @@ fn collect_removed_dest_targets<R: Read + Seek>(
         // borrowing the owned array element rather than `source`.
         match elem {
             Object::Reference(annot_ref) => {
-                let Some(annot) = source.resolve_borrowed(annot_ref)?.as_dict().cloned() else {
+                // The element may be a reference to a reference to the annotation;
+                // follow the whole chain so a multi-hop annotation is scanned (a
+                // one-hop resolve would stop on an intermediate Reference and miss
+                // its removed-page destinations).
+                let (concrete, _) = resolve_ref_chain(source, &Object::Reference(annot_ref))?;
+                let Some(annot) = concrete.into_dict() else {
                     continue;
                 };
                 scan_annotation(source, &annot, selected, removed)?;
@@ -329,6 +334,11 @@ fn collect_sd_target<R: Read + Seek>(
 struct PrimaryDocLevel {
     /// Indirect `/Outlines` root ref, if present.
     outlines: Option<ObjectRef>,
+    /// Direct (inline-on-catalog) `/Outlines` root dictionary. ISO 32000 permits
+    /// the catalog `/Outlines` to be a direct dict, like the other catalog-level
+    /// carriers; its item refs are indirect and are folded/wired the same way as
+    /// the inline `/Names /Dests` and legacy `/Dests` roots.
+    outlines_inline: Option<Dictionary>,
     /// Indirect name-tree root held under the catalog's `/Names /Dests`.
     names_dests: Option<ObjectRef>,
     /// Direct `/Names /Dests` name-tree root (inline on the catalog). ISO 32000
@@ -360,10 +370,14 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
         return Ok(PrimaryDocLevel::default()); // cov:ignore: a /Root always resolves to a dictionary catalog
     };
 
-    let mut doc = PrimaryDocLevel {
-        outlines: catalog.get_ref("Outlines"),
-        ..PrimaryDocLevel::default()
-    };
+    let mut doc = PrimaryDocLevel::default();
+    // /Outlines — an indirect root ref, or a direct (inline) root dict on the
+    // catalog (ISO 32000 permits either, like the other catalog-level carriers).
+    match catalog.get("Outlines") {
+        Some(Object::Reference(r)) => doc.outlines = Some(*r),
+        Some(Object::Dictionary(d)) => doc.outlines_inline = Some(d.clone()),
+        _ => {}
+    }
 
     // /Names /Dests — the catalog's /Names is an indirect ref or an inline dict.
     // Its /Dests name-tree root may be an indirect ref OR a direct dictionary:
@@ -373,7 +387,9 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     // their own document-level handling and are not merged here.
     let names_val = catalog.get("Names").cloned();
     let names_dict = match names_val {
-        Some(Object::Reference(r)) => source.resolve_borrowed(r)?.as_dict().cloned(),
+        // /Names may sit behind a holder chain (a ref to a ref to the dict); follow
+        // it so the inherited /Dests name tree is not dropped.
+        Some(value @ Object::Reference(_)) => resolve_ref_chain(source, &value)?.0.into_dict(),
         Some(Object::Dictionary(d)) => Some(d),
         _ => None,
     };
@@ -450,6 +466,19 @@ fn fold_doc_level_closure<R: Read + Seek>(
             for kid in kid_refs {
                 closure.extend(page_object_closure(source, kid)?);
             }
+        }
+    }
+    // An INLINE (on-catalog) `/Outlines` root is likewise not an indirect root;
+    // fold its item chain through the `/First` and `/Last` child refs so the
+    // outline items (and their destination pages) are copied, mirroring what the
+    // indirect `outlines` root gets for free.
+    if let Some(inline) = &doc.outlines_inline {
+        let child_refs: Vec<ObjectRef> = ["First", "Last"]
+            .into_iter()
+            .filter_map(|key| inline.get_ref(key))
+            .collect();
+        for child in child_refs {
+            closure.extend(page_object_closure(source, child)?);
         }
     }
     Ok(())
@@ -561,7 +590,11 @@ fn collect_doc_level_removed_targets<R: Read + Seek>(
     // Legacy /Dests: each value is a destination; reached as an indirect dict or
     // an inline dict on the catalog.
     let legacy = match (doc.legacy_dests_ref, &doc.legacy_dests_inline) {
-        (Some(r), _) => source.resolve_borrowed(r)?.as_dict().cloned(),
+        // The legacy /Dests carrier may sit behind a holder chain (a ref to a ref
+        // to the dict); follow it so its entries are scanned for removed targets.
+        (Some(r), _) => resolve_ref_chain(source, &Object::Reference(r))?
+            .0
+            .into_dict(),
         (None, Some(d)) => Some(d.clone()),
         (None, None) => None,
     };
@@ -636,12 +669,14 @@ fn collect_outline_doc_dests<R: Read + Seek>(
     selected: &BTreeSet<ObjectRef>,
     removed: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    let Some(outlines_ref) = doc.outlines else {
-        return Ok(());
-    };
-    let first = {
-        let obj = source.resolve_borrowed(outlines_ref)?;
-        obj.as_dict().and_then(|d| d.get_ref("First"))
+    let first = match (doc.outlines, &doc.outlines_inline) {
+        (Some(outlines_ref), _) => {
+            let obj = source.resolve_borrowed(outlines_ref)?;
+            obj.as_dict().and_then(|d| d.get_ref("First"))
+        }
+        // A direct (inline) root holds its `/First` item ref inline on the catalog.
+        (None, Some(inline)) => inline.get_ref("First"),
+        (None, None) => return Ok(()),
     };
     let Some(first) = first else {
         // An /Outlines root with no /First is an empty outline tree — nothing to
@@ -683,11 +718,14 @@ fn collect_outline_removed_targets<R: Read + Seek>(
     }
     let mut current = Some(first);
     while let Some(item_ref) = current {
-        if !visited.insert(item_ref) {
+        // /First and /Next may point through holder chains (a ref to a ref to the
+        // item); resolve to the terminal item and key the cycle guard on the
+        // terminal ref so a destination below a holder is still reached.
+        let (item_obj, terminal) = resolve_ref_chain(source, &Object::Reference(item_ref))?;
+        if !visited.insert(terminal.unwrap_or(item_ref)) {
             break; // Cycle guard (/Next or /First back-edge).
         }
         let (dest_val, action_val, next_ref, first_child) = {
-            let item_obj = source.resolve_borrowed(item_ref)?;
             let Some(item) = item_obj.as_dict() else {
                 break; // Malformed — stop this chain.
             };
@@ -731,6 +769,10 @@ fn collect_name_tree_removed_targets<R: Read + Seek>(
     selected: &BTreeSet<ObjectRef>,
     removed: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
+    // The name-tree root may sit behind a holder chain (a ref to a ref to the root
+    // node); resolve it so read_name_tree walks the concrete root rather than
+    // stopping on an intermediate Reference and enumerating nothing.
+    let (root, _) = resolve_ref_chain(source, &root)?;
     let entries = read_name_tree(
         source,
         root,
@@ -768,6 +810,14 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
         if let Some(&new_ref) = map.get(&outlines) {
             catalog.insert("Outlines", Object::Reference(new_ref));
         }
+    } else if let Some(inline) = &doc.outlines_inline {
+        // The inline root dict lived on the primary catalog (never copied);
+        // rebuild it with its item refs (`/First`, `/Last`) remapped to the copied
+        // items, mirroring the inline `/Names` and legacy `/Dests` reconstruction.
+        catalog.insert(
+            "Outlines",
+            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
+        );
     }
     // /Names /Dests: indirect root → wire copied ref; inline root → reconstruct
     // it from the renumber map (the catalog is never copied, so an inline root's
@@ -1151,7 +1201,10 @@ fn resolve_field_partial_name<R: Read + Seek>(
         field.get("T").cloned()
     };
     let resolved = match t_value {
-        Some(Object::Reference(r)) => source.resolve(r)?,
+        // `/T` may be stored through more than one indirect hop; follow the whole
+        // chain (not a one-hop resolve) so a multi-hop name string is read and
+        // used for collision renaming rather than yielding `None`.
+        Some(value @ Object::Reference(_)) => resolve_ref_chain(source, &value)?.0,
         Some(other) => other,
         None => return Ok(None),
     };
@@ -1261,7 +1314,11 @@ fn field_kid_refs<R: Read + Seek>(
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
         if let Object::Reference(r) = item {
-            refs.push(r);
+            // A `/Kids` element may be a reference to a reference to the field/
+            // widget; resolve the holder chain to the terminal ref so trimming
+            // compares the same ref that retained-`/Annots` membership records.
+            let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
+            refs.push(terminal.unwrap_or(r));
         }
     }
     Ok(Some(refs))
@@ -1302,7 +1359,11 @@ fn collect_retained_widget_refs<R: Read + Seek>(
         };
         for elem in elems {
             if let Object::Reference(r) = elem {
-                retained.insert(r);
+                // An `/Annots` element may be a reference to a reference to the
+                // widget; resolve the holder chain to the terminal widget ref so it
+                // matches the field-tree kid ref recorded by `field_kid_refs`.
+                let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
+                retained.insert(terminal.unwrap_or(r));
             }
         }
     }

@@ -2669,6 +2669,116 @@ fn merge_appends_unnamed_secondary_field() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
+/// One-page form whose field `/T` is stored through TWO indirect hops
+/// (obj 7 -> obj 8 -> the name string), exercising multi-hop `/T` resolution.
+fn form_pdf_multi_hop_t(field_name: &[u8]) -> Vec<u8> {
+    let name = std::str::from_utf8(field_name).expect("field name is valid UTF-8");
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T 7 0 R /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Fields [4 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (7, "8 0 R"),
+            (8, &format!("({name})")),
+        ],
+        1,
+    )
+}
+
+// A secondary field whose `/T` is stored through MORE THAN ONE indirect hop
+// (obj 7 -> obj 8 -> string) is resolved for collision detection and renamed by
+// the qpdf `+N` rule, like a direct or single-hop name. Before the fix the
+// one-hop resolve yielded `None`, so the colliding name was appended unrenamed.
+#[test]
+fn merge_resolves_multi_hop_field_name() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    let mut b = Pdf::open_mem_owned(form_pdf_multi_hop_t(b"name")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"name".to_vec(), b"name+1".to_vec()]
+    );
+}
+
+/// One-page form with a non-terminal field (obj 7) whose single widget kid is a
+/// `/P`-less widget (obj 4) reached through reference-holder chains on BOTH the
+/// field `/Kids` side (obj 20 -> widget 4) and the page `/Annots` side (obj 21 ->
+/// widget 4). With no `/P`, the widget's survival depends on retained-`/Annots`
+/// membership, which only matches if both sides resolve the holder chains to the
+/// terminal widget ref.
+fn nonterminal_field_ref_chain_widget_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [21 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /Parent 7 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (7, "<< /FT /Tx /T (parent) /Kids [20 0 R] >>"),
+            (
+                8,
+                "<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 0 Tf 0 g) >>",
+            ),
+            (20, "4 0 R"),
+            (21, "4 0 R"),
+        ],
+        1,
+    )
+}
+
+// A non-terminal field whose `/P`-less widget is reached through reference-holder
+// chains on both the `/Kids` side and the page `/Annots` side must survive the
+// merge: resolving both to the terminal widget ref lets retained-`/Annots`
+// membership match. Before the fix each side recorded its holder ref, so the
+// widget was considered absent and the field was pruned.
+#[test]
+fn merge_keeps_field_whose_widget_is_reached_through_ref_chains() {
+    let mut a = Pdf::open_mem_owned(nonterminal_field_ref_chain_widget_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"parent".to_vec()],
+        "the field whose widget is reached via ref chains must be kept"
+    );
+    assert_eq!(
+        sole_field_kids_count(&mut doc),
+        1,
+        "the surviving widget kid is retained"
+    );
+}
+
 /// Count live `/Type /Page` objects in `doc` (reachable or not — every object
 /// still present after the merge's `sweep_unreachable_objects`). Used to assert
 /// that a non-terminal field's unselected-page widget did not leave an orphan
@@ -4049,4 +4159,237 @@ fn merge_multihop_indirect_annots_nulls_removed_dest() {
     let mut out = Vec::new();
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// === #329 review: discovery-side reference-chain resolution (codex P2 batch) ===
+// The copy path follows full indirect-reference chains; several discovery/collect
+// paths resolved only one hop, so a destination reached through a holder chain
+// was not recorded as a removed target (its page stayed live off-tree) or a
+// document-level carrier was dropped entirely. Each test isolates one path.
+
+/// 2-page doc; page 0's `/Annots [20 0 R]` reaches its annotation through a
+/// per-ELEMENT holder chain (20 -> 21 -> annot dict) whose `/Dest` targets the
+/// unselected page 1.
+fn annots_element_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [20 0 R] >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (20, "21 0 R"),
+            (
+                21,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_nulls_removed_dest_behind_annots_element_chain() {
+    let mut a = Pdf::open_mem_owned(annots_element_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "a removed dest reached via an /Annots element holder chain must be nulled"
+    );
+}
+
+/// 2-page doc whose legacy `/Catalog /Dests` is behind a holder chain
+/// (12 -> 13 -> the /Dests dict); one entry targets the unselected page 1.
+fn legacy_dests_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 12 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (12, "13 0 R"),
+            (13, "<< /d_p1 [4 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_nulls_removed_legacy_dest_behind_carrier_chain() {
+    let mut a = Pdf::open_mem_owned(legacy_dests_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "a removed legacy /Dests target behind a carrier holder chain must be nulled"
+    );
+}
+
+/// 2-page doc with a direct `/Names` dict whose `/Dests` name-tree root is behind
+/// a holder chain (12 -> 13 -> leaf); the leaf's named dest targets page 1.
+fn name_tree_root_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 12 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (12, "13 0 R"),
+            (13, "<< /Names [(d_p1) [4 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_nulls_removed_named_dest_behind_name_tree_root_chain() {
+    let mut a = Pdf::open_mem_owned(name_tree_root_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "a removed named dest behind a name-tree root holder chain must be nulled"
+    );
+}
+
+/// 2-page doc whose catalog `/Names` is behind a holder chain (10 -> 11 -> names
+/// dict); its `/Dests` leaf carries a named dest to the SELECTED page 0. The
+/// merge inherits the primary named dests, so the merged catalog must keep
+/// `/Names`.
+fn names_holder_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (10, "11 0 R"),
+            (11, "<< /Dests 12 0 R >>"),
+            (12, "<< /Names [(d) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_inherits_names_tree_behind_holder_chain() {
+    let mut a = Pdf::open_mem_owned(names_holder_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    assert!(
+        cat.get("Names").is_some(),
+        "the inherited /Names tree must not be dropped when /Names is behind a holder chain"
+    );
+}
+
+/// 2-page doc whose primary `/Outlines` reaches its first item through a holder
+/// chain (`/First 20 0 R`, 20 -> 21 -> item); the item's `/Dest` targets the
+/// unselected page 1.
+fn outline_link_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                10,
+                "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+            ),
+            (20, "21 0 R"),
+            (21, "<< /Title (x) /Parent 10 0 R /Dest [4 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_nulls_removed_outline_dest_behind_link_chain() {
+    let mut a = Pdf::open_mem_owned(outline_link_chain_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        1,
+        "a removed outline dest behind a /First|/Next holder chain must be nulled"
+    );
+}
+
+/// 1-page doc whose catalog stores a DIRECT (inline) `/Outlines` root dict rather
+/// than an indirect reference. The merge inherits the primary outlines, so this
+/// direct root must be captured and wired onto the output, not dropped.
+fn direct_outline_root_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /Outlines << /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (20, "<< /Title (x) /Dest [3 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_inherits_direct_outline_root() {
+    let mut a = Pdf::open_mem_owned(direct_outline_root_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    // The inherited /Outlines is reconstructed inline on the output catalog.
+    let outlines = match cat.get("Outlines") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!(
+            "a direct (inline) primary /Outlines root must be inherited, not dropped, got {other:?}"
+        ),
+    };
+
+    // The inline-root fold must have pulled item 20 (and its destination page)
+    // into the copy closure: the output /Outlines /First item was copied and its
+    // /Dest resolves to a live remapped page (the selected page 0), not null.
+    let first_ref = outlines
+        .get_ref("First")
+        .expect("the copied inline outline must carry a /First item ref");
+    let item = doc.resolve(first_ref).unwrap().into_dict().unwrap();
+    let dest = match item.get("Dest") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected the copied item's /Dest array, got {other:?}"),
+    };
+    let (_dref, d_null) = dest_array_first(&mut doc, &dest);
+    assert!(
+        !d_null,
+        "the inline outline item's surviving /Dest must be remapped to a live page"
+    );
 }
