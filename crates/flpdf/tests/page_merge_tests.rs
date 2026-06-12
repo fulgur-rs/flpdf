@@ -970,3 +970,807 @@ fn merge_tolerates_malformed_carrier_shapes() {
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: document-level inheritance from the PRIMARY input only.
+// ---------------------------------------------------------------------------
+
+/// Three-page document carrying a full set of document-level destination
+/// carriers, all using INDIRECT page references inside their dest arrays so a
+/// removed target's `Dest[0]` is an `Object::Reference` resolving to `null`:
+///
+/// - `/Outlines` (obj 10) tree with three items:
+///   - obj 20 "P1" → `/Dest [3 0 R /XYZ 0 792 0]` (array dest, surviving page0).
+///   - obj 21 "P2" → `/A << /S /GoTo /D [4 0 R /Fit] >>` (action dest, page1).
+///   - obj 22 "P3" → `/Dest [5 0 R /Fit]` (removed page2 when [0,1] selected).
+/// - `/Names` (obj 11) → `/Dests` name-tree leaf (obj 30):
+///   d_p1 → page0, d_p3 → removed page2.
+/// - legacy `/Catalog /Dests` (obj 12): legacy_p3 → removed page2.
+/// - `/OpenAction` (obj 13): `<< /S /GoTo /D [5 0 R /Fit] >>` → removed page2.
+fn doc_level_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names 11 0 R \
+                 /Dests 12 0 R /OpenAction 13 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                10,
+                "<< /Type /Outlines /First 20 0 R /Last 22 0 R /Count 3 >>",
+            ),
+            (11, "<< /Dests 30 0 R >>"),
+            (12, "<< /legacy_p3 [5 0 R /Fit] >>"),
+            (13, "<< /S /GoTo /D [5 0 R /Fit] >>"),
+            (
+                20,
+                "<< /Title (P1) /Parent 10 0 R /Next 21 0 R /Dest [3 0 R /XYZ 0 792 0] >>",
+            ),
+            (
+                21,
+                "<< /Title (P2) /Parent 10 0 R /Prev 20 0 R /Next 22 0 R \
+                 /A << /S /GoTo /D [4 0 R /Fit] >> >>",
+            ),
+            (
+                22,
+                "<< /Title (P3) /Parent 10 0 R /Prev 21 0 R /Dest [5 0 R /Fit] >>",
+            ),
+            (
+                30,
+                "<< /Limits [(d_p1) (d_p3)] \
+                 /Names [(d_p1) [3 0 R /XYZ 0 792 0] (d_p3) [5 0 R /Fit]] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+/// Resolve the catalog dict of a merged document.
+fn catalog_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
+    let catalog_ref = doc.root_ref().unwrap();
+    doc.resolve(catalog_ref).unwrap().into_dict().unwrap()
+}
+
+/// Walk an `/Outlines` tree (`/First` → `/Next`, descending `/First`) and return
+/// every item's `ObjectRef` in document order. Cycle-guarded.
+fn outline_item_refs(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    outlines_ref: flpdf::ObjectRef,
+) -> Vec<flpdf::ObjectRef> {
+    let mut out = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let first = doc
+        .resolve(outlines_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap()
+        .get_ref("First");
+    if let Some(first) = first {
+        walk_outline_refs(doc, first, &mut out, &mut visited);
+    }
+    out
+}
+
+fn walk_outline_refs(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    start: flpdf::ObjectRef,
+    out: &mut Vec<flpdf::ObjectRef>,
+    visited: &mut std::collections::BTreeSet<flpdf::ObjectRef>,
+) {
+    let mut current = Some(start);
+    while let Some(r) = current {
+        if !visited.insert(r) {
+            break;
+        }
+        // A /First/Next may point at a non-dict (malformed); stop that chain.
+        let Some(item) = doc.resolve(r).unwrap().into_dict() else {
+            break;
+        };
+        out.push(r);
+        if let Some(child) = item.get_ref("First") {
+            walk_outline_refs(doc, child, out, visited);
+        }
+        current = item.get_ref("Next");
+    }
+}
+
+/// Read the first element of a `/Dest`-style array on the item/dict at `r`,
+/// returning `(dest_ref, resolves_to_null)`. Panics if the dest isn't an array
+/// of `[<ref> ...]` shape.
+fn dest_array_first(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    arr: &[Object],
+) -> (flpdf::ObjectRef, bool) {
+    let page_ref = match arr.first() {
+        Some(Object::Reference(r)) => *r,
+        other => panic!("expected dest[0] to be a reference, got {other:?}"),
+    };
+    let is_null = matches!(doc.resolve(page_ref).unwrap(), Object::Null);
+    (page_ref, is_null)
+}
+
+// The merge inherits the PRIMARY input's /Outlines, /Names /Dests, and
+// /OpenAction; the SECONDARY input contributes pages only — its document-level
+// structures are NOT merged. Surviving-page dests are remapped to the new page
+// refs (folded into the primary closure so copy_objects's single rewrite pass
+// remaps them); the secondary's outline items never appear in the output.
+#[test]
+fn merge_inherits_primary_outline_only() {
+    let mut a = Pdf::open_mem_owned(doc_level_dest_pdf()).unwrap(); // primary
+    let mut b = Pdf::open_mem_owned(doc_level_dest_pdf()).unwrap(); // secondary
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0, 1],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 3, "two primary pages + one secondary page");
+    let primary_page0 = refs[0];
+    let primary_page1 = refs[1];
+
+    // Output catalog wires /Outlines, /Names, /OpenAction.
+    let cat = catalog_dict(&mut doc);
+    let outlines_ref = cat
+        .get_ref("Outlines")
+        .expect("output catalog must have /Outlines");
+    assert!(
+        cat.get("Names").is_some(),
+        "output catalog must have /Names"
+    );
+    assert!(
+        cat.get("OpenAction").is_some(),
+        "output catalog must have /OpenAction"
+    );
+
+    // Exactly the primary's three outline items (secondary's are NOT merged).
+    let items = outline_item_refs(&mut doc, outlines_ref);
+    assert_eq!(
+        items.len(),
+        3,
+        "only the primary's three outline items are inherited"
+    );
+
+    // Item 0 /Dest → surviving primary page0: remapped to its new ref, NOT null.
+    let item0 = doc.resolve(items[0]).unwrap().into_dict().unwrap();
+    let dest0 = match item0.get("Dest") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected item0 /Dest array, got {other:?}"),
+    };
+    let (d0_ref, d0_null) = dest_array_first(&mut doc, &dest0);
+    assert_eq!(d0_ref, primary_page0, "item0 dest remaps to new page0 ref");
+    assert!(!d0_null, "surviving outline dest must not be nulled");
+
+    // Item 1 /A /GoTo /D → surviving primary page1: remapped, NOT null.
+    let item1 = doc.resolve(items[1]).unwrap().into_dict().unwrap();
+    let action = match item1.get("A") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected item1 /A dict, got {other:?}"),
+    };
+    let d1 = match action.get("D") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected item1 /A /D array, got {other:?}"),
+    };
+    let (d1_ref, d1_null) = dest_array_first(&mut doc, &d1);
+    assert_eq!(d1_ref, primary_page1, "item1 action dest remaps to page1");
+    assert!(!d1_null, "surviving action dest must not be nulled");
+
+    // /Names /Dests carries the primary's named dests; d_p1 → surviving page0.
+    let names = match cat.get("Names") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Names, got {other:?}"),
+    };
+    let dests_leaf_ref = names.get_ref("Dests").expect("/Names /Dests ref");
+    let leaf = doc.resolve(dests_leaf_ref).unwrap().into_dict().unwrap();
+    let pairs = match leaf.get("Names") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected name-tree /Names array, got {other:?}"),
+    };
+    // d_p1 is the first pair; its dest array's first element resolves to page0.
+    let d_p1_dest = match &pairs[1] {
+        Object::Array(arr) => arr.clone(),
+        other => panic!("expected d_p1 dest array, got {other:?}"),
+    };
+    let (np1_ref, np1_null) = dest_array_first(&mut doc, &d_p1_dest);
+    assert_eq!(np1_ref, primary_page0, "named dest d_p1 remaps to page0");
+    assert!(!np1_null, "surviving named dest must not be nulled");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// A primary outline / named / legacy / OpenAction destination targeting a page
+// NOT selected from the primary keeps its destination reference, and that
+// reference resolves to a NULL object (qpdf --pages null-out parity) — the dest
+// is NOT dropped and NOT replaced with an inline [null]; the array survives with
+// its first element pointing at a nulled placeholder page object.
+#[test]
+fn merge_primary_outline_dest_to_removed_page_is_nulled() {
+    let mut a = Pdf::open_mem_owned(doc_level_dest_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let outlines_ref = cat.get_ref("Outlines").unwrap();
+    let items = outline_item_refs(&mut doc, outlines_ref);
+    assert_eq!(items.len(), 3, "all primary outline items kept");
+
+    // Outline item 2 /Dest → removed page2: array kept, first element is a
+    // reference resolving to null.
+    let item2 = doc.resolve(items[2]).unwrap().into_dict().unwrap();
+    let dest2 = match item2.get("Dest") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected item2 /Dest array, got {other:?}"),
+    };
+    let (od_ref, od_null) = dest_array_first(&mut doc, &dest2);
+    assert!(od_null, "removed outline dest target must resolve to null");
+
+    // Named dest d_p3 → removed page2: same null-out.
+    let names = match cat.get("Names") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Names, got {other:?}"),
+    };
+    let leaf = doc
+        .resolve(names.get_ref("Dests").unwrap())
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    let pairs = match leaf.get("Names") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected name-tree /Names array, got {other:?}"),
+    };
+    let d_p3_dest = match &pairs[3] {
+        Object::Array(arr) => arr.clone(),
+        other => panic!("expected d_p3 dest array, got {other:?}"),
+    };
+    let (nd_ref, nd_null) = dest_array_first(&mut doc, &d_p3_dest);
+    assert!(nd_null, "removed named dest target must resolve to null");
+
+    // Legacy /Catalog /Dests legacy_p3 → removed page2: same null-out.
+    let legacy = match cat.get("Dests") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected legacy /Dests, got {other:?}"),
+    };
+    let legacy_dest = match legacy.get("legacy_p3") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected legacy_p3 dest array, got {other:?}"),
+    };
+    let (ld_ref, ld_null) = dest_array_first(&mut doc, &legacy_dest);
+    assert!(ld_null, "removed legacy dest target must resolve to null");
+
+    // /OpenAction /GoTo /D → removed page2: same null-out.
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /OpenAction, got {other:?}"),
+    };
+    let oa_d = match oa.get("D") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    let (oad_ref, oad_null) = dest_array_first(&mut doc, &oa_d);
+    assert!(
+        oad_null,
+        "removed /OpenAction dest target must resolve to null"
+    );
+
+    // All four removed-target dests point at the SAME placeholder (page2 copied
+    // once), distinct from the surviving pages.
+    assert_eq!(
+        od_ref, nd_ref,
+        "shared removed-page placeholder (outline=named)"
+    );
+    assert_eq!(
+        od_ref, ld_ref,
+        "shared removed-page placeholder (outline=legacy)"
+    );
+    assert_eq!(
+        od_ref, oad_ref,
+        "shared removed-page placeholder (outline=openaction)"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// An inline-on-catalog /OpenAction (a bare dest array, not an indirect action
+// object) targeting a removed page is nulled too, and a surviving target is
+// remapped. This exercises the inline-on-catalog wiring path (the value lives on
+// the primary catalog, which copy_objects never copies, so merge constructs the
+// target value from the renumber map).
+#[test]
+fn merge_inline_openaction_dest_array_remapped_and_nulled() {
+    // Build a variant whose /OpenAction is an inline dest array to the removed
+    // page2, and a second doc whose /OpenAction targets the surviving page0.
+    let removed = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /OpenAction [5 0 R /Fit] >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(removed).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected inline /OpenAction array, got {other:?}"),
+    };
+    let (_oa_ref, oa_null) = dest_array_first(&mut doc, &oa);
+    assert!(oa_null, "inline /OpenAction to removed page must be nulled");
+
+    // Surviving variant: /OpenAction → page0, kept and remapped.
+    let surviving = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /OpenAction [3 0 R /Fit] >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut s = Pdf::open_mem_owned(surviving).unwrap();
+    let mut inputs2 = [MergeInput {
+        source: &mut s,
+        pages: vec![0, 1],
+    }];
+    let mut doc2 = merge_documents(&mut inputs2).unwrap();
+    let refs2 = pages::page_refs(&mut doc2).unwrap();
+    let cat2 = catalog_dict(&mut doc2);
+    let oa2 = match cat2.get("OpenAction") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected inline /OpenAction array, got {other:?}"),
+    };
+    let (oa2_ref, oa2_null) = dest_array_first(&mut doc2, &oa2);
+    assert!(!oa2_null, "surviving inline /OpenAction must not be nulled");
+    assert_eq!(oa2_ref, refs2[0], "inline /OpenAction remaps to new page0");
+}
+
+/// Three-page primary whose document-level carriers are held INLINE on the
+/// catalog (not as indirect objects), exercising the inline-on-catalog wiring
+/// and reconstruction paths:
+///
+/// - inline `/Names << /Dests 30 0 R >>` (the name-tree leaf 30 is still an
+///   indirect object, per the spec).
+/// - inline legacy `/Dests` dict with a surviving array dest (legacy_p0 → page0),
+///   a removed array dest (legacy_p2 → removed page2), a name-form dest
+///   (legacy_named → /SomeName, no page ref), and a no-leading-ref array dest
+///   (legacy_noref → [/Fit]).
+/// - inline `/OpenAction << /S /GoTo /D [5 0 R /Fit] >>` → removed page2.
+fn inline_doc_level_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 30 0 R >> \
+                 /Dests << /legacy_p0 [3 0 R /XYZ 0 792 0] /legacy_p2 [5 0 R /Fit] \
+                 /legacy_named /SomeName /legacy_noref [/Fit] >> \
+                 /OpenAction << /S /GoTo /D [5 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                30,
+                "<< /Limits [(d_p0) (d_p2)] \
+                 /Names [(d_p0) [3 0 R /Fit] (d_p2) [5 0 R /Fit]] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// Inline-on-catalog document-level carriers: an inline /Names dict, an inline
+// legacy /Dests dict (array/named/no-ref entries), and an inline /OpenAction
+// GoTo action are all inherited. Surviving dests remap to new page refs; removed
+// dests keep their reference resolving to null; page-less dests pass through.
+#[test]
+fn merge_inherits_inline_doc_level_carriers() {
+    let mut a = Pdf::open_mem_owned(inline_doc_level_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2);
+    let page0 = refs[0];
+    let cat = catalog_dict(&mut doc);
+
+    // Inline /Names was inherited; its /Dests leaf carries the named dests.
+    let names = match cat.get("Names") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Names, got {other:?}"),
+    };
+    let leaf = doc
+        .resolve(names.get_ref("Dests").unwrap())
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    let pairs = match leaf.get("Names") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected name-tree /Names array, got {other:?}"),
+    };
+    // d_p0 → surviving page0 (remapped); d_p2 → removed page2 (nulled).
+    let (np0_ref, np0_null) = dest_array_first(
+        &mut doc,
+        match &pairs[1] {
+            Object::Array(a) => a,
+            o => panic!("d_p0 dest: {o:?}"),
+        },
+    );
+    assert_eq!(np0_ref, page0);
+    assert!(!np0_null);
+    let (_np2_ref, np2_null) = dest_array_first(
+        &mut doc,
+        match &pairs[3] {
+            Object::Array(a) => a,
+            o => panic!("d_p2 dest: {o:?}"),
+        },
+    );
+    assert!(np2_null, "removed named dest nulled");
+
+    // Inline legacy /Dests reconstructed: surviving remapped, removed nulled,
+    // name-form and no-ref-array entries passed through verbatim.
+    let legacy = match cat.get("Dests") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline legacy /Dests, got {other:?}"),
+    };
+    let (lp0_ref, lp0_null) = dest_array_first(
+        &mut doc,
+        match legacy.get("legacy_p0") {
+            Some(Object::Array(a)) => a,
+            o => panic!("legacy_p0: {o:?}"),
+        },
+    );
+    assert_eq!(lp0_ref, page0, "legacy_p0 remaps to page0");
+    assert!(!lp0_null);
+    let (_lp2_ref, lp2_null) = dest_array_first(
+        &mut doc,
+        match legacy.get("legacy_p2") {
+            Some(Object::Array(a)) => a,
+            o => panic!("legacy_p2: {o:?}"),
+        },
+    );
+    assert!(lp2_null, "legacy_p2 (removed) nulled");
+    // Name-form dest: kept verbatim (remap_inline_dest non-array arm).
+    assert_eq!(
+        legacy.get("legacy_named").and_then(|o| o.as_name()),
+        Some(&b"SomeName"[..]),
+        "name-form legacy dest passed through unchanged"
+    );
+    // No-leading-ref array dest: first element is a name, left unchanged.
+    let noref = match legacy.get("legacy_noref") {
+        Some(Object::Array(a)) => a.clone(),
+        o => panic!("legacy_noref: {o:?}"),
+    };
+    assert_eq!(noref.first(), Some(&Object::Name(b"Fit".to_vec())));
+
+    // Inline /OpenAction GoTo dict → removed page2: /D[0] resolves to null.
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    let oa_d = match oa.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    let (_oad_ref, oad_null) = dest_array_first(&mut doc, &oa_d);
+    assert!(oad_null, "inline /OpenAction GoTo to removed page nulled");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// A non-GoTo inline /OpenAction action dict, and an /OpenAction that is neither
+// an array nor a dict (a bare name), are both passed through verbatim — their
+// /D, if any, is not a local page destination, so no remap is attempted. This
+// exercises remap_inline_action's non-GoTo dict and "other" arms.
+#[test]
+fn merge_inline_non_goto_open_action_passed_through() {
+    let non_goto = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /URI /URI (http://example.com) >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(non_goto).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+    assert_eq!(
+        oa.get("S").and_then(|o| o.as_name()),
+        Some(&b"URI"[..]),
+        "non-GoTo /OpenAction kept verbatim"
+    );
+
+    // /OpenAction as a bare name (neither array nor dict): passed through.
+    let name_oa = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /OpenAction /SomeName >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut b = Pdf::open_mem_owned(name_oa).unwrap();
+    let mut inputs2 = [MergeInput {
+        source: &mut b,
+        pages: vec![0],
+    }];
+    let mut doc2 = merge_documents(&mut inputs2).unwrap();
+    let cat2 = catalog_dict(&mut doc2);
+    assert_eq!(
+        cat2.get("OpenAction").and_then(|o| o.as_name()),
+        Some(&b"SomeName"[..]),
+        "name-form /OpenAction kept verbatim"
+    );
+}
+
+/// Primary whose outline tree has a NESTED child item targeting a removed page,
+/// a cyclic `/Next` back-edge, and a `/First` pointing at a non-dict object,
+/// exercising the outline collector's child-descent, cycle-guard, and
+/// malformed-item arms.
+///
+/// - obj 20 "P0" → `/Dest [3 0 R /Fit]` (surviving page0), child 22, `/Next 21`.
+/// - obj 21 "P1" → `/Next 20` (cyclic back-edge to the already-visited 20).
+/// - obj 22 "sub" → `/Dest [5 0 R /Fit]` (removed page2), `/First 99` (non-dict).
+/// - obj 99 = a non-dict object used as 22's `/First` (malformed child head).
+fn nested_cyclic_outline_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                10,
+                "<< /Type /Outlines /First 20 0 R /Last 21 0 R /Count 2 >>",
+            ),
+            (
+                20,
+                "<< /Title (P0) /Parent 10 0 R /Next 21 0 R /First 22 0 R /Last 22 0 R \
+                 /Dest [3 0 R /Fit] >>",
+            ),
+            (
+                21,
+                "<< /Title (P1) /Parent 10 0 R /Prev 20 0 R /Next 20 0 R >>",
+            ),
+            (
+                22,
+                "<< /Title (sub) /Parent 20 0 R /First 99 0 R /Dest [5 0 R /Fit] >>",
+            ),
+            (99, "42"),
+        ],
+        1,
+    )
+}
+
+// A nested outline child targeting a removed page is nulled (child-descent), a
+// cyclic /Next back-edge terminates the walk (cycle guard), and a /First
+// pointing at a non-dict object is tolerated (malformed-item arm).
+#[test]
+fn merge_outline_nested_child_cyclic_and_malformed() {
+    let mut a = Pdf::open_mem_owned(nested_cyclic_outline_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2);
+    let cat = catalog_dict(&mut doc);
+    let outlines_ref = cat.get_ref("Outlines").unwrap();
+    let items = outline_item_refs(&mut doc, outlines_ref);
+    // Walk order: 20, its child 22 (whose malformed /First 99 stops descent),
+    // then 21; 21's /Next 20 is a visited back-edge so the walk terminates.
+    assert_eq!(items.len(), 3, "items 20, 22, 21 all visited once");
+
+    // Exactly one outline item's /Dest targets the removed page (the nested
+    // child item 22); it must be nulled. The parent item 20's /Dest targets the
+    // surviving page0 and must NOT be nulled.
+    let mut null_dest_count = 0;
+    let mut surviving_dest_count = 0;
+    for &r in &items {
+        let item = doc.resolve(r).unwrap().into_dict().unwrap();
+        if let Some(Object::Array(arr)) = item.get("Dest") {
+            let arr = arr.clone();
+            let (_ref, is_null) = dest_array_first(&mut doc, &arr);
+            if is_null {
+                null_dest_count += 1;
+            } else {
+                surviving_dest_count += 1;
+            }
+        }
+    }
+    assert_eq!(
+        null_dest_count, 1,
+        "nested-child dest to removed page nulled"
+    );
+    assert_eq!(
+        surviving_dest_count, 1,
+        "parent dest to surviving page kept"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Two-page primary whose `/Names /Dests` name-tree root is a DIRECT dictionary
+/// (inline single leaf), not an indirect object. ISO 32000 permits this — the
+/// root is referenced only from `/Names /Dests`. The leaf carries a named dest
+/// to a surviving page (d_a → page0) and one to a removed page (d_b → page1,
+/// dropped when only [0] is selected).
+fn inline_dests_root_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /Names << /Dests << /Limits [(d_a) (d_b)] \
+                 /Names [(d_a) [3 0 R /Fit] (d_b) [4 0 R /Fit]] >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+// An inline (direct-dict) /Names /Dests name-tree root is inherited like an
+// indirect one: its named dest to a surviving page is remapped (not null), and
+// its named dest to a removed page keeps its reference resolving to null. This
+// is the case that previously dropped the primary's named dests silently because
+// the root was extracted with get_ref (which returns None for a direct dict).
+#[test]
+fn merge_inherits_inline_dests_root() {
+    let mut a = Pdf::open_mem_owned(inline_dests_root_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1);
+    let page0 = refs[0];
+    let cat = catalog_dict(&mut doc);
+
+    // The inline /Dests root was inherited: catalog has /Names → /Dests leaf.
+    let names = match cat.get("Names") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Names, got {other:?}"),
+    };
+    let leaf = match names.get("Dests") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Dests leaf, got {other:?}"),
+    };
+    let pairs = match leaf.get("Names") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected name-tree /Names array, got {other:?}"),
+    };
+    assert_eq!(pairs.len(), 4, "both named dests inherited (d_a, d_b)");
+
+    // d_a → surviving page0: remapped to its new ref, NOT null.
+    let (da_ref, da_null) = dest_array_first(
+        &mut doc,
+        match &pairs[1] {
+            Object::Array(a) => a,
+            o => panic!("d_a dest: {o:?}"),
+        },
+    );
+    assert_eq!(da_ref, page0, "inline-root named dest d_a remaps to page0");
+    assert!(!da_null, "surviving named dest must not be nulled");
+
+    // d_b → removed page1: reference kept, resolves to null.
+    let (_db_ref, db_null) = dest_array_first(
+        &mut doc,
+        match &pairs[3] {
+            Object::Array(a) => a,
+            o => panic!("d_b dest: {o:?}"),
+        },
+    );
+    assert!(db_null, "removed named dest target must resolve to null");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+// A primary whose /Outlines root is empty (/Type /Outlines /Count 0, no /First)
+// is a legitimate, reachable PDF shape: merge must tolerate it (no crash, no
+// dropped pages) and still inherit the (empty) /Outlines root. Exercises the
+// missing-/First early return in collect_outline_doc_dests.
+#[test]
+fn merge_tolerates_empty_outline_root() {
+    let empty_outline = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (10, "<< /Type /Outlines /Count 0 >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(empty_outline).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // Pages are not dropped.
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2, "both pages survive an empty outline root");
+
+    // The empty /Outlines root is inherited and has no /First.
+    let cat = catalog_dict(&mut doc);
+    let outlines_ref = cat
+        .get_ref("Outlines")
+        .expect("empty /Outlines root inherited onto output catalog");
+    let outlines = doc.resolve(outlines_ref).unwrap().into_dict().unwrap();
+    assert!(
+        outlines.get("First").is_none(),
+        "empty outline root has no /First"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
