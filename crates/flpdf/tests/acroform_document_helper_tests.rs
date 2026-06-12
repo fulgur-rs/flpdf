@@ -822,6 +822,53 @@ fn copy_fields_from_skips_field_p_reference() {
 }
 
 #[test]
+fn copy_fields_from_skips_nested_annotation_page_back_pointer() {
+    // A copied widget links a nested annotation (/Popup) whose own /P is still a
+    // page back-pointer. The /P skip must stay active through the annotation graph
+    // — it is lifted only when the walk crosses into resource data (/Resources) —
+    // so the popup's page (reachable only via /Popup -> /P) is not pulled into the
+    // copy set. Regression for flpdf-4ue7 (codex review): the skip must not turn
+    // off for every non-field key, only for /Resources.
+    let source_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Fields [5 0 R] >>"),
+            (5, "<< /T (widget) /FT /Tx /V (val) /Popup 7 0 R >>"),
+            (
+                7,
+                "<< /Type /Annot /Subtype /Popup /Parent 5 0 R /P 8 0 R >>",
+            ),
+            (8, "<< /Type /Page /Marker (must-not-be-copied) >>"),
+        ],
+        1,
+    );
+    let target_bytes = empty_pdf();
+    let mut source = Pdf::open_mem(&source_bytes).unwrap();
+    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+
+    let copied = target.acroform().copy_fields_from(&mut source).unwrap();
+    assert_eq!(copied.len(), 1, "the single top-level field is copied");
+
+    let Object::Dictionary(field) = target.resolve(copied[0]).unwrap() else {
+        panic!("copied field should be a dictionary");
+    };
+    // The /Popup annotation itself is reachable via a non-/P key, so it is copied.
+    let popup_ref = field
+        .get_ref("Popup")
+        .expect("copied field should retain its /Popup annotation reference");
+    let Object::Dictionary(popup) = target.resolve(popup_ref).unwrap() else {
+        panic!("copied /Popup should be a dictionary");
+    };
+    assert_eq!(
+        popup.get("P"),
+        Some(&Object::Null),
+        "the nested annotation's /P page back-pointer must be skipped and left dangling (Null)"
+    );
+}
+
+#[test]
 fn copy_fields_from_appends_copied_fields_to_target_acroform() {
     let source_bytes = form_pdf();
     let target_bytes = empty_pdf();

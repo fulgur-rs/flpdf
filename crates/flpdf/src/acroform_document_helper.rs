@@ -833,17 +833,22 @@ fn collect_refs_in_dict<R: Read + Seek>(
     skip_parent_key: bool,
 ) -> Result<()> {
     for (key, value) in dict.iter() {
-        // /P is a widget's page back-pointer only within the field tree; in a
-        // resource dictionary it is an ordinary resource name and must be walked.
+        // Skip /P while it is a page back-pointer (`skip_parent_key` tracks that
+        // context; see the `next_skip_parent_key` derivation below). Inside
+        // resource data /P is an ordinary resource name and must be collected.
         if skip_parent_key && key == b"P" {
             continue;
         }
-        // Keep the /P skip on the field-tree axis only. /Kids (down) and /Parent
-        // (up) lead to sibling/ancestor field dictionaries whose /P is likewise a
-        // page back-pointer; every other key (/AP appearance streams, /DR, /MK,
-        // /V, ...) leads out of the field tree, where /P is a plain resource name
-        // and must not be skipped (e.g. a font named /P in an /AP /Resources dict).
-        let next_skip_parent_key = skip_parent_key && (key == b"Kids" || key == b"Parent");
+        // /P is a page back-pointer throughout the annotation/field graph — field
+        // and widget dicts, but also nested annotations reached via non-field keys
+        // (e.g. a widget's /Popup, whose own /P points at a page). Keep skipping it
+        // across that whole graph. It only becomes an ordinary resource name once
+        // the walk crosses into resource data via /Resources (an appearance
+        // stream's, page's, or XObject's resources — e.g. a font named /P), so the
+        // skip is lifted there and stays off for that resource subtree. (The
+        // inherited /DR /DA walk already enters with the skip off; see the call in
+        // `source_field_copy_set`.)
+        let next_skip_parent_key = skip_parent_key && key != b"Resources";
         // Forward the same `inline_depth`: the caller incremented it when
         // descending into this dict, and each value re-enters
         // `collect_refs_in_object` where the guard re-checks.
