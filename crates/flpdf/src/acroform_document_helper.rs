@@ -683,10 +683,18 @@ fn source_field_copy_set<RS: Read + Seek>(
     let mut copy_set = BTreeSet::new();
     let mut seen = BTreeSet::new();
     for field_ref in &top_fields {
-        collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen, 0)?;
+        // Field-tree walk: skip a widget's /P (its page back-pointer) so the
+        // closure never pulls the page and its sibling tree into the copy set.
+        collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen, 0, true)?;
     }
     for (_, value) in &inherited_entries {
-        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen, 0, 0)?;
+        // /DR and /DA are resource subtrees, not field-tree nodes: a resource may
+        // be legitimately named /P (e.g. a /DA-referenced font), so collect /P
+        // here rather than dropping it as a field-tree back-pointer. A well-formed
+        // resource dict holds no field-tree back-pointers; the `seen` set and the
+        // depth cap still bound traversal against cycles and long reference chains
+        // (DoS) on hostile input.
+        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen, 0, 0, false)?;
     }
     Ok((top_fields, inherited_entries, copy_set))
 }
@@ -730,6 +738,7 @@ fn collect_reachable_refs<R: Read + Seek>(
     out: &mut BTreeSet<ObjectRef>,
     seen: &mut BTreeSet<ObjectRef>,
     depth: usize,
+    skip_parent_key: bool,
 ) -> Result<()> {
     // The `seen` cycle guard cannot stop a long *acyclic* indirect-reference chain
     // (obj1 -> obj2 -> ... -> objN), where recursion depth grows with the chain length.
@@ -750,7 +759,7 @@ fn collect_reachable_refs<R: Read + Seek>(
     out.insert(object_ref);
 
     let obj = pdf.resolve(object_ref)?;
-    collect_refs_in_object(pdf, &obj, out, seen, depth, 0)
+    collect_refs_in_object(pdf, &obj, out, seen, depth, 0, skip_parent_key)
 }
 
 fn collect_refs_in_object<R: Read + Seek>(
@@ -760,6 +769,7 @@ fn collect_refs_in_object<R: Read + Seek>(
     seen: &mut BTreeSet<ObjectRef>,
     depth: usize,
     inline_depth: usize,
+    skip_parent_key: bool,
 ) -> Result<()> {
     if inline_depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(format!(
@@ -770,20 +780,40 @@ fn collect_refs_in_object<R: Read + Seek>(
         Object::Reference(object_ref) => {
             // Ref hop: bump the ref-hop axis; `collect_reachable_refs` resets
             // `inline_depth` to 0 for the freshly resolved object.
-            collect_reachable_refs(pdf, *object_ref, out, seen, depth + 1)
+            collect_reachable_refs(pdf, *object_ref, out, seen, depth + 1, skip_parent_key)
         }
         Object::Array(items) => {
             for item in items {
-                collect_refs_in_object(pdf, item, out, seen, depth, inline_depth + 1)?;
+                collect_refs_in_object(
+                    pdf,
+                    item,
+                    out,
+                    seen,
+                    depth,
+                    inline_depth + 1,
+                    skip_parent_key,
+                )?;
             }
             Ok(())
         }
-        Object::Dictionary(dict) => {
-            collect_refs_in_dict(pdf, dict, out, seen, depth, inline_depth + 1)
-        }
-        Object::Stream(stream) => {
-            collect_refs_in_dict(pdf, &stream.dict, out, seen, depth, inline_depth + 1)
-        }
+        Object::Dictionary(dict) => collect_refs_in_dict(
+            pdf,
+            dict,
+            out,
+            seen,
+            depth,
+            inline_depth + 1,
+            skip_parent_key,
+        ),
+        Object::Stream(stream) => collect_refs_in_dict(
+            pdf,
+            &stream.dict,
+            out,
+            seen,
+            depth,
+            inline_depth + 1,
+            skip_parent_key,
+        ),
         Object::Null
         | Object::Boolean(_)
         | Object::Integer(_)
@@ -800,15 +830,37 @@ fn collect_refs_in_dict<R: Read + Seek>(
     seen: &mut BTreeSet<ObjectRef>,
     depth: usize,
     inline_depth: usize,
+    skip_parent_key: bool,
 ) -> Result<()> {
     for (key, value) in dict.iter() {
-        if key == b"P" {
+        // Skip /P while it is a page back-pointer (`skip_parent_key` tracks that
+        // context; see the `next_skip_parent_key` derivation below). Inside
+        // resource data /P is an ordinary resource name and must be collected.
+        if skip_parent_key && key == b"P" {
             continue;
         }
+        // /P is a page back-pointer throughout the annotation/field graph — field
+        // and widget dicts, but also nested annotations reached via non-field keys
+        // (e.g. a widget's /Popup, whose own /P points at a page). Keep skipping it
+        // across that whole graph. It only becomes an ordinary resource name once
+        // the walk crosses into resource data via /Resources (an appearance
+        // stream's, page's, or XObject's resources — e.g. a font named /P), so the
+        // skip is lifted there and stays off for that resource subtree. (The
+        // inherited /DR /DA walk already enters with the skip off; see the call in
+        // `source_field_copy_set`.)
+        let next_skip_parent_key = skip_parent_key && key != b"Resources";
         // Forward the same `inline_depth`: the caller incremented it when
         // descending into this dict, and each value re-enters
         // `collect_refs_in_object` where the guard re-checks.
-        collect_refs_in_object(pdf, value, out, seen, depth, inline_depth)?;
+        collect_refs_in_object(
+            pdf,
+            value,
+            out,
+            seen,
+            depth,
+            inline_depth,
+            next_skip_parent_key,
+        )?;
     }
     Ok(())
 }
@@ -1070,8 +1122,8 @@ mod tests {
         let mut out = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let deep = nested_arrays(MAX_INLINE_DEPTH + 5);
-        // arg order: (pdf, obj, out, seen, depth, inline_depth)
-        let err = collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0);
+        // arg order: (pdf, obj, out, seen, depth, inline_depth, skip_parent_key)
+        let err = collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0, true);
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
@@ -1083,7 +1135,7 @@ mod tests {
         // Null leaf sits at inline_depth = MAX_INLINE_DEPTH, the deepest level
         // accepted under the strict `>` guard.
         let deep = nested_arrays(MAX_INLINE_DEPTH);
-        collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0).unwrap();
+        collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0, true).unwrap();
         assert!(out.is_empty());
     }
 
@@ -1099,7 +1151,7 @@ mod tests {
             Vec::new(),
         ));
         let obj = Object::Dictionary(dict(&[("S", stream), ("N", Object::Integer(1))]));
-        collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0).unwrap();
+        collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0, true).unwrap();
         assert!(out.is_empty());
     }
 
