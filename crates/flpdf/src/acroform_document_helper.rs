@@ -838,10 +838,24 @@ fn collect_refs_in_dict<R: Read + Seek>(
         if skip_parent_key && key == b"P" {
             continue;
         }
+        // Keep the /P skip on the field-tree axis only. /Kids (down) and /Parent
+        // (up) lead to sibling/ancestor field dictionaries whose /P is likewise a
+        // page back-pointer; every other key (/AP appearance streams, /DR, /MK,
+        // /V, ...) leads out of the field tree, where /P is a plain resource name
+        // and must not be skipped (e.g. a font named /P in an /AP /Resources dict).
+        let next_skip_parent_key = skip_parent_key && (key == b"Kids" || key == b"Parent");
         // Forward the same `inline_depth`: the caller incremented it when
         // descending into this dict, and each value re-enters
         // `collect_refs_in_object` where the guard re-checks.
-        collect_refs_in_object(pdf, value, out, seen, depth, inline_depth, skip_parent_key)?;
+        collect_refs_in_object(
+            pdf,
+            value,
+            out,
+            seen,
+            depth,
+            inline_depth,
+            next_skip_parent_key,
+        )?;
     }
     Ok(())
 }
@@ -1103,8 +1117,8 @@ mod tests {
         let mut out = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let deep = nested_arrays(MAX_INLINE_DEPTH + 5);
-        // arg order: (pdf, obj, out, seen, depth, inline_depth)
-        let err = collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0);
+        // arg order: (pdf, obj, out, seen, depth, inline_depth, skip_parent_key)
+        let err = collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0, true);
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
@@ -1116,7 +1130,7 @@ mod tests {
         // Null leaf sits at inline_depth = MAX_INLINE_DEPTH, the deepest level
         // accepted under the strict `>` guard.
         let deep = nested_arrays(MAX_INLINE_DEPTH);
-        collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0).unwrap();
+        collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0, true).unwrap();
         assert!(out.is_empty());
     }
 
@@ -1132,7 +1146,7 @@ mod tests {
             Vec::new(),
         ));
         let obj = Object::Dictionary(dict(&[("S", stream), ("N", Object::Integer(1))]));
-        collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0).unwrap();
+        collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0, true).unwrap();
         assert!(out.is_empty());
     }
 
