@@ -861,7 +861,13 @@ fn inherited_field_value<R: Read + Seek>(
 
     let mut parent = field_dict.get("Parent").cloned();
     let mut seen = BTreeSet::new();
+    let mut depth: usize = 0;
     while let Some(Object::Reference(parent_ref)) = parent {
+        if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "signature field-tree depth limit {DEFAULT_MAX_SIGNATURE_FIELD_DEPTH} exceeded at {parent_ref}"
+            )));
+        }
         if !seen.insert(parent_ref) {
             break;
         }
@@ -874,6 +880,7 @@ fn inherited_field_value<R: Read + Seek>(
             }
             _ => break,
         }
+        depth += 1;
     }
     Ok(None)
 }
@@ -972,5 +979,69 @@ fn object_has_byte_range(object: &Object) -> bool {
         Object::Dictionary(dict) => dict.get("ByteRange").is_some(),
         Object::Stream(stream) => stream.dict.get("ByteRange").is_some(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // Minimal valid PDF; nodes are supplied via set_object refs (catalog unused).
+    fn empty_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).expect("open")
+    }
+
+    // Register a /Parent chain obj(start)->obj(start+1)->...->obj(start+len-1).
+    // The deepest node carries `key`; the starting dict (returned) only has /Parent.
+    fn parent_chain(pdf: &mut Pdf<Cursor<Vec<u8>>>, start: u32, len: u32, key: &str) -> Dictionary {
+        for i in 0..len {
+            let num = start + i;
+            let mut d = Dictionary::new();
+            if i + 1 < len {
+                d.insert("Parent", Object::Reference(ObjectRef::new(num + 1, 0)));
+            } else {
+                // deepest node holds the inheritable value
+                d.insert(key, Object::Integer(42));
+            }
+            pdf.set_object(ObjectRef::new(num, 0), Object::Dictionary(d));
+        }
+        let mut start_dict = Dictionary::new();
+        start_dict.insert("Parent", Object::Reference(ObjectRef::new(start, 0)));
+        start_dict
+    }
+
+    #[test]
+    fn inherited_field_value_errors_on_excessive_parent_depth() {
+        let mut pdf = empty_pdf();
+        // Chain longer than the limit so the guard trips before reaching the leaf.
+        let start_dict = parent_chain(
+            &mut pdf,
+            2,
+            (DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32) + 5,
+            "V",
+        );
+        let err = inherited_field_value(&mut pdf, &start_dict, "V");
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn inherited_field_value_resolves_within_limit() {
+        let mut pdf = empty_pdf();
+        // Short chain: the inherited value must be found, not errored.
+        let start_dict = parent_chain(&mut pdf, 2, 4, "V");
+        let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
+        assert_eq!(got, Some(Object::Integer(42)));
     }
 }
