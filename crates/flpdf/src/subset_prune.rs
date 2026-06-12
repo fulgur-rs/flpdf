@@ -44,6 +44,7 @@
 //! This confirms that `Auto` (the qpdf default) performs both name-level
 //! pruning **and** xref-level GC of unreachable objects.  `No` preserves both.
 
+use crate::object::MAX_INLINE_DEPTH;
 use crate::resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
@@ -136,7 +137,7 @@ pub(crate) fn sweep_unreachable_objects<R: Read + Seek>(pdf: &mut Pdf<R>) -> Res
     let trailer_refs = {
         let trailer_clone = Object::Dictionary(pdf.trailer().clone());
         let mut refs: Vec<ObjectRef> = Vec::new();
-        walk_refs(&trailer_clone, &mut refs);
+        walk_refs(&trailer_clone, 0, &mut refs)?;
         refs
     };
     let reachable = collect_reachable(pdf, root_ref, trailer_refs)?;
@@ -202,7 +203,7 @@ fn collect_reachable<R: Read + Seek>(
         };
 
         // Walk all ObjectRefs contained in the resolved object.
-        walk_refs(obj, &mut queue);
+        walk_refs(obj, 0, &mut queue)?;
     }
 
     Ok(visited)
@@ -212,32 +213,38 @@ fn collect_reachable<R: Read + Seek>(
 ///
 /// This is a pure structural walk — it does not resolve any references; the
 /// caller drives resolution in the BFS/DFS loop.
-fn walk_refs(obj: &Object, queue: &mut Vec<ObjectRef>) {
+fn walk_refs(obj: &Object, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
     match obj {
         Object::Reference(r) => {
             queue.push(*r);
         }
         Object::Array(arr) => {
             for item in arr {
-                walk_refs(item, queue);
+                walk_refs(item, depth + 1, queue)?;
             }
         }
         Object::Dictionary(dict) => {
             for (_, val) in dict.iter() {
-                walk_refs(val, queue);
+                walk_refs(val, depth + 1, queue)?;
             }
         }
         Object::Stream(stream) => {
             // Walk the stream dictionary; the stream data itself contains no
             // nested PDF object references at the indirect-object level.
             for (_, val) in stream.dict.iter() {
-                walk_refs(val, queue);
+                walk_refs(val, depth + 1, queue)?;
             }
         }
         // Scalar values (null, boolean, integer, real, name, string) carry
         // no references.
         _ => {}
     }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -246,12 +253,44 @@ fn walk_refs(obj: &Object, queue: &mut Vec<ObjectRef>) {
 mod tests {
     use super::*;
     use crate::check::check_reader;
+    use crate::object::MAX_INLINE_DEPTH;
     use crate::page_tree_rebuild::rebuild_page_tree;
     use crate::pages::page_refs;
     use crate::writer::write_pdf;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
+
+    // ── Inline-depth guard ───────────────────────────────────────────────────
+
+    fn nested_arrays(depth: usize) -> Object {
+        let mut o = Object::Null;
+        for _ in 0..depth {
+            o = Object::Array(vec![o]);
+        }
+        o
+    }
+
+    #[test]
+    fn walk_refs_errors_on_excessive_nesting() {
+        let mut queue = Vec::new();
+        let err = walk_refs(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &mut queue);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn walk_refs_accepts_nesting_up_to_the_limit() {
+        let mut queue = Vec::new();
+        // Bury one Reference so it is visited at exactly inline depth
+        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
+        // guard); it must be collected, not errored.
+        let mut o = Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]);
+        for _ in 0..(MAX_INLINE_DEPTH - 1) {
+            o = Object::Array(vec![o]);
+        }
+        walk_refs(&o, 0, &mut queue).unwrap();
+        assert_eq!(queue, vec![ObjectRef::new(9, 0)]);
+    }
 
     // ── Fixture builders ─────────────────────────────────────────────────────
 

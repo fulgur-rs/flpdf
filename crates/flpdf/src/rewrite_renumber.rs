@@ -26,18 +26,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek};
 
-use crate::object::{Object, ObjectRef};
+use crate::object::{Object, ObjectRef, MAX_INLINE_DEPTH};
 use crate::reader::Pdf;
 use crate::Error;
-
-/// Maximum inline structural nesting depth walked when collecting or rewriting
-/// references inside a single resolved object. Indirect references are enqueued
-/// rather than recursed, so this only bounds inline dictionary/array nesting and
-/// guards against stack overflow on adversarial input. Exceeding it is a hard
-/// error (not a silent stop): a reference past the limit would be left
-/// uncollected/un-rewritten and corrupt the renumbered output. Real PDFs never
-/// nest inline structures this deeply.
-const MAX_INLINE_DEPTH: usize = 256;
 
 /// A map from original object references to their qpdf-style Catalog-first
 /// numbers, plus the visitation order that produced them.
@@ -153,7 +144,7 @@ fn enqueue(
 /// corrupt renumbered PDF as if it succeeded. Refusing is the safe choice
 /// (real PDFs never nest inline structures that deeply).
 fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) -> crate::Result<()> {
-    if depth >= MAX_INLINE_DEPTH {
+    if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
             "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
              reference collection"
@@ -200,7 +191,7 @@ pub(crate) fn renumber_refs_in_place(
 }
 
 fn rewrite(obj: &mut Object, depth: usize, map: &CatalogFirstRenumber) -> crate::Result<()> {
-    if depth >= MAX_INLINE_DEPTH {
+    if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
             "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
              reference rewriting"
@@ -422,12 +413,10 @@ mod tests {
 
     #[test]
     fn collect_refs_accepts_nesting_up_to_the_limit() {
-        // Nesting just under the limit is walked normally and the buried
-        // reference is collected.
-        let obj = nest_in_arrays(
-            Object::Reference(ObjectRef::new(10, 0)),
-            MAX_INLINE_DEPTH - 1,
-        );
+        // The buried Reference sits at exactly inline depth MAX_INLINE_DEPTH,
+        // the deepest level accepted under the strict `>` guard; it is walked
+        // normally and collected, not errored.
+        let obj = nest_in_arrays(Object::Reference(ObjectRef::new(10, 0)), MAX_INLINE_DEPTH);
         let mut collected: Vec<ObjectRef> = Vec::new();
         collect_refs(&obj, 0, &mut |r| collected.push(r)).expect("within limit");
         assert_eq!(collected, vec![ObjectRef::new(10, 0)]);

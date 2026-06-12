@@ -30,11 +30,12 @@
 //!
 //! The four parts are always disjoint (invariant preserved by construction).
 
+use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm,
     ObjectStreamMode, PlannerConfig,
 };
-use crate::{Object, ObjectRef, Pdf};
+use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
@@ -104,28 +105,34 @@ impl SharedObjectHintEntry {
 /// Walks arrays, dictionaries, and stream dictionaries (but NOT stream data
 /// bytes). A `Reference(r)` is pushed to `out` as-is.  The caller is
 /// responsible for cycle detection and transitive expansion.
-fn collect_direct_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
+fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
     match obj {
         Object::Reference(r) => out.push(*r),
         Object::Array(arr) => {
             for elem in arr {
-                collect_direct_refs(elem, out);
+                collect_direct_refs(elem, depth + 1, out)?;
             }
         }
         Object::Dictionary(dict) => {
             for (_k, v) in dict.iter() {
-                collect_direct_refs(v, out);
+                collect_direct_refs(v, depth + 1, out)?;
             }
         }
         Object::Stream(s) => {
             // Only walk the stream dictionary; do not scan raw data bytes.
             for (_k, v) in s.dict.iter() {
-                collect_direct_refs(v, out);
+                collect_direct_refs(v, depth + 1, out)?;
             }
         }
         // Scalar types cannot contain refs.
         _ => {}
     }
+    Ok(())
 }
 
 /// Compute the transitive closure of objects reachable from `root`.
@@ -190,7 +197,7 @@ fn compute_closure<R: Read + Seek>(
                         // the queue traverse into ref targets normally.
                         let mut to_visit: Vec<ObjectRef> = Vec::new();
                         let mut seen_parents: BTreeSet<ObjectRef> = BTreeSet::new();
-                        collect_direct_refs(v, &mut to_visit);
+                        collect_direct_refs(v, 0, &mut to_visit)?;
 
                         while let Some(parent_ref) = to_visit.pop() {
                             if !seen_parents.insert(parent_ref) {
@@ -223,11 +230,11 @@ fn compute_closure<R: Read + Seek>(
                                 if pk == b"Parent" {
                                     // Climb to the next ancestor instead of
                                     // stopping at one level.
-                                    collect_direct_refs(pv, &mut to_visit);
+                                    collect_direct_refs(pv, 0, &mut to_visit)?;
                                     continue;
                                 }
                                 let mut refs = Vec::new();
-                                collect_direct_refs(pv, &mut refs);
+                                collect_direct_refs(pv, 0, &mut refs)?;
                                 for r in refs {
                                     if !visited.contains(&r) {
                                         queue.push_back(r);
@@ -238,7 +245,7 @@ fn compute_closure<R: Read + Seek>(
                         continue;
                     }
                     let mut refs = Vec::new();
-                    collect_direct_refs(v, &mut refs);
+                    collect_direct_refs(v, 0, &mut refs)?;
                     for r in refs {
                         if !visited.contains(&r) {
                             queue.push_back(r);
@@ -248,7 +255,7 @@ fn compute_closure<R: Read + Seek>(
             }
         } else {
             let mut refs = Vec::new();
-            collect_direct_refs(&obj, &mut refs);
+            collect_direct_refs(&obj, 0, &mut refs)?;
             for r in refs {
                 if !visited.contains(&r) {
                     queue.push_back(r);
@@ -1168,7 +1175,41 @@ impl LinearizationPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::MAX_INLINE_DEPTH;
     use std::io::Cursor;
+
+    // -----------------------------------------------------------------------
+    // Inline-depth guard
+    // -----------------------------------------------------------------------
+
+    fn nested_arrays(depth: usize) -> Object {
+        let mut o = Object::Null;
+        for _ in 0..depth {
+            o = Object::Array(vec![o]);
+        }
+        o
+    }
+
+    #[test]
+    fn collect_direct_refs_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_refs(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &mut out);
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_direct_refs_accepts_nesting_up_to_the_limit() {
+        let mut out = Vec::new();
+        // Bury one Reference so it is visited at exactly inline depth
+        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
+        // guard); it must be collected, not errored.
+        let mut o = Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]);
+        for _ in 0..(MAX_INLINE_DEPTH - 1) {
+            o = Object::Array(vec![o]);
+        }
+        collect_direct_refs(&o, 0, &mut out).unwrap();
+        assert_eq!(out, vec![ObjectRef::new(4, 0)]);
+    }
 
     // -----------------------------------------------------------------------
     // Fixture builders
