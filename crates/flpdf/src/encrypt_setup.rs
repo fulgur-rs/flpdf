@@ -165,6 +165,19 @@ impl EncryptParams {
             EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 | EncryptMethod::V4Rc4128
         )
     }
+
+    /// True when this method writes deprecated revision-5 (V=5 R=5,
+    /// pre-ISO 32000-2) AES-256 output. R=5 was dropped from the published
+    /// standard in favour of R=6, so the CLI gates *creating* R=5 files
+    /// behind `--allow-weak-crypto`, mirroring the reader, which rejects R=5
+    /// input unless the same opt-in is given.
+    ///
+    /// This is disjoint from [`is_weak_rc4`](Self::is_weak_rc4): R=5 still
+    /// uses AES-256, not RC4. Both classify methods the CLI refuses to write
+    /// without the explicit weak-crypto opt-in.
+    pub fn is_deprecated_r5(&self) -> bool {
+        matches!(self.method, EncryptMethod::V5R5Aes256)
+    }
 }
 
 /// Donor `/Encrypt` dictionary and derived file key for the
@@ -196,4 +209,33 @@ pub struct CopyEncryptionSource {
     /// Per-object key derivation algorithm implied by the donor's crypt filter.
     /// Always [`ObjectKeyAlg::Aes`] for the V=4 AES-128 scope.
     pub object_key_alg: ObjectKeyAlg,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_deprecated_r5_only_true_for_v5_r5() {
+        assert!(EncryptParams::v5_r5(b"u".to_vec(), b"o".to_vec()).is_deprecated_r5());
+        assert!(!EncryptParams::v5_r6(b"u".to_vec(), b"o".to_vec()).is_deprecated_r5());
+        assert!(!EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()).is_deprecated_r5());
+        assert!(
+            !EncryptParams::rc4(EncryptMethod::V1Rc440, b"u".to_vec(), b"o".to_vec())
+                .is_deprecated_r5()
+        );
+    }
+
+    #[test]
+    fn weak_rc4_and_deprecated_r5_classify_disjoint_methods() {
+        // R=5 is deprecated but AES-256, not RC4: the two weak-write
+        // classifiers must never both fire for one method.
+        let r5 = EncryptParams::v5_r5(b"u".to_vec(), b"o".to_vec());
+        assert!(r5.is_deprecated_r5() && !r5.is_weak_rc4());
+        let rc4 = EncryptParams::rc4(EncryptMethod::V2Rc4128, b"u".to_vec(), b"o".to_vec());
+        assert!(rc4.is_weak_rc4() && !rc4.is_deprecated_r5());
+        // The default 256-bit method (R=6) is neither.
+        let r6 = EncryptParams::v5_r6(b"u".to_vec(), b"o".to_vec());
+        assert!(!r6.is_deprecated_r5() && !r6.is_weak_rc4());
+    }
 }

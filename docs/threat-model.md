@@ -110,12 +110,14 @@ are not treated as vulnerabilities on their own:
   feature, not a bypass.
 - **Strength of legacy PDF cryptography.** Reading RC4- and MD5-based
   encryption (V=1/2/4, R=2/3/4) is required for compatibility and is not a
-  vulnerability. *Creating* RC4-weak output is gated behind an explicit
-  `--allow-weak-crypto` opt-in; that gate is not yet enforced on the CLI
-  R=5 (AES-256) *write* path, although the read path already requires the
-  opt-in for R=5 (tracked as `flpdf-hn1g.8`). AES-CBC without integrity
-  protection, MD5 in key derivation, etc. are properties of the PDF standard
-  security handler, not of flpdf.
+  vulnerability. *Creating* RC4-weak output, and creating deprecated R=5
+  (AES-256) output, is gated behind an explicit `--allow-weak-crypto`
+  opt-in — the same opt-in the reader requires to *decrypt* such files on the
+  normal open path. (Read-only detection probes — `is-encrypted`,
+  `requires-password` — deliberately bypass the gate, matching qpdf, since
+  merely identifying a weak file must not require the opt-in.) AES-CBC without
+  integrity protection, MD5 in key derivation, etc. are properties of the PDF
+  standard security handler, not of flpdf.
 - **Bugs inside dependencies** (`flate2`, RustCrypto crates, …) that flpdf
   does not reach or amplify with attacker-controlled input. These should be
   reported upstream; flpdf's responsibility is to update promptly. A
@@ -135,7 +137,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Cycle detection (visited sets) on iterative chain following: xref `/Prev` chains, outline `/Next` chains, field `/Parent` chains (an iterative `while`-loop with a visited set — terminating; the missing depth cap is hardening only, `flpdf-hn1g.3`) | `xref.rs` (`merge_previous_xref_sections`), `outline.rs` (`walk_outline`), `annotation_helper.rs`, `signatures.rs`, `json_inspect.rs` |
 | Checked arithmetic and non-negative validation on parser-derived sizes (`/Length` bounds, PNG-predictor row math, LZW table size cap of 4096 entries) | `parser.rs`, `filters.rs` |
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
-| Weak-crypto write gate: RC4 output requires the explicit `--allow-weak-crypto` opt-in (the R=5 AES-256 write path is not yet gated — see `flpdf-hn1g.8`) | `Error::Encrypted(WeakCryptoNotAllowed)`, CLI `--allow-weak-crypto` |
+| Weak-crypto write gate: RC4 output and deprecated R=5 (AES-256) output both require the explicit `--allow-weak-crypto` opt-in | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the write; the reader's parallel refusal on the open path is `Error::Encrypted(WeakCryptoNotAllowed)` |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `security/` |
 | Signed-PDF preserve-by-default policy (edits that would invalidate signatures are rejected unless explicitly opted in) | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Traversal boundaries on page closures: stop at other `Page`/`Catalog` dicts and skip `/Kids` on `/Pages` nodes; `/Parent` is intentionally followed upward for inherited resources, bounded by the `Page`/`Catalog` stop; no brute-force scans of all live objects | `page_closure.rs`, [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
@@ -179,7 +181,6 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
 | No opt-in decode-output limits and no `/Filter` chain length cap (compression bombs covered by §4, but mitigations are worth offering). | §4 mitigation | `flpdf-hn1g.4` |
-| The CLI R=5 (AES-256) write path (`--encrypt … 256 --force-R5`) creates deprecated R=5 output without the `--allow-weak-crypto` opt-in: `parse_encrypt_segment` returns `EncryptParams::v5_r5(...)` without the RC4-only `guard_weak`, although the read path already gates R=5 and §4 states weak-output creation is gated. | §4 weak-crypto gate | `flpdf-hn1g.8` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
 ## Appendix A: attack surface inventory
