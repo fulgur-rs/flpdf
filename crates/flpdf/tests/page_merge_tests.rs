@@ -2045,6 +2045,76 @@ fn merge_inherits_primary_acroform_dr_and_da() {
     );
 }
 
+// Regression guard: the primary's `/AcroForm` closure seed (its `/DR` font refs,
+// in the PRIMARY's object numbering) must be folded into the PRIMARY's copy
+// closure only — never a secondary's. A secondary is copied against ITS OWN
+// document, so a primary ref number injected into the secondary's closure would
+// resolve against the wrong document. This asymmetric fixture (primary `form_pdf`
+// with a `/DR /Helv` font; structurally different, smaller `single_font_pdf`
+// secondary at `/Courier`) keeps each input's fonts distinct and checks the
+// merged output keeps exactly one copy of each, the secondary page is intact,
+// and the result round-trips.
+//
+// Note: this is a GUARD test, not a discriminating one. The leak is benign in the
+// FINAL output by the merge architecture (fresh renumbering + `/Parent` reparent
+// in `materialize_leaf` + the final `sweep_unreachable_objects`): any stray copy
+// of a leaked secondary object is unreferenced and reclaimed by the sweep, so it
+// never reaches the output. Removing the `is_primary` gate does NOT make this
+// test fail (verified empirically). The fix's value is correctness-of-intent and
+// robustness — it stops resolving primary refs against the wrong document — not a
+// change visible in this fixture's final bytes.
+#[test]
+fn merge_primary_acroform_seed_does_not_leak_into_secondary() {
+    // PRIMARY: a form whose /AcroForm /DR references a Helvetica font (obj 5).
+    // Its closure_seed therefore holds primary object number 5.
+    let mut primary = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
+    // SECONDARY: a structurally different, smaller document with a single Courier
+    // font and NO /AcroForm — a different object layout/count from the primary.
+    let mut secondary = Pdf::open_mem_owned(single_font_pdf(b"Courier")).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut secondary,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // Both pages present in input order.
+    let root = pages_dict(&mut doc);
+    assert!(matches!(root.get("Count"), Some(Object::Integer(2))));
+    assert_eq!(pages::page_refs(&mut doc).unwrap().len(), 2);
+
+    // The secondary's copied page is intact: its font is still Courier (not
+    // displaced by a leaked primary ref resolving against the secondary).
+    assert_eq!(
+        leaf_base_font(&mut doc, 1),
+        b"Courier".to_vec(),
+        "secondary page's font must survive intact"
+    );
+
+    // Each input contributes EXACTLY its own font, with no stray/duplicate copies
+    // leaked from the primary's AcroForm seed into the secondary's closure.
+    assert_eq!(
+        count_font_objects(&mut doc, b"Helvetica"),
+        1,
+        "primary's /DR Helvetica font must be copied exactly once (no leak)"
+    );
+    assert_eq!(
+        count_font_objects(&mut doc, b"Courier"),
+        1,
+        "secondary's Courier font must be copied exactly once (no stray copy)"
+    );
+
+    // The merged output round-trips.
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
 // The primary's `/AcroForm /DA` stored as an INDIRECT reference must be remapped
 // to the copied object, not copied verbatim (which would leave a source object
 // number dangling). The output `/DA` must resolve to the original string.

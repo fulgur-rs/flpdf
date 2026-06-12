@@ -1097,8 +1097,14 @@ pub fn merge_documents<R: Read + Seek>(
 
         // Fold the primary's `/AcroForm /DR` / `/DA` fonts into the closure so a
         // `/DA` resource (e.g. `/Helv`) is copied and the output `/DR` can point
-        // at it after the remap. A no-op for secondary inputs.
-        closure.extend(primary_acroform.closure_seed.iter().copied());
+        // at it after the remap. Gated on the primary input: `primary_acroform`
+        // is read from the primary's source and its `closure_seed` holds the
+        // primary's object refs, which are meaningless against a secondary's
+        // numbering — folding them into a secondary's closure would resolve
+        // those refs against the wrong document.
+        if is_primary {
+            closure.extend(primary_acroform.closure_seed.iter().copied());
+        }
 
         // qpdf `--pages` null-out parity: a destination (annotation `/Dest`,
         // `/A /GoTo /D`, or page `/AA`) targeting a page NOT selected from this
