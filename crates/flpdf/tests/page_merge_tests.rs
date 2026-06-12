@@ -3696,3 +3696,274 @@ fn merge_trims_field_via_p_fallback_when_widgets_absent_from_annots() {
     write_pdf(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
+
+// ===========================================================================
+// codex H1/H2/H3: indirect path asymmetries in the merge primitive.
+// ===========================================================================
+
+/// Two-page primary whose `/Names /Dests` name-tree root is a DIRECT dictionary
+/// (inline on the catalog) with a `/Kids` array (an indirect sub-leaf), the
+/// normal shape for a name tree with more entries than fit one leaf. ISO 32000-2
+/// §7.9.6 lets a name-tree root carry `/Kids` instead of `/Names`; whether the
+/// root is inline-on-catalog or indirect is purely a serialization choice. The
+/// kid leaf (obj 30) carries a named dest to a surviving page (d_a → page0) and
+/// one to a removed page (d_b → page1, dropped when only [0] is selected).
+fn inline_dests_kids_root_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /Names << /Dests << /Kids [30 0 R] >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                30,
+                "<< /Limits [(d_a) (d_b)] \
+                 /Names [(d_a) [3 0 R /Fit] (d_b) [4 0 R /Fit]] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+// H2: an inline (direct-dict) `/Names /Dests` name-tree root whose root node is
+// a `/Kids` node (not a `/Names` leaf). The kid sub-leaf must be copied into the
+// output and the root's `/Kids` array remapped to it, so its named dests survive
+// the merge (d_a → surviving page0 remapped, not null; d_b → removed page1 kept
+// resolving to null). Before the fix the inline `/Kids` root was rebuilt with
+// its `/Kids` refs verbatim and the kid was never copied, so the kid resolved to
+// Null and every named dest was silently lost.
+#[test]
+fn merge_inherits_inline_dests_kids_root() {
+    let mut a = Pdf::open_mem_owned(inline_dests_kids_root_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1);
+    let page0 = refs[0];
+    let cat = catalog_dict(&mut doc);
+
+    let names = match cat.get("Names") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Names, got {other:?}"),
+    };
+    let root = match names.get("Dests") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        other => panic!("expected /Dests root, got {other:?}"),
+    };
+    // The root keeps its /Kids shape; the single kid ref must be remapped to a
+    // copied object (NOT the source obj 30) that resolves to a real leaf dict.
+    let kids = match root.get("Kids") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected /Dests /Kids array, got {other:?}"),
+    };
+    assert_eq!(kids.len(), 1, "the single /Kids sub-leaf is inherited");
+    let kid_ref = match &kids[0] {
+        Object::Reference(r) => *r,
+        o => panic!("expected /Kids[0] indirect ref, got {o:?}"),
+    };
+    let kid = match doc.resolve(kid_ref).unwrap() {
+        Object::Dictionary(d) => d,
+        other => panic!("the /Kids sub-leaf must be copied, not Null: {other:?}"),
+    };
+    let pairs = match kid.get("Names") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected sub-leaf /Names array, got {other:?}"),
+    };
+    assert_eq!(pairs.len(), 4, "both named dests inherited (d_a, d_b)");
+
+    // d_a → surviving page0: remapped to its new ref, NOT null.
+    let (da_ref, da_null) = dest_array_first(
+        &mut doc,
+        match &pairs[1] {
+            Object::Array(a) => a,
+            o => panic!("d_a dest: {o:?}"),
+        },
+    );
+    assert_eq!(
+        da_ref, page0,
+        "inline /Kids-root named dest d_a remaps to page0"
+    );
+    assert!(!da_null, "surviving named dest must not be nulled");
+
+    // d_b → removed page1: reference kept, resolves to null.
+    let (_db_ref, db_null) = dest_array_first(
+        &mut doc,
+        match &pairs[3] {
+            Object::Array(a) => a,
+            o => panic!("d_b dest: {o:?}"),
+        },
+    );
+    assert!(db_null, "removed named dest target must resolve to null");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Two-page primary whose inline `/OpenAction` GoTo action's `/Next` is an
+/// INDIRECT reference (obj 12) that resolves to an ARRAY of actions. The array
+/// element is itself a GoTo to the second selected page. Before the fix the
+/// indirect `/Next` resolving to an array was routed through `remap_inline_dest`
+/// (which only touches `arr[0]` as a page ref), so the array element's inner
+/// `/D` page ref was never remapped — leaving the survivor mispointed.
+fn inline_open_action_indirect_next_array_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoTo /D [3 0 R /Fit] /Next 12 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (12, "[ << /S /GoTo /D [4 0 R /Fit] >> ]"),
+        ],
+        1,
+    )
+}
+
+// H1: an inline `/OpenAction`'s `/Next` is an indirect ref resolving to an array
+// of actions. Each array element must be treated as an action and have its `/D`
+// page ref remapped (mirroring the inline-`/Next`-array arm). The top `/D[0]`
+// remaps to page0 and the `/Next`-array element's `/D[0]` remaps to page1.
+#[test]
+fn merge_inline_open_action_indirect_next_array_remapped() {
+    let mut a = Pdf::open_mem_owned(inline_open_action_indirect_next_array_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2);
+    let (page0, page1) = (refs[0], refs[1]);
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline /OpenAction dict, got {other:?}"),
+    };
+
+    let top_d = match oa.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /OpenAction /D array, got {other:?}"),
+    };
+    assert_eq!(dest_array_first(&mut doc, &top_d).0, page0, "/D[0] → page0");
+
+    // /Next resolved to an array; its single action element's /D[0] must be
+    // remapped to page1 (NOT left at the unmapped source ref).
+    let next = match oa.get("Next") {
+        Some(Object::Array(a)) => a.clone(),
+        // The indirect /Next may be re-wired either inline-resolved or as a
+        // copied indirect ref; resolve it either way.
+        Some(Object::Reference(r)) => match doc.resolve(*r).unwrap() {
+            Object::Array(a) => a,
+            other => panic!("expected /Next ref to resolve to array, got {other:?}"),
+        },
+        other => panic!("expected /Next array, got {other:?}"),
+    };
+    assert_eq!(next.len(), 1, "/Next array has one action element");
+    let n0 = match &next[0] {
+        Object::Dictionary(d) => d.clone(),
+        Object::Reference(r) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        o => panic!("/Next[0] action: {o:?}"),
+    };
+    let n0_d = match n0.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        o => panic!("/Next[0] /D: {o:?}"),
+    };
+    assert_eq!(
+        dest_array_first(&mut doc, &n0_d).0,
+        page1,
+        "/Next-array element /D[0] must remap to page1"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Three-page primary whose page 0 reaches its annotations through a MULTI-HOP
+/// indirect `/Annots` chain (obj 20 → obj 21 → the array). The sole annotation
+/// (obj 6) carries a `/Dest` to the removed page2. Before the fix the removed
+/// scan resolved `/Annots` only one level (landing on the `21 0 R` reference,
+/// not the array), so the annotation was never scanned and its removed dest was
+/// copied by the closure but left un-nulled (a live off-tree orphan page).
+fn three_page_multihop_annots_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots 20 0 R >>",
+            ),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                6,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [5 0 R /Fit] >>",
+            ),
+            (20, "21 0 R"),
+            (21, "[6 0 R]"),
+        ],
+        1,
+    )
+}
+
+// H3: a multi-hop indirect `/Annots` chain (20 → 21 → array). The removed-target
+// scan must follow the full reference chain to reach the annotation array, so an
+// annotation `/Dest` to a removed page is nulled (not left as a live orphan).
+#[test]
+fn merge_multihop_indirect_annots_nulls_removed_dest() {
+    let mut a = Pdf::open_mem_owned(three_page_multihop_annots_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2, "removed page2 is absent from /Kids");
+    let page0_ref = refs[0];
+
+    // Chase the multi-hop /Annots chain explicitly (the merge preserves the
+    // 2-hop indirection, so a one-level resolve would land on a Reference).
+    let page0 = doc.resolve(page0_ref).unwrap().into_dict().unwrap();
+    let mut annots_val = page0.get("Annots").cloned();
+    let annot_arr = loop {
+        match annots_val {
+            Some(Object::Array(arr)) => break arr,
+            Some(Object::Reference(r)) => annots_val = Some(doc.resolve(r).unwrap()),
+            other => panic!("expected /Annots chain to reach an array, got {other:?}"),
+        }
+    };
+    assert_eq!(annot_arr.len(), 1, "the sole annotation is retained");
+    let annot_ref = match &annot_arr[0] {
+        Object::Reference(r) => *r,
+        o => panic!("expected annotation ref, got {o:?}"),
+    };
+
+    // The annotation's /Dest targets the removed page2: it must be nulled even
+    // though /Annots was reached through a multi-hop indirect chain.
+    let (_removed_dest, removed_is_null) = annot_dest_ref(&mut doc, annot_ref);
+    assert!(
+        removed_is_null,
+        "removed-target /Dest behind a multi-hop indirect /Annots must be nulled"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}

@@ -93,8 +93,13 @@ fn collect_removed_dest_targets<R: Read + Seek>(
     // null target).
     let annot_elems: Vec<Object> = match annots_val {
         Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match source.resolve_borrowed(r)? {
-            Object::Array(arr) => arr.clone(),
+        // /Annots may be reached through a multi-hop indirect chain (a ref to a
+        // ref to the array); follow the whole chain via resolve_ref_chain so the
+        // terminal array is reached (a one-level resolve would stop on an
+        // intermediate Reference and miss the annotations). resolve_ref_chain
+        // returns an owned Object, so no clone is needed.
+        Some(r @ Object::Reference(_)) => match resolve_ref_chain(source, &r)?.0 {
+            Object::Array(arr) => arr,
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -326,10 +331,11 @@ struct PrimaryDocLevel {
     outlines: Option<ObjectRef>,
     /// Indirect name-tree root held under the catalog's `/Names /Dests`.
     names_dests: Option<ObjectRef>,
-    /// Direct `/Names /Dests` name-tree root (inline single leaf). ISO 32000
+    /// Direct `/Names /Dests` name-tree root (inline on the catalog). ISO 32000
     /// permits a name-tree root to be a direct dictionary — it is referenced
     /// only from `/Names /Dests`, so a producer may inline it; an indirect root
-    /// is a producer convention, not a spec rule. Both forms are handled.
+    /// is a producer convention, not a spec rule. The root may be a `/Names`
+    /// leaf or a `/Kids` node (§7.9.6); both shapes are handled.
     names_dests_inline: Option<Dictionary>,
     /// Indirect legacy `/Catalog /Dests` dictionary ref.
     legacy_dests_ref: Option<ObjectRef>,
@@ -432,6 +438,20 @@ fn fold_doc_level_closure<R: Read + Seek>(
     if let Some(inline) = &doc.open_action_inline {
         fold_inline_action_operands(source, inline, closure, MAX_ACTION_CHAIN_DEPTH)?;
     }
+    // An INLINE (on-catalog) `/Names /Dests` name-tree root is likewise not an
+    // indirect root. When such a root is a `/Kids` node (ISO 32000-2 §7.9.6: a
+    // name-tree root may carry `/Kids` instead of `/Names`), its sub-leaf
+    // objects are not pulled in by the loop above. Fold each kid ref through the
+    // transitive closure so the sub-leaves (and their destinations) are copied,
+    // mirroring what the indirect `names_dests` root gets for free.
+    if let Some(inline) = &doc.names_dests_inline {
+        if let Some(Object::Array(kids)) = inline.get("Kids") {
+            let kid_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
+            for kid in kid_refs {
+                closure.extend(page_object_closure(source, kid)?);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -476,16 +496,21 @@ fn fold_inline_action_operands<R: Read + Seek>(
         // back-pointer, matching the field-tree closure discipline.
         collect_refs_in_object(source, value, closure, &mut seen, 0, true)?;
     }
-    // Follow the `/Next` continuation chain (single action or array) so a
-    // continuation's operands are folded too.
+    // Follow the `/Next` continuation chain so a continuation's operands are
+    // folded too. `/Next` may be a single action, an array of actions, or an
+    // indirect ref to either; resolve the chain first so an indirect `/Next`
+    // resolving to an array is folded as actions (each element recursed), not
+    // skipped as a bare-dest array (which would hit the `into_dict()` early
+    // return). Mirrors remap_next_continuation on the remap side.
     if let Some(next_val) = dict.get("Next") {
-        match next_val {
+        let (concrete, _) = resolve_ref_chain(source, next_val)?;
+        match concrete {
             Object::Array(elems) => {
-                for elem in elems {
+                for elem in &elems {
                     fold_inline_action_operands(source, elem, closure, depth - 1)?;
                 }
             }
-            single => fold_inline_action_operands(source, single, closure, depth - 1)?,
+            single => fold_inline_action_operands(source, &single, closure, depth - 1)?,
         }
     }
     Ok(())
@@ -731,10 +756,10 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
         }
     }
     // /Names /Dests: indirect root → wire copied ref; inline root → reconstruct
-    // the single leaf from the renumber map (the catalog is never copied, so an
-    // inline root's dest page refs are remapped here, like inline legacy /Dests).
-    // Either way a minimal /Names holder carries only the inherited /Dests name
-    // tree (sibling name trees are not merged).
+    // it from the renumber map (the catalog is never copied, so an inline root's
+    // dest page refs and `/Kids` sub-leaf refs are remapped here, like inline
+    // legacy /Dests). Either way a minimal /Names holder carries only the
+    // inherited /Dests name tree (sibling name trees are not merged).
     if let Some(dests) = doc.names_dests {
         if let Some(&new_ref) = map.get(&dests) {
             let mut names = Dictionary::new();
@@ -840,33 +865,50 @@ fn remap_inline_dest_depth<R: Read + Seek>(
 /// Reconstruct an inline (direct-dictionary) `/Names /Dests` name-tree root,
 /// remapping each destination in its `/Names` `[(key) dest (key) dest …]` array
 /// (the dests are the odd-indexed elements) through `map` via
-/// [`remap_inline_dest`]. Other keys (`/Limits`) are kept verbatim.
+/// [`remap_inline_dest`], and remapping each `/Kids` sub-leaf reference through
+/// `map` to its copied object. Other keys (`/Limits`) are kept verbatim.
 ///
-/// Only the inline leaf's own `/Names` dests are remapped: an inline root with
-/// indirect `/Kids` sub-leaves is pathological (producers inline a `/Dests` root
-/// precisely because it is a small single leaf), and those sub-leaves are not
-/// copied, so their refs are left untouched. Removed targets carried anywhere in
-/// the tree are still nulled — [`collect_name_tree_removed_targets`] enumerates
-/// leaf and `/Kids` dests when collecting the null-out set.
+/// Per ISO 32000-2 §7.9.6 a name-tree root may carry `/Names`, `/Kids`, or both.
+/// A `/Kids` root is the normal shape once there are more entries than fit one
+/// leaf; whether the root is inline-on-catalog or indirect is purely a
+/// serialization choice. The kid sub-leaves are folded into the copy closure (so
+/// they are copied) by [`fold_doc_level_closure`], and `copy_objects` remaps the
+/// destinations *inside* each copied leaf; this function only rewrites the top
+/// `/Kids` refs to point at those copies. A kid absent from `map` keeps its
+/// source ref (which was copied as a placeholder and nulled), matching the
+/// destination null-out. Removed targets carried anywhere in the tree are nulled
+/// — [`collect_name_tree_removed_targets`] enumerates leaf and `/Kids` dests when
+/// collecting the null-out set.
 fn remap_inline_name_tree_root<R: Read + Seek>(
     source: &mut Pdf<R>,
     leaf: &Dictionary,
     map: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<Dictionary> {
     let mut out = leaf.clone();
-    // A leaf with no /Names array (e.g. a /Kids-only intermediate node used
-    // directly as the root) has no own dests to remap; its /Kids refs are left
-    // untouched (see the doc note above), so only the /Names-array arm acts.
-    let Some(Object::Array(names)) = leaf.get("Names") else {
-        return Ok(out); // cov:ignore: inline root is always a single /Names leaf in practice; /Kids-only direct root is pathological
-    };
-    let mut rebuilt = names.clone();
-    let mut i = 1;
-    while i < rebuilt.len() {
-        rebuilt[i] = remap_inline_dest(source, &rebuilt[i], map)?;
-        i += 2;
+    // A leaf root: remap its own `/Names` array dests (the odd-indexed elements).
+    if let Some(Object::Array(names)) = leaf.get("Names") {
+        let mut rebuilt = names.clone();
+        let mut i = 1;
+        while i < rebuilt.len() {
+            rebuilt[i] = remap_inline_dest(source, &rebuilt[i], map)?;
+            i += 2;
+        }
+        out.insert("Names", Object::Array(rebuilt));
     }
-    out.insert("Names", Object::Array(rebuilt));
+    // A `/Kids` root: remap each sub-leaf ref to its copied object (mirroring the
+    // `arr[0]` page-ref remap in remap_inline_dest_depth). Every kid ref was
+    // folded into the copy closure by fold_doc_level_closure, so it is always
+    // present in `map`; an unmapped ref (or a malformed non-ref element) is left
+    // verbatim by falling back to its current value.
+    if let Some(Object::Array(kids)) = leaf.get("Kids") {
+        let mut rebuilt = kids.clone();
+        for kid in &mut rebuilt {
+            if let Object::Reference(r) = kid {
+                *kid = Object::Reference(map.get(r).copied().unwrap_or(*r));
+            }
+        }
+        out.insert("Kids", Object::Array(rebuilt));
+    }
     Ok(out)
 }
 
@@ -940,24 +982,48 @@ fn remap_inline_action_depth<R: Read + Seek>(
                 };
                 out.insert("D", remapped);
             }
-            // /Next — a single action or an array of actions. Recurse into each
-            // at `depth - 1` so a continuation's /D is remapped too.
+            // /Next — a single action, an array of actions, or an indirect ref to
+            // either. Recurse into each at `depth - 1` so a continuation's /D is
+            // remapped too. An indirect ref that resolves to an array is an array
+            // OF ACTIONS (not a destination array), so resolve the chain first and
+            // route an array through the per-element action recursion — mirroring
+            // collect_action_chain_targets / the inline-array arm. (The top-level
+            // Object::Array arm above is for a bare-dest `/OpenAction` array, which
+            // `/Next` is never.)
             if let Some(next) = next {
-                let remapped_next = match next {
-                    Object::Array(elems) => {
-                        let mut rebuilt = Vec::with_capacity(elems.len());
-                        for elem in &elems {
-                            rebuilt.push(remap_inline_action_depth(source, elem, map, depth - 1)?);
-                        }
-                        Object::Array(rebuilt)
-                    }
-                    single => remap_inline_action_depth(source, &single, map, depth - 1)?,
-                };
+                let remapped_next = remap_next_continuation(source, &next, map, depth)?;
                 out.insert("Next", remapped_next);
             }
             Ok(Object::Dictionary(out))
         }
         other => Ok(other),
+    }
+}
+
+/// Remap a `/Next` continuation value: a single action, an array of actions, or
+/// an indirect reference resolving to either. The chain is resolved via
+/// [`resolve_ref_chain`] so an indirect `/Next` is reached; if it resolves to an
+/// array, the array is treated as a list of actions (each element recursed as an
+/// action through [`remap_inline_action_depth`]) — NOT as a destination array,
+/// since a `/Next` continuation always carries actions (ISO 32000-2 §12.6.3). A
+/// non-array continuation is recursed directly. Bounded by `depth` (inline
+/// nesting) and [`resolve_ref_chain`] (reference indirection).
+fn remap_next_continuation<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    next: &Object,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+    depth: usize,
+) -> Result<Object> {
+    let (concrete, _) = resolve_ref_chain(source, next)?;
+    match concrete {
+        Object::Array(elems) => {
+            let mut rebuilt = Vec::with_capacity(elems.len());
+            for elem in &elems {
+                rebuilt.push(remap_inline_action_depth(source, elem, map, depth - 1)?);
+            }
+            Ok(Object::Array(rebuilt))
+        }
+        single => remap_inline_action_depth(source, &single, map, depth - 1),
     }
 }
 
@@ -1410,10 +1476,11 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// (and the legacy `/Catalog /Dests` dictionary), and `/OpenAction` are copied
 /// into the output and their destinations remapped to the copied page refs.
 /// Later inputs contribute pages only — their outlines and named destinations
-/// are not merged. A direct (inline) `/Names /Dests` name-tree root is remapped
-/// only at its own leaf: an inline root with indirect `/Kids` sub-leaves is not
-/// remapped beyond that leaf (such a root is pathological — producers inline a
-/// `/Dests` root precisely because it is a small single leaf).
+/// are not merged. A direct (inline) `/Names /Dests` name-tree root is inherited
+/// in either ISO 32000-2 §7.9.6 shape: a `/Names` leaf has its destinations
+/// remapped, and a `/Kids` root has its sub-leaves copied and its `/Kids`
+/// references remapped to those copies, so the named destinations survive in
+/// both forms.
 ///
 /// A destination (annotation `/Dest`, an `/A` or `/AA` `/GoTo` action, including
 /// `/Next` continuations and `/GoTo /SD` structure destinations, plus the
