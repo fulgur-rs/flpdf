@@ -1420,6 +1420,12 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 ///
 /// # Errors
 ///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
+/// is combined with encrypted output ([`WriteOptions::encrypt`] or
+/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
+/// produced once the bytes are encrypted, so the combination is rejected up
+/// front (the linearized writer emits plaintext only).
+///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
 /// object (catalog, page, shared, or body object) has no entry in the
@@ -1438,6 +1444,20 @@ pub fn write_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriteOptions,
 ) -> Result<LinearizedDocument> {
+    // The linearized writer emits plaintext only — it does not implement
+    // encryption. A deterministic `/ID` feeds the encryption key, so a
+    // content-derived `/ID` cannot be computed before the encrypted bytes
+    // exist; qpdf rejects the same combination. Mirror the flat
+    // (`crate::writer::write_pdf_full_rewrite`) guard so both write paths
+    // behave identically rather than silently producing a plaintext file with
+    // a deterministic `/ID`.
+    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+    if options.deterministic_id && encrypting {
+        return Err(crate::Error::Unsupported(
+            "the deterministic-id option is incompatible with encrypted output files".to_string(),
+        ));
+    }
+
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
@@ -2925,5 +2945,73 @@ mod tests {
         );
         crate::linearization::check_linearization_bytes(&out)
             .expect("static-id linearized output must pass the linearization checker");
+    }
+
+    /// `--deterministic-id` combined with encryption is rejected up front:
+    /// the linearized writer emits plaintext only, and a content-derived `/ID`
+    /// cannot be computed once the bytes are encrypted. Mirrors the flat
+    /// (`write_pdf_full_rewrite`) guard, including its wording.
+    #[test]
+    fn deterministic_id_linearized_rejects_encrypt() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            "got {err:?}"
+        );
+    }
+
+    /// As [`deterministic_id_linearized_rejects_encrypt`] but for the
+    /// `copy_encryption` donor path.
+    #[test]
+    fn deterministic_id_linearized_rejects_copy_encryption() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            "got {err:?}"
+        );
+    }
+
+    /// Regression: `--deterministic-id` without encryption must still succeed
+    /// (the guard must reject only the *combination*).
+    #[test]
+    fn deterministic_id_linearized_without_encryption_succeeds() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("deterministic-id without encryption must succeed");
     }
 }
