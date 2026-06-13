@@ -1944,6 +1944,58 @@ fn merge_inline_legacy_dests_non_array_remapped() {
     assert!(d_nod.get("D").is_none(), "no-/D dict dest stays without /D");
 }
 
+// M3: an inline (on-catalog) dest array whose LEADING page ref is itself a
+// holder chain (`30 0 R → 3 0 R`, the page) must remap to the copied page. The
+// copy map keys pages by their terminal ref, so a one-hop match on the holder
+// `30 0 R` misses and emits the uncopied source holder (resolving to Null);
+// terminal normalization matches the page and remaps to the new page0.
+#[test]
+fn merge_inline_dest_holder_chain_leading_ref_remapped() {
+    let pdf = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /Dests << /d_holder << /D [30 0 R /Fit] >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (30, "3 0 R"), // holder: 30 0 R -> 3 0 R (page0)
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(pdf).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 1);
+    let page0 = refs[0];
+    let cat = catalog_dict(&mut doc);
+    let legacy = match cat.get("Dests") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected inline legacy /Dests, got {other:?}"),
+    };
+    let d_holder = match legacy.get("d_holder") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /d_holder dict dest, got {other:?}"),
+    };
+    let arr = match d_holder.get("D") {
+        Some(Object::Array(a)) => a.clone(),
+        other => panic!("expected /d_holder /D array, got {other:?}"),
+    };
+    let (first, is_null) = dest_array_first(&mut doc, &arr);
+    assert_eq!(first, page0, "holder-chain leading ref remaps to new page0");
+    assert!(
+        !is_null,
+        "surviving holder-chain dest must not resolve to null"
+    );
+}
+
 // F2: an inline (on-catalog) /OpenAction GoTo action whose /Next continuation is
 // itself a GoTo to a different page must have BOTH /D destinations remapped. The
 // pre-fix `remap_inline_action` rewrote only the top-level /D and never recursed
