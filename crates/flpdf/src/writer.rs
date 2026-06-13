@@ -3678,16 +3678,17 @@ mod tests {
 
     fn trailer_id_pair(output: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let pdf = crate::Pdf::open_mem(output).expect("output must re-open");
-        match pdf.trailer().get("ID") {
-            Some(Object::Array(values)) if values.len() == 2 => {
-                let extract = |o: &Object| match o {
-                    Object::String(s) => s.clone(),
-                    other => panic!("/ID element is not a string: {other:?}"),
-                };
-                (extract(&values[0]), extract(&values[1]))
-            }
-            other => panic!("expected a 2-element /ID array, got {other:?}"),
-        }
+        let id = pdf
+            .trailer()
+            .get("ID")
+            .and_then(Object::as_array)
+            .expect("trailer /ID must be an array");
+        let extract = |o: &Object| {
+            o.as_string()
+                .expect("/ID element must be a string")
+                .to_vec()
+        };
+        (extract(&id[0]), extract(&id[1]))
     }
 
     /// Parse the `startxref` offset from the tail of a PDF — equals the byte
