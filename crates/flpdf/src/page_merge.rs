@@ -13,7 +13,7 @@ use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::object_copy::copy_objects;
 use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
 use crate::outline_dest_remap::dest_page_ref_resolved;
-use crate::page_closure::page_object_closure;
+use crate::page_closure::extend_page_object_closure;
 use crate::page_extract::{
     append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
     sd_target_page_ref, target_pages_root, InheritedAttrs,
@@ -436,7 +436,8 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
 }
 
 /// Fold every indirect document-level carrier of `doc` into `closure` via the
-/// complete transitive [`page_object_closure`] (which stops at `Page`/`Catalog`
+/// complete transitive [`page_object_closure`](crate::page_closure::page_object_closure)
+/// (which stops at `Page`/`Catalog`
 /// dicts, collecting a destination page as a leaf reference without descending).
 /// This makes the primary's single `copy_objects` pass copy the whole outline /
 /// name-tree / action graph and remap every destination in one rewrite — no
@@ -455,7 +456,14 @@ fn fold_doc_level_closure<R: Read + Seek>(
     .into_iter()
     .flatten()
     {
-        closure.extend(page_object_closure(source, root)?);
+        // Thread one `visited` set (the accumulating `closure`) through every
+        // doc-level root so a subtree reachable from several roots (e.g. a page
+        // referenced by both an outline item and the `/OpenAction`) is walked
+        // once for the union. Behaviour-preserving: the shared-visited union
+        // equals the independent union (start refs are force-traversed; non-start
+        // `Page`/`Catalog` leaves stop in both walks). None of these roots is a
+        // `Page`/`Catalog`, so force-traversal never expands a sibling page.
+        extend_page_object_closure(source, root, closure)?;
     }
     // An INLINE (on-catalog) `/OpenAction` is not an indirect root, so its
     // operand objects (e.g. a `/JavaScript` action's `/JS` string) are not pulled
@@ -472,9 +480,11 @@ fn fold_doc_level_closure<R: Read + Seek>(
     // mirroring what the indirect `names_dests` root gets for free.
     if let Some(inline) = &doc.names_dests_inline {
         if let Some(Object::Array(kids)) = inline.get("Kids") {
-            let kid_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
-            for kid in kid_refs {
-                closure.extend(page_object_closure(source, kid)?);
+            // `kids` borrows `doc`, disjoint from the `&mut source` the fold
+            // needs, so iterate the filter-mapped refs directly — no intermediate
+            // `Vec`.
+            for kid in kids.iter().filter_map(Object::as_ref_id) {
+                extend_page_object_closure(source, kid, closure)?;
             }
         }
     }
@@ -483,12 +493,13 @@ fn fold_doc_level_closure<R: Read + Seek>(
     // outline items (and their destination pages) are copied, mirroring what the
     // indirect `outlines` root gets for free.
     if let Some(inline) = &doc.outlines_inline {
-        let child_refs: Vec<ObjectRef> = ["First", "Last"]
+        // `inline` borrows `doc`, disjoint from the `&mut source` the fold needs,
+        // so iterate the resolved child refs directly — no intermediate `Vec`.
+        for child in ["First", "Last"]
             .into_iter()
             .filter_map(|key| inline.get_ref(key))
-            .collect();
-        for child in child_refs {
-            closure.extend(page_object_closure(source, child)?);
+        {
+            extend_page_object_closure(source, child, closure)?;
         }
     }
     Ok(())
@@ -507,7 +518,8 @@ const ACTION_DEST_KEYS: [&[u8]; 5] = [b"D", b"SD", b"Dest", b"Next", b"Parent"];
 /// non-destination operand such as a `/JavaScript` action's `/JS` string is
 /// copied into the output. Destination/structural keys ([`ACTION_DEST_KEYS`]) are
 /// skipped — their pages are handled by the destination null-out path, mirroring
-/// what the indirect-`/OpenAction` root gets for free from [`page_object_closure`]
+/// what the indirect-`/OpenAction` root gets for free from
+/// [`page_object_closure`](crate::page_closure::page_object_closure)
 /// (which stops at `Page`/`Catalog` boundaries). Bounded by `depth` (inline
 /// `/Next` nesting) and [`resolve_ref_chain`] (reference indirection); the
 /// `collect_refs_in_object` operand walk is itself depth- and cycle-bounded.
@@ -1775,10 +1787,15 @@ pub fn merge_documents<R: Read + Seek>(
 
         // UNION of the per-page transitive closures, then ONE deep-copy pass
         // into the growing target: a single renumbering map means an object
-        // shared by several selected pages of this input is copied once.
+        // shared by several selected pages of this input is copied once. The
+        // closures share one `visited` set so a subtree reachable from several
+        // selected pages of THIS input is walked once for the union, not once
+        // per referencing page (extract_pages parity, flpdf-11lj). The set is
+        // local to this input — never shared across inputs, whose distinct
+        // source docs and numbering would alias.
         let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
         for &page_ref in &unique {
-            closure.extend(page_object_closure(input.source, page_ref)?);
+            extend_page_object_closure(input.source, page_ref, &mut closure)?;
         }
 
         // Fold the primary's document-level carriers (outline tree, name-tree
