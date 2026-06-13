@@ -2172,9 +2172,17 @@ fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
 ///
 /// 1. `det_data` = lowercase hex of `md5(bytes[0..=id_array_offset])` — qpdf
 ///    captures the running digest immediately after writing `" /ID ["`, so the
-///    range is inclusive of the `[`.
+///    range is inclusive of the `[`. qpdf computes this body digest with
+///    `Pl_MD5`, which hashes the full byte range regardless of any embedded NUL.
 /// 2. `seed` = `det_data` + `" QPDF "` + `info_suffix`.
-/// 3. `/ID[1]` (changing identifier) = `md5(seed)`.
+/// 3. `/ID[1]` (changing identifier) = `md5(seed)`, but the seed is truncated at
+///    its first NUL byte before hashing. qpdf hashes the seed with
+///    `MD5::encodeString(seed.c_str())`, which treats the seed as a C string and
+///    stops at the first NUL (`strlen`). The hex `det_data` and `" QPDF "` are
+///    NUL-free, so any NUL originates in `info_suffix` (e.g. a UTF-16BE `/Info`
+///    string, whose `00xx` code units carry NUL bytes); everything from the
+///    first NUL onward is excluded from the changing identifier exactly as qpdf
+///    excludes it.
 /// 4. `/ID[0]` (permanent identifier) = `source_id0` when present, else `/ID[1]`.
 fn compute_deterministic_id(
     bytes: &[u8],
@@ -2189,7 +2197,11 @@ fn compute_deterministic_id(
     push_hex_lower(&mut seed, det_data.as_slice());
     seed.extend_from_slice(b" QPDF ");
     seed.extend_from_slice(info_suffix);
-    let id1: [u8; 16] = md5::Md5::digest(&seed).into();
+    // qpdf hashes the seed as a C string (`encodeString(seed.c_str())`), so it
+    // stops at the first NUL. Mirror that strlen truncation; the leading hex
+    // det_data and " QPDF " are NUL-free, so a NUL can only come from /Info.
+    let seed_hash_input = &seed[..seed.iter().position(|&b| b == 0).unwrap_or(seed.len())];
+    let id1: [u8; 16] = md5::Md5::digest(seed_hash_input).into();
     let id0 = source_id0.unwrap_or(id1);
     (id0, id1)
 }
@@ -3923,7 +3935,9 @@ mod tests {
     /// Re-derive qpdf's two-level deterministic `/ID[1]` (changing identifier)
     /// from an output PDF and the expected `/Info` seed suffix. This mirrors
     /// `compute_deterministic_id` so a wrong digest range, seed order, or
-    /// `/Info` handling in the writer would make the assertion fail.
+    /// `/Info` handling in the writer would make the assertion fail. The seed is
+    /// truncated at its first NUL byte before the final hash, matching qpdf's
+    /// `encodeString(seed.c_str())` strlen behaviour.
     fn expected_changing_id(output: &[u8], info_suffix: &[u8]) -> [u8; 16] {
         use md5::Digest as _;
         let bracket = id_array_bracket_offset(output);
@@ -3934,7 +3948,8 @@ mod tests {
         }
         seed.extend_from_slice(b" QPDF ");
         seed.extend_from_slice(info_suffix);
-        md5::Md5::digest(&seed).into()
+        let truncated = &seed[..seed.iter().position(|&b| b == 0).unwrap_or(seed.len())];
+        md5::Md5::digest(truncated).into()
     }
 
     #[test]
@@ -4156,6 +4171,76 @@ mod tests {
             trailer_id_pair(&with_empty_info).1,
             expected_changing_id(&with_empty_info, b"").to_vec(),
             "an /Info with no string entries contributes nothing to the seed"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_truncates_seed_at_first_nul() {
+        // qpdf hashes the seed via `encodeString(seed.c_str())`, which stops at
+        // the first NUL (strlen). A /Title carrying a NUL (here a UTF-16BE
+        // string: BOM FEFF, then NUL-bearing code units) must therefore
+        // contribute only the bytes BEFORE its first NUL to /ID[1]. The hex
+        // string <feff0041> decodes to [0xFE, 0xFF, 0x00, 0x41], so the /Info
+        // suffix is b" \xfe\xff\x00A" and the seed is truncated just after
+        // b" \xfe\xff".
+        let out = write_det_id(&build_det_id_source(
+            "/Info 3 0 R",
+            &["3 0 obj\n<< /Title <feff0041> >>\nendobj\n"],
+        ));
+        // expected_changing_id truncates the (suffix) seed at its first NUL too,
+        // so passing the FULL suffix asserts the writer applied the same cut.
+        assert_eq!(
+            trailer_id_pair(&out).1,
+            expected_changing_id(&out, b" \xfe\xff\x00A").to_vec(),
+            "/ID[1] must be md5 of the seed truncated at the first NUL"
+        );
+        // Self-sufficient discriminator: the truncated /ID[1] must DIFFER from
+        // the digest of the full (untruncated) seed, proving the cut happened.
+        use md5::Digest as _;
+        let bracket = id_array_bracket_offset(&out);
+        let det_data = md5::Md5::digest(&out[..=bracket]);
+        let mut full_seed = Vec::new();
+        for byte in det_data.iter() {
+            full_seed.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        full_seed.extend_from_slice(b" QPDF ");
+        full_seed.extend_from_slice(b" \xfe\xff\x00A");
+        let untruncated: [u8; 16] = md5::Md5::digest(&full_seed).into();
+        assert_ne!(
+            trailer_id_pair(&out).1,
+            untruncated.to_vec(),
+            "hashing the full (untruncated) seed must NOT match — the NUL cut is load-bearing"
+        );
+    }
+
+    #[test]
+    fn compute_deterministic_id_ignores_seed_bytes_after_first_nul() {
+        // Isolated proof of seed truncation: with the body digest pinned (same
+        // `bytes` and `id_array_offset`), only the info_suffix varies. qpdf's
+        // strlen cut means bytes from the first NUL onward are excluded from the
+        // changing identifier. (An end-to-end /Info test cannot isolate this:
+        // the post-NUL bytes also feed the full-output body digest, so they
+        // would change /ID[1] through det_data regardless of truncation.)
+        let bytes = b"anything[";
+        let offset = bytes.len() - 1; // the `[`
+        let a = compute_deterministic_id(bytes, offset, b" \xfe\xff\x00AAA", None);
+        let b = compute_deterministic_id(bytes, offset, b" \xfe\xff\x00BBB", None);
+        assert_eq!(
+            a.1, b.1,
+            "info_suffix bytes after the first NUL must not affect /ID[1]"
+        );
+        // A byte BEFORE the NUL still matters, confirming the cut is at the NUL
+        // and not earlier/later.
+        let c = compute_deterministic_id(bytes, offset, b" \xfd\xff\x00AAA", None);
+        assert_ne!(
+            a.1, c.1,
+            "info_suffix bytes before the first NUL must affect /ID[1]"
+        );
+        // A suffix with no NUL is hashed in full (control case).
+        let d = compute_deterministic_id(bytes, offset, b" \xfe\xff", None);
+        assert_eq!(
+            a.1, d.1,
+            "truncating at the NUL must equal hashing the pre-NUL bytes alone"
         );
     }
 
