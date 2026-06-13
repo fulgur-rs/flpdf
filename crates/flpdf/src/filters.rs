@@ -8,6 +8,14 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::{Read, Write};
 
+/// Maximum number of stages a `/Filter` chain may declare on the **decode**
+/// path. Real PDFs use at most a few stages; this rejects only pathological
+/// input where each stage re-expands the previous (multiplicative blow-up).
+/// Unlike qpdf — which imposes no chain-length cap — flpdf rejects such chains
+/// outright; this is an intentional divergence, not a compatibility target.
+/// The encode path (writer output, not untrusted) is not capped.
+const MAX_FILTER_CHAIN_LEN: usize = 16;
+
 /// Return a human-readable codec label if `filter_name` is an image/binary
 /// passthrough codec that flpdf does not decode.
 ///
@@ -122,6 +130,12 @@ where
             }
 
             if let Some(filters) = filter.as_array() {
+                if filters.len() > MAX_FILTER_CHAIN_LEN {
+                    return Err(Error::Unsupported(format!(
+                        "filter chain length {} exceeds maximum of {MAX_FILTER_CHAIN_LEN}",
+                        filters.len()
+                    )));
+                }
                 let mut decoded = stream_data.to_vec();
                 for (index, filter) in filters.iter().enumerate() {
                     let Some(filter_name) = filter.as_name() else {
@@ -1460,5 +1474,50 @@ mod tests {
             msg.contains("out of range") || msg.contains("no previous entry"),
             "error must describe the out-of-range condition; got: {msg}"
         );
+    }
+
+    // ----- Task 1: /Filter chain length cap (flpdf-hn1g.4) -----
+
+    #[test]
+    fn decode_rejects_overlong_filter_chain() {
+        // 17 filters (> MAX_FILTER_CHAIN_LEN = 16) on the decode path is rejected
+        // before any stage runs. The data is irrelevant; the cap trips first.
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"FlateDecode".to_vec()); 17]),
+        );
+        let err = decode_stream_data(&dict, b"anything");
+        assert!(
+            matches!(err, Err(Error::Unsupported(ref m)) if m.contains("filter chain length")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_accepts_max_length_filter_chain() {
+        // Exactly MAX_FILTER_CHAIN_LEN (16) ASCIIHexDecode stages round-trips (each
+        // stage is identity here: hex-encode applied 16 times, then this many decodes).
+        // Build by encoding 16 times so the 16-deep decode chain reproduces the input.
+        let original = b"hello";
+        let mut data = original.to_vec();
+        for _ in 0..16 {
+            data = encode_stream_data(
+                &{
+                    let mut d = Dictionary::new();
+                    d.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+                    d
+                },
+                &data,
+            )
+            .unwrap();
+        }
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"ASCIIHexDecode".to_vec()); 16]),
+        );
+        let decoded = decode_stream_data(&dict, &data).unwrap();
+        assert_eq!(decoded, original);
     }
 }
