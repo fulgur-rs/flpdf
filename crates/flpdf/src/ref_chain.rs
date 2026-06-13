@@ -26,9 +26,16 @@ pub(crate) fn resolve_ref_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: &Object,
 ) -> Result<(Object, Option<ObjectRef>)> {
-    let mut last_ref: Option<ObjectRef> = None;
-    let mut cur = start.clone();
-    for _ in 0..MAX_REF_CHAIN_DEPTH {
+    // `start` is a reference in the hot path; resolve it directly rather than
+    // cloning the object first. A non-reference start has no chain to follow and
+    // is returned as-is — the one unavoidable clone, since it is the return value.
+    let Object::Reference(first) = start else {
+        return Ok((start.clone(), None));
+    };
+    let mut last_ref = Some(*first);
+    let mut cur = pdf.resolve(*first)?;
+    // First hop taken above; follow the remaining hops up to the bound.
+    for _ in 1..MAX_REF_CHAIN_DEPTH {
         match cur {
             Object::Reference(r) => {
                 last_ref = Some(r);
