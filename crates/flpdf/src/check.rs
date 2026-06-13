@@ -935,8 +935,12 @@ mod tests {
         )
         .unwrap();
         assert!(report.valid); // warning only -> still valid
+                               // The warning names the offending stream (acceptance: "naming the
+                               // stream") and marks it as a guard trip.
         assert!(report.diagnostics.entries().iter().any(|d| {
-            d.severity == Severity::Warning && d.message.contains("decode-bomb guard")
+            d.severity == Severity::Warning
+                && d.message.contains("content stream object")
+                && d.message.contains("decode-bomb guard")
         }));
         // The guard trip must never be reported as a decode error: that message
         // must appear in no diagnostic at all. (Checking the message regardless
