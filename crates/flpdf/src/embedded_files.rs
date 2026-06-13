@@ -82,6 +82,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -277,10 +278,17 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     // object `r` (which must be patched, not just the parent dict).
     let (array_ref, af_array): (Option<ObjectRef>, Vec<Object>) = match af_value {
         Object::Array(arr) => (None, arr),
-        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
-            Object::Array(arr) => (Some(r), arr.clone()),
-            _ => return Ok(()),
-        },
+        // /AF may be reached through more than one indirect hop
+        // (ref -> ref -> array); follow the chain so the terminal array — the
+        // object that actually holds the refs and is rewritten below — is read
+        // and patched, not an intermediate carrier.
+        Object::Reference(r) => {
+            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+            match terminal.into_array() {
+                Some(arr) => (Some(terminal_ref.unwrap_or(r)), arr),
+                None => return Ok(()),
+            }
+        }
         _ => return Ok(()),
     };
 
@@ -405,8 +413,10 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
     // ── Step 2: resolve /Names dictionary ────────────────────────────────────
     // /Names may be an indirect reference or a direct inline dictionary.
     let names_dict = match names_value {
-        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
-            Object::Dictionary(d) => d.clone(),
+        // /Names may be reached through more than one indirect hop
+        // (ref -> ref -> dict); follow the chain to its terminal.
+        Object::Reference(r) => match resolve_ref_chain(pdf, &Object::Reference(r))?.0 {
+            Object::Dictionary(d) => d,
             _ => return Ok(vec![]),
         },
         Object::Dictionary(d) => d,
@@ -445,8 +455,10 @@ pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
     };
 
     let names_dict = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-            Object::Dictionary(d) => d.clone(),
+        // /Names may be reached through more than one indirect hop
+        // (ref -> ref -> dict); follow the chain to its terminal.
+        Some(Object::Reference(r)) => match resolve_ref_chain(pdf, &Object::Reference(r))?.0 {
+            Object::Dictionary(d) => d,
             _ => return Ok(vec![]),
         },
         Some(Object::Dictionary(d)) => d,
@@ -566,10 +578,16 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     if entries.is_empty() {
         // Retrieve (or create empty) /Names dict and drop /EmbeddedFiles from it.
         let names_dict_opt = match catalog.get("Names").cloned() {
-            Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-                Object::Dictionary(d) => Some((Some(r), d.clone())),
-                _ => None,
-            },
+            // /Names may be reached through more than one indirect hop
+            // (ref -> ref -> dict); follow the chain so the terminal dict — the
+            // object actually rewritten below — is the one updated, not an
+            // intermediate carrier.
+            Some(Object::Reference(r)) => {
+                let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+                terminal
+                    .into_dict()
+                    .map(|d| (Some(terminal_ref.unwrap_or(r)), d))
+            }
             Some(Object::Dictionary(d)) => Some((None, d)),
             _ => None,
         };
@@ -607,13 +625,20 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     // Resolve or create the /Names dict.  We always store it as an indirect
     // object and point /EmbeddedFiles to the tree root indirectly.
     let (names_ref, mut names_dict) = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-            Object::Dictionary(d) => (r, d.clone()),
-            _ => {
-                let r2 = alloc();
-                (r2, Dictionary::new())
+        // /Names may be reached through more than one indirect hop
+        // (ref -> ref -> dict); follow the chain so /EmbeddedFiles is written
+        // into the terminal dict and the catalog /Names rewrite below collapses
+        // the chain to point straight at it.
+        Some(Object::Reference(r)) => {
+            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+            match terminal.into_dict() {
+                Some(d) => (terminal_ref.unwrap_or(r), d),
+                None => {
+                    let r2 = alloc();
+                    (r2, Dictionary::new())
+                }
             }
-        },
+        }
         Some(Object::Dictionary(d)) => {
             let r = alloc();
             (r, d)
@@ -1502,5 +1527,58 @@ mod tests {
                 .is_empty(),
             "raw collector must be empty when /EmbeddedFiles is absent"
         );
+    }
+
+    // ── Test: raw collector reads through a 2-hop /Names (flpdf-3x23) ─────────
+    //
+    // `collect_embedded_file_pairs_raw` resolves the catalog `/Names` value once.
+    // When /Names is reached through more than one indirect hop
+    // (`ref → ref → dict`), a single-hop resolve sees a Reference (not a dict)
+    // and returns an empty list, silently dropping every attachment. Following
+    // the holder chain to its terminal recovers them.
+    #[test]
+    fn collect_pairs_reads_through_two_hop_names() {
+        let mut pdf = open_minimal();
+
+        // Register an attachment so /Names /EmbeddedFiles holds a real entry.
+        let fs_ref = FileSpecBuilder::new("chain.txt", b"chain payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"chain.txt", fs_ref).expect("insert");
+
+        // Find the catalog's current /Names ref (insert stored it indirectly).
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog
+            .get("Names")
+            .and_then(Object::as_ref_id)
+            .expect("catalog /Names must be indirect after insert");
+
+        // Insert a bare-reference carrier in front of the names dict so the
+        // catalog reaches /Names through two hops: catalog → carrier → names.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let carrier_ref = ObjectRef::new(next + 1, 0);
+        pdf.set_object(carrier_ref, Object::Reference(names_ref));
+        catalog.insert("Names", Object::Reference(carrier_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let pairs = collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
+            .expect("raw collector");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "raw collector must enumerate the attachment behind a 2-hop /Names"
+        );
+        assert_eq!(pairs[0].0, b"chain.txt");
+        assert_eq!(pairs[0].1, Object::Reference(fs_ref));
     }
 }

@@ -708,3 +708,342 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
         other => panic!("direct-dict value must stay a dictionary, got: {other:?}"),
     }
 }
+
+// ── Holder-chain (double-indirect) coverage (flpdf-3x23) ─────────────────────
+//
+// `Pdf::resolve`/`resolve_borrowed` are single-hop. When the catalog `/Names`
+// value (or a `/AF` array) is reached through more than one indirect hop
+// (`ref → ref → value`), code that resolves once then type-checks drops the
+// terminal. These tests build such 2-hop chains and assert the EFFECT through
+// the public API; each is RED before the `resolve_ref_chain` fix.
+
+/// Catalog `/Names` reached through a 2-hop chain: `2 0 R → 3 0 R → names dict`.
+///
+/// Object layout:
+///   1 0 R  Catalog       (/Names 2 0 R)
+///   2 0 R  bare reference 3 0 R              (first hop)
+///   3 0 R  /Names dict    (/EmbeddedFiles 4 0 R)
+///   4 0 R  leaf node      (/Names [(alpha) 5 0 R])
+///   5 0 R  Filespec for alpha
+fn build_two_hop_names_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R >>\nendobj\n");
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n3 0 R\nendobj\n");
+
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /EmbeddedFiles 4 0 R >>\nendobj\n");
+
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Names [ (alpha) 5 0 R ] >>\nendobj\n");
+
+    off.insert(5, out.len() as u64);
+    out.extend_from_slice(b"5 0 obj\n<< /Type /Filespec /F (alpha.txt) >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 5, 1);
+    out
+}
+
+// ── Site 2: list_embedded_files reads through a 2-hop /Names ──────────────────
+
+#[test]
+fn list_enumerates_through_two_hop_names() {
+    let mut pdf = open(build_two_hop_names_pdf());
+    let entries = list_embedded_files(&mut pdf).expect("list_embedded_files");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the embedded file behind a 2-hop /Names must be enumerated"
+    );
+    assert_eq!(entries[0].0, b"alpha");
+    assert_eq!(entries[0].1, ObjectRef::new(5, 0));
+}
+
+// ── Site 5: insert via a 2-hop /Names preserves sibling keys ──────────────────
+//
+// `insert_embedded_file` collects existing entries (site 3) then rebuilds
+// (site 5). With a 2-hop /Names, a single-hop reader returns the names dict as
+// non-dict, so the rebuilt tree drops a sibling key (`/Dests`) and the pre-
+// existing attachment. Following the chain preserves both.
+
+#[test]
+fn insert_through_two_hop_names_preserves_sibling_and_existing() {
+    use flpdf::Object;
+
+    let mut pdf = open(build_two_hop_names_pdf());
+
+    // Add a sibling key to the terminal /Names dict (object 3) so we can detect
+    // whether the rebuild operated on the real terminal dict or a fresh one.
+    let Object::Dictionary(mut names_dict) = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve 3")
+    else {
+        panic!("object 3 must be the /Names dict");
+    };
+    names_dict.insert("Dests", Object::Reference(ObjectRef::new(99, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(names_dict));
+
+    // Insert a new embedded file (reference value; object 5 already exists).
+    insert_embedded_file(&mut pdf, b"beta.txt", ObjectRef::new(5, 0)).expect("insert beta");
+
+    // Both the pre-existing attachment and the new one must be listable.
+    let entries = list_embedded_files(&mut pdf).expect("list after insert");
+    let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+    assert!(
+        keys.contains(&b"alpha".as_ref()),
+        "pre-existing attachment behind 2-hop /Names must survive insert, got {keys:?}"
+    );
+    assert!(
+        keys.contains(&b"beta.txt".as_ref()),
+        "newly inserted attachment must be listable, got {keys:?}"
+    );
+
+    // The sibling /Dests key in the terminal names dict must be preserved: the
+    // rebuild must operate on the real terminal dict, not a fresh one.
+    let catalog = match pdf.resolve(pdf.root_ref().expect("root")).expect("catalog") {
+        Object::Dictionary(d) => d,
+        other => panic!("catalog not a dict: {other:?}"),
+    };
+    let names_ref = catalog.get_ref("Names").expect("catalog /Names");
+    // The rewritten /Names points (possibly through the chain) at the dict that
+    // now carries /EmbeddedFiles; resolve follows one hop, and the terminal
+    // must still hold /Dests.
+    let names_dict = match pdf.resolve(names_ref).expect("resolve /Names terminal") {
+        Object::Dictionary(d) => d,
+        Object::Reference(r) => match pdf.resolve(r).expect("resolve /Names hop2") {
+            Object::Dictionary(d) => d,
+            other => panic!("/Names hop2 not a dict: {other:?}"),
+        },
+        other => panic!("/Names not a dict/ref: {other:?}"),
+    };
+    assert!(
+        names_dict.get("Dests").is_some(),
+        "sibling /Dests key in terminal names dict must survive rebuild, got {names_dict:?}"
+    );
+}
+
+// ── Site 4: delete last entry via a 2-hop /Names reaches the rebuild ──────────
+//
+// `delete_embedded_file` collects (site 3) then rebuilds-empty (site 4). With a
+// 2-hop /Names, a single-hop collect returns empty so `delete` reports `false`
+// and never reaches the empty rebuild. Following the chain finds the entry,
+// removes it, and (with a sibling key present) updates the terminal dict.
+
+#[test]
+fn delete_last_entry_through_two_hop_names() {
+    use flpdf::Object;
+
+    let mut pdf = open(build_two_hop_names_pdf());
+
+    // Add a sibling /Dests key so the terminal /Names dict is non-empty after
+    // /EmbeddedFiles is dropped — exercises the non-empty set_object branch of
+    // the empty-rebuild path on the terminal ref.
+    let Object::Dictionary(mut names_dict) = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve 3")
+    else {
+        panic!("object 3 must be the /Names dict");
+    };
+    names_dict.insert("Dests", Object::Reference(ObjectRef::new(99, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(names_dict));
+
+    let removed = delete_embedded_file(&mut pdf, b"alpha").expect("delete");
+    assert!(
+        removed,
+        "delete of the sole entry behind a 2-hop /Names must find and remove it"
+    );
+
+    // /EmbeddedFiles must be gone from the terminal dict while /Dests survives.
+    let Object::Dictionary(terminal) = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve terminal")
+    else {
+        panic!("object 3 must still be the terminal /Names dict");
+    };
+    assert!(
+        terminal.get("EmbeddedFiles").is_none(),
+        "/EmbeddedFiles must be removed from the terminal /Names dict"
+    );
+    assert!(
+        terminal.get("Dests").is_some(),
+        "sibling /Dests key must survive the empty rebuild on the terminal dict"
+    );
+
+    // And the tree must now enumerate as empty.
+    let entries = list_embedded_files(&mut pdf).expect("list after delete");
+    assert!(
+        entries.is_empty(),
+        "tree must be empty after deleting last entry"
+    );
+}
+
+// ── Site 1: remove_attachment clears a ref from a 2-hop /AF array ─────────────
+//
+// `remove_ref_from_af_in_dict` resolves the catalog `/AF` value once. When /AF
+// is a 2-hop chain (`ref → ref → array`), a single-hop resolve sees a Reference
+// (not an array) and skips removal, leaving the removed filespec referenced.
+// Following the chain rewrites the terminal array. A second, unrelated ref is
+// kept in the array so it stays non-empty (carrier not orphaned/swept).
+
+/// Object layout:
+///   1 0 R  Catalog  (/Names 2 0 R, /AF 6 0 R)
+///   2 0 R  /Names dict  (/EmbeddedFiles 3 0 R)   [1-hop so collect finds it]
+///   3 0 R  leaf node  (/Names [(gone) 4 0 R])
+///   4 0 R  Filespec for "gone" (the attachment to remove)
+///   5 0 R  Filespec kept as an unrelated /AF entry
+///   6 0 R  bare reference 7 0 R                   (first /AF hop)
+///   7 0 R  array [4 0 R 5 0 R]                    (terminal /AF array)
+fn build_two_hop_af_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R /AF 6 0 R >>\nendobj\n",
+    );
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
+
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Names [ (gone) 4 0 R ] >>\nendobj\n");
+
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Type /Filespec /F (gone.txt) >>\nendobj\n");
+
+    off.insert(5, out.len() as u64);
+    out.extend_from_slice(b"5 0 obj\n<< /Type /Filespec /F (kept.txt) >>\nendobj\n");
+
+    off.insert(6, out.len() as u64);
+    out.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+
+    off.insert(7, out.len() as u64);
+    out.extend_from_slice(b"7 0 obj\n[ 4 0 R 5 0 R ]\nendobj\n");
+
+    finish_pdf(&mut out, &off, 7, 1);
+    out
+}
+
+#[test]
+fn remove_attachment_clears_ref_from_two_hop_af_array() {
+    use flpdf::{remove_attachment, Object};
+
+    let mut pdf = open(build_two_hop_af_pdf());
+
+    let removed = remove_attachment(&mut pdf, b"gone").expect("remove");
+    assert!(removed, "existing attachment must report removed");
+
+    // The terminal /AF array (object 7) must no longer reference the removed
+    // filespec (4 0 R) but must still reference the unrelated kept ref (5 0 R).
+    let Object::Array(af) = pdf
+        .resolve(ObjectRef::new(7, 0))
+        .expect("terminal /AF array must still resolve (carrier not orphaned)")
+    else {
+        panic!("object 7 must be the terminal /AF array");
+    };
+    assert!(
+        !af.iter()
+            .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(4, 0))),
+        "removed filespec ref must be absent from the terminal /AF array, got {af:?}"
+    );
+    assert!(
+        af.iter()
+            .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(5, 0))),
+        "unrelated kept ref must remain in the terminal /AF array, got {af:?}"
+    );
+}
+
+// ── Site 1 boundary: indirect /AF whose terminal is not an array ──────────────
+//
+// When the catalog `/AF` value resolves (through the chain) to a non-array
+// object, `remove_ref_from_af_in_dict` must treat it as a no-op and return
+// cleanly rather than panicking — the removal still succeeds via the name tree.
+//
+// Object layout:
+///   1 0 R  Catalog  (/Names 2 0 R, /AF 5 0 R)
+///   2 0 R  /Names dict  (/EmbeddedFiles 3 0 R)
+///   3 0 R  leaf node  (/Names [(x) 4 0 R])
+///   4 0 R  Filespec for "x"
+///   5 0 R  a dictionary (NOT an array) — the malformed /AF terminal
+fn build_non_array_af_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R /AF 5 0 R >>\nendobj\n",
+    );
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
+
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Names [ (x) 4 0 R ] >>\nendobj\n");
+
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Type /Filespec /F (x.txt) >>\nendobj\n");
+
+    off.insert(5, out.len() as u64);
+    out.extend_from_slice(b"5 0 obj\n<< /Type /SomethingElse >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 5, 1);
+    out
+}
+
+#[test]
+fn remove_attachment_with_non_array_af_terminal_is_noop() {
+    use flpdf::remove_attachment;
+
+    let mut pdf = open(build_non_array_af_pdf());
+    let removed = remove_attachment(&mut pdf, b"x").expect("remove must not error");
+    assert!(
+        removed,
+        "the attachment must still be removed via the name tree"
+    );
+    assert!(
+        list_embedded_files(&mut pdf).expect("list").is_empty(),
+        "tree must be empty after removing the sole attachment"
+    );
+}
+
+// ── Site 5 boundary: indirect /Names whose terminal is not a dict ─────────────
+//
+// When the catalog `/Names` value resolves (through the chain) to a non-dict
+// object, `insert_embedded_file`'s rebuild must fall back to allocating a fresh
+// /Names dict rather than panicking, and the inserted attachment must remain
+// listable.
+//
+/// Object layout:
+///   1 0 R  Catalog  (/Names 2 0 R)
+///   2 0 R  an array (NOT a dict) — the malformed /Names terminal
+///   3 0 R  pre-allocated Filespec slot for the inserted entry
+fn build_non_dict_names_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R >>\nendobj\n");
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n[ 1 2 3 ]\nendobj\n");
+
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Type /Filespec /F (new.txt) >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 3, 1);
+    out
+}
+
+#[test]
+fn insert_with_non_dict_names_terminal_allocates_fresh_dict() {
+    let mut pdf = open(build_non_dict_names_pdf());
+
+    insert_embedded_file(&mut pdf, b"new.txt", ObjectRef::new(3, 0)).expect("insert must succeed");
+
+    let entries = list_embedded_files(&mut pdf).expect("list after insert");
+    assert_eq!(
+        entries.len(),
+        1,
+        "inserted attachment must be listable via a freshly allocated /Names dict"
+    );
+    assert_eq!(entries[0].0, b"new.txt");
+    assert_eq!(entries[0].1, ObjectRef::new(3, 0));
+}
