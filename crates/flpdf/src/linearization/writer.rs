@@ -1262,6 +1262,10 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 ///
 /// # Errors
 ///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
+/// is set — deterministic `/ID` generation is not yet supported on the
+/// linearized output path.
+///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
 /// object (catalog, page, shared, or body object) has no entry in the
@@ -1280,6 +1284,14 @@ pub fn write_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriteOptions,
 ) -> Result<LinearizedDocument> {
+    if options.deterministic_id {
+        // qpdf computes a deterministic /ID for linearized output too, but
+        // flpdf's linearized writer is a separate two-pass path that does not
+        // yet support it. Reject rather than silently emit a random /ID.
+        return Err(crate::Error::Unsupported(
+            "deterministic-id is not yet supported for linearized output".to_string(),
+        ));
+    }
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
@@ -2166,6 +2178,24 @@ mod tests {
         let doc = build_linearized();
         Pdf::open(Cursor::new(doc.bytes))
             .expect("linearized output must be parseable by Pdf::open");
+    }
+
+    #[test]
+    fn deterministic_id_rejected_for_linearized_output() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "deterministic-id is not yet supported for linearized output"),
+            "got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

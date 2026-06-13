@@ -182,7 +182,8 @@ struct Cli {
           require_equals = true,
           value_name = "VERSION", value_parser = ["2"],
           conflicts_with_all = [
-              "check", "linearize", "static_id", "static_aes_iv", "dump_object",
+              "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
+              "dump_object",
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
@@ -272,6 +273,14 @@ struct Cli {
     /// surface instead.
     #[arg(long = "static-id")]
     static_id: bool,
+    /// Generate a deterministic trailer /ID[1] from an MD5 of the rewritten
+    /// output body instead of a random value (top-level alias of `flpdf rewrite
+    /// --deterministic-id`; qpdf `--deterministic-id` equivalent). The permanent
+    /// identifier /ID[0] is preserved from the input. Implies a full rewrite.
+    /// Mutually exclusive with `--static-id`, and incompatible with encrypted
+    /// output (the /ID feeds the encryption key).
+    #[arg(long = "deterministic-id", conflicts_with = "static_id")]
+    deterministic_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value
     /// (top-level alias of `flpdf rewrite --static-aes-iv`).
     /// **Testing only; produces insecure deterministic IVs, NOT for
@@ -813,6 +822,18 @@ struct RewriteCommand {
     /// FLPDF_STATIC_ID_QUIET env var).
     #[arg(long = "static-id")]
     static_id: bool,
+    /// Generate a deterministic trailer /ID[1] from an MD5 of the rewritten
+    /// output body instead of a random value (qpdf `--deterministic-id`
+    /// equivalent).
+    ///
+    /// The changing identifier /ID[1] is an MD5 over the rewritten output body;
+    /// the permanent identifier /ID[0] is preserved from the input (matching
+    /// `--static-id` and ISO 32000-1 §14.4). Implies `--full-rewrite`. Mutually
+    /// exclusive with `--static-id`, and incompatible with encrypted output (the
+    /// /ID feeds the encryption key). Unlike `--static-id` it is a production-safe
+    /// flag and emits no testing-only warning.
+    #[arg(long = "deterministic-id", conflicts_with = "static_id")]
+    deterministic_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value.
     /// **Testing only; produces insecure deterministic IVs, NOT for
     /// production.** Mirrors `qpdf --static-aes-iv`.
@@ -1339,7 +1360,14 @@ fn main() {
             args.show_attachment_to,
         )
     } else if let Some(key) = args.remove_attachment {
-        run_remove_attachment(args.input, args.output, args.repair, &args.password, &key)
+        run_remove_attachment(
+            args.input,
+            args.output,
+            args.repair,
+            &args.password,
+            &key,
+            args.deterministic_id,
+        )
     } else if !args.add_attachment.is_empty() {
         run_add_attachment(
             args.input,
@@ -1347,6 +1375,7 @@ fn main() {
             args.repair,
             &args.password,
             args.add_attachment,
+            args.deterministic_id,
         )
     } else if !args.copy_attachments_from.is_empty() {
         run_copy_attachments_from(
@@ -1355,6 +1384,7 @@ fn main() {
             args.repair,
             &args.password,
             args.copy_attachments_from,
+            args.deterministic_id,
         )
     } else if args.linearize {
         // --linearize is incompatible with the page-extraction pipeline:
@@ -1369,6 +1399,7 @@ fn main() {
         }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.deterministic_id = args.deterministic_id;
         options.static_aes_iv = args.static_aes_iv;
         options.no_original_object_ids = args.no_original_object_ids;
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
@@ -1446,6 +1477,7 @@ fn main() {
         }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.deterministic_id = args.deterministic_id;
         options.static_aes_iv = args.static_aes_iv;
         options.no_original_object_ids = args.no_original_object_ids;
         if let Some(ref cs) = args.compress_streams {
@@ -1487,6 +1519,7 @@ fn main() {
     } else {
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
+        options.deterministic_id = args.deterministic_id;
         options.static_aes_iv = args.static_aes_iv;
         options.no_original_object_ids = args.no_original_object_ids;
         // Top-level `--qdf` is an alias of `rewrite --qdf`. The QDF code path
@@ -1497,6 +1530,11 @@ fn main() {
         // no conflict diagnostic is needed here.
         options.qdf = args.qdf;
         if args.qdf {
+            options.full_rewrite = true;
+        }
+        if args.deterministic_id {
+            // The deterministic /ID is an MD5 over the rewritten body, which
+            // only the full-rewrite writer produces; imply it like --qdf does.
             options.full_rewrite = true;
         }
         // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
@@ -1840,15 +1878,17 @@ fn run_command(command: Commands) -> CliResult<()> {
             }
             let mut options = WriteOptions::default();
             options.static_id = cmd.static_id;
+            options.deterministic_id = cmd.deterministic_id;
             options.static_aes_iv = cmd.static_aes_iv;
             options.min_version = cmd.min_version;
             options.force_version = cmd.force_version;
             options.no_original_object_ids = cmd.no_original_object_ids;
             // `--qdf` enables QDF and, because the QDF code path lives in the
             // full-rewrite writer, forces full_rewrite=true regardless of
-            // whether --full-rewrite was passed.
+            // whether --full-rewrite was passed. `--deterministic-id` likewise
+            // needs the full-rewrite body to hash, so it implies full_rewrite.
             options.qdf = cmd.qdf;
-            options.full_rewrite = cmd.full_rewrite || cmd.qdf;
+            options.full_rewrite = cmd.full_rewrite || cmd.qdf || cmd.deterministic_id;
             options.object_streams = cmd.object_streams.into();
             options.compress_streams = match cmd.compress_streams {
                 CliYesNo::Yes => CompressStreams::Yes,
@@ -3202,7 +3242,7 @@ fn run_page_extraction(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output)?;
+        split_pages(&bytes, n, output, options.deterministic_id)?;
     } else {
         std::fs::write(output, &bytes)?;
     }
@@ -3286,7 +3326,7 @@ fn run_rewrite_with_page_ops(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output)?;
+        split_pages(&bytes, n, output, options.deterministic_id)?;
     } else {
         std::fs::write(output, &bytes)?;
     }
@@ -4244,6 +4284,7 @@ fn run_add_attachment(
     repair: bool,
     password: &PasswordArgs,
     tokens: Vec<String>,
+    deterministic_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
@@ -4300,6 +4341,7 @@ fn run_add_attachment(
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.deterministic_id = deterministic_id;
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut pdf, &mut out, &options)?;
     Ok(())
@@ -4312,6 +4354,7 @@ fn run_remove_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &str,
+    deterministic_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
@@ -4326,6 +4369,7 @@ fn run_remove_attachment(
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.deterministic_id = deterministic_id;
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut pdf, &mut out, &options)?;
     Ok(())
@@ -4379,6 +4423,7 @@ fn run_copy_attachments_from(
     repair: bool,
     password: &PasswordArgs,
     tokens: Vec<String>,
+    deterministic_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
@@ -4404,6 +4449,7 @@ fn run_copy_attachments_from(
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.deterministic_id = deterministic_id;
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut target, &mut out, &options)?;
     Ok(())

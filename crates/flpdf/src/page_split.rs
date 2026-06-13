@@ -72,12 +72,13 @@
 //! use flpdf::{page_split::split_pages, Pdf};
 //!
 //! let src = std::fs::read("input.pdf").unwrap();
-//! split_pages(&src, 2, Path::new("output.pdf")).unwrap();
+//! // `false` = incremental chunks; pass `true` for deterministic-ID full-rewrite chunks.
+//! split_pages(&src, 2, Path::new("output.pdf"), false).unwrap();
 //! // Produces: output-1-2.pdf, output-3-4.pdf, …
 //! ```
 
 use crate::pages::page_refs;
-use crate::writer::write_pdf;
+use crate::writer::{write_pdf, write_pdf_with_options, WriteOptions};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::fs::File;
 use std::io::{BufWriter, Cursor};
@@ -101,12 +102,22 @@ use std::path::{Path, PathBuf};
 ///   → `output-1-2.pdf`), or `-{page}` for `chunk_size == 1` (e.g.
 ///   `output.pdf` → `output-1.pdf`), matching qpdf 11.9.0.
 ///
+/// When `deterministic_id` is set, each chunk is written as a full rewrite with
+/// a content-derived deterministic `/ID` (mirroring `qpdf --split-pages
+/// --deterministic-id`, which applies the deterministic-ID policy to every split
+/// output); otherwise each chunk is written as an incremental update.
+///
 /// # Errors
 ///
 /// - [`Error::Missing`] if the source PDF has no `/Root` or no pages.
 /// - [`Error::Io`] on any file-system error writing the output files.
 /// - Other [`Error`] variants on structural PDF problems.
-pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) -> Result<()> {
+pub fn split_pages(
+    src_bytes: &[u8],
+    chunk_size: usize,
+    output_template: &Path,
+    deterministic_id: bool,
+) -> Result<()> {
     if chunk_size == 0 {
         return Err(Error::Unsupported(
             "split_pages: chunk_size must be >= 1".to_string(),
@@ -152,7 +163,13 @@ pub fn split_pages(src_bytes: &[u8], chunk_size: usize, output_template: &Path) 
         let chunk_refs: Vec<ObjectRef> = all_page_refs[chunk_start..chunk_end].to_vec();
 
         // Write the chunk to the output file.
-        write_chunk(src_bytes, pages_root_ref, &chunk_refs, &out_path)?;
+        write_chunk(
+            src_bytes,
+            pages_root_ref,
+            &chunk_refs,
+            &out_path,
+            deterministic_id,
+        )?;
 
         chunk_start = chunk_end;
     }
@@ -328,6 +345,7 @@ fn write_chunk(
     pages_root_ref: ObjectRef,
     chunk_refs: &[ObjectRef],
     out_path: &Path,
+    deterministic_id: bool,
 ) -> Result<()> {
     // Re-open the source bytes so each chunk starts from the pristine state.
     let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
@@ -360,10 +378,21 @@ fn write_chunk(
         }
     }
 
-    // Write the modified PDF via incremental update.
+    // Write the modified PDF. With --deterministic-id the chunk needs a
+    // content-derived /ID, which only the full-rewrite writer produces; without
+    // it, keep the cheaper incremental update.
     let file = File::create(out_path).map_err(Error::Io)?;
     let mut writer = BufWriter::new(file);
-    write_pdf(&mut pdf, &mut writer)?;
+    if deterministic_id {
+        let options = WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut writer, &options)?;
+    } else {
+        write_pdf(&mut pdf, &mut writer)?;
+    }
 
     Ok(())
 }
@@ -608,7 +637,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 1, &template).expect("split should succeed");
+        split_pages(&src, 1, &template, false).expect("split should succeed");
 
         // qpdf 11.9.0: --split-pages=1 → single-number suffix (out-N.pdf),
         // not the range form out-N-N.pdf (flpdf-s5e).
@@ -632,7 +661,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 2, &template).expect("split should succeed");
+        split_pages(&src, 2, &template, false).expect("split should succeed");
 
         let out12 = tmpdir.path().join("out-1-2.pdf");
         let out34 = tmpdir.path().join("out-3-4.pdf");
@@ -654,7 +683,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 100, &template).expect("split should succeed");
+        split_pages(&src, 100, &template, false).expect("split should succeed");
 
         let out = tmpdir.path().join("out-1-3.pdf");
         assert!(out.exists(), "single chunk file should exist: {:?}", out);
@@ -668,7 +697,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 2, &template).expect("split should succeed");
+        split_pages(&src, 2, &template, false).expect("split should succeed");
 
         // First chunk: out-01-02.pdf
         let first = tmpdir.path().join("out-01-02.pdf");
@@ -688,11 +717,47 @@ mod tests {
     }
 
     #[test]
+    fn split_pages_deterministic_id_produces_stable_chunks() {
+        // With deterministic_id, each chunk is a full rewrite with a
+        // content-derived /ID, so two runs over the same input are byte-stable.
+        let src = build_n_page_pdf(3);
+        let d1 = tempfile::tempdir().expect("tmpdir");
+        let d2 = tempfile::tempdir().expect("tmpdir");
+        split_pages(&src, 1, &d1.path().join("out.pdf"), true).expect("split should succeed");
+        split_pages(&src, 1, &d2.path().join("out.pdf"), true).expect("split should succeed");
+
+        let c1 = std::fs::read(d1.path().join("out-1.pdf")).unwrap();
+        let c2 = std::fs::read(d2.path().join("out-1.pdf")).unwrap();
+        assert_eq!(
+            c1, c2,
+            "deterministic-id chunks must be byte-stable across runs"
+        );
+        assert!(
+            c1.windows(3).any(|w| w == b"/ID"),
+            "a deterministic-id chunk must carry an /ID"
+        );
+    }
+
+    #[test]
+    fn split_pages_propagates_chunk_write_error() {
+        // A chunk write into a non-existent directory fails at File::create
+        // inside write_chunk; that error must propagate out of split_pages.
+        let src = build_n_page_pdf(2);
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let bad = tmpdir.path().join("no_such_subdir").join("out.pdf");
+        let result = split_pages(&src, 1, &bad, false);
+        assert!(
+            result.is_err(),
+            "a chunk write failure must propagate out of split_pages"
+        );
+    }
+
+    #[test]
     fn split_pages_chunk_size_zero_is_error() {
         let src = build_n_page_pdf(3);
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
-        let result = split_pages(&src, 0, &template);
+        let result = split_pages(&src, 0, &template, false);
         assert!(result.is_err(), "chunk_size=0 should return an error");
     }
 }
