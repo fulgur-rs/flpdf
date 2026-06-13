@@ -805,27 +805,20 @@ fn acroform_set_default_appearance_matches_manual_promote_and_insert() {
 // Layer 2 round-trip: PageLabel mutating helpers == independent raw manipulation
 // ---------------------------------------------------------------------------
 
-/// Point the catalog `/PageLabels` at a freshly-allocated single-leaf number
+/// Point the catalog `/PageLabels` at a freshly-allocated single-node number
 /// tree built from `nums` (a flat `/Nums` pair array). Mirrors what
 /// `PageLabelDocumentHelper::rebuild` emits for a small tree (<= LEAF_MAX
-/// entries): one leaf dict `<< /Limits [first last] /Nums [...] >>` at a new
-/// indirect ref, with the old inline `/PageLabels` dict left as an orphan that
-/// `full_rewrite` drops. `first`/`last` are the leading key of the first/last
-/// `(key, dict)` pair in `nums`.
+/// entries): one root node `<< /Nums [...] >>` at a new indirect ref (the root
+/// omits `/Limits` per ISO 32000-2 7.9.7), with the old inline `/PageLabels`
+/// dict left as an orphan that `full_rewrite` drops.
 fn manual_set_pagelabels_leaf(
     pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>,
     nums: Vec<flpdf::Object>,
-    first: i64,
-    last: i64,
 ) {
     use flpdf::{Dictionary, Object, ObjectRef};
     let next = next_free_number(pdf);
     let leaf_ref = ObjectRef::new(next, 0);
     let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
-    );
     leaf.insert("Nums", Object::Array(nums));
     pdf.set_object(leaf_ref, Object::Dictionary(leaf));
 
@@ -839,8 +832,9 @@ fn manual_set_pagelabels_leaf(
 ///
 /// `set_range(0, ..)` replaces the existing index-0 range (lowercase roman) with
 /// an uppercase-roman range, then rebuilds the `/Nums` tree. With two entries
-/// (<= LEAF_MAX) the rebuild produces ONE leaf `<< /Limits [0 3] /Nums [...] >>`
-/// at a fresh ref, with catalog `/PageLabels` repointed there. The replacement
+/// (<= LEAF_MAX) the rebuild produces ONE root node `<< /Nums [...] >>` (no
+/// `/Limits` on the root) at a fresh ref, with catalog `/PageLabels` repointed
+/// there. The replacement
 /// dict is `LabelRange { RomanUpper, "", 1 }.to_dict()` == `<< /S /R >>` (no
 /// `/St` since start==1, no `/P` since empty). The index-3 dict is preserved
 /// verbatim from the original inline `/Nums`. The manual path builds that exact
@@ -878,7 +872,7 @@ fn page_label_set_range_matches_manual_nums_rebuild() {
                 Object::Integer(3),
                 Object::Dictionary(idx3),
             ];
-            manual_set_pagelabels_leaf(pdf, nums, 0, 3);
+            manual_set_pagelabels_leaf(pdf, nums);
         },
     );
 }
@@ -888,9 +882,9 @@ fn page_label_set_range_matches_manual_nums_rebuild() {
 /// `remove_range(3)` drops the index-3 range, leaving the single non-last entry
 /// `(0, <</S /r>>)`. Because the entry list is non-empty, `/PageLabels` is NOT
 /// dropped (that only happens when the LAST range is removed); instead the tree
-/// is rebuilt as one leaf `<< /Limits [0 0] /Nums [0 <</S /r>>] >>` at a fresh
-/// ref. The manual path reproduces that exact single-entry leaf, preserving the
-/// index-0 dict verbatim ⇒ byte-identity.
+/// is rebuilt as one root node `<< /Nums [0 <</S /r>>] >>` (no `/Limits` on the
+/// root) at a fresh ref. The manual path reproduces that exact single-entry
+/// node, preserving the index-0 dict verbatim ⇒ byte-identity.
 #[test]
 fn page_label_remove_range_matches_manual_nums_shrink() {
     use flpdf::Object;
@@ -904,7 +898,7 @@ fn page_label_remove_range_matches_manual_nums_shrink() {
             let mut idx0 = flpdf::Dictionary::new();
             idx0.insert("S", Object::Name(b"r".to_vec()));
             let nums = vec![Object::Integer(0), Object::Dictionary(idx0)];
-            manual_set_pagelabels_leaf(pdf, nums, 0, 0);
+            manual_set_pagelabels_leaf(pdf, nums);
         },
     );
 }
@@ -934,9 +928,9 @@ fn make_filespec(
 /// Attachment `insert_embedded_file` parity (byte-identity).
 ///
 /// Starting from a no-attachment PDF, `insert_embedded_file(b"new.txt", fs)`
-/// rebuilds the name tree from one entry (<= LEAF_MAX), emitting a leaf
-/// `<< /Limits [(new.txt) (new.txt)] /Names [(new.txt) fs] >>`, a fresh
-/// `/Names` dict `<< /EmbeddedFiles <leaf_ref> >>`, and catalog
+/// rebuilds the name tree from one entry (<= LEAF_MAX), emitting a single root
+/// node `<< /Names [(new.txt) fs] >>` (the root omits `/Limits` per ISO 32000-2
+/// 7.9.6), a fresh `/Names` dict `<< /EmbeddedFiles <leaf_ref> >>`, and catalog
 /// `/Names -> <names_ref>`. The manual path reproduces that exact graph
 /// (filespec created identically on both sides via `make_filespec`);
 /// `full_rewrite` renumbers Catalog-first so the differing fresh object numbers
@@ -960,13 +954,6 @@ fn attachment_insert_embedded_file_matches_manual_name_tree() {
             let names_ref = ObjectRef::new(next + 1, 0);
 
             let mut leaf = Dictionary::new();
-            leaf.insert(
-                "Limits",
-                Object::Array(vec![
-                    Object::String(key.to_vec()),
-                    Object::String(key.to_vec()),
-                ]),
-            );
             leaf.insert(
                 "Names",
                 Object::Array(vec![

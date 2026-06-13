@@ -2,7 +2,7 @@
 //!
 //! # Reader
 //!
-//! Walks the catalog's `/Names /EmbeddedFiles` name tree (ISO 32000-1 §7.9.6
+//! Walks the catalog's `/Names /EmbeddedFiles` name tree (ISO 32000-2 §7.9.6
 //! + §7.11) and returns an ordered list of `(name_key, filespec_ref)` pairs.
 //!
 //! The result is in depth-first, key-ascending order as mandated by the spec
@@ -19,8 +19,10 @@
 //! - ≤ [`LEAF_MAX`] entries → a single leaf node (no `/Kids`).
 //! - > [`LEAF_MAX`] entries → a root node with `/Kids` pointing to leaf chunks.
 //!
-//! Every node carries a `/Limits [first, last]` array as required by validators
-//! such as qpdf.
+//! Intermediate and leaf nodes carry a `/Limits [first, last]` array bounding
+//! the key range of their subtree, but the **root node omits `/Limits`**
+//! (ISO 32000-2 §7.9.6 restricts `/Limits` to intermediate and leaf nodes;
+//! this matches qpdf's observed output).
 //!
 //! The writer normalises the catalog path: after any mutation `/Names` is
 //! stored as an indirect object and `/EmbeddedFiles` within it is an indirect
@@ -31,18 +33,20 @@
 //! removed from the `/Names` dictionary; if that makes the dictionary empty
 //! the `/Names` key is removed from the catalog.
 //!
-//! # Name-tree structure (ISO 32000-1 §7.9.6)
+//! # Name-tree structure (ISO 32000-2 §7.9.6)
 //!
 //! A name tree node is a dictionary with either:
 //! - `/Kids` — an array of indirect references to child nodes (intermediate),
 //! - `/Names` — a flat array `[key₁, val₁, key₂, val₂, …]` (leaf).
 //!
-//! An optional `/Limits [least, greatest]` array on each node bounds the key
-//! range of its subtree.  For full enumeration (this module's purpose), `/Limits`
-//! is informational: the tree is pre-sorted and DFS order already yields keys in
-//! ascending order.  `/Limits` is *not* used to prune subtrees here because we
-//! are collecting all entries, not searching for one.  If `/Limits` is present
-//! it is simply skipped without error.
+//! Intermediate and leaf nodes carry a `/Limits [least, greatest]` array
+//! bounding the key range of their subtree; the root node omits it
+//! (ISO 32000-2 §7.9.6).  For full enumeration (this module's purpose),
+//! `/Limits` is informational: the tree is pre-sorted and DFS order already
+//! yields keys in ascending order.  `/Limits` is *not* used to prune subtrees
+//! here because we are collecting all entries, not searching for one.  Wherever
+//! `/Limits` is present — including on a malformed root — it is simply skipped
+//! without error.
 //!
 //! # Missing keys
 //!
@@ -128,7 +132,7 @@ use std::io::{Read, Seek};
 /// When the name-tree value is a *direct* `/Filespec` dictionary (not an
 /// indirect reference) there is no `ObjectRef` to clear from `/AF`; the
 /// name-tree entry is removed and the sweep still runs. This case is
-/// exceedingly rare in practice (ISO 32000-1 §7.11 expects indirect refs)
+/// exceedingly rare in practice (ISO 32000-2 §7.11 expects indirect refs)
 /// and is handled gracefully — no panic, no spurious error.
 ///
 /// # Errors
@@ -542,12 +546,15 @@ pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Res
 /// becomes empty), leaving no dangling references.
 ///
 /// Otherwise it constructs a tree with at most two levels:
-/// - ≤ [`LEAF_MAX`] entries → single-leaf root (just `/Names` + `/Limits`).
+/// - ≤ [`LEAF_MAX`] entries → single-node root (just `/Names`; the root omits
+///   `/Limits`).
 /// - > [`LEAF_MAX`] entries → root with `/Kids` pointing to leaf chunks.
 ///
-/// All emitted nodes carry `/Limits [first, last]` as required by PDF
-/// validators.  The catalog `/Names` reference is stored as an indirect object;
-/// `/EmbeddedFiles` within it points indirectly to the tree root.
+/// Leaf and intermediate nodes carry `/Limits [first, last]` bounding their
+/// subtree's key range; the root node does not (ISO 32000-2 §7.9.6 restricts
+/// `/Limits` to intermediate and leaf nodes).  The catalog `/Names` reference is
+/// stored as an indirect object; `/EmbeddedFiles` within it points indirectly to
+/// the tree root.
 fn rebuild_embedded_files_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     entries: Vec<(Vec<u8>, Object)>,
