@@ -2067,6 +2067,18 @@ fn resolve_id0_for_encryption<R: Read + Seek>(pdf: &Pdf<R>, options: &WriteOptio
     }
 }
 
+/// Append the lowercase-hex encoding of `bytes` to `out` via a table lookup,
+/// avoiding the per-byte `String` allocation a `format!("{:02x}")` loop incurs.
+/// Both the fixed-width `/ID` hex form and the deterministic-ID seed must be
+/// lowercase hex byte-for-byte, which this matches.
+fn push_hex_lower(out: &mut Vec<u8>, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0x0f) as usize]);
+    }
+}
+
 /// Byte length of the serialized deterministic `/ID` array value
 /// `[<id0_hex><id1_hex>]`: `[` + (`<` + 32 hex + `>`) twice + `]`.
 const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
@@ -2082,9 +2094,7 @@ fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16
     out.push(b'[');
     for id in [id0, id1] {
         out.push(b'<');
-        for byte in id {
-            out.extend_from_slice(format!("{byte:02x}").as_bytes());
-        }
+        push_hex_lower(out, id);
         out.push(b'>');
     }
     out.push(b']');
@@ -2174,10 +2184,9 @@ fn compute_deterministic_id(
 ) -> ([u8; 16], [u8; 16]) {
     use md5::Digest as _;
     let det_data = md5::Md5::digest(&bytes[..=id_array_offset]);
-    let mut seed = Vec::new();
-    for byte in det_data.iter() {
-        seed.extend_from_slice(format!("{byte:02x}").as_bytes());
-    }
+    // 32 hex chars for the 16-byte digest + " QPDF " (6) + the /Info suffix.
+    let mut seed = Vec::with_capacity(32 + 6 + info_suffix.len());
+    push_hex_lower(&mut seed, det_data.as_slice());
     seed.extend_from_slice(b" QPDF ");
     seed.extend_from_slice(info_suffix);
     let id1: [u8; 16] = md5::Md5::digest(&seed).into();
