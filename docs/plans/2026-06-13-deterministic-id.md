@@ -2,6 +2,19 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (or subagent-driven-development) to implement this plan task-by-task.
 
+> **Correction (post-review, supersedes the /ID details below).** Primary-source
+> verification against qpdf 11.9.0 (source + output) showed the real algorithm
+> differs from this plan's initial model: qpdf preserves `/ID[0]` (the permanent
+> identifier) from the input and sets only `/ID[1]` to a digest, and that digest
+> is `md5(hex(md5(output up to /ID)) + " QPDF " + /Info strings)` — not a single
+> MD5 over the body with both elements equal. The shipped implementation
+> therefore **preserves `/ID[0]`** and uses flpdf's own self-stable `/ID[1]`
+> digest (`md5(bytes[0..xref_offset])`); it is qpdf-equivalent in *behaviour*
+> (deterministic, content-derived, permanent-ID-preserving) but **not**
+> byte-identical to qpdf's `/ID`. Full byte-level qpdf `/ID` parity is tracked as
+> a follow-up issue. Disregard the "both `/ID` elements", "qpdf's hash range", and
+> "byte-parity bonus" wording in the sections below.
+
 **Goal:** Implement qpdf-equivalent `--deterministic-id`: derive the output `/ID` from an MD5 over the output body so it is self-stable across runs, and reject the qpdf-incompatible combinations.
 
 **Architecture:** `write_pdf_full_rewrite` already buffers the whole output into a `Vec<u8>` and captures `xref_offset = bytes.len()` right after the body, before the xref table (`crates/flpdf/src/writer.rs:2866`). When `deterministic_id` is set we compute `MD5(bytes[0..xref_offset])` (= qpdf's hash range: header + body, excluding xref/trailer) and set both `/ID` elements to that digest, applied through `apply_encrypt_trailer_entries` (the single seam used by Table/Stream/QDF paths). deterministic-id + encryption and deterministic-id + static-id are mutually exclusive (qpdf rejects both); the linearized writer is out of scope and errors explicitly.
@@ -249,7 +262,7 @@ scripts/patch-coverage.sh --base main
 Expected: flpdf changed lines 100% covered. Any genuinely untestable line → `// cov:ignore: <reason>` and note it in the PR description.
 
 **Step 5: Final verification**
-Run: `cargo fmt --check`, `cargo clippy -p flpdf -p flpdf-cli`, `cargo test -p flpdf -p flpdf-cli`.
+Run (in this repo's plan-doc order): `cargo build` → `cargo test -p flpdf -p flpdf-cli` → `cargo clippy -p flpdf -p flpdf-cli -- -D warnings`, plus `cargo fmt --check`.
 
 ---
 

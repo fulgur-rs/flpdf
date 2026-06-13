@@ -2,19 +2,20 @@
 //!
 //! Pins the wiring of qpdf's `--deterministic-id`:
 //! - two runs over the same input are byte-identical (self-stable /ID);
-//! - the /ID depends on the input content and is not the `--static-id`
+//! - /ID[0] (permanent identifier) is preserved from the input, while /ID[1]
+//!   (changing identifier) is content-derived and is not the `--static-id`
 //!   constant;
 //! - the qpdf-incompatible combinations are rejected (+ `--static-id`,
 //!   + `--encrypt`, + `--linearize`);
 //! - unlike `--static-id`, the flag is production-safe and emits no
 //!   testing-only warning.
 //!
-//! The exact digest algorithm (/ID == MD5 over the body up to the xref table)
-//! is verified by the library test
-//! `writer::tests::deterministic_id_is_stable_and_equals_md5_over_body`. Byte
-//! parity with qpdf's `--deterministic-id` holds only under the
-//! `qpdf-zlib-compat` build feature (the default Pure-Rust build diverges in
-//! compressed-stream bytes), so no qpdf `/ID`-equality oracle runs here.
+//! The /ID[1] body-digest algorithm is verified by the library test
+//! `writer::tests::deterministic_id_is_stable_and_equals_md5_over_body`. flpdf's
+//! digest is its own scheme and is NOT byte-identical to qpdf's /ID (qpdf seeds a
+//! second MD5 with the body digest plus the `/Info` strings), so no qpdf
+//! `/ID`-equality oracle runs here; the `--deterministic-id` equivalence is
+//! behavioural (deterministic, content-derived, permanent-ID-preserving).
 
 use assert_cmd::Command as CargoCommand;
 use predicates::prelude::*;
@@ -91,7 +92,7 @@ fn deterministic_id_is_stable_across_runs() {
 }
 
 #[test]
-fn deterministic_id_is_content_dependent_and_not_static_constant() {
+fn deterministic_id_preserves_permanent_id_and_is_content_dependent() {
     let tmp = tempdir().expect("tempdir");
     let out1 = tmp.path().join("one.pdf");
     let out2 = tmp.path().join("two.pdf");
@@ -100,17 +101,27 @@ fn deterministic_id_is_content_dependent_and_not_static_constant() {
     run_rewrite_det_id(&fixture_path("two-page.pdf"), &out2);
 
     let (id0_1, id1_1) = extract_id_array(&std::fs::read(&out1).expect("read one"));
-    let (id0_2, _) = extract_id_array(&std::fs::read(&out2).expect("read two"));
+    let (_id0_2, id1_2) = extract_id_array(&std::fs::read(&out2).expect("read two"));
 
-    assert_eq!(id0_1, id1_1, "both /ID elements must equal the digest");
+    // /ID[0] (permanent identifier) is preserved from one-page.pdf's input /ID.
+    assert_eq!(
+        id0_1.as_slice(),
+        b"2dc780102304e5176780e8127fa6438c",
+        "/ID[0] must be preserved from the source permanent identifier"
+    );
     assert_ne!(
-        id0_1, id0_2,
-        "different input content must yield a different deterministic /ID"
+        id0_1, id1_1,
+        "permanent and changing identifiers must differ"
+    );
+    // /ID[1] (changing identifier) is the content digest → content-dependent.
+    assert_ne!(
+        id1_1, id1_2,
+        "different input content must yield a different /ID[1]"
     );
     assert_ne!(
         id1_1.as_slice(),
         b"31415926535897932384626433832795",
-        "deterministic /ID must not be the --static-id constant"
+        "deterministic /ID[1] must not be the --static-id constant"
     );
 }
 
@@ -149,6 +160,21 @@ fn deterministic_id_incompatible_with_encryption() {
         .stderr(predicate::str::contains(
             "incompatible with encrypted output files",
         ));
+}
+
+#[test]
+fn deterministic_id_conflicts_with_json() {
+    // --json is dispatched before any rewrite path; without the conflict the
+    // flag would be silently ignored. clap must reject the combination.
+    let input = fixture_path("one-page.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--json", "--deterministic-id"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -209,10 +235,9 @@ fn deterministic_id_is_honored_in_page_ops_pipeline() {
     }
 
     let (id0, id1) = extract_id_array(&std::fs::read(&a).expect("read a"));
-    assert_eq!(
-        id0, id1,
-        "page-ops deterministic /ID elements must be equal"
-    );
+    // three-page.pdf carries an input /ID, so /ID[0] (preserved) and /ID[1]
+    // (content digest) differ.
+    assert_ne!(id0, id1, "permanent /ID[0] and changing /ID[1] must differ");
     assert_eq!(
         std::fs::read(&a).expect("read a"),
         std::fs::read(&b).expect("read b"),

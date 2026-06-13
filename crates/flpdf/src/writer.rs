@@ -185,11 +185,14 @@ pub struct WriteOptions {
     /// Mirrors `qpdf --static-id` and is intended for byte-identical testing.
     pub static_id: bool,
 
-    /// Derive the trailer `/ID` from an MD5 digest of the output body — the
-    /// bytes from the file header through the last body object, up to (but not
-    /// including) the cross-reference table — so the identifier is stable
-    /// across runs for identical input and flags. Both `/ID` elements are set
-    /// to the digest. Mirrors `qpdf --deterministic-id`.
+    /// Derive the trailer `/ID[1]` (the changing identifier) from an MD5 digest
+    /// of the rewritten output body — the bytes from the file header through the
+    /// last body object, up to (but not including) the cross-reference table —
+    /// so the identifier is stable across runs for identical input and flags.
+    /// The permanent identifier `/ID[0]` is preserved from the input (ISO
+    /// 32000-1 §14.4), falling back to the digest when the input has no usable
+    /// `/ID`. Like `qpdf --deterministic-id`, this yields a content-derived,
+    /// run-stable `/ID` and preserves the permanent identifier.
     ///
     /// Only the full-rewrite path honours this flag; requesting it on the
     /// incremental-update path is rejected. It is mutually exclusive with
@@ -197,11 +200,10 @@ pub struct WriteOptions {
     /// `/ID` feeds the encryption key, so a content-derived `/ID` would be
     /// circular) — both matching qpdf.
     ///
-    /// Because the digest covers the exact output bytes, the default Pure-Rust
-    /// build produces a `/ID` that is self-stable but **not** byte-identical to
-    /// qpdf's (compressed-stream bytes differ); byte-for-byte parity with qpdf
-    /// holds only under the `qpdf-zlib-compat` test feature for classic
-    /// cross-reference-table output.
+    /// The digest is flpdf's own scheme (a single MD5 over the body); it is
+    /// **not** byte-identical to the value qpdf writes, which seeds a second MD5
+    /// with the body digest plus the `/Info` strings. The `/ID` is therefore
+    /// self-stable and qpdf-equivalent in behaviour, but not in exact bytes.
     pub deterministic_id: bool,
 
     /// Force every AES CBC IV to `0x00 × 16` instead of a cryptographically
@@ -1505,11 +1507,25 @@ pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
     trailer.insert("ID", Object::Array(vec![first_id, pi_id]));
 }
 
-/// Set the trailer `/ID` to two copies of `digest` (qpdf's `--deterministic-id`
-/// shape: both the permanent and changing identifiers equal the body digest).
+/// Set the trailer `/ID[1]` (the changing identifier) to `digest` while
+/// preserving `/ID[0]` (the permanent identifier) from the existing `/ID` when
+/// it is a well-formed 2-element array of strings. When the input has no usable
+/// `/ID`, both elements fall back to `digest`. This matches qpdf's
+/// `--deterministic-id` handling of the permanent identifier and ISO 32000-1
+/// §14.4, where `/ID[0]` stays stable across updates and only `/ID[1]` changes.
 pub(crate) fn apply_deterministic_id(trailer: &mut Dictionary, digest: [u8; 16]) {
-    let id = Object::String(digest.to_vec());
-    trailer.insert("ID", Object::Array(vec![id.clone(), id]));
+    let id2 = Object::String(digest.to_vec());
+    let id1 = match trailer.get("ID") {
+        Some(Object::Array(values))
+            if values.len() == 2
+                && matches!(values[0], Object::String(_))
+                && matches!(values[1], Object::String(_)) =>
+        {
+            values[0].clone()
+        }
+        _ => id2.clone(),
+    };
+    trailer.insert("ID", Object::Array(vec![id1, id2]));
 }
 
 /// Generate a fresh 16-byte file identifier.
@@ -2919,10 +2935,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     // Build xref / trailer matching the input's xref form.
     let xref_offset = bytes.len();
-    // qpdf's --deterministic-id: MD5 over the output body (header + objects, up
-    // to but not including the xref table). `xref_offset` froze that prefix, so
+    // Deterministic /ID[1]: MD5 over the output body (header + objects, up to
+    // but not including the xref table). `xref_offset` froze that prefix, so
     // hashing `bytes[..xref_offset]` is stable regardless of what we append
-    // next. Both /ID elements are set to this digest (see apply_deterministic_id).
+    // next. /ID[0] (the permanent identifier) is preserved separately in
+    // apply_deterministic_id.
     let deterministic_id_digest: Option<[u8; 16]> = if options.deterministic_id {
         use md5::Digest as _;
         Some(md5::Md5::digest(&bytes[..xref_offset]).into())
@@ -3734,6 +3751,45 @@ mod tests {
             trailer_id_pair(&b).0,
             "different input content must yield a different deterministic /ID"
         );
+    }
+
+    #[test]
+    fn deterministic_id_preserves_source_permanent_id() {
+        // A source with a well-formed /ID: /ID[0] (permanent identifier) must be
+        // preserved; only /ID[1] (changing identifier) becomes the body digest.
+        let mut src = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        src.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 3 /Root 1 0 R /ID [<{}><{}>] >>\nstartxref\n{startxref}\n%%EOF\n",
+                "aa".repeat(16),
+                "bb".repeat(16),
+            )
+            .as_bytes(),
+        );
+
+        let out = write_det_id(&src);
+        let (id0, id1) = trailer_id_pair(&out);
+        assert_eq!(
+            id0,
+            vec![0xAAu8; 16],
+            "/ID[0] must be preserved from the source"
+        );
+
+        let xref_offset = parse_startxref(&out);
+        use md5::Digest as _;
+        let digest: [u8; 16] = md5::Md5::digest(&out[..xref_offset]).into();
+        assert_eq!(id1, digest.to_vec(), "/ID[1] must equal the body digest");
+        assert_ne!(id0, id1, "permanent and changing identifiers must differ");
     }
 
     #[test]

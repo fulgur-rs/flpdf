@@ -1262,6 +1262,10 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 ///
 /// # Errors
 ///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
+/// is set — deterministic `/ID` generation is not yet supported on the
+/// linearized output path.
+///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
 /// object (catalog, page, shared, or body object) has no entry in the

@@ -182,7 +182,8 @@ struct Cli {
           require_equals = true,
           value_name = "VERSION", value_parser = ["2"],
           conflicts_with_all = [
-              "check", "linearize", "static_id", "static_aes_iv", "dump_object",
+              "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
+              "dump_object",
               "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_fonts", "show_npages", "show_pages", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
@@ -272,11 +273,12 @@ struct Cli {
     /// surface instead.
     #[arg(long = "static-id")]
     static_id: bool,
-    /// Generate a deterministic trailer /ID from a digest of the file contents
-    /// instead of a random value (top-level alias of `flpdf rewrite
-    /// --deterministic-id`; qpdf `--deterministic-id` equivalent). Implies a
-    /// full rewrite. Mutually exclusive with `--static-id`, and incompatible
-    /// with encrypted output (the /ID feeds the encryption key).
+    /// Generate a deterministic trailer /ID[1] from an MD5 of the rewritten
+    /// output body instead of a random value (top-level alias of `flpdf rewrite
+    /// --deterministic-id`; qpdf `--deterministic-id` equivalent). The permanent
+    /// identifier /ID[0] is preserved from the input. Implies a full rewrite.
+    /// Mutually exclusive with `--static-id`, and incompatible with encrypted
+    /// output (the /ID feeds the encryption key).
     #[arg(long = "deterministic-id", conflicts_with = "static_id")]
     deterministic_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value
@@ -820,13 +822,16 @@ struct RewriteCommand {
     /// FLPDF_STATIC_ID_QUIET env var).
     #[arg(long = "static-id")]
     static_id: bool,
-    /// Generate a deterministic trailer /ID from a digest of the file contents
-    /// instead of a random value (qpdf `--deterministic-id` equivalent).
+    /// Generate a deterministic trailer /ID[1] from an MD5 of the rewritten
+    /// output body instead of a random value (qpdf `--deterministic-id`
+    /// equivalent).
     ///
-    /// Implies `--full-rewrite` (the /ID is an MD5 over the rewritten body).
-    /// Mutually exclusive with `--static-id`, and incompatible with encrypted
-    /// output (the /ID feeds the encryption key). Unlike `--static-id` it is a
-    /// production-safe flag and emits no testing-only warning.
+    /// The changing identifier /ID[1] is an MD5 over the rewritten output body;
+    /// the permanent identifier /ID[0] is preserved from the input (matching
+    /// `--static-id` and ISO 32000-1 §14.4). Implies `--full-rewrite`. Mutually
+    /// exclusive with `--static-id`, and incompatible with encrypted output (the
+    /// /ID feeds the encryption key). Unlike `--static-id` it is a production-safe
+    /// flag and emits no testing-only warning.
     #[arg(long = "deterministic-id", conflicts_with = "static_id")]
     deterministic_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value.
