@@ -739,6 +739,20 @@ mod tests {
     }
 
     #[test]
+    fn split_pages_propagates_chunk_write_error() {
+        // A chunk write into a non-existent directory fails at File::create
+        // inside write_chunk; that error must propagate out of split_pages.
+        let src = build_n_page_pdf(2);
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let bad = tmpdir.path().join("no_such_subdir").join("out.pdf");
+        let result = split_pages(&src, 1, &bad, false);
+        assert!(
+            result.is_err(),
+            "a chunk write failure must propagate out of split_pages"
+        );
+    }
+
+    #[test]
     fn split_pages_chunk_size_zero_is_error() {
         let src = build_n_page_pdf(3);
         let tmpdir = tempfile::tempdir().expect("tmpdir");
