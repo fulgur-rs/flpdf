@@ -1240,12 +1240,17 @@ fn do_write_pass<R: Read + Seek>(
         // above /Size (a non-contiguous split, guarded elsewhere).
         let first_page_count = total_count
             .checked_sub(param_dict_obj_number)
+            // cov:ignore-start: defensive invariant — the param-dict object
+            // number is always a slot below /Size (the contiguous-split
+            // precondition), so the subtraction never underflows; the guard
+            // only prevents an unsigned wrap if a future plan breaks that.
             .ok_or_else(|| {
                 crate::Error::Unsupported(format!(
                     "linearization writer: param-dict object number ({param_dict_obj_number}) \
                  exceeds /Size ({total_count}) — cannot size the first-page xref subsection"
                 ))
             })?;
+        // cov:ignore-end
         let section_start = bytes.len();
         let (p1_xref_offset, range, patch) = write_part1_xref_and_trailer(
             &mut bytes,
@@ -1411,13 +1416,20 @@ fn do_write_pass<R: Read + Seek>(
         // Part-1 first-page xref's placeholder entry block in place.  The block
         // length was reserved exactly, so this shifts no bytes and the
         // hint-stream convergence loop is unaffected.
-        let patch = part1_xref_patch.as_ref().ok_or_else(|| {
-            crate::Error::Unsupported(
-                "linearization writer: classic path produced no Part-1 xref patch \
-                 (internal invariant violated)"
-                    .to_string(),
-            )
-        })?;
+        let patch = part1_xref_patch
+            .as_ref()
+            // cov:ignore-start: unreachable internal invariant — this is the
+            // classic (`objstm_layout.is_empty()`) branch, which always sets
+            // `part1_xref_patch = Some(..)` just above when emitting the Part-1
+            // xref; the guard mirrors the ObjStm path's analogous check.
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "linearization writer: classic path produced no Part-1 xref patch \
+                     (internal invariant violated)"
+                        .to_string(),
+                )
+            })?;
+        // cov:ignore-end
         patch_part1_xref(&mut bytes, patch, &xref_offsets)?;
 
         result
@@ -2555,6 +2567,97 @@ mod tests {
             final_value, first_xref_pos,
             "final startxref ({final_value}) must equal the FIRST-PAGE xref keyword \
              offset ({first_xref_pos}) — qpdf classic linearized layout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 14b. patch_part1_xref overwrites the placeholder block with real classic
+    //      entries (happy path) and rejects each inconsistency it guards.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn patch_part1_xref_fills_classic_entries_for_covered_objects() {
+        // Cover objects 3..6 (count = 3); reserve count*20 placeholder bytes.
+        let count = 3u32;
+        let block = vec![b' '; count as usize * CLASSIC_XREF_ENTRY_WIDTH];
+        let mut bytes = block.clone();
+        let patch = Part1XrefPatch {
+            start_num: 3,
+            count,
+            data_range: 0..bytes.len(),
+        };
+        let mut offs = BTreeMap::new();
+        offs.insert(3, 15usize);
+        offs.insert(4, 533usize);
+        offs.insert(5, 601usize);
+
+        patch_part1_xref(&mut bytes, &patch, &offs).expect("happy path patches in place");
+
+        let expected = b"0000000015 00000 n \n0000000533 00000 n \n0000000601 00000 n \n";
+        assert_eq!(
+            &bytes[..],
+            &expected[..],
+            "entries must be 20-byte classic rows"
+        );
+    }
+
+    #[test]
+    fn patch_part1_xref_errors_when_a_covered_object_has_no_offset() {
+        let count = 2u32;
+        let mut bytes = vec![b' '; count as usize * CLASSIC_XREF_ENTRY_WIDTH];
+        let patch = Part1XrefPatch {
+            start_num: 3,
+            count,
+            data_range: 0..bytes.len(),
+        };
+        // Only obj 3 is present; obj 4 is missing → live object without offset.
+        let mut offs = BTreeMap::new();
+        offs.insert(3, 15usize);
+
+        let err = patch_part1_xref(&mut bytes, &patch, &offs)
+            .expect_err("missing covered-object offset must be rejected");
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("has no offset")),
+            "expected a 'has no offset' Unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn patch_part1_xref_errors_on_out_of_bounds_range() {
+        let mut bytes = vec![b' '; 20];
+        // data_range.end (40) exceeds the buffer length (20).
+        let patch = Part1XrefPatch {
+            start_num: 3,
+            count: 2,
+            data_range: 0..40,
+        };
+        let offs = BTreeMap::new();
+        let err = patch_part1_xref(&mut bytes, &patch, &offs)
+            .expect_err("out-of-bounds patch range must be rejected");
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("out of bounds")),
+            "expected an 'out of bounds' Unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn patch_part1_xref_errors_on_payload_length_drift() {
+        // data_range length (21) is not count*20 (40), so the encoded entries
+        // cannot fill it exactly → length-drift guard fires.  The range stays
+        // in-bounds so the earlier out-of-bounds guard does not pre-empt it.
+        let mut bytes = vec![b' '; 21];
+        let patch = Part1XrefPatch {
+            start_num: 3,
+            count: 2,
+            data_range: 0..21,
+        };
+        let mut offs = BTreeMap::new();
+        offs.insert(3, 15usize);
+        offs.insert(4, 533usize);
+        let err = patch_part1_xref(&mut bytes, &patch, &offs)
+            .expect_err("payload length drift must be rejected");
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("length drift")),
+            "expected a 'length drift' Unsupported error, got {err:?}"
         );
     }
 
