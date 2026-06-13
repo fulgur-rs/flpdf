@@ -188,6 +188,39 @@ fn deterministic_id_emits_no_testing_warning() {
 }
 
 #[test]
+fn deterministic_id_is_honored_in_page_ops_pipeline() {
+    // The page-extraction pipeline rewrites through the full-rewrite writer, so
+    // --deterministic-id must produce a stable /ID there too (not silently fall
+    // back to a random one). Guards against a silent regression.
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("three-page.pdf");
+    let a = tmp.path().join("a.pdf");
+    let b = tmp.path().join("b.pdf");
+
+    for out in [&a, &b] {
+        CargoCommand::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg("--deterministic-id")
+            .arg(&input)
+            .args(["--pages", ".", "1-2", "--"])
+            .arg(out)
+            .assert()
+            .success();
+    }
+
+    let (id0, id1) = extract_id_array(&std::fs::read(&a).expect("read a"));
+    assert_eq!(
+        id0, id1,
+        "page-ops deterministic /ID elements must be equal"
+    );
+    assert_eq!(
+        std::fs::read(&a).expect("read a"),
+        std::fs::read(&b).expect("read b"),
+        "page-ops --deterministic-id must be byte-stable across runs"
+    );
+}
+
+#[test]
 fn deterministic_id_top_level_alias_is_stable() {
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
