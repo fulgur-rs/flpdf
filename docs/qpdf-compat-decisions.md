@@ -65,6 +65,17 @@ Grouped by area for navigation.
 **Owner:** unassigned  
 **Rationale:** qpdf derives /ID from MD5 over output bytes; reproducing qpdf's exact deterministic /ID requires byte-identical output up to the trailer. flpdf's deterministic-id will be stable across runs but NOT equal to qpdf's value on the same input. Decision between shipping a self-stable deterministic /ID, attempting full byte parity, or explicitly documenting the divergence.
 
+#### `flpdf-9hc.13.10` — linearized --deterministic-id /ID[1] (qpdf hashes its first-pass placeholder buffer)
+
+**Decision:** documented divergence (self-stable /ID retained)
+**Owner:** unassigned
+
+**Context:** flpdf's linearized `rewrite --linearize --deterministic-id` output is now **byte-identical to `qpdf 11.9.0 --linearize --deterministic-id`** on the stream-free fixture corpus (one/two/three-page) for every byte **except the changing identifier `/ID[1]`** (the permanent `/ID[0]` matches). This was reached by aligning the classic linearized layout with qpdf: first-page object numbering (a page's `/Resources` subtree numbered ahead of its `/Contents`), physical placement (catalog emitted at the start of the first-page section, remaining body in ascending object number after `/E`), the Part-1 trailer `/ID` spacing, and recompressed-body `endstream` framing.
+
+**Why `/ID[1]` cannot match (corrects the `.13.10` issue's premise):** the issue assumed `/ID[1]` would match automatically once the layout is byte-identical. It does not. qpdf computes the linearized deterministic ID during its **first write pass** and MD5-hashes that entire first-pass buffer, in which the linearization parameters (`/L /H /O /E /T`), the trailer `/Prev`, the cross-reference offsets, **and the hint stream** are still dummy/placeholder values — not their final bytes (verified against qpdf's `QPDFWriter::generateID` / `computeDeterministicIDData`, and confirmed empirically: no reconstructible state from the final golden bytes — neither a first-`/ID[` cutoff nor a whole-buffer digest — reproduces qpdf's `/ID[1]`). flpdf instead fingerprints its own converged buffer, where those bytes are final. Matching qpdf would require reproducing qpdf's exact first-pass placeholder buffer, i.e. reimplementing its two-pass writer's internal layout — out of scope and not worth the coupling.
+
+**Consequence for tests:** the strict byte-identity tests (`{one,two,three}_page_linearized_is_byte_identical_to_qpdf`) are `#[ignore]`d with a discoverable reason; new `*_structurally_byte_identical_to_qpdf` tests positively pin the layout (masking only the `/ID[1]` hex runs, still asserting `/ID[0]`). The linearize verdict in `tests/golden/compat-matrix.md` stays `diverge`.
+
 ### Appearance generation
 
 #### `flpdf-9hc.9.5` — Tx (text field) appearance stream renderer
