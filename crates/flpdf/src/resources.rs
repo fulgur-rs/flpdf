@@ -21,6 +21,7 @@
 
 use crate::content_stream::{ContentStreamParser, ContentToken};
 use crate::filters::decode_stream_data;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -750,14 +751,16 @@ fn recurse_form_xobject<R: Read + Seek>(
     // Locate the XObject entry in the current /Resources scope. The
     // `/XObject` resource category itself may be a direct dictionary *or*
     // an indirect reference (`/XObject 6 0 R`) — resolve the latter, the
-    // same way `apply_pruning` already treats indirect category dicts.
+    // same way `apply_pruning` already treats indirect category dicts. The
+    // reference may itself be reached through more than one indirect hop
+    // (ref -> ref -> dict); follow the chain to its terminal dictionary.
     let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject").cloned())
     {
         Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
-        Some(Object::Reference(cat_ref)) => match pdf.resolve_borrowed(cat_ref)? {
-            Object::Dictionary(xobj_dict) => xobj_dict.get(xobject_name).cloned(),
-            _ => None,
-        },
+        Some(Object::Reference(cat_ref)) => resolve_ref_chain(pdf, &Object::Reference(cat_ref))?
+            .0
+            .into_dict()
+            .and_then(|xobj_dict| xobj_dict.get(xobject_name).cloned()),
         _ => None,
     };
 
@@ -774,20 +777,23 @@ fn recurse_form_xobject<R: Read + Seek>(
     };
 
     // Resolve to a Stream, handling both indirect references and direct streams.
-    let stream: crate::object::Stream = match xobj_val {
-        Object::Reference(xobj_ref) => {
-            let obj = pdf.resolve_borrowed(xobj_ref)?;
-            match obj {
-                Object::Stream(s) => s.clone(),
-                _ => return Ok(true),
-            }
-        }
-        Object::Stream(s) => {
-            // Direct stream: owned by its parent dict, so cycles are impossible
-            // in well-formed PDFs.  Depth guard above is sufficient.
-            s
-        }
-        _ => return Ok(true),
+    // An indirect XObject may be reached through more than one indirect hop
+    // (ref -> ref -> stream); follow the chain to its terminal and move the
+    // owned Stream out rather than cloning it again. (`indirect_ref` above keeps
+    // the *first* hop for the `visited` stack-pop cycle guard — unaffected here.)
+    // A non-Stream terminal, a non-reference/non-stream value, and (above) an
+    // absent entry all mean "nothing to recurse into" → the page stays complete.
+    let stream: Option<crate::object::Stream> = match xobj_val {
+        Object::Reference(xobj_ref) => resolve_ref_chain(pdf, &Object::Reference(xobj_ref))?
+            .0
+            .into_stream(),
+        // Direct stream: owned by its parent dict, so cycles are impossible in
+        // well-formed PDFs.  Depth guard above is sufficient.
+        Object::Stream(s) => Some(s),
+        _ => None,
+    };
+    let Some(stream) = stream else {
+        return Ok(true);
     };
 
     // Only recurse into Form XObjects.
