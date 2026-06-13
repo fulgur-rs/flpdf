@@ -150,8 +150,10 @@ struct Cli {
     password: PasswordArgs,
     /// Bound each page content stream's decoded output to BYTES during `--check`
     /// (opt-in decompression-bomb guard). Absent = unlimited (qpdf's default).
-    /// A stream exceeding the cap is a warning (exit 3), not an error.
-    #[arg(long = "decode-memory-limit", value_name = "BYTES")]
+    /// A stream exceeding the cap is a warning (exit 3), not an error. Only
+    /// meaningful with `--check`, so it `requires` that flag rather than being
+    /// silently ignored alongside other modes.
+    #[arg(long = "decode-memory-limit", value_name = "BYTES", requires = "check")]
     decode_memory_limit: Option<usize>,
     #[arg(long)]
     dump_object: Option<String>,

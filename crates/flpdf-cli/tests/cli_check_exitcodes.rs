@@ -702,3 +702,19 @@ fn check_decode_memory_limit_does_not_mask_corruption() {
         "errors while decoding content stream",
     ));
 }
+
+/// `--decode-memory-limit` only affects the `--check` audit path, so passing it
+/// without `--check` is a clap usage error (`requires = "check"`) rather than a
+/// silently-ignored flag. clap reports a missing-required-argument error
+/// (exit 2) naming `--check`.
+#[test]
+fn decode_memory_limit_requires_check() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&clean_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--decode-memory-limit", "1024", f.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--check"));
+}
