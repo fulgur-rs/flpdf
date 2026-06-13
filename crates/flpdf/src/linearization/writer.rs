@@ -1444,6 +1444,17 @@ pub fn write_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriteOptions,
 ) -> Result<LinearizedDocument> {
+    // `--deterministic-id` and `--static-id` are mutually exclusive: a
+    // content-derived `/ID` and qpdf's fixed test constant cannot both be the
+    // identifier. The flat (`crate::writer::write_pdf_full_rewrite`) path
+    // rejects the combination; mirror it here so the public linearization API
+    // does not silently let the deterministic branch win over `static_id`.
+    if options.deterministic_id && options.static_id {
+        return Err(crate::Error::Unsupported(
+            "deterministic_id and static_id are mutually exclusive".to_string(),
+        ));
+    }
+
     // The linearized writer emits plaintext only — it does not implement
     // encryption. A deterministic `/ID` feeds the encryption key, so a
     // content-derived `/ID` cannot be computed before the encrypted bytes
@@ -2969,6 +2980,28 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported(ref m)
                 if m == "the deterministic-id option is incompatible with encrypted output files"),
+            "got {err:?}"
+        );
+    }
+
+    /// `--deterministic-id` and `--static-id` are mutually exclusive on the
+    /// linearized write path too, mirroring `write_pdf_full_rewrite`. Without
+    /// the guard the deterministic branch silently wins over `static_id`.
+    #[test]
+    fn deterministic_id_linearized_rejects_static_id() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "deterministic_id and static_id are mutually exclusive"),
             "got {err:?}"
         );
     }
