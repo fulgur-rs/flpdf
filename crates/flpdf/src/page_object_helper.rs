@@ -123,6 +123,7 @@
 use crate::content_stream::{ContentStreamParser, ContentToken};
 use crate::page_rotate::resolve_inherited_rotate;
 use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -380,9 +381,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let annots_array = match annots_val {
             Object::Array(arr) => arr,
             Object::Reference(r) => {
-                let resolved = self.pdf.resolve_borrowed(r)?;
-                match resolved {
-                    Object::Array(arr) => arr.clone(),
+                // /Annots may be stored behind a holder chain (ref -> ref ->
+                // array); follow the chain to its terminal rather than a single
+                // hop, then move the owned array out.
+                let (terminal, _) = resolve_ref_chain(self.pdf, &Object::Reference(r))?;
+                match terminal {
+                    Object::Array(arr) => arr,
                     _ => {
                         return Err(Error::Unsupported(format!(
                             "/Annots reference {r} on page {} does not resolve to an array",
