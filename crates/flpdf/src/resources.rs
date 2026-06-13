@@ -21,7 +21,7 @@
 
 use crate::content_stream::{ContentStreamParser, ContentToken};
 use crate::filters::decode_stream_data;
-use crate::ref_chain::resolve_ref_chain;
+use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -519,8 +519,12 @@ fn resources_location<R: Read + Seek>(
                 // resolve a ref-to-a-ref, see a non-dict, and silently skip
                 // pruning. A single-hop ref's terminal is itself, so this
                 // preserves the prior result for that case.
-                let (terminal_obj, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
-                match terminal_obj {
+                //
+                // `terminal_ref_of_chain` walks by borrow and returns only the
+                // ref, so the terminal `/Resources` dictionary — re-inspected by
+                // borrow just below — is never cloned on this per-page hot path.
+                let terminal_ref = terminal_ref_of_chain(pdf, r)?;
+                match pdf.resolve_borrowed(terminal_ref)? {
                     // A chain resolving to null is "absent" (PDF §7.3.9): fall
                     // through to the parent, matching the `Absent` arm and the
                     // read side. Returning `Indirect(terminal)` would key this
@@ -531,9 +535,7 @@ fn resources_location<R: Read + Seek>(
                         Some(parent) => current = parent,
                         None => return Ok(ResourcesLoc::None),
                     },
-                    Object::Dictionary(_) => {
-                        return Ok(terminal_ref.map_or(ResourcesLoc::None, ResourcesLoc::Indirect));
-                    }
+                    Object::Dictionary(_) => return Ok(ResourcesLoc::Indirect(terminal_ref)),
                     // A non-dict, non-null terminal has nothing prunable; the
                     // read side rejects it, but here we simply skip (no-op).
                     _ => return Ok(ResourcesLoc::None),
