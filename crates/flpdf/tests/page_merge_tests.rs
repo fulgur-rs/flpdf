@@ -4766,3 +4766,55 @@ fn merge_keeps_surviving_dest_behind_page_ref_chain() {
         "a /Dest whose leading page ref is a holder chain to a SELECTED page must remap to a live page, not null"
     );
 }
+
+/// Single input, two selected pages where page 0 cross-references page 1 and
+/// page 1 owns an exclusive resource. Page 0's `/Annots` link `/Dest` targets
+/// page 1, so the per-input closure walk reaches page 1 as a sibling and stops
+/// at it (Page guard) before page 1 is processed as its own start. Page 1's
+/// exclusive `/Resources` (font obj 7, referenced by nothing else) must still be
+/// copied: the shared-visited union threads ONE `visited` set across the two
+/// selected pages (extract_pages parity, flpdf-11lj) and force-traverses each
+/// start page, so a gate-on-insert start push would drop obj 7.
+fn cross_ref_exclusive_resource_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 6 0 R >>",
+            ),
+            (5, "<< /Subtype /Link /Dest [4 0 R /Fit] >>"),
+            (6, "<< /Font << /F1 7 0 R >> >>"),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_shared_visited_keeps_cross_referenced_pages_exclusive_resource() {
+    let mut src = Pdf::open_mem_owned(cross_ref_exclusive_resource_pdf()).unwrap();
+    // Select page 0 FIRST so its walk reaches page 1 (via the link `/Dest`) and
+    // stops at it before page 1 is force-traversed as its own start.
+    let mut inputs = [MergeInput {
+        source: &mut src,
+        pages: vec![0, 1],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(refs.len(), 2, "both selected pages are merged");
+    // Page 1's exclusive `/Resources` font must survive the shared-visited union:
+    // force-traversal of page 1 collects obj 7 even though page 0's earlier walk
+    // already visited page 1 as a sibling leaf.
+    assert_eq!(
+        leaf_base_font(&mut doc, 1),
+        b"Courier".to_vec(),
+        "page 1's exclusive /Resources font must be copied into the merged output"
+    );
+}
