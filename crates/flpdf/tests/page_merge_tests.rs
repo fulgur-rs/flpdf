@@ -1440,6 +1440,189 @@ fn merge_opaque_openaction_d_operand_is_copied_and_remapped() {
     );
 }
 
+// An inline-on-catalog /OpenAction of /S /GoTo carrying BOTH a /SD structure
+// destination and a /D explicit destination: merge never copies the structure
+// tree, so /SD (pointing at an uncopied StructElem) cannot resolve and — per
+// ISO 32000-2 §12.3.2.3, /SD takes precedence over /D for structure-aware
+// viewers — would suppress the working /D if left in place (nulled or dangling).
+// merge drops /SD and keeps /D, which is remapped to the copied page.
+#[test]
+fn merge_inline_openaction_goto_sd_dropped_falls_back_to_d() {
+    let src = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoTo /SD [8 0 R /Fit] /D [3 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"), // page0 kept, /D target
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"), // page1 removed, /SD target
+            (8, "<< /Type /StructElem /S /Sect /Pg 4 0 R >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(src).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let refs = pages::page_refs(&mut doc).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /OpenAction action dict, got {other:?}"),
+    };
+    assert!(
+        oa.get("SD").is_none(),
+        "/SD must be dropped (structure tree not copied), got {:?}",
+        oa.get("SD")
+    );
+    let d = match oa.get("D") {
+        Some(Object::Array(arr)) => arr.clone(),
+        other => panic!("expected /D array fallback, got {other:?}"),
+    };
+    let (d_ref, d_null) = dest_array_first(&mut doc, &d);
+    assert!(!d_null, "/D fallback must remain live");
+    assert_eq!(d_ref, refs[0], "/D remaps to copied page0");
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok(), "merged doc round-trips");
+}
+
+// An inline /OpenAction /S /GoTo with ONLY /SD (no /D): dropping /SD leaves the
+// GoTo with no destination (a benign no-op action), retained like extract's
+// neutralize keeps the action and drops only the destination key.
+#[test]
+fn merge_inline_openaction_goto_sd_only_yields_no_dest() {
+    let src = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoTo /SD [8 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"), // page0 kept
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"), // /SD target page
+            (8, "<< /Type /StructElem /S /Sect /Pg 4 0 R >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(src).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /OpenAction action dict, got {other:?}"),
+    };
+    assert!(oa.get("SD").is_none(), "/SD dropped");
+    assert!(oa.get("D").is_none(), "no /D fallback present");
+    assert_eq!(
+        oa.get("S").and_then(Object::as_name),
+        Some(&b"GoTo"[..]),
+        "the GoTo action itself is retained"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok(), "merged doc round-trips");
+}
+
+// /SD is dropped UNCONDITIONALLY — even when its StructElem /Pg targets a KEPT
+// page. Unlike extract (which keeps a kept-page /SD because it retains the
+// structure tree), merge never copies the structure tree, so the StructElem ref
+// is uncopied regardless of whether the target page survives. This pins the
+// unconditional-drop discipline (guards against a copy of extract's
+// drop-only-when-absent condition).
+#[test]
+fn merge_inline_openaction_goto_sd_dropped_even_when_target_kept() {
+    let src = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoTo /SD [8 0 R /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"), // page0 kept
+            (8, "<< /Type /StructElem /S /Sect /Pg 3 0 R >>"),              // /Pg → KEPT page0
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(src).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /OpenAction action dict, got {other:?}"),
+    };
+    assert!(
+        oa.get("SD").is_none(),
+        "/SD dropped even when its target page is kept (structure tree never copied)"
+    );
+}
+
+// An inline /OpenAction that is an OPAQUE remote go-to (/S /GoToR) carrying its
+// own /SD: that /SD references a structure element in the *target* document, not
+// the primary's (absent) local structure tree, so — unlike a local /GoTo — merge
+// must preserve it verbatim alongside the remote /D. The /SD drop is gated on
+// local-dest actions, mirroring the /GoTo-only gating in the collector and in
+// extract's neutralize family. Regression guard for the GoTo-only scope.
+#[test]
+fn merge_inline_openaction_gotor_sd_is_preserved() {
+    let src = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /OpenAction << /S /GoToR /F (other.pdf) /D [0 /Fit] /SD [(StructID) /Fit] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut a = Pdf::open_mem_owned(src).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let cat = catalog_dict(&mut doc);
+    let oa = match cat.get("OpenAction") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /OpenAction action dict, got {other:?}"),
+    };
+    // The remote go-to's structure destination must survive verbatim (not dropped,
+    // not nulled — it carries no in-document ref, so it round-trips unchanged).
+    match oa.get("SD") {
+        Some(Object::Array(arr)) => match arr.first() {
+            Some(Object::String(s)) => assert_eq!(
+                s.as_slice(),
+                b"StructID",
+                "remote /SD structure-element id must be preserved verbatim"
+            ),
+            other => panic!("expected /SD string id, got {other:?}"),
+        },
+        other => panic!("opaque /GoToR /SD must be preserved, got {other:?}"),
+    }
+}
+
 /// Three-page primary whose document-level carriers are held INLINE on the
 /// catalog (not as indirect objects), exercising the inline-on-catalog wiring
 /// and reconstruction paths:
