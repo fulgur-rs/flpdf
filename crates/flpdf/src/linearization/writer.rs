@@ -522,6 +522,18 @@ fn write_part1_xref_and_trailer(
 /// Write the Part 6 cross-reference table covering all objects (0 through N),
 /// followed by the main trailer.
 ///
+/// The main trailer is the cross-reference section the file's trailing
+/// `startxref` points at, so it is the one a reader resolves first. It
+/// therefore carries `/ID`: the file identifier `write_linearized` finalized
+/// once onto `source_trailer["ID"]` is emitted verbatim, so the main trailer
+/// advertises the same identifier as the Part-1 first-page trailer (qpdf
+/// likewise repeats `/ID` in both). Without it, readers that follow the
+/// tail-`startxref` path would see no `/ID` at all.
+///
+/// The trailer keys are written as raw bytes (not via `Dictionary::write_pdf`,
+/// which would alphabetize them) to preserve qpdf's key order
+/// `/Size /Root /Info /ID`.
+///
 /// Returns `(xref_keyword_offset, xref_first_entry_offset)` where:
 /// - `xref_keyword_offset` is the byte offset of the `xref` keyword
 /// - `xref_first_entry_offset` is the byte offset of the first xref entry
@@ -533,6 +545,7 @@ fn write_main_xref_and_trailer(
     total_count: u32, // /Size — highest object number + 1
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
+    source_trailer: &Dictionary,
 ) -> (usize, usize) {
     let xref_start = bytes.len();
 
@@ -551,15 +564,32 @@ fn write_main_xref_and_trailer(
         }
     }
 
-    // Main trailer.
-    let mut trailer = Dictionary::new();
-    trailer.insert("Size", Object::Integer(i64::from(total_count)));
-    trailer.insert("Root", Object::Reference(catalog_new_ref));
+    // Main trailer.  Written as raw bytes (not Dictionary::write_pdf, which
+    // alphabetizes) to keep qpdf's key order /Size /Root /Info /ID and to emit
+    // /ID with the same idiom as the Part-1 trailer.
+    bytes.extend_from_slice(b"trailer << ");
+    bytes.extend_from_slice(format!("/Size {} ", total_count).as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "/Root {} {} R ",
+            catalog_new_ref.number, catalog_new_ref.generation
+        )
+        .as_bytes(),
+    );
     if let Some(info_ref) = info_new_ref {
-        trailer.insert("Info", Object::Reference(info_ref));
+        bytes.extend_from_slice(
+            format!("/Info {} {} R ", info_ref.number, info_ref.generation).as_bytes(),
+        );
     }
-    bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(bytes);
+    // /ID — emit the file-scoped identifier verbatim (the same value the
+    // Part-1 trailer carries), so the trailer a reader resolves via the
+    // trailing `startxref` advertises the identifier.
+    if let Some(id_obj) = source_trailer.get("ID") {
+        bytes.extend_from_slice(b"/ID ");
+        id_obj.write_pdf(bytes);
+        bytes.extend_from_slice(b" ");
+    }
+    bytes.extend_from_slice(b">>");
     bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", xref_start).as_bytes());
 
     (xref_start, xref_first_entry_offset)
@@ -1094,7 +1124,10 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
         );
-        // Part-1 trailer is the sole `/ID` site on the classic table path.
+        // Part-1 first-page trailer `/ID` site.  The main (Part-6) trailer
+        // emitted at EOF carries the same `/ID` (its span is captured at
+        // the `write_main_xref_and_trailer` call below), so the classic
+        // table path has two `/ID` sites — both back-patched together.
         id_ranges.push(section_start..bytes.len());
         range
     } else {
@@ -1216,13 +1249,23 @@ fn do_write_pass<R: Read + Seek>(
     // an xref stream.  With an empty layout the classic table path is kept
     // verbatim — no behavioural change for Disable / no-ObjStm inputs.
     let (last_xref_offset, last_xref_first_entry_offset) = if objstm_layout.is_empty() {
-        write_main_xref_and_trailer(
+        // The main (Part-6) trailer is the section the file's trailing
+        // `startxref` points at, so it is the trailer a reader resolves.  It
+        // carries the same `/ID` as the Part-1 first-page trailer; capture its
+        // span so the deterministic-`/ID` back-patch rewrites the placeholder
+        // there too (the push is unconditional, matching the Part-1 site —
+        // `id_ranges` is consulted only when `deterministic_id` is set).
+        let main_section_start = bytes.len();
+        let result = write_main_xref_and_trailer(
             &mut bytes,
             &xref_offsets,
             total_count,
             catalog_new_ref,
             info_new_ref,
-        )
+            source_trailer,
+        );
+        id_ranges.push(main_section_start..bytes.len());
+        result
     } else {
         // The first-page xref stream was already emitted before /E; record
         // where it landed so the main xref's /Prev (main → first) and /T can
@@ -2803,5 +2846,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Linearize `source_bytes` in the given write mode with the supplied
+    /// `WriteOptions` mutator applied, returning the fully back-patched bytes.
+    /// Mirrors [`linearize_deterministic_mode`] but lets a test pick a
+    /// non-deterministic `/ID` policy (e.g. `--static-id`).
+    fn linearize_with(source_bytes: &[u8], configure: impl FnOnce(&mut WriteOptions)) -> Vec<u8> {
+        let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut opts = WriteOptions::default();
+        configure(&mut opts);
+        let mut pdf2 = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
+        let mut doc =
+            write_linearized(&plan, &renumber, &mut pdf2, &opts).expect("write_linearized");
+        doc.back_patch().expect("back_patch must succeed");
+        doc.bytes
+    }
+
+    /// The classic xref-table path (no object streams) must carry `/ID` in
+    /// **both** the Part-1 first-page trailer and the main (Part-6) trailer at
+    /// EOF — the trailing `startxref` points at the main trailer, so a reader
+    /// resolves its `/ID`. qpdf likewise repeats the identifier in both
+    /// trailers. Before this fix the main trailer omitted `/ID`, so a reader
+    /// saw none at all.
+    #[test]
+    fn deterministic_id_linearized_classic_main_trailer_has_id() {
+        let out = linearize_deterministic(&tiny_pdf_bytes());
+
+        // Exactly two byte-equal /ID sites: the Part-1 trailer and the main
+        // (Part-6) trailer.
+        let ids = collect_id_arrays(&out);
+        assert_eq!(
+            ids.len(),
+            2,
+            "classic-table linearized output must carry /ID in both the \
+             Part-1 and main trailers, got {ids:?}"
+        );
+        let first = &ids[0];
+        assert!(
+            ids.iter().all(|id| id == first),
+            "every /ID site in one linearized file must be byte-equal: {ids:?}"
+        );
+        assert_eq!(first.len(), DETERMINISTIC_ID_ARRAY_LEN);
+
+        // The reader resolves the main trailer (the one the trailing startxref
+        // points at), so the deterministic /ID must be visible there.
+        let reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
+        let trailer_id = reopened
+            .trailer()
+            .get("ID")
+            .expect("main trailer must carry /ID after linearize --deterministic-id");
+        // Serialize the resolved trailer /ID and confirm it matches the
+        // byte-for-byte /ID array found in the file.
+        let mut serialized = Vec::new();
+        trailer_id.write_pdf(&mut serialized);
+        assert_eq!(
+            serialized.as_slice(),
+            first.as_slice(),
+            "reader-visible main-trailer /ID must equal the Part-1 trailer /ID"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output must pass the linearization checker");
+    }
+
+    /// Reader-visibility regression for non-deterministic `/ID` policies: even
+    /// with `--static-id` the classic main trailer must advertise `/ID` (the
+    /// fix is not deterministic-id specific — the main trailer was previously
+    /// `/ID`-less in every mode).
+    #[test]
+    fn static_id_linearized_main_trailer_visible_to_reader() {
+        let out = linearize_with(&tiny_pdf_bytes(), |o| o.static_id = true);
+        let reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
+        assert!(
+            reopened.trailer().get("ID").is_some(),
+            "static-id linearized output must carry /ID in the reader-visible main trailer"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("static-id linearized output must pass the linearization checker");
     }
 }
