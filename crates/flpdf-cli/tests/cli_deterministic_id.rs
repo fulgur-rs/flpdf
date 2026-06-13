@@ -5,8 +5,10 @@
 //! - /ID[0] (permanent identifier) is preserved from the input, while /ID[1]
 //!   (changing identifier) is content-derived and is not the `--static-id`
 //!   constant;
+//! - `--linearize` is supported: the deterministic /ID is derived from the
+//!   linearized body and is self-stable across runs;
 //! - the qpdf-incompatible combinations are rejected (+ `--static-id`,
-//!   + `--encrypt`, + `--linearize`);
+//!   + `--encrypt`);
 //! - unlike `--static-id`, the flag is production-safe and emits no
 //!   testing-only warning.
 //!
@@ -177,22 +179,55 @@ fn deterministic_id_conflicts_with_json() {
         .stderr(predicate::str::contains("cannot be used with"));
 }
 
-#[test]
-fn deterministic_id_rejected_with_linearize() {
-    let tmp = tempdir().expect("tempdir");
-    let input = fixture_path("one-page.pdf");
-    let output = tmp.path().join("out.pdf");
-
+fn run_rewrite_linearize_det_id(input: &Path, output: &Path) {
     CargoCommand::cargo_bin("flpdf")
         .expect("flpdf binary")
         .args(["rewrite", "--linearize", "--deterministic-id"])
-        .arg(&input)
-        .arg(&output)
+        .arg(input)
+        .arg(output)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "not yet supported for linearized output",
-        ));
+        .success();
+}
+
+#[test]
+fn deterministic_id_with_linearize_is_stable_across_runs() {
+    // qpdf computes a deterministic /ID for linearized output too; flpdf's
+    // linearized writer derives it from an MD5 over the finished body and
+    // back-patches every trailer / xref-stream /ID with the same value, so two
+    // runs over the same input produce a byte-identical file.
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("one-page.pdf");
+    let a = tmp.path().join("lin-a.pdf");
+    let b = tmp.path().join("lin-b.pdf");
+
+    run_rewrite_linearize_det_id(&input, &a);
+    run_rewrite_linearize_det_id(&input, &b);
+
+    let bytes_a = std::fs::read(&a).expect("read a");
+    let bytes_b = std::fs::read(&b).expect("read b");
+    assert_eq!(
+        bytes_a, bytes_b,
+        "two --linearize --deterministic-id runs must be byte-identical"
+    );
+
+    // The linearized output is a valid, linearized PDF with a non-placeholder /ID.
+    assert!(
+        bytes_a
+            .windows(b"/Linearized".len())
+            .any(|w| w == b"/Linearized"),
+        "output must be linearized"
+    );
+    let (id0, id1) = extract_id_array(&bytes_a);
+    assert_ne!(
+        id0,
+        vec![b'0'; 32],
+        "/ID[0] placeholder must be patched to a real value"
+    );
+    assert_ne!(
+        id1,
+        vec![b'0'; 32],
+        "/ID[1] placeholder must be patched to a real value"
+    );
 }
 
 #[test]

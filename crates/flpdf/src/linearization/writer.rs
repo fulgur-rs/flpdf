@@ -522,6 +522,18 @@ fn write_part1_xref_and_trailer(
 /// Write the Part 6 cross-reference table covering all objects (0 through N),
 /// followed by the main trailer.
 ///
+/// The main trailer is the cross-reference section the file's trailing
+/// `startxref` points at, so it is the one a reader resolves first. It
+/// therefore carries `/ID`: the file identifier `write_linearized` finalized
+/// once onto `source_trailer["ID"]` is emitted verbatim, so the main trailer
+/// advertises the same identifier as the Part-1 first-page trailer (qpdf
+/// likewise repeats `/ID` in both). Without it, readers that follow the
+/// tail-`startxref` path would see no `/ID` at all.
+///
+/// The trailer keys are written as raw bytes (not via `Dictionary::write_pdf`,
+/// which would alphabetize them) to preserve qpdf's key order
+/// `/Size /Root /Info /ID`.
+///
 /// Returns `(xref_keyword_offset, xref_first_entry_offset)` where:
 /// - `xref_keyword_offset` is the byte offset of the `xref` keyword
 /// - `xref_first_entry_offset` is the byte offset of the first xref entry
@@ -533,6 +545,7 @@ fn write_main_xref_and_trailer(
     total_count: u32, // /Size — highest object number + 1
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
+    source_trailer: &Dictionary,
 ) -> (usize, usize) {
     let xref_start = bytes.len();
 
@@ -551,15 +564,32 @@ fn write_main_xref_and_trailer(
         }
     }
 
-    // Main trailer.
-    let mut trailer = Dictionary::new();
-    trailer.insert("Size", Object::Integer(i64::from(total_count)));
-    trailer.insert("Root", Object::Reference(catalog_new_ref));
+    // Main trailer.  Written as raw bytes (not Dictionary::write_pdf, which
+    // alphabetizes) to keep qpdf's key order /Size /Root /Info /ID and to emit
+    // /ID with the same idiom as the Part-1 trailer.
+    bytes.extend_from_slice(b"trailer << ");
+    bytes.extend_from_slice(format!("/Size {} ", total_count).as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "/Root {} {} R ",
+            catalog_new_ref.number, catalog_new_ref.generation
+        )
+        .as_bytes(),
+    );
     if let Some(info_ref) = info_new_ref {
-        trailer.insert("Info", Object::Reference(info_ref));
+        bytes.extend_from_slice(
+            format!("/Info {} {} R ", info_ref.number, info_ref.generation).as_bytes(),
+        );
     }
-    bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(bytes);
+    // /ID — emit the file-scoped identifier verbatim (the same value the
+    // Part-1 trailer carries), so the trailer a reader resolves via the
+    // trailing `startxref` advertises the identifier.
+    if let Some(id_obj) = source_trailer.get("ID") {
+        bytes.extend_from_slice(b"/ID ");
+        id_obj.write_pdf(bytes);
+        bytes.extend_from_slice(b" ");
+    }
+    bytes.extend_from_slice(b">>");
     bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", xref_start).as_bytes());
 
     (xref_start, xref_first_entry_offset)
@@ -629,13 +659,27 @@ fn encode_split_xref_slice(
 /// producing inconsistent identifiers within a single file).
 ///
 /// Policy mirrors `crate::writer`:
+///   - `--deterministic-id`: a fixed-width all-zero placeholder
+///     `[<0×32><0×32>]` that every trailer / xref-stream dict emits verbatim.
+///     The real two-level identifier is computed from a digest over the
+///     finished output and back-patched in place (see
+///     [`patch_linearized_deterministic_id`]), because the value cannot be
+///     known until the bytes exist. The placeholder
+///     serializes to the same width as the final value, so the patch leaves
+///     every later byte offset (`startxref`, hint stream, xref offsets)
+///     untouched.
 ///   - `--static-id`: `[source_id0_or_π, π_const]`
 ///   - default: a fresh random two-element /ID — element 1 preserved from a
 ///     well-formed source /ID on re-save, both fresh on first save
 ///     (ISO 32000-1 §14.4).
 fn finalize_linearized_id(options: &WriteOptions, source_trailer: &Dictionary) -> Object {
     let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
-    if options.static_id {
+    if options.deterministic_id {
+        Object::Array(vec![
+            Object::String(vec![0u8; 16]),
+            Object::String(vec![0u8; 16]),
+        ])
+    } else if options.static_id {
         let first_id = match source_trailer.get("ID") {
             Some(Object::Array(values))
                 if values.len() == 2 && matches!(values[0], Object::String(_)) =>
@@ -656,6 +700,80 @@ fn finalize_linearized_id(options: &WriteOptions, source_trailer: &Dictionary) -
 /// trailer.
 fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
     source_trailer.get("ID").cloned()
+}
+
+/// Overwrite every all-zero deterministic `/ID` placeholder in the finished
+/// linearized output with the final two-level qpdf identifier.
+///
+/// A linearized file repeats `/ID` across the Part-1 trailer, the first-page
+/// xref-stream dict, and the main xref-stream dict; a file identifier is
+/// file-scoped, so all three must carry the *same* value. The identifier is
+/// computed once from a single MD5 over the whole buffer (the placeholder is
+/// all-zero, so this digest depends only on the input and is stable across
+/// runs). Because the replacement is the same width as the placeholder, no
+/// byte offset shifts and the digest is never recomputed (the operation is
+/// acyclic).
+///
+/// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
+/// spans of the sections that actually emit a `/ID` (collected by the writer as
+/// it lays them down). Scanning the whole buffer would corrupt the output if a
+/// content stream, string, or metadata object happened to contain the same
+/// fixed-width placeholder byte sequence; restricting the search to the known
+/// `/ID` sections makes that misfire impossible. The digest still covers the
+/// whole buffer, so the identifier remains a content fingerprint.
+///
+/// # Panics
+///
+/// Panics (via `debug_assert!`) in debug builds if any `/ID` range does not
+/// contain exactly one placeholder — an internal invariant, since
+/// [`finalize_linearized_id`] installs exactly one placeholder per `/ID` site
+/// whenever `deterministic_id` is set, and the writer records one range per
+/// emitted site.
+fn patch_linearized_deterministic_id(
+    bytes: &mut [u8],
+    id_ranges: &[std::ops::Range<usize>],
+    info_suffix: &[u8],
+    source_id0: Option<[u8; 16]>,
+) {
+    use crate::writer::{
+        compute_deterministic_id, write_deterministic_id_array, DETERMINISTIC_ID_ARRAY_LEN,
+    };
+
+    // Compute the identifier once over the placeholder-bearing buffer. There is
+    // no single `[` cutoff (the array recurs at several sites), so the whole
+    // buffer is the digest range: pass the last index as the inclusive end.
+    // (Digest stays global so body-content changes still alter the /ID.)
+    let (id0, id1) = compute_deterministic_id(bytes, bytes.len() - 1, info_suffix, source_id0);
+
+    let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
+    write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
+    let mut final_id = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
+    write_deterministic_id_array(&mut final_id, &id0, &id1);
+
+    // Patch each known `/ID` section in isolation. Body bytes outside these
+    // spans are never inspected, so a placeholder-shaped byte run in user data
+    // can never be mistaken for a `/ID`.
+    for range in id_ranges {
+        // Clamp defensively: a recorded range must lie within the buffer.
+        let start = range.start.min(bytes.len());
+        let end = range.end.min(bytes.len());
+        let mut patched = 0usize;
+        let mut i = start;
+        while i + DETERMINISTIC_ID_ARRAY_LEN <= end {
+            if &bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN] == placeholder.as_slice() {
+                bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN].copy_from_slice(&final_id);
+                patched += 1;
+                i += DETERMINISTIC_ID_ARRAY_LEN;
+            } else {
+                i += 1;
+            }
+        }
+        debug_assert_eq!(
+            patched, 1,
+            "each /ID section must contain exactly one deterministic /ID placeholder \
+             (0 or >1 indicates a linearization writer bug)"
+        );
+    }
 }
 
 /// Emit the **first-page (Part-1) cross-reference stream** at its proper
@@ -950,12 +1068,13 @@ fn do_write_pass<R: Read + Seek>(
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
-    usize,                  // hint_stream_offset
-    usize,                  // hint_stream_obj_total_len
-    usize,                  // end_of_first_page_offset
-    usize,                  // last_xref_offset (xref keyword position)
-    usize,                  // last_xref_first_entry_offset (= /T value per qpdf's convention)
-    std::ops::Range<usize>, // first_trailer_prev_range
+    usize,                       // hint_stream_offset
+    usize,                       // hint_stream_obj_total_len
+    usize,                       // end_of_first_page_offset
+    usize,                       // last_xref_offset (xref keyword position)
+    usize,                       // last_xref_first_entry_offset (= /T value per qpdf's convention)
+    std::ops::Range<usize>,      // first_trailer_prev_range
+    Vec<std::ops::Range<usize>>, // id_ranges: absolute spans of every /ID-bearing section
 )> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
@@ -988,7 +1107,14 @@ fn do_write_pass<R: Read + Seek>(
     // `/Prev` range tells the back-patcher there is no classic Part-1 trailer
     // `/Prev` to patch.
     let mut first_page_xref_patch: Option<FirstPageXrefPatch> = None;
+    // Absolute byte spans of every section that carries a `/ID`.  The
+    // deterministic-`/ID` back-patch scans *only* inside these spans so it can
+    // never overwrite a body byte sequence that happens to equal the all-zero
+    // `/ID` placeholder (see `patch_linearized_deterministic_id`).  Each span is
+    // captured as `start..bytes.len()` around the call that emits its `/ID`.
+    let mut id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let first_trailer_prev_range = if objstm_layout.is_empty() {
+        let section_start = bytes.len();
         let (_p1_xref_offset, range) = write_part1_xref_and_trailer(
             &mut bytes,
             param_dict_absolute_offset,
@@ -998,8 +1124,14 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
         );
+        // Part-1 first-page trailer `/ID` site.  The main (Part-6) trailer
+        // emitted at EOF carries the same `/ID` (its span is captured at
+        // the `write_main_xref_and_trailer` call below), so the classic
+        // table path has two `/ID` sites — both back-patched together.
+        id_ranges.push(section_start..bytes.len());
         range
     } else {
+        let section_start = bytes.len();
         let patch = write_first_page_xref_stream(
             &mut bytes,
             relocation,
@@ -1008,6 +1140,11 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
         )?;
+        // First-page xref stream object carries one `/ID` (the main xref
+        // stream below carries the second).  `patch_first_page_xref` later
+        // overwrites only this object's entry payload (after the dict `/ID`),
+        // length-preservingly, so the span stays valid.
+        id_ranges.push(section_start..bytes.len());
         first_page_xref_patch = Some(patch);
         0..0
     };
@@ -1112,13 +1249,23 @@ fn do_write_pass<R: Read + Seek>(
     // an xref stream.  With an empty layout the classic table path is kept
     // verbatim — no behavioural change for Disable / no-ObjStm inputs.
     let (last_xref_offset, last_xref_first_entry_offset) = if objstm_layout.is_empty() {
-        write_main_xref_and_trailer(
+        // The main (Part-6) trailer is the section the file's trailing
+        // `startxref` points at, so it is the trailer a reader resolves.  It
+        // carries the same `/ID` as the Part-1 first-page trailer; capture its
+        // span so the deterministic-`/ID` back-patch rewrites the placeholder
+        // there too (the push is unconditional, matching the Part-1 site —
+        // `id_ranges` is consulted only when `deterministic_id` is set).
+        let main_section_start = bytes.len();
+        let result = write_main_xref_and_trailer(
             &mut bytes,
             &xref_offsets,
             total_count,
             catalog_new_ref,
             info_new_ref,
-        )
+            source_trailer,
+        );
+        id_ranges.push(main_section_start..bytes.len());
+        result
     } else {
         // The first-page xref stream was already emitted before /E; record
         // where it landed so the main xref's /Prev (main → first) and /T can
@@ -1141,6 +1288,7 @@ fn do_write_pass<R: Read + Seek>(
              /E ({end_of_first_page_offset}) — linearization boundary violated"
         );
 
+        let main_section_start = bytes.len();
         let result = write_main_xref_stream_and_trailer(
             &mut bytes,
             &xref_offsets,
@@ -1152,6 +1300,11 @@ fn do_write_pass<R: Read + Seek>(
             source_trailer,
             first_page_obj_offset,
         )?;
+        // Main xref stream object is the second (and last) `/ID` site on the
+        // ObjStm path.  Its span extends through the trailing
+        // `startxref`/`%%EOF` and is never touched by `patch_first_page_xref`
+        // below (which patches only the first-page region, before /E).
+        id_ranges.push(main_section_start..bytes.len());
 
         // Every downstream object offset is now known, so back-patch the
         // first-page xref's placeholder entry payload in place.  The payload
@@ -1171,6 +1324,7 @@ fn do_write_pass<R: Read + Seek>(
         last_xref_offset,
         last_xref_first_entry_offset,
         first_trailer_prev_range,
+        id_ranges,
     ))
 }
 
@@ -1260,11 +1414,17 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// Returns [`LinearizedDocument`] containing both the bytes and the
 /// [`LinearizedOffsets`] needed for back-patching.
 ///
+/// With [`WriteOptions::deterministic_id`] the `/ID` is derived from an MD5
+/// over the assembled layout (the same digest feeds every trailer / xref-stream
+/// dict), so the identifier is reproducible across runs for identical input.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
-/// is set — deterministic `/ID` generation is not yet supported on the
-/// linearized output path.
+/// is combined with encrypted output ([`WriteOptions::encrypt`] or
+/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
+/// produced once the bytes are encrypted, so the combination is rejected up
+/// front (the linearized writer emits plaintext only).
 ///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
@@ -1284,14 +1444,31 @@ pub fn write_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriteOptions,
 ) -> Result<LinearizedDocument> {
-    if options.deterministic_id {
-        // qpdf computes a deterministic /ID for linearized output too, but
-        // flpdf's linearized writer is a separate two-pass path that does not
-        // yet support it. Reject rather than silently emit a random /ID.
+    // `--deterministic-id` and `--static-id` are mutually exclusive: a
+    // content-derived `/ID` and qpdf's fixed test constant cannot both be the
+    // identifier. The flat (`crate::writer::write_pdf_full_rewrite`) path
+    // rejects the combination; mirror it here so the public linearization API
+    // does not silently let the deterministic branch win over `static_id`.
+    if options.deterministic_id && options.static_id {
         return Err(crate::Error::Unsupported(
-            "deterministic-id is not yet supported for linearized output".to_string(),
+            "deterministic_id and static_id are mutually exclusive".to_string(),
         ));
     }
+
+    // The linearized writer emits plaintext only — it does not implement
+    // encryption. A deterministic `/ID` feeds the encryption key, so a
+    // content-derived `/ID` cannot be computed before the encrypted bytes
+    // exist; qpdf rejects the same combination. Mirror the flat
+    // (`crate::writer::write_pdf_full_rewrite`) guard so both write paths
+    // behave identically rather than silently producing a plaintext file with
+    // a deterministic `/ID`.
+    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+    if options.deterministic_id && encrypting {
+        return Err(crate::Error::Unsupported(
+            "the deterministic-id option is incompatible with encrypted output files".to_string(),
+        ));
+    }
+
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
@@ -1407,6 +1584,21 @@ pub fn write_linearized<R: Read + Seek>(
     // output carries one consistent /ID — and it also stays stable across the
     // up-to-3 convergence iterations.
     let mut source_trailer = pdf.trailer().clone();
+
+    // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
+    // BEFORE the all-zero placeholder overwrites `/ID` below. `/ID[0]` is the
+    // preserved permanent identifier and the `/Info`-derived suffix feeds the
+    // seed; reading either after the placeholder is installed would mistake the
+    // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
+    let (det_id_source_id0, det_id_info_suffix): (Option<[u8; 16]>, Vec<u8>) =
+        if options.deterministic_id {
+            let id0 = crate::writer::source_permanent_id(&source_trailer);
+            let suffix = crate::writer::deterministic_id_info_suffix(pdf);
+            (id0, suffix)
+        } else {
+            (None, Vec::new())
+        };
+
     let finalized_id = finalize_linearized_id(options, &source_trailer);
     source_trailer.insert("ID", finalized_id);
     let source_trailer = source_trailer;
@@ -1423,6 +1615,7 @@ pub fn write_linearized<R: Read + Seek>(
     let mut final_last_xref_keyword_offset: usize = 0;
     let mut final_last_xref_first_entry_offset: usize = 0;
     let mut final_first_trailer_prev_range: std::ops::Range<usize> = 0..0;
+    let mut final_id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
 
     for iter in 0..max_iters {
         let (
@@ -1434,6 +1627,7 @@ pub fn write_linearized<R: Read + Seek>(
             last_xref_offset,
             last_xref_first_entry_offset,
             _probe_prev_range,
+            _probe_id_ranges,
         ) = do_write_pass(
             plan,
             renumber,
@@ -1781,6 +1975,7 @@ pub fn write_linearized<R: Read + Seek>(
                 lxr_final,
                 lxr_first_final,
                 prev_range_final,
+                id_ranges_final,
             ) = do_write_pass(
                 plan,
                 renumber,
@@ -1805,8 +2000,32 @@ pub fn write_linearized<R: Read + Seek>(
             final_last_xref_keyword_offset = lxr_final;
             final_last_xref_first_entry_offset = lxr_first_final;
             final_first_trailer_prev_range = prev_range_final;
+            final_id_ranges = id_ranges_final;
             break;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Deterministic /ID: back-patch every all-zero placeholder in place.
+    //
+    // The placeholder is fixed-width, so the digest range and every byte
+    // offset (startxref, hint stream, xref offsets) are unchanged by the
+    // overwrite. Done after the convergence loop so the digest covers the
+    // converged layout.
+    //
+    // The digest is taken over THIS buffer, before the caller's
+    // `LinearizedDocument::back_patch` fills the /L, /Prev and hint-table
+    // numeric placeholders. Those values are a deterministic function of this
+    // same byte buffer (same input → same offsets), so the /ID remains a stable
+    // content fingerprint and the final back-patched file is reproducible.
+    // ------------------------------------------------------------------
+    if options.deterministic_id {
+        patch_linearized_deterministic_id(
+            &mut final_bytes,
+            &final_id_ranges,
+            &det_id_info_suffix,
+            det_id_source_id0,
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1847,7 +2066,7 @@ mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
     use crate::object::MAX_INLINE_DEPTH;
-    use crate::writer::WriteOptions;
+    use crate::writer::{WriteOptions, DETERMINISTIC_ID_ARRAY_LEN};
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -2180,22 +2399,339 @@ mod tests {
             .expect("linearized output must be parseable by Pdf::open");
     }
 
-    #[test]
-    fn deterministic_id_rejected_for_linearized_output() {
-        let mut pdf = open_tiny_pdf();
+    // -------------------------------------------------------------------
+    // Deterministic-/ID helpers and self-stability suite.
+    // -------------------------------------------------------------------
+
+    /// Linearize `source_bytes` with `--deterministic-id`, returning the output.
+    fn linearize_deterministic(source_bytes: &[u8]) -> Vec<u8> {
+        linearize_deterministic_mode(source_bytes, crate::writer::ObjectStreamMode::default())
+    }
+
+    /// As [`linearize_deterministic`] but with an explicit object-stream mode.
+    /// `Generate` produces the xref-stream output shape, which carries `/ID` in
+    /// both the first-page and main xref-stream dictionaries (the classic
+    /// table path emits `/ID` only in the single Part-1 trailer).
+    fn linearize_deterministic_mode(
+        source_bytes: &[u8],
+        object_streams: crate::writer::ObjectStreamMode,
+    ) -> Vec<u8> {
+        let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriteOptions {
             deterministic_id: true,
+            object_streams,
             ..WriteOptions::default()
         };
-        let mut pdf2 = open_tiny_pdf();
-        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m == "deterministic-id is not yet supported for linearized output"),
-            "got {err:?}"
+        let mut pdf2 = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("deterministic-id linearize must succeed");
+        // Fill the layout placeholders (/L, /Prev, hint offsets) the same way
+        // the CLI does, so tests see the real on-disk bytes and can run the
+        // linearization checker. back_patch touches numeric placeholders only,
+        // never /ID, and is deterministic — so the output stays self-stable.
+        doc.back_patch().expect("back_patch must succeed");
+        doc.bytes
+    }
+
+    // The serialized `/ID` array is `[<id0_hex(32)><id1_hex(32)>]`:
+    //   index 0 `[`, 1 `<`, 2..34 id0 hex, 34 `>`, 35 `<`, 36..68 id1 hex,
+    //   68 `>`, 69 `]`.
+    const ID0_HEX: std::ops::Range<usize> = 2..34;
+    const ID1_HEX: std::ops::Range<usize> = 36..68;
+
+    /// Collect every deterministic `/ID [...]` array that appears in linearized
+    /// output. A linearized file repeats `/ID` in the Part-1 trailer, the
+    /// first-page xref dict, and the main xref dict. The deterministic array is
+    /// always the fixed [`DETERMINISTIC_ID_ARRAY_LEN`]-byte hex form starting at
+    /// the `[`, so the window is taken directly.
+    fn collect_id_arrays(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let needle = b"/ID [";
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let open = i + needle.len() - 1; // index of '['
+                out.push(bytes[open..open + DETERMINISTIC_ID_ARRAY_LEN].to_vec());
+                i = open + DETERMINISTIC_ID_ARRAY_LEN;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// First `/ID` array in the output (all sites must be byte-equal).
+    fn first_id_array(bytes: &[u8]) -> Vec<u8> {
+        collect_id_arrays(bytes)
+            .into_iter()
+            .next()
+            .expect("output must contain an /ID array")
+    }
+
+    /// Minimal single-page PDF carrying the given trailer-`/ID` and `/Info`
+    /// fragments (already serialized, e.g. `"/ID [<aa..> <bb..>]"`).
+    fn tiny_pdf_with(id_entry: &str, info_obj: Option<&str>) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
         );
+        let mut info_ref_entry = String::new();
+        if let Some(info) = info_obj {
+            offs.push(pdf.len() as u64);
+            pdf.extend_from_slice(format!("4 0 obj\n{info}\nendobj\n").as_bytes());
+            info_ref_entry = " /Info 4 0 R".to_string();
+        }
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {size} /Root 1 0 R{info_ref_entry} {id_entry} >>\nstartxref\n{xref_start}\n%%EOF\n",
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn deterministic_id_linearized_is_self_stable() {
+        let src = tiny_pdf_bytes();
+        let a = linearize_deterministic(&src);
+        let b = linearize_deterministic(&src);
+        assert_eq!(
+            a, b,
+            "deterministic-id linearized output must be byte-identical across runs"
+        );
+        // The /ID patch is length-preserving, so the output must still be a
+        // valid, structurally-sound linearized PDF: it reparses and passes the
+        // linearization checker (which validates /E, /T, hint offsets, etc.).
+        Pdf::open(Cursor::new(a.clone())).expect("deterministic-id output must reparse");
+        crate::linearization::check_linearization_bytes(&a)
+            .expect("deterministic-id linearized output must pass the linearization checker");
+    }
+
+    #[test]
+    fn deterministic_id_linearized_all_ids_match() {
+        // Object-stream mode yields the xref-stream output shape, which writes
+        // `/ID` in both the first-page and main xref-stream dictionaries; a
+        // file identifier is file-scoped, so they must be byte-equal.
+        let out = linearize_deterministic_mode(
+            &tiny_pdf_bytes(),
+            crate::writer::ObjectStreamMode::Generate,
+        );
+        let ids = collect_id_arrays(&out);
+        // Exactly two /ID sites on the xref-stream path: the first-page and the
+        // main xref-stream dicts (the classic-table Part-1 trailer is replaced
+        // by the first-page xref stream).
+        assert_eq!(
+            ids.len(),
+            2,
+            "xref-stream linearized output must carry /ID in both the \
+             first-page and main xref-stream dicts"
+        );
+        let first = &ids[0];
+        assert!(
+            ids.iter().all(|id| id == first),
+            "every /ID site in one linearized file must be byte-equal: {ids:?}"
+        );
+        // The final value is the 70-byte hex form with no zero placeholder left.
+        assert_eq!(first.len(), DETERMINISTIC_ID_ARRAY_LEN);
+        assert_ne!(
+            first, b"[<00000000000000000000000000000000><00000000000000000000000000000000>]",
+            "placeholder must be patched"
+        );
+        // The xref-stream shape must also remain a valid linearized PDF after
+        // the length-preserving /ID patch.
+        crate::linearization::check_linearization_bytes(&out).expect(
+            "deterministic-id xref-stream linearized output must pass the linearization checker",
+        );
+    }
+
+    /// Build a minimal single-page PDF whose page **content stream** embeds the
+    /// exact 70-byte all-zero deterministic-/ID placeholder literal as ordinary
+    /// body data. This is the adversarial input for the back-patch: a
+    /// whole-buffer scan would clobber this user data; a section-scoped scan
+    /// leaves it untouched.
+    fn tiny_pdf_with_placeholder_in_content() -> Vec<u8> {
+        // 70-byte placeholder identical to what `finalize_linearized_id`
+        // installs and `patch_linearized_deterministic_id` searches for.
+        let placeholder = b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        assert_eq!(placeholder.len(), DETERMINISTIC_ID_ARRAY_LEN);
+        // Embed it inside a literal-string drawing op so it survives
+        // serialization verbatim (uncompressed content stream).
+        let mut content = Vec::new();
+        content.extend_from_slice(b"BT /F1 12 Tf (");
+        content.extend_from_slice(placeholder);
+        content.extend_from_slice(b") Tj ET\n");
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]               /Contents 4 0 R >>\nendobj\n",
+        );
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(&content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",);
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Regression: the deterministic-/ID back-patch must never overwrite a body
+    /// byte sequence that merely *looks* like the all-zero `/ID` placeholder.
+    /// The old whole-buffer scan would corrupt such content; the section-scoped
+    /// scan only rewrites the real `/ID` sites.
+    #[test]
+    fn deterministic_id_linearized_does_not_clobber_body_placeholder() {
+        let placeholder: &[u8] =
+            b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        let src = tiny_pdf_with_placeholder_in_content();
+        // Sanity: the source genuinely embeds the placeholder literal in body.
+        assert!(
+            src.windows(placeholder.len()).any(|w| w == placeholder),
+            "test fixture must embed the placeholder in body content"
+        );
+
+        let out = linearize_deterministic(&src);
+
+        // The body copy of the placeholder must survive *verbatim* — the
+        // back-patch must not have touched it.
+        assert!(
+            out.windows(placeholder.len()).any(|w| w == placeholder),
+            "body content placeholder must be preserved, not mistaken for /ID"
+        );
+
+        // The real /ID site(s) must be patched to the computed deterministic ID,
+        // all byte-equal, and free of any leftover all-zero placeholder array.
+        let ids = collect_id_arrays(&out);
+        assert!(!ids.is_empty(), "output must carry at least one /ID array");
+        let first = &ids[0];
+        assert!(
+            ids.iter().all(|id| id == first),
+            "every /ID site must be byte-equal: {ids:?}"
+        );
+        assert_eq!(first.len(), DETERMINISTIC_ID_ARRAY_LEN);
+        assert_ne!(
+            first.as_slice(),
+            placeholder,
+            "/ID must be patched away from the all-zero placeholder"
+        );
+
+        // Self-stable across runs and a valid linearized PDF.
+        let out2 = linearize_deterministic(&src);
+        assert_eq!(out, out2, "output must be byte-identical across runs");
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output must pass the linearization checker");
+    }
+
+    #[test]
+    fn deterministic_id_linearized_xref_stream_is_self_stable() {
+        // The classic-table path is covered by `..._is_self_stable`; this one
+        // pins the xref-stream (object-stream) shape's stability too.
+        let src = tiny_pdf_bytes();
+        let a = linearize_deterministic_mode(&src, crate::writer::ObjectStreamMode::Generate);
+        let b = linearize_deterministic_mode(&src, crate::writer::ObjectStreamMode::Generate);
+        assert_eq!(a, b, "xref-stream deterministic-id output must be stable");
+    }
+
+    #[test]
+    fn deterministic_id_linearized_depends_on_content() {
+        let out_a = linearize_deterministic(&tiny_pdf_bytes());
+        // A different MediaBox changes the body, hence the whole-buffer digest,
+        // hence the /ID. The replacement is the same length, so offsets and the
+        // tail xref stay valid for `Pdf::open` reparse inside the linearizer.
+        let mut alt = tiny_pdf_bytes();
+        let from = b"[0 0 612 792]";
+        let to = b"[0 0 200 200]";
+        let pos = alt
+            .windows(from.len())
+            .position(|w| w == from)
+            .expect("MediaBox present");
+        alt[pos..pos + from.len()].copy_from_slice(to);
+        let out_b = linearize_deterministic(&alt);
+        assert_ne!(
+            first_id_array(&out_a),
+            first_id_array(&out_b),
+            "different content must yield a different deterministic /ID"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_linearized_preserves_source_permanent_id() {
+        let id_entry =
+            "/ID [<0102030405060708090a0b0c0d0e0f10> <ffffffffffffffffffffffffffffffff>]";
+        let out = linearize_deterministic(&tiny_pdf_with(id_entry, None));
+        let id = first_id_array(&out);
+        // /ID[0] is the preserved source permanent identifier (hex of the 16 bytes).
+        assert_eq!(
+            &id[ID0_HEX], b"0102030405060708090a0b0c0d0e0f10",
+            "source /ID[0] must be preserved as the permanent identifier"
+        );
+        // /ID[1] is derived and must differ from /ID[0] here.
+        assert_ne!(&id[ID0_HEX], &id[ID1_HEX], "changing /ID must differ");
+    }
+
+    #[test]
+    fn deterministic_id_linearized_id0_equals_id1_without_source_id() {
+        // No usable source /ID → permanent identifier falls back to the changing one.
+        let out = linearize_deterministic(&tiny_pdf_with("/ID []", None));
+        let id = first_id_array(&out);
+        assert_eq!(
+            &id[ID0_HEX], &id[ID1_HEX],
+            "without a source /ID[0], /ID[0] must equal /ID[1]"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_linearized_info_seed_changes_id() {
+        let with_info =
+            linearize_deterministic(&tiny_pdf_with("/ID []", Some("<< /Producer (alpha) >>")));
+        let with_other =
+            linearize_deterministic(&tiny_pdf_with("/ID []", Some("<< /Producer (bravo) >>")));
+        assert_ne!(
+            first_id_array(&with_info),
+            first_id_array(&with_other),
+            "/Info string values must feed the deterministic /ID seed"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_linearized_no_info_boundary() {
+        // Boundary: no /Info at all still produces a stable, patched /ID.
+        let a = linearize_deterministic(&tiny_pdf_with("/ID []", None));
+        let b = linearize_deterministic(&tiny_pdf_with("/ID []", None));
+        assert_eq!(a, b, "no-/Info input must still be self-stable");
+        let id = first_id_array(&a);
+        assert_eq!(id.len(), DETERMINISTIC_ID_ARRAY_LEN);
     }
 
     // -----------------------------------------------------------------------
@@ -2341,5 +2877,174 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Linearize `source_bytes` in the given write mode with the supplied
+    /// `WriteOptions` mutator applied, returning the fully back-patched bytes.
+    /// Mirrors [`linearize_deterministic_mode`] but lets a test pick a
+    /// non-deterministic `/ID` policy (e.g. `--static-id`).
+    fn linearize_with(source_bytes: &[u8], configure: impl FnOnce(&mut WriteOptions)) -> Vec<u8> {
+        let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut opts = WriteOptions::default();
+        configure(&mut opts);
+        let mut pdf2 = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
+        let mut doc =
+            write_linearized(&plan, &renumber, &mut pdf2, &opts).expect("write_linearized");
+        doc.back_patch().expect("back_patch must succeed");
+        doc.bytes
+    }
+
+    /// The classic xref-table path (no object streams) must carry `/ID` in
+    /// **both** the Part-1 first-page trailer and the main (Part-6) trailer at
+    /// EOF — the trailing `startxref` points at the main trailer, so a reader
+    /// resolves its `/ID`. qpdf likewise repeats the identifier in both
+    /// trailers. Before this fix the main trailer omitted `/ID`, so a reader
+    /// saw none at all.
+    #[test]
+    fn deterministic_id_linearized_classic_main_trailer_has_id() {
+        let out = linearize_deterministic(&tiny_pdf_bytes());
+
+        // Exactly two byte-equal /ID sites: the Part-1 trailer and the main
+        // (Part-6) trailer.
+        let ids = collect_id_arrays(&out);
+        assert_eq!(
+            ids.len(),
+            2,
+            "classic-table linearized output must carry /ID in both the \
+             Part-1 and main trailers, got {ids:?}"
+        );
+        let first = &ids[0];
+        assert!(
+            ids.iter().all(|id| id == first),
+            "every /ID site in one linearized file must be byte-equal: {ids:?}"
+        );
+        assert_eq!(first.len(), DETERMINISTIC_ID_ARRAY_LEN);
+
+        // The reader resolves the main trailer (the one the trailing startxref
+        // points at), so the deterministic /ID must be visible there.
+        let reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
+        let trailer_id = reopened
+            .trailer()
+            .get("ID")
+            .expect("main trailer must carry /ID after linearize --deterministic-id");
+        // Serialize the resolved trailer /ID and confirm it matches the
+        // byte-for-byte /ID array found in the file.
+        let mut serialized = Vec::new();
+        trailer_id.write_pdf(&mut serialized);
+        assert_eq!(
+            serialized.as_slice(),
+            first.as_slice(),
+            "reader-visible main-trailer /ID must equal the Part-1 trailer /ID"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output must pass the linearization checker");
+    }
+
+    /// Reader-visibility regression for non-deterministic `/ID` policies: even
+    /// with `--static-id` the classic main trailer must advertise `/ID` (the
+    /// fix is not deterministic-id specific — the main trailer was previously
+    /// `/ID`-less in every mode).
+    #[test]
+    fn static_id_linearized_main_trailer_visible_to_reader() {
+        let out = linearize_with(&tiny_pdf_bytes(), |o| o.static_id = true);
+        let reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
+        assert!(
+            reopened.trailer().get("ID").is_some(),
+            "static-id linearized output must carry /ID in the reader-visible main trailer"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("static-id linearized output must pass the linearization checker");
+    }
+
+    /// `--deterministic-id` combined with encryption is rejected up front:
+    /// the linearized writer emits plaintext only, and a content-derived `/ID`
+    /// cannot be computed once the bytes are encrypted. Mirrors the flat
+    /// (`write_pdf_full_rewrite`) guard, including its wording.
+    #[test]
+    fn deterministic_id_linearized_rejects_encrypt() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            "got {err:?}"
+        );
+    }
+
+    /// `--deterministic-id` and `--static-id` are mutually exclusive on the
+    /// linearized write path too, mirroring `write_pdf_full_rewrite`. Without
+    /// the guard the deterministic branch silently wins over `static_id`.
+    #[test]
+    fn deterministic_id_linearized_rejects_static_id() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "deterministic_id and static_id are mutually exclusive"),
+            "got {err:?}"
+        );
+    }
+
+    /// As [`deterministic_id_linearized_rejects_encrypt`] but for the
+    /// `copy_encryption` donor path.
+    #[test]
+    fn deterministic_id_linearized_rejects_copy_encryption() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            "got {err:?}"
+        );
+    }
+
+    /// Regression: `--deterministic-id` without encryption must still succeed
+    /// (the guard must reject only the *combination*).
+    #[test]
+    fn deterministic_id_linearized_without_encryption_succeeds() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            deterministic_id: true,
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("deterministic-id without encryption must succeed");
     }
 }
