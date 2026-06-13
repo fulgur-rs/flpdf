@@ -50,7 +50,48 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
 ///   ASCII85, ASCIIHex, or RunLength data, or a corrupt PNG-predictor stream.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
-    decode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
+    decode_stream_data_with_filters(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        stream_data,
+        DecodeLimits::default(),
+    )
+}
+
+/// Opt-in limits applied while decoding a stream's filter chain.
+///
+/// Default is unlimited, matching [`decode_stream_data`]. Embedders processing
+/// untrusted input can set [`max_output`](Self::max_output) to bound the
+/// decompressed size of each `FlateDecode` / `LZWDecode` stage (qpdf's
+/// `Pl_Flate::setMemoryLimit` analogue), trading completeness for a memory
+/// ceiling.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodeLimits {
+    /// Maximum decompressed byte count permitted out of any single
+    /// `FlateDecode` / `LZWDecode` stage. `None` (default) is unlimited.
+    pub max_output: Option<usize>,
+}
+
+/// Decode a stream's filter chain like [`decode_stream_data`], enforcing the
+/// opt-in [`DecodeLimits`].
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] for the same reasons as [`decode_stream_data`],
+/// plus when a `FlateDecode` / `LZWDecode` stage's decompressed output exceeds
+/// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds the fixed
+/// stage cap.
+pub fn decode_stream_data_with_limits(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<Vec<u8>> {
+    decode_stream_data_with_filters(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        stream_data,
+        limits,
+    )
 }
 
 // Wired into encrypted document reads by later flpdf-9hc.3 layers.
@@ -77,6 +118,7 @@ where
         dict.get("Filter"),
         dict.get("DecodeParms"),
         stream_data,
+        DecodeLimits::default(),
         &mut decrypt_crypt,
     )
 }
@@ -99,18 +141,26 @@ fn decode_stream_data_with_filters(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
     stream_data: &[u8],
+    limits: DecodeLimits,
 ) -> Result<Vec<u8>> {
-    decode_stream_data_with_filters_and_crypt(filter, decode_params, stream_data, &mut |_, _| {
-        Err(Error::Unsupported(
-            "unsupported stream filter: Crypt".to_string(),
-        ))
-    })
+    decode_stream_data_with_filters_and_crypt(
+        filter,
+        decode_params,
+        stream_data,
+        limits,
+        &mut |_, _| {
+            Err(Error::Unsupported(
+                "unsupported stream filter: Crypt".to_string(),
+            ))
+        },
+    )
 }
 
 fn decode_stream_data_with_filters_and_crypt<F>(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
     stream_data: &[u8],
+    limits: DecodeLimits,
     decrypt_crypt: &mut F,
 ) -> Result<Vec<u8>>
 where
@@ -124,8 +174,9 @@ where
                     return decrypt_crypt(get_decode_params(decode_params, 0), stream_data);
                 }
                 let params = get_decode_params(decode_params, 0);
-                let decoded = apply_single_filter_decode(filter_name, stream_data, params)
-                    .map_err(Error::Unsupported)?;
+                let decoded =
+                    apply_single_filter_decode(filter_name, stream_data, params, limits.max_output)
+                        .map_err(Error::Unsupported)?;
                 return apply_decode_params(params, &decoded);
             }
 
@@ -147,8 +198,13 @@ where
                         decoded = decrypt_crypt(get_decode_params(decode_params, index), &decoded)?;
                     } else {
                         let params = get_decode_params(decode_params, index);
-                        decoded = apply_single_filter_decode(filter_name, &decoded, params)
-                            .map_err(Error::Unsupported)?;
+                        decoded = apply_single_filter_decode(
+                            filter_name,
+                            &decoded,
+                            params,
+                            limits.max_output,
+                        )
+                        .map_err(Error::Unsupported)?;
                         decoded = apply_decode_params(params, &decoded)?;
                     }
                 }
@@ -504,13 +560,33 @@ fn apply_single_filter_decode(
     filter_name: &[u8],
     stream_data: &[u8],
     decode_params: Option<&Object>,
+    max_output: Option<usize>,
 ) -> std::result::Result<Vec<u8>, String> {
     if filter_name == b"FlateDecode" {
         let mut decoded = Vec::new();
-        let mut decoder = ZlibDecoder::new(stream_data);
-        decoder
-            .read_to_end(&mut decoded)
-            .map_err(|error| error.to_string())?;
+        match max_output {
+            Some(limit) => {
+                // Bound the allocation during decode: a post-hoc length check
+                // cannot help because read_to_end would OOM first on a bomb.
+                // take(limit+1) lets output of exactly `limit` succeed while one
+                // byte over is read as truncated and rejected. saturating_add
+                // guards the (absurd) usize::MAX limit from overflowing.
+                ZlibDecoder::new(stream_data)
+                    .take((limit as u64).saturating_add(1))
+                    .read_to_end(&mut decoded)
+                    .map_err(|error| error.to_string())?;
+                if decoded.len() > limit {
+                    return Err(format!(
+                        "decoded output exceeds configured limit of {limit} bytes"
+                    ));
+                }
+            }
+            None => {
+                ZlibDecoder::new(stream_data)
+                    .read_to_end(&mut decoded)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         return Ok(decoded);
     }
 
@@ -524,7 +600,7 @@ fn apply_single_filter_decode(
             },
             _ => true, // no DecodeParms → default EarlyChange = 1
         };
-        return lzw_decode(stream_data, early_change);
+        return lzw_decode(stream_data, early_change, max_output);
     }
 
     if filter_name == b"ASCII85Decode" {
@@ -565,7 +641,11 @@ fn apply_single_filter_decode(
 ///   increments one code *before* the table is full (i.e. when the next code
 ///   to be added would exceed the current code width capacity).  When `false`
 ///   (EarlyChange=0), the width increments *after* the table fills.
-fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, String> {
+fn lzw_decode(
+    data: &[u8],
+    early_change: bool,
+    max_output: Option<usize>,
+) -> std::result::Result<Vec<u8>, String> {
     const CLEAR_CODE: u16 = 256;
     const EOD_CODE: u16 = 257;
     const FIRST_CODE: u16 = 258;
@@ -651,6 +731,13 @@ fn lzw_decode(data: &[u8], early_change: bool) -> std::result::Result<Vec<u8>, S
         };
 
         output.extend_from_slice(&entry);
+        if let Some(limit) = max_output {
+            if output.len() > limit {
+                return Err(format!(
+                    "decoded output exceeds configured limit of {limit} bytes"
+                ));
+            }
+        }
 
         // Add a new entry = prev_string + first_byte(current_string).
         if let Some(ref prev) = prev_entry {
@@ -1519,5 +1606,105 @@ mod tests {
         );
         let decoded = decode_stream_data(&dict, &data).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    // ----- Task 2: opt-in DecodeLimits output cap (flpdf-hn1g.4) -----
+
+    /// Pack a sequence of LZW codes as fixed 9-bit, MSB-first codewords (PDF
+    /// LZWDecode initial width). flpdf has no LZW encoder, so tests synthesize
+    /// minimal streams directly. Keeping every code 9 bits wide is valid only
+    /// while the decoder's table stays below 511 entries (the first width-bump
+    /// threshold under the default EarlyChange), i.e. fewer than ~253 literal
+    /// codes — comfortably true for these fixtures.
+    fn pack_lzw_9bit(codes: &[u16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf: u32 = 0;
+        let mut bits: u32 = 0;
+        for &code in codes {
+            buf = (buf << 9) | u32::from(code);
+            bits += 9;
+            while bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        if bits > 0 {
+            out.push((buf << (8 - bits)) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn flate_decode_honors_output_limit() {
+        // 2000 'A' bytes compress small but decode large. A limit below 2000 is
+        // rejected; a limit >= 2000 succeeds. Boundary: exactly 2000 succeeds.
+        let raw = vec![b'A'; 2000];
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+
+        // Under limit -> Unsupported.
+        let err = decode_stream_data_with_limits(
+            &dict,
+            &encoded,
+            DecodeLimits {
+                max_output: Some(1999),
+            },
+        );
+        assert!(
+            matches!(err, Err(Error::Unsupported(ref m)) if m.contains("exceeds configured limit")),
+            "got {err:?}"
+        );
+        // Exactly at limit -> Ok (boundary: take(limit+1) reads all 2000, len == limit).
+        let ok = decode_stream_data_with_limits(
+            &dict,
+            &encoded,
+            DecodeLimits {
+                max_output: Some(2000),
+            },
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 2000);
+    }
+
+    #[test]
+    fn lzw_decode_honors_output_limit() {
+        // Build a minimal LZW stream that decodes to 150 'A' bytes (code 65
+        // repeated 150 times, then EOD=257). Each code emits one byte, so the
+        // decoded length is deterministically 150. With every code 9 bits wide
+        // (table never reaches 511 entries), the fixed-width packer is exact.
+        let mut codes = vec![65u16; 150];
+        codes.push(257); // EOD
+        let lzw_bytes = pack_lzw_9bit(&codes);
+
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
+        let err = decode_stream_data_with_limits(
+            &dict,
+            &lzw_bytes,
+            DecodeLimits {
+                max_output: Some(100),
+            },
+        );
+        assert!(
+            matches!(err, Err(Error::Unsupported(ref m)) if m.contains("exceeds configured limit")),
+            "got {err:?}"
+        );
+        // Unbounded still decodes fully.
+        let full = decode_stream_data(&dict, &lzw_bytes).unwrap();
+        assert_eq!(full, vec![b'A'; 150]);
+        assert!(full.len() > 100);
+    }
+
+    #[test]
+    fn decode_stream_data_is_unbounded_by_default() {
+        // The legacy entry point keeps decoding arbitrarily large output (DecodeLimits
+        // default = max_output None), guaranteeing backward compatibility.
+        let raw = vec![b'Z'; 5000];
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        assert_eq!(decode_stream_data(&dict, &encoded).unwrap().len(), 5000);
+        assert_eq!(DecodeLimits::default().max_output, None);
     }
 }
