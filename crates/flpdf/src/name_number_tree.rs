@@ -108,12 +108,13 @@ where
 /// caller must store via [`Pdf::set_object`]. The caller owns object numbering
 /// (via `alloc`), the empty-entries case, and all catalog wiring.
 ///
-/// Layout (qpdf-aligned, identical to the legacy embedded-files writer):
-/// - `<= LEAF_MAX` entries → a single leaf node (`/Limits` + `/Names`), returned
-///   as the root.
+/// Layout (qpdf-aligned). Per ISO 32000-2 §7.9.6, `/Limits` is carried by
+/// intermediate and leaf nodes only; the root node omits it:
+/// - `<= LEAF_MAX` entries → a single root node holding `/Names` only (no
+///   `/Limits`), returned as the root.
 /// - `> LEAF_MAX` entries → leaves chunked by `div_ceil`, each `/Limits` +
-///   `/Names`, under a root `/Limits` + `/Kids`. Leaves are allocated in order,
-///   the root last.
+///   `/Names`, under a root carrying `/Kids` only (no `/Limits`). Leaves are
+///   allocated in order, the root last.
 ///
 /// The number-tree analogue is [`build_number_tree`]; the two share this exact
 /// chunking/allocation layout and must be kept in sync (only the key encoding
@@ -135,9 +136,14 @@ where
     let mut nodes: Vec<(ObjectRef, Object)> = Vec::new();
 
     if entries.len() <= LEAF_MAX {
-        let leaf_ref = alloc();
-        nodes.push((leaf_ref, Object::Dictionary(build_leaf_dict(entries))));
-        return (leaf_ref, nodes);
+        let root_ref = alloc();
+        // Root node omits /Limits: ISO 32000-2 7.9.6 restricts /Limits to
+        // intermediate and leaf nodes. qpdf emits a single-node name-tree root as
+        // /Names only.
+        let mut root = Dictionary::new();
+        root.insert("Names", Object::Array(name_pairs(entries)));
+        nodes.push((root_ref, Object::Dictionary(root)));
+        return (root_ref, nodes);
     }
 
     let n_leaves = entries.len().div_ceil(LEAF_MAX);
@@ -148,45 +154,47 @@ where
         nodes.push((leaf_ref, Object::Dictionary(build_leaf_dict(chunk))));
         kids.push(Object::Reference(leaf_ref));
     }
-    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
+    // Root node omits /Limits (ISO 32000-2 7.9.6: /Limits is for intermediate
+    // and leaf nodes only; qpdf emits a multi-node root as /Kids only).
     let mut root = Dictionary::new();
-    root.insert(
-        "Limits",
-        Object::Array(vec![Object::String(first), Object::String(last)]),
-    );
     root.insert("Kids", Object::Array(kids));
     let root_ref = alloc();
     nodes.push((root_ref, Object::Dictionary(root)));
     (root_ref, nodes)
 }
 
-/// Leaf node dict: `/Limits [first last]` + `/Names [k1 v1 ...]`.
-fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
-    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
-    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
+/// The `/Names` value: a flat `[key1 val1 key2 val2 ...]` array.
+fn name_pairs(entries: &[(Vec<u8>, Object)]) -> Vec<Object> {
+    let mut pairs = Vec::with_capacity(entries.len() * 2);
     for (key, val) in entries {
         pairs.push(Object::String(key.clone()));
         pairs.push(val.clone());
     }
+    pairs
+}
+
+/// Leaf node dict: `/Limits [first last]` + `/Names [k1 v1 ...]`.
+fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
+    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
     let mut dict = Dictionary::new();
     dict.insert(
         "Limits",
         Object::Array(vec![Object::String(first), Object::String(last)]),
     );
-    dict.insert("Names", Object::Array(pairs));
+    dict.insert("Names", Object::Array(name_pairs(entries)));
     dict
 }
 
 /// Build a **number** tree from a **non-empty, pre-sorted** `(key, value)` slice.
 ///
-/// Number-tree analogue of [`build_name_tree`]: identical layout (single leaf
-/// `<= LEAF_MAX`, else `div_ceil`-chunked leaves under a `/Limits` + `/Kids`
-/// root, leaves allocated first then the root), but with `/Nums` leaves and
-/// **integer** `/Limits`. Returns `(root_ref, nodes)` for the caller to
-/// [`Pdf::set_object`]; the caller owns numbering, the empty case, and catalog
-/// wiring.
+/// Number-tree analogue of [`build_name_tree`]: identical layout per ISO
+/// 32000-2 §7.9.7. For `<= LEAF_MAX` entries the root holds `/Nums` only (no
+/// `/Limits`); otherwise `div_ceil`-chunked leaves (each `/Limits` + `/Nums`,
+/// **integer** `/Limits`) sit under a root carrying `/Kids` only (no
+/// `/Limits`), leaves allocated first then the root. Returns `(root_ref,
+/// nodes)` for the caller to [`Pdf::set_object`]; the caller owns numbering,
+/// the empty case, and catalog wiring.
 ///
 /// # Panics (debug)
 /// Debug-asserts `entries` is non-empty.
@@ -204,9 +212,14 @@ where
     let mut nodes: Vec<(ObjectRef, Object)> = Vec::new();
 
     if entries.len() <= LEAF_MAX {
-        let leaf_ref = alloc();
-        nodes.push((leaf_ref, Object::Dictionary(build_num_leaf_dict(entries))));
-        return (leaf_ref, nodes);
+        let root_ref = alloc();
+        // Root node omits /Limits: ISO 32000-2 7.9.7 restricts /Limits to
+        // intermediate and leaf nodes. qpdf emits a single-node number-tree root
+        // as /Nums only.
+        let mut root = Dictionary::new();
+        root.insert("Nums", Object::Array(num_pairs(entries)));
+        nodes.push((root_ref, Object::Dictionary(root)));
+        return (root_ref, nodes);
     }
 
     let n_leaves = entries.len().div_ceil(LEAF_MAX);
@@ -217,34 +230,35 @@ where
         nodes.push((leaf_ref, Object::Dictionary(build_num_leaf_dict(chunk))));
         kids.push(Object::Reference(leaf_ref));
     }
-    let first = entries.first().map(|(k, _)| *k).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| *k).unwrap_or_default();
+    // Root node omits /Limits (ISO 32000-2 7.9.7: /Limits is for intermediate
+    // and leaf nodes only; qpdf emits a multi-node root as /Kids only).
     let mut root = Dictionary::new();
-    root.insert(
-        "Limits",
-        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
-    );
     root.insert("Kids", Object::Array(kids));
     let root_ref = alloc();
     nodes.push((root_ref, Object::Dictionary(root)));
     (root_ref, nodes)
 }
 
-/// Leaf node dict: `/Limits [first last]` (integers) + `/Nums [k1 v1 ...]`.
-fn build_num_leaf_dict(entries: &[(i64, Object)]) -> Dictionary {
-    let first = entries.first().map(|(k, _)| *k).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| *k).unwrap_or_default();
-    let mut pairs: Vec<Object> = Vec::with_capacity(entries.len() * 2);
+/// The `/Nums` value: a flat `[key1 val1 key2 val2 ...]` array (integer keys).
+fn num_pairs(entries: &[(i64, Object)]) -> Vec<Object> {
+    let mut pairs = Vec::with_capacity(entries.len() * 2);
     for (key, val) in entries {
         pairs.push(Object::Integer(*key));
         pairs.push(val.clone());
     }
+    pairs
+}
+
+/// Leaf node dict: `/Limits [first last]` (integers) + `/Nums [k1 v1 ...]`.
+fn build_num_leaf_dict(entries: &[(i64, Object)]) -> Dictionary {
+    let first = entries.first().map(|(k, _)| *k).unwrap_or_default();
+    let last = entries.last().map(|(k, _)| *k).unwrap_or_default();
     let mut dict = Dictionary::new();
     dict.insert(
         "Limits",
         Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
     );
-    dict.insert("Nums", Object::Array(pairs));
+    dict.insert("Nums", Object::Array(num_pairs(entries)));
     dict
 }
 
@@ -708,7 +722,10 @@ mod tests {
         let d = nodes[0].1.as_dict().expect("leaf dict");
         assert!(d.get("Kids").is_none(), "single leaf must not have /Kids");
         assert!(d.get("Names").is_some());
-        assert!(d.get("Limits").is_some());
+        assert!(
+            d.get("Limits").is_none(),
+            "single-node root omits /Limits (ISO 32000-2 7.9.6; qpdf)"
+        );
     }
 
     #[test]
@@ -730,10 +747,20 @@ mod tests {
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0], Object::Reference(ObjectRef::new(1, 0)));
         assert_eq!(kids[1], Object::Reference(ObjectRef::new(2, 0)));
-        // Every node carries /Limits.
-        for (_, n) in &nodes {
-            let d = n.as_dict().expect("node dict");
-            assert!(d.get("Limits").is_some());
+        // Root omits /Limits (ISO 32000-2 7.9.6); both leaves keep it.
+        assert!(
+            root_dict.get("Limits").is_none(),
+            "multi-node root omits /Limits"
+        );
+        for (_, leaf) in &nodes[..2] {
+            let lim = leaf
+                .as_dict()
+                .unwrap()
+                .get("Limits")
+                .and_then(Object::as_array)
+                .expect("leaf keeps string /Limits");
+            assert!(matches!(lim[0], Object::String(_)));
+            assert!(matches!(lim[1], Object::String(_)));
         }
     }
 
@@ -897,10 +924,10 @@ mod tests {
         let d = nodes[0].1.as_dict().expect("leaf dict");
         assert!(d.get("Kids").is_none(), "single leaf must not have /Kids");
         assert!(d.get("Nums").is_some());
-        // Integer /Limits.
-        let lim = d.get("Limits").and_then(Object::as_array).expect("limits");
-        assert_eq!(lim[0], Object::Integer(0));
-        assert_eq!(lim[1], Object::Integer(20));
+        assert!(
+            d.get("Limits").is_none(),
+            "single-node number root omits /Limits"
+        );
     }
 
     #[test]
@@ -920,9 +947,20 @@ mod tests {
             .expect("root needs /Kids");
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0], Object::Reference(ObjectRef::new(1, 0)));
-        // Every node carries integer /Limits + a /Nums leaf where applicable.
-        for (_, n) in &nodes {
-            assert!(n.as_dict().expect("dict").get("Limits").is_some());
+        // Root omits /Limits (ISO 32000-2 7.9.7); both leaves keep integer /Limits.
+        assert!(
+            root_dict.get("Limits").is_none(),
+            "multi-node root omits /Limits"
+        );
+        for (_, leaf) in &nodes[..2] {
+            let lim = leaf
+                .as_dict()
+                .unwrap()
+                .get("Limits")
+                .and_then(Object::as_array)
+                .expect("leaf keeps integer /Limits");
+            assert!(matches!(lim[0], Object::Integer(_)));
+            assert!(matches!(lim[1], Object::Integer(_)));
         }
     }
 
@@ -947,5 +985,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![(0, 100), (5, 200)]);
+    }
+
+    #[test]
+    fn build_number_tree_multi_node_round_trips_via_read_number_tree() {
+        // LEAF_MAX + 1 entries force a multi-node tree (2 leaves under a
+        // /Kids-only root with no /Limits). Reading back from that root proves
+        // the reader traverses a Limits-less root and enumerates every entry in
+        // order via /Kids -> /Nums.
+        let mut pdf = empty_pdf();
+        let entries = mk_num_entries(LEAF_MAX + 1);
+        let expected: Vec<(i64, ObjectRef)> = entries
+            .iter()
+            .map(|(k, v)| (*k, v.as_ref_id().unwrap()))
+            .collect();
+        let mut next = 0u32;
+        let (root, nodes) = build_number_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        assert!(nodes.len() > 1, "expected a multi-node tree");
+        assert!(
+            nodes[nodes.len() - 1]
+                .1
+                .as_dict()
+                .unwrap()
+                .get("Limits")
+                .is_none(),
+            "multi-node root must omit /Limits"
+        );
+        for (r, n) in nodes {
+            pdf.set_object(r, n);
+        }
+        let out: Vec<(i64, ObjectRef)> = read_number_tree(
+            &mut pdf,
+            Object::Reference(root),
+            ref_only,
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn build_name_tree_multi_node_round_trips_via_read_name_tree() {
+        // Name-tree analogue: LEAF_MAX + 1 entries force a /Kids-only root
+        // without /Limits. Reading back from the root recovers all entries in
+        // order, proving the Limits-less root is traversed via /Kids -> /Names.
+        let mut pdf = empty_pdf();
+        let entries = mk_entries(LEAF_MAX + 1);
+        let expected: Vec<(Vec<u8>, ObjectRef)> = entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_ref_id().unwrap()))
+            .collect();
+        let mut next = 0u32;
+        let (root, nodes) = build_name_tree(&entries, || {
+            next += 1;
+            ObjectRef::new(next, 0)
+        });
+        assert!(nodes.len() > 1, "expected a multi-node tree");
+        assert!(
+            nodes[nodes.len() - 1]
+                .1
+                .as_dict()
+                .unwrap()
+                .get("Limits")
+                .is_none(),
+            "multi-node root must omit /Limits"
+        );
+        for (r, n) in nodes {
+            pdf.set_object(r, n);
+        }
+        let out: Vec<(Vec<u8>, ObjectRef)> = read_name_tree(
+            &mut pdf,
+            Object::Reference(root),
+            ref_only,
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(out, expected);
     }
 }
