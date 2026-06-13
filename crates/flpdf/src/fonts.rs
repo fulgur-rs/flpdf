@@ -4,6 +4,7 @@
 //! dictionary into a single `BTreeMap` keyed by resource name. Uses the same recursion
 //! limit and cycle protection as [`crate::pages`].
 
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -117,7 +118,10 @@ fn collect_page_fonts<R: Read + Seek>(
             if let Some(resources) = resources.as_dict() {
                 Some(resources.clone())
             } else if let Some(reference) = resources.as_ref_id() {
-                pdf.resolve_borrowed(reference)?.as_dict().cloned()
+                // /Resources may be reached through more than one indirect hop
+                // (ref -> ref -> dict); follow the chain to its terminal.
+                let (terminal, _) = resolve_ref_chain(pdf, &Object::Reference(reference))?;
+                terminal.into_dict()
             } else {
                 None
             }
@@ -134,7 +138,10 @@ fn collect_page_fonts<R: Read + Seek>(
             if let Some(fonts_dict) = fonts_dict.as_dict() {
                 Some(fonts_dict.clone())
             } else if let Some(reference) = fonts_dict.as_ref_id() {
-                pdf.resolve_borrowed(reference)?.as_dict().cloned()
+                // The /Font value may be reached through more than one indirect
+                // hop (ref -> ref -> dict); follow the chain to its terminal.
+                let (terminal, _) = resolve_ref_chain(pdf, &Object::Reference(reference))?;
+                terminal.into_dict()
             } else {
                 None
             }
@@ -148,27 +155,34 @@ fn collect_page_fonts<R: Read + Seek>(
 
     for (font_name, value) in fonts_dict.iter() {
         // A font value may be inlined as a dictionary, embedded as a stream, or
-        // (most commonly) stored indirectly. Resolve references first, then
-        // normalize to the font dictionary: dictionaries are kept as-is and
-        // streams contribute their dictionary. PDF streams are always indirect
-        // objects, so a stream-valued font is only ever seen through the
-        // reference arm; the direct Object::Stream arm below mirrors it for
+        // (most commonly) stored indirectly — possibly through more than one
+        // indirect hop (ref -> ref -> dict), so follow the chain to its
+        // terminal. Then normalize to the font dictionary: dictionaries are kept
+        // as-is and streams contribute their dictionary. PDF streams are always
+        // indirect objects, so a stream-valued font is only ever seen through
+        // the reference arm; the direct Object::Stream arm below mirrors it for
         // completeness. Anything that is not a font dictionary is skipped.
+        //
+        // The reference arm yields an owned terminal, so the Dictionary/Stream
+        // dictionary is moved out below rather than cloned again. Inline dict
+        // and stream values are cloned once from `fonts_dict` (it is borrowed
+        // here); the skip path borrows and never clones.
         //
         // Resolution errors propagate via `?`, matching how /Resources and
         // /Font are resolved above; a missing or deleted reference is not an
         // error (it resolves to `Object::Null`) and is skipped by the match
         // below.
-        let resolved = match value {
-            Object::Reference(font_ref) => pdf.resolve_borrowed(*font_ref)?,
-            other => other,
+        let resolved: Object = match value {
+            Object::Reference(font_ref) => resolve_ref_chain(pdf, &Object::Reference(*font_ref))?.0,
+            Object::Dictionary(_) | Object::Stream(_) => value.clone(),
+            _ => continue,
         };
         match resolved {
             Object::Dictionary(font_dict) => {
-                fonts.insert(font_name.to_vec(), Object::Dictionary(font_dict.clone()));
+                fonts.insert(font_name.to_vec(), Object::Dictionary(font_dict));
             }
             Object::Stream(stream) => {
-                fonts.insert(font_name.to_vec(), Object::Dictionary(stream.dict.clone()));
+                fonts.insert(font_name.to_vec(), Object::Dictionary(stream.dict));
             }
             _ => {}
         }

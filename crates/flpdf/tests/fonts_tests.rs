@@ -459,3 +459,104 @@ fn font_entries_propagates_font_reference_resolution_error() {
     let result = font_entries(&mut pdf);
     assert!(result.is_err(), "expected resolution error, got {result:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Holder chains (double-indirect ref -> ref -> value). A single-hop resolve
+// returns the intermediate reference, not the terminal dictionary, so the
+// font would be silently dropped unless the full chain is followed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn font_entries_resolves_holder_chain_resources_dictionary() {
+    // /Resources is stored behind two indirect hops: 8 0 R -> 10 0 R -> dict.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (3, "<< /Type /Page /Parent 2 0 R /Resources 8 0 R >>".into()),
+            (8, "10 0 R".into()),
+            (10, "<< /Font << /F1 7 0 R >> >>".into()),
+            (
+                7,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = open(bytes);
+    let fonts = font_entries(&mut pdf).unwrap();
+    assert!(fonts.contains_key(b"F1".as_slice()));
+}
+
+#[test]
+fn font_entries_resolves_holder_chain_font_dictionary() {
+    // The /Font value is stored behind two indirect hops: 9 0 R -> 11 0 R -> dict.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /Resources << /Font 9 0 R >> >>".into(),
+            ),
+            (9, "11 0 R".into()),
+            (11, "<< /F1 7 0 R >>".into()),
+            (
+                7,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = open(bytes);
+    let fonts = font_entries(&mut pdf).unwrap();
+    assert!(fonts.contains_key(b"F1".as_slice()));
+}
+
+#[test]
+fn font_entries_resolves_holder_chain_font_entry() {
+    // An individual font entry is stored behind two indirect hops:
+    // /F1 7 0 R -> 12 0 R -> font dict.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 7 0 R >> >> >>".into(),
+            ),
+            (7, "12 0 R".into()),
+            (
+                12,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = open(bytes);
+    let fonts = font_entries(&mut pdf).unwrap();
+    assert!(fonts.contains_key(b"F1".as_slice()));
+}
+
+#[test]
+fn font_entries_skips_holder_chain_terminating_at_non_dictionary() {
+    // A font entry holder chain that terminates at a non-dictionary value:
+    // /F1 7 0 R -> 12 0 R -> 42 (an integer). Following the chain to a
+    // non-dict terminal skips the font gracefully rather than erroring.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 7 0 R >> >> >>".into(),
+            ),
+            (7, "12 0 R".into()),
+            (12, "42".into()),
+        ],
+        1,
+    );
+    let mut pdf = open(bytes);
+    let fonts = font_entries(&mut pdf).unwrap();
+    assert!(!fonts.contains_key(b"F1".as_slice()));
+}
