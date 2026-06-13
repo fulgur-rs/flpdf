@@ -97,35 +97,30 @@ fn assert_linearize_byte_identical(fixture: &str, stem: &str) {
 }
 
 #[test]
-#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-wb76."]
 fn one_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("one-page.pdf", "one-page");
 }
 
 #[test]
-#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-wb76."]
 fn two_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("two-page.pdf", "two-page");
 }
 
 #[test]
-#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-wb76."]
 fn three_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("three-page.pdf", "three-page");
 }
 
 // --------------------------------------------------------------------------
-// Structural byte-parity (flpdf-9hc.13.10): the linearized output is identical
-// to the qpdf golden EXCEPT the deterministic `/ID[1]` (the changing
-// identifier). qpdf derives that value by MD5-hashing its entire *first-pass*
-// buffer, in which the linearization parameters, `/Prev`, the xref offsets, and
-// the hint stream are still dummy placeholders (confirmed against qpdf's
-// `QPDFWriter::generateID` / `computeDeterministicIDData`). flpdf instead
-// fingerprints its own converged buffer, so the two `/ID[1]` digests differ
-// while every structural byte matches. These tests pin that structural parity
-// (object numbering, physical order, trailers, framing) by zeroing the
-// `/ID[1]` hex runs on both sides before comparing; they would catch any
-// regression in the layout fixed by divergences B and C.
+// Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
+// above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
+// digesting a byte-identical reconstruction of qpdf's *first* write pass (empty
+// parameter dict, no hint stream, unresolved first-page xref; see
+// `QPDFWriter::writeLinearized` → `computeDeterministicIDData`). These tests are
+// kept as a narrower diagnostic: they zero the `/ID[1]` hex run on both sides
+// before comparing, so a regression in the structural layout (object numbering,
+// physical order, trailers, framing) is isolated from a regression in the
+// `/ID[1]` digest, giving a more targeted failure than the strict tests.
 // --------------------------------------------------------------------------
 
 /// Replace the 32 hex bytes of every `/ID [<id0><id1>]` array's *second*

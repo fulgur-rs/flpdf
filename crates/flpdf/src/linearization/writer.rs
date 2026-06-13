@@ -899,11 +899,22 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// A linearized file repeats `/ID` across the Part-1 trailer, the first-page
 /// xref-stream dict, and the main xref-stream dict; a file identifier is
 /// file-scoped, so all three must carry the *same* value. The identifier is
-/// computed once from a single MD5 over the whole buffer (the placeholder is
+/// computed once from a single MD5 over `digest_source` (the placeholder is
 /// all-zero, so this digest depends only on the input and is stable across
 /// runs). Because the replacement is the same width as the placeholder, no
 /// byte offset shifts and the digest is never recomputed (the operation is
 /// acyclic).
+///
+/// `digest_source` is the buffer whose MD5 seeds the identifier; it may differ
+/// from `bytes`. qpdf's linearized `--deterministic-id` hashes its *first* write
+/// pass — a throwaway buffer with an empty parameter dict, no hint stream, and an
+/// unresolved first-page xref (`QPDFWriter::writeLinearized` →
+/// `computeDeterministicIDData`, qpdf 11.9.0). The classic path reproduces that
+/// pass-1 buffer separately and passes it here, so the digest matches qpdf
+/// byte-for-byte; the result is then patched into the final `bytes`. The ObjStm
+/// path (which qpdf writes with xref *streams*, a different pass-1 layout out of
+/// scope here) passes `bytes` as its own digest source, preserving the prior
+/// whole-final-buffer behaviour.
 ///
 /// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
 /// spans of the sections that actually emit a `/ID` (collected by the writer as
@@ -911,7 +922,7 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// content stream, string, or metadata object happened to contain the same
 /// fixed-width placeholder byte sequence; restricting the search to the known
 /// `/ID` sections makes that misfire impossible. The digest still covers the
-/// whole buffer, so the identifier remains a content fingerprint.
+/// whole `digest_source`, so the identifier remains a content fingerprint.
 ///
 /// # Panics
 ///
@@ -922,6 +933,7 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// emitted site.
 fn patch_linearized_deterministic_id(
     bytes: &mut [u8],
+    digest_source: &[u8],
     id_ranges: &[std::ops::Range<usize>],
     info_suffix: &[u8],
     source_id0: Option<[u8; 16]>,
@@ -930,11 +942,16 @@ fn patch_linearized_deterministic_id(
         compute_deterministic_id, write_deterministic_id_array, DETERMINISTIC_ID_ARRAY_LEN,
     };
 
-    // Compute the identifier once over the placeholder-bearing buffer. There is
-    // no single `[` cutoff (the array recurs at several sites), so the whole
-    // buffer is the digest range: pass the last index as the inclusive end.
-    // (Digest stays global so body-content changes still alter the /ID.)
-    let (id0, id1) = compute_deterministic_id(bytes, bytes.len() - 1, info_suffix, source_id0);
+    // Compute the identifier once over the placeholder-bearing digest source.
+    // There is no single `[` cutoff (the array recurs at several sites), so the
+    // whole buffer is the digest range: pass the last index as the inclusive
+    // end. (Digest stays global so body-content changes still alter the /ID.)
+    let (id0, id1) = compute_deterministic_id(
+        digest_source,
+        digest_source.len() - 1,
+        info_suffix,
+        source_id0,
+    );
 
     let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
     write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
@@ -1243,6 +1260,37 @@ fn append_hint_stream_object(
     offset
 }
 
+/// Build the pass-1 (digest) variant of an already-built [`Part1Bytes`].
+///
+/// qpdf's first write pass emits the linearization parameter dict **empty**
+/// (`<< >>`) instead of the full `/Linearized 1 /L .. /H [ .. ] /O .. >>` body,
+/// but pads the object region to the *same* size so the first-page `xref`
+/// keyword still lands at its fixed offset.  We reproduce that by cloning the
+/// converged Part-1 bytes and overwriting the rewritable dict region (`<<`
+/// through the trailing pad) in place with `<< >>\nendobj\n` followed by ASCII
+/// spaces to refill the region.  The region length is invariant, so `obj1_offset`
+/// and every later offset are unchanged.
+///
+/// The placeholders / writable-region metadata are irrelevant for the digest
+/// buffer (it is never back-patched), so they are left as-is on the clone.
+fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
+    // Empty-dict object body exactly as qpdf's pass 1 writes it.
+    const EMPTY_DICT: &[u8] = b"<< >>\nendobj\n";
+    let mut pass1 = part1.clone();
+    let region = part1.dict_writable_region.clone();
+    // The region always holds the full `<< .. >>\nendobj\n` + pad, which is far
+    // wider than the empty-dict body; assert so the `resize` below can only ever
+    // grow (refill with spaces), never truncate the empty dict.
+    debug_assert!(region.len() >= EMPTY_DICT.len());
+    let mut replacement = Vec::with_capacity(region.len());
+    replacement.extend_from_slice(EMPTY_DICT);
+    // Refill to the exact region length with ASCII spaces (qpdf's pad), keeping
+    // the region length invariant so no downstream offset shifts.
+    replacement.resize(region.len(), b' ');
+    pass1.bytes[region].copy_from_slice(&replacement);
+    pass1
+}
+
 /// Perform a complete single-pass write of the linearized PDF body.
 ///
 /// Returns `(bytes, xref_offsets, hint_stream_offset, hint_stream_obj_total_len,
@@ -1251,6 +1299,20 @@ fn append_hint_stream_object(
 ///
 /// `hint_compressed` is the compressed payload to use for the hint stream object.
 /// `hint_shared_section_offset` is the `/S` value (offset within the uncompressed stream).
+///
+/// When `pass1_digest` is set, the buffer reproduces qpdf's *first* write pass —
+/// the throwaway buffer qpdf MD5-hashes to seed a linearized `--deterministic-id`
+/// (`QPDFWriter::writeLinearized` → `computeDeterministicIDData`, qpdf 11.9.0).
+/// That pass differs from the final (second) pass only in length-preserving ways
+/// the classic stream-free path can reproduce: the linearization parameter dict
+/// is emitted empty (`<< >>` padded to the same region size, supplied via the
+/// `part1` argument), the primary hint stream object is **absent** (every object
+/// physically after it shifts down by the hint length), and the first-page xref
+/// subsection carries formatted zero-offset entries (qpdf never back-patches it
+/// in pass 1). `/Prev` and `/ID` are left at their placeholders (`0` and the
+/// all-zero array), which is exactly what qpdf's pass-1 buffer contains. The
+/// flag is honoured on the classic (`objstm_layout.is_empty()`) path only; the
+/// caller never sets it for ObjStm-bearing output.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
@@ -1268,6 +1330,7 @@ fn do_write_pass<R: Read + Seek>(
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
     options: &WriteOptions,
+    pass1_digest: bool,
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -1401,15 +1464,26 @@ fn do_write_pass<R: Read + Seek>(
         } // cov:ignore: llvm-cov attributes 0 to this `if let` closing brace; the block body (catalog emit) runs and is covered above.
     }
 
-    // Hint stream object
+    // Hint stream object.
+    //
+    // In pass-1-digest mode the hint stream is absent (qpdf reserves its xref
+    // slot but writes no bytes during pass 1), so every object physically after
+    // it shifts down by the hint length.  Skipping the emission here reproduces
+    // that shift incrementally — no offset arithmetic.  The slot is also kept
+    // out of `xref_offsets`: the first-page xref that covers it is written as
+    // formatted zero-offset entries below, so the slot needs no real offset.
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
-    let hint_stream_offset = append_hint_stream_object(
-        &mut bytes,
-        hint_new_ref,
-        hint_compressed,
-        hint_shared_section_offset,
-    );
-    xref_offsets.insert(hint_stream_new_num, hint_stream_offset);
+    let hint_stream_offset = bytes.len();
+    if !pass1_digest {
+        let emitted_offset = append_hint_stream_object(
+            &mut bytes,
+            hint_new_ref,
+            hint_compressed,
+            hint_shared_section_offset,
+        );
+        debug_assert_eq!(emitted_offset, hint_stream_offset);
+        xref_offsets.insert(hint_stream_new_num, emitted_offset);
+    }
     let hint_stream_obj_total_len = bytes.len() - hint_stream_offset;
 
     // Part 3 (Annex F): first-page body — Plan.part2_objects (page-0 private
@@ -1561,7 +1635,21 @@ fn do_write_pass<R: Read + Seek>(
                 )
             })?;
         // cov:ignore-end
-        patch_part1_xref(&mut bytes, patch, &xref_offsets)?;
+        if pass1_digest {
+            // qpdf's pass-1 buffer leaves the first-page xref unresolved:
+            // every covered entry is a formatted zero-offset record
+            // (`0000000000 00000 n `), not the real offsets and not the raw
+            // space placeholder.  Patch the block with an all-zero offsets map
+            // so the encoder emits exactly those bytes (reusing the same
+            // formatter the final pass uses keeps the framing identical).
+            let zero_offsets: BTreeMap<u32, usize> = (patch.start_num
+                ..patch.start_num + patch.count)
+                .map(|n| (n, 0usize))
+                .collect();
+            patch_part1_xref(&mut bytes, patch, &zero_offsets)?;
+        } else {
+            patch_part1_xref(&mut bytes, patch, &xref_offsets)?;
+        }
 
         result
     } else {
@@ -1942,6 +2030,7 @@ pub fn write_linearized<R: Read + Seek>(
             &objstm_layout,
             &relocation,
             options,
+            false,
         )?;
 
         // ------------------------------------------------------------------
@@ -2291,6 +2380,7 @@ pub fn write_linearized<R: Read + Seek>(
                 &objstm_layout,
                 &relocation,
                 options,
+                false,
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;
@@ -2308,24 +2398,75 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Deterministic /ID: back-patch every all-zero placeholder in place.
     //
-    // The placeholder is fixed-width, so the digest range and every byte
-    // offset (startxref, hint stream, xref offsets) are unchanged by the
-    // overwrite. Done after the convergence loop so the digest covers the
-    // converged layout.
+    // The placeholder is fixed-width, so every byte offset (startxref, hint
+    // stream, xref offsets) is unchanged by the overwrite. The result is
+    // patched into the converged final buffer; the *digest source* depends on
+    // the layout:
     //
-    // The digest is taken over THIS buffer, before the caller's
-    // `LinearizedDocument::back_patch` fills the /L, /Prev and hint-table
-    // numeric placeholders. Those values are a deterministic function of this
-    // same byte buffer (same input → same offsets), so the /ID remains a stable
-    // content fingerprint and the final back-patched file is reproducible.
+    //   * Classic (stream-free) path — qpdf seeds the linearized
+    //     `--deterministic-id` from its *first* write pass, a throwaway buffer
+    //     with an empty parameter dict, no hint stream, and an unresolved
+    //     first-page xref (`QPDFWriter::writeLinearized` →
+    //     `computeDeterministicIDData`, qpdf 11.9.0; the hint stream is written
+    //     only afterwards). We rebuild that exact pass-1 buffer here — one extra
+    //     `do_write_pass` in pass-1 mode, no convergence loop (pass 1 has no
+    //     hint to converge) — and digest it, so the `/ID[1]` matches qpdf's
+    //     byte-for-byte.
+    //   * ObjStm / xref-stream path — qpdf's pass-1 layout there uses xref
+    //     streams (out of scope for this byte-parity work), so we keep the prior
+    //     behaviour and digest the final buffer itself.
+    //
+    // Either way the digest covers a placeholder-bearing buffer that is a
+    // deterministic function of the input (the caller's
+    // `LinearizedDocument::back_patch` fills /L, /Prev and the hint-table
+    // numbers later, all derived from this same layout), so the `/ID` stays a
+    // stable content fingerprint and the back-patched file is reproducible.
     // ------------------------------------------------------------------
     if options.deterministic_id {
-        patch_linearized_deterministic_id(
-            &mut final_bytes,
-            &final_id_ranges,
-            &det_id_info_suffix,
-            det_id_source_id0,
-        );
+        if objstm_layout.is_empty() {
+            // Build qpdf's pass-1 digest buffer once (no convergence needed).
+            let pass1_part1 = build_pass1_part1(&part1);
+            let (pass1_bytes, ..) = do_write_pass(
+                plan,
+                renumber,
+                pdf,
+                &pass1_part1,
+                catalog_new_ref,
+                hint_stream_new_num,
+                total_count,
+                info_new_ref,
+                first_page_object_new_num,
+                // The hint stream is absent in pass 1, so its payload / `/S`
+                // offset are never emitted; pass empty / zero placeholders.
+                &[],
+                0,
+                &source_trailer,
+                &objstm_layout,
+                &relocation,
+                options,
+                true,
+            )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeeded on these same inputs, so it cannot introduce a new Err.
+            patch_linearized_deterministic_id(
+                &mut final_bytes,
+                &pass1_bytes,
+                &final_id_ranges,
+                &det_id_info_suffix,
+                det_id_source_id0,
+            );
+        } else {
+            // qpdf's pass-1 layout for xref-stream output differs (it uses xref
+            // streams, not the classic table reconstructed above), so byte-parity
+            // with qpdf's `/ID` is out of scope on this path. Keep the prior,
+            // self-stable behaviour: digest the final buffer itself.
+            let digest_source = final_bytes.clone();
+            patch_linearized_deterministic_id(
+                &mut final_bytes,
+                &digest_source,
+                &final_id_ranges,
+                &det_id_info_suffix,
+                det_id_source_id0,
+            );
+        }
     }
 
     // ------------------------------------------------------------------
