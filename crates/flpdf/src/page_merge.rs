@@ -1016,7 +1016,12 @@ fn remap_inline_name_tree_root<R: Read + Seek>(
 /// classification, so its concrete destinations are reached. The primary catalog
 /// is never copied, so this is the only place an inline `/OpenAction`'s
 /// destinations are remapped (not a re-pass over a copied object). Inline `/Next`
-/// nesting is bounded by [`MAX_ACTION_CHAIN_DEPTH`].
+/// nesting is bounded by [`MAX_ACTION_CHAIN_DEPTH`]. A local `/GoTo`'s `/SD`
+/// (structure destination) is dropped: page-merge copies no structure tree, so
+/// its StructElem ref cannot resolve, and `/SD` would otherwise take precedence
+/// over the `/D` fallback (ISO 32000-2 §12.3.2.3). An opaque `/GoToR`/`/GoToE`
+/// action's `/SD` targets the remote/embedded document and is preserved verbatim
+/// like its `/D`.
 fn remap_inline_action<R: Read + Seek>(
     source: &mut Pdf<R>,
     action: &Object,
@@ -1048,6 +1053,34 @@ fn remap_inline_action_depth<R: Read + Seek>(
             let dest = out.remove("D");
             let next = out.remove("Next");
 
+            // A dict is an opaque non-destination action ONLY when `/S` is present
+            // AND != GoTo (e.g. `/GoToR`, `/URI`, `/JavaScript`); its `/D`, when
+            // present, is a remote/named destination, not a local page ref. A dict
+            // with no `/S` (a bare `<< /D … >>` destination dictionary) or `/S
+            // /GoTo` has a local-page `/D` to remap. Mirrors
+            // outline_dest_remap::remap_or_null_action_dest. Classified on the
+            // un-remapped `/S` (a Name, unaffected by the operand remap below) so
+            // it also gates the `/SD` drop that precedes that remap.
+            let dest_bearing = !matches!(out.get("S"), Some(Object::Name(n)) if n != b"GoTo");
+
+            // Drop a local `/GoTo`'s (or bare-dest dict's) `/SD` structure
+            // destination. It references a StructElem in the primary's structure
+            // tree, which page-merge never copies, so the ref is unmapped: left in
+            // place it would dangle (or be nulled by remap_refs_in_object below)
+            // AND — `/SD` takes precedence over `/D` for structure-aware viewers
+            // (ISO 32000-2 §12.3.2.3) — suppress the still-valid `/D` fallback.
+            // Removing it degrades the action to its explicit `/D`. Dropped
+            // regardless of whether the `/SD` target page is selected (merge copies
+            // no structure tree, so `/SD` is invalid either way), but ONLY for a
+            // local-dest action: an opaque `/GoToR`/`/GoToE` carries an `/SD` into
+            // the *remote/embedded* document, preserved verbatim like its `/D`.
+            // The collector (collect_action_chain_targets) and extract's
+            // neutralize_action_chain gate `/SD` on `/GoTo` the same way; the fold
+            // side already skips `/SD` (ACTION_DEST_KEYS), keeping remap symmetric.
+            if dest_bearing {
+                out.remove("SD");
+            }
+
             // Remap every other indirect operand (e.g. a `/JavaScript` action's
             // `/JS` string ref) through the copy map. The catalog is never copied,
             // so an inline action's operand objects (folded into the primary
@@ -1057,13 +1090,6 @@ fn remap_inline_action_depth<R: Read + Seek>(
                 other => return Ok(other), // cov:ignore: remap_refs_in_object preserves the Dictionary variant
             };
 
-            // A dict is an opaque non-destination action ONLY when `/S` is present
-            // AND != GoTo (e.g. `/GoToR`, `/URI`, `/JavaScript`); its `/D`, when
-            // present, is a remote/named destination, not a local page ref. A dict
-            // with no `/S` (a bare `<< /D … >>` destination dictionary) or `/S
-            // /GoTo` has a local-page `/D` to remap. Mirrors
-            // outline_dest_remap::remap_or_null_action_dest.
-            let dest_bearing = !matches!(out.get("S"), Some(Object::Name(n)) if n != b"GoTo");
             if let Some(dest) = dest {
                 let remapped = if dest_bearing {
                     // A local-page destination: remap its leading page ref.
