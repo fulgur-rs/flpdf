@@ -17,6 +17,7 @@
 //!   W5. Delete non-existent key → returns false, tree unchanged.
 //!   W6. Delete last entry → /EmbeddedFiles removed from /Names dict.
 //!   W7. Insert > LEAF_MAX entries → tree has two levels with /Kids.
+//!   W7b. Single insert → single-node root omits /Limits (ISO 32000-2 §7.9.6).
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
 use flpdf::{
@@ -551,6 +552,80 @@ fn writer_large_insert_produces_kids() {
     assert!(
         first_lim <= last_lim,
         "leaf /Limits[0] must be ≤ /Limits[1]"
+    );
+}
+
+// ── W7b: single insert → single-node root omits /Limits ──────────────────────
+
+#[test]
+fn writer_single_insert_root_omits_limits() {
+    use flpdf::Object;
+
+    let mut pdf = open(build_empty_pdf());
+    let fs_ref = ObjectRef::new(3, 0);
+
+    // One attachment → the tree fits in a single node (entries <= LEAF_MAX), so
+    // the root is itself the leaf-root holding /Names directly.
+    insert_embedded_file(&mut pdf, b"alpha.txt", fs_ref).expect("insert");
+
+    // Reader round-trip: the single attachment must be enumerable, proving the
+    // tree is a real, populated single node (not empty/degenerate).
+    let entries = list_embedded_files(&mut pdf).expect("list");
+    assert_eq!(entries.len(), 1, "exactly one attachment must round-trip");
+    assert_eq!(entries[0].0, b"alpha.txt");
+    assert_eq!(entries[0].1, fs_ref);
+
+    // Walk: catalog → /Names ref → /EmbeddedFiles ref → tree root dict.
+    let catalog_ref = pdf.root_ref().expect("root");
+    let catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+        Object::Dictionary(d) => d,
+        other => panic!("catalog not a dict: {other:?}"),
+    };
+    let names_ref = catalog.get_ref("Names").expect("catalog /Names");
+    let names_dict = match pdf.resolve(names_ref).expect("resolve /Names") {
+        Object::Dictionary(d) => d,
+        other => panic!("/Names not a dict: {other:?}"),
+    };
+    let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
+    let ef_root = match pdf.resolve(ef_root_ref).expect("resolve EF root") {
+        Object::Dictionary(d) => d,
+        other => panic!("EF root not a dict: {other:?}"),
+    };
+
+    // Structural conformance (ISO 32000-2 §7.9.6; qpdf): a single-node root is a
+    // /Names leaf-root that omits /Limits and is not a /Kids root.
+    assert!(
+        ef_root.get("Names").is_some(),
+        "single-node root is a /Names leaf-root, got: {ef_root:?}"
+    );
+    assert!(
+        ef_root.get("Limits").is_none(),
+        "root omits /Limits (ISO 32000-2 §7.9.6; qpdf), got: {ef_root:?}"
+    );
+    assert!(
+        ef_root.get("Kids").is_none(),
+        "single node is not a /Kids root, got: {ef_root:?}"
+    );
+
+    // Substantive check: the /Names array actually names the single attachment,
+    // confirming a populated single-node tree rather than an empty one.
+    let Object::Array(pairs) = ef_root.get("Names").cloned().unwrap() else {
+        panic!("/Names is not an array");
+    };
+    assert_eq!(
+        pairs.len(),
+        2,
+        "single-entry leaf /Names must be one [key, value] pair"
+    );
+    assert!(
+        matches!(&pairs[0], Object::String(k) if k == b"alpha.txt"),
+        "/Names[0] must be the attachment key, got: {:?}",
+        pairs[0]
+    );
+    assert!(
+        matches!(&pairs[1], Object::Reference(r) if *r == fs_ref),
+        "/Names[1] must reference the inserted filespec, got: {:?}",
+        pairs[1]
     );
 }
 
