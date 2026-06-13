@@ -1684,6 +1684,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 8b. First-page closure /Resources DFS — defensive branch coverage.
+    //
+    // The page-leaf `/Resources` subtree walk (a) dedups via the visited set
+    // when the same object is reached twice before it is popped, and (b) stops
+    // at any page-tree node a resource value cross-links to, so it never pulls
+    // in sibling pages. These fixtures exercise both guards directly.
+    // -----------------------------------------------------------------------
+
+    /// Page whose inline `/Resources` lists the SAME object ref twice, so the
+    /// DFS stack holds two copies of obj 4 before either is popped — exercising
+    /// the `visited.insert` dedup `continue` in the subtree walk.
+    fn resources_duplicate_ref_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]               /Resources << /A 4 0 R /B 4 0 R >> >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font /Helvetica >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n                 {off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// Page whose `/Resources` value cross-links back to the `/Pages` node, so
+    /// the subtree walk must STOP there (the `is_page_tree_node` guard) instead
+    /// of pulling the page tree into the first-page closure.
+    fn resources_crosslink_page_tree_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        // /Resources references obj 2 (the Pages node) — a malformed cross-link.
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]               /Resources << /Bad 2 0 R >> >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n                 {off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn resources_subtree_dedups_duplicate_ref() {
+        let mut pdf = Pdf::open(Cursor::new(resources_duplicate_ref_pdf_bytes()))
+            .expect("duplicate-ref PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        // The doubly-referenced resource object appears exactly once across all
+        // parts (the visited-set dedup prevents a duplicate).
+        assert!(plan.parts_are_disjoint());
+        let res = ObjectRef::new(4, 0);
+        assert!(
+            plan.part2_objects.contains(&res),
+            "the resource object must be in the first-page section exactly once"
+        );
+        assert_eq!(
+            plan.part2_objects.iter().filter(|r| **r == res).count(),
+            1,
+            "duplicate /Resources ref must not duplicate the object in Part 2"
+        );
+    }
+
+    #[test]
+    fn resources_subtree_stops_at_page_tree_crosslink() {
+        let mut pdf = Pdf::open(Cursor::new(resources_crosslink_page_tree_pdf_bytes()))
+            .expect("crosslink PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        // The walk reaches the /Pages node via the bad /Resources link but does
+        // not descend into it (no sibling-page content pulled in); the plan is
+        // still well-formed and disjoint.
+        assert!(plan.parts_are_disjoint());
+        // The page itself is the first-page anchor.
+        assert!(
+            plan.part2_objects.contains(&ObjectRef::new(3, 0)),
+            "the page leaf must anchor the first-page section"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // 9. Page-1 hint entry has correct object_count after closure.
     //
     //    object_count[0] must include both Part-2 (page-0 private) and
