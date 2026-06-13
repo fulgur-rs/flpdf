@@ -3650,14 +3650,6 @@ mod tests {
         assert_eq!(str_bytes(&v[1]).len(), 16);
     }
 
-    // --- partition_objstm_eligible (flpdf-9hc.5.9, Task 1) ------------------
-
-    /// Build a minimal xref-table PDF with five resolvable indirects:
-    ///   1 0  Catalog            (plain dict — eligible, but used for /Root)
-    ///   2 0  Pages              (plain dict — eligible)
-    ///   3 0  neutral plain dict (eligible)
-    ///   4 0  stream object      (ineligible — Object::Stream)
-    ///   5 1  plain dict, gen 1  (ineligible — generation != 0)
     // --- deterministic-id (qpdf --deterministic-id) -----------------------
 
     fn det_id_options() -> WriteOptions {
@@ -3798,6 +3790,14 @@ mod tests {
         );
     }
 
+    // --- partition_objstm_eligible (flpdf-9hc.5.9, Task 1) ------------------
+
+    /// Build a minimal xref-table PDF with five resolvable indirects:
+    ///   1 0  Catalog            (plain dict — eligible, but used for /Root)
+    ///   2 0  Pages              (plain dict — eligible)
+    ///   3 0  neutral plain dict (eligible)
+    ///   4 0  stream object      (ineligible — Object::Stream)
+    ///   5 1  plain dict, gen 1  (ineligible — generation != 0)
     fn build_partition_fixture() -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         // (object_number, generation, offset)
