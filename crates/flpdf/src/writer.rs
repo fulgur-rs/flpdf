@@ -185,6 +185,25 @@ pub struct WriteOptions {
     /// Mirrors `qpdf --static-id` and is intended for byte-identical testing.
     pub static_id: bool,
 
+    /// Derive the trailer `/ID` from an MD5 digest of the output body — the
+    /// bytes from the file header through the last body object, up to (but not
+    /// including) the cross-reference table — so the identifier is stable
+    /// across runs for identical input and flags. Both `/ID` elements are set
+    /// to the digest. Mirrors `qpdf --deterministic-id`.
+    ///
+    /// Only the full-rewrite path honours this flag; requesting it on the
+    /// incremental-update path is rejected. It is mutually exclusive with
+    /// [`WriteOptions::static_id`] and is rejected for encrypted output (the
+    /// `/ID` feeds the encryption key, so a content-derived `/ID` would be
+    /// circular) — both matching qpdf.
+    ///
+    /// Because the digest covers the exact output bytes, the default Pure-Rust
+    /// build produces a `/ID` that is self-stable but **not** byte-identical to
+    /// qpdf's (compressed-stream bytes differ); byte-for-byte parity with qpdf
+    /// holds only under the `qpdf-zlib-compat` test feature for classic
+    /// cross-reference-table output.
+    pub deterministic_id: bool,
+
     /// Force every AES CBC IV to `0x00 × 16` instead of a cryptographically
     /// random value.
     ///
@@ -547,6 +566,14 @@ pub fn write_pdf_with_options<R: Read + Seek, W: Write>(
 ) -> Result<()> {
     if options.full_rewrite {
         return write_pdf_full_rewrite(pdf, out, options);
+    }
+    if options.deterministic_id {
+        // The deterministic /ID is an MD5 over the rewritten body, which only
+        // the full-rewrite path produces. Reject rather than silently emit a
+        // random /ID and break the "deterministic" contract.
+        return Err(crate::Error::Unsupported(
+            "deterministic-id requires a full rewrite".to_string(),
+        ));
     }
     write_pdf_incremental(pdf, out, options)
 }
@@ -1478,6 +1505,13 @@ pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
     trailer.insert("ID", Object::Array(vec![first_id, pi_id]));
 }
 
+/// Set the trailer `/ID` to two copies of `digest` (qpdf's `--deterministic-id`
+/// shape: both the permanent and changing identifiers equal the body digest).
+pub(crate) fn apply_deterministic_id(trailer: &mut Dictionary, digest: [u8; 16]) {
+    let id = Object::String(digest.to_vec());
+    trailer.insert("ID", Object::Array(vec![id.clone(), id]));
+}
+
 /// Generate a fresh 16-byte file identifier.
 ///
 /// Mirrors qpdf's default-`/ID` algorithm in spirit: an MD5 digest seeded from
@@ -2023,6 +2057,7 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
     pdf: &Pdf<R>,
     options: &WriteOptions,
     encrypt_ctx: Option<&EncryptionContext>,
+    deterministic_id: Option<[u8; 16]>,
 ) {
     if let Some(ctx) = encrypt_ctx {
         // Reference the freshly-emitted /Encrypt object and pin /ID[0] to
@@ -2043,7 +2078,12 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
         if pdf.is_encrypted() {
             trailer.remove("Encrypt");
         }
-        if options.static_id {
+        // deterministic_id is mutually exclusive with static_id and rejected for
+        // encrypted output (both guarded earlier in write_pdf_full_rewrite), so
+        // it only reaches this non-encrypted arm and takes precedence.
+        if let Some(digest) = deterministic_id {
+            apply_deterministic_id(trailer, digest);
+        } else if options.static_id {
             apply_static_id(trailer);
         } else {
             apply_random_id(trailer);
@@ -2233,6 +2273,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     refuse_signed_full_rewrite(pdf, options)?;
 
+    if options.deterministic_id && options.static_id {
+        return Err(crate::Error::Unsupported(
+            "deterministic_id and static_id are mutually exclusive".to_string(),
+        ));
+    }
+
     let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
 
     // ── encryption preflight (flpdf-9hc.4.9 / 4.11 / 4.16 / 4.17) ─────────
@@ -2250,6 +2296,15 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         ));
     }
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+
+    if options.deterministic_id && encrypting {
+        // qpdf rejects this combination: the /ID feeds the encryption key, so a
+        // content-derived /ID cannot be computed before the encrypted bytes
+        // exist. Mirror qpdf's user-facing wording.
+        return Err(crate::Error::Unsupported(
+            "the deterministic-id option is incompatible with encrypted output files".to_string(),
+        ));
+    }
 
     if encrypting && options.qdf {
         return Err(crate::Error::Unsupported(
@@ -2864,6 +2919,16 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     // Build xref / trailer matching the input's xref form.
     let xref_offset = bytes.len();
+    // qpdf's --deterministic-id: MD5 over the output body (header + objects, up
+    // to but not including the xref table). `xref_offset` froze that prefix, so
+    // hashing `bytes[..xref_offset]` is stable regardless of what we append
+    // next. Both /ID elements are set to this digest (see apply_deterministic_id).
+    let deterministic_id_digest: Option<[u8; 16]> = if options.deterministic_id {
+        use md5::Digest as _;
+        Some(md5::Md5::digest(&bytes[..xref_offset]).into())
+    } else {
+        None
+    };
     // `object_count` is the smallest object number strictly greater than every
     // emitted one — i.e. the number we'll assign to a freshly created xref
     // stream object.  Using `saturating_add` here would silently fail when the
@@ -2900,7 +2965,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
             trailer.insert("Size", Object::Integer(object_count as i64));
             trailer.insert("Root", Object::Reference(new_root));
-            apply_encrypt_trailer_entries(&mut trailer, pdf, options, encrypt_ctx.as_ref());
+            apply_encrypt_trailer_entries(
+                &mut trailer,
+                pdf,
+                options,
+                encrypt_ctx.as_ref(),
+                deterministic_id_digest,
+            );
 
             if options.qdf {
                 // qpdf --qdf trailer: "trailer <<" on one line, then one
@@ -3064,7 +3135,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                     crate::Error::Unsupported("xref stream /Length does not fit i64".to_string())
                 })?),
             );
-            apply_encrypt_trailer_entries(&mut xref_dict, pdf, options, encrypt_ctx.as_ref());
+            apply_encrypt_trailer_entries(
+                &mut xref_dict,
+                pdf,
+                options,
+                encrypt_ctx.as_ref(),
+                deterministic_id_digest,
+            );
 
             let xref_stream = crate::Stream::new(xref_dict, stream_data);
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
@@ -3581,6 +3658,145 @@ mod tests {
     ///   3 0  neutral plain dict (eligible)
     ///   4 0  stream object      (ineligible — Object::Stream)
     ///   5 1  plain dict, gen 1  (ineligible — generation != 0)
+    // --- deterministic-id (qpdf --deterministic-id) -----------------------
+
+    fn det_id_options() -> WriteOptions {
+        WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            ..WriteOptions::default()
+        }
+    }
+
+    fn write_det_id(fixture: &[u8]) -> Vec<u8> {
+        let mut pdf = crate::Pdf::open_mem(fixture).expect("fixture must open");
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &det_id_options())
+            .expect("deterministic-id write must succeed");
+        out
+    }
+
+    fn trailer_id_pair(output: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let pdf = crate::Pdf::open_mem(output).expect("output must re-open");
+        match pdf.trailer().get("ID") {
+            Some(Object::Array(values)) if values.len() == 2 => {
+                let extract = |o: &Object| match o {
+                    Object::String(s) => s.clone(),
+                    other => panic!("/ID element is not a string: {other:?}"),
+                };
+                (extract(&values[0]), extract(&values[1]))
+            }
+            other => panic!("expected a 2-element /ID array, got {other:?}"),
+        }
+    }
+
+    /// Parse the `startxref` offset from the tail of a PDF — equals the byte
+    /// length of the body the deterministic /ID is hashed over.
+    fn parse_startxref(output: &[u8]) -> usize {
+        let marker = b"startxref";
+        let pos = output
+            .windows(marker.len())
+            .rposition(|w| w == marker)
+            .expect("output must contain startxref");
+        let digits: Vec<u8> = output[pos + marker.len()..]
+            .iter()
+            .copied()
+            .skip_while(|b| b.is_ascii_whitespace())
+            .take_while(|b| b.is_ascii_digit())
+            .collect();
+        std::str::from_utf8(&digits)
+            .expect("startxref digits are ASCII")
+            .parse()
+            .expect("startxref offset must parse")
+    }
+
+    #[test]
+    fn deterministic_id_is_stable_and_equals_md5_over_body() {
+        let fixture = build_string_and_stream_fixture();
+        let o1 = write_det_id(&fixture);
+        let o2 = write_det_id(&fixture);
+        assert_eq!(
+            o1, o2,
+            "same input + deterministic_id must produce byte-identical output"
+        );
+
+        // Both /ID elements equal the MD5 over the body (header + objects, up to
+        // but not including the xref table) — qpdf's --deterministic-id range.
+        let xref_offset = parse_startxref(&o1);
+        use md5::Digest as _;
+        let digest: [u8; 16] = md5::Md5::digest(&o1[..xref_offset]).into();
+        let (id0, id1) = trailer_id_pair(&o1);
+        assert_eq!(id0, digest.to_vec(), "/ID[0] must equal MD5 over the body");
+        assert_eq!(id1, digest.to_vec(), "/ID[1] must equal MD5 over the body");
+        // Distinct from the --static-id constant so the two flags never collide.
+        assert_ne!(id0.as_slice(), &QPDF_STATIC_ID[..]);
+    }
+
+    #[test]
+    fn deterministic_id_depends_on_content() {
+        let a = write_det_id(&build_string_and_stream_fixture());
+        let b = write_det_id(&build_metadata_fixture());
+        assert_ne!(
+            trailer_id_pair(&a).0,
+            trailer_id_pair(&b).0,
+            "different input content must yield a different deterministic /ID"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_and_static_id_are_mutually_exclusive() {
+        let fixture = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let opts = WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let err = write_pdf_with_options(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("mutually exclusive")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_rejected_with_encryption() {
+        let fixture = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let opts = WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let err = write_pdf_with_options(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_requires_full_rewrite() {
+        let fixture = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        // full_rewrite defaults to false → incremental path.
+        let opts = WriteOptions {
+            deterministic_id: true,
+            ..WriteOptions::default()
+        };
+        let err = write_pdf_with_options(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("requires a full rewrite")),
+            "got {err:?}"
+        );
+    }
+
     fn build_partition_fixture() -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         // (object_number, generation, offset)
