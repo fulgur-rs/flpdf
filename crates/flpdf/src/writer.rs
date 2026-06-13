@@ -2210,17 +2210,24 @@ fn compute_deterministic_id(
 /// two-level qpdf identifier, in place.
 ///
 /// `region_start` is the offset where the structural trailer (or xref-stream)
-/// dictionary begins; the all-zero placeholder
-/// [`apply_deterministic_id_placeholder`] installs is located by scanning from
-/// there, so it cannot be confused with arbitrary body content earlier in the
-/// file. Because the replacement is the same [`DETERMINISTIC_ID_ARRAY_LEN`]
-/// bytes as the placeholder, every later byte offset (and thus the digest
-/// range and `startxref`) is left untouched.
+/// dictionary begins. The all-zero placeholder
+/// [`apply_deterministic_id_placeholder`] installs is located by searching from
+/// there for the `/ID ` key token immediately followed by the placeholder
+/// array. Anchoring on the key token (rather than the bare placeholder array)
+/// means a preserved trailer entry whose *value* happens to serialize to the
+/// same [`DETERMINISTIC_ID_ARRAY_LEN`] bytes is not mistaken for `/ID`: that
+/// value is not preceded by the `/ID ` token. This matters because `/ID` is not
+/// always the last key in the region — the xref-stream dictionary serializes
+/// keys in plain lexicographic order, so a preserved key sorting after `/ID`
+/// would otherwise precede or follow the real `/ID` ambiguously. Because the
+/// replacement is the same [`DETERMINISTIC_ID_ARRAY_LEN`] bytes as the
+/// placeholder, every later byte offset (and thus the digest range and
+/// `startxref`) is left untouched.
 ///
 /// # Panics
 ///
-/// Panics if the placeholder is not present in the region. This is an internal
-/// invariant: callers always install the placeholder via
+/// Panics if the `/ID ` placeholder is not present in the region. This is an
+/// internal invariant: callers always install the placeholder via
 /// [`apply_deterministic_id_placeholder`] before serializing the dictionary,
 /// so an absent placeholder indicates a writer bug rather than malformed input.
 fn patch_deterministic_id(
@@ -2232,11 +2239,30 @@ fn patch_deterministic_id(
     let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
     write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
 
-    let id_array_offset = region_start
+    // All three trailer serializers emit `/ID ` (slash, I, D, space) directly
+    // before the `/ID` array value (see `Dictionary::write_pdf`,
+    // `write_pdf_trailer`, and `write_qdf_trailer`). Anchor on that token so the
+    // search locks onto the real `/ID` entry, not an unrelated key whose value
+    // coincidentally serializes to the same placeholder bytes.
+    const ID_TOKEN: &[u8] = b"/ID ";
+    let mut anchor = Vec::with_capacity(ID_TOKEN.len() + DETERMINISTIC_ID_ARRAY_LEN);
+    anchor.extend_from_slice(ID_TOKEN);
+    anchor.extend_from_slice(&placeholder);
+
+    let token_offset = region_start
         + bytes[region_start..]
-            .windows(DETERMINISTIC_ID_ARRAY_LEN)
-            .position(|window| window == placeholder.as_slice())
+            .windows(anchor.len())
+            .position(|window| window == anchor.as_slice())
             .expect("deterministic-id /ID placeholder must be present in the trailer region");
+    // `token_offset` is the `/` of `/ID `; the placeholder array's `[` starts
+    // ID_TOKEN.len() bytes later. qpdf captures the body digest inclusive of
+    // this `[`, so the offset must match the bare-placeholder location exactly.
+    let id_array_offset = token_offset + ID_TOKEN.len();
+    debug_assert_eq!(
+        &bytes[id_array_offset..id_array_offset + DETERMINISTIC_ID_ARRAY_LEN],
+        placeholder.as_slice(),
+        "anchored /ID offset must land on the placeholder array"
+    );
 
     let (id0, id1) = compute_deterministic_id(bytes, id_array_offset, info_suffix, source_id0);
 
@@ -4241,6 +4267,109 @@ mod tests {
         assert_eq!(
             a.1, d.1,
             "truncating at the NUL must equal hashing the pre-NUL bytes alone"
+        );
+    }
+
+    #[test]
+    fn patch_deterministic_id_targets_id_not_earlier_placeholder() {
+        // Regression for the "first matching placeholder" bug: a preserved
+        // trailer key whose value serializes to the same 70-byte placeholder
+        // array, positioned BEFORE the real /ID, must NOT be patched. Anchoring
+        // on the `/ID ` key token (rather than the bare placeholder bytes) is
+        // what keeps the patch on the genuine identifier.
+        //
+        // A direct unit test (rather than an end-to-end rewrite) is used because
+        // it lets us place the decoy at a precise, controlled offset and assert
+        // byte-for-byte that the decoy is untouched and the real /ID is filled.
+        let mut placeholder = Vec::new();
+        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
+
+        // region = "<< /Probe [decoy] /ID [real] >>" — the decoy array appears
+        // before the `/ID ` token, exactly the layout a crafted classic trailer
+        // would produce (where /ID is forced last, after sorted keys).
+        let mut region = Vec::new();
+        region.extend_from_slice(b"<< /Probe ");
+        let decoy_offset = region.len();
+        region.extend_from_slice(&placeholder);
+        region.extend_from_slice(b" /ID ");
+        let id_offset = region.len();
+        region.extend_from_slice(&placeholder);
+        region.extend_from_slice(b" >>");
+
+        // Prefix the region with unrelated body bytes so region_start > 0 and the
+        // search is genuinely scoped from there.
+        let mut bytes = b"%PDF-1.7\nbody bytes\n".to_vec();
+        let region_start = bytes.len();
+        let decoy_abs = region_start + decoy_offset;
+        let id_abs = region_start + id_offset;
+        bytes.extend_from_slice(&region);
+
+        patch_deterministic_id(&mut bytes, region_start, b"", None);
+
+        // The decoy (no `/ID ` prefix) must remain the all-zero placeholder.
+        assert_eq!(
+            &bytes[decoy_abs..decoy_abs + placeholder.len()],
+            placeholder.as_slice(),
+            "the earlier non-/ID placeholder must not be patched"
+        );
+        // The real /ID must be overwritten with a non-zero computed identifier.
+        assert_ne!(
+            &bytes[id_abs..id_abs + placeholder.len()],
+            placeholder.as_slice(),
+            "the genuine /ID placeholder must be patched"
+        );
+        // And it must equal the value compute_deterministic_id derives for the
+        // /ID array offset (id_abs points at the `[`).
+        let (id0, id1) = compute_deterministic_id(&bytes, id_abs, b"", None);
+        let mut expected = Vec::new();
+        write_deterministic_id_array(&mut expected, &id0, &id1);
+        assert_eq!(
+            &bytes[id_abs..id_abs + placeholder.len()],
+            expected.as_slice(),
+            "patched /ID must equal the two-level deterministic identifier"
+        );
+    }
+
+    #[test]
+    fn deterministic_id_preserves_decoy_trailer_key_through_full_rewrite() {
+        // End-to-end regression for the decoy-collision bug: a preserved (unknown)
+        // trailer key `/Probe` whose value serializes to the EXACT 70-byte /ID
+        // placeholder `[<0x32><0x32>]`. The full-rewrite trailer keeps unknown
+        // keys (`trailer = pdf.trailer().clone()`) and forces /ID last, so the
+        // serialized output is `... /Probe [<0..0><0..0>] ... /ID [<0..0><0..0>]`.
+        // The patch must overwrite only the genuine /ID (anchored on `/ID `) and
+        // leave /Probe untouched.
+        let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
+        let src = build_det_id_source(&format!("/Probe [<{zeros}><{zeros}>]"), &[]);
+        let out = write_det_id(&src);
+
+        // The decoy /Probe must survive as the original all-zero 16-byte array.
+        let reopened = crate::Pdf::open_mem(&out).expect("output must re-open");
+        let probe = reopened
+            .trailer()
+            .get("Probe")
+            .and_then(Object::as_array)
+            .expect("/Probe must be preserved as an array");
+        assert_eq!(probe.len(), 2, "/Probe array arity must be preserved");
+        for element in probe {
+            assert_eq!(
+                element
+                    .as_string()
+                    .expect("/Probe element must be a string"),
+                &[0u8; 16],
+                "/Probe must NOT be mis-patched — it stays the all-zero placeholder"
+            );
+        }
+        // The genuine /ID[1] must be patched to the non-zero computed identifier.
+        assert_ne!(
+            trailer_id_pair(&out).1,
+            vec![0u8; 16],
+            "the real /ID must be patched, not left as the zero placeholder"
+        );
+        assert_eq!(
+            trailer_id_pair(&out).1,
+            expected_changing_id(&out, b"").to_vec(),
+            "/ID[1] must be the two-level deterministic digest"
         );
     }
 
