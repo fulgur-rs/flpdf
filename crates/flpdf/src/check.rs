@@ -938,10 +938,15 @@ mod tests {
         assert!(report.diagnostics.entries().iter().any(|d| {
             d.severity == Severity::Warning && d.message.contains("decode-bomb guard")
         }));
-        assert!(!report.diagnostics.entries().iter().any(|d| {
-            d.severity == Severity::Error
-                && d.message.contains("errors while decoding content stream")
-        }));
+        // The guard trip must never be reported as a decode error: that message
+        // must appear in no diagnostic at all. (Checking the message regardless
+        // of severity also keeps the closure free of a short-circuit that would
+        // leave the `contains` arm unevaluated when no error exists.)
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|d| d.message.contains("errors while decoding content stream")));
     }
 
     #[test]
