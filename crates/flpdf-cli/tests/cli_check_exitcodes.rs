@@ -140,6 +140,49 @@ fn corrupt_content_stream_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// A structurally valid single-page PDF whose page `/Contents 4 0 R` is a
+/// *valid* FlateDecode stream that inflates to `decoded_len` bytes (small
+/// compressed, large inflated). Exercises the opt-in `--decode-memory-limit`
+/// guard: the stream is intact, so without a cap it is clean, and with a tight
+/// cap it trips the guard as a warning.
+fn bomb_content_stream_pdf_bytes(decoded_len: usize) -> Vec<u8> {
+    let mut flate_dict = flpdf::Dictionary::new();
+    flate_dict.insert("Filter", flpdf::Object::Name(b"FlateDecode".to_vec()));
+    let encoded = flpdf::filters::encode_stream_data(&flate_dict, &vec![0u8; decoded_len]).unwrap();
+
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+            encoded.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&encoded);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 /// Valid xref but the trailer lacks /Root — opens fine, check reports an
 /// error-severity diagnostic → exit 2.
 fn missing_root_pdf_bytes() -> Vec<u8> {
@@ -577,4 +620,101 @@ fn rewrite_repair_warnings_use_qpdf_stderr_format() {
             "WARNING: {path}: file is damaged\n"
         )))
         .stderr(predicate::str::contains("warning: ").not());
+}
+
+// ---------------------------------------------------------------------------
+// Tests: opt-in `--decode-memory-limit` decompression-bomb guard
+// ---------------------------------------------------------------------------
+
+/// With `--decode-memory-limit` below the inflated size, the intact-but-large
+/// content stream trips the decompression-bomb guard: a WARNING (exit 3), the
+/// trailing "clean" note suppressed — NOT an error (exit 2).
+#[test]
+fn check_decode_memory_limit_bomb_warns_exit_3() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&bomb_content_stream_pdf_bytes(64 * 1024))
+        .unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args([
+            "--check",
+            "--decode-memory-limit",
+            "1024",
+            f.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
+        .stderr(predicate::str::contains("decode-bomb guard"));
+}
+
+/// Without the flag, the same large stream decodes fine: clean exit 0 (default
+/// unlimited, matching qpdf).
+#[test]
+fn check_no_limit_large_stream_exits_0() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&bomb_content_stream_pdf_bytes(64 * 1024))
+        .unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", f.path().to_str().unwrap()])
+        .assert()
+        .code(0);
+}
+
+/// The `check` subcommand carries the same flag.
+#[test]
+fn check_subcommand_decode_memory_limit_bomb_warns_exit_3() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&bomb_content_stream_pdf_bytes(64 * 1024))
+        .unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "check",
+        "--decode-memory-limit",
+        "1024",
+        f.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(3)
+    .stderr(predicate::str::contains("decode-bomb guard"));
+}
+
+/// A genuinely corrupt content stream is still an error (exit 2) even with the
+/// cap set — the limit path must not mask real decode failures.
+#[test]
+fn check_decode_memory_limit_does_not_mask_corruption() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&corrupt_content_stream_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--check",
+        "--decode-memory-limit",
+        "1024",
+        f.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains(
+        "errors while decoding content stream",
+    ));
+}
+
+/// `--decode-memory-limit` only affects the `--check` audit path, so passing it
+/// without `--check` is a clap usage error (`requires = "check"`) rather than a
+/// silently-ignored flag. clap reports a missing-required-argument error
+/// (exit 2) naming `--check`.
+#[test]
+fn decode_memory_limit_requires_check() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&clean_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--decode-memory-limit", "1024", f.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--check"));
 }

@@ -105,8 +105,14 @@ are not treated as vulnerabilities on their own:
   chains), and an opt-in decode-output limit comparable to qpdf's
   `Pl_Flate::setMemoryLimit` is available via `filters::DecodeLimits` /
   `filters::decode_stream_data_with_limits` (default unbounded; embedders set
-  `max_output` to bound each `FlateDecode` / `LZWDecode` stage). flpdf's own
-  document paths still place no output cap by default.
+  `max_output` to bound each `FlateDecode` / `LZWDecode` stage). The CLI exposes
+  this cap on the `--check` audit path via `--decode-memory-limit=BYTES` (default
+  unbounded, matching qpdf's default `flate_max_memory`); a content stream that
+  exceeds the cap is reported as a warning, not as corruption. The `--check` cap
+  bounds the generalized-filter decode the check pass performs; a content stream
+  carrying an explicit `/Crypt` filter is decoded during object resolution
+  (unbounded) before the check pass sees it, so it is not yet bounded. flpdf's
+  other document paths still place no output cap by default.
 - **PDF permission enforcement.** Owner-password usage restrictions
   (printing, copying, …) are advisory metadata under the PDF specification.
   flpdf, like qpdf, can remove them (`--remove-restrictions`); this is a
@@ -197,7 +203,7 @@ Entry points through which untrusted bytes reach flpdf:
 | Lazy object loading | `Pdf::resolve` / `resolve_borrowed` (xref offsets, object syntax, object streams) |
 | Stream decoding | filter pipeline in `filters.rs`: Flate, LZW, ASCII85, ASCIIHex, RunLength (+ pass-through DCT/JBIG2/JPX/CCITT) |
 | Decryption | standard security handler (`security/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); password normalization incl. SASLprep |
-| Validation | `check_reader`, `check_reader_strict`, `check_reader_with_options` |
+| Validation | `check_reader`, `check_reader_strict`, `check_reader_with_options`, `check_reader_with_options_and_limits` |
 | Writing (reads everything it writes) | `write_pdf`, `write_qdf`, linearization |
 | Signature inspection | `signatures.rs` (`/ByteRange`, signature dictionaries, certificates) |
 | CLI (drives all of the above on argv-named files) | `flpdf-cli`: `check`, `rewrite`, `qdf`, `qdf-fix`, `linearize`, `dump-object`, `show-stream`, `pages`/`--pages`, `--split-pages`, attachment options, encryption options, JSON output |

@@ -77,6 +77,27 @@ pub struct DecodeLimits {
     pub max_output: Option<usize>,
 }
 
+/// Message prefix shared by every bounded-decode site that aborts because the
+/// decoded output would exceed [`DecodeLimits::max_output`]. Producers build
+/// their message as `"{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"`, and
+/// [`is_decode_output_limit_error`] matches on this prefix. Keeping both on one
+/// constant stops the message and the matcher from drifting apart.
+pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
+
+/// Returns `true` when `error` is the limit-exceeded signal raised when a
+/// `FlateDecode`/`LZWDecode` stage aborts because its output would exceed
+/// [`DecodeLimits::max_output`].
+///
+/// Both limit-exceeded and genuine decode failures surface as
+/// [`Error::Unsupported`]; this predicate lets the `--check` pass classify a
+/// decompression-bomb guard trip (the stream is intact, merely larger than the
+/// configured cap) as a warning rather than a stream-encoding error. The
+/// sentinel is internal to flpdf — the trailing byte count is flpdf's own value —
+/// so PDF content cannot forge a corrupt-stream message into this shape.
+pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
+    matches!(error, Error::Unsupported(message) if message.starts_with(DECODE_OUTPUT_LIMIT_PREFIX))
+}
+
 /// Decode a stream's filter chain like [`decode_stream_data`], enforcing the
 /// opt-in [`DecodeLimits`].
 ///
@@ -581,9 +602,7 @@ fn apply_single_filter_decode(
                     .read_to_end(&mut decoded)
                     .map_err(|error| error.to_string())?;
                 if decoded.len() > limit {
-                    return Err(format!(
-                        "decoded output exceeds configured limit of {limit} bytes"
-                    ));
+                    return Err(format!("{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"));
                 }
             }
             None => {
@@ -738,9 +757,7 @@ fn lzw_decode(
         output.extend_from_slice(&entry);
         if let Some(limit) = max_output {
             if output.len() > limit {
-                return Err(format!(
-                    "decoded output exceeds configured limit of {limit} bytes"
-                ));
+                return Err(format!("{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"));
             }
         }
 
@@ -1726,5 +1743,22 @@ mod tests {
         let encoded = encode_stream_data(&dict, &raw).unwrap();
         assert_eq!(decode_stream_data(&dict, &encoded).unwrap().len(), 5000);
         assert_eq!(DecodeLimits::default().max_output, None);
+    }
+
+    #[test]
+    fn is_decode_output_limit_error_matches_only_the_limit_sentinel() {
+        // The bounded-decode limit message is recognised as a limit trip...
+        let limit_err = Error::Unsupported(format!("{DECODE_OUTPUT_LIMIT_PREFIX} 1024 bytes"));
+        assert!(is_decode_output_limit_error(&limit_err));
+
+        // ...but an unrelated Unsupported message (genuine corruption / unknown
+        // codec) is not.
+        let corrupt =
+            Error::Unsupported("corrupt deflate stream: invalid distance code".to_string());
+        assert!(!is_decode_output_limit_error(&corrupt));
+
+        // ...and a non-Unsupported error never matches.
+        let parse = Error::parse(0, "boom");
+        assert!(!is_decode_output_limit_error(&parse));
     }
 }
