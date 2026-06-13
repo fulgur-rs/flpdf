@@ -21,7 +21,7 @@
 
 use crate::content_stream::{ContentStreamParser, ContentToken};
 use crate::filters::decode_stream_data;
-use crate::ref_chain::resolve_ref_chain;
+use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -96,7 +96,8 @@ enum ResourcesLoc {
     PageInline,
     /// `/Resources` is an inline (direct) dictionary on an ancestor `/Pages` node.
     AncestorInline(ObjectRef),
-    /// `/Resources` is an indirect object reference (anywhere in the chain).
+    /// `/Resources` is an indirect object reference, collapsed to the terminal
+    /// ref of any holder chain (`a 0 R → b 0 R → <<dict>>` stores `b`).
     Indirect(ObjectRef),
 }
 
@@ -451,7 +452,8 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
 ///
 /// Walks the parent chain looking for the first `/Resources` entry and
 /// returns a [`ResourcesLoc`] discriminating among:
-/// - [`ResourcesLoc::Indirect`] – indirect object reference (anywhere in chain)
+/// - [`ResourcesLoc::Indirect`] – indirect object reference, collapsed to the
+///   terminal ref of any holder chain
 /// - [`ResourcesLoc::PageInline`] – inline dict on the page dict itself
 /// - [`ResourcesLoc::AncestorInline`] – inline dict on a `/Pages` ancestor
 /// - [`ResourcesLoc::None`] – no `/Resources` found at all
@@ -479,9 +481,67 @@ fn resources_location<R: Read + Seek>(
             return Ok(ResourcesLoc::None);
         };
 
-        match dict.get("Resources").cloned() {
-            Some(Object::Reference(r)) => return Ok(ResourcesLoc::Indirect(r)),
-            Some(Object::Dictionary(_)) => {
+        // Classify `/Resources` and capture the parent ref *by reference*. We
+        // only ever need a small `ObjectRef` (or a "this is an inline dict" flag)
+        // out of this borrow, so an inline `/Resources` dictionary must not be
+        // deep-cloned on this per-page hot path. The `node_obj` borrow ends once
+        // these two cheap values are extracted, freeing `&mut pdf` for the
+        // holder-chain follow below.
+        enum ResKind {
+            /// `/Resources` is an indirect reference (the holder-chain head).
+            Ref(ObjectRef),
+            /// `/Resources` is an inline (direct) dictionary.
+            Inline,
+            /// `/Resources` is absent or null — inherit from the parent.
+            Absent,
+            /// `/Resources` is present but neither a reference, dict, nor null —
+            /// nothing prunable.
+            Other,
+        }
+        let res_kind = match dict.get("Resources") {
+            Some(Object::Reference(r)) => ResKind::Ref(*r),
+            Some(Object::Dictionary(_)) => ResKind::Inline,
+            Some(Object::Null) | None => ResKind::Absent,
+            _ => ResKind::Other,
+        };
+        let parent_ref: Option<ObjectRef> = match dict.get("Parent") {
+            Some(Object::Reference(p)) => Some(*p),
+            _ => None,
+        };
+
+        match res_kind {
+            ResKind::Ref(r) => {
+                // Collapse the holder chain (`a 0 R → b 0 R → <<dict>>`) to its
+                // terminal so every `ResourcesLoc::Indirect` consumer (grouping,
+                // ref-counting, pruning) keys on the terminal — the same dict the
+                // read side (`pages::resolve_inherited_resources`) resolves to.
+                // Keying on the first hop instead made `prune_resources_object`
+                // resolve a ref-to-a-ref, see a non-dict, and silently skip
+                // pruning. A single-hop ref's terminal is itself, so this
+                // preserves the prior result for that case.
+                //
+                // `terminal_ref_of_chain` walks by borrow and returns only the
+                // ref, so the terminal `/Resources` dictionary — re-inspected by
+                // borrow just below — is never cloned on this per-page hot path.
+                let terminal_ref = terminal_ref_of_chain(pdf, r)?;
+                match pdf.resolve_borrowed(terminal_ref)? {
+                    // A chain resolving to null is "absent" (PDF §7.3.9): fall
+                    // through to the parent, matching the `Absent` arm and the
+                    // read side. Returning `Indirect(terminal)` would key this
+                    // page's used names on the null ref while it renders from the
+                    // inherited parent dict, so the parent could be pruned against
+                    // only the other pages' names and lose this page's resources.
+                    Object::Null => match parent_ref {
+                        Some(parent) => current = parent,
+                        None => return Ok(ResourcesLoc::None),
+                    },
+                    Object::Dictionary(_) => return Ok(ResourcesLoc::Indirect(terminal_ref)),
+                    // A non-dict, non-null terminal has nothing prunable; the
+                    // read side rejects it, but here we simply skip (no-op).
+                    _ => return Ok(ResourcesLoc::None),
+                }
+            }
+            ResKind::Inline => {
                 // Inline dict: distinguish page-level vs ancestor.
                 if current == page_ref {
                     return Ok(ResourcesLoc::PageInline);
@@ -489,16 +549,12 @@ fn resources_location<R: Read + Seek>(
                     return Ok(ResourcesLoc::AncestorInline(current));
                 }
             }
-            Some(Object::Null) | None => {
+            ResKind::Absent => match parent_ref {
                 // Fall through to parent.
-                match dict.get("Parent").cloned() {
-                    Some(Object::Reference(parent)) => {
-                        current = parent;
-                    }
-                    _ => return Ok(ResourcesLoc::None),
-                }
-            }
-            _ => return Ok(ResourcesLoc::None),
+                Some(parent) => current = parent,
+                None => return Ok(ResourcesLoc::None),
+            },
+            ResKind::Other => return Ok(ResourcesLoc::None),
         }
     }
 }
@@ -1109,4 +1165,385 @@ fn apply_pruning<R: Read + Seek>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a 1-page PDF whose inherited `/Resources` is an indirect reference.
+    /// The terminal `/Font` dict (object 5) carries a used `/F1` and an unused
+    /// `/F2`; the single page's content references only `/F1`.
+    ///
+    /// `resources_ref` is the object the `/Pages` node points its `/Resources`
+    /// at, and `obj4_body` is object 4's body — together they select the shape:
+    /// - holder chain: `resources_ref = 4`, `obj4_body = "5 0 R"`
+    ///   (`/Resources 4 0 R → 5 0 R → <<dict>>`)
+    /// - single hop:   `resources_ref = 5`, `obj4_body = "<< >>"`
+    ///   (`/Resources 5 0 R → <<dict>>`; object 4 is an inert orphan)
+    fn build_inherited_indirect_resources_pdf(resources_ref: u32, obj4_body: &str) -> Vec<u8> {
+        let content = b"BT /F1 12 Tf 10 10 Td (hi) Tj ET";
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+
+        let dicts: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (
+                2,
+                format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources {resources_ref} 0 R >>"),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>".into(),
+            ),
+            (4, obj4_body.into()),
+            (
+                5,
+                "<< /Font << \
+                 /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> \
+                 /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> \
+                 >> >>"
+                    .into(),
+            ),
+        ];
+        for (n, s) in &dicts {
+            offs.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+        offs.insert(6, out.len() as u64);
+        out.extend_from_slice(
+            format!("6 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        out.extend_from_slice(content);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_start = out.len() as u64;
+        let total = 7u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    /// Run a prune in `mode` and return the `/Font` sub-dictionary keys of the
+    /// terminal `/Resources` object `terminal_obj`.
+    fn font_keys_after_prune(
+        bytes: Vec<u8>,
+        mode: RemoveUnreferencedResources,
+        terminal_obj: u32,
+    ) -> Vec<String> {
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        remove_unreferenced_resources(&mut pdf, mode).expect("prune should succeed");
+        let obj = pdf
+            .resolve_borrowed(ObjectRef::new(terminal_obj, 0))
+            .expect("terminal obj resolves");
+        let res_dict = obj.as_dict().expect("terminal obj is the /Resources dict");
+        let font = res_dict
+            .get("Font")
+            .and_then(Object::as_dict)
+            .expect("/Font present");
+        font.iter()
+            .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+            .collect()
+    }
+
+    // Regression (flpdf-12jh): when a page's inherited /Resources lives behind a
+    // holder chain, pruning must follow the chain to the terminal dict and remove
+    // the unused /F2. Before the resources_location terminal-collapse fix this
+    // asserts FAIL — the first-hop ref resolved to another reference, as_dict()
+    // returned None, and the prune was a silent no-op that left /F2 in place.
+    #[test]
+    fn prune_follows_holder_chain_to_terminal_inherited_resources() {
+        let keys = font_keys_after_prune(
+            build_inherited_indirect_resources_pdf(4, "5 0 R"),
+            RemoveUnreferencedResources::Auto,
+            5,
+        );
+        assert!(
+            keys.contains(&"F1".to_string()),
+            "F1 (used) must remain: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"F2".to_string()),
+            "F2 (unused) must be pruned from the terminal dict: {keys:?}"
+        );
+    }
+
+    // No-regression guard: a single-hop indirect /Resources (5 0 R -> <<dict>>)
+    // must still prune exactly as before the terminal-collapse fix — its terminal
+    // ref is the ref itself, so ResourcesLoc::Indirect is unchanged.
+    #[test]
+    fn prune_single_hop_indirect_inherited_resources_unaffected() {
+        let keys = font_keys_after_prune(
+            build_inherited_indirect_resources_pdf(5, "<< >>"),
+            RemoveUnreferencedResources::Auto,
+            5,
+        );
+        assert!(
+            keys.contains(&"F1".to_string()),
+            "F1 (used) must remain: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"F2".to_string()),
+            "F2 (unused) must be pruned: {keys:?}"
+        );
+    }
+
+    /// Build a 2-page PDF where each page reaches one *shared* terminal
+    /// `/Resources` dict (object 8 = `<< /Font << /F1 /F2 >> >>`) through its own
+    /// distinct first-hop carrier: page A `/Resources 7 0 R → 8 0 R`, page B
+    /// `/Resources 9 0 R → 8 0 R`. Page A's content uses only `/F1`, page B's
+    /// only `/F2`.
+    fn build_shared_terminal_distinct_carriers_pdf() -> Vec<u8> {
+        let content_a = b"BT /F1 12 Tf 10 10 Td (A) Tj ET";
+        let content_b = b"BT /F2 12 Tf 10 10 Td (B) Tj ET";
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+
+        let dicts: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R \
+                 /Resources 7 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R \
+                 /Resources 9 0 R >>"
+                    .into(),
+            ),
+            (7, "8 0 R".into()), // carrier A → shared terminal
+            (
+                8,
+                "<< /Font << \
+                 /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> \
+                 /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> \
+                 >> >>"
+                    .into(),
+            ),
+            (9, "8 0 R".into()), // carrier B → same shared terminal
+        ];
+        for (n, s) in &dicts {
+            offs.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+        for (n, content) in [(5u32, &content_a[..]), (6u32, &content_b[..])] {
+            offs.insert(n, out.len() as u64);
+            out.extend_from_slice(
+                format!("{n} 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+            );
+            out.extend_from_slice(content);
+            out.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+
+        let xref_start = out.len() as u64;
+        let total = 10u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    // Over-prune guard (the scenario this issue was deferred over): two retained
+    // pages reach ONE shared terminal /Resources via distinct first-hop carriers.
+    // Collapsing to the terminal at the source keeps grouping/ref-count terminal-
+    // consistent, so the shared dict is detected as shared. Both /F1 (used by A)
+    // and /F2 (used by B) must survive — under Auto (shared → skipped) and Yes
+    // (union of both pages' used names). A prune-only collapse (grouping left at
+    // the first hop) would prune each page against its own single used name and
+    // strip the other's font — this test fails in that broken variant.
+    #[test]
+    fn shared_terminal_via_distinct_carriers_not_over_pruned() {
+        for mode in [
+            RemoveUnreferencedResources::Auto,
+            RemoveUnreferencedResources::Yes,
+        ] {
+            let keys =
+                font_keys_after_prune(build_shared_terminal_distinct_carriers_pdf(), mode, 8);
+            assert!(
+                keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
+                "shared terminal must keep both fonts in {mode:?} mode: {keys:?}"
+            );
+        }
+    }
+
+    /// Build a 2-page PDF where page B's `/Resources` is an indirect chain that
+    /// resolves to `null` (`7 0 R → null`), so both pages inherit the shared
+    /// `/Pages` dict (object 8 = `<< /Font << /F1 /F2 >> >>`). Page A uses only
+    /// `/F1`, page B only `/F2`.
+    fn build_null_chain_resources_pdf() -> Vec<u8> {
+        let content_a = b"BT /F1 12 Tf 10 10 Td (A) Tj ET";
+        let content_b = b"BT /F2 12 Tf 10 10 Td (B) Tj ET";
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+
+        let dicts: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /Resources 8 0 R >>".into(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>".into(),
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R \
+                 /Resources 7 0 R >>"
+                    .into(),
+            ),
+            (7, "null".into()), // page B's /Resources chain resolves to null → absent
+            (
+                8,
+                "<< /Font << \
+                 /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> \
+                 /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> \
+                 >> >>"
+                    .into(),
+            ),
+        ];
+        for (n, s) in &dicts {
+            offs.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+        for (n, content) in [(5u32, &content_a[..]), (6u32, &content_b[..])] {
+            offs.insert(n, out.len() as u64);
+            out.extend_from_slice(
+                format!("{n} 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+            );
+            out.extend_from_slice(content);
+            out.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+
+        let xref_start = out.len() as u64;
+        let total = 9u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    // Correctness guard: a page whose /Resources is an indirect chain resolving
+    // to null must fall through to the parent (PDF §7.3.9), exactly as the read
+    // side (pages::resolve_inherited_resources) does. Otherwise its used names
+    // are keyed on the null ref while it renders from the inherited parent dict,
+    // and the parent gets pruned against the *other* page's names only — silently
+    // deleting this page's font. Both /F1 (page A) and /F2 (page B) must survive
+    // under Auto (shared parent → skipped) and Yes (union). FAILS before the
+    // null-terminal fall-through: page B keys on ref 7, the parent (obj 8) is seen
+    // as unshared, and /F2 is stripped.
+    #[test]
+    fn null_chain_resources_falls_through_to_parent_no_corruption() {
+        for mode in [
+            RemoveUnreferencedResources::Auto,
+            RemoveUnreferencedResources::Yes,
+        ] {
+            let keys = font_keys_after_prune(build_null_chain_resources_pdf(), mode, 8);
+            assert!(
+                keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
+                "inherited parent dict must keep both fonts in {mode:?} mode: {keys:?}"
+            );
+        }
+    }
+
+    /// Build a minimal doc with a single leaf at object 3 whose body is
+    /// `page_body` and whose `/Resources 4 0 R` carrier (object 4) has body
+    /// `obj4_body`. Used to drive `resources_location` edge cases directly.
+    fn build_page_with_resources_carrier_pdf(page_body: &str, obj4_body: &str) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+        let dicts: [(u32, &str); 4] = [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, page_body),
+            (4, obj4_body),
+        ];
+        for (n, s) in dicts {
+            offs.insert(n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+        let xref_start = out.len() as u64;
+        let total = 5u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    // Edge: /Resources chain resolves to null and the node has no /Parent to
+    // inherit from — there is nothing to prune, so the location is None.
+    #[test]
+    fn resources_location_null_chain_without_parent_is_none() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] /Resources 4 0 R >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
+        assert_eq!(loc, ResourcesLoc::None);
+    }
+
+    // Edge: /Resources chain resolves to a non-dict, non-null terminal (here an
+    // integer) — nothing prunable, so the location is None (no-op).
+    #[test]
+    fn resources_location_chain_to_non_dict_is_none() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 4 0 R >>",
+            "42",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
+        assert_eq!(loc, ResourcesLoc::None);
+    }
+
+    // Edge: /Resources is a *direct* non-dict, non-reference value (here an
+    // integer) — the `ResKind::Other` arm; nothing prunable, location is None.
+    #[test]
+    fn resources_location_direct_non_dict_is_none() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 42 >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
+        assert_eq!(loc, ResourcesLoc::None);
+    }
+
+    // Edge: no /Resources anywhere and no /Parent to walk to — the `ResKind::Absent`
+    // arm with no parent ref; location is None.
+    #[test]
+    fn resources_location_absent_without_parent_is_none() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
+        assert_eq!(loc, ResourcesLoc::None);
+    }
 }
