@@ -58,8 +58,39 @@ pub fn page_object_closure<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<BTreeSet<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    extend_page_object_closure(pdf, page_ref, &mut visited)?;
+    Ok(visited)
+}
+
+/// Extend `visited` with the transitive closure of every [`ObjectRef`]
+/// reachable from `page_ref`, reusing whatever is already in `visited`.
+///
+/// This is the shared-state core of [`page_object_closure`]. Passing one
+/// `visited` set across several start pages computes their union in a single
+/// linear pass: a subtree shared between selected pages is walked once instead
+/// of once per referencing page. Same traversal and `Page`/`Catalog` boundary
+/// guard as [`page_object_closure`] — see its docs for the semantics.
+///
+/// `page_ref` is always queued and traversed, even when already present in
+/// `visited` (e.g. it was reached and stopped at as a sibling page during an
+/// earlier start's walk). This force-traversal is what keeps the union complete
+/// when start pages cross-reference one another.
+///
+/// # Errors
+///
+/// Returns [`Err`] only if [`Pdf::resolve`] fails for an object (e.g. corrupt
+/// or missing xref entry).
+pub(crate) fn extend_page_object_closure<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    visited: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
     let mut queue: VecDeque<ObjectRef> = VecDeque::new();
 
+    // Queue the start page unconditionally: it may already be in `visited` from
+    // an earlier start's walk that reached it as a sibling and stopped at the
+    // Page guard without expanding it. Gating this push on `insert` would skip
+    // such a page and drop the objects only it reaches.
     visited.insert(page_ref);
     queue.push_back(page_ref);
 
@@ -91,7 +122,7 @@ pub fn page_object_closure<R: Read + Seek>(
         }
     }
 
-    Ok(visited)
+    Ok(())
 }
 
 /// Recursively collect every [`ObjectRef`] embedded in `obj` into `out`.
@@ -150,6 +181,121 @@ fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) 
 mod tests {
     use super::*;
     use crate::object::MAX_INLINE_DEPTH;
+    use std::collections::BTreeMap;
+
+    /// Build a PDF from `(number, body)` object definitions plus a `/Root`
+    /// number, computing xref offsets so the bytes are always valid.
+    fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+        let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+        let max = objects.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        for (n, body) in objects {
+            offsets.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = out.len() as u64;
+        let size = max + 1;
+        out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for n in 1..=max {
+            match offsets.get(&n) {
+                Some(off) => out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes()),
+                None => out.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// Sharing a `visited` set across selected start pages must still
+    /// force-traverse each start page. Page 1 carries a cross-page link whose
+    /// `/Dest` targets page 2 (also selected): walking page 1 first reaches
+    /// page 2's ref and stops at it (Page guard), leaving it visited-but-
+    /// unexpanded. When page 2 is then extended into the same set it must be
+    /// force-traversed so its exclusive `/Resources` (object 7, referenced by
+    /// nothing else) is collected. A gate-on-insert start would skip page 2 and
+    /// drop object 7 — this is the discriminating assertion.
+    #[test]
+    fn extend_force_traverses_a_start_page_already_seen_as_a_sibling() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /Resources 7 0 R >>"),
+                (5, "<< /Subtype /Link /Dest [4 0 R /Fit] >>"),
+                (7, "<< /Font << /F1 8 0 R >> >>"),
+                (8, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let p1 = ObjectRef::new(3, 0);
+        let p2 = ObjectRef::new(4, 0);
+
+        // Walking p1 alone reaches p2 (via the link) but stops at it, so p2's
+        // exclusive resource is NOT yet present.
+        let mut shared: BTreeSet<ObjectRef> = BTreeSet::new();
+        extend_page_object_closure(&mut pdf, p1, &mut shared).unwrap();
+        assert!(shared.contains(&p2), "p1's walk reaches p2's ref");
+        assert!(
+            !shared.contains(&ObjectRef::new(7, 0)),
+            "p2's exclusive resource is not collected by p1's walk (Page guard stops at p2)"
+        );
+
+        // Extending p2 into the SAME set must force-traverse it and collect 7/8.
+        extend_page_object_closure(&mut pdf, p2, &mut shared).unwrap();
+        assert!(
+            shared.contains(&ObjectRef::new(7, 0)),
+            "p2's exclusive /Resources must be collected when p2 is its own start"
+        );
+        assert!(
+            shared.contains(&ObjectRef::new(8, 0)),
+            "the font under p2's exclusive /Resources must be collected too"
+        );
+    }
+
+    /// The shared-visited union equals the independent per-page union: extending
+    /// both pages into one set yields exactly `closure(p1) ∪ closure(p2)`.
+    #[test]
+    fn shared_union_equals_independent_union() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /Annots [5 0 R] /Resources 6 0 R >>",
+                ),
+                (4, "<< /Type /Page /Parent 2 0 R /Resources 7 0 R >>"),
+                (5, "<< /Subtype /Link /Dest [4 0 R /Fit] >>"),
+                (6, "<< /Font << /F1 8 0 R >> >>"),
+                (7, "<< /Font << /F1 8 0 R >> >>"),
+                (8, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let p1 = ObjectRef::new(3, 0);
+        let p2 = ObjectRef::new(4, 0);
+
+        let independent: BTreeSet<ObjectRef> = {
+            let mut u = page_object_closure(&mut pdf, p1).unwrap();
+            u.extend(page_object_closure(&mut pdf, p2).unwrap());
+            u
+        };
+
+        let mut shared: BTreeSet<ObjectRef> = BTreeSet::new();
+        extend_page_object_closure(&mut pdf, p1, &mut shared).unwrap();
+        extend_page_object_closure(&mut pdf, p2, &mut shared).unwrap();
+
+        assert_eq!(shared, independent);
+    }
 
     fn nested_arrays(depth: usize) -> Object {
         let mut o = Object::Null;
