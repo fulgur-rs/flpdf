@@ -13,6 +13,7 @@
 //! This module owns only structural concerns (parse + build). Catalog wiring,
 //! `/AF` upkeep, GC, and prune-during-walk stay in the consumer.
 
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -282,9 +283,15 @@ where
             if !visited.insert(r) {
                 return Ok(()); // cycle — skip
             }
-            match pdf.resolve_borrowed(r)?.as_dict() {
-                Some(d) => d.clone(),
-                None => return Ok(()), // malformed node — skip
+            // A /Kids node ref may be a holder chain (`r → r2 → node dict`);
+            // follow it to the terminal so a doubled-indirect kid is descended,
+            // not dropped. Holder hops are bounded by resolve_ref_chain's own
+            // MAX_REF_CHAIN_DEPTH — a separate axis from the /Kids `visited` /
+            // `depth` guards (kept as-is). `into_dict` takes the terminal by
+            // value, so no extra clone over the prior `as_dict().clone()`.
+            match resolve_ref_chain(pdf, &Object::Reference(r))?.0.into_dict() {
+                Some(d) => d,
+                None => return Ok(()), // malformed / non-dict node — skip
             }
         }
         _ => return Ok(()), // unexpected node type — skip
@@ -452,6 +459,40 @@ mod tests {
         // Root with /Kids -> [20 0 R].
         let mut root = Dictionary::new();
         root.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        let out = read_name_tree(
+            &mut pdf,
+            Object::Dictionary(root),
+            ref_only,
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(out, vec![(b"k".to_vec(), ObjectRef::new(99, 0))]);
+    }
+
+    #[test]
+    fn read_name_tree_descends_kids_via_holder_chain() {
+        let mut pdf = empty_pdf();
+        // Leaf node at obj 20.
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"k".to_vec()),
+                Object::Reference(ObjectRef::new(99, 0)),
+            ]),
+        );
+        pdf.set_object(ObjectRef::new(20, 0), Object::Dictionary(leaf));
+        // Holder: obj 21 is a bare reference to obj 20 (ref → ref → node).
+        pdf.set_object(
+            ObjectRef::new(21, 0),
+            Object::Reference(ObjectRef::new(20, 0)),
+        );
+        // Root /Kids -> [21 0 R]; 21 is a holder chain, not a direct node.
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(21, 0))]),
+        );
         let out = read_name_tree(
             &mut pdf,
             Object::Dictionary(root),
