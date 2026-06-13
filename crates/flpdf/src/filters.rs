@@ -94,8 +94,6 @@ pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds conf
 /// configured cap) as a warning rather than a stream-encoding error. The
 /// sentinel is internal to flpdf — the trailing byte count is flpdf's own value —
 /// so PDF content cannot forge a corrupt-stream message into this shape.
-// Consumed by the --check decode-limit classification in a later task.
-#[allow(dead_code)]
 pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
     matches!(error, Error::Unsupported(message) if message.starts_with(DECODE_OUTPUT_LIMIT_PREFIX))
 }

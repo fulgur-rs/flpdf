@@ -118,7 +118,8 @@ pub use appearance::{
 pub use attachment_list::{format_attachment_list, list_attachment_info, AttachmentInfo};
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{
-    check_reader, check_reader_strict, check_reader_with_options, CheckReport, CheckSummary,
+    check_reader, check_reader_strict, check_reader_with_options,
+    check_reader_with_options_and_limits, CheckReport, CheckSummary,
 };
 pub use content_stream::{
     normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,

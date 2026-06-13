@@ -4,6 +4,7 @@
 //! enabled), report parser warnings, and flag a few high-level invariants that would
 //! cause downstream tools to fail.
 
+use crate::filters::{decode_stream_data_with_limits, is_decode_output_limit_error, DecodeLimits};
 use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
@@ -91,7 +92,29 @@ pub fn check_reader_with_options<R: Read + Seek>(
     reader: R,
     options: PdfOpenOptions,
 ) -> crate::Result<CheckReport> {
-    check_reader_inner_with_options(reader, options)
+    check_reader_inner_with_options(reader, options, DecodeLimits::default())
+}
+
+/// Validate the document with explicit open options and an opt-in decode-output
+/// limit.
+///
+/// Behaves like [`check_reader_with_options`], but bounds each page content
+/// stream's `FlateDecode`/`LZWDecode` output to [`DecodeLimits::max_output`]. A
+/// stream whose decoded output would exceed that cap is reported as a warning
+/// (a decompression-bomb guard trip), not a stream-encoding error: the stream
+/// is intact, merely larger than the caller allowed. With
+/// [`DecodeLimits::default`] (no cap) this is identical to
+/// [`check_reader_with_options`].
+///
+/// # Errors
+///
+/// Same as [`check_reader_with_options`].
+pub fn check_reader_with_options_and_limits<R: Read + Seek>(
+    reader: R,
+    options: PdfOpenOptions,
+    limits: DecodeLimits,
+) -> crate::Result<CheckReport> {
+    check_reader_inner_with_options(reader, options, limits)
 }
 
 /// Validate the document behind `reader` without running the recovery heuristics.
@@ -119,12 +142,14 @@ fn check_reader_inner<R: Read + Seek>(reader: R, allow_repair: bool) -> crate::R
             repair: allow_repair,
             ..PdfOpenOptions::default()
         },
+        DecodeLimits::default(),
     )
 }
 
 fn check_reader_inner_with_options<R: Read + Seek>(
     reader: R,
     options: PdfOpenOptions,
+    limits: DecodeLimits,
 ) -> crate::Result<CheckReport> {
     let allow_repair = options.repair;
     let mut pdf = if allow_repair {
@@ -180,7 +205,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     // content stream. The whole-document page walk here is deliberate: --check is
     // a full-document audit, the one place flpdf's lazy-load discipline is
     // intentionally relaxed.
-    check_content_streams(&mut pdf, &mut diagnostics);
+    check_content_streams(&mut pdf, &mut diagnostics, limits);
 
     let summary = CheckSummary {
         version: pdf.version().to_string(),
@@ -263,7 +288,11 @@ fn content_filter_chain_is_generalized(dict: &Dictionary) -> bool {
 /// corruption from an unsupported codec. Structural problems that block
 /// enumeration downgrade to a warning so the already-opened document still
 /// yields a report.
-fn check_content_streams<R: Read + Seek>(pdf: &mut Pdf<R>, diagnostics: &mut Diagnostics) {
+fn check_content_streams<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    diagnostics: &mut Diagnostics,
+    limits: DecodeLimits,
+) {
     let page_refs = match crate::pages::page_refs(pdf) {
         Ok(refs) => refs,
         Err(error) => {
@@ -293,22 +322,40 @@ fn check_content_streams<R: Read + Seek>(pdf: &mut Pdf<R>, diagnostics: &mut Dia
             if !content_filter_chain_is_generalized(&stream.dict) {
                 continue;
             }
-            // A decode `Err` here covers both corrupt payloads and rarer
-            // structural conditions (`/Filter` chain past the 16-stage cap, bad
-            // `/DecodeParms`); both mean the stream cannot be decoded as
-            // declared, so both are legitimately reported as decode errors.
-            if crate::filters::decode_stream_data(&stream.dict, &stream.data).is_err() {
+            // A decode `Err` is one of two things:
+            //   * the opt-in output cap tripped — the stream is intact, just
+            //     larger than the configured limit, so this is a deliberate
+            //     decode-bomb guard, reported as a WARNING (qpdf's posture:
+            //     exceeding flate_max_memory is a warning, not an error);
+            //   * any other failure means the stream cannot be decoded as
+            //     declared (corrupt payload, `/Filter` chain past the cap, bad
+            //     `/DecodeParms`) — a genuine stream-encoding ERROR.
+            if let Err(error) = decode_stream_data_with_limits(&stream.dict, &stream.data, limits) {
                 // qpdf renders the location as "content stream object N G" (no
-                // trailing " R"); ObjectRef's Display would add " R", so format
-                // the number/generation pair directly to match qpdf's wording.
+                // trailing " R"); format the number/generation pair directly.
                 let location = match stream_ref {
                     Some(r) => format!("content stream object {} {}", r.number, r.generation),
                     None => "inline content stream".to_string(),
                 };
-                diagnostics.push(Diagnostic::error(
-                    format!("page {page_number}: {location}: errors while decoding content stream"),
-                    None,
-                ));
+                if is_decode_output_limit_error(&error) {
+                    // The guard only trips when a cap is set, so `max_output` is
+                    // always `Some` here; `unwrap_or_default` echoes the cap into
+                    // the diagnostic without an unreachable branch or a panic.
+                    let limit = limits.max_output.unwrap_or_default();
+                    diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "page {page_number}: {location}: decoded output exceeds the configured limit of {limit} bytes; skipped (decode-bomb guard)"
+                        ),
+                        None,
+                    ));
+                } else {
+                    diagnostics.push(Diagnostic::error(
+                        format!(
+                            "page {page_number}: {location}: errors while decoding content stream"
+                        ),
+                        None,
+                    ));
+                }
             }
         }
     }
@@ -652,6 +699,16 @@ mod tests {
         )
     }
 
+    /// A single-page PDF whose `/Contents 4 0 R` is a *valid* FlateDecode stream
+    /// that inflates to `decoded_len` bytes — small compressed, large inflated:
+    /// a decompression bomb relative to a tight output cap.
+    fn bomb_flate_content_pdf(decoded_len: usize) -> Vec<u8> {
+        content_pdf(
+            "4 0 R",
+            &[(4, clean_flate_object(4, &vec![0u8; decoded_len]))],
+        )
+    }
+
     /// A FlateDecode image XObject (`num 0 obj`) whose payload is corrupt.
     fn corrupt_flate_image_object(num: u32) -> Vec<u8> {
         let mut out = Vec::new();
@@ -860,5 +917,96 @@ mod tests {
         assert!(report.diagnostics.entries().iter().any(|d| {
             d.severity == Severity::Warning && d.message.contains("could not read content streams")
         }));
+    }
+
+    #[test]
+    fn decode_output_one_over_limit_warns_not_errors() {
+        // 1025 inflated bytes under a 1024-byte cap: the stream is intact, so the
+        // guard trips as a WARNING (still valid), never a decode error.
+        let report = check_reader_with_options_and_limits(
+            Cursor::new(bomb_flate_content_pdf(1025)),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+            crate::filters::DecodeLimits {
+                max_output: Some(1024),
+            },
+        )
+        .unwrap();
+        assert!(report.valid); // warning only -> still valid
+        assert!(report.diagnostics.entries().iter().any(|d| {
+            d.severity == Severity::Warning && d.message.contains("decode-bomb guard")
+        }));
+        assert!(!report.diagnostics.entries().iter().any(|d| {
+            d.severity == Severity::Error
+                && d.message.contains("errors while decoding content stream")
+        }));
+    }
+
+    #[test]
+    fn decode_output_exactly_at_limit_is_clean() {
+        // Boundary: inflated output == cap succeeds (no warning, no error).
+        let report = check_reader_with_options_and_limits(
+            Cursor::new(bomb_flate_content_pdf(1024)),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+            crate::filters::DecodeLimits {
+                max_output: Some(1024),
+            },
+        )
+        .unwrap();
+        assert!(report.valid);
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|d| d.message.contains("content stream")));
+    }
+
+    #[test]
+    fn decode_limit_does_not_mask_corruption() {
+        // With a cap set, a genuinely corrupt FlateDecode stream is still an
+        // ERROR, not a guard warning — the limit path must not swallow real
+        // decode failures.
+        let report = check_reader_with_options_and_limits(
+            Cursor::new(corrupt_flate_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+            crate::filters::DecodeLimits {
+                max_output: Some(1024),
+            },
+        )
+        .unwrap();
+        assert!(!report.valid);
+        assert!(report.diagnostics.entries().iter().any(|d| {
+            d.severity == Severity::Error
+                && d.message.contains("errors while decoding content stream")
+        }));
+    }
+
+    #[test]
+    fn unlimited_default_decodes_large_stream_without_warning() {
+        // Regression guard: with no cap (default), the same large stream decodes
+        // fine — behaviour is unchanged from before the limit existed.
+        let report = check_reader_with_options_and_limits(
+            Cursor::new(bomb_flate_content_pdf(64 * 1024)),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+            crate::filters::DecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(report.valid);
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|d| d.message.contains("content stream")));
     }
 }
