@@ -45,6 +45,8 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// - a `/Filter` entry is an unknown or unimplemented codec, or a `Crypt`
 ///   filter (decryption is not performed by this entry point).
 /// - `/Filter` is neither a name nor an array of names.
+/// - a `/Filter` array declares more than 16 stages (the decode-path chain-length
+///   cap, which rejects pathological multiplicative-expansion chains).
 /// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
 ///   negative predictor parameter, or a predictor configuration that overflows).
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
@@ -63,8 +65,11 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 /// Default is unlimited, matching [`decode_stream_data`]. Embedders processing
 /// untrusted input can set [`max_output`](Self::max_output) to bound the
 /// decompressed size of each `FlateDecode` / `LZWDecode` stage (qpdf's
-/// `Pl_Flate::setMemoryLimit` analogue), trading completeness for a memory
-/// ceiling.
+/// `Pl_Flate::setMemoryLimit` analogue), trading completeness for a per-stage
+/// bound on those codecs. It is a per-`FlateDecode`/`LZWDecode`-stage limit, not
+/// a ceiling on total output: a later non-decompressing stage (e.g. a
+/// `RunLengthDecode` following a bounded `FlateDecode`) is not itself capped and
+/// can re-expand its input.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeLimits {
     /// Maximum decompressed byte count permitted out of any single
@@ -1577,6 +1582,21 @@ mod tests {
         let err = decode_stream_data(&dict, b"anything");
         assert!(
             matches!(err, Err(Error::Unsupported(ref m)) if m.contains("filter chain length")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_stream_data_rejects_crypt_filter() {
+        // The non-decrypting entry point cannot perform Crypt decryption, so a
+        // `/Crypt` filter is rejected (decryption is only available through the
+        // crypt-aware decode path). This exercises the default-crypt closure
+        // `decode_stream_data_with_filters` installs.
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        let err = decode_stream_data(&dict, b"data");
+        assert!(
+            matches!(err, Err(Error::Unsupported(ref m)) if m.contains("Crypt")),
             "got {err:?}"
         );
     }
