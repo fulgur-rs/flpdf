@@ -910,11 +910,11 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// pass — a throwaway buffer with an empty parameter dict, no hint stream, and an
 /// unresolved first-page xref (`QPDFWriter::writeLinearized` →
 /// `computeDeterministicIDData`, qpdf 11.9.0). The classic path reproduces that
-/// pass-1 buffer separately and passes it here, so the digest matches qpdf
-/// byte-for-byte; the result is then patched into the final `bytes`. The ObjStm
-/// path (which qpdf writes with xref *streams*, a different pass-1 layout out of
-/// scope here) passes `bytes` as its own digest source, preserving the prior
-/// whole-final-buffer behaviour.
+/// pass-1 buffer separately and passes it as `Some(pass1_bytes)`, so the digest
+/// matches qpdf byte-for-byte; the result is then patched into the final `bytes`.
+/// The ObjStm path (which qpdf writes with xref *streams*, a different pass-1
+/// layout out of scope here) passes `None` to digest `bytes` itself in place,
+/// preserving the prior whole-final-buffer behaviour without cloning it.
 ///
 /// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
 /// spans of the sections that actually emit a `/ID` (collected by the writer as
@@ -933,7 +933,7 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// emitted site.
 fn patch_linearized_deterministic_id(
     bytes: &mut [u8],
-    digest_source: &[u8],
+    digest_source: Option<&[u8]>,
     id_ranges: &[std::ops::Range<usize>],
     info_suffix: &[u8],
     source_id0: Option<[u8; 16]>,
@@ -942,16 +942,17 @@ fn patch_linearized_deterministic_id(
         compute_deterministic_id, write_deterministic_id_array, DETERMINISTIC_ID_ARRAY_LEN,
     };
 
+    // Digest source: the classic path supplies qpdf's separate pass-1 buffer;
+    // the ObjStm path passes `None` to digest `bytes` itself in place (no clone).
+    // `compute_deterministic_id` returns owned ids, so this read-only borrow ends
+    // before the in-place `/ID` patch loop below takes a mutable borrow.
+    let digest = digest_source.unwrap_or(&*bytes);
+
     // Compute the identifier once over the placeholder-bearing digest source.
     // There is no single `[` cutoff (the array recurs at several sites), so the
     // whole buffer is the digest range: pass the last index as the inclusive
     // end. (Digest stays global so body-content changes still alter the /ID.)
-    let (id0, id1) = compute_deterministic_id(
-        digest_source,
-        digest_source.len() - 1,
-        info_suffix,
-        source_id0,
-    );
+    let (id0, id1) = compute_deterministic_id(digest, digest.len() - 1, info_suffix, source_id0);
 
     let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
     write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
@@ -2448,7 +2449,7 @@ pub fn write_linearized<R: Read + Seek>(
             )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeeded on these same inputs, so it cannot introduce a new Err.
             patch_linearized_deterministic_id(
                 &mut final_bytes,
-                &pass1_bytes,
+                Some(&pass1_bytes),
                 &final_id_ranges,
                 &det_id_info_suffix,
                 det_id_source_id0,
@@ -2457,11 +2458,11 @@ pub fn write_linearized<R: Read + Seek>(
             // qpdf's pass-1 layout for xref-stream output differs (it uses xref
             // streams, not the classic table reconstructed above), so byte-parity
             // with qpdf's `/ID` is out of scope on this path. Keep the prior,
-            // self-stable behaviour: digest the final buffer itself.
-            let digest_source = final_bytes.clone();
+            // self-stable behaviour: digest the final buffer itself (`None` digests
+            // `final_bytes` in place — no clone).
             patch_linearized_deterministic_id(
                 &mut final_bytes,
-                &digest_source,
+                None,
                 &final_id_ranges,
                 &det_id_info_suffix,
                 det_id_source_id0,
