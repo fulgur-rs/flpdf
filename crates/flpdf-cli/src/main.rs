@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::{
