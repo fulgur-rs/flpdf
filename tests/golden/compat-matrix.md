@@ -55,13 +55,13 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 |---|---|---|---|---|---|
 | one-page.pdf | plain | ac8ca6312f2a918e | diverge | diverge | diverge |
 | one-page.pdf | static-id | ac8ca6312f2a918e | diverge | diverge | match |
-| one-page.pdf | linearize | c6c762d3ada2b57d | diverge | diverge | diverge |
+| one-page.pdf | linearize | 6a21950b9592e3e4 | diverge | diverge | diverge |
 | two-page.pdf | plain | bad1dc13c53a93f8 | diverge | diverge | diverge |
 | two-page.pdf | static-id | bad1dc13c53a93f8 | diverge | diverge | match |
-| two-page.pdf | linearize | eaea3ae6f576d7ec | diverge | diverge | diverge |
+| two-page.pdf | linearize | a3e82e196b243586 | diverge | diverge | diverge |
 | three-page.pdf | plain | 261c0e31280434aa | diverge | diverge | diverge |
 | three-page.pdf | static-id | 261c0e31280434aa | diverge | diverge | match |
-| three-page.pdf | linearize | f7eda28758e0c1e9 | diverge | diverge | diverge |
+| three-page.pdf | linearize | 2f65c9129523f998 | diverge | diverge | diverge |
 | linearized-one-page.pdf | plain | 31180d37257abf16 | diverge | diverge | diverge |
 | attachment-two-page.pdf | plain | 90e0aad41c003854 | diverge | diverge | diverge |
 | attachment-two-page.pdf | static-id | 90e0aad41c003854 | diverge | diverge | match |

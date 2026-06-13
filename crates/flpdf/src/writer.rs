@@ -3524,7 +3524,7 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
 /// permits both forms (ISO 32000-1 §7.3.8.2), and qpdf preserves such streams
 /// (does not re-filter them), so the stream-dict key ordering must treat both
 /// the same way.
-fn is_lone_flate(filter: Option<&Object>) -> bool {
+pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
     match filter {
         Some(Object::Name(name)) => name.as_slice() == b"FlateDecode",
         Some(Object::Array(items)) => {
@@ -3573,7 +3573,7 @@ pub fn write_stream_to_buf(
 /// and `/Filter /FlateDecode` is re-appended after `/Length`. Used by the
 /// full-rewrite path so re-encoded content streams match `qpdf --static-id`
 /// byte-for-byte (modulo the deflate-backend-dependent `/Length` value).
-fn write_stream_to_buf_qpdf_order(
+pub(crate) fn write_stream_to_buf_qpdf_order(
     buf: &mut Vec<u8>,
     stream: &crate::Stream,
     policy: NewlineBeforeEndstream,

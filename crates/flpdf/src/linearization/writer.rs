@@ -71,7 +71,10 @@ use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
-use crate::writer::{effective_pdf_version, WriteOptions, QPDF_STATIC_ID};
+use crate::writer::{
+    apply_stream_compress_policy, effective_pdf_version, effective_stream_policy, is_lone_flate,
+    write_stream_to_buf_qpdf_order, CompressStreams, WriteOptions, QPDF_STATIC_ID,
+};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
 // ---------------------------------------------------------------------------
@@ -423,6 +426,79 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     object.write_pdf(bytes);
+    bytes.extend_from_slice(b"\nendobj\n");
+    offset
+}
+
+/// Append a renumbered body object, routing `Object::Stream` payloads through
+/// the same [`CompressStreams`] re-encoding the flat full-rewrite path applies
+/// so a linearized file's body content streams are byte-identical to qpdf's
+/// (see [`crate::writer::apply_stream_compress_policy`]).
+///
+/// The flat writer (`crate::writer`, the `Object::Stream` branch of
+/// `write_pdf_full_rewrite`) decodes each declared filter chain and, under
+/// [`CompressStreams::Yes`] (the default), re-encodes to a single
+/// `/FlateDecode`. The plain [`append_object`] path instead clones the source
+/// stream's dict + raw data verbatim — preserving e.g. an
+/// `[/ASCII85Decode /FlateDecode]` source chain — which diverges from qpdf's
+/// output. This helper closes that gap for plain-indirect body objects only;
+/// ObjStm containers and the hint stream are emitted by their own dedicated
+/// writers and are not routed here.
+///
+/// Serialization mirrors the flat path exactly: a re-filtered stream (decode +
+/// re-encode under `CompressStreams::Yes`, when the source was *not* already a
+/// lone `/FlateDecode`) is written with qpdf's stream-dict key order
+/// (`/Length` pulled out, then a regenerated `/Filter /FlateDecode` — see
+/// [`crate::object::Dictionary::write_pdf_stream`]); otherwise the existing
+/// (sorted) order is kept. The `/Length` value is the re-encoded byte count,
+/// and the `newline_before_endstream` policy is honoured so the framing matches
+/// the option the caller passed.
+///
+/// Non-stream objects are delegated to [`append_object`] unchanged.
+fn append_body_object(
+    bytes: &mut Vec<u8>,
+    new_ref: ObjectRef,
+    object: &Object,
+    options: &WriteOptions,
+) -> usize {
+    let Object::Stream(stream) = object else {
+        return append_object(bytes, new_ref, object);
+    };
+
+    // Preserve mode (no decode/re-encode) keeps the verbatim layout, so the
+    // generic serializer is correct there too.
+    let Some(policy) = effective_stream_policy(options) else {
+        return append_object(bytes, new_ref, object);
+    };
+
+    // qpdf re-filters (decode + re-encode to a single regenerated
+    // `/FlateDecode`, emitting `/Length` before the new `/Filter`) only for
+    // streams whose source filter chain is NOT already a lone `/FlateDecode`;
+    // an already-Flate source is preserved with `/Length` last. Capture the
+    // source decision before the policy rewrites the dict.
+    let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
+    let reencoded = apply_stream_compress_policy(stream, policy);
+
+    // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
+    // constructs one), so this destructuring never fails.
+    // cov:ignore-start: unreachable — apply_stream_compress_policy always
+    // returns Object::Stream, so the else arm is dead.
+    let Object::Stream(ref s) = reencoded else {
+        unreachable!("apply_stream_compress_policy always returns Object::Stream")
+    };
+    // cov:ignore-end
+
+    let offset = bytes.len();
+    bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
+    // Emit qpdf's re-filtered stream-dict order only when all hold:
+    //  - the compress policy re-encodes (`CompressStreams::Yes`),
+    //  - the source was NOT already a lone `/FlateDecode`, and
+    //  - the *final* dict carries a lone `/FlateDecode` (so a decode/encode
+    //    failure that kept a fallback filter is not silently re-filtered).
+    let refiltered = matches!(policy, CompressStreams::Yes)
+        && !source_filter_is_lone_flate
+        && is_lone_flate(s.dict.get("Filter"));
+    write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
     bytes.extend_from_slice(b"\nendobj\n");
     offset
 }
@@ -1176,6 +1252,7 @@ fn do_write_pass<R: Read + Seek>(
     source_trailer: &Dictionary,
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
+    options: &WriteOptions,
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -1315,7 +1392,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(object, 0, renumber)?;
-        let offset = append_object(&mut bytes, new_ref, &renumbered);
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -1338,7 +1415,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(object, 0, renumber)?;
-        let offset = append_object(&mut bytes, new_ref, &renumbered);
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -1372,7 +1449,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(object, 0, renumber)?;
-        let offset = append_object(&mut bytes, new_ref, &renumbered);
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -1810,6 +1887,7 @@ pub fn write_linearized<R: Read + Seek>(
             &source_trailer,
             &objstm_layout,
             &relocation,
+            options,
         )?;
 
         // ------------------------------------------------------------------
@@ -2158,6 +2236,7 @@ pub fn write_linearized<R: Read + Seek>(
                 &source_trailer,
                 &objstm_layout,
                 &relocation,
+                options,
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;
@@ -2885,6 +2964,12 @@ mod tests {
     /// byte sequence that merely *looks* like the all-zero `/ID` placeholder.
     /// The old whole-buffer scan would corrupt such content; the section-scoped
     /// scan only rewrites the real `/ID` sites.
+    ///
+    /// Linearizes with `CompressStreams::No` so the body content stream is
+    /// emitted as raw (decoded) bytes — keeping the placeholder literal verbatim
+    /// on disk. Under the default `CompressStreams::Yes` the body would be
+    /// re-encoded to `/FlateDecode` and the literal would no longer appear, which
+    /// would make the "must survive verbatim" assertion vacuous.
     #[test]
     fn deterministic_id_linearized_does_not_clobber_body_placeholder() {
         let placeholder: &[u8] =
@@ -2896,7 +2981,10 @@ mod tests {
             "test fixture must embed the placeholder in body content"
         );
 
-        let out = linearize_deterministic(&src);
+        let out = linearize_with(&src, |o| {
+            o.deterministic_id = true;
+            o.compress_streams = crate::writer::CompressStreams::No;
+        });
 
         // The body copy of the placeholder must survive *verbatim* — the
         // back-patch must not have touched it.
@@ -2922,10 +3010,93 @@ mod tests {
         );
 
         // Self-stable across runs and a valid linearized PDF.
-        let out2 = linearize_deterministic(&src);
+        let out2 = linearize_with(&src, |o| {
+            o.deterministic_id = true;
+            o.compress_streams = crate::writer::CompressStreams::No;
+        });
         assert_eq!(out, out2, "output must be byte-identical across runs");
         crate::linearization::check_linearization_bytes(&out)
             .expect("output must pass the linearization checker");
+    }
+
+    /// Default Compress policy (`CompressStreams::Yes`) re-encodes a body
+    /// content stream to a single `/FlateDecode`, dropping the literal raw
+    /// payload (the `refiltered` arm of [`append_body_object`]): the source had
+    /// no `/Filter`, so it is re-filtered and serialized in qpdf key order.
+    #[test]
+    fn linearized_compress_mode_refilters_body_stream() {
+        let raw_content: &[u8] =
+            b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        let src = tiny_pdf_with_placeholder_in_content();
+
+        // Default WriteOptions => compress_streams = Yes, stream_data = None.
+        let out = linearize_with(&src, |o| o.deterministic_id = true);
+
+        // Re-encoded: the raw literal no longer appears verbatim in the output.
+        assert!(
+            !out.windows(raw_content.len()).any(|w| w == raw_content),
+            "compress mode must re-encode the body stream, dropping the raw literal"
+        );
+        // A single `/FlateDecode` content stream (qpdf key order: `/Length N
+        // /Filter /FlateDecode`, no `/Type`) is present.
+        let dict_marker: &[u8] = b"/Filter /FlateDecode >>\nstream\n";
+        assert!(
+            out.windows(dict_marker.len()).any(|w| w == dict_marker),
+            "compress mode must emit a re-filtered /FlateDecode content stream \
+             in qpdf key order"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("compress-mode linearized output must pass the checker");
+        // The output reparses and the re-encoded content decodes back to the
+        // original raw payload, proving recompression is lossless.
+        let mut reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
+        let refs = reopened.live_object_refs();
+        let decoded_any_match = refs.into_iter().any(|r| {
+            reopened
+                .resolve(r)
+                .ok()
+                .and_then(|o| o.into_stream())
+                .and_then(|stream| {
+                    crate::filters::decode_stream_data(&stream.dict, &stream.data).ok()
+                })
+                .map(|d| d.windows(raw_content.len()).any(|w| w == raw_content))
+                .unwrap_or(false)
+        });
+        assert!(
+            decoded_any_match,
+            "the re-encoded content stream must decode back to the original payload"
+        );
+    }
+
+    /// Preserve mode (`StreamDataMode::Preserve`) must NOT recompress body
+    /// content streams: the source dict + raw payload pass through verbatim.
+    /// This exercises [`append_body_object`]'s early return when
+    /// [`effective_stream_policy`] yields `None` (the only non-recompressing
+    /// branch on the linearized body path).
+    #[test]
+    fn linearized_preserve_mode_emits_body_stream_verbatim() {
+        // Use an UNCOMPRESSED body content stream (no /Filter) so the raw payload
+        // is a recognizable literal: under Compress it would be FlateDecode'd
+        // away, under Preserve it must survive byte-for-byte.
+        let raw_content: &[u8] =
+            b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        let src = tiny_pdf_with_placeholder_in_content();
+
+        let out = linearize_with(&src, |o| {
+            o.deterministic_id = true;
+            o.stream_data = Some(crate::writer::StreamDataMode::Preserve);
+        });
+
+        // Verbatim: the raw (unfiltered) payload literal appears unchanged in
+        // the output. Under the default Compress policy it would be re-encoded
+        // to FlateDecode and the literal would vanish, so its survival proves
+        // preserve mode bypassed recompression.
+        assert!(
+            out.windows(raw_content.len()).any(|w| w == raw_content),
+            "preserve mode must emit the body content stream payload verbatim"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("preserve-mode linearized output must pass the checker");
     }
 
     #[test]
