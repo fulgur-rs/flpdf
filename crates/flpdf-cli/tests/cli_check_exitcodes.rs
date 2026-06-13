@@ -93,6 +93,53 @@ fn corrupt_pdf_bytes() -> Vec<u8> {
     b"%PDF-1.4\nthis is not a valid pdf at all\n%%EOF\n".to_vec()
 }
 
+/// A structurally valid single-page PDF whose page `/Contents 4 0 R` is a
+/// `/FlateDecode` stream whose body is not valid zlib. The document opens
+/// cleanly (correct xref/trailer), so the only error is the decode failure of
+/// the content stream — `--check` reports it as an error → exit 2.
+fn corrupt_content_stream_pdf_bytes() -> Vec<u8> {
+    // The literal payload is deliberately not a zlib stream; its byte length is
+    // written verbatim into `/Length` so the object parses but fails to decode.
+    let payload: &[u8] = b"this is not valid zlib data at all";
+
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(payload);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 /// Valid xref but the trailer lacks /Root — opens fine, check reports an
 /// error-severity diagnostic → exit 2.
 fn missing_root_pdf_bytes() -> Vec<u8> {
@@ -381,6 +428,28 @@ fn check_corrupt_pdf_exits_2() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(2);
+}
+
+/// A document that opens cleanly but whose page content stream fails to decode
+/// is an error, not a warning: `--check` exits 2 and, because the run is not
+/// valid, suppresses the trailing "No syntax or stream encoding errors found"
+/// reassurance note (which is only printed on a clean exit-0 run). The decode
+/// failure is reported on stderr, which also proves the exit-2 comes from the
+/// content stream rather than a structural parse failure.
+#[test]
+fn check_corrupt_content_stream_exits_2_without_clean_note() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&corrupt_content_stream_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", f.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
+        .stderr(predicate::str::contains(
+            "errors while decoding content stream",
+        ));
 }
 
 /// qpdf prints check errors as a single `<progname>: <file>: <msg>` line and
