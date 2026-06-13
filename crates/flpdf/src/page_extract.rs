@@ -12,7 +12,8 @@
 //! page exactly as [`crate::page_tree_rebuild`] does, so the pages render
 //! identically in isolation.
 //!
-//! Composes [`page_object_closure`] and [`copy_objects`]. All selected pages
+//! Composes [`page_object_closure`](crate::page_closure::page_object_closure)
+//! and [`copy_objects`]. All selected pages
 //! are copied in a single pass, so objects shared between them (fonts, images,
 //! content streams) are copied exactly once.
 //!
@@ -45,7 +46,7 @@
 
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::dest_page_ref_resolved;
-use crate::page_closure::page_object_closure;
+use crate::page_closure::extend_page_object_closure;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::page_tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
@@ -181,10 +182,12 @@ pub fn extract_pages<R: Read + Seek>(
 
     // UNION of the per-page transitive closures, then ONE deep-copy pass into
     // a fresh minimal doc: a single renumbering map means an object shared by
-    // several selected pages is copied exactly once.
+    // several selected pages is copied exactly once. The closures share one
+    // `visited` set so a subtree reachable from several selected pages is
+    // walked once for the whole union, not once per referencing page.
     let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in &unique {
-        closure.extend(page_object_closure(source, page_ref)?);
+        extend_page_object_closure(source, page_ref, &mut closure)?;
     }
     let mut target = Pdf::open_mem_owned(minimal_target_bytes())?;
     let map = copy_objects(source, &mut target, &closure)?;
