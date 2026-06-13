@@ -37,6 +37,10 @@
 //! except for the small [`object::ParseObjectRefError`] returned by
 //! [`ObjectRef::parse`].
 
+// Mechanically enforce threat-model guarantee (a): no undefined behaviour. The
+// crate contains no `unsafe` blocks, so this attribute keeps it that way.
+#![forbid(unsafe_code)]
+
 pub mod acroform_document_helper;
 pub mod acroform_field_prune;
 pub mod annotation_helper;
