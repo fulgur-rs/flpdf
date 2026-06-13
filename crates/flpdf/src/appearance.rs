@@ -35,6 +35,7 @@ use crate::json_inspect::decode_pdf_text_string;
 use crate::object::write_literal_string;
 use crate::page_object_helper::PageBox;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::ref_chain::resolve_ref_chain;
 use crate::standard_font_metrics::StandardFont;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -151,15 +152,14 @@ pub(crate) fn install_normal_appearance<R: Read + Seek>(
         }
     };
 
-    let mut ap_dict = match widget_dict.get("AP").cloned() {
-        Some(Object::Dictionary(d)) => d,
-        Some(Object::Reference(r)) => {
-            let resolved = pdf.resolve(r)?;
-            match resolved {
-                Object::Dictionary(d) => d,
-                _ => Dictionary::new(),
-            }
-        }
+    let mut ap_dict = match widget_dict.get("AP") {
+        Some(Object::Dictionary(d)) => d.clone(),
+        // `/AP` may be stored behind a holder chain (`ref → ref → dict`); follow
+        // it to the terminal dict so a pre-existing `/AP/D`/`/AP/R` is preserved.
+        Some(value @ Object::Reference(_)) => resolve_ref_chain(pdf, value)?
+            .0
+            .into_dict()
+            .unwrap_or_default(),
         _ => Dictionary::new(),
     };
 
@@ -1148,10 +1148,9 @@ fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Opti
     let acroform_dict: Option<Dictionary> = match acroform_val {
         None | Some(Object::Null) => None,
         Some(Object::Dictionary(d)) => Some(d),
-        Some(Object::Reference(r)) => {
-            let resolved = pdf.resolve_borrowed(r)?;
-            resolved.as_dict().cloned()
-        }
+        // `/AcroForm` may be stored behind a holder chain; follow it to the
+        // terminal dict so the document-level `/DA` fallback is found.
+        Some(Object::Reference(r)) => resolve_ref_chain(pdf, &Object::Reference(r))?.0.into_dict(),
         _ => None,
     };
 
@@ -1183,7 +1182,11 @@ fn resolve_to_dict<R: Read + Seek>(
     match value {
         None | Some(Object::Null) => Ok(None),
         Some(Object::Dictionary(d)) => Ok(Some(d)),
-        Some(Object::Reference(r)) => Ok(pdf.resolve(r)?.into_dict()),
+        // The value may be stored behind a holder chain (`ref → ref → dict`);
+        // follow it to the terminal so a doubled-indirect container is not lost.
+        Some(Object::Reference(r)) => {
+            Ok(resolve_ref_chain(pdf, &Object::Reference(r))?.0.into_dict())
+        }
         Some(_) => Ok(None),
     }
 }
@@ -7297,6 +7300,242 @@ mod tests {
         assert!(
             tjs.contains(&b"ShowThis".to_vec()),
             "matching export key must return display string; got {tjs:?}"
+        );
+    }
+
+    // ── Holder-chain (ref→ref→value) robustness for structural dicts ──────────
+    //
+    // `Pdf::resolve` is single-hop; a structural dict stored behind two indirect
+    // hops (`a 0 R → b 0 R → dict`) is dropped by code that resolves once then
+    // type-checks. Each test stores one structural dict as a 2-hop holder chain
+    // and asserts the EFFECT that only chain-following enables.
+
+    /// Tx PDF whose widget `/AP` is a two-hop holder chain `4→6→7`, with the
+    /// terminal `/AP` dict carrying a sentinel entry `/D 99 0 R`. A correct
+    /// chain-follow preserves that sentinel; a single-hop resolve sees the
+    /// second-hop `Reference`, falls back to an empty dict, and drops it.
+    fn build_ap_holder_chain_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+              /V (Hello World) /Rect [100 700 300 720] /P 3 0 R /AP 6 0 R>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        // First hop of the /AP chain.
+        pdf.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+        let off6 = pdf.len() as u64;
+        // Terminal /AP dict with a sentinel entry that must survive.
+        pdf.extend_from_slice(b"7 0 obj\n<</D 99 0 R>>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        // Object 5 is unused (the chain uses 6/7), so its slot is free.
+        let xref = format!(
+            "xref\n0 8\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             0000000000 00000 f \n\
+             {off5:010} 00000 n \n\
+             {off6:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 8 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Site 1: the pre-existing `/AP` sub-dict reached through a 2-hop holder
+    /// chain must be preserved (sentinel `/D` survives) while `/N` is added.
+    #[test]
+    fn ap_holder_chain_preserves_existing_entries() {
+        let mut pdf = Pdf::open(Cursor::new(build_ap_holder_chain_pdf())).expect("parse");
+        generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Tx field handled");
+
+        let widget = pdf.resolve(ObjectRef::new(4, 0)).expect("widget");
+        let widget = widget.as_dict().expect("widget is a dict");
+        let ap = widget
+            .get("AP")
+            .and_then(Object::as_dict)
+            .expect("/AP is a direct dict after generation");
+        // The new normal appearance was installed.
+        assert!(ap.get("N").is_some(), "/AP/N must be installed");
+        // The pre-existing /D sentinel (reached only via the 2-hop chain) survives.
+        assert_eq!(
+            ap.get("D"),
+            Some(&Object::Reference(ObjectRef::new(99, 0))),
+            "pre-existing /AP/D must survive: holder chain to the /AP dict was dropped"
+        );
+    }
+
+    /// Tx PDF whose catalog `/AcroForm` is a two-hop holder chain `1→6→7`. The
+    /// terminal AcroForm dict carries a red `/DA` (`1 0 0 rg`). Only a correct
+    /// chain-follow reaches that DA; a single-hop resolve sees the second-hop
+    /// `Reference`, finds no AcroForm DA, and emits the default black `0 g`.
+    fn build_acroform_holder_chain_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm 6 0 R>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        // Widget carries no own /DA so the AcroForm DA is the only colour source.
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+              /V (Hi) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        // First hop of the /AcroForm chain.
+        pdf.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+        let off6 = pdf.len() as u64;
+        // Terminal /AcroForm dict with a red DA.
+        pdf.extend_from_slice(
+            b"7 0 obj\n<</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 1 0 0 rg)>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        // Object 5 is unused (the chain uses 6/7), so its slot is free.
+        let xref = format!(
+            "xref\n0 8\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             0000000000 00000 f \n\
+             {off5:010} 00000 n \n\
+             {off6:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 8 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Site 2: the catalog `/AcroForm` dict reached through a 2-hop holder chain
+    /// must yield its `/DA`, so the red colour operator appears in the stream.
+    #[test]
+    fn acroform_holder_chain_resolves_default_da() {
+        let mut pdf = Pdf::open(Cursor::new(build_acroform_holder_chain_pdf())).expect("parse");
+        let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Tx field handled");
+        let xobj = pdf.resolve(xobj_ref).expect("resolve xobj");
+        let stream = xobj.as_stream().expect("xobj is a stream");
+        let content = String::from_utf8_lossy(&stream.data).into_owned();
+        assert!(
+            content.contains("1 0 0 rg"),
+            "AcroForm /DA red colour must reach the stream via the holder chain; got:\n{content}"
+        );
+    }
+
+    /// Tx PDF whose AcroForm `/DR` is a two-hop holder chain `1→6→7`. The DA is
+    /// inline (`/F1 12 Tf`) so the AcroForm dict itself is direct — only the
+    /// `/DR` lookup exercises the chain. The terminal `/DR` maps `/F1` to a
+    /// Times-Roman font; a single-hop `into_dict()` on the second-hop
+    /// `Reference` yields `None`, so the font falls back to Helvetica.
+    fn build_dr_holder_chain_pdf() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR 6 0 R /DA (/F1 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (field1) \
+              /V (Hi) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        // First hop of the /DR chain.
+        pdf.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+        let off6 = pdf.len() as u64;
+        // Terminal /DR dict mapping /F1 to a Times-Roman font (obj 8).
+        pdf.extend_from_slice(b"7 0 obj\n<</Font <</F1 8 0 R>>>>\nendobj\n");
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"8 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Times-Roman>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        // Object 5 is unused (the chain uses 6/7/8), so its slot is free.
+        let xref = format!(
+            "xref\n0 9\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             0000000000 00000 f \n\
+             {off5:010} 00000 n \n\
+             {off6:010} 00000 n \n\
+             {off7:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 9 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Site 3 (`resolve_to_dict`): the `/DR` dict reached through a 2-hop holder
+    /// chain must be followed so `/F1` resolves to its Times-Roman `/BaseFont`.
+    #[test]
+    fn dr_holder_chain_resolves_font_basefont() {
+        let mut pdf = Pdf::open(Cursor::new(build_dr_holder_chain_pdf())).expect("parse");
+        let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+            .expect("generate")
+            .expect("Tx field handled");
+        let xobj = pdf.resolve(xobj_ref).expect("resolve xobj");
+        let stream = xobj.as_stream().expect("xobj is a stream");
+        let res = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("/Resources is a dict");
+        let fonts = res
+            .get("Font")
+            .and_then(Object::as_dict)
+            .expect("/Resources/Font is a dict");
+        let f1 = fonts.get("F1").expect("F1 entry");
+        let fdict = resolve_ref_chain(&mut pdf, f1)
+            .expect("resolve F1")
+            .0
+            .into_dict()
+            .expect("F1 resolves to a font dict");
+        assert_eq!(
+            fdict.get("BaseFont"),
+            Some(&Object::Name(b"Times-Roman".to_vec())),
+            "BaseFont must resolve from the /DR holder chain to Times-Roman"
         );
     }
 }

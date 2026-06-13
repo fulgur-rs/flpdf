@@ -6,7 +6,7 @@
 //! inheritance resolution and per-page mutation round-trips.
 
 use flpdf::{
-    apply_rotate_to_pages, pages, write_pdf, ContentToken, Object, ObjectRef, PageBox,
+    apply_rotate_to_pages, pages, write_pdf, ContentToken, Error, Object, ObjectRef, PageBox,
     PageObjectHelper, Pdf, RotateMode, RotateOp,
 };
 use std::io::Cursor;
@@ -352,6 +352,82 @@ fn get_annotations_resolves_indirect_array() {
     let annots = helper.get_annotations().unwrap();
 
     assert_eq!(annots, vec![ObjectRef::new(4, 0)]);
+}
+
+#[test]
+fn get_annotations_follows_holder_chain() {
+    // /Annots is stored behind a two-hop holder chain:
+    //   page /Annots -> 5 0 R -> 6 0 R -> [4 0 R]
+    // A single resolve hop would stop at the intermediate reference 6 0 R
+    // (not an array) and error; the chain must be followed to the terminal.
+    let annot4 = (
+        4u32,
+        b"4 0 obj\n<< /Type /Annot /Subtype /Text >>\nendobj\n".to_vec(),
+    );
+    let carrier = (5u32, b"5 0 obj\n6 0 R\nendobj\n".to_vec());
+    let annot_array = (6u32, b"6 0 obj\n[4 0 R]\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Annots 5 0 R",
+        &[annot4, carrier, annot_array],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let annots = helper.get_annotations().unwrap();
+
+    assert_eq!(annots, vec![ObjectRef::new(4, 0)]);
+}
+
+#[test]
+fn get_annotations_reference_terminal_not_array_errors() {
+    // /Annots is an indirect reference whose terminal is NOT an array.
+    // The chain is followed to object 5 (a dictionary), and the helper must
+    // surface the specific "does not resolve to an array" error rather than a
+    // generic failure.
+    let non_array = (5u32, b"5 0 obj\n<< >>\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 612 792]", "/Annots 5 0 R", &[non_array]);
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    match helper.get_annotations() {
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("does not resolve to an array"),
+                "expected 'does not resolve to an array' message, got: {msg}"
+            );
+        }
+        other => panic!("expected Error::Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn get_annotations_chain_terminal_not_array_errors() {
+    // /Annots is stored behind a two-hop holder chain whose terminal is NOT an
+    // array:
+    //   page /Annots -> 5 0 R -> 6 0 R -> << >>
+    // The chain must be followed past the intermediate reference to its
+    // non-array terminal, then surface the specific error. A single resolve hop
+    // would stop at 6 0 R (still a reference) and never reach the dictionary.
+    let carrier = (5u32, b"5 0 obj\n6 0 R\nendobj\n".to_vec());
+    let non_array = (6u32, b"6 0 obj\n<< >>\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Annots 5 0 R",
+        &[carrier, non_array],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    match helper.get_annotations() {
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("does not resolve to an array"),
+                "expected 'does not resolve to an array' message, got: {msg}"
+            );
+        }
+        other => panic!("expected Error::Unsupported, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

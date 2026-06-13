@@ -2031,3 +2031,212 @@ fn corrupt_page_content_no_resources_anywhere_does_not_abort() {
         "page without /Resources must stay resource-less after graceful degradation"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// flpdf-3x23: holder-chain resolution in recurse_form_xobject
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// A PDF value reached through more than one indirect hop (`ref → ref → value`,
+// a "holder chain") must be followed to its terminal. Single-hop resolution
+// (`resolve_borrowed`) stops at the first reference and type-matches against a
+// still-indirect `Object::Reference`, silently dropping the target. These two
+// tests construct 2-hop chains and assert the pruning EFFECT distinguishes
+// "chain followed" (used resource RETAINED) from "chain dropped" (over-pruned).
+
+// Site 1 — /XObject resource *category* reached through a 2-hop chain.
+//
+//   5 0 R  /Resources  << ... /XObject 7 0 R >>
+//   7 0 R  body = "8 0 R"          ← intermediate holder (bare reference)
+//   8 0 R  << /Fm0 6 0 R >>        ← terminal /XObject category dict
+//   6 0 R  Form XObject (no own /Resources) using /F1 via Tf
+//   page content: /Fm0 Do
+//
+// Pre-fix: resolve_borrowed(7 0 R) yields Object::Reference(8 0 R), which is not
+// an Object::Dictionary → the category arm falls to `_ => None` → the Form is
+// never recursed → /F1 appears unused → wrongly pruned. Post-fix: the chain is
+// followed to 8 0 R, the Form recurses, /F1 is recorded and kept.
+#[test]
+fn test_3x23_xobject_category_holder_chain_form_font_kept() {
+    let form_content = b"BT /F1 10 Tf (form via 2-hop xobject cat) Tj ET";
+    let form_stream = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // /XObject category is a 2-hop holder chain: 7 0 R → 8 0 R → dict.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> /XObject 7 0 R >>",
+            ),
+        ),
+        (6, form_stream),
+        (7, obj_bytes(7, "8 0 R")),
+        (8, obj_bytes(8, "<< /Fm0 6 0 R >>")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R not a dict");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font missing");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "3x23 site1: /F1 must be kept (Form via 2-hop /XObject category uses it): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "3x23 site1: /F2 must be pruned (unused): {keys:?}"
+    );
+}
+
+// Site 2 — XObject *stream* reached through a 2-hop chain.
+//
+//   5 0 R  /Resources  << ... /XObject << /Fm0 7 0 R >> >>
+//   7 0 R  body = "6 0 R"          ← intermediate holder (bare reference)
+//   6 0 R  Form XObject (no own /Resources) using /F1 via Tf  ← terminal stream
+//   page content: /Fm0 Do
+//
+// Pre-fix: resolve_borrowed(7 0 R) yields Object::Reference(6 0 R), which is not
+// an Object::Stream → the stream arm falls to `_ => return Ok(true)` → the Form
+// is never recursed → /F1 appears unused → wrongly pruned. Post-fix: the chain
+// is followed to 6 0 R, the Form recurses, /F1 is recorded and kept.
+#[test]
+fn test_3x23_xobject_stream_holder_chain_form_font_kept() {
+    let form_content = b"BT /F1 10 Tf (form via 2-hop xobject stream) Tj ET";
+    let form_stream = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // /Fm0 points at a 2-hop holder chain to the Form stream: 7 0 R → 6 0 R.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> /XObject << /Fm0 7 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+        (7, obj_bytes(7, "6 0 R")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R not a dict");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font missing");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "3x23 site2: /F1 must be kept (Form stream via 2-hop chain uses it): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "3x23 site2: /F2 must be pruned (unused): {keys:?}"
+    );
+}
+
+// Site 2 (degenerate value) — an /XObject entry whose value is neither a
+// reference nor a stream (here a bare Name `/Junk`). `recurse_form_xobject`
+// must treat this as "nothing to recurse into" (the stream-resolution match
+// yields None) and report the page complete rather than panicking. The Do-named
+// entry is recorded as used, so the /XObject category survives; the unused /F2
+// font is still pruned.
+#[test]
+fn test_3x23_xobject_entry_non_stream_value_handled() {
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // /Fm0 maps to a bare Name (not a reference, not a stream).
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F2 << /Type /Font >> >> /XObject << /Fm0 /Junk >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R not a dict");
+    };
+    // /XObject/Fm0 is recorded as used by the Do operator → category retained.
+    let Some(Object::Dictionary(xobj_dict)) = res_dict.get("XObject") else {
+        panic!("/XObject category must survive (Fm0 is used via Do)");
+    };
+    assert!(
+        xobj_dict.get("Fm0").is_some(),
+        "3x23 site2-degenerate: /XObject/Fm0 must remain: {xobj_dict:?}"
+    );
+    // /F2 is never referenced → pruned (the whole /Font dict goes away).
+    assert!(
+        res_dict.get("Font").is_none(),
+        "3x23 site2-degenerate: unused /Font must be pruned: {res_dict:?}"
+    );
+}

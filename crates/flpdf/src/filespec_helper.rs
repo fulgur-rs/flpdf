@@ -83,6 +83,7 @@
 
 use crate::filters::{decode_stream_data, encode_stream_data};
 use crate::object::{Dictionary, Object, Stream};
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, ObjectRef, Pdf, Result};
 use md5::{Digest, Md5};
 use std::io::{Read, Seek, Write};
@@ -115,9 +116,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let params = match stream.dict.get("Params") {
             Some(Object::Dictionary(d)) => Some(d.clone()),
             Some(Object::Reference(r)) => {
-                let r = *r;
-                match pdf.resolve_borrowed(r)? {
-                    Object::Dictionary(d) => Some(d.clone()),
+                // /Params may be reached through more than one indirect hop
+                // (ref -> ref -> dict); follow the chain to its terminal.
+                match resolve_ref_chain(pdf, &Object::Reference(*r))?.0 {
+                    Object::Dictionary(d) => Some(d),
                     _ => None,
                 }
             }
@@ -377,9 +379,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let ef_dict: Dictionary = match dict.get("EF") {
             Some(Object::Dictionary(d)) => d.clone(),
             Some(Object::Reference(r)) => {
-                let r = *r;
-                match self.pdf.resolve_borrowed(r)? {
-                    Object::Dictionary(d) => d.clone(),
+                // /EF may be reached through more than one indirect hop
+                // (ref -> ref -> dict); follow the chain to its terminal.
+                match resolve_ref_chain(self.pdf, &Object::Reference(*r))?.0 {
+                    Object::Dictionary(d) => d,
                     _ => return Ok(None),
                 }
             }
@@ -396,8 +399,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             .collect();
 
         for ef_ref in candidates {
-            if let Object::Stream(stream) = self.pdf.resolve_borrowed(ef_ref)? {
-                return EmbeddedFileStream::new(stream.clone(), self.pdf).map(Some);
+            // A candidate stream may be reached through more than one indirect
+            // hop (ref -> ref -> stream); follow the chain to its terminal.
+            let (terminal, _) = resolve_ref_chain(self.pdf, &Object::Reference(ef_ref))?;
+            if let Object::Stream(stream) = terminal {
+                return EmbeddedFileStream::new(stream, self.pdf).map(Some);
             }
         }
 
@@ -1162,8 +1168,12 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
     for (key, value) in entries {
         // ── Step 1: resolve filespec dictionary ───────────────────────────────
         let fs_dict: Dictionary = match value {
-            Object::Reference(r) => match source.resolve_borrowed(r) {
-                Ok(Object::Dictionary(d)) => d.clone(),
+            // A filespec value may be reached through more than one indirect hop
+            // (ref -> ref -> dict); follow the chain to its terminal. Matching on
+            // the whole `Result` keeps a malformed/dangling chain a skip rather
+            // than aborting the whole copy.
+            Object::Reference(r) => match resolve_ref_chain(source, &Object::Reference(r)) {
+                Ok((Object::Dictionary(d), _)) => d,
                 _ => continue, // skip: cannot resolve filespec
             },
             Object::Dictionary(d) => d,
@@ -1173,10 +1183,13 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
         // ── Step 2: resolve /EF sub-dictionary ───────────────────────────────
         let ef_dict: Dictionary = match fs_dict.get("EF") {
             Some(Object::Dictionary(d)) => d.clone(),
-            Some(Object::Reference(r)) => {
-                let r = *r;
-                match source.resolve_borrowed(r) {
-                    Ok(Object::Dictionary(d)) => d.clone(),
+            Some(value @ Object::Reference(_)) => {
+                // /EF may be reached through more than one indirect hop
+                // (ref -> ref -> dict); follow the chain to its terminal.
+                // Matching on the whole `Result` keeps a malformed/dangling
+                // chain a skip rather than aborting the whole copy.
+                match resolve_ref_chain(source, value) {
+                    Ok((Object::Dictionary(d), _)) => d,
                     _ => continue, // skip: cannot resolve /EF
                 }
             }
@@ -1189,10 +1202,13 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
         let mut ef_stream: Stream = {
             let mut found = None;
             for k in &["UF", "F", "Unix", "Mac", "DOS"] {
-                if let Some(Object::Reference(r)) = ef_dict.get(k) {
-                    let r = *r;
-                    if let Ok(Object::Stream(s)) = source.resolve_borrowed(r) {
-                        found = Some(s.clone());
+                if let Some(value @ Object::Reference(_)) = ef_dict.get(k) {
+                    // A candidate stream may be reached through more than one
+                    // indirect hop (ref -> ref -> stream); follow the chain to
+                    // its terminal. Matching on the whole `Result` keeps a
+                    // malformed/dangling chain a skip rather than aborting.
+                    if let Ok((Object::Stream(s), _)) = resolve_ref_chain(source, value) {
+                        found = Some(s);
                         break;
                     }
                 }
@@ -2210,5 +2226,134 @@ mod tests {
         let decoded =
             crate::filters::decode_stream_data(&tgt_stream.dict, &tgt_stream.data).expect("decode");
         assert_eq!(decoded.as_slice(), raw.as_ref());
+    }
+
+    // ── copy_attachments_from: holder-chain (multi-hop indirect) resolution ───
+    //
+    // A value reached by indirection in the source may sit behind more than one
+    // hop (`a 0 R -> b 0 R -> value`). The single-hop `resolve_borrowed` used to
+    // drop such carriers, silently skipping the attachment. Each test below
+    // 2-hops ONLY the value under test and keeps every sibling link single-hop,
+    // so a pre-fix failure (the attachment is not copied) attributes cleanly to
+    // one site.
+
+    /// Build a single-attachment source with an uncompressed `/EmbeddedFile`
+    /// stream. Returns `(source, stream_ref, ef_subdict_ref, fs_ref)` so a test
+    /// can interpose a holder-chain carrier at exactly one link. `ef_subdict_ref`
+    /// holds the `/EF` sub-dictionary as a standalone indirect object.
+    fn build_chain_source(raw: &[u8]) -> (Pdf<Cursor<Vec<u8>>>, ObjectRef, ObjectRef, ObjectRef) {
+        let mut source = open_minimal();
+        let base = source
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let stream_ref = ObjectRef::new(base + 1, 0);
+        let ef_subdict_ref = ObjectRef::new(base + 2, 0);
+        let fs_ref = ObjectRef::new(base + 3, 0);
+
+        // Uncompressed /EmbeddedFile stream.
+        let mut sdict = Dictionary::new();
+        sdict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        sdict.insert("Length", Object::Integer(raw.len() as i64));
+        source.set_object(stream_ref, Object::Stream(Stream::new(sdict, raw.to_vec())));
+
+        // /EF sub-dictionary as a standalone indirect object.
+        let mut efsub = Dictionary::new();
+        efsub.insert("F", Object::Reference(stream_ref));
+        efsub.insert("UF", Object::Reference(stream_ref));
+        source.set_object(ef_subdict_ref, Object::Dictionary(efsub));
+
+        // Filespec referencing the /EF sub-dictionary indirectly.
+        let mut fs = Dictionary::new();
+        fs.insert("Type", Object::Name(b"Filespec".to_vec()));
+        fs.insert("F", Object::String(b"c.bin".to_vec()));
+        fs.insert("UF", Object::String(b"c.bin".to_vec()));
+        fs.insert("EF", Object::Reference(ef_subdict_ref));
+        source.set_object(fs_ref, Object::Dictionary(fs));
+
+        (source, stream_ref, ef_subdict_ref, fs_ref)
+    }
+
+    /// Site 4: the filespec value (the name-tree leaf value) is a holder chain
+    /// `carrier -> fs_ref -> <filespec dict>`; every link below it stays
+    /// single-hop. The attachment must still be copied.
+    #[test]
+    fn copy_attachments_filespec_value_follows_holder_chain() {
+        let raw = b"chain-filespec-payload";
+        let (mut source, _stream_ref, _ef_ref, fs_ref) = build_chain_source(raw);
+
+        // Interpose a carrier between the name-tree leaf and the filespec dict:
+        // the leaf stores `Reference(carrier)`, carrier -> `Reference(fs_ref)`.
+        let carrier = ObjectRef::new(fs_ref.number + 1, 0);
+        source.set_object(carrier, Object::Reference(fs_ref));
+        insert_embedded_file(&mut source, b"c.bin", carrier).expect("insert source");
+
+        let mut target = open_minimal();
+        let count = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(count, 1, "filespec reached via a two-hop chain must copy");
+        let got = extract_attachment(&mut target, b"c.bin").expect("extract");
+        assert_eq!(got.as_slice(), raw);
+    }
+
+    /// Site 5: the filespec's `/EF` sub-dictionary is a holder chain
+    /// `ef_carrier -> ef_subdict_ref -> <dict>`; the filespec value and the
+    /// stream entries stay single-hop. The attachment must still be copied.
+    #[test]
+    fn copy_attachments_ef_dict_follows_holder_chain() {
+        let raw = b"chain-ef-payload";
+        let (mut source, _stream_ref, ef_subdict_ref, fs_ref) = build_chain_source(raw);
+
+        // Re-point the filespec's /EF at a carrier: /EF -> ef_carrier ->
+        // ef_subdict_ref -> <dict>.
+        let ef_carrier = ObjectRef::new(fs_ref.number + 1, 0);
+        source.set_object(ef_carrier, Object::Reference(ef_subdict_ref));
+        let mut fs = source
+            .resolve(fs_ref)
+            .expect("resolve fs")
+            .into_dict()
+            .expect("filespec dict");
+        fs.insert("EF", Object::Reference(ef_carrier));
+        source.set_object(fs_ref, Object::Dictionary(fs));
+        insert_embedded_file(&mut source, b"c.bin", fs_ref).expect("insert source");
+
+        let mut target = open_minimal();
+        let count = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(count, 1, "/EF reached via a two-hop chain must copy");
+        let got = extract_attachment(&mut target, b"c.bin").expect("extract");
+        assert_eq!(got.as_slice(), raw);
+    }
+
+    /// Site 6: the `/EF` candidate stream entries are a holder chain
+    /// `stream_carrier -> stream_ref -> <stream>`; the filespec value and the
+    /// `/EF` sub-dictionary stay single-hop. The attachment must still be copied.
+    #[test]
+    fn copy_attachments_ef_stream_entry_follows_holder_chain() {
+        let raw = b"chain-stream-payload";
+        let (mut source, stream_ref, ef_subdict_ref, fs_ref) = build_chain_source(raw);
+
+        // Re-point the /EF stream entries at a carrier: /F and /UF ->
+        // stream_carrier -> stream_ref -> <stream>.
+        let stream_carrier = ObjectRef::new(fs_ref.number + 1, 0);
+        source.set_object(stream_carrier, Object::Reference(stream_ref));
+        let mut efsub = source
+            .resolve(ef_subdict_ref)
+            .expect("resolve ef")
+            .into_dict()
+            .expect("/EF dict");
+        efsub.insert("F", Object::Reference(stream_carrier));
+        efsub.insert("UF", Object::Reference(stream_carrier));
+        source.set_object(ef_subdict_ref, Object::Dictionary(efsub));
+        insert_embedded_file(&mut source, b"c.bin", fs_ref).expect("insert source");
+
+        let mut target = open_minimal();
+        let count = copy_attachments_from(&mut target, &mut source, None).expect("copy");
+        assert_eq!(
+            count, 1,
+            "/EF candidate stream reached via a two-hop chain must copy"
+        );
+        let got = extract_attachment(&mut target, b"c.bin").expect("extract");
+        assert_eq!(got.as_slice(), raw);
     }
 }
