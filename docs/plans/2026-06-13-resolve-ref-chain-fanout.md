@@ -49,6 +49,8 @@ pdf.set_object(terminal_ref.unwrap_or(r), updated);
 ```
 中間 ref（`r`）を visited/`set_object` に使うとバグが別の形で再発する。
 
+**カバレッジ注意（必読）**: 本サイト群では `resolve_ref_chain` に**常に `Object::Reference(r)` を渡す**ため、`terminal_ref` は **構造的に常に `Some`**（`None` は start が非 Reference のときだけ）。よって必ず `terminal_ref.unwrap_or(r)`（eager・単一式）を使うこと。`match terminal_ref { Some(t)=>t, None=>r }` や `unwrap_or_else(|| r)` に展開しない — `None` アーム/クロージャは**到達不能な dead code** で、変更行 100% カバレッジゲートが落ちる。
+
 ### レシピT: holder-chain テスト（各サイト1件）
 
 `tests/*.rs`（既存の対応ファイル）に追加。`common::build_pdf(&[(num,"body")], root)` を使い、対象の値を **carrier `(N,"M 0 R")` + terminal `(M, "<本来の値>")`** の2ホップで格納する。既存の手本: `acroform_document_helper_tests.rs:410`（`(6,"7 0 R")`,`(7,"[4 0 R]")`）、`page_merge_tests.rs:4329`（`(10,"11 0 R")`）。
@@ -84,6 +86,7 @@ TDD 順序:
    git add crates/flpdf/src/fonts.rs crates/flpdf/tests/fonts_tests.rs
    git commit -m "fix(flpdf): follow holder chains in fonts.rs font collection (flpdf-3x23)"
    ```
+6. **Step 6（パイロット検証 — fan-out 前に必ず実行）**: `scripts/patch-coverage.sh --base main` を回し、fonts.rs 変更行が 100% カバーされることを確認する。これは Task 1 が以下を end-to-end で検証するパイロット: `into_dict()` move イディオム、`build_pdf` 2ホップテスト形、red-gate が実際に赤くなる、**カバレッジゲートが実変更行で通る**。ここで失敗したらレシピを修正してから Task 2 以降に進む（借用チェックの問題が出るのも通常ここだけ — `resolve_ref_chain` は所有を返し `resolve_borrowed` の借用を解放するため、むしろ改善することが多い）。
 
 ---
 
@@ -101,7 +104,8 @@ TDD 順序:
 5. `rebuild_embedded_files_tree`（`(names_ref, mut names_dict)` 取得）: `Object::Reference(r) => match { Object::Dictionary(d) => (r, d.clone()) }` → **レシピB**（`names_ref` は `set_object(names_ref, ...)` 対象 → terminal_ref）。
 
 **Steps（TDD、各サイト1テスト）:**
-1. テスト: `/AF` 配列、`/Names` dict を2ホップ carrier で格納した PDF を作り、(2)(3) は `list_embedded_files` が列挙する、(1)(4)(5) は AF 除去/tree 再構築の公開操作が二重間接の names_ref を正しく書き換える（出力にゴーストが残らない / 列挙が成立）ことを assert。**レシピB サイトは terminal_ref で書換されること**（中間 carrier obj が live orphan として残らない）も assert。
+1. テスト: `/AF` 配列、`/Names` dict を2ホップ carrier で格納した PDF を作り、(2)(3) は `list_embedded_files` が列挙する、(1)(4)(5) は AF 除去/tree 再構築の公開操作が二重間接の terminal を正しく書き換えることを assert。
+   - **レシピB の正しい assertion（効果ベース）**: 書換は terminal_ref（内側オブジェクト）に着地し、carrier `r` は引き続き terminal を指す正当な中間ホップなので **orphan にはならない**。「carrier が orphan GC される」を assert してはならない（fix 後も pass しない）。代わりに **操作の効果**を assert する: 例 (1) なら「除去後に resolved `/AF` 配列が除去 ref を含まない」、(4)(5) なら「二重間接の `/Names` 経由で tree が再構築され列挙/参照が成立する」。
 2. fix 前 FAIL 確認。
 3. レシピ適用（1/4/5=B、2/3=A）。
 4. PASS + clippy。
