@@ -135,9 +135,24 @@ fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> 
     Ok(())
 }
 
+/// Returns whether a resolved object is a page-tree node we must not descend
+/// into during a subtree expansion (a `/Type /Page` leaf or `/Type /Pages`
+/// interior node). Used to stop a `/Resources` subtree walk from pulling in
+/// sibling pages if a resource value cross-links back into the page tree.
+fn is_page_tree_node(obj: &Object) -> bool {
+    matches!(obj, Object::Dictionary(d)
+        if matches!(d.get("Type"), Some(Object::Name(n))
+            if n.as_slice() == b"Pages" || n.as_slice() == b"Page"))
+}
+
 /// Compute the transitive closure of objects reachable from `root`.
 ///
-/// Returns the list in BFS discovery order (root first).
+/// Returns the list in discovery order (root first). The walk is breadth-first
+/// over the object graph in general, with one exception for page leaves: a
+/// page's `/Resources` subtree is expanded depth-first and placed ahead of its
+/// `/Contents`. This reproduces qpdf's physical ordering for the first-page
+/// section, where the Resources dictionary (and the fonts/XObjects it points
+/// at) precede the content stream.
 ///
 /// ### `/Parent` / `/Kids` handling
 ///
@@ -172,6 +187,49 @@ fn compute_closure<R: Read + Seek>(
 
         if is_pages_node || is_page_leaf {
             if let Some(dict) = obj.as_dict() {
+                // For a page leaf, expand the `/Resources` subtree depth-first
+                // and append it to `order` *before* the generic key loop runs.
+                // flpdf's `Dictionary` is a `BTreeMap`, so a plain key walk
+                // would visit `/Contents` (alphabetically first) before
+                // `/Resources`; qpdf instead numbers the Resources dictionary
+                // and the fonts/XObjects it references ahead of the content
+                // stream. Reproducing that order here is what makes the
+                // first-page object numbering match qpdf (e.g. one-page:
+                // Page, Resources, Font, Content). The depth-first walk is
+                // required because the content stream sits at depth 1 while a
+                // font hangs at depth 2 under `/Resources`; a breadth-first
+                // pass would otherwise emit the content stream first.
+                if is_page_leaf {
+                    if let Some(resources) = dict.get("Resources") {
+                        let mut seeds = Vec::new();
+                        collect_direct_refs(resources, 0, &mut seeds)?;
+                        // DFS via an explicit stack (no recursion) so deeply
+                        // nested resource graphs cannot overflow the stack.
+                        // The visited set bounds cycles; `is_page_tree_node`
+                        // stops the walk if a resource value cross-links back
+                        // into the page tree, so we never pull in sibling pages.
+                        let mut stack: Vec<ObjectRef> = seeds.into_iter().rev().collect();
+                        while let Some(r) = stack.pop() {
+                            if !visited.insert(r) {
+                                continue;
+                            }
+                            order.push(r);
+                            let child = pdf.resolve(r)?;
+                            if is_page_tree_node(&child) {
+                                continue;
+                            }
+                            let mut child_refs = Vec::new();
+                            collect_direct_refs(&child, 0, &mut child_refs)?;
+                            // Push in reverse so the first reference is popped
+                            // first, preserving left-to-right discovery order.
+                            for cr in child_refs.into_iter().rev() {
+                                if !visited.contains(&cr) {
+                                    stack.push(cr);
+                                }
+                            }
+                        }
+                    }
+                }
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
                         // Pages → sibling pages — never follow.
@@ -473,8 +531,9 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
         // ----------------------------------------------------------------
-        // Maintain BFS order from first_page_closure for Part 2 (page dict
-        // first, then resources, fonts, images, etc.).
+        // Maintain closure discovery order from first_page_closure for Part 2
+        // (page dict first, then its `/Resources` subtree, then `/Contents`,
+        // matching qpdf's first-page object numbering).
         //
         // The page-1 dictionary itself is pinned to Part 2 even if another
         // page directly references it; the linearization layout requires
