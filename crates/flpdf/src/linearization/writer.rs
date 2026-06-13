@@ -1023,22 +1023,33 @@ fn write_main_xref_stream_and_trailer(
     Ok((main_xref_offset, first_page_obj_offset))
 }
 
-/// Build the hint stream object bytes for a given compressed payload.
+/// Emit the primary hint-stream object and return its start byte offset.
 ///
-/// Returns the full object bytes (header + dict + stream + endobj) and the
-/// byte length of the object for `/H[1]`.
-fn build_hint_stream_object(
+/// qpdf 11.9.0 serializes the hint-stream object dict in the key order
+/// `/Filter /S /Length` (observed against its `--check-linearization` golden
+/// output), which the generic `BTreeMap`-ordered [`Object::Stream`] serializer
+/// cannot reproduce. This emitter writes the dict literal by hand to match that
+/// order; the surrounding framing (`N G obj\n` … `\nstream\n` … `\nendstream\nendobj\n`)
+/// is byte-identical to [`append_object`].
+fn append_hint_stream_object(
+    bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
     compressed_payload: &[u8],
     shared_section_offset: usize,
-) -> Object {
-    let compressed_len = compressed_payload.len();
-    let mut hint_dict = Dictionary::new();
-    hint_dict.insert("Length", Object::Integer(compressed_len as i64));
-    hint_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    hint_dict.insert("S", Object::Integer(shared_section_offset as i64));
-    let _ = new_ref; // ref is used at call site via append_object
-    Object::Stream(Stream::new(hint_dict, compressed_payload.to_vec()))
+) -> usize {
+    let offset = bytes.len();
+    bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "<< /Filter /FlateDecode /S {} /Length {} >>\nstream\n",
+            shared_section_offset,
+            compressed_payload.len(),
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(compressed_payload);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    offset
 }
 
 /// Perform a complete single-pass write of the linearized PDF body.
@@ -1151,9 +1162,12 @@ fn do_write_pass<R: Read + Seek>(
 
     // Hint stream object
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
-    let hint_obj =
-        build_hint_stream_object(hint_new_ref, hint_compressed, hint_shared_section_offset);
-    let hint_stream_offset = append_object(&mut bytes, hint_new_ref, &hint_obj);
+    let hint_stream_offset = append_hint_stream_object(
+        &mut bytes,
+        hint_new_ref,
+        hint_compressed,
+        hint_shared_section_offset,
+    );
     xref_offsets.insert(hint_stream_new_num, hint_stream_offset);
     let hint_stream_obj_total_len = bytes.len() - hint_stream_offset;
 
@@ -3046,5 +3060,25 @@ mod tests {
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &opts)
             .expect("deterministic-id without encryption must succeed");
+    }
+
+    /// The primary hint-stream object must serialize its dict in qpdf's key
+    /// order `/Filter /S /Length` (so `/S` precedes `/Length`), with framing
+    /// byte-identical to the generic object serializer. Asserts the complete
+    /// object bytes — not just the dict substring — so a newline regression in
+    /// the `stream`/`endstream`/`endobj` framing is also caught.
+    #[test]
+    fn append_hint_stream_object_emits_qpdf_key_order() {
+        let payload = vec![0u8; 53];
+        let mut bytes = Vec::new();
+        let offset = append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46);
+        assert_eq!(offset, 0, "emitter returns its start offset");
+
+        let mut expected = Vec::new();
+        expected
+            .extend_from_slice(b"9 0 obj\n<< /Filter /FlateDecode /S 46 /Length 53 >>\nstream\n");
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(bytes, expected, "hint-stream object framing + key order");
     }
 }
