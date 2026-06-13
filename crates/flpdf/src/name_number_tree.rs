@@ -1,4 +1,4 @@
-//! Generic name-tree / number-tree iteration (ISO 32000-1 §7.9.6 / §7.9.7).
+//! Generic name-tree / number-tree iteration (ISO 32000-2 §7.9.6 / §7.9.7).
 //!
 //! Name trees (`/Names` leaf, string keys) and number trees (`/Nums` leaf,
 //! integer keys) share the same shape: `/Kids` intermediate nodes, an optional
