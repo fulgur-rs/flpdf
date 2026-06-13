@@ -427,13 +427,51 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
     offset
 }
 
-/// Write a Part 1 xref subsection (the linearization parameter dict only) plus
-/// a first-page trailer, then return `(xref_offset, prev_value_range)`.
+/// Byte width of a single classic cross-reference entry:
+/// `NNNNNNNNNN GGGGG n \n` = 10 + 1 + 5 + 1 + 1 + 1 + 1 = 20 bytes.  Kept in
+/// one place so the first-page placeholder block length and the back-patch
+/// entry encoder agree.
+const CLASSIC_XREF_ENTRY_WIDTH: usize = 20;
+
+/// Byte range (inside the writer's `bytes` buffer) and object-number range that
+/// the classic first-page cross-reference subsection reserves for in-place
+/// back-patching once every covered object offset is known.
 ///
-/// The Part 1 xref is required by the linearized PDF spec so that a viewer can
-/// quickly locate the linearization parameter dict without parsing the whole
-/// file.  It covers only the param-dict object (at whatever number the
-/// renumber map assigned it); all other objects are recorded in Part 6.
+/// The classic (stream-free) analogue of [`FirstPageXrefPatch`].  qpdf's
+/// linearized first-page `xref` covers the whole first-page section (objects
+/// `param_slot..total`), whose offsets are forward references not yet known
+/// when the subsection is emitted, so the entries are written as a fixed-width
+/// placeholder block and overwritten by [`patch_part1_xref`] after the final
+/// pass collects every object offset.
+struct Part1XrefPatch {
+    /// First object number the subsection covers (`= param_slot`).
+    start_num: u32,
+    /// Number of entries the subsection covers (`= total − param_slot`).
+    count: u32,
+    /// Absolute byte range of the fixed-width entry block (overwritten with the
+    /// real 20-byte classic entries once offsets are final).
+    data_range: std::ops::Range<usize>,
+}
+
+/// Write a Part 1 xref subsection covering the whole first-page section plus a
+/// first-page trailer, then return `(xref_keyword_offset, prev_value_range,
+/// patch)`.
+///
+/// The Part 1 xref is required by the linearized PDF spec so a viewer can
+/// resolve the first page (and the linearization parameter dict) from the
+/// leading bytes without parsing the whole file.  Matching qpdf's classic
+/// (stream-free) layout, the subsection header is `xref {param_slot}
+/// {total − param_slot}` and it covers the high-numbered first-page objects
+/// (param dict, catalog, hint stream, first page, and page-1 private objects).
+/// The low-numbered "rest" objects (other pages, the Pages tree, Info) are
+/// recorded by the main (Part 6) xref instead.
+///
+/// Only the param-dict object's offset is known when this runs; the rest are
+/// forward references.  The entry block is therefore emitted as a fixed-width
+/// placeholder (`count × `[`CLASSIC_XREF_ENTRY_WIDTH`]) and back-patched in
+/// place by [`patch_part1_xref`] once the final pass has every offset.  Because
+/// the block byte length is invariant, no downstream offset shifts and the hint
+/// stream remains the sole convergence variable.
 ///
 /// The first-page trailer includes `/Info` (when present), `/Root`, `/Size`,
 /// `/Prev`, and `/ID` — matching qpdf's key order and content for linearized
@@ -441,24 +479,45 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
 /// padded on the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes so it
 /// can be back-patched in-place once the Part 6 xref offset is known.
 ///
-/// Returns `(xref_keyword_offset, prev_value_byte_range)` where
-/// `prev_value_byte_range` is the absolute byte range of the `/Prev` value
-/// field in `bytes` (for back-patching).
+/// Returns `(xref_keyword_offset, prev_value_byte_range, patch)`.
 #[allow(clippy::too_many_arguments)]
 fn write_part1_xref_and_trailer(
     bytes: &mut Vec<u8>,
-    param_dict_offset: usize,
     param_dict_obj_number: u32,
     total_object_count: u32,
+    first_page_count: u32,
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
-) -> (usize, std::ops::Range<usize>) {
+) -> (usize, std::ops::Range<usize>, Part1XrefPatch) {
+    // The param-dict object's trailing pad (reserved by `Part1Bytes::build`)
+    // ends with spaces; qpdf starts the first-page `xref` on a fresh line, so
+    // emit the line-break separator here.  This lands the `xref` keyword at
+    // qpdf's fixed offset (216 for the 15-byte header) once the pad width is
+    // taken into account.
+    bytes.push(b'\n');
     let xref_offset = bytes.len();
 
-    // Subsection: param dict object only.
-    bytes.extend_from_slice(format!("xref\n{param_dict_obj_number} 1\n").as_bytes());
-    bytes.extend_from_slice(format!("{:010} 00000 n \n", param_dict_offset).as_bytes());
+    // Subsection: the whole first-page section (objects param_slot..total).
+    bytes.extend_from_slice(
+        format!("xref\n{param_dict_obj_number} {first_page_count}\n").as_bytes(),
+    );
+    // Fixed-width placeholder block: `first_page_count` classic entries, each
+    // CLASSIC_XREF_ENTRY_WIDTH bytes.  The offsets are forward references, so
+    // patch_part1_xref overwrites this block in place once they are known.
+    // Its byte length is invariant (it never depends on the offsets it carries),
+    // so no downstream byte shifts.
+    let data_start = bytes.len();
+    bytes.resize(
+        data_start + (first_page_count as usize) * CLASSIC_XREF_ENTRY_WIDTH,
+        b' ',
+    );
+    let data_end = bytes.len();
+    let patch = Part1XrefPatch {
+        start_num: param_dict_obj_number,
+        count: first_page_count,
+        data_range: data_start..data_end,
+    };
 
     // First-page trailer for Part 1.  qpdf emits keys in this order:
     //   /Info /Root /Size /Prev /ID
@@ -516,23 +575,77 @@ fn write_part1_xref_and_trailer(
     // linearized file"; we adopt the same convention for byte-identical output.
     bytes.extend_from_slice(b"\nstartxref\n0\n%%EOF\n");
 
-    (xref_offset, prev_value_start..prev_value_end)
+    (xref_offset, prev_value_start..prev_value_end, patch)
 }
 
-/// Write the Part 6 cross-reference table covering all objects (0 through N),
-/// followed by the main trailer.
+/// Overwrite the classic first-page xref subsection's placeholder entry block
+/// in place, now that every covered object offset is known.
 ///
-/// The main trailer is the cross-reference section the file's trailing
-/// `startxref` points at, so it is the one a reader resolves first. It
-/// therefore carries `/ID`: the file identifier `write_linearized` finalized
-/// once onto `source_trailer["ID"]` is emitted verbatim, so the main trailer
-/// advertises the same identifier as the Part-1 first-page trailer (qpdf
-/// likewise repeats `/ID` in both). Without it, readers that follow the
-/// tail-`startxref` path would see no `/ID` at all.
+/// The subsection covers objects `[start_num, start_num + count)` — the whole
+/// first-page section — all of which are plain indirects on the classic path,
+/// so the encoder needs only the final `xref_offsets` map.  Because the block
+/// was emitted at its final byte length, this is a pure in-place patch: no
+/// offset shifts and the hint-stream convergence loop is untouched.
 ///
-/// The trailer keys are written as raw bytes (not via `Dictionary::write_pdf`,
-/// which would alphabetize them) to preserve qpdf's key order
-/// `/Size /Root /Info /ID`.
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if a covered object number has no
+/// entry in `xref_offsets` (a planner / writer inconsistency that would
+/// otherwise emit a free entry for a live object), or if the patch range lies
+/// outside `bytes`.
+fn patch_part1_xref(
+    bytes: &mut [u8],
+    patch: &Part1XrefPatch,
+    xref_offsets: &BTreeMap<u32, usize>,
+) -> Result<()> {
+    if patch.data_range.end > bytes.len() {
+        return Err(crate::Error::Unsupported(
+            "Part-1 xref patch range out of bounds".to_string(),
+        ));
+    }
+    let mut data = Vec::with_capacity(patch.count as usize * CLASSIC_XREF_ENTRY_WIDTH);
+    for number in patch.start_num..patch.start_num + patch.count {
+        let offset = xref_offsets.get(&number).copied().ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "Part-1 xref: covered object {number} has no offset (planner / writer \
+                 inconsistency — would emit a free entry for a live first-page object)"
+            ))
+        })?;
+        data.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    if data.len() != patch.data_range.len() {
+        return Err(crate::Error::Unsupported(format!(
+            "Part-1 xref payload length drift: encoded {} bytes, reserved {}",
+            data.len(),
+            patch.data_range.len()
+        )));
+    }
+    bytes[patch.data_range.clone()].copy_from_slice(&data);
+    Ok(())
+}
+
+/// Write the main (Part 6) cross-reference table — covering only the
+/// low-numbered "rest" objects `[0, param_slot)` — followed by the main
+/// trailer and the file's trailing `startxref`/`%%EOF`.
+///
+/// Matching qpdf's classic linearized layout, the main xref records object 0
+/// (the free head) and objects `1..param_slot` (the other pages, the Pages
+/// tree, and Info — the objects physically after `/E`).  The high-numbered
+/// first-page objects `[param_slot, total)` are recorded by the Part-1
+/// first-page xref instead.
+///
+/// The main trailer is `<< /Size {param_slot} /ID .. >>`: no `/Root` and no
+/// `/Info` (qpdf omits both here — the first-page trailer carries them).  `/ID`
+/// is still emitted: a file identifier is file-scoped, so the trailer a reader
+/// resolves via the trailing `startxref` must advertise the same identifier the
+/// first-page trailer carries.  The keys are written as raw bytes (not via
+/// `Dictionary::write_pdf`, which alphabetizes) to preserve qpdf's key order
+/// `/Size /ID`.
+///
+/// The trailing `startxref` points at `first_page_xref_offset` — the first-page
+/// `xref` keyword near the top of the file — not at the main xref.  qpdf chains
+/// a linearized reader: trailing `startxref` → first-page xref → its `/Prev` →
+/// main xref.
 ///
 /// Returns `(xref_keyword_offset, xref_first_entry_offset)` where:
 /// - `xref_keyword_offset` is the byte offset of the `xref` keyword
@@ -542,20 +655,19 @@ fn write_part1_xref_and_trailer(
 fn write_main_xref_and_trailer(
     bytes: &mut Vec<u8>,
     xref_offsets: &BTreeMap<u32, usize>,
-    total_count: u32, // /Size — highest object number + 1
-    catalog_new_ref: ObjectRef,
-    info_new_ref: Option<ObjectRef>,
+    param_slot: u32, // /Size of the main subsection — covers objects [0, param_slot)
+    first_page_xref_offset: usize,
     source_trailer: &Dictionary,
 ) -> (usize, usize) {
     let xref_start = bytes.len();
 
-    // Dense table: objects 0 .. total_count.
-    let xref_header = format!("xref\n0 {}\n", total_count);
+    // Dense table: objects 0 .. param_slot (the low-numbered "rest" objects).
+    let xref_header = format!("xref\n0 {}\n", param_slot);
     bytes.extend_from_slice(xref_header.as_bytes());
     let xref_first_entry_offset = bytes.len();
     // Object 0 — free head.
     bytes.extend_from_slice(b"0000000000 65535 f \n");
-    for number in 1..total_count {
+    for number in 1..param_slot {
         match xref_offsets.get(&number) {
             Some(offset) => {
                 bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes())
@@ -565,22 +677,10 @@ fn write_main_xref_and_trailer(
     }
 
     // Main trailer.  Written as raw bytes (not Dictionary::write_pdf, which
-    // alphabetizes) to keep qpdf's key order /Size /Root /Info /ID and to emit
-    // /ID with the same idiom as the Part-1 trailer.
+    // alphabetizes) to keep qpdf's key order /Size /ID.  No /Root or /Info —
+    // qpdf omits both from the main trailer of a classic linearized file.
     bytes.extend_from_slice(b"trailer << ");
-    bytes.extend_from_slice(format!("/Size {} ", total_count).as_bytes());
-    bytes.extend_from_slice(
-        format!(
-            "/Root {} {} R ",
-            catalog_new_ref.number, catalog_new_ref.generation
-        )
-        .as_bytes(),
-    );
-    if let Some(info_ref) = info_new_ref {
-        bytes.extend_from_slice(
-            format!("/Info {} {} R ", info_ref.number, info_ref.generation).as_bytes(),
-        );
-    }
+    bytes.extend_from_slice(format!("/Size {} ", param_slot).as_bytes());
     // /ID — emit the file-scoped identifier verbatim (the same value the
     // Part-1 trailer carries), so the trailer a reader resolves via the
     // trailing `startxref` advertises the identifier.
@@ -590,7 +690,7 @@ fn write_main_xref_and_trailer(
         bytes.extend_from_slice(b" ");
     }
     bytes.extend_from_slice(b">>");
-    bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", xref_start).as_bytes());
+    bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes());
 
     (xref_start, xref_first_entry_offset)
 }
@@ -1118,6 +1218,13 @@ fn do_write_pass<R: Read + Seek>(
     // `/Prev` range tells the back-patcher there is no classic Part-1 trailer
     // `/Prev` to patch.
     let mut first_page_xref_patch: Option<FirstPageXrefPatch> = None;
+    // Classic-path first-page xref: its keyword offset (threaded to the main
+    // trailer's `startxref`) and the placeholder block to back-patch once every
+    // first-page object offset is known.  qpdf's classic linearized layout
+    // makes the file's trailing `startxref` point at this first-page xref, and
+    // the first-page xref covers the whole first-page section.
+    let mut part1_classic_xref_offset: usize = 0;
+    let mut part1_xref_patch: Option<Part1XrefPatch> = None;
     // Absolute byte spans of every section that carries a `/ID`.  The
     // deterministic-`/ID` back-patch scans *only* inside these spans so it can
     // never overwrite a body byte sequence that happens to equal the all-zero
@@ -1125,16 +1232,32 @@ fn do_write_pass<R: Read + Seek>(
     // captured as `start..bytes.len()` around the call that emits its `/ID`.
     let mut id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let first_trailer_prev_range = if objstm_layout.is_empty() {
+        // First-page xref covers objects [param_slot, total): the param dict
+        // plus every other first-page object (catalog, hint, first page, page-1
+        // private).  total_count = /Size (highest object number + 1), so the
+        // count is `total_count − param_slot`.  Validate the subtraction to
+        // avoid an unsigned wrap if a future plan ever puts the param dict
+        // above /Size (a non-contiguous split, guarded elsewhere).
+        let first_page_count = total_count
+            .checked_sub(param_dict_obj_number)
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "linearization writer: param-dict object number ({param_dict_obj_number}) \
+                 exceeds /Size ({total_count}) — cannot size the first-page xref subsection"
+                ))
+            })?;
         let section_start = bytes.len();
-        let (_p1_xref_offset, range) = write_part1_xref_and_trailer(
+        let (p1_xref_offset, range, patch) = write_part1_xref_and_trailer(
             &mut bytes,
-            param_dict_absolute_offset,
             param_dict_obj_number,
             total_count,
+            first_page_count,
             catalog_new_ref,
             info_new_ref,
             source_trailer,
         );
+        part1_classic_xref_offset = p1_xref_offset;
+        part1_xref_patch = Some(patch);
         // Part-1 first-page trailer `/ID` site.  The main (Part-6) trailer
         // emitted at EOF carries the same `/ID` (its span is captured at
         // the `write_main_xref_and_trailer` call below), so the classic
@@ -1263,22 +1386,40 @@ fn do_write_pass<R: Read + Seek>(
     // an xref stream.  With an empty layout the classic table path is kept
     // verbatim — no behavioural change for Disable / no-ObjStm inputs.
     let (last_xref_offset, last_xref_first_entry_offset) = if objstm_layout.is_empty() {
-        // The main (Part-6) trailer is the section the file's trailing
-        // `startxref` points at, so it is the trailer a reader resolves.  It
-        // carries the same `/ID` as the Part-1 first-page trailer; capture its
-        // span so the deterministic-`/ID` back-patch rewrites the placeholder
-        // there too (the push is unconditional, matching the Part-1 site —
-        // `id_ranges` is consulted only when `deterministic_id` is set).
+        // The main (Part-6) xref covers only the low-numbered "rest" objects
+        // [0, param_slot); the first-page section [param_slot, total) was
+        // recorded by the Part-1 first-page xref above.  qpdf's classic layout
+        // makes the file's trailing `startxref` point back at that first-page
+        // xref (near the top of the file), so thread its keyword offset in.
+        //
+        // The main trailer carries the same `/ID` as the Part-1 first-page
+        // trailer; capture its span so the deterministic-`/ID` back-patch
+        // rewrites the placeholder there too (the push is unconditional,
+        // matching the Part-1 site — `id_ranges` is consulted only when
+        // `deterministic_id` is set).
         let main_section_start = bytes.len();
         let result = write_main_xref_and_trailer(
             &mut bytes,
             &xref_offsets,
-            total_count,
-            catalog_new_ref,
-            info_new_ref,
+            param_dict_obj_number,
+            part1_classic_xref_offset,
             source_trailer,
         );
         id_ranges.push(main_section_start..bytes.len());
+
+        // Every first-page object offset is now known, so back-patch the
+        // Part-1 first-page xref's placeholder entry block in place.  The block
+        // length was reserved exactly, so this shifts no bytes and the
+        // hint-stream convergence loop is unaffected.
+        let patch = part1_xref_patch.as_ref().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "linearization writer: classic path produced no Part-1 xref patch \
+                 (internal invariant violated)"
+                    .to_string(),
+            )
+        })?;
+        patch_part1_xref(&mut bytes, patch, &xref_offsets)?;
+
         result
     } else {
         // The first-page xref stream was already emitted before /E; record
@@ -2331,16 +2472,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 14. Part 1 (first trailer) startxref value must be 0 (qpdf linearized
-    //     PDF convention, ISO 32000-1 Annex F).  The Part 6 (main) startxref
-    //     at the end of the file must be the real xref keyword offset.
+    // 14. startxref targets for a classic linearized file (qpdf layout):
     //
-    //     qpdf always emits `startxref\n0\n%%EOF` in the first trailer to
-    //     signal "linearized first trailer".  The main xref at the file tail
-    //     carries the actual byte offset for readers that seek to the end.
+    //     - The Part-1 first trailer's `startxref` is always 0 (qpdf linearized
+    //       convention, ISO 32000-1 Annex F: it signals "linearized first
+    //       trailer"; its `/Prev` carries the real main-xref offset instead).
+    //     - The file's FINAL `startxref` points at the FIRST-PAGE cross-
+    //       reference section — the FIRST standalone `xref` keyword, near the
+    //       top of the file — NOT the main xref at the tail.  qpdf chains a
+    //       linearized reader: final startxref → first-page xref → its `/Prev`
+    //       → main xref.
+    //
+    //     (Previously this test asserted the final startxref equalled the LAST
+    //     xref keyword, i.e. the main xref.  That was flpdf's old non-qpdf
+    //     layout; qpdf's classic layout points it at the first-page xref so a
+    //     web reader resolves page 1 from the leading bytes.)
     // -----------------------------------------------------------------------
     #[test]
-    fn part1_startxref_is_zero_and_main_startxref_is_real_offset() {
+    fn part1_startxref_is_zero_and_final_startxref_points_at_first_page_xref() {
         let doc = build_linearized();
         let bytes = &doc.bytes;
 
@@ -2378,25 +2527,34 @@ mod tests {
             .windows(needle.len())
             .rposition(|w| w == needle)
             .expect("linearized output must contain at least two startxref");
-        let main_value: usize = parse_startxref_value(last_sxref_pos);
+        let final_value: usize = parse_startxref_value(last_sxref_pos);
 
-        // The main startxref must point to the last standalone `xref` keyword
-        // token (not the `xref` that appears inside `startxref`).
-        // A standalone `xref` is preceded by whitespace or the start of the
-        // buffer, and followed by whitespace or the end of the buffer.
+        // The final startxref must point to the FIRST standalone `xref` keyword
+        // token (the first-page xref), not the last (`main`) one.  A standalone
+        // `xref` is preceded by whitespace or the start of the buffer, and
+        // followed by whitespace or the end of the buffer.
+        let is_standalone_xref = |i: usize| -> bool {
+            &bytes[i..i + 4] == b"xref"
+                && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                && (i + 4 >= bytes.len() || bytes[i + 4].is_ascii_whitespace())
+        };
+        let first_xref_pos = (0..bytes.len().saturating_sub(3))
+            .find(|&i| is_standalone_xref(i))
+            .expect("linearized output must contain at least one standalone xref keyword");
         let last_xref_pos = (0..bytes.len().saturating_sub(3))
             .rev()
-            .find(|&i| {
-                &bytes[i..i + 4] == b"xref"
-                    && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-                    && (i + 4 >= bytes.len() || bytes[i + 4].is_ascii_whitespace())
-            })
+            .find(|&i| is_standalone_xref(i))
             .expect("linearized output must contain at least one standalone xref keyword");
 
+        // Sanity: the two xref sections are distinct (first-page vs. main).
+        assert!(
+            first_xref_pos < last_xref_pos,
+            "first-page xref ({first_xref_pos}) must precede the main xref ({last_xref_pos})"
+        );
         assert_eq!(
-            main_value, last_xref_pos,
-            "Part 6 main startxref ({main_value}) must equal the last xref keyword \
-             offset ({last_xref_pos})"
+            final_value, first_xref_pos,
+            "final startxref ({final_value}) must equal the FIRST-PAGE xref keyword \
+             offset ({first_xref_pos}) — qpdf classic linearized layout"
         );
     }
 
