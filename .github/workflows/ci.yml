@@ -137,6 +137,9 @@ jobs:
           cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
           # Demonstrates plain --static-id rewrite is cmp-diff-0 vs qpdf golden.
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_diff_zero_tests
+          # Pins linearized output structural byte-parity vs qpdf golden
+          # (everything except the qpdf-internal /ID[1]; see flpdf-wb76).
+          cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
 
       - name: Compat matrix baselines (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
