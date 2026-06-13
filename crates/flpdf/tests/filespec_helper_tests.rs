@@ -892,3 +892,103 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
         "/Subtype must round-trip back to application/pdf after serialization"
     );
 }
+
+// ── Holder-chain (multi-hop indirect) resolution ──────────────────────────────
+//
+// A value reachable by indirection may sit behind more than one hop
+// (`a 0 R -> b 0 R -> value`). The single-hop `resolve_borrowed` used to drop
+// such carriers; `resolve_ref_chain` follows them to the terminal. Each test
+// below 2-hops ONLY the value under test and keeps every sibling link
+// single-hop, so a pre-fix failure attributes cleanly to one site.
+
+/// Site 1: `EmbeddedFileStream::new` resolves `/Params` through a holder chain.
+/// `/Params` is `8 0 R -> 9 0 R -> << /Size 42 >>`; `/EF` stays single-hop.
+#[test]
+fn params_follows_holder_chain() {
+    // Start from a PDF whose /Params is the direct dict << /Size 42 >>.
+    let mut pdf = open(build_pdf_with_params("/Size 42", b"data"));
+    // Rewrite the EmbeddedFile stream's /Params to a two-hop carrier
+    // 8 0 R -> 9 0 R -> << /Size 42 >>.
+    let Object::Stream(mut ef_stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected EmbeddedFile stream");
+    };
+    let params = ef_stream.dict.get("Params").cloned().expect("/Params");
+    pdf.set_object(ObjectRef::new(9, 0), params);
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Reference(ObjectRef::new(9, 0)),
+    );
+    ef_stream
+        .dict
+        .insert("Params", Object::Reference(ObjectRef::new(8, 0)));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Stream(ef_stream));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(
+        ef.size().expect("size()"),
+        Some(42),
+        "/Params reached via a two-hop chain must resolve"
+    );
+}
+
+/// Site 2: `FileSpec::embedded_file` resolves the `/EF` sub-dictionary through a
+/// holder chain. `/EF` is `7 0 R -> 8 0 R -> << /F 6 0 R /UF 6 0 R >>`; the
+/// stream entries inside `/EF` stay single-hop.
+#[test]
+fn embedded_file_ef_dict_follows_holder_chain() {
+    let mut pdf = open(build_attachment_pdf("", "", b"ef-payload"));
+    let Object::Dictionary(mut fs_dict) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dict");
+    };
+    let ef_dict = fs_dict.get("EF").cloned().expect("/EF dict");
+    // Two-hop carrier: /EF 7 0 R -> 8 0 R -> << /F 6 0 R /UF 6 0 R >>.
+    pdf.set_object(ObjectRef::new(8, 0), ef_dict);
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
+    fs_dict.insert("EF", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(fs_dict));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(
+        ef.payload().expect("payload()"),
+        b"ef-payload",
+        "/EF reached via a two-hop chain must resolve"
+    );
+}
+
+/// Site 3: `FileSpec::embedded_file` resolves an `/EF` candidate stream through
+/// a holder chain. `/EF /F` and `/UF` are `7 0 R -> 6 0 R -> <stream>`; the
+/// `/EF` sub-dictionary itself stays single-hop (direct dict).
+#[test]
+fn embedded_file_stream_entry_follows_holder_chain() {
+    let mut pdf = open(build_attachment_pdf("", "", b"stream-payload"));
+    let Object::Dictionary(mut fs_dict) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dict");
+    };
+    // /EF stays a direct dict; only its stream entries become two-hop.
+    // /EF /F and /UF -> 7 0 R -> 6 0 R (the real stream).
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
+    let mut ef_dict = match fs_dict.get("EF").cloned().expect("/EF dict") {
+        Object::Dictionary(d) => d,
+        _ => panic!("expected /EF dict"),
+    };
+    ef_dict.insert("F", Object::Reference(ObjectRef::new(7, 0)));
+    ef_dict.insert("UF", Object::Reference(ObjectRef::new(7, 0)));
+    fs_dict.insert("EF", Object::Dictionary(ef_dict));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(fs_dict));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(
+        ef.payload().expect("payload()"),
+        b"stream-payload",
+        "/EF candidate stream reached via a two-hop chain must resolve"
+    );
+}
