@@ -480,8 +480,10 @@ fn fold_doc_level_closure<R: Read + Seek>(
     // mirroring what the indirect `names_dests` root gets for free.
     if let Some(inline) = &doc.names_dests_inline {
         if let Some(Object::Array(kids)) = inline.get("Kids") {
-            let kid_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
-            for kid in kid_refs {
+            // `kids` borrows `doc`, disjoint from the `&mut source` the fold
+            // needs, so iterate the filter-mapped refs directly — no intermediate
+            // `Vec`.
+            for kid in kids.iter().filter_map(Object::as_ref_id) {
                 extend_page_object_closure(source, kid, closure)?;
             }
         }
@@ -491,11 +493,12 @@ fn fold_doc_level_closure<R: Read + Seek>(
     // outline items (and their destination pages) are copied, mirroring what the
     // indirect `outlines` root gets for free.
     if let Some(inline) = &doc.outlines_inline {
-        let child_refs: Vec<ObjectRef> = ["First", "Last"]
+        // `inline` borrows `doc`, disjoint from the `&mut source` the fold needs,
+        // so iterate the resolved child refs directly — no intermediate `Vec`.
+        for child in ["First", "Last"]
             .into_iter()
             .filter_map(|key| inline.get_ref(key))
-            .collect();
-        for child in child_refs {
+        {
             extend_page_object_closure(source, child, closure)?;
         }
     }
