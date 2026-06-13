@@ -754,10 +754,9 @@ fn recurse_form_xobject<R: Read + Seek>(
     // same way `apply_pruning` already treats indirect category dicts. The
     // reference may itself be reached through more than one indirect hop
     // (ref -> ref -> dict); follow the chain to its terminal dictionary.
-    let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject").cloned())
-    {
+    let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject")) {
         Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
-        Some(Object::Reference(cat_ref)) => resolve_ref_chain(pdf, &Object::Reference(cat_ref))?
+        Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(pdf, cat_ref)?
             .0
             .into_dict()
             .and_then(|xobj_dict| xobj_dict.get(xobject_name).cloned()),

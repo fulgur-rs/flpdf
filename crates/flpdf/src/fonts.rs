@@ -117,10 +117,10 @@ fn collect_page_fonts<R: Read + Seek>(
         Some(resources) => {
             if let Some(resources) = resources.as_dict() {
                 Some(resources.clone())
-            } else if let Some(reference) = resources.as_ref_id() {
+            } else if resources.as_ref_id().is_some() {
                 // /Resources may be reached through more than one indirect hop
                 // (ref -> ref -> dict); follow the chain to its terminal.
-                let (terminal, _) = resolve_ref_chain(pdf, &Object::Reference(reference))?;
+                let (terminal, _) = resolve_ref_chain(pdf, resources)?;
                 terminal.into_dict()
             } else {
                 None
@@ -137,10 +137,10 @@ fn collect_page_fonts<R: Read + Seek>(
         Some(fonts_dict) => {
             if let Some(fonts_dict) = fonts_dict.as_dict() {
                 Some(fonts_dict.clone())
-            } else if let Some(reference) = fonts_dict.as_ref_id() {
+            } else if fonts_dict.as_ref_id().is_some() {
                 // The /Font value may be reached through more than one indirect
                 // hop (ref -> ref -> dict); follow the chain to its terminal.
-                let (terminal, _) = resolve_ref_chain(pdf, &Object::Reference(reference))?;
+                let (terminal, _) = resolve_ref_chain(pdf, fonts_dict)?;
                 terminal.into_dict()
             } else {
                 None
@@ -173,7 +173,7 @@ fn collect_page_fonts<R: Read + Seek>(
         // error (it resolves to `Object::Null`) and is skipped by the match
         // below.
         let resolved: Object = match value {
-            Object::Reference(font_ref) => resolve_ref_chain(pdf, &Object::Reference(*font_ref))?.0,
+            Object::Reference(_) => resolve_ref_chain(pdf, value)?.0,
             Object::Dictionary(_) | Object::Stream(_) => value.clone(),
             _ => continue,
         };

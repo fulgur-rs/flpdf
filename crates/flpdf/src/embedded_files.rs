@@ -577,18 +577,18 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     // ── Empty case: remove /EmbeddedFiles ────────────────────────────────────
     if entries.is_empty() {
         // Retrieve (or create empty) /Names dict and drop /EmbeddedFiles from it.
-        let names_dict_opt = match catalog.get("Names").cloned() {
+        let names_dict_opt = match catalog.get("Names") {
             // /Names may be reached through more than one indirect hop
             // (ref -> ref -> dict); follow the chain so the terminal dict — the
             // object actually rewritten below — is the one updated, not an
             // intermediate carrier.
-            Some(Object::Reference(r)) => {
-                let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+            Some(value @ Object::Reference(r)) => {
+                let (terminal, terminal_ref) = resolve_ref_chain(pdf, value)?;
                 terminal
                     .into_dict()
-                    .map(|d| (Some(terminal_ref.unwrap_or(r)), d))
+                    .map(|d| (Some(terminal_ref.unwrap_or(*r)), d))
             }
-            Some(Object::Dictionary(d)) => Some((None, d)),
+            Some(Object::Dictionary(d)) => Some((None, d.clone())),
             _ => None,
         };
         if let Some((names_ref_opt, mut names_dict)) = names_dict_opt {
@@ -604,6 +604,14 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
                 match names_ref_opt {
                     Some(r) => {
                         pdf.set_object(r, Object::Dictionary(names_dict));
+                        // Collapse any holder chain: re-point catalog /Names
+                        // straight at the terminal dict so a mutated
+                        // `ref -> ref -> dict` /Names is normalized to one hop,
+                        // mirroring the non-empty rebuild path. For an
+                        // already-direct /Names this re-inserts the same ref
+                        // (harmless).
+                        catalog.insert("Names", Object::Reference(r));
+                        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
                     }
                     None => {
                         catalog.insert("Names", Object::Dictionary(names_dict));
@@ -624,15 +632,15 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
     // ── Patch the catalog /Names dictionary ───────────────────────────────────
     // Resolve or create the /Names dict.  We always store it as an indirect
     // object and point /EmbeddedFiles to the tree root indirectly.
-    let (names_ref, mut names_dict) = match catalog.get("Names").cloned() {
+    let (names_ref, mut names_dict) = match catalog.get("Names") {
         // /Names may be reached through more than one indirect hop
         // (ref -> ref -> dict); follow the chain so /EmbeddedFiles is written
         // into the terminal dict and the catalog /Names rewrite below collapses
         // the chain to point straight at it.
-        Some(Object::Reference(r)) => {
-            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+        Some(value @ Object::Reference(r)) => {
+            let (terminal, terminal_ref) = resolve_ref_chain(pdf, value)?;
             match terminal.into_dict() {
-                Some(d) => (terminal_ref.unwrap_or(r), d),
+                Some(d) => (terminal_ref.unwrap_or(*r), d),
                 None => {
                     let r2 = alloc();
                     (r2, Dictionary::new())
@@ -641,7 +649,7 @@ fn rebuild_embedded_files_tree<R: Read + Seek>(
         }
         Some(Object::Dictionary(d)) => {
             let r = alloc();
-            (r, d)
+            (r, d.clone())
         }
         _ => {
             let r = alloc();
@@ -1580,5 +1588,220 @@ mod tests {
         );
         assert_eq!(pairs[0].0, b"chain.txt");
         assert_eq!(pairs[0].1, Object::Reference(fs_ref));
+    }
+
+    // ── Test: empty rebuild collapses a 2-hop /Names holder chain (flpdf-3x23)
+    //
+    // When the last /EmbeddedFiles entry is removed and the /Names dict still
+    // carries a surviving sibling (here /Dests), the empty-rebuild path rewrites
+    // the terminal names dict in place. If /Names is reached through two hops
+    // (catalog → carrier → terminal), the catalog must be re-pointed straight at
+    // the terminal — otherwise it keeps pointing at the carrier, leaving the
+    // mutated dict unreachable and the chain un-normalized. This mirrors the
+    // non-empty rebuild path's collapse.
+    #[test]
+    fn empty_rebuild_collapses_two_hop_names_with_surviving_sibling() {
+        let mut pdf = open_minimal();
+
+        // Register an attachment so /Names /EmbeddedFiles holds a real entry.
+        let fs_ref = FileSpecBuilder::new("only.txt", b"only payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"only.txt", fs_ref).expect("insert");
+
+        // Locate the terminal names dict (insert stored it indirectly) and add a
+        // surviving sibling key so the empty-with-sibling branch is exercised.
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let terminal_ref = catalog
+            .get("Names")
+            .and_then(Object::as_ref_id)
+            .expect("catalog /Names must be indirect after insert");
+        let mut terminal = pdf
+            .resolve(terminal_ref)
+            .expect("resolve names")
+            .into_dict()
+            .expect("names dict");
+        // /Dests as a small inline dict: survives the post-removal sweep because
+        // it is owned by the (still-reachable) terminal names dict.
+        let mut dests = Dictionary::new();
+        dests.insert("X", Object::Reference(fs_ref));
+        terminal.insert("Dests", Object::Dictionary(dests));
+        pdf.set_object(terminal_ref, Object::Dictionary(terminal));
+
+        // Insert a bare-reference carrier so the catalog reaches /Names through
+        // two hops: catalog → carrier → terminal.
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let carrier_ref = ObjectRef::new(next + 1, 0);
+        pdf.set_object(carrier_ref, Object::Reference(terminal_ref));
+        catalog.insert("Names", Object::Reference(carrier_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        // Remove the last (only) embedded file → empty rebuild with a surviving
+        // /Dests sibling.
+        let removed = remove_attachment(&mut pdf, b"only.txt").expect("remove only");
+        assert!(removed, "remove_attachment must return true");
+
+        // The catalog /Names must now point in ONE hop straight at the terminal
+        // dict (the one carrying /Dests), NOT at the carrier whose body is a bare
+        // reference. Assert ref-identity first (immune to resolve semantics).
+        let catalog_after = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog after")
+            .into_dict()
+            .expect("catalog dict after");
+        let names_after = catalog_after
+            .get("Names")
+            .and_then(Object::as_ref_id)
+            .expect("catalog /Names must still be indirect");
+        assert_eq!(
+            names_after, terminal_ref,
+            "catalog /Names must point straight at the terminal, not the carrier"
+        );
+        assert_ne!(
+            names_after, carrier_ref,
+            "catalog /Names must not point at the carrier after the empty rebuild"
+        );
+
+        // Secondary confirmation: the object the catalog /Names ref resolves to
+        // is the terminal dict (it has /Dests and no /EmbeddedFiles), not the
+        // carrier (which resolves to a bare Reference).
+        let resolved = pdf.resolve(names_after).expect("resolve /Names target");
+        let names_dict = resolved.into_dict().expect("/Names target is a dict");
+        assert!(
+            names_dict.get("Dests").is_some(),
+            "terminal /Names dict must retain the surviving /Dests sibling"
+        );
+        assert!(
+            names_dict.get("EmbeddedFiles").is_none(),
+            "/EmbeddedFiles must be gone after removing the last attachment"
+        );
+    }
+
+    // ── Test: non-empty rebuild with a *direct* (inline) /Names dict ──────────
+    //
+    // Catalog /Names may be stored inline as a dictionary rather than indirectly.
+    // The non-empty rebuild path must allocate a fresh ref for it and write the
+    // /EmbeddedFiles tree, preserving any sibling (here /Dests).
+    #[test]
+    fn non_empty_rebuild_with_direct_names_dict() {
+        let mut pdf = open_minimal();
+
+        // Seed catalog /Names as a *direct* dict carrying only an unrelated key.
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let mut names = Dictionary::new();
+        names.insert("Dests", Object::Dictionary(Dictionary::new()));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        // Adding an attachment drives the non-empty rebuild over the direct dict.
+        let fs_ref = FileSpecBuilder::new("direct.txt", b"direct payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"direct.txt", fs_ref).expect("insert");
+
+        let entries = list_embedded_files(&mut pdf).expect("list");
+        assert_eq!(entries.len(), 1, "attachment must be registered");
+        assert_eq!(entries[0].0, b"direct.txt");
+
+        // /Names is now indirect (rebuild stores it so) and retains /Dests.
+        let catalog_after = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog after")
+            .into_dict()
+            .expect("catalog dict after");
+        let names_ref = catalog_after
+            .get("Names")
+            .and_then(Object::as_ref_id)
+            .expect("/Names indirect after rebuild");
+        let names_after = pdf
+            .resolve(names_ref)
+            .expect("resolve /Names")
+            .into_dict()
+            .expect("/Names dict");
+        assert!(
+            names_after.get("Dests").is_some(),
+            "the inline /Dests sibling must survive the rebuild"
+        );
+        assert!(
+            names_after.get("EmbeddedFiles").is_some(),
+            "/EmbeddedFiles must be written into the /Names dict"
+        );
+    }
+
+    // ── Test: empty rebuild with a *direct* (inline) /Names dict + sibling ────
+    //
+    // When /Names is an inline dict that directly holds both /EmbeddedFiles and a
+    // surviving sibling (/Dests), removing the last attachment must drop
+    // /EmbeddedFiles and rewrite the catalog with the trimmed inline dict.
+    #[test]
+    fn empty_rebuild_with_direct_names_dict_and_sibling() {
+        let mut pdf = open_minimal();
+
+        // First build a real /EmbeddedFiles tree via the helper (indirect /Names).
+        let fs_ref = FileSpecBuilder::new("only2.txt", b"only2 payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"only2.txt", fs_ref).expect("insert");
+
+        // Inline that names dict directly into the catalog (and add /Dests), so
+        // the catalog reaches /EmbeddedFiles through a *direct* /Names dict.
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog
+            .get("Names")
+            .and_then(Object::as_ref_id)
+            .expect("/Names indirect after insert");
+        let mut names = pdf
+            .resolve(names_ref)
+            .expect("resolve /Names")
+            .into_dict()
+            .expect("/Names dict");
+        names.insert("Dests", Object::Dictionary(Dictionary::new()));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        pdf.delete_object(names_ref); // old indirect names dict no longer used
+
+        // Remove the only attachment → empty rebuild over the direct /Names dict.
+        let removed = remove_attachment(&mut pdf, b"only2.txt").expect("remove only2");
+        assert!(removed, "remove_attachment must return true");
+
+        // /Names stays an inline dict on the catalog: /EmbeddedFiles dropped,
+        // /Dests preserved.
+        let catalog_after = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog after")
+            .into_dict()
+            .expect("catalog dict after");
+        let names_after = catalog_after
+            .get("Names")
+            .and_then(Object::as_dict)
+            .expect("/Names must remain a direct dict");
+        assert!(
+            names_after.get("Dests").is_some(),
+            "the /Dests sibling must survive the empty rebuild"
+        );
+        assert!(
+            names_after.get("EmbeddedFiles").is_none(),
+            "/EmbeddedFiles must be removed after the last attachment is gone"
+        );
     }
 }

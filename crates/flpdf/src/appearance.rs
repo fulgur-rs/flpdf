@@ -152,11 +152,11 @@ pub(crate) fn install_normal_appearance<R: Read + Seek>(
         }
     };
 
-    let mut ap_dict = match widget_dict.get("AP").cloned() {
-        Some(Object::Dictionary(d)) => d,
+    let mut ap_dict = match widget_dict.get("AP") {
+        Some(Object::Dictionary(d)) => d.clone(),
         // `/AP` may be stored behind a holder chain (`ref → ref → dict`); follow
         // it to the terminal dict so a pre-existing `/AP/D`/`/AP/R` is preserved.
-        Some(Object::Reference(r)) => resolve_ref_chain(pdf, &Object::Reference(r))?
+        Some(value @ Object::Reference(_)) => resolve_ref_chain(pdf, value)?
             .0
             .into_dict()
             .unwrap_or_default(),

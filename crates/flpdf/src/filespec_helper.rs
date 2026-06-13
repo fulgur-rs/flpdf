@@ -1183,12 +1183,12 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
         // ── Step 2: resolve /EF sub-dictionary ───────────────────────────────
         let ef_dict: Dictionary = match fs_dict.get("EF") {
             Some(Object::Dictionary(d)) => d.clone(),
-            Some(Object::Reference(r)) => {
+            Some(value @ Object::Reference(_)) => {
                 // /EF may be reached through more than one indirect hop
                 // (ref -> ref -> dict); follow the chain to its terminal.
                 // Matching on the whole `Result` keeps a malformed/dangling
                 // chain a skip rather than aborting the whole copy.
-                match resolve_ref_chain(source, &Object::Reference(*r)) {
+                match resolve_ref_chain(source, value) {
                     Ok((Object::Dictionary(d), _)) => d,
                     _ => continue, // skip: cannot resolve /EF
                 }
@@ -1202,14 +1202,12 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
         let mut ef_stream: Stream = {
             let mut found = None;
             for k in &["UF", "F", "Unix", "Mac", "DOS"] {
-                if let Some(Object::Reference(r)) = ef_dict.get(k) {
+                if let Some(value @ Object::Reference(_)) = ef_dict.get(k) {
                     // A candidate stream may be reached through more than one
                     // indirect hop (ref -> ref -> stream); follow the chain to
                     // its terminal. Matching on the whole `Result` keeps a
                     // malformed/dangling chain a skip rather than aborting.
-                    if let Ok((Object::Stream(s), _)) =
-                        resolve_ref_chain(source, &Object::Reference(*r))
-                    {
+                    if let Ok((Object::Stream(s), _)) = resolve_ref_chain(source, value) {
                         found = Some(s);
                         break;
                     }
