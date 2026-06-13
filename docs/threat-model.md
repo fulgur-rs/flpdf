@@ -96,14 +96,17 @@ are not treated as vulnerabilities on their own:
   and complex, so flpdf imposes no global memory or time limits in normal
   operation. In particular, today:
   - stream decoding (`FlateDecode`, `LZWDecode`, …) places no cap on output
-    size, so a compression bomb can exhaust memory;
-  - `/Filter` chains have no length limit, allowing multiplicative
-    expansion across stages;
+    size **by default**, so a compression bomb can exhaust memory;
   - some operations read the whole file or whole streams into memory.
   Callers that process untrusted input should run flpdf under external
   resource limits (container memory limits, `ulimit`/rlimits, timeouts).
-  Opt-in decode limits comparable to qpdf's `Pl_Flate::memory_limit` are
-  planned (§8).
+  Two mitigations are now offered: `/Filter` chains are always capped at 16
+  stages on the decode path (rejecting pathological multiplicative-expansion
+  chains), and an opt-in decode-output limit comparable to qpdf's
+  `Pl_Flate::setMemoryLimit` is available via `filters::DecodeLimits` /
+  `filters::decode_stream_data_with_limits` (default unbounded; embedders set
+  `max_output` to bound each `FlateDecode` / `LZWDecode` stage). flpdf's own
+  document paths still place no output cap by default.
 - **PDF permission enforcement.** Owner-password usage restrictions
   (printing, copying, …) are advisory metadata under the PDF specification.
   flpdf, like qpdf, can remove them (`--remove-restrictions`); this is a
@@ -180,7 +183,7 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | Structural ref-walkers recurse over direct array/dictionary/stream-dictionary structure with no depth cap (e.g. `page_closure::collect_refs_in_object`, `subset_prune::walk_refs`), unlike `rewrite_renumber`'s `MAX_INLINE_DEPTH`-bounded `collect_refs`; a resolved object with deeply nested direct structure can overflow the stack during page-closure copy or `--pages`/attachment GC. Currently shadowed by the parser gap (`flpdf-hn1g.1`) but independent uncapped paths; the fix is a single shared bounded walk. | (b) no panic/abort | `flpdf-hn1g.9` |
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
-| No opt-in decode-output limits and no `/Filter` chain length cap (compression bombs covered by §4, but mitigations are worth offering). | §4 mitigation | `flpdf-hn1g.4` |
+| Decode-side resource-exhaustion mitigations are now in place (was: no opt-in decode-output limit and no `/Filter` chain length cap). The decode path caps `/Filter` chains at 16 stages unconditionally, and an opt-in output limit is provided via `filters::DecodeLimits` / `decode_stream_data_with_limits` (default unbounded). Compression bombs remain out of scope by default per §4. | §4 mitigation (delivered) | `flpdf-hn1g.4` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
 ## Appendix A: attack surface inventory
