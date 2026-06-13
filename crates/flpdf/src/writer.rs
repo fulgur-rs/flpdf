@@ -4284,15 +4284,21 @@ mod tests {
         let mut placeholder = Vec::new();
         write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
 
-        // region = "<< /Probe [decoy] /ID [real] >>" — the decoy array appears
-        // before the `/ID ` token, exactly the layout a crafted classic trailer
-        // would produce (where /ID is forced last, after sorted keys).
+        // region = "<< /Before [decoy] /ID [real] /After [decoy] >>". The first
+        // decoy precedes the `/ID ` token (the classic-trailer layout, where /ID
+        // is forced last); the second FOLLOWS it (the xref-stream layout, where
+        // keys are plain-sorted and a key like /After lands after /ID). Anchoring
+        // on `/ID ` must patch only the real /ID — defeating BOTH a naive
+        // first-match (`position`) and a naive last-match (`rposition`) search.
         let mut region = Vec::new();
-        region.extend_from_slice(b"<< /Probe ");
-        let decoy_offset = region.len();
+        region.extend_from_slice(b"<< /Before ");
+        let before_offset = region.len();
         region.extend_from_slice(&placeholder);
         region.extend_from_slice(b" /ID ");
         let id_offset = region.len();
+        region.extend_from_slice(&placeholder);
+        region.extend_from_slice(b" /After ");
+        let after_offset = region.len();
         region.extend_from_slice(&placeholder);
         region.extend_from_slice(b" >>");
 
@@ -4300,17 +4306,27 @@ mod tests {
         // search is genuinely scoped from there.
         let mut bytes = b"%PDF-1.7\nbody bytes\n".to_vec();
         let region_start = bytes.len();
-        let decoy_abs = region_start + decoy_offset;
+        let before_abs = region_start + before_offset;
         let id_abs = region_start + id_offset;
+        let after_abs = region_start + after_offset;
         bytes.extend_from_slice(&region);
 
         patch_deterministic_id(&mut bytes, region_start, b"", None);
 
-        // The decoy (no `/ID ` prefix) must remain the all-zero placeholder.
+        // The decoy BEFORE /ID (no `/ID ` prefix) must remain the placeholder —
+        // a `position` (first-match) search would have wrongly patched it.
         assert_eq!(
-            &bytes[decoy_abs..decoy_abs + placeholder.len()],
+            &bytes[before_abs..before_abs + placeholder.len()],
             placeholder.as_slice(),
-            "the earlier non-/ID placeholder must not be patched"
+            "an earlier non-/ID placeholder must not be patched"
+        );
+        // The decoy AFTER /ID must also remain the placeholder — an `rposition`
+        // (last-match) search would have wrongly patched it. This is the case
+        // the `/ID `-token anchor exists to handle (xref-stream key ordering).
+        assert_eq!(
+            &bytes[after_abs..after_abs + placeholder.len()],
+            placeholder.as_slice(),
+            "a later non-/ID placeholder must not be patched"
         );
         // The real /ID must be overwritten with a non-zero computed identifier.
         assert_ne!(
