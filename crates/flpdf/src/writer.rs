@@ -2081,7 +2081,7 @@ fn push_hex_lower(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Byte length of the serialized deterministic `/ID` array value
 /// `[<id0_hex><id1_hex>]`: `[` + (`<` + 32 hex + `>`) twice + `]`.
-const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
+pub(crate) const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
 
 /// Serialize a deterministic `/ID` array of two 16-byte identifiers as the
 /// fixed-width hex form qpdf emits: `[<id0_hex><id1_hex>]`, exactly
@@ -2090,7 +2090,7 @@ const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
 /// form even when a digest happens to be all-printable, which keeps the
 /// placeholder and the final value the same length — a hard requirement for
 /// the placeholder-then-patch scheme to leave every later byte offset intact.
-fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16]) {
+pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16]) {
     out.push(b'[');
     for id in [id0, id1] {
         out.push(b'<');
@@ -2106,7 +2106,7 @@ fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16
 /// length other than 16), in which case qpdf reuses the changing identifier as
 /// the permanent one. The 16-byte constraint keeps the serialized `/ID` array
 /// at the fixed [`DETERMINISTIC_ID_ARRAY_LEN`] the patch step depends on.
-fn source_permanent_id(trailer: &Dictionary) -> Option<[u8; 16]> {
+pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<[u8; 16]> {
     match trailer.get("ID") {
         Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
             (Object::String(first), Object::String(_)) => {
@@ -2126,7 +2126,7 @@ fn source_permanent_id(trailer: &Dictionary) -> Option<[u8; 16]> {
 /// entries are skipped. `/Info`, and each value, may be an indirect reference,
 /// so both are resolved (PDF allows any value to be indirect, ISO 32000-1
 /// §7.3.10). The returned bytes are appended after `" QPDF "` to form the seed.
-fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
+pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
     let info_obj = match pdf.trailer().get("Info").cloned() {
         Some(info) => info,
         None => return Vec::new(),
@@ -2167,13 +2167,19 @@ fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
 /// Compute qpdf's two-level deterministic `/ID` from the serialized output.
 ///
 /// `bytes` is the full output with a fixed-width `/ID` placeholder already in
-/// place; `id_array_offset` points at the placeholder's opening `[`. Mirrors
-/// `QPDFWriter::computeDeterministicIDData` + `generateID`:
+/// place; `id_array_offset` is the inclusive end of the content digest range.
+/// Mirrors `QPDFWriter::computeDeterministicIDData` + `generateID`:
 ///
-/// 1. `det_data` = lowercase hex of `md5(bytes[0..=id_array_offset])` — qpdf
-///    captures the running digest immediately after writing `" /ID ["`, so the
-///    range is inclusive of the `[`. qpdf computes this body digest with
-///    `Pl_MD5`, which hashes the full byte range regardless of any embedded NUL.
+/// 1. `det_data` = lowercase hex of `md5(bytes[0..=id_array_offset])`. For the
+///    non-linearized writer this offset points at the placeholder's opening `[`,
+///    so the range is inclusive of the `[` (qpdf captures the running digest
+///    immediately after writing `" /ID ["`). The linearized writer instead
+///    passes `bytes.len() - 1` to digest the whole output, because a linearized
+///    file repeats `/ID` in several trailers/xref-stream dicts and so has no
+///    single `[` cutoff; the all-zero placeholder makes that whole-buffer digest
+///    depend only on the input, keeping it self-stable across runs. qpdf computes
+///    this body digest with `Pl_MD5`, which hashes the full byte range regardless
+///    of any embedded NUL (unlike the seed in step 3).
 /// 2. `seed` = `det_data` + `" QPDF "` + `info_suffix`.
 /// 3. `/ID[1]` (changing identifier) = `md5(seed)`, but the seed is truncated at
 ///    its first NUL byte before hashing. qpdf hashes the seed with
@@ -2184,7 +2190,7 @@ fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
 ///    first NUL onward is excluded from the changing identifier exactly as qpdf
 ///    excludes it.
 /// 4. `/ID[0]` (permanent identifier) = `source_id0` when present, else `/ID[1]`.
-fn compute_deterministic_id(
+pub(crate) fn compute_deterministic_id(
     bytes: &[u8],
     id_array_offset: usize,
     info_suffix: &[u8],
