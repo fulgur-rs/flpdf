@@ -73,7 +73,8 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     apply_stream_compress_policy, effective_pdf_version, effective_stream_policy, is_lone_flate,
-    write_stream_to_buf_qpdf_order, CompressStreams, WriteOptions, QPDF_STATIC_ID,
+    write_stream_to_buf_qpdf_order, CompressStreams, NewlineBeforeEndstream, WriteOptions,
+    QPDF_STATIC_ID,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -498,7 +499,16 @@ fn append_body_object(
     let refiltered = matches!(policy, CompressStreams::Yes)
         && !source_filter_is_lone_flate
         && is_lone_flate(s.dict.get("Filter"));
-    write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
+    // The linearized writer targets byte-identical qpdf output.  qpdf writes
+    // recompressed body streams with no newline before `endstream` (exactly
+    // `/Length` bytes between `stream` and `endstream`), regardless of its
+    // `--newline-before-endstream` flag, which only governs qpdf's plain
+    // rewrite.  `options.newline_before_endstream` therefore must not leak into
+    // this path (the CLI flag is documented as full-rewrite-only and has no
+    // route to `Never`); force `Never` so the framing matches qpdf.  The
+    // primary hint stream keeps its newline via the separate
+    // `append_hint_stream_object`, matching qpdf's hint-stream framing.
+    write_stream_to_buf_qpdf_order(bytes, s, NewlineBeforeEndstream::Never, refiltered);
     bytes.extend_from_slice(b"\nendobj\n");
     offset
 }
@@ -638,7 +648,12 @@ fn write_part1_xref_and_trailer(
     // regenerating a fresh random /ID here (as before) produced inconsistent
     // identifiers across trailers within one linearized file.
     if let Some(id_obj) = source_trailer.get("ID") {
-        bytes.extend_from_slice(b" /ID ");
+        // No separator space before `/ID`: the fixed-width `/Prev`
+        // placeholder above is right-padded with spaces, so its trailing pad
+        // already separates the value from `/ID`.  qpdf writes `/ID` directly
+        // after that pad (field width 22), so adding a leading space here
+        // would make the Part-1 trailer one byte wider than qpdf's.
+        bytes.extend_from_slice(b"/ID ");
         id_obj.write_pdf(bytes);
     }
 
