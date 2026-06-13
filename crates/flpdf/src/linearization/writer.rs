@@ -1329,7 +1329,9 @@ fn do_write_pass<R: Read + Seek>(
         // private).  total_count = /Size (highest object number + 1), so the
         // count is `total_count − param_slot`.  Validate the subtraction to
         // avoid an unsigned wrap if a future plan ever puts the param dict
-        // above /Size (a non-contiguous split, guarded elsewhere).
+        // above /Size (a non-contiguous split). That precondition is currently
+        // unenforced (a dedicated guard is pending a later task); the
+        // checked_sub below is the only thing preventing the wrap today.
         let first_page_count = total_count
             .checked_sub(param_dict_obj_number)
             // cov:ignore-start: defensive invariant — the param-dict object
