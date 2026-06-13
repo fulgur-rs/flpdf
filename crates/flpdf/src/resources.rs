@@ -481,13 +481,36 @@ fn resources_location<R: Read + Seek>(
             return Ok(ResourcesLoc::None);
         };
 
-        // Clone the values we need, then drop the `node_obj` borrow so the
-        // holder-chain follow below can take `&mut pdf`.
-        let resources_val = dict.get("Resources").cloned();
-        let parent_val = dict.get("Parent").cloned();
+        // Classify `/Resources` and capture the parent ref *by reference*. We
+        // only ever need a small `ObjectRef` (or a "this is an inline dict" flag)
+        // out of this borrow, so an inline `/Resources` dictionary must not be
+        // deep-cloned on this per-page hot path. The `node_obj` borrow ends once
+        // these two cheap values are extracted, freeing `&mut pdf` for the
+        // holder-chain follow below.
+        enum ResKind {
+            /// `/Resources` is an indirect reference (the holder-chain head).
+            Ref(ObjectRef),
+            /// `/Resources` is an inline (direct) dictionary.
+            Inline,
+            /// `/Resources` is absent or null — inherit from the parent.
+            Absent,
+            /// `/Resources` is present but neither a reference, dict, nor null —
+            /// nothing prunable.
+            Other,
+        }
+        let res_kind = match dict.get("Resources") {
+            Some(Object::Reference(r)) => ResKind::Ref(*r),
+            Some(Object::Dictionary(_)) => ResKind::Inline,
+            Some(Object::Null) | None => ResKind::Absent,
+            _ => ResKind::Other,
+        };
+        let parent_ref: Option<ObjectRef> = match dict.get("Parent") {
+            Some(Object::Reference(p)) => Some(*p),
+            _ => None,
+        };
 
-        match resources_val {
-            Some(rv @ Object::Reference(_)) => {
+        match res_kind {
+            ResKind::Ref(r) => {
                 // Collapse the holder chain (`a 0 R → b 0 R → <<dict>>`) to its
                 // terminal so every `ResourcesLoc::Indirect` consumer (grouping,
                 // ref-counting, pruning) keys on the terminal — the same dict the
@@ -496,17 +519,17 @@ fn resources_location<R: Read + Seek>(
                 // resolve a ref-to-a-ref, see a non-dict, and silently skip
                 // pruning. A single-hop ref's terminal is itself, so this
                 // preserves the prior result for that case.
-                let (terminal_obj, terminal_ref) = resolve_ref_chain(pdf, &rv)?;
+                let (terminal_obj, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
                 match terminal_obj {
                     // A chain resolving to null is "absent" (PDF §7.3.9): fall
-                    // through to the parent, matching the direct-null arm and the
+                    // through to the parent, matching the `Absent` arm and the
                     // read side. Returning `Indirect(terminal)` would key this
                     // page's used names on the null ref while it renders from the
                     // inherited parent dict, so the parent could be pruned against
                     // only the other pages' names and lose this page's resources.
-                    Object::Null => match parent_val {
-                        Some(Object::Reference(parent)) => current = parent,
-                        _ => return Ok(ResourcesLoc::None),
+                    Object::Null => match parent_ref {
+                        Some(parent) => current = parent,
+                        None => return Ok(ResourcesLoc::None),
                     },
                     Object::Dictionary(_) => {
                         return Ok(terminal_ref.map_or(ResourcesLoc::None, ResourcesLoc::Indirect));
@@ -516,7 +539,7 @@ fn resources_location<R: Read + Seek>(
                     _ => return Ok(ResourcesLoc::None),
                 }
             }
-            Some(Object::Dictionary(_)) => {
+            ResKind::Inline => {
                 // Inline dict: distinguish page-level vs ancestor.
                 if current == page_ref {
                     return Ok(ResourcesLoc::PageInline);
@@ -524,16 +547,12 @@ fn resources_location<R: Read + Seek>(
                     return Ok(ResourcesLoc::AncestorInline(current));
                 }
             }
-            Some(Object::Null) | None => {
+            ResKind::Absent => match parent_ref {
                 // Fall through to parent.
-                match parent_val {
-                    Some(Object::Reference(parent)) => {
-                        current = parent;
-                    }
-                    _ => return Ok(ResourcesLoc::None),
-                }
-            }
-            _ => return Ok(ResourcesLoc::None),
+                Some(parent) => current = parent,
+                None => return Ok(ResourcesLoc::None),
+            },
+            ResKind::Other => return Ok(ResourcesLoc::None),
         }
     }
 }
@@ -1494,6 +1513,32 @@ mod tests {
         let bytes = build_page_with_resources_carrier_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 4 0 R >>",
             "42",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
+        assert_eq!(loc, ResourcesLoc::None);
+    }
+
+    // Edge: /Resources is a *direct* non-dict, non-reference value (here an
+    // integer) — the `ResKind::Other` arm; nothing prunable, location is None.
+    #[test]
+    fn resources_location_direct_non_dict_is_none() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 42 >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
+        assert_eq!(loc, ResourcesLoc::None);
+    }
+
+    // Edge: no /Resources anywhere and no /Parent to walk to — the `ResKind::Absent`
+    // arm with no parent ref; location is None.
+    #[test]
+    fn resources_location_absent_without_parent_is_none() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
