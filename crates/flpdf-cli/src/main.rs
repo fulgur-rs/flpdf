@@ -14,8 +14,8 @@ use flpdf::{
     SIG_FLAGS_SIGNATURES_EXIST,
 };
 use flpdf::{
-    check_reader_with_options, enumerate_document_annotations, filters, flatten_annotations,
-    flatten_rotation_on_pages, fonts, generate_button_field_appearance,
+    check_reader_with_options_and_limits, enumerate_document_annotations, filters,
+    flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
         build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
@@ -148,6 +148,11 @@ struct Cli {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
+    /// Bound each page content stream's decoded output to BYTES during `--check`
+    /// (opt-in decompression-bomb guard). Absent = unlimited (qpdf's default).
+    /// A stream exceeding the cap is a warning (exit 3), not an error.
+    #[arg(long = "decode-memory-limit", value_name = "BYTES")]
+    decode_memory_limit: Option<usize>,
     #[arg(long)]
     dump_object: Option<String>,
     #[arg(long)]
@@ -740,6 +745,11 @@ struct CheckCommand {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
+    /// Bound each page content stream's decoded output to BYTES (opt-in
+    /// decompression-bomb guard). Absent = unlimited. Exceeding the cap is a
+    /// warning (exit 3), not an error.
+    #[arg(long = "decode-memory-limit", value_name = "BYTES")]
+    decode_memory_limit: Option<usize>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -1348,7 +1358,14 @@ fn main() {
     } else if args.show_pages {
         run_show_pages(args.input, args.repair, &args.password)
     } else if args.check {
-        run_check(args.input, args.repair, &args.password)
+        run_check(
+            args.input,
+            args.repair,
+            &args.password,
+            filters::DecodeLimits {
+                max_output: args.decode_memory_limit,
+            },
+        )
     } else if args.list_attachments {
         run_list_attachments(args.input, args.repair, &args.password, args.verbose)
     } else if let Some(key) = args.show_attachment {
@@ -1787,7 +1804,14 @@ fn collect_datafile_object_refs(v2: &flpdf::json::JsonValue) -> Vec<ObjectRef> {
 
 fn run_command(command: Commands) -> CliResult<()> {
     match command {
-        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password),
+        Commands::Check(cmd) => run_check(
+            Some(cmd.input),
+            cmd.repair,
+            &cmd.password,
+            filters::DecodeLimits {
+                max_output: cmd.decode_memory_limit,
+            },
+        ),
         Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
             Ok(()) => {
                 println!("linearization OK");
@@ -2043,11 +2067,16 @@ fn run_command(command: Commands) -> CliResult<()> {
     }
 }
 
-fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+fn run_check(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    decode_limits: filters::DecodeLimits,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
-    let report = check_reader_with_options(BufReader::new(file), options)
+    let report = check_reader_with_options_and_limits(BufReader::new(file), options, decode_limits)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     for diagnostic in report.diagnostics.entries() {
         let location = diagnostic_location(&input, diagnostic.offset);
