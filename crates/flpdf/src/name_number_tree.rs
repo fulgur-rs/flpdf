@@ -280,16 +280,24 @@ where
     let mut dict: Dictionary = match node {
         Object::Dictionary(d) => d,
         Object::Reference(r) => {
-            if !visited.insert(r) {
-                return Ok(()); // cycle — skip
-            }
             // A /Kids node ref may be a holder chain (`r → r2 → node dict`);
             // follow it to the terminal so a doubled-indirect kid is descended,
             // not dropped. Holder hops are bounded by resolve_ref_chain's own
             // MAX_REF_CHAIN_DEPTH — a separate axis from the /Kids `visited` /
             // `depth` guards (kept as-is). `into_dict` takes the terminal by
             // value, so no extra clone over the prior `as_dict().clone()`.
-            match resolve_ref_chain(pdf, &Object::Reference(r))?.0.into_dict() {
+            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+            // Dedup on the *terminal* ref, not the holder `r`: two distinct
+            // holders (`21 0 R`, `22 0 R`) resolving to one terminal node are
+            // the holder-form of a direct `[20 0 R 20 0 R]` dup, which the
+            // visited set already collapses. Keying on `r` would walk that
+            // shared child twice and emit duplicate name/number-tree entries.
+            // (terminal_ref is always Some for a Reference start; fall back to
+            // `r` defensively.)
+            if !visited.insert(terminal_ref.unwrap_or(r)) {
+                return Ok(()); // already walked this terminal node / cycle — skip
+            }
+            match terminal.into_dict() {
                 Some(d) => d,
                 None => return Ok(()), // malformed / non-dict node — skip
             }
@@ -500,6 +508,50 @@ mod tests {
             DEFAULT_MAX_TREE_DEPTH,
         )
         .unwrap();
+        assert_eq!(out, vec![(b"k".to_vec(), ObjectRef::new(99, 0))]);
+    }
+
+    #[test]
+    fn read_name_tree_dedups_distinct_holders_to_same_terminal() {
+        // Two distinct holder refs (21, 22) both resolve to the same terminal
+        // leaf node (20). This is the holder-form of a direct `[20 0 R 20 0 R]`
+        // duplicate: the shared child must be walked once, not once per holder.
+        // Keying `visited` on the holder ref would emit the leaf entry twice.
+        let mut pdf = empty_pdf();
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"k".to_vec()),
+                Object::Reference(ObjectRef::new(99, 0)),
+            ]),
+        );
+        pdf.set_object(ObjectRef::new(20, 0), Object::Dictionary(leaf));
+        // Holders 21 and 22 are bare references to the same terminal node 20.
+        pdf.set_object(
+            ObjectRef::new(21, 0),
+            Object::Reference(ObjectRef::new(20, 0)),
+        );
+        pdf.set_object(
+            ObjectRef::new(22, 0),
+            Object::Reference(ObjectRef::new(20, 0)),
+        );
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(21, 0)),
+                Object::Reference(ObjectRef::new(22, 0)),
+            ]),
+        );
+        let out = read_name_tree(
+            &mut pdf,
+            Object::Dictionary(root),
+            ref_only,
+            DEFAULT_MAX_TREE_DEPTH,
+        )
+        .unwrap();
+        // Exactly one entry: the second holder collapses onto the terminal ref.
         assert_eq!(out, vec![(b"k".to_vec(), ObjectRef::new(99, 0))]);
     }
 
