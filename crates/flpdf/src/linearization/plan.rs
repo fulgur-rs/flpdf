@@ -229,7 +229,7 @@ fn compute_closure<R: Read + Seek>(
                             }
                         }
                     }
-                }
+                } // cov:ignore: llvm-cov attributes 0 to this `if is_page_leaf` closing brace; the block body (the /Resources DFS) runs and is covered above.
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
                         // Pages → sibling pages — never follow.

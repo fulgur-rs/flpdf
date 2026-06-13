@@ -1398,7 +1398,7 @@ fn do_write_pass<R: Read + Seek>(
             let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
             xref_offsets.insert(catalog_new_ref.number, offset);
             catalog_emitted_early = true;
-        }
+        } // cov:ignore: llvm-cov attributes 0 to this `if let` closing brace; the block body (catalog emit) runs and is covered above.
     }
 
     // Hint stream object
