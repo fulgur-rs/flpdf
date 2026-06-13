@@ -97,19 +97,19 @@ fn assert_linearize_byte_identical(fixture: &str, stem: &str) {
 }
 
 #[test]
-#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-9hc.13.11."]
+#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-wb76."]
 fn one_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("one-page.pdf", "one-page");
 }
 
 #[test]
-#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-9hc.13.11."]
+#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-wb76."]
 fn two_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("two-page.pdf", "two-page");
 }
 
 #[test]
-#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-9hc.13.11."]
+#[ignore = "blocked on qpdf-internal deterministic /ID[1] divergence (qpdf hashes its first-pass placeholder buffer; not reproducible from final bytes). Structural byte-parity IS verified by the *_structurally_byte_identical_* tests. See docs/qpdf-compat-decisions.md (flpdf-9hc.13.10) and beads flpdf-wb76."]
 fn three_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("three-page.pdf", "three-page");
 }
