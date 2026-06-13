@@ -70,11 +70,6 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 /// a ceiling on total output: a later non-decompressing stage (e.g. a
 /// `RunLengthDecode` following a bounded `FlateDecode`) is not itself capped and
 /// can re-expand its input.
-///
-/// This struct is `#[non_exhaustive]`: construct it from
-/// [`DecodeLimits::default`] and set the fields you need, so adding future limit
-/// options stays backward compatible.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeLimits {
     /// Maximum decompressed byte count permitted out of any single
