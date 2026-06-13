@@ -6,6 +6,7 @@
 //! delegated to [`crate::name_number_tree`].
 
 use crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -277,7 +278,14 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             |pdf, v| {
                 let dict = match v {
                     Object::Dictionary(d) => Some(d),
-                    Object::Reference(r) => pdf.resolve_borrowed(r)?.as_dict().cloned(),
+                    Object::Reference(r) => {
+                        // A label-range value may be stored behind a holder
+                        // chain (ref -> ref -> dict); follow the chain to its
+                        // terminal rather than a single hop, then move the
+                        // owned dictionary out.
+                        let (terminal, _) = resolve_ref_chain(pdf, &Object::Reference(r))?;
+                        terminal.into_dict()
+                    }
                     _ => None,
                 };
                 match dict {
