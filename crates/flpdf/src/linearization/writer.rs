@@ -1365,6 +1365,25 @@ fn do_write_pass<R: Read + Seek>(
         0..0
     };
 
+    // Catalog (qpdf `lc_root`).  On the classic (non-ObjStm) path qpdf emits
+    // the document catalog at the very start of the first-page section —
+    // physically before the primary hint stream and the page objects — so the
+    // first-page region is numbered in ascending order (Catalog, Hint, Page,
+    // Resources, ...).  Emitting it here (rather than in the Part-5 remaining
+    // body after /E) is what aligns flpdf's physical layout with qpdf's.  The
+    // ObjStm path keeps the catalog in the Part-4 body (its split-xref layout
+    // relocates the tail differently), so only the classic path moves it.
+    let mut catalog_emitted_early = false;
+    if objstm_layout.is_empty() {
+        if let Some(catalog_orig) = plan.root_ref {
+            let object = pdf.resolve_borrowed(catalog_orig)?;
+            let renumbered = renumber_object(object, 0, renumber)?;
+            let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
+            xref_offsets.insert(catalog_new_ref.number, offset);
+            catalog_emitted_early = true;
+        }
+    }
+
     // Hint stream object
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
     let hint_stream_offset = append_hint_stream_object(
@@ -1434,11 +1453,29 @@ fn do_write_pass<R: Read + Seek>(
     // ObjStm containers.
     let end_of_first_page_offset = bytes.len();
 
-    // Part 5 (Annex F): remaining body — derived view of all Part-4
-    // sub-partitions in writer-emission order.  ObjStm members are skipped
-    // here and emitted via their Part-4 container below.
-    for original_ref in &plan.part4_objects() {
+    // Part 5 (Annex F): remaining body.  qpdf emits the objects that follow
+    // /E (the Pages tree, Info, and any other tail objects) in ascending
+    // new-number order.  On the classic path we therefore sort the Part-4
+    // refs by their renumbered object number; part7/part8 are already in
+    // number order, so this only reorders `part4_rest`.  The catalog, when it
+    // was emitted early in the first-page section above, is skipped here so it
+    // is not written twice.  ObjStm members are skipped and emitted via their
+    // Part-4 container below.  The ObjStm path retains the writer-emission
+    // order of `part4_objects()` (its split-xref tail relocation depends on it).
+    let mut part4_refs = plan.part4_objects();
+    if objstm_layout.is_empty() {
+        part4_refs.sort_by_key(|r| {
+            renumber
+                .new_for_original(*r)
+                .map(|nr| nr.number)
+                .unwrap_or(u32::MAX)
+        });
+    }
+    for original_ref in &part4_refs {
         if objstm_layout.member_to_container.contains_key(original_ref) {
+            continue;
+        }
+        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
             continue;
         }
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
