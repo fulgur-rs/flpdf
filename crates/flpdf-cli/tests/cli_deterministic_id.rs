@@ -246,6 +246,81 @@ fn deterministic_id_is_honored_in_page_ops_pipeline() {
 }
 
 #[test]
+fn deterministic_id_honored_in_split_pages() {
+    // qpdf applies the deterministic-ID policy to every --split-pages output;
+    // flpdf threads it into the chunk writer, so each chunk is byte-stable.
+    let tmp = tempdir().expect("tempdir");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::create_dir_all(&a).expect("mkdir a");
+    std::fs::create_dir_all(&b).expect("mkdir b");
+    let input = fixture_path("three-page.pdf");
+
+    for dir in [&a, &b] {
+        CargoCommand::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg("--deterministic-id")
+            .arg(&input)
+            .arg("--split-pages")
+            .arg("--")
+            .arg(dir.join("out.pdf"))
+            .assert()
+            .success();
+    }
+
+    assert_eq!(
+        std::fs::read(a.join("out-1.pdf")).expect("chunk a"),
+        std::fs::read(b.join("out-1.pdf")).expect("chunk b"),
+        "split chunk must be byte-stable under --deterministic-id"
+    );
+}
+
+#[test]
+fn deterministic_id_honored_in_add_attachment() {
+    // qpdf applies --deterministic-id to attachment writes too; flpdf threads it
+    // into run_add_attachment, so the output is byte-stable across runs.
+    let tmp = tempdir().expect("tempdir");
+    let att = tmp.path().join("payload.txt");
+    std::fs::write(&att, b"attachment payload").expect("write attachment");
+    let input = fixture_path("three-page.pdf");
+    let o1 = tmp.path().join("a.pdf");
+    let o2 = tmp.path().join("b.pdf");
+
+    for out in [&o1, &o2] {
+        CargoCommand::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg("--deterministic-id")
+            .arg("--add-attachment")
+            .arg(&att)
+            .arg("--")
+            .arg(&input)
+            .arg(out)
+            .assert()
+            .success();
+    }
+
+    assert_eq!(
+        std::fs::read(&o1).expect("read a"),
+        std::fs::read(&o2).expect("read b"),
+        "add-attachment output must be byte-stable under --deterministic-id"
+    );
+}
+
+#[test]
+fn deterministic_id_accepted_with_check_like_qpdf() {
+    // qpdf accepts `--check --deterministic-id` (the flag is moot for an
+    // inspection that writes nothing — not an error). flpdf matches qpdf and
+    // does NOT reject the combination.
+    let input = fixture_path("one-page.pdf");
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--check", "--deterministic-id"])
+        .arg(&input)
+        .assert()
+        .success();
+}
+
+#[test]
 fn deterministic_id_top_level_alias_is_stable() {
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");

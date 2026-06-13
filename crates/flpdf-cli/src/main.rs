@@ -1360,7 +1360,14 @@ fn main() {
             args.show_attachment_to,
         )
     } else if let Some(key) = args.remove_attachment {
-        run_remove_attachment(args.input, args.output, args.repair, &args.password, &key)
+        run_remove_attachment(
+            args.input,
+            args.output,
+            args.repair,
+            &args.password,
+            &key,
+            args.deterministic_id,
+        )
     } else if !args.add_attachment.is_empty() {
         run_add_attachment(
             args.input,
@@ -1368,6 +1375,7 @@ fn main() {
             args.repair,
             &args.password,
             args.add_attachment,
+            args.deterministic_id,
         )
     } else if !args.copy_attachments_from.is_empty() {
         run_copy_attachments_from(
@@ -1376,6 +1384,7 @@ fn main() {
             args.repair,
             &args.password,
             args.copy_attachments_from,
+            args.deterministic_id,
         )
     } else if args.linearize {
         // --linearize is incompatible with the page-extraction pipeline:
@@ -3233,7 +3242,7 @@ fn run_page_extraction(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output)?;
+        split_pages(&bytes, n, output, options.deterministic_id)?;
     } else {
         std::fs::write(output, &bytes)?;
     }
@@ -3317,7 +3326,7 @@ fn run_rewrite_with_page_ops(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output)?;
+        split_pages(&bytes, n, output, options.deterministic_id)?;
     } else {
         std::fs::write(output, &bytes)?;
     }
@@ -4275,6 +4284,7 @@ fn run_add_attachment(
     repair: bool,
     password: &PasswordArgs,
     tokens: Vec<String>,
+    deterministic_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
@@ -4331,6 +4341,7 @@ fn run_add_attachment(
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.deterministic_id = deterministic_id;
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut pdf, &mut out, &options)?;
     Ok(())
@@ -4343,6 +4354,7 @@ fn run_remove_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &str,
+    deterministic_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
@@ -4357,6 +4369,7 @@ fn run_remove_attachment(
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.deterministic_id = deterministic_id;
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut pdf, &mut out, &options)?;
     Ok(())
@@ -4410,6 +4423,7 @@ fn run_copy_attachments_from(
     repair: bool,
     password: &PasswordArgs,
     tokens: Vec<String>,
+    deterministic_id: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
@@ -4435,6 +4449,7 @@ fn run_copy_attachments_from(
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.deterministic_id = deterministic_id;
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut target, &mut out, &options)?;
     Ok(())
