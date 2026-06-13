@@ -399,6 +399,33 @@ fn fields_walks_acroform_field_tree() {
     assert_eq!(fields, vec![ObjectRef::new(5, 0), ObjectRef::new(6, 0)]);
 }
 
+// A `/Fields` array carrier stored as a holder chain (`6 0 R → 7 0 R → [4 0 R]`)
+// must still yield its top-level field. A one-hop carrier resolve returns the
+// inner `Reference` (not an `Array`) and dropped every field; the chain resolve
+// follows to the terminal array. Exercised through the public `fields()` entry,
+// which routes the carrier through the same `resolve_array_value` as
+// `top_level_fields`; field 4 is a leaf (`/FT /Tx`, no `/Kids`) so the walked
+// result is the carrier's single top-level field.
+#[test]
+fn fields_follows_holder_chain_carrier() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /T (f1) /FT /Tx >>"),
+            // Holder chain carrier: AcroForm /Fields 6 0 R -> 7 0 R -> [4 0 R].
+            (6, "7 0 R"),
+            (7, "[4 0 R]"),
+            (8, "<< /Fields 6 0 R >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+    let fields = pdf.acroform().fields().unwrap();
+    assert_eq!(fields, vec![ObjectRef::new(4, 0)]);
+}
+
 #[test]
 fn field_infos_materialize_inherited_values_and_full_names() {
     let bytes = inherited_field_info_pdf();
