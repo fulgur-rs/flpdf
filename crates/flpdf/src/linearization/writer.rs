@@ -500,7 +500,7 @@ fn append_body_object(
         && !source_filter_is_lone_flate
         && is_lone_flate(s.dict.get("Filter"));
     // The linearized writer targets byte-identical qpdf output.  qpdf writes
-    // recompressed body streams with no newline before `endstream` (exactly
+    // policy-driven body streams with no newline before `endstream` (exactly
     // `/Length` bytes between `stream` and `endstream`), regardless of its
     // `--newline-before-endstream` flag, which only governs qpdf's plain
     // rewrite.  `options.newline_before_endstream` therefore must not leak into
