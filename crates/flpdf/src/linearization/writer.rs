@@ -680,17 +680,28 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// file-scoped, so all three must carry the *same* value. The identifier is
 /// computed once from a single MD5 over the whole buffer (the placeholder is
 /// all-zero, so this digest depends only on the input and is stable across
-/// runs), then written into every placeholder window. Because the replacement
-/// is the same width as the placeholder, no byte offset shifts and the digest
-/// is never recomputed (the operation is acyclic).
+/// runs). Because the replacement is the same width as the placeholder, no
+/// byte offset shifts and the digest is never recomputed (the operation is
+/// acyclic).
+///
+/// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
+/// spans of the sections that actually emit a `/ID` (collected by the writer as
+/// it lays them down). Scanning the whole buffer would corrupt the output if a
+/// content stream, string, or metadata object happened to contain the same
+/// fixed-width placeholder byte sequence; restricting the search to the known
+/// `/ID` sections makes that misfire impossible. The digest still covers the
+/// whole buffer, so the identifier remains a content fingerprint.
 ///
 /// # Panics
 ///
-/// Panics (via `debug_assert!`) in debug builds if no placeholder is found —
-/// an internal invariant, since [`finalize_linearized_id`] installs the
-/// placeholder on every `/ID` site whenever `deterministic_id` is set.
+/// Panics (via `debug_assert!`) in debug builds if any `/ID` range does not
+/// contain exactly one placeholder — an internal invariant, since
+/// [`finalize_linearized_id`] installs exactly one placeholder per `/ID` site
+/// whenever `deterministic_id` is set, and the writer records one range per
+/// emitted site.
 fn patch_linearized_deterministic_id(
     bytes: &mut [u8],
+    id_ranges: &[std::ops::Range<usize>],
     info_suffix: &[u8],
     source_id0: Option<[u8; 16]>,
 ) {
@@ -701,6 +712,7 @@ fn patch_linearized_deterministic_id(
     // Compute the identifier once over the placeholder-bearing buffer. There is
     // no single `[` cutoff (the array recurs at several sites), so the whole
     // buffer is the digest range: pass the last index as the inclusive end.
+    // (Digest stays global so body-content changes still alter the /ID.)
     let (id0, id1) = compute_deterministic_id(bytes, bytes.len() - 1, info_suffix, source_id0);
 
     let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
@@ -708,21 +720,30 @@ fn patch_linearized_deterministic_id(
     let mut final_id = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
     write_deterministic_id_array(&mut final_id, &id0, &id1);
 
-    let mut patched = 0usize;
-    let mut i = 0usize;
-    while i + DETERMINISTIC_ID_ARRAY_LEN <= bytes.len() {
-        if &bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN] == placeholder.as_slice() {
-            bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN].copy_from_slice(&final_id);
-            patched += 1;
-            i += DETERMINISTIC_ID_ARRAY_LEN;
-        } else {
-            i += 1;
+    // Patch each known `/ID` section in isolation. Body bytes outside these
+    // spans are never inspected, so a placeholder-shaped byte run in user data
+    // can never be mistaken for a `/ID`.
+    for range in id_ranges {
+        // Clamp defensively: a recorded range must lie within the buffer.
+        let start = range.start.min(bytes.len());
+        let end = range.end.min(bytes.len());
+        let mut patched = 0usize;
+        let mut i = start;
+        while i + DETERMINISTIC_ID_ARRAY_LEN <= end {
+            if &bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN] == placeholder.as_slice() {
+                bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN].copy_from_slice(&final_id);
+                patched += 1;
+                i += DETERMINISTIC_ID_ARRAY_LEN;
+            } else {
+                i += 1;
+            }
         }
+        debug_assert_eq!(
+            patched, 1,
+            "each /ID section must contain exactly one deterministic /ID placeholder \
+             (0 or >1 indicates a linearization writer bug)"
+        );
     }
-    debug_assert!(
-        patched >= 1,
-        "deterministic-id linearized output must contain at least one /ID placeholder"
-    );
 }
 
 /// Emit the **first-page (Part-1) cross-reference stream** at its proper
@@ -1017,12 +1038,13 @@ fn do_write_pass<R: Read + Seek>(
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
-    usize,                  // hint_stream_offset
-    usize,                  // hint_stream_obj_total_len
-    usize,                  // end_of_first_page_offset
-    usize,                  // last_xref_offset (xref keyword position)
-    usize,                  // last_xref_first_entry_offset (= /T value per qpdf's convention)
-    std::ops::Range<usize>, // first_trailer_prev_range
+    usize,                       // hint_stream_offset
+    usize,                       // hint_stream_obj_total_len
+    usize,                       // end_of_first_page_offset
+    usize,                       // last_xref_offset (xref keyword position)
+    usize,                       // last_xref_first_entry_offset (= /T value per qpdf's convention)
+    std::ops::Range<usize>,      // first_trailer_prev_range
+    Vec<std::ops::Range<usize>>, // id_ranges: absolute spans of every /ID-bearing section
 )> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1055,7 +1077,14 @@ fn do_write_pass<R: Read + Seek>(
     // `/Prev` range tells the back-patcher there is no classic Part-1 trailer
     // `/Prev` to patch.
     let mut first_page_xref_patch: Option<FirstPageXrefPatch> = None;
+    // Absolute byte spans of every section that carries a `/ID`.  The
+    // deterministic-`/ID` back-patch scans *only* inside these spans so it can
+    // never overwrite a body byte sequence that happens to equal the all-zero
+    // `/ID` placeholder (see `patch_linearized_deterministic_id`).  Each span is
+    // captured as `start..bytes.len()` around the call that emits its `/ID`.
+    let mut id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let first_trailer_prev_range = if objstm_layout.is_empty() {
+        let section_start = bytes.len();
         let (_p1_xref_offset, range) = write_part1_xref_and_trailer(
             &mut bytes,
             param_dict_absolute_offset,
@@ -1065,8 +1094,11 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
         );
+        // Part-1 trailer is the sole `/ID` site on the classic table path.
+        id_ranges.push(section_start..bytes.len());
         range
     } else {
+        let section_start = bytes.len();
         let patch = write_first_page_xref_stream(
             &mut bytes,
             relocation,
@@ -1075,6 +1107,11 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
         )?;
+        // First-page xref stream object carries one `/ID` (the main xref
+        // stream below carries the second).  `patch_first_page_xref` later
+        // overwrites only this object's entry payload (after the dict `/ID`),
+        // length-preservingly, so the span stays valid.
+        id_ranges.push(section_start..bytes.len());
         first_page_xref_patch = Some(patch);
         0..0
     };
@@ -1208,6 +1245,7 @@ fn do_write_pass<R: Read + Seek>(
              /E ({end_of_first_page_offset}) — linearization boundary violated"
         );
 
+        let main_section_start = bytes.len();
         let result = write_main_xref_stream_and_trailer(
             &mut bytes,
             &xref_offsets,
@@ -1219,6 +1257,11 @@ fn do_write_pass<R: Read + Seek>(
             source_trailer,
             first_page_obj_offset,
         )?;
+        // Main xref stream object is the second (and last) `/ID` site on the
+        // ObjStm path.  Its span extends through the trailing
+        // `startxref`/`%%EOF` and is never touched by `patch_first_page_xref`
+        // below (which patches only the first-page region, before /E).
+        id_ranges.push(main_section_start..bytes.len());
 
         // Every downstream object offset is now known, so back-patch the
         // first-page xref's placeholder entry payload in place.  The payload
@@ -1238,6 +1281,7 @@ fn do_write_pass<R: Read + Seek>(
         last_xref_offset,
         last_xref_first_entry_offset,
         first_trailer_prev_range,
+        id_ranges,
     ))
 }
 
@@ -1497,6 +1541,7 @@ pub fn write_linearized<R: Read + Seek>(
     let mut final_last_xref_keyword_offset: usize = 0;
     let mut final_last_xref_first_entry_offset: usize = 0;
     let mut final_first_trailer_prev_range: std::ops::Range<usize> = 0..0;
+    let mut final_id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
 
     for iter in 0..max_iters {
         let (
@@ -1508,6 +1553,7 @@ pub fn write_linearized<R: Read + Seek>(
             last_xref_offset,
             last_xref_first_entry_offset,
             _probe_prev_range,
+            _probe_id_ranges,
         ) = do_write_pass(
             plan,
             renumber,
@@ -1855,6 +1901,7 @@ pub fn write_linearized<R: Read + Seek>(
                 lxr_final,
                 lxr_first_final,
                 prev_range_final,
+                id_ranges_final,
             ) = do_write_pass(
                 plan,
                 renumber,
@@ -1879,6 +1926,7 @@ pub fn write_linearized<R: Read + Seek>(
             final_last_xref_keyword_offset = lxr_final;
             final_last_xref_first_entry_offset = lxr_first_final;
             final_first_trailer_prev_range = prev_range_final;
+            final_id_ranges = id_ranges_final;
             break;
         }
     }
@@ -1898,7 +1946,12 @@ pub fn write_linearized<R: Read + Seek>(
     // content fingerprint and the final back-patched file is reproducible.
     // ------------------------------------------------------------------
     if options.deterministic_id {
-        patch_linearized_deterministic_id(&mut final_bytes, &det_id_info_suffix, det_id_source_id0);
+        patch_linearized_deterministic_id(
+            &mut final_bytes,
+            &final_id_ranges,
+            &det_id_info_suffix,
+            det_id_source_id0,
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2429,6 +2482,101 @@ mod tests {
         crate::linearization::check_linearization_bytes(&out).expect(
             "deterministic-id xref-stream linearized output must pass the linearization checker",
         );
+    }
+
+    /// Build a minimal single-page PDF whose page **content stream** embeds the
+    /// exact 70-byte all-zero deterministic-/ID placeholder literal as ordinary
+    /// body data. This is the adversarial input for the back-patch: a
+    /// whole-buffer scan would clobber this user data; a section-scoped scan
+    /// leaves it untouched.
+    fn tiny_pdf_with_placeholder_in_content() -> Vec<u8> {
+        // 70-byte placeholder identical to what `finalize_linearized_id`
+        // installs and `patch_linearized_deterministic_id` searches for.
+        let placeholder = b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        assert_eq!(placeholder.len(), DETERMINISTIC_ID_ARRAY_LEN);
+        // Embed it inside a literal-string drawing op so it survives
+        // serialization verbatim (uncompressed content stream).
+        let mut content = Vec::new();
+        content.extend_from_slice(b"BT /F1 12 Tf (");
+        content.extend_from_slice(placeholder);
+        content.extend_from_slice(b") Tj ET\n");
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]               /Contents 4 0 R >>\nendobj\n",
+        );
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(&content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",);
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Regression: the deterministic-/ID back-patch must never overwrite a body
+    /// byte sequence that merely *looks* like the all-zero `/ID` placeholder.
+    /// The old whole-buffer scan would corrupt such content; the section-scoped
+    /// scan only rewrites the real `/ID` sites.
+    #[test]
+    fn deterministic_id_linearized_does_not_clobber_body_placeholder() {
+        let placeholder: &[u8] =
+            b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        let src = tiny_pdf_with_placeholder_in_content();
+        // Sanity: the source genuinely embeds the placeholder literal in body.
+        assert!(
+            src.windows(placeholder.len()).any(|w| w == placeholder),
+            "test fixture must embed the placeholder in body content"
+        );
+
+        let out = linearize_deterministic(&src);
+
+        // The body copy of the placeholder must survive *verbatim* — the
+        // back-patch must not have touched it.
+        assert!(
+            out.windows(placeholder.len()).any(|w| w == placeholder),
+            "body content placeholder must be preserved, not mistaken for /ID"
+        );
+
+        // The real /ID site(s) must be patched to the computed deterministic ID,
+        // all byte-equal, and free of any leftover all-zero placeholder array.
+        let ids = collect_id_arrays(&out);
+        assert!(!ids.is_empty(), "output must carry at least one /ID array");
+        let first = &ids[0];
+        assert!(
+            ids.iter().all(|id| id == first),
+            "every /ID site must be byte-equal: {ids:?}"
+        );
+        assert_eq!(first.len(), DETERMINISTIC_ID_ARRAY_LEN);
+        assert_ne!(
+            first.as_slice(),
+            placeholder,
+            "/ID must be patched away from the all-zero placeholder"
+        );
+
+        // Self-stable across runs and a valid linearized PDF.
+        let out2 = linearize_deterministic(&src);
+        assert_eq!(out, out2, "output must be byte-identical across runs");
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output must pass the linearization checker");
     }
 
     #[test]
