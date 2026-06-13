@@ -6,6 +6,7 @@
 //! depth limit, since malformed PDFs occasionally embed self-referential page trees.
 
 use crate::filters::decode_stream_data;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -157,12 +158,14 @@ fn collect_content_streams<R: Read + Seek>(
         // Direct inline stream — valid per spec (§7.8.2 note) and used in test PDFs.
         Object::Stream(s) => Ok(vec![s.clone()]),
 
-        // Indirect reference — must resolve to a stream.
+        // Indirect reference — must resolve to a stream. Follow the full holder
+        // chain (`ref → ref → stream`) so a doubly-indirect /Contents is not
+        // dropped as "not a stream".
         Object::Reference(r) => {
-            let resolved = pdf.resolve_borrowed(*r)?;
-            match resolved {
-                Object::Stream(s) => Ok(vec![s.clone()]),
-                _ => Err(Error::Unsupported(format!(
+            let stream = resolve_ref_chain(pdf, contents)?.0.into_stream();
+            match stream {
+                Some(s) => Ok(vec![s]),
+                None => Err(Error::Unsupported(format!(
                     "/Contents reference {r} on page {page_ref} does not resolve to a stream"
                 ))),
             }
@@ -173,17 +176,16 @@ fn collect_content_streams<R: Read + Seek>(
             let mut streams = Vec::with_capacity(elems.len());
             for elem in elems {
                 match elem {
-                    Object::Reference(r) => {
-                        let resolved = pdf.resolve_borrowed(*r)?;
-                        match resolved {
-                            Object::Stream(s) => streams.push(s.clone()),
-                            _ => {
-                                return Err(Error::Unsupported(format!(
-                                    "/Contents array element {r} on page {page_ref} does not resolve to a stream"
-                                )));
-                            }
+                    // Follow the full holder chain per element so a doubly-indirect
+                    // array entry (`ref → ref → stream`) is not dropped.
+                    Object::Reference(r) => match resolve_ref_chain(pdf, elem)?.0.into_stream() {
+                        Some(s) => streams.push(s),
+                        None => {
+                            return Err(Error::Unsupported(format!(
+                                "/Contents array element {r} on page {page_ref} does not resolve to a stream"
+                            )));
                         }
-                    }
+                    },
                     Object::Stream(s) => streams.push(s.clone()),
                     other => {
                         let type_name = object_type_name(other);
@@ -308,17 +310,16 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     let mut new_dict: Option<Dictionary> = None;
     for (i, elem) in refs.iter().enumerate() {
         let stream: Stream = match elem {
-            Object::Reference(r) => {
-                let resolved = pdf.resolve_borrowed(*r)?;
-                match resolved {
-                    Object::Stream(s) => s.clone(),
-                    _ => {
-                        return Err(Error::Unsupported(format!(
-                            "/Contents array element {r} on page {page_ref} does not resolve to a stream"
-                        )));
-                    }
+            // Follow the full holder chain per element so a doubly-indirect
+            // array entry (`ref → ref → stream`) is coalesced rather than dropped.
+            Object::Reference(r) => match resolve_ref_chain(pdf, elem)?.0.into_stream() {
+                Some(s) => s,
+                None => {
+                    return Err(Error::Unsupported(format!(
+                        "/Contents array element {r} on page {page_ref} does not resolve to a stream"
+                    )));
                 }
-            }
+            },
             Object::Stream(s) => s.clone(),
             other => {
                 let type_name = object_type_name(other);
@@ -472,18 +473,17 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
             match resources_val {
                 Object::Null => {}
                 Object::Dictionary(d) => return Ok(Some(d)),
-                Object::Reference(r) => {
-                    let resolved = pdf.resolve_borrowed(r)?;
-                    match resolved {
-                        Object::Null => {}
-                        Object::Dictionary(d) => return Ok(Some(d.clone())),
-                        _ => {
-                            return Err(Error::Unsupported(format!(
-                                "/Resources reference {r} on node {current} does not resolve to a dictionary"
-                            )));
-                        }
+                // Follow the full holder chain (`ref → ref → dict`) so an
+                // indirectly-held inherited /Resources is resolved, not dropped.
+                Object::Reference(r) => match resolve_ref_chain(pdf, &Object::Reference(r))?.0 {
+                    Object::Null => {}
+                    Object::Dictionary(d) => return Ok(Some(d)),
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "/Resources reference {r} on node {current} does not resolve to a dictionary"
+                        )));
                     }
-                }
+                },
                 _ => {
                     return Err(Error::Unsupported(format!(
                         "/Resources entry on node {current} has unexpected type"
@@ -1490,5 +1490,203 @@ mod tests {
             .collect::<Result<_>>()
             .unwrap();
         assert_eq!(from_page_refs, from_walk);
+    }
+
+    /// Build a raw indirect object whose body is a bare reference (`N 0 R`),
+    /// i.e. a holder-chain carrier object.
+    fn ref_carrier_object_bytes(num: u32, target: u32) -> Vec<u8> {
+        format!("{num} 0 obj\n{target} 0 R\nendobj\n").into_bytes()
+    }
+
+    // -----------------------------------------------------------------------
+    // Holder-chain (flpdf-3x23) tests: /Contents reached via ref → ref → value
+    // must be followed to its terminal, not dropped at the first hop.
+    // -----------------------------------------------------------------------
+
+    // Site 1: /Contents = single indirect Reference behind a 2-hop chain.
+    #[test]
+    fn page_content_bytes_follows_single_contents_holder_chain() {
+        let body = b"BT /F1 12 Tf (Chained) Tj ET";
+        // /Contents 4 0 R ; 4 0 R → 5 0 R (carrier) ; 5 0 R is the stream.
+        let carrier = ref_carrier_object_bytes(4, 5);
+        let stream_bytes = stream_object_bytes(5, body);
+        let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, carrier), (5, stream_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(content, body);
+    }
+
+    // Site 1 error arm: a 2-hop chain terminating at a non-stream is rejected.
+    #[test]
+    fn page_content_bytes_single_contents_chain_to_non_stream_errors() {
+        // /Contents 4 0 R ; 4 0 R → 5 0 R ; 5 0 R is a dictionary, not a stream.
+        let carrier = ref_carrier_object_bytes(4, 5);
+        let non_stream = b"5 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
+        let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, carrier), (5, non_stream)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
+            "expected Unsupported(\"…does not resolve to a stream\"), got {err:?}"
+        );
+    }
+
+    // Site 2: /Contents array element reached via a 2-hop chain.
+    #[test]
+    fn page_content_bytes_follows_array_element_holder_chain() {
+        let body1 = b"q 1 0 0 1 0 0 cm";
+        let body2 = b"BT /F1 12 Tf (World) Tj ET";
+        // First element is direct (4 0 R → stream); second is chained (5 0 R → 6 0 R → stream).
+        let stream1 = stream_object_bytes(4, body1);
+        let carrier = ref_carrier_object_bytes(5, 6);
+        let stream2 = stream_object_bytes(6, body2);
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[(4, stream1), (5, carrier), (6, stream2)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let mut expected = body1.to_vec();
+        expected.push(b' ');
+        expected.extend_from_slice(body2);
+        assert_eq!(content, expected);
+    }
+
+    // Site 2 error arm: a chained array element terminating at a non-stream errors.
+    #[test]
+    fn page_content_bytes_array_element_chain_to_non_stream_errors() {
+        let stream1 = stream_object_bytes(4, b"q Q");
+        let carrier = ref_carrier_object_bytes(5, 6);
+        let non_stream = b"6 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[(4, stream1), (5, carrier), (6, non_stream)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
+            "expected Unsupported(\"…does not resolve to a stream\"), got {err:?}"
+        );
+    }
+
+    // Site 4: inherited /Resources held behind a 2-hop chain on the parent node.
+    #[test]
+    fn resolve_inherited_resources_follows_holder_chain() {
+        // 2 0 R Pages has /Resources 4 0 R ; 4 0 R → 5 0 R (carrier) ; 5 0 R is the dict.
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n5 0 R\nendobj\n"); // carrier
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Font << /F1 << /Type /Font >> >> >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(pdf)).expect("PDF should parse");
+        let result = resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0))
+            .expect("should succeed")
+            .expect("should find inherited /Resources via holder chain");
+        assert!(
+            result.get("Font").is_some(),
+            "expected /Font key in chained inherited Resources dict"
+        );
+    }
+
+    // Site 4 error arm: a chained /Resources terminating at a non-dict, non-null
+    // value is rejected.
+    #[test]
+    fn resolve_inherited_resources_chain_to_non_dict_errors() {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n5 0 R\nendobj\n"); // carrier
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n42\nendobj\n"); // integer, not a dict
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(pdf)).expect("PDF should parse");
+        let err = resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(msg) if msg.contains("does not resolve to a dictionary")),
+            "expected Unsupported(\"…does not resolve to a dictionary\"), got {err:?}"
+        );
+    }
+
+    // Site 4 null arm: a chained /Resources that resolves to null must fall
+    // through inheritance to the parent's real /Resources (PDF §7.3.9).
+    #[test]
+    fn resolve_inherited_resources_chain_to_null_falls_through_to_parent() {
+        // 3 0 R Page has /Resources 5 0 R ; 5 0 R → 6 0 R → null, so the page's
+        // own /Resources is "absent" and inheritance continues to 2 0 R Pages,
+        // which carries the real /Resources dict (4 0 R).
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 << /Type /Font >> >> >>\nendobj\n");
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n6 0 R\nendobj\n"); // carrier
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\nnull\nendobj\n"); // terminal null
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 7\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n{off6:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(pdf)).expect("PDF should parse");
+        let result = resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0))
+            .expect("should succeed")
+            .expect("null /Resources chain should fall through to parent's /Resources");
+        assert!(
+            result.get("Font").is_some(),
+            "expected /Font key inherited from parent after null fall-through"
+        );
     }
 }

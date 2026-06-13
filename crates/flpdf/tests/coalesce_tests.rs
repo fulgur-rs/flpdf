@@ -501,3 +501,64 @@ fn coalesce_noop_for_direct_stream_in_contents() {
 
     assert_eq!(before_contents, after_contents);
 }
+
+// ── Holder-chain (flpdf-3x23): coalesce must follow ref → ref → stream ────────
+
+/// Build a raw indirect object whose body is a bare reference (`N 0 R`),
+/// i.e. a holder-chain carrier object.
+fn ref_carrier(num: u32, target: u32) -> Vec<u8> {
+    format!("{num} 0 obj\n{target} 0 R\nendobj\n").into_bytes()
+}
+
+/// Site 3: a /Contents array element reached via a 2-hop chain
+/// (`ref → ref → stream`) must be coalesced, not dropped.
+#[test]
+fn coalesce_follows_array_element_holder_chain() {
+    let seg1 = b"q 1 0 0 1 0 0 cm";
+    let seg2 = b"BT /F1 12 Tf (Hello) Tj ET";
+
+    // First element direct (4 0 R → stream); second chained (5 0 R → 6 0 R → stream).
+    let s1 = stream_obj(4, seg1);
+    let carrier = ref_carrier(5, 6);
+    let s2 = stream_obj(6, seg2);
+    let bytes = build_pdf("[4 0 R 5 0 R]", &[(4, s1), (5, carrier), (6, s2)]);
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    let page_ref = ObjectRef::new(3, 0);
+    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+
+    let Object::Dictionary(page_dict) = pdf.resolve(page_ref).expect("page resolves") else {
+        panic!("page is not a dict");
+    };
+    let Object::Reference(new_ref) = page_dict.get("Contents").expect("/Contents present") else {
+        panic!("/Contents is not a Reference after coalesce");
+    };
+    let Object::Stream(s) = pdf.resolve(*new_ref).expect("new stream resolves") else {
+        panic!("new /Contents ref does not resolve to a stream");
+    };
+
+    let mut expected = seg1.to_vec();
+    expected.push(b'\n');
+    expected.extend_from_slice(seg2);
+    assert_eq!(
+        s.data, expected,
+        "chained array element must be coalesced into the joined stream"
+    );
+}
+
+/// Site 3 error arm: a chained array element terminating at a non-stream is
+/// rejected with an Unsupported error.
+#[test]
+fn coalesce_array_element_chain_to_non_stream_errors() {
+    let s1 = stream_obj(4, b"q Q");
+    let carrier = ref_carrier(5, 6);
+    let non_stream = b"6 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
+    let bytes = build_pdf("[4 0 R 5 0 R]", &[(4, s1), (5, carrier), (6, non_stream)]);
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    let err = pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
+    assert!(
+        matches!(&err, flpdf::Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
+        "expected Unsupported(\"…does not resolve to a stream\"), got {err:?}"
+    );
+}
