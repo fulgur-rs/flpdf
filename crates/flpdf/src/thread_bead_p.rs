@@ -68,8 +68,8 @@
 //! document; cross-document merge — which could renumber a first occurrence —
 //! is out of scope here.)
 
-use crate::outline_dest_remap::resolve_ref_chain;
 use crate::page_tree_rebuild::RebuildResult;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};

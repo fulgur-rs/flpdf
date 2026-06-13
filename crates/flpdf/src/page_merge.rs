@@ -12,13 +12,14 @@ use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::object_copy::copy_objects;
 use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
-use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
+use crate::outline_dest_remap::dest_page_ref_resolved;
 use crate::page_closure::page_object_closure;
 use crate::page_extract::{
     append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
     sd_target_page_ref, target_pages_root, InheritedAttrs,
 };
 use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::ref_chain::resolve_ref_chain;
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -920,9 +921,23 @@ fn remap_inline_dest_depth<R: Read + Seek>(
     let (concrete, _) = resolve_ref_chain(source, dest)?;
     match concrete {
         Object::Array(mut arr) => {
-            if let Some(Object::Reference(r)) = arr.first() {
-                if let Some(&new_ref) = map.get(r) {
+            // The leading page ref may be a holder chain (`r → r2 → page`); the
+            // copy map keys pages by their TERMINAL ref. The common case is a
+            // direct ref already present in `map`, so match it first and only fall
+            // back to a terminal-normalizing chain resolve (a `pdf.resolve`) when
+            // the direct lookup misses — otherwise a doubled-indirect dest ref
+            // would be emitted as the (uncopied) source holder ref.
+            let first_ref = match arr.first() {
+                Some(Object::Reference(r)) => Some(*r),
+                _ => None,
+            };
+            if let Some(r) = first_ref {
+                if let Some(&new_ref) = map.get(&r) {
                     arr[0] = Object::Reference(new_ref);
+                } else if let Some(terminal) = resolve_ref_chain(source, &Object::Reference(r))?.1 {
+                    if let Some(&new_ref) = map.get(&terminal) {
+                        arr[0] = Object::Reference(new_ref);
+                    }
                 }
             }
             Ok(Object::Array(arr))

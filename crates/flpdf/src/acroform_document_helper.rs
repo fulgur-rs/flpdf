@@ -6,6 +6,7 @@
 //! [`crate::copy_objects`] for cross-document field copying.
 
 use crate::object::MAX_INLINE_DEPTH;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{
     copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, FormFieldObjectHelper,
     Object, ObjectRef, Pdf, Result, DEFAULT_MAX_ACROFORM_DEPTH,
@@ -872,11 +873,17 @@ fn resolve_array_value<R: Read + Seek>(
     match value {
         None | Some(Object::Null) => Ok(None),
         Some(Object::Array(values)) => Ok(Some(values)),
-        Some(Object::Reference(object_ref)) => match pdf.resolve_borrowed(object_ref)? {
-            Object::Array(values) => Ok(Some(values.clone())),
-            Object::Null => Ok(None),
-            _ => Ok(None),
-        },
+        Some(value @ Object::Reference(_)) => {
+            // The array carrier itself may be a holder chain (`/Fields 20 0 R →
+            // 21 0 R → [..]`); follow it to the terminal so a doubled-indirect
+            // carrier yields its array instead of being dropped as a non-array.
+            // The terminal is returned by value, so the array moves out without
+            // the prior `.clone()`.
+            match resolve_ref_chain(pdf, &value)?.0 {
+                Object::Array(values) => Ok(Some(values)),
+                _ => Ok(None), // Null or non-array terminal
+            }
+        }
         Some(_) => Ok(None),
     }
 }
