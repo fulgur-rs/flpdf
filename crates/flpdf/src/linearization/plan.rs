@@ -213,11 +213,19 @@ fn compute_closure<R: Read + Seek>(
                             if !visited.insert(r) {
                                 continue;
                             }
-                            order.push(r);
                             let child = pdf.resolve(r)?;
+                            // Stop at a page-tree boundary BEFORE adding `r` to
+                            // the closure: a resource that malformedly cross-links
+                            // to a sibling `/Page` or the `/Pages` node must be
+                            // kept in `visited` (so it is never revisited) but
+                            // excluded from the first-page closure entirely — per
+                            // the page-closure boundary rule, we neither descend
+                            // into it nor pull the boundary node itself into
+                            // Part 2/3.
                             if is_page_tree_node(&child) {
                                 continue;
                             }
+                            order.push(r);
                             let mut child_refs = Vec::new();
                             collect_direct_refs(&child, 0, &mut child_refs)?;
                             // Push in reverse so the first reference is popped
@@ -1784,6 +1792,16 @@ mod tests {
         assert!(
             plan.part2_objects.contains(&ObjectRef::new(3, 0)),
             "the page leaf must anchor the first-page section"
+        );
+        // The cross-linked /Pages node (obj 2) must be EXCLUDED from the
+        // first-page closure entirely — it is a page-tree boundary, so it is
+        // kept in `visited` but neither descended into nor added to Part 2/3.
+        // (Before the boundary check moved ahead of `order.push`, the node was
+        // wrongly pulled into Part 2.)
+        let pages_node = ObjectRef::new(2, 0);
+        assert!(
+            !plan.part2_objects.contains(&pages_node) && !plan.part3_objects.contains(&pages_node),
+            "the cross-linked /Pages node must not be pulled into the first-page section"
         );
     }
 
