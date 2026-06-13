@@ -50,6 +50,7 @@
 //! Single-document only. Multi-input cross-document merge is a separate path.
 
 use crate::page_tree_rebuild::RebuildResult;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -728,29 +729,6 @@ fn null_removed_dest_target<R: Read + Seek>(
 // ---------------------------------------------------------------------------
 // Destination resolution helpers
 // ---------------------------------------------------------------------------
-
-/// Follow a chain of `Object::Reference` indirections up to
-/// [`MAX_DEST_RESOLVE_DEPTH`], returning the terminal non-reference object and
-/// the last `ObjectRef` traversed (for in-place rewrite of an indirect
-/// target). A cyclic / over-deep chain terminates at the bound and yields the
-/// last resolved value, so a hostile `/A`/`/Dest` cannot loop forever.
-pub(crate) fn resolve_ref_chain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: &Object,
-) -> Result<(Object, Option<ObjectRef>)> {
-    let mut last_ref: Option<ObjectRef> = None;
-    let mut cur = start.clone();
-    for _ in 0..MAX_DEST_RESOLVE_DEPTH {
-        match cur {
-            Object::Reference(r) => {
-                last_ref = Some(r);
-                cur = pdf.resolve(r)?;
-            }
-            _ => break,
-        }
-    }
-    Ok((cur, last_ref))
-}
 
 /// Remap the page reference in an outline item's `/Dest` or `/A /D` field.
 fn remap_item_dest<R: Read + Seek>(

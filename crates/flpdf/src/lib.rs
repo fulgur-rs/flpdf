@@ -85,6 +85,7 @@ pub mod parser;
 pub mod permissions;
 pub mod qdf_fix;
 pub mod reader;
+pub(crate) mod ref_chain;
 pub mod resources;
 pub(crate) mod rewrite_renumber;
 pub mod rotate_spec;

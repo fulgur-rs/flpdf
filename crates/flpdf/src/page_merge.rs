@@ -12,13 +12,14 @@ use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::object_copy::copy_objects;
 use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
-use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
+use crate::outline_dest_remap::dest_page_ref_resolved;
 use crate::page_closure::page_object_closure;
 use crate::page_extract::{
     append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
     sd_target_page_ref, target_pages_root, InheritedAttrs,
 };
 use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::ref_chain::resolve_ref_chain;
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};

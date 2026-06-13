@@ -44,13 +44,14 @@
 //! in place rather than splicing it.
 
 use crate::object_copy::{copy_objects, rewrite_refs};
-use crate::outline_dest_remap::{dest_page_ref_resolved, resolve_ref_chain};
+use crate::outline_dest_remap::dest_page_ref_resolved;
 use crate::page_closure::page_object_closure;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::page_tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
     page_refs, resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
+use crate::ref_chain::resolve_ref_chain;
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
