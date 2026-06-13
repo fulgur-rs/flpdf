@@ -223,12 +223,13 @@ TDD 順序:
 
 ## Task 9: 最終ゲート
 
-**Steps:**
+**Steps:**（検証順は repo 方針に合わせて build/check → test → clippy。`cargo fmt` は別軸の整形チェックとして併走）
 1. `cargo fmt --all` → `cargo fmt --all --check`（[[memory: flpdf-ci-quality-fmt-check]]）。
-2. `cargo clippy --workspace --all-targets -- -D warnings`。
+2. `cargo check --workspace --all-targets`（または `cargo build`）。
 3. `cargo test -p flpdf`（全 green）。
-4. **patch-coverage ゲート**: 全 commit 後に `scripts/patch-coverage.sh --base main`。flpdf 変更行 **100%** 必須。未カバー行はテスト追加 or `// cov:ignore: <理由>`。
-5. **質的チェック**（CLAUDE.md step4）: 各 holder-chain テストが「fix 前に fail する実質的 assertion」であることを再確認（単なる行実行でない）。
-6. PR 説明に: 対象/除外サイトの分類根拠、skip したサイト（fix 前 fail せず）と理由、`cov:ignore` があれば理由。
+4. `cargo clippy --workspace --all-targets -- -D warnings`。
+5. **patch-coverage ゲート**: 全 commit 後に `scripts/patch-coverage.sh --base main`。flpdf 変更行 **100%** 必須。未カバー行はテスト追加 or `// cov:ignore: <理由>`。
+6. **質的チェック**（CLAUDE.md step4）: 各 holder-chain テストが「fix 前に fail する実質的 assertion」であることを再確認（単なる行実行でない）。
+7. PR 説明に: 対象/除外サイトの分類根拠、skip したサイト（fix 前 fail せず）と理由、`cov:ignore` があれば理由。
 
 **最終確認**: skip 判定で実際に変更したサイト数が design の ~25 から減った場合、残りを follow-up issue 化するか PR 説明に明記。
