@@ -371,10 +371,12 @@ mod byte_gate {
         .unwrap();
 
         // Write through the same recipe as `flpdf rewrite --static-id`.
-        let mut opts = WriteOptions::default();
-        opts.full_rewrite = true;
-        opts.static_id = true;
-        opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..Default::default()
+        };
 
         let mut actual = Vec::new();
         write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
