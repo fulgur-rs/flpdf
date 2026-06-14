@@ -88,10 +88,15 @@ Fallback chain remains TrimBox -> CropBox -> MediaBox when TrimBox absent.
 
 ## Page mapping (--from/--to/--repeat) -- pin precisely at .16.4 impl
 
-Defaults: --from=1-z (all source pages), --to=1-z (all dest pages), --repeat=z.
+Defaults: --from=1-z (all source pages), --to=1-z (all dest pages),
+--repeat=EMPTY (no repeat). NOTE the issue's "--repeat=z" acceptance text is
+WRONG vs qpdf observed and must NOT be used: with no --repeat, when source pages
+run out the extra destination pages get NOTHING (confirmed empirically above;
+qpdf observed wins per the byte-identical policy).
 Pair i-th selected source page with i-th selected dest page; when source pages
-run out, if --repeat range given, cycle those; extra dest pages with no source
-get nothing. (qpdf manual help=overlay-underlay + QPDFJob doUnderOverlay loop.)
+run out, ONLY if a --repeat range is given do those repeat pages cycle; with no
+--repeat the extra dest pages with no source get nothing. (qpdf manual
+help=overlay-underlay + QPDFJob doUnderOverlay loop.)
 Re-derive the exact loop from qpdf source at impl time with a correct per-page
 inspector (the quick awk counter used during oracle was buggy).
 
