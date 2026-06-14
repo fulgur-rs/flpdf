@@ -255,3 +255,37 @@ fn overlay_encrypted_source_without_password_fails() {
         .assert()
         .failure();
 }
+
+#[test]
+fn overlay_on_non_rewrite_subcommand_is_rejected() {
+    // An overlay group is stripped from argv before clap; on a non-rewrite
+    // command it must fail loudly, not be silently ignored.
+    let one = fixture("one-page.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("check")
+        .arg(fixture("three-page.pdf"))
+        .args(["--overlay", &one, "--"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "can only be used with rewrite output",
+        ));
+}
+
+#[test]
+fn overlay_on_top_level_inspection_is_rejected() {
+    // Top-level inspection mode (--show-npages) with an overlay group must also
+    // fail rather than drop the overlay.
+    let one = fixture("one-page.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--show-npages")
+        .arg(fixture("three-page.pdf"))
+        .args(["--overlay", &one, "--"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "can only be used with rewrite output",
+        ));
+}
