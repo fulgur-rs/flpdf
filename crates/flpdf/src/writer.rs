@@ -3622,6 +3622,16 @@ pub(crate) fn write_stream_to_buf_qpdf_order(
     write_stream_payload(buf, &stream.data, policy);
 }
 
+/// Emit a preserved (verbatim) stream body: the `dict` in qpdf's stream-dict key
+/// order (`/Length` pulled out and written last; no re-filtering) followed by the
+/// raw `data` framed with no newline before `endstream`. Used to emit an
+/// already-lone-/FlateDecode stream without decode + re-encode. The caller is
+/// responsible for setting `dict`'s `/Length` to `data.len()`.
+pub(crate) fn write_preserved_stream(buf: &mut Vec<u8>, dict: &Dictionary, data: &[u8]) {
+    dict.write_pdf_stream(buf, false);
+    write_stream_payload(buf, data, NewlineBeforeEndstream::Never);
+}
+
 /// Emit the `\nstream\n<payload><EOL>endstream` framing shared by
 /// [`write_stream_to_buf`] and [`write_stream_to_buf_qpdf_order`], applying the
 /// [`NewlineBeforeEndstream`] policy. The dictionary must already be written.
