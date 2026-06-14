@@ -109,6 +109,30 @@ fn overlay_and_underlay_compose_successfully() {
 }
 
 #[test]
+fn overlay_with_from_range_succeeds() {
+    // `--from=2` selects source page 2 first; the CLI must thread the range
+    // through `build_overlay_specs` so the overlay still stacks (p1 <- s2).
+    let two = fixture("two-page.pdf");
+    let bytes = run_overlay_ok("three-page.pdf", &["--overlay", &two, "--from=2", "--"]);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("/Fx0"), "page must become /Fx0");
+    assert!(
+        text.contains("/Fx1"),
+        "--from-selected source must import as /Fx1"
+    );
+}
+
+#[test]
+fn single_underlay_succeeds() {
+    // A lone `--underlay` (no overlay) must stack the source beneath the page.
+    let two = fixture("two-page.pdf");
+    let bytes = run_overlay_ok("three-page.pdf", &["--underlay", &two, "--"]);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("/Fx0"), "page must become /Fx0");
+    assert!(text.contains("/Fx1"), "underlay source must import as /Fx1");
+}
+
+#[test]
 fn overlay_with_pages_is_rejected() {
     let one = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().unwrap();

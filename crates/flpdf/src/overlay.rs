@@ -675,6 +675,40 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // because byte-identity requires flpdf's deflate output to match qpdf's classic
 // libz output (see CLAUDE.md DEFLATE carve-out). It lives inside the crate, not
 // in `tests/`, because the overlay entry points are `pub(crate)`.
+//
+// Overlay/underlay byte-identity matrix (flpdf-9hc.16.7). Each row is a
+// `qpdf 11.9.0 --static-id` invocation reproduced byte-for-byte at the library
+// layer; the golden recipes live in tests/golden/regenerate.sh. Goldens under
+// tests/golden/references/overlay/.
+//
+//   case                | kind     | source        | --from | --to  | --repeat
+//   --------------------|----------|---------------|--------|-------|---------
+//   one-page (.16.3)    | overlay  | one-page      | -      | -     | -
+//   two-page default    | overlay  | two-page      | -      | -     | -
+//   one-page repeat1    | overlay  | one-page      | -      | -     | 1
+//   two-page to=2-3     | overlay  | two-page      | -      | 2-3   | -
+//   two overlays (.16.5)| overlay×2| one + two     | -      | -     | -
+//   overlay+underlay    | over+und | one + two     | -      | -     | -
+//   two-page from=2     | overlay  | two-page      | 2      | -     | -
+//   underlay two-page   | underlay | two-page      | -      | -     | -
+//   rotated (.16.3 mtx) | overlay  | one-page-r90  | -      | -     | -
+//   one-page to=1-3 rpt1| overlay  | one-page      | -      | 1-3   | 1
+//
+// The rotated row is the matrix-transformed placement check: the source page
+// carries /Rotate 90, so its imported Form XObject gets a non-identity /Matrix
+// and the placement `cm` is fitted to the matrix-transformed bbox (a whole-file
+// byte match proves both the /Matrix import and the cm fragment).
+//
+// Explicit deferrals (NOT covered here, by design):
+//   - Encrypted-source --password byte-identity: deferred to flpdf-9hc.16.8
+//     (source version-floor propagation). qpdf raises the output version to
+//     max(dest, sources) for AES-256 sources; flpdf keeps the dest version, so
+//     those bytes diverge. The behavioral --password path is covered in
+//     crates/flpdf-cli/tests/cli_overlay.rs.
+//   - CLI-level byte-identity: deferred to flpdf-9hc.33. The flpdf CLI emits
+//     NewlineBeforeEndstream::Yes and exposes no ::Never (qpdf's default), so
+//     every CLI-written stream diverges. These gates write through the library
+//     entry points with NewlineBeforeEndstream::Never instead.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
     use super::{
@@ -856,6 +890,88 @@ mod byte_gate {
         .unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-two-page-to2-3.pdf");
+    }
+
+    #[test]
+    fn overlay_two_page_from2_is_byte_identical() {
+        // dest=three-page, overlay source=two-page, --from=2: the source range
+        // starts at page 2, so p1<-s2 and then the source is exhausted (p2, p3
+        // untouched).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr("2"),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-two-page-from2.pdf");
+    }
+
+    #[test]
+    fn underlay_two_page_default_is_byte_identical() {
+        // dest=three-page, single --underlay source=two-page, defaults: p1<-s1,
+        // p2<-s2, p3 untouched. The source is drawn BENEATH the page (Fx1 placed
+        // before Fx0 in the new content stream).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Underlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-underlay-two-page.pdf");
+    }
+
+    #[test]
+    fn overlay_rotated_source_is_byte_identical() {
+        // dest=three-page, overlay source=one-page-r90 (a +90-rotated page). The
+        // imported Form XObject carries a non-identity /Matrix encoding the
+        // rotation, and the placement `cm` must fit the matrix-TRANSFORMED bbox
+        // (the visual extent), not the raw /BBox. A whole-file byte match proves
+        // both the /Matrix import and the matrix-transformed cm fragment.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("one-page-r90.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-rotated.pdf");
+    }
+
+    #[test]
+    fn overlay_one_page_to1_3_repeat1_is_byte_identical() {
+        // dest=three-page, overlay source=one-page, --to=1-3 --repeat=1: every
+        // dest page is selected and the single source page cycles via --repeat,
+        // so all three pages share the SAME imported XObject.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr("1-3"),
+            Some(&pr("1")),
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-to-repeat.pdf");
     }
 
     /// Build a default-range [`OverlaySpec`] over a fixture document.

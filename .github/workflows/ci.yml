@@ -149,6 +149,10 @@ jobs:
           # Pins linearized output structural byte-parity vs qpdf golden
           # (everything except the qpdf-internal /ID[1]; see flpdf-wb76).
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
+          # Pins overlay/underlay output byte-identity vs committed qpdf goldens.
+          # These gates live in lib unit tests (overlay::byte_gate) behind the
+          # qpdf-zlib-compat cfg, so they must be run explicitly with --lib.
+          cargo test -p flpdf --features qpdf-zlib-compat --lib overlay::byte_gate
 
       - name: Compat matrix baselines (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
