@@ -1525,18 +1525,19 @@ pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
     trailer.insert("ID", Object::Array(vec![first_id, pi_id]));
 }
 
-/// Install a fixed-width `/ID` placeholder for qpdf's `--deterministic-id`
-/// scheme: an array of two 16-byte zero strings.
+/// Ensure the trailer carries an `/ID` key for qpdf's `--deterministic-id`
+/// scheme, with a dummy array of two 16-byte zero strings as its value.
 ///
-/// The real `/ID` cannot be computed until the output bytes exist, because
-/// qpdf's changing identifier `/ID[1]` is `md5(seed)` where the seed embeds an
-/// MD5 over the file written so far (ISO 32000-2 §7.5.2 leaves the algorithm to
-/// the producer; this mirrors `QPDFWriter::generateID`). The placeholder
-/// serializes to the same [`DETERMINISTIC_ID_ARRAY_LEN`] bytes as the final
-/// value, so overwriting it afterwards leaves every later byte offset — and
-/// therefore the captured digest range — unchanged. The two elements
-/// (permanent / changing identifier) are filled in by the post-serialization
-/// patch in [`write_pdf_full_rewrite`].
+/// Only the *presence* of the `/ID` key matters here: it makes the flat trailer
+/// serializers emit `/ID` (at the position the serializer assigns it) so the
+/// deterministic identifier can be written there. The stored zero value is a
+/// dummy and is never serialized on the deterministic paths — those serializers
+/// direct-write the real two-level identifier through their `id_writer` hook
+/// (see [`write_deterministic_id_inline`]), computing it from the bytes written
+/// so far. The real `/ID` cannot be a stored value because qpdf's changing
+/// identifier `/ID[1]` is `md5(seed)` over a digest of the file written so far
+/// (ISO 32000-2 §7.5.2 leaves the algorithm to the producer; this mirrors
+/// `QPDFWriter::generateID`).
 fn apply_deterministic_id_placeholder(trailer: &mut Dictionary) {
     trailer.insert(
         "ID",
@@ -2106,8 +2107,10 @@ pub(crate) const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
 /// [`DETERMINISTIC_ID_ARRAY_LEN`] bytes with no inner spaces. Building the
 /// bytes by hand (rather than via [`Object::write_pdf`]) guarantees the hex
 /// form even when a digest happens to be all-printable, which keeps the
-/// placeholder and the final value the same length — a hard requirement for
-/// the placeholder-then-patch scheme to leave every later byte offset intact.
+/// placeholder and the final value the same length — a hard requirement for the
+/// linearized writer's placeholder-then-patch scheme to leave every later byte
+/// offset intact. (The flat write paths instead direct-write the final value
+/// via [`write_deterministic_id_inline`], with no placeholder.)
 pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16]) {
     out.push(b'[');
     for id in [id0, id1] {
@@ -2123,7 +2126,8 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id
 /// Returns `None` for any other shape (missing, wrong arity, wrong types, or a
 /// length other than 16), in which case qpdf reuses the changing identifier as
 /// the permanent one. The 16-byte constraint keeps the serialized `/ID` array
-/// at the fixed [`DETERMINISTIC_ID_ARRAY_LEN`] the patch step depends on.
+/// at the fixed [`DETERMINISTIC_ID_ARRAY_LEN`] the linearized writer's
+/// placeholder-then-patch step depends on.
 pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<[u8; 16]> {
     match trailer.get("ID") {
         Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
@@ -2184,20 +2188,21 @@ pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
 
 /// Compute qpdf's two-level deterministic `/ID` from the serialized output.
 ///
-/// `bytes` is the full output with a fixed-width `/ID` placeholder already in
-/// place; `id_array_offset` is the inclusive end of the content digest range.
+/// `bytes` is the output written up to and including the `/ID` array's opening
+/// `[`; `id_array_offset` is the inclusive end of the content digest range.
 /// Mirrors `QPDFWriter::computeDeterministicIDData` + `generateID`:
 ///
-/// 1. `det_data` = lowercase hex of `md5(bytes[0..=id_array_offset])`. For the
-///    non-linearized writer this offset points at the placeholder's opening `[`,
-///    so the range is inclusive of the `[` (qpdf captures the running digest
-///    immediately after writing `" /ID ["`). The linearized writer instead
-///    passes `bytes.len() - 1` to digest the whole output, because a linearized
-///    file repeats `/ID` in several trailers/xref-stream dicts and so has no
-///    single `[` cutoff; the all-zero placeholder makes that whole-buffer digest
-///    depend only on the input, keeping it self-stable across runs. qpdf computes
-///    this body digest with `Pl_MD5`, which hashes the full byte range regardless
-///    of any embedded NUL (unlike the seed in step 3).
+/// 1. `det_data` = lowercase hex of `md5(bytes[0..=id_array_offset])`. The flat
+///    writers call this from [`write_deterministic_id_inline`] with the offset
+///    of the just-written `[`, so the range is inclusive of the `[` (qpdf
+///    captures the running digest immediately after writing `" /ID ["`). The
+///    linearized writer instead passes `bytes.len() - 1` to digest the whole
+///    output, because a linearized file repeats `/ID` in several
+///    trailers/xref-stream dicts and so has no single `[` cutoff; its all-zero
+///    placeholder makes that whole-buffer digest depend only on the input,
+///    keeping it self-stable across runs. qpdf computes this body digest with
+///    `Pl_MD5`, which hashes the full byte range regardless of any embedded NUL
+///    (unlike the seed in step 3).
 /// 2. `seed` = `det_data` + `" QPDF "` + `info_suffix`.
 /// 3. `/ID[1]` (changing identifier) = `md5(seed)`, but the seed is truncated at
 ///    its first NUL byte before hashing. qpdf hashes the seed with
@@ -2230,74 +2235,30 @@ pub(crate) fn compute_deterministic_id(
     (id0, id1)
 }
 
-/// Overwrite the deterministic `/ID` placeholder in `bytes` with the final
-/// two-level qpdf identifier, in place.
+/// Direct-write qpdf's deterministic `/ID` array value INLINE at the current
+/// output position, computing it from the bytes written so far.
 ///
-/// `region_start` is the offset where the structural trailer (or xref-stream)
-/// dictionary begins. The all-zero placeholder
-/// [`apply_deterministic_id_placeholder`] installs is located by searching from
-/// there for the `/ID ` key token immediately followed by the placeholder
-/// array. Anchoring on the key token (rather than the bare placeholder array)
-/// means a preserved trailer entry whose *value* happens to serialize to the
-/// same [`DETERMINISTIC_ID_ARRAY_LEN`] bytes is not mistaken for `/ID`: that
-/// value is not preceded by the `/ID ` token. This matters because `/ID` is not
-/// always the last key in the region — the xref-stream dictionary serializes
-/// keys in plain lexicographic order, so a preserved key sorting after `/ID`
-/// would otherwise precede or follow the real `/ID` ambiguously. Because the
-/// replacement is the same [`DETERMINISTIC_ID_ARRAY_LEN`] bytes as the
-/// placeholder, every later byte offset (and thus the digest range and
-/// `startxref`) is left untouched.
-///
-/// # Panics
-///
-/// Panics if the `/ID ` placeholder is not present in the region. This is an
-/// internal invariant: callers always install the placeholder via
-/// [`apply_deterministic_id_placeholder`] before serializing the dictionary,
-/// so an absent placeholder indicates a writer bug rather than malformed input.
-fn patch_deterministic_id(
-    bytes: &mut [u8],
-    region_start: usize,
+/// Mirrors `QPDFWriter::generateID`: push `[`, MD5-digest the bytes written so
+/// far (inclusive of the `[`, the range [`compute_deterministic_id`] expects),
+/// compute the two-level identifier, then write `<id0_hex><id1_hex>]`. This
+/// replaces the placeholder-then-byte-search scheme on the flat write paths, so
+/// a crafted placeholder-shaped byte run elsewhere can never be mistaken for the
+/// real `/ID`. The emitted bytes are identical to
+/// [`write_deterministic_id_array`] for the same computed id.
+pub(crate) fn write_deterministic_id_inline(
+    out: &mut Vec<u8>,
     info_suffix: &[u8],
     source_id0: Option<[u8; 16]>,
 ) {
-    let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
-    write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
-
-    // All three trailer serializers emit `/ID ` (slash, I, D, space) directly
-    // before the `/ID` array value (see `Dictionary::write_pdf`,
-    // `write_pdf_trailer`, and `write_qdf_trailer`). Anchor on that token so the
-    // search locks onto the real `/ID` entry, not an unrelated key whose value
-    // coincidentally serializes to the same placeholder bytes.
-    const ID_TOKEN: &[u8] = b"/ID ";
-    let mut anchor = Vec::with_capacity(ID_TOKEN.len() + DETERMINISTIC_ID_ARRAY_LEN);
-    anchor.extend_from_slice(ID_TOKEN);
-    anchor.extend_from_slice(&placeholder);
-
-    let token_offset = region_start
-        + bytes[region_start..]
-            .windows(anchor.len())
-            .position(|window| window == anchor.as_slice())
-            .expect("deterministic-id /ID placeholder must be present in the trailer region");
-    // `token_offset` is the `/` of `/ID `; the placeholder array's `[` starts
-    // ID_TOKEN.len() bytes later. qpdf captures the body digest inclusive of
-    // this `[`, so the offset must match the bare-placeholder location exactly.
-    let id_array_offset = token_offset + ID_TOKEN.len();
-    debug_assert_eq!(
-        &bytes[id_array_offset..id_array_offset + DETERMINISTIC_ID_ARRAY_LEN],
-        placeholder.as_slice(),
-        "anchored /ID offset must land on the placeholder array"
-    );
-
-    let (id0, id1) = compute_deterministic_id(bytes, id_array_offset, info_suffix, source_id0);
-
-    let mut final_id = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
-    write_deterministic_id_array(&mut final_id, &id0, &id1);
-    debug_assert_eq!(
-        final_id.len(),
-        DETERMINISTIC_ID_ARRAY_LEN,
-        "deterministic /ID replacement must match the placeholder width"
-    );
-    bytes[id_array_offset..id_array_offset + DETERMINISTIC_ID_ARRAY_LEN].copy_from_slice(&final_id);
+    out.push(b'[');
+    let id_array_offset = out.len() - 1; // index of the just-pushed `[`
+    let (id0, id1) = compute_deterministic_id(out, id_array_offset, info_suffix, source_id0);
+    for id in [&id0, &id1] {
+        out.push(b'<');
+        push_hex_lower(out, id);
+        out.push(b'>');
+    }
+    out.push(b']');
 }
 
 /// Fill the trailer's `/Encrypt` and `/ID` entries appropriately for both
@@ -3250,9 +3211,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 options.deterministic_id,
             );
 
-            // The trailer dictionary begins here; the deterministic-/ID patch
-            // searches for its placeholder only within this structural region.
-            let trailer_region_start = bytes.len();
             if options.qdf {
                 // qpdf --qdf trailer: "trailer <<" on one line, then one
                 // "  /Key value" entry per line with the keys alphabetically
@@ -3263,7 +3221,20 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 // ("[<hex><hex>]") — do NOT route the trailer through the qdf
                 // dict serializer. Closing ">>" then startxref directly (no
                 // extra leading newline) to match the qpdf reference.
-                write_qdf_trailer(&mut bytes, &trailer);
+                if options.deterministic_id {
+                    // Direct-write the real /ID inline (computed from the bytes
+                    // written up to and including its opening `[`) instead of
+                    // emitting the placeholder and byte-searching for it later.
+                    // The bytes are identical to the placeholder-then-patch
+                    // result for the same computed id, so output stays
+                    // byte-for-byte equal to qpdf 11.9.0.
+                    let mut id_writer = |out: &mut Vec<u8>| {
+                        write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                    };
+                    write_qdf_trailer(&mut bytes, &trailer, Some(&mut id_writer));
+                } else {
+                    write_qdf_trailer(&mut bytes, &trailer, None);
+                }
                 bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
             } else {
                 // qpdf classic trailer: the dict sits on the `trailer ` line
@@ -3271,16 +3242,21 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 // forced last — `trailer << /Info .. /Root .. /Size N /ID [..]
                 // >>` (verified against qpdf 11.9.0 static-id goldens).
                 bytes.extend_from_slice(b"trailer ");
-                trailer.write_pdf_trailer(&mut bytes);
+                if options.deterministic_id {
+                    // Direct-write the real /ID inline (computed from the bytes
+                    // written up to and including its opening `[`) instead of
+                    // emitting the placeholder and byte-searching for it later.
+                    // The bytes are identical to the placeholder-then-patch
+                    // result for the same computed id, so output stays
+                    // byte-for-byte equal to qpdf 11.9.0.
+                    let mut id_writer = |out: &mut Vec<u8>| {
+                        write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                    };
+                    trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+                } else {
+                    trailer.write_pdf_trailer(&mut bytes, None);
+                }
                 bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-            }
-            if options.deterministic_id {
-                patch_deterministic_id(
-                    &mut bytes,
-                    trailer_region_start,
-                    &det_id_info_suffix,
-                    det_id_source_id0,
-                );
             }
         }
 
@@ -3431,25 +3407,30 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 options.deterministic_id,
             );
 
-            // The xref-stream dictionary begins here; the deterministic-/ID
-            // patch searches for its placeholder only within this dictionary
-            // (which precedes the compressed binary payload, so the placeholder
-            // cannot collide with it). qpdf does not produce byte-parity output
-            // for xref-stream form, but the same content-derived /ID keeps the
-            // output self-stable.
-            let xref_dict_region_start = bytes.len();
+            // The cross-reference stream dictionary is serialized in plain
+            // lexicographic order (so `/ID` is NOT last), and its compressed
+            // binary payload follows. When deterministic-/ID is requested,
+            // direct-write the real /ID inline at `/ID`'s sorted position,
+            // computed from the bytes written up to and including its opening
+            // `[` — the same digest range the placeholder-then-patch step used
+            // to target. qpdf does not produce byte-parity output for xref-stream
+            // form, but this content-derived /ID keeps the output self-stable.
             let xref_stream = crate::Stream::new(xref_dict, stream_data);
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
-            write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
-            bytes.extend_from_slice(b"\nendobj\n");
             if options.deterministic_id {
-                patch_deterministic_id(
+                let mut id_writer = |out: &mut Vec<u8>| {
+                    write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                };
+                write_stream_to_buf_with_id_writer(
                     &mut bytes,
-                    xref_dict_region_start,
-                    &det_id_info_suffix,
-                    det_id_source_id0,
+                    &xref_stream,
+                    options.newline_before_endstream,
+                    Some(&mut id_writer),
                 );
+            } else {
+                write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
             }
+            bytes.extend_from_slice(b"\nendobj\n");
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
         }
     }
@@ -3605,6 +3586,23 @@ pub fn write_stream_to_buf(
     write_stream_payload(buf, &stream.data, policy);
 }
 
+/// Like [`write_stream_to_buf`] but serializes the stream dictionary via
+/// [`crate::object::Dictionary::write_pdf_with_id_writer`], so the `/ID` value
+/// (at its lexicographic position in the dictionary) can be produced by
+/// `id_writer` from the bytes written so far. With `id_writer = None` the output
+/// is byte-identical to [`write_stream_to_buf`]. Used by the cross-reference
+/// stream path to direct-write the deterministic `/ID` inline instead of
+/// emitting a placeholder and byte-searching for it afterwards.
+pub(crate) fn write_stream_to_buf_with_id_writer(
+    buf: &mut Vec<u8>,
+    stream: &crate::Stream,
+    policy: NewlineBeforeEndstream,
+    id_writer: Option<crate::object::TrailerIdWriter>,
+) {
+    stream.dict.write_pdf_with_id_writer(buf, id_writer);
+    write_stream_payload(buf, &stream.data, policy);
+}
+
 /// Like [`write_stream_to_buf`] but serializes the stream dictionary in qpdf's
 /// stream-dictionary key order (see [`crate::object::Dictionary::write_pdf_stream`]):
 /// `/Length` is pulled out and written after the other (sorted) keys, and when
@@ -3726,7 +3724,19 @@ fn write_stream_to_buf_qdf(
 /// `/ID [<hex><hex>]` stay inline (qpdf formats the trailer specially). The
 /// closing `>>` is followed by a newline; the caller appends `startxref`
 /// directly afterwards.
-fn write_qdf_trailer(bytes: &mut Vec<u8>, trailer: &Dictionary) {
+///
+/// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
+/// (the `  /ID ` key token is still emitted) instead of serializing the
+/// dictionary's stored `/ID` value. This lets the caller compute the `/ID`
+/// directly from the bytes written so far — used by the deterministic-`/ID`
+/// writer to emit qpdf's content-derived identifier inline rather than via a
+/// placeholder-then-patch step. The closure runs only when the `/ID` key is
+/// present in the dictionary; if it is absent, `id_writer` is ignored.
+fn write_qdf_trailer(
+    bytes: &mut Vec<u8>,
+    trailer: &Dictionary,
+    id_writer: Option<crate::object::TrailerIdWriter>,
+) {
     bytes.extend_from_slice(b"trailer <<\n");
 
     // `Dictionary::iter()` already yields keys in lexicographic (BTreeMap)
@@ -3745,7 +3755,10 @@ fn write_qdf_trailer(bytes: &mut Vec<u8>, trailer: &Dictionary) {
     }
     if let Some(value) = id_value {
         bytes.extend_from_slice(b"  /ID ");
-        value.write_pdf(bytes);
+        match id_writer {
+            Some(write_id) => write_id(bytes),
+            None => value.write_pdf(bytes),
+        }
         bytes.push(b'\n');
     }
 
@@ -4326,79 +4339,174 @@ mod tests {
     }
 
     #[test]
-    fn patch_deterministic_id_targets_id_not_earlier_placeholder() {
-        // Regression for the "first matching placeholder" bug: a preserved
-        // trailer key whose value serializes to the same 70-byte placeholder
-        // array, positioned BEFORE the real /ID, must NOT be patched. Anchoring
-        // on the `/ID ` key token (rather than the bare placeholder bytes) is
-        // what keeps the patch on the genuine identifier.
-        //
-        // A direct unit test (rather than an end-to-end rewrite) is used because
-        // it lets us place the decoy at a precise, controlled offset and assert
-        // byte-for-byte that the decoy is untouched and the real /ID is filled.
-        let mut placeholder = Vec::new();
+    fn write_deterministic_id_inline_matches_placeholder_then_patch() {
+        // Inline direct-write must equal the legacy placeholder-then-patch result
+        // for an identical prefix: same digest range (inclusive of `[`), same id.
+        let prefix =
+            b"%PDF-1.7\n1 0 obj<</X 1>>endobj\ntrailer << /Size 4 /Root 1 0 R /ID ".to_vec();
+
+        let mut inline = prefix.clone();
+        write_deterministic_id_inline(&mut inline, b"", None);
+
+        // Legacy path: place the all-zero placeholder, then compute over [..='[']
+        // (id_array_offset is the offset of the placeholder's opening `[`).
+        let id_array_offset = prefix.len();
+        let mut legacy_buf = prefix.clone();
+        write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
+        let (id0, id1) = compute_deterministic_id(&legacy_buf, id_array_offset, b"", None);
+        let mut expect = prefix.clone();
+        write_deterministic_id_array(&mut expect, &id0, &id1);
+
+        assert_eq!(
+            inline, expect,
+            "inline direct-write must equal placeholder+patch output"
+        );
+        // And it must NOT be the all-zero placeholder.
+        let mut placeholder = prefix.clone();
         write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
-
-        // region = "<< /Before [decoy] /ID [real] /After [decoy] >>". The first
-        // decoy precedes the `/ID ` token (the classic-trailer layout, where /ID
-        // is forced last); the second FOLLOWS it (the xref-stream layout, where
-        // keys are plain-sorted and a key like /After lands after /ID). Anchoring
-        // on `/ID ` must patch only the real /ID — defeating BOTH a naive
-        // first-match (`position`) and a naive last-match (`rposition`) search.
-        let mut region = Vec::new();
-        region.extend_from_slice(b"<< /Before ");
-        let before_offset = region.len();
-        region.extend_from_slice(&placeholder);
-        region.extend_from_slice(b" /ID ");
-        let id_offset = region.len();
-        region.extend_from_slice(&placeholder);
-        region.extend_from_slice(b" /After ");
-        let after_offset = region.len();
-        region.extend_from_slice(&placeholder);
-        region.extend_from_slice(b" >>");
-
-        // Prefix the region with unrelated body bytes so region_start > 0 and the
-        // search is genuinely scoped from there.
-        let mut bytes = b"%PDF-1.7\nbody bytes\n".to_vec();
-        let region_start = bytes.len();
-        let before_abs = region_start + before_offset;
-        let id_abs = region_start + id_offset;
-        let after_abs = region_start + after_offset;
-        bytes.extend_from_slice(&region);
-
-        patch_deterministic_id(&mut bytes, region_start, b"", None);
-
-        // The decoy BEFORE /ID (no `/ID ` prefix) must remain the placeholder —
-        // a `position` (first-match) search would have wrongly patched it.
-        assert_eq!(
-            &bytes[before_abs..before_abs + placeholder.len()],
-            placeholder.as_slice(),
-            "an earlier non-/ID placeholder must not be patched"
-        );
-        // The decoy AFTER /ID must also remain the placeholder — an `rposition`
-        // (last-match) search would have wrongly patched it. This is the case
-        // the `/ID `-token anchor exists to handle (xref-stream key ordering).
-        assert_eq!(
-            &bytes[after_abs..after_abs + placeholder.len()],
-            placeholder.as_slice(),
-            "a later non-/ID placeholder must not be patched"
-        );
-        // The real /ID must be overwritten with a non-zero computed identifier.
         assert_ne!(
-            &bytes[id_abs..id_abs + placeholder.len()],
-            placeholder.as_slice(),
-            "the genuine /ID placeholder must be patched"
+            inline, placeholder,
+            "inline must write the real id, not the placeholder"
         );
-        // And it must equal the value compute_deterministic_id derives for the
-        // /ID array offset (id_abs points at the `[`).
-        let (id0, id1) = compute_deterministic_id(&bytes, id_abs, b"", None);
-        let mut expected = Vec::new();
-        write_deterministic_id_array(&mut expected, &id0, &id1);
+    }
+
+    #[test]
+    fn write_deterministic_id_inline_preserves_source_permanent_id() {
+        // With a source permanent identifier supplied, /ID[0] (permanent) must
+        // equal that source id and /ID[1] (changing) is the two-level digest, so
+        // the inline write matches the placeholder-then-patch bytes for the same
+        // computed id. Mirrors the full-buffer equivalence of the prior test.
+        let prefix =
+            b"%PDF-1.7\n1 0 obj<</X 1>>endobj\ntrailer << /Size 4 /Root 1 0 R /ID ".to_vec();
+        let src0 = [0xAAu8; 16];
+
+        let id_array_offset = prefix.len();
+        let mut legacy_buf = prefix.clone();
+        write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
+        let (id0, id1) = compute_deterministic_id(&legacy_buf, id_array_offset, b"", Some(src0));
+        let mut expect = prefix.clone();
+        write_deterministic_id_array(&mut expect, &src0, &id1);
+
+        let mut inline = prefix.clone();
+        write_deterministic_id_inline(&mut inline, b"", Some(src0));
+
         assert_eq!(
-            &bytes[id_abs..id_abs + placeholder.len()],
-            expected.as_slice(),
-            "patched /ID must equal the two-level deterministic identifier"
+            inline, expect,
+            "inline write with a source id must equal placeholder+patch output"
         );
+        assert_eq!(
+            id0, src0,
+            "/ID[0] must be the supplied permanent identifier"
+        );
+        assert_ne!(
+            id0, id1,
+            "permanent and changing identifiers must differ in general"
+        );
+    }
+
+    #[test]
+    fn write_pdf_with_id_writer_none_matches_write_pdf() {
+        // With `id_writer = None`, the serializer must be byte-identical to the
+        // plain `write_pdf` even when `/ID` is present — covering the fallback
+        // arm that production (always `Some`) never exercises.
+        let mut dict = Dictionary::new();
+        dict.insert("Size", Object::Integer(4));
+        dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
+        dict.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0xAB; 16]),
+                Object::String(vec![0xCD; 16]),
+            ]),
+        );
+
+        let mut plain = Vec::new();
+        dict.write_pdf(&mut plain);
+        let mut via_none = Vec::new();
+        dict.write_pdf_with_id_writer(&mut via_none, None);
+        assert_eq!(
+            via_none, plain,
+            "write_pdf_with_id_writer(None) must equal write_pdf byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn write_stream_to_buf_with_id_writer_none_matches_write_stream_to_buf() {
+        // The xref-stream helper documents byte-identity with `write_stream_to_buf`
+        // when `id_writer = None`; production only ever passes `Some`, so this pins
+        // the documented `None` contract across both the dictionary and the payload
+        // framing (the helper is otherwise unreachable with `None`).
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::Integer(3));
+        dict.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0xAB; 16]),
+                Object::String(vec![0xCD; 16]),
+            ]),
+        );
+        let stream = crate::Stream::new(dict, b"abc".to_vec());
+
+        let mut expected = Vec::new();
+        write_stream_to_buf(&mut expected, &stream, NewlineBeforeEndstream::Yes);
+        let mut actual = Vec::new();
+        write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
+        assert_eq!(
+            actual, expected,
+            "write_stream_to_buf_with_id_writer(None) must equal write_stream_to_buf"
+        );
+    }
+
+    #[test]
+    fn write_pdf_with_id_writer_keys_on_name_not_byte_pattern() {
+        // The direct-write path keys on the `/ID` dictionary *name*, not on a
+        // byte pattern. A preserved entry whose key sorts before `/ID` (here
+        // `/AA`) and whose string value embeds the literal `/ID ` token plus the
+        // all-zero placeholder array must survive verbatim, while only the real
+        // `/ID` value is produced by the closure. This is exactly the ambiguity
+        // the dropped byte-search patch scheme had to guard against.
+        let mut decoy_value = b"/ID ".to_vec();
+        write_deterministic_id_array(&mut decoy_value, &[0u8; 16], &[0u8; 16]);
+        let mut dict = Dictionary::new();
+        dict.insert("AA", Object::String(decoy_value.clone()));
+        dict.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0u8; 16]),
+                Object::String(vec![0u8; 16]),
+            ]),
+        );
+
+        let sentinel: &[u8] = b"[<DIGEST-FROM-CLOSURE>]";
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(sentinel);
+        let mut out = Vec::new();
+        dict.write_pdf_with_id_writer(&mut out, Some(&mut id_writer));
+
+        // The decoy value is serialized as a literal string `(...)` containing
+        // the `/ID ` token and the placeholder array — it must appear verbatim.
+        let mut decoy_serialized = Vec::new();
+        Object::String(decoy_value).write_pdf(&mut decoy_serialized);
+        assert!(
+            out.windows(decoy_serialized.len())
+                .any(|w| w == decoy_serialized.as_slice()),
+            "preserved decoy entry embedding /ID + placeholder must survive verbatim"
+        );
+        // The real /ID value is the closure output, not the stored array.
+        let id_token_pos = out
+            .windows(5)
+            .position(|w| w == b" /ID ")
+            .expect("real /ID key token must be present");
+        assert_eq!(
+            &out[id_token_pos + 5..id_token_pos + 5 + sentinel.len()],
+            sentinel,
+            "the real /ID value must be the closure output, not the stored array"
+        );
+        // The closure ran exactly once: the sentinel appears a single time.
+        let sentinel_count = out
+            .windows(sentinel.len())
+            .filter(|w| *w == sentinel)
+            .count();
+        assert_eq!(sentinel_count, 1, "id_writer must run exactly once");
     }
 
     #[test]
@@ -4408,8 +4516,8 @@ mod tests {
         // placeholder `[<0x32><0x32>]`. The full-rewrite trailer keeps unknown
         // keys (`trailer = pdf.trailer().clone()`) and forces /ID last, so the
         // serialized output is `... /Probe [<0..0><0..0>] ... /ID [<0..0><0..0>]`.
-        // The patch must overwrite only the genuine /ID (anchored on `/ID `) and
-        // leave /Probe untouched.
+        // The direct-write path must emit the genuine /ID's digest (keyed on the
+        // `/ID` name) and leave /Probe untouched.
         let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
         let src = build_det_id_source(&format!("/Probe [<{zeros}><{zeros}>]"), &[]);
         let out = write_det_id(&src);
@@ -4431,16 +4539,270 @@ mod tests {
                 "/Probe must NOT be mis-patched — it stays the all-zero placeholder"
             );
         }
-        // The genuine /ID[1] must be patched to the non-zero computed identifier.
+        // The genuine /ID[1] must be the non-zero computed identifier.
         assert_ne!(
             trailer_id_pair(&out).1,
             vec![0u8; 16],
-            "the real /ID must be patched, not left as the zero placeholder"
+            "the real /ID must be direct-written, not left as the zero placeholder"
         );
         assert_eq!(
             trailer_id_pair(&out).1,
             expected_changing_id(&out, b"").to_vec(),
             "/ID[1] must be the two-level deterministic digest"
+        );
+    }
+
+    #[test]
+    fn classic_trailer_deterministic_id_preserves_decoy_anchor_literal() {
+        // Crafted-decoy survival guard for the CLASSIC (non-qdf) xref-table
+        // trailer, the counterpart to
+        // `qdf_trailer_deterministic_id_preserves_decoy_anchor_literal`. A
+        // preserved (unknown) trailer key `/Decoy` whose STRING value's bytes
+        // literally contain the `/ID ` token followed by the exact 70-byte
+        // all-zero placeholder array. The full-rewrite classic trailer keeps
+        // unknown keys (`trailer = pdf.trailer().clone()`) and forces the real
+        // `/ID` last, so `/Decoy` sorts before it: a byte-search patch anchored
+        // on the first `/ID ` occurrence would clobber the decoy and leave the
+        // real `/ID` zeroed. The direct-write path never emits a placeholder and
+        // never byte-searches, so the decoy survives verbatim and the genuine
+        // /ID is the computed digest.
+        let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
+        let decoy_literal = format!("/ID [<{zeros}><{zeros}>]");
+        let src = build_det_id_source(&format!("/Decoy ({decoy_literal})"), &[]);
+        let out = write_det_id(&src);
+
+        // Confirm we exercised the classic `trailer` (Table xref) arm, not the
+        // xref-stream form — otherwise this would silently duplicate the
+        // xref-stream decoy coverage instead of guarding the classic flat path.
+        assert!(
+            out.windows(b"trailer ".len()).any(|w| w == b"trailer "),
+            "classic deterministic-id output must use a classic `trailer` (Table xref form)"
+        );
+
+        // (a) The crafted decoy bytes must survive VERBATIM in the output — a
+        // non-vacuous check that the literal `/ID `+placeholder run is present.
+        assert!(
+            out.windows(decoy_literal.len())
+                .any(|window| window == decoy_literal.as_bytes()),
+            "the crafted /Decoy bytes (`/ID `+placeholder) must appear verbatim"
+        );
+        // And the reopened /Decoy value is exactly the original literal string.
+        let reopened = crate::Pdf::open_mem(&out).expect("output must re-open");
+        let decoy = reopened
+            .trailer()
+            .get("Decoy")
+            .and_then(Object::as_string)
+            .expect("/Decoy must be preserved as a string");
+        assert_eq!(
+            decoy,
+            decoy_literal.as_bytes(),
+            "/Decoy must NOT be mis-patched — its `/ID `+placeholder bytes stay verbatim"
+        );
+
+        // (b) The genuine forced-last /ID[1] must be the non-zero computed digest
+        // (not the all-zero placeholder).
+        assert_ne!(
+            trailer_id_pair(&out).1,
+            vec![0u8; 16],
+            "the real /ID must be direct-written, not left as the zero placeholder"
+        );
+        assert_eq!(
+            trailer_id_pair(&out).1,
+            expected_changing_id(&out, b"").to_vec(),
+            "classic /ID[1] must be the two-level deterministic digest"
+        );
+    }
+
+    #[test]
+    fn classic_trailer_deterministic_id_is_direct_written_no_placeholder() {
+        // The classic (non-qdf) xref-table trailer must DIRECT-WRITE the real
+        // deterministic /ID inline, never leaving the all-zero placeholder for a
+        // later byte-search patch. A clean fixture (no decoy keys) is used so the
+        // only 70-byte `[<0..><0..>]` run that could appear would be a leftover
+        // placeholder.
+        let src = build_det_id_source("/Info 3 0 R", &["3 0 obj\n<< /Title (Doc) >>\nendobj\n"]);
+        let out = write_det_id(&src);
+
+        // (a) No all-zero /ID placeholder survives anywhere in the output.
+        let mut placeholder = Vec::new();
+        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
+        assert_eq!(placeholder.len(), 70, "placeholder must be 70 bytes");
+        assert!(
+            out.windows(placeholder.len())
+                .all(|window| window != placeholder.as_slice()),
+            "the all-zero /ID placeholder must not appear — /ID is direct-written"
+        );
+
+        // (b) The /ID array is the real digest and is deterministic across runs.
+        let out2 = write_det_id(&src);
+        assert_eq!(
+            out, out2,
+            "classic-trailer deterministic-id output must be byte-stable"
+        );
+        let (id0, id1) = trailer_id_pair(&out);
+        assert_eq!(
+            id1,
+            expected_changing_id(&out, b" Doc").to_vec(),
+            "/ID[1] must be the two-level deterministic digest, not a placeholder"
+        );
+        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+        assert_ne!(
+            id1,
+            vec![0u8; 16],
+            "/ID[1] must not be the zero placeholder"
+        );
+    }
+
+    /// `qdf: true` + `deterministic_id: true` writer options, sharing the
+    /// classic-xref-table fixture set.
+    fn write_qdf_det_id(fixture: &[u8]) -> Vec<u8> {
+        let opts = WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            qdf: true,
+            ..WriteOptions::default()
+        };
+        let mut pdf = crate::Pdf::open_mem(fixture).expect("fixture must open");
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &opts).expect("qdf deterministic write");
+        out
+    }
+
+    #[test]
+    fn qdf_trailer_deterministic_id_is_direct_written_no_placeholder() {
+        // The qdf classic-table trailer must DIRECT-WRITE the real deterministic
+        // /ID inline (via `write_qdf_trailer`'s id_writer), never leaving the
+        // all-zero placeholder for a later byte-search patch. A clean fixture (no
+        // decoy keys) is used so the only 70-byte `[<0..><0..>]` run that could
+        // appear would be a leftover placeholder.
+        //
+        // Output is byte-identical to the old placeholder-then-patch result for
+        // the same computed id, so the placeholder-absent / digest assertions
+        // below are a regression guard, not a red-first failure: they hold under
+        // byte-identity. The behavioral guard that the path no longer depends on
+        // a byte-search patch lives in
+        // `qdf_trailer_deterministic_id_preserves_decoy_anchor_literal` (a value
+        // embedding the `/ID ` token + placeholder, which a first-match patch
+        // would clobber).
+        let src = build_det_id_source("/Info 3 0 R", &["3 0 obj\n<< /Title (Doc) >>\nendobj\n"]);
+        let out = write_qdf_det_id(&src);
+
+        // qdf forces an uncompressed classic xref table — confirm we exercised
+        // the Table-arm qdf branch (not the xref-stream form).
+        assert!(
+            out.windows(b"trailer ".len()).any(|w| w == b"trailer "),
+            "qdf output must use a classic `trailer` (Table xref form)"
+        );
+
+        // (a) No all-zero /ID placeholder survives anywhere in the output.
+        let mut placeholder = Vec::new();
+        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
+        assert_eq!(placeholder.len(), 70, "placeholder must be 70 bytes");
+        assert!(
+            out.windows(placeholder.len())
+                .all(|window| window != placeholder.as_slice()),
+            "the all-zero /ID placeholder must not appear — /ID is direct-written"
+        );
+
+        // (b) The /ID array is the real digest and is deterministic across runs.
+        let out2 = write_qdf_det_id(&src);
+        assert_eq!(
+            out, out2,
+            "qdf-trailer deterministic-id output must be byte-stable"
+        );
+        let (id0, id1) = trailer_id_pair(&out);
+        assert_eq!(
+            id1,
+            expected_changing_id(&out, b" Doc").to_vec(),
+            "qdf /ID[1] must be the two-level deterministic digest, not a placeholder"
+        );
+        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+        assert_ne!(
+            id1,
+            vec![0u8; 16],
+            "/ID[1] must not be the zero placeholder"
+        );
+    }
+
+    #[test]
+    fn qdf_trailer_deterministic_id_preserves_decoy_anchor_literal() {
+        // Forward regression guard for the direct-write path: a preserved
+        // (unknown) trailer key `/Decoy` whose STRING value's bytes literally
+        // contain the `/ID ` token followed by the exact 70-byte all-zero
+        // placeholder. `/Decoy` sorts before the forced-last real `/ID`, so a
+        // byte-search patch anchored on the first `/ID ` occurrence would clobber
+        // the decoy and leave the real `/ID` zeroed. The direct-write path never
+        // emits the placeholder and never byte-searches, so the decoy survives
+        // verbatim and the genuine /ID is the computed digest.
+        let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
+        let decoy_literal = format!("/ID [<{zeros}><{zeros}>]");
+        let src = build_det_id_source(&format!("/Decoy ({decoy_literal})"), &[]);
+        let out = write_qdf_det_id(&src);
+
+        // The decoy /Decoy must survive as the original literal string, untouched.
+        let reopened = crate::Pdf::open_mem(&out).expect("output must re-open");
+        let decoy = reopened
+            .trailer()
+            .get("Decoy")
+            .and_then(Object::as_string)
+            .expect("/Decoy must be preserved as a string");
+        assert_eq!(
+            decoy,
+            decoy_literal.as_bytes(),
+            "/Decoy must NOT be mis-patched — its `/ID `+placeholder bytes stay verbatim"
+        );
+        // The genuine /ID[1] must be the non-zero computed identifier.
+        assert_ne!(
+            trailer_id_pair(&out).1,
+            vec![0u8; 16],
+            "the real /ID must be direct-written, not left as the zero placeholder"
+        );
+        assert_eq!(
+            trailer_id_pair(&out).1,
+            expected_changing_id(&out, b"").to_vec(),
+            "qdf /ID[1] must be the two-level deterministic digest"
+        );
+    }
+
+    #[test]
+    fn qdf_trailer_without_deterministic_id_serializes_stored_id() {
+        // `write_qdf_trailer`'s `None` arm: plain qdf without `deterministic_id`
+        // serializes the dictionary's stored /ID value verbatim (no id_writer
+        // closure runs). Use `static_id` so the stored /ID is deterministic:
+        // /ID[0] is the source permanent id, /ID[1] is the qpdf static constant.
+        let src = build_det_id_source(
+            "/ID [<0102030405060708090a0b0c0d0e0f10><1112131415161718191a1b1c1d1e1f20>]",
+            &[],
+        );
+        let opts = WriteOptions {
+            full_rewrite: true,
+            qdf: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let write = |f: &[u8]| {
+            let mut pdf = crate::Pdf::open_mem(f).expect("fixture must open");
+            let mut out = Vec::new();
+            write_pdf_with_options(&mut pdf, &mut out, &opts).expect("qdf write");
+            out
+        };
+        let out = write(&src);
+        assert_eq!(out, write(&src), "static-id qdf output must be byte-stable");
+
+        assert!(
+            out.windows(b"trailer <<".len()).any(|w| w == b"trailer <<"),
+            "qdf output must use the multi-line `trailer <<` layout"
+        );
+        let (id0, id1) = trailer_id_pair(&out);
+        assert_eq!(
+            id0,
+            (1u8..=16).collect::<Vec<u8>>(),
+            "stored /ID[0] (source permanent id) must be serialized verbatim"
+        );
+        assert_eq!(
+            id1.as_slice(),
+            &QPDF_STATIC_ID[..],
+            "stored /ID[1] (qpdf static constant) must be serialized verbatim"
         );
     }
 

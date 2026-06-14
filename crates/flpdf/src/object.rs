@@ -564,6 +564,11 @@ fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
     out.push(b'>');
 }
 
+/// Callback that writes a trailer's `/ID` array value at the current output
+/// position, used by [`Dictionary::write_pdf_trailer`] to emit a value computed
+/// from the bytes written so far (the deterministic-`/ID` direct-write path).
+pub(crate) type TrailerIdWriter<'a> = &'a mut dyn FnMut(&mut Vec<u8>);
+
 /// PDF dictionary, keyed by raw byte slices (PDF names are arbitrary byte strings).
 ///
 /// Backed by a `BTreeMap`, so iteration order is the lexicographic order of the keys —
@@ -627,6 +632,39 @@ impl Dictionary {
         out.extend_from_slice(b" >>");
     }
 
+    /// Serialize this dictionary like [`write_pdf`](Self::write_pdf) (compact,
+    /// plain lexicographic key order), but when `id_writer` is `Some` produce
+    /// the `/ID` *value* from that closure instead of serializing the stored
+    /// value (the ` /ID ` key token is still emitted at its sorted position).
+    ///
+    /// Every other key — and the `/ID` key itself when `id_writer` is `None` —
+    /// is written byte-for-byte identically to [`write_pdf`](Self::write_pdf),
+    /// so the two serializers agree except for the substituted `/ID` value.
+    /// This lets the caller compute the `/ID` directly from the bytes written so
+    /// far — used by the deterministic-`/ID` writer to emit a content-derived
+    /// identifier inline rather than via a placeholder-then-patch step. Unlike
+    /// the trailer, the cross-reference *stream* dictionary keeps `/ID` at its
+    /// lexicographic position (it is not forced last), so the closure runs
+    /// mid-iteration when the `/ID` key is reached.
+    pub(crate) fn write_pdf_with_id_writer(
+        &self,
+        out: &mut Vec<u8>,
+        id_writer: Option<TrailerIdWriter>,
+    ) {
+        out.extend_from_slice(b"<<");
+        let mut id_writer = id_writer;
+        for (key, value) in self.iter() {
+            out.extend_from_slice(b" /");
+            out.extend_from_slice(key);
+            out.push(b' ');
+            match (key == b"ID", id_writer.as_mut()) {
+                (true, Some(write_id)) => write_id(out),
+                _ => value.write_pdf(out),
+            }
+        }
+        out.extend_from_slice(b" >>");
+    }
+
     /// Serialize a stream's dictionary using qpdf's stream-dictionary key
     /// ordering, appending to `out`.
     ///
@@ -683,7 +721,15 @@ impl Dictionary {
     /// `qpdf --static-id` 11.9.0: `<< /Info .. /Root .. /Size N /ID [..] >>`.
     /// Layout otherwise matches [`write_pdf`](Self::write_pdf) (compact, one
     /// line). If `/ID` is absent the output is plain sorted order.
-    pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>) {
+    ///
+    /// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
+    /// (the `b" /ID "` key token is still emitted) instead of serializing the
+    /// dictionary's stored `/ID` value. This lets the caller compute the `/ID`
+    /// directly from the bytes written so far — used by the deterministic-`/ID`
+    /// writer to emit qpdf's content-derived identifier inline rather than via a
+    /// placeholder-then-patch step. The closure runs only when the `/ID` key is
+    /// present in the dictionary; if it is absent, `id_writer` is ignored.
+    pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>, id_writer: Option<TrailerIdWriter>) {
         out.extend_from_slice(b"<<");
         let mut id_value: Option<&Object> = None;
         for (key, value) in self.iter() {
@@ -698,7 +744,10 @@ impl Dictionary {
         }
         if let Some(value) = id_value {
             out.extend_from_slice(b" /ID ");
-            value.write_pdf(out);
+            match id_writer {
+                Some(write_id) => write_id(out),
+                None => value.write_pdf(out),
+            }
         }
         out.extend_from_slice(b" >>");
     }
@@ -849,11 +898,30 @@ mod stream_dict_order_tests {
         d.insert(b"Info", Object::reference(ObjectRef::new(2, 0)));
         d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
         let mut out = Vec::new();
-        d.write_pdf_trailer(&mut out);
+        d.write_pdf_trailer(&mut out, None);
         assert_eq!(
             out,
             b"<< /Info 2 0 R /Root 1 0 R /Size 8 /ID [ 1 2 ] >>".to_vec()
         );
+    }
+
+    /// With an `id_writer`, the trailer substitutes the `/ID` *value* from the
+    /// closure while still forcing `/ID` last in qpdf's order; every other key
+    /// stays byte-identical to the `None` arm. Production only ever passes
+    /// `Some` (the deterministic-`/ID` direct-write), so this pins that contract.
+    #[test]
+    fn trailer_id_writer_substitutes_value_but_keeps_id_last() {
+        let mut d = Dictionary::new();
+        d.insert(b"Size", Object::Integer(8));
+        d.insert(
+            b"ID",
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+        );
+        d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
+        let mut out = Vec::new();
+        let mut id_writer = |o: &mut Vec<u8>| o.extend_from_slice(b"[<aa><bb>]");
+        d.write_pdf_trailer(&mut out, Some(&mut id_writer));
+        assert_eq!(out, b"<< /Root 1 0 R /Size 8 /ID [<aa><bb>] >>".to_vec());
     }
 
     /// A trailer without `/ID` is plain sorted order (no special handling).
@@ -863,7 +931,7 @@ mod stream_dict_order_tests {
         d.insert(b"Size", Object::Integer(3));
         d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
         let mut out = Vec::new();
-        d.write_pdf_trailer(&mut out);
+        d.write_pdf_trailer(&mut out, None);
         assert_eq!(out, b"<< /Root 1 0 R /Size 3 >>".to_vec());
     }
 
