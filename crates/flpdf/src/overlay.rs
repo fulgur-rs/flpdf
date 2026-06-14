@@ -30,10 +30,13 @@
 // feature-gated byte-comparison test).
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::page_form_xobject::page_to_form_xobject;
+use crate::page_form_xobject::{import_pages_as_form_xobjects, page_to_form_xobject};
 use crate::page_object_helper::{PageBox, PageObjectHelper};
+use crate::page_range::PageRange;
+use crate::pages::page_refs;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
@@ -222,6 +225,155 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     Ok(())
 }
 
+/// Pair selected destination pages with source pages, mirroring qpdf's
+/// `QPDFJob::doUnderOverlay` page-mapping loop (qpdf 11.9.0).
+///
+/// `from_pages`, `to_pages`, and `repeat_pages` are 1-based page numbers already
+/// resolved from the `--from`, `--to`, and `--repeat` page ranges. The `i`-th
+/// selected destination page (`to_pages[i]`) is paired with:
+///
+/// - `from_pages[i]` while `i < from_pages.len()`;
+/// - otherwise, when `repeat_pages` is non-empty,
+///   `repeat_pages[(i - from_pages.len()) % repeat_pages.len()]` (the repeat
+///   pages cycle);
+/// - otherwise that destination page is skipped (it receives no overlay).
+///
+/// The result is a `Vec<(dest_page, source_page)>` in `to_pages` order, omitting
+/// the skipped destination pages.
+fn map_overlay_pages(
+    from_pages: &[u32],
+    to_pages: &[u32],
+    repeat_pages: &[u32],
+) -> Vec<(u32, u32)> {
+    let mut pairs = Vec::new();
+    for (i, &dest) in to_pages.iter().enumerate() {
+        let source = if i < from_pages.len() {
+            from_pages[i]
+        } else if !repeat_pages.is_empty() {
+            repeat_pages[(i - from_pages.len()) % repeat_pages.len()]
+        } else {
+            // Source pages exhausted and no --repeat: this dest page gets nothing.
+            continue;
+        };
+        pairs.push((dest, source));
+    }
+    pairs
+}
+
+/// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
+/// `QPDFJob::doUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
+///
+/// `from`, `to`, and `repeat` are the spec's page ranges. `from` (default all
+/// source pages) selects source pages; `to` (default all destination pages)
+/// selects destination pages; `repeat` is `None` by default (no repetition) and,
+/// when `Some`, selects source pages to cycle once `from` is exhausted. The
+/// selected pages are paired by [`map_overlay_pages`].
+///
+/// The distinct source pages used by the mapping are imported into `dest` in a
+/// single cross-document copy via [`import_pages_as_form_xobjects`] (so an object
+/// shared by several source pages is copied once), and the imported Form XObject
+/// reference is shared across every destination page that uses that source page
+/// (qpdf imports each source page once and reuses the object). Each paired
+/// destination page is then patched by [`apply_overlays_to_page`] with a single
+/// [`OverlaySource`] of the given `kind`. Destination pages not in the mapping
+/// are left untouched.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] when a resolved page number falls outside `dest` or
+///   `source` (the page lists and counts are read once up front, so this only
+///   triggers on an internally inconsistent mapping), or any error propagated
+///   from [`PageRange::resolve`], [`import_pages_as_form_xobjects`], or
+///   [`apply_overlays_to_page`].
+fn apply_overlay_spec<RS, RT>(
+    dest: &mut Pdf<RT>,
+    source: &mut Pdf<RS>,
+    kind: OverlayKind,
+    from: &PageRange,
+    to: &PageRange,
+    repeat: Option<&PageRange>,
+) -> Result<()>
+where
+    RS: Read + Seek,
+    RT: Read + Seek,
+{
+    // Snapshot both page lists before mutating `dest`. The applied patches change
+    // page dictionaries in place but never reorder or remove page objects, so the
+    // 1-based page numbers and the captured refs stay valid throughout.
+    let source_pages = page_refs(source)?;
+    let dest_pages = page_refs(dest)?;
+    let n_source = u32_len(source_pages.len());
+    let n_dest = u32_len(dest_pages.len());
+
+    let from_pages = from.resolve(n_source)?;
+    let to_pages = to.resolve(n_dest)?;
+    let repeat_pages = match repeat {
+        Some(pr) => pr.resolve(n_source)?,
+        None => Vec::new(),
+    };
+
+    let pairs = map_overlay_pages(&from_pages, &to_pages, &repeat_pages);
+
+    // Collect the distinct source pages in first-use order, then import them all
+    // in a SINGLE cross-document copy. One copy shares any indirect object used
+    // by more than one source page (a `/Font`, `/ProcSet`, …) instead of
+    // duplicating it, matching qpdf's per-document foreign→local map. The same
+    // imported XObject ref is then reused on every dest page that uses that
+    // source page (qpdf imports each source page once).
+    let mut distinct_sources: Vec<u32> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &(_dest_page, source_page) in &pairs {
+        if seen.insert(source_page) {
+            distinct_sources.push(source_page);
+        }
+    }
+    let source_refs: Vec<ObjectRef> = distinct_sources
+        .iter()
+        .map(|&p| page_ref_for(&source_pages, p, "source"))
+        .collect::<Result<_>>()?;
+    let imported_refs = import_pages_as_form_xobjects(dest, source, &source_refs)?;
+    let imported: BTreeMap<u32, ObjectRef> = distinct_sources
+        .iter()
+        .copied()
+        .zip(imported_refs)
+        .collect();
+
+    for &(dest_page, source_page) in &pairs {
+        // `source_page` came from `pairs`, so it is one of `distinct_sources` and
+        // is always present in the map; index directly.
+        let xobject_ref = imported[&source_page];
+        let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
+        apply_overlays_to_page(dest, dest_ref, &[OverlaySource { kind, xobject_ref }])?;
+    }
+
+    Ok(())
+}
+
+/// Convert a page-list length to `u32`, the width [`PageRange::resolve`] expects.
+///
+/// A document with more than `u32::MAX` pages is not representable; clamp to
+/// `u32::MAX` so a pathological count cannot wrap (qpdf's page index is `int`,
+/// far below this bound, so real documents never reach the clamp).
+fn u32_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+/// Look up the [`ObjectRef`] of a 1-based `page` number in `pages`, erroring when
+/// it is out of range. `which` names the document (`"source"`/`"destination"`)
+/// for the error message.
+fn page_ref_for(pages: &[ObjectRef], page: u32, which: &str) -> Result<ObjectRef> {
+    let idx = (page as usize)
+        .checked_sub(1)
+        .filter(|&i| i < pages.len())
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{which} page {page} is out of range (document has {} page(s))",
+                pages.len()
+            ))
+        })?;
+    Ok(pages[idx])
+}
+
 /// Which destination page box a placement rectangle comes from.
 #[derive(Clone, Copy)]
 enum BoxKind {
@@ -385,8 +537,9 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // in `tests/`, because the overlay entry points are `pub(crate)`.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
-    use super::{apply_overlays_to_page, OverlayKind, OverlaySource};
+    use super::{apply_overlay_spec, apply_overlays_to_page, OverlayKind, OverlaySource};
     use crate::page_form_xobject::import_page_as_form_xobject;
+    use crate::page_range::PageRange;
     use crate::pages::page_refs;
     use crate::{write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions};
     use std::path::Path;
@@ -399,10 +552,29 @@ mod byte_gate {
         Pdf::open(std::io::BufReader::new(file)).unwrap()
     }
 
-    fn golden() -> Vec<u8> {
+    fn golden(name: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/golden/references/overlay/three-page-overlay-one-page.pdf");
+            .join("../../tests/golden/references/overlay")
+            .join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+    }
+
+    /// Parse a page-range string, panicking with context on error.
+    fn pr(input: &str) -> PageRange {
+        PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+    }
+
+    /// Write `dest` through the `flpdf rewrite --static-id` recipe.
+    fn write_static_id<R: std::io::Read + std::io::Seek>(dest: &mut Pdf<R>) -> Vec<u8> {
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(dest, &mut out, &opts).unwrap();
+        out
     }
 
     /// Report the first differing byte offset for a readable failure message.
@@ -412,6 +584,27 @@ mod byte_gate {
         }
         let common = a.len().min(b.len());
         (0..common).find(|&i| a[i] != b[i]).or(Some(common))
+    }
+
+    /// Assert `actual` is byte-identical to the golden named `golden_name`,
+    /// reporting the first diff offset and surrounding bytes on mismatch.
+    fn assert_byte_identical(actual: &[u8], golden_name: &str) {
+        let expected = golden(golden_name);
+        if let Some(off) = first_diff(actual, &expected) {
+            let lo = off.saturating_sub(24);
+            let g = expected.get(off).copied().unwrap_or(0);
+            let f = actual.get(off).copied().unwrap_or(0);
+            panic!(
+                "overlay output not byte-identical to qpdf golden {golden_name} \
+                 (flpdf={} bytes, golden={} bytes)\n\
+                 first diff at offset {off} (golden=0x{g:02x} flpdf=0x{f:02x})\n\
+                 golden[{lo}..]: {:?}\nflpdf [{lo}..]: {:?}",
+                actual.len(),
+                expected.len(),
+                String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+                String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
+            );
+        }
     }
 
     #[test]
@@ -447,7 +640,7 @@ mod byte_gate {
         let mut actual = Vec::new();
         write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
 
-        let expected = golden();
+        let expected = golden("three-page-overlay-one-page.pdf");
         if let Some(off) = first_diff(&actual, &expected) {
             let lo = off.saturating_sub(24);
             let g = expected.get(off).copied().unwrap_or(0);
@@ -463,6 +656,63 @@ mod byte_gate {
                 String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
             );
         }
+    }
+
+    #[test]
+    fn overlay_two_page_default_is_byte_identical() {
+        // dest=three-page, overlay source=two-page, defaults: p1<-s1, p2<-s2,
+        // p3 untouched (source exhausted, no --repeat).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-two-page.pdf");
+    }
+
+    #[test]
+    fn overlay_one_page_repeat1_is_byte_identical() {
+        // dest=three-page, overlay source=one-page, --repeat=1: every dest page
+        // shares the SAME imported XObject (obj9 in the golden).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            Some(&pr("1")),
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-one-page-repeat1.pdf");
+    }
+
+    #[test]
+    fn overlay_two_page_to2_3_is_byte_identical() {
+        // dest=three-page, overlay source=two-page, --to=2-3: p1 untouched,
+        // p2<-s1, p3<-s2.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr("2-3"),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-two-page-to2-3.pdf");
     }
 }
 
@@ -1043,5 +1293,331 @@ mod tests {
             xobject_placement_box(&mut pdf, r).unwrap(),
             [0.0, 0.0, 792.0, 612.0]
         );
+    }
+
+    // ---- map_overlay_pages (pure) ----------------------------------------
+
+    /// Resolve a page-range string and pin a panic message on failure.
+    fn pr(input: &str) -> PageRange {
+        PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+    }
+
+    #[test]
+    fn map_two_page_default_pairs_in_order_and_skips_extra() {
+        // dest=three-page, source=two-page, defaults: p1<-s1, p2<-s2, p3 none.
+        let from = pr("").resolve(2).unwrap();
+        let to = pr("").resolve(3).unwrap();
+        assert_eq!(map_overlay_pages(&from, &to, &[]), vec![(1, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn map_one_page_repeat1_cycles_single_source_over_all_dest() {
+        // source=one-page, --repeat=1: p1,p2,p3 all <- s1.
+        let from = pr("").resolve(1).unwrap();
+        let to = pr("").resolve(3).unwrap();
+        let repeat = pr("1").resolve(1).unwrap();
+        assert_eq!(
+            map_overlay_pages(&from, &to, &repeat),
+            vec![(1, 1), (2, 1), (3, 1)]
+        );
+    }
+
+    #[test]
+    fn map_to_2_3_pairs_against_the_to_list() {
+        // source=two-page, --to=2-3: p2<-s1, p3<-s2 (p1 untouched). Pairing is
+        // positional against the --to LIST, not the absolute page numbers.
+        let from = pr("").resolve(2).unwrap();
+        let to = pr("2-3").resolve(3).unwrap();
+        assert_eq!(map_overlay_pages(&from, &to, &[]), vec![(2, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn map_from_2_uses_offset_source_then_exhausts() {
+        // source=two-page, --from=2: p1<-s2, then from exhausted -> p2,p3 none.
+        let from = pr("2").resolve(2).unwrap();
+        let to = pr("").resolve(3).unwrap();
+        assert_eq!(map_overlay_pages(&from, &to, &[]), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn map_to_1_3_skips_unpaired_dest_when_source_exhausted() {
+        // source=one-page, --to=1,3: p1<-s1; p3 is in --to but the single source
+        // is exhausted and no --repeat -> p3 gets nothing.
+        let from = pr("").resolve(1).unwrap();
+        let to = pr("1,3").resolve(3).unwrap();
+        assert_eq!(map_overlay_pages(&from, &to, &[]), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn map_repeat_2_cycles_last_source_past_exhaustion() {
+        // source=two-page, --repeat=2: p1<-s1, p2<-s2, then from exhausted ->
+        // p3<-repeat[(2-2)%1]=s2.
+        let from = pr("").resolve(2).unwrap();
+        let to = pr("").resolve(3).unwrap();
+        let repeat = pr("2").resolve(2).unwrap();
+        assert_eq!(
+            map_overlay_pages(&from, &to, &repeat),
+            vec![(1, 1), (2, 2), (3, 2)]
+        );
+    }
+
+    #[test]
+    fn map_repeat_cycles_when_more_dest_than_repeat_pages() {
+        // Drive the modulo wrap: from exhausted at index 0, repeat=[3,4] cycles
+        // 3,4,3,4 across four dest pages.
+        let from: Vec<u32> = Vec::new();
+        let to = vec![1, 2, 3, 4];
+        let repeat = vec![3, 4];
+        assert_eq!(
+            map_overlay_pages(&from, &to, &repeat),
+            vec![(1, 3), (2, 4), (3, 3), (4, 4)]
+        );
+    }
+
+    // ---- apply_overlay_spec (driving function, end-to-end in memory) ------
+
+    /// Build a `count`-page document. Every page is object `2 + i` (page 1 is
+    /// object 3), each with a 612x792 MediaBox, a shared font, and its own
+    /// content stream. Returns parseable PDF bytes.
+    fn multi_page_doc(count: u32) -> Vec<u8> {
+        assert!(count >= 1);
+        let mut objs: Vec<(u32, String)> = Vec::new();
+        objs.push((1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()));
+        // Page objects are 3..3+count; content streams follow them.
+        let kids: Vec<String> = (0..count).map(|i| format!("{} 0 R", 3 + i)).collect();
+        objs.push((
+            2,
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {count} >>",
+                kids.join(" ")
+            ),
+        ));
+        // Shared font object placed after the pages + their content streams.
+        let font_obj = 3 + count * 2;
+        for i in 0..count {
+            let page_num = i + 1;
+            let page_obj = 3 + i;
+            let content_obj = 3 + count + i;
+            objs.push((
+                page_obj,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Resources << /Font << /F1 {font_obj} 0 R >> >> /Contents {content_obj} 0 R >>"
+                ),
+            ));
+            let content = format!("page {page_num} content");
+            let body = format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            );
+            objs.push((content_obj, body));
+        }
+        objs.push((
+            font_obj,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ));
+        let borrowed: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
+        build_pdf(&borrowed, 1)
+    }
+
+    /// The imported overlay XObject ref (`/Fx1`) referenced by a patched page.
+    fn fx1_ref<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> ObjectRef {
+        let page = pdf.resolve(page_ref).unwrap();
+        let res = page
+            .as_dict()
+            .unwrap()
+            .get("Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let xobj = res.get("XObject").unwrap().as_dict().unwrap();
+        match xobj.get("Fx1") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Fx1 should be a reference, got {other:?}"), // cov:ignore: defensive — apply always inserts /Fx1 as a reference
+        }
+    }
+
+    /// Whether a page has been patched into an overlay page (its /Resources is
+    /// just `<< /XObject << /Fx0 ... >> >>`, so /Font is gone and /XObject present).
+    fn is_patched<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> bool {
+        let page = pdf.resolve(page_ref).unwrap();
+        let res = page
+            .as_dict()
+            .unwrap()
+            .get("Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        res.get("XObject").is_some() && res.get("Font").is_none()
+    }
+
+    #[test]
+    fn apply_overlay_spec_two_page_default_shares_nothing_and_skips_third() {
+        // dest=3 pages, source=2 pages, defaults. p1<-s1, p2<-s2, p3 untouched.
+        let mut dest = open(multi_page_doc(3));
+        let mut source = open(multi_page_doc(2));
+        let dest_pages = page_refs(&mut dest).unwrap();
+
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+
+        assert!(is_patched(&mut dest, dest_pages[0]), "p1 patched");
+        assert!(is_patched(&mut dest, dest_pages[1]), "p2 patched");
+        assert!(!is_patched(&mut dest, dest_pages[2]), "p3 untouched");
+        // Distinct sources -> distinct imported XObjects.
+        let fx1_p1 = fx1_ref(&mut dest, dest_pages[0]);
+        let fx1_p2 = fx1_ref(&mut dest, dest_pages[1]);
+        assert_ne!(
+            fx1_p1, fx1_p2,
+            "distinct source pages import distinct XObjects"
+        );
+    }
+
+    #[test]
+    fn apply_overlay_spec_repeat_shares_single_source_xobject() {
+        // dest=3, source=1, --repeat=1: every dest page shares the SAME imported
+        // XObject ref (qpdf imports the source page once and reuses it).
+        let mut dest = open(multi_page_doc(3));
+        let mut source = open(multi_page_doc(1));
+        let dest_pages = page_refs(&mut dest).unwrap();
+
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            Some(&pr("1")),
+        )
+        .unwrap();
+
+        let fx1_p1 = fx1_ref(&mut dest, dest_pages[0]);
+        let fx1_p2 = fx1_ref(&mut dest, dest_pages[1]);
+        let fx1_p3 = fx1_ref(&mut dest, dest_pages[2]);
+        assert_eq!(fx1_p1, fx1_p2, "same source -> shared XObject ref");
+        assert_eq!(fx1_p2, fx1_p3, "same source -> shared XObject ref");
+
+        // /Fx0 (the page itself) differs per page (each page's own content).
+        let fx0 = |pdf: &mut Pdf<_>, page_ref: ObjectRef| -> ObjectRef {
+            let page = pdf.resolve(page_ref).unwrap();
+            let xobj = page
+                .as_dict()
+                .unwrap()
+                .get("Resources")
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("XObject")
+                .unwrap()
+                .as_dict()
+                .unwrap();
+            match xobj.get("Fx0") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("Fx0 ref: {other:?}"), // cov:ignore: defensive — apply always inserts /Fx0 as a reference
+            }
+        };
+        let fx0_p1 = fx0(&mut dest, dest_pages[0]);
+        let fx0_p2 = fx0(&mut dest, dest_pages[1]);
+        assert_ne!(fx0_p1, fx0_p2, "each page's own Fx0 is distinct");
+    }
+
+    #[test]
+    fn apply_overlay_spec_to_range_leaves_unselected_dest_untouched() {
+        // dest=3, source=2, --to=2-3: p1 untouched, p2<-s1, p3<-s2.
+        let mut dest = open(multi_page_doc(3));
+        let mut source = open(multi_page_doc(2));
+        let dest_pages = page_refs(&mut dest).unwrap();
+
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr("2-3"),
+            None,
+        )
+        .unwrap();
+
+        assert!(!is_patched(&mut dest, dest_pages[0]), "p1 untouched");
+        assert!(is_patched(&mut dest, dest_pages[1]), "p2 patched");
+        assert!(is_patched(&mut dest, dest_pages[2]), "p3 patched");
+    }
+
+    #[test]
+    fn apply_overlay_spec_underlay_kind_is_threaded_through() {
+        // A single underlay: the source is named /Fx1 and drawn BEFORE /Fx0.
+        let mut dest = open(multi_page_doc(1));
+        let mut source = open(multi_page_doc(1));
+        let dest_pages = page_refs(&mut dest).unwrap();
+
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Underlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+
+        let page = dest.resolve(dest_pages[0]).unwrap();
+        let contents_ref = match page.as_dict().unwrap().get("Contents") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
+        };
+        let stream = dest.resolve(contents_ref).unwrap().into_stream().unwrap();
+        let text = String::from_utf8(stream.data).unwrap();
+        let fx1 = text.find("/Fx1 Do").unwrap();
+        let fx0 = text.find("/Fx0 Do").unwrap();
+        assert!(fx1 < fx0, "underlay /Fx1 must draw before /Fx0: {text:?}");
+    }
+
+    #[test]
+    fn apply_overlay_spec_errors_on_out_of_range_from() {
+        // --from=5 against a 2-page source resolves out of range and errors.
+        let mut dest = open(multi_page_doc(2));
+        let mut source = open(multi_page_doc(2));
+        let err = apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr("5"),
+            &pr(""),
+            None,
+        );
+        assert!(matches!(err, Err(Error::Parse { .. })));
+    }
+
+    #[test]
+    fn page_ref_for_errors_when_out_of_range() {
+        // A 1-based page number past the end is rejected (defensive guard).
+        let pages = vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)];
+        assert!(matches!(
+            page_ref_for(&pages, 3, "source"),
+            Err(Error::Unsupported(_))
+        ));
+        // Page 0 (would underflow) is also rejected.
+        assert!(matches!(
+            page_ref_for(&pages, 0, "destination"),
+            Err(Error::Unsupported(_))
+        ));
+        // In-range lookups return the right ref.
+        assert_eq!(page_ref_for(&pages, 1, "source").unwrap(), pages[0]);
+        assert_eq!(page_ref_for(&pages, 2, "source").unwrap(), pages[1]);
+    }
+
+    #[test]
+    fn u32_len_clamps_oversized_lengths() {
+        assert_eq!(u32_len(0), 0);
+        assert_eq!(u32_len(5), 5);
+        // A length above u32::MAX clamps instead of wrapping.
+        assert_eq!(u32_len(usize::MAX), u32::MAX);
     }
 }

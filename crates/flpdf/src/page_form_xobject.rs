@@ -152,6 +152,68 @@ where
     // cov:ignore-end
 }
 
+/// Import several `source` pages into `dest` as Form XObjects in a single
+/// cross-document copy, returning each page's imported XObject [`ObjectRef`] in
+/// the same order as `source_page_refs`.
+///
+/// Unlike calling [`import_page_as_form_xobject`] once per page, this builds the
+/// Form XObject for every page inside `source`, **unions** their reachable object
+/// closures, and runs [`copy_objects`](crate::object_copy::copy_objects) exactly
+/// once over that union. A single copy shares any indirect object referenced by
+/// more than one page (a `/Font`, `/ProcSet`, image, …) instead of duplicating
+/// it — matching qpdf's `copyForeignObject`, which keeps one foreign→local map
+/// per source document. Per-page copies would emit a duplicate of every shared
+/// resource, so the result would not be byte-identical to qpdf's overlay output.
+///
+/// `source_page_refs` should already be distinct; duplicate refs would request
+/// the same imported XObject twice and are not deduplicated here.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] when a source page cannot be converted, when a
+///   reachable closure exceeds the depth guard, when the destination object-
+///   number space is exhausted, or when an imported XObject is unexpectedly
+///   absent from the copy map.
+/// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
+pub(crate) fn import_pages_as_form_xobjects<RS, RT>(
+    dest: &mut Pdf<RT>,
+    source: &mut Pdf<RS>,
+    source_page_refs: &[ObjectRef],
+) -> Result<Vec<ObjectRef>>
+where
+    RS: Read + Seek,
+    RT: Read + Seek,
+{
+    // 1. Build a Form XObject inside `source` for each page and union the
+    //    reachable object closures (a shared child object appears once in the set).
+    let mut xobject_refs = Vec::with_capacity(source_page_refs.len());
+    let mut union: BTreeSet<ObjectRef> = BTreeSet::new();
+    for &page_ref in source_page_refs {
+        let xobject_ref = page_to_form_xobject(source, page_ref)?;
+        union.extend(xobject_object_closure(source, xobject_ref)?);
+        xobject_refs.push(xobject_ref);
+    }
+
+    // 2. One copy over the union deduplicates shared child objects.
+    let map = crate::object_copy::copy_objects(source, dest, &union)?;
+
+    // 3. Map each per-page XObject seed to its imported destination ref.
+    xobject_refs
+        .iter()
+        .map(|xref| {
+            // Each XObject ref seeds its own closure, so it is always in the
+            // union and thus in the copy map; the error arm is defensive.
+            // cov:ignore-start: every seed is in the union -> in the copy map.
+            map.get(xref).copied().ok_or_else(|| {
+                Error::Unsupported(
+                    "imported Form XObject reference missing from copy map".to_string(),
+                )
+            })
+            // cov:ignore-end
+        })
+        .collect()
+}
+
 /// Resolve the page's effective box as a raw `Object::Array`, following qpdf's
 /// `getTrimBox(false)` fallback chain: `/TrimBox` → `/CropBox` → `/MediaBox`.
 ///
