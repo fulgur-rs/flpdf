@@ -332,3 +332,169 @@ fn objr_obj_annot_p_to_removed_page_dropped_and_page_gced_like_qpdf() {
     assert_facts(&q_qdf, "qpdf");
     assert_facts(&f_qdf, "flpdf");
 }
+
+/// Build a 3-page PDF whose removed page 2 (object 4) is referenced by BOTH a
+/// surviving outline `/Dest` AND a structure-tree OBJR `/Obj` annotation's `/P`.
+///
+/// The surviving destination forces the earlier null-out pass to keep the
+/// removed page as `null` (rather than garbage-collect it), so the OBJR-survived
+/// annotation's `/P` resolves to `null` when the `/P`-drop pass runs.
+fn combined_outline_dest_objr_fixture() -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut buf: Vec<u8> = b"%PDF-1.5\n".to_vec();
+    let mut offsets: Vec<(u32, usize)> = Vec::new();
+    let mut add = |buf: &mut Vec<u8>, num: u32, body: &str| {
+        offsets.push((num, buf.len()));
+        buf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+    };
+
+    add(
+        &mut buf,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R /Outlines 40 0 R >>",
+    );
+    add(
+        &mut buf,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+    );
+    add(
+        &mut buf,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    );
+    add(
+        &mut buf,
+        4,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [30 0 R] >>",
+    );
+    add(
+        &mut buf,
+        5,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    );
+    add(&mut buf, 10, "<< /Type /StructTreeRoot /K 20 0 R >>");
+    add(
+        &mut buf,
+        20,
+        "<< /Type /StructElem /S /Document /K 21 0 R >>",
+    );
+    add(&mut buf, 21, "<< /Type /OBJR /Pg 4 0 R /Obj 30 0 R >>");
+    add(
+        &mut buf,
+        30,
+        "<< /Type /Annot /Subtype /Text /NM (rm) /P 4 0 R /Rect [0 0 10 10] >>",
+    );
+    add(
+        &mut buf,
+        40,
+        "<< /Type /Outlines /First 41 0 R /Last 41 0 R /Count 1 >>",
+    );
+    add(
+        &mut buf,
+        41,
+        "<< /Title (to removed) /Parent 40 0 R /Dest [4 0 R /Fit] >>",
+    );
+
+    let max_num = offsets.iter().map(|&(n, _)| n).max().unwrap();
+    let xref_pos = buf.len();
+    buf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_num + 1).as_bytes());
+    for i in 1..=max_num {
+        match offsets.iter().find(|&&(n, _)| n == i) {
+            Some(&(_, off)) => {
+                buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            None => buf.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    buf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+            max_num + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+    f.write_all(&buf).unwrap();
+    f.flush().unwrap();
+    f
+}
+
+/// Return the body of the raw (un-normalized) `N 0 obj … endobj` span that
+/// contains `marker`. Panics if no such object exists — an object hidden inside
+/// an object stream would otherwise let a regression pass silently.
+fn raw_object_with<'a>(raw: &'a str, marker: &str, tool: &str) -> &'a str {
+    raw.split("endobj")
+        .find(|chunk| chunk.contains(marker))
+        .unwrap_or_else(|| {
+            panic!("{tool}: no raw object containing `{marker}` (object-stream compressed?)")
+        })
+}
+
+#[test]
+fn objr_obj_annot_p_dropped_even_when_page_nulled_by_surviving_dest_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    eprintln!(
+        "qpdf {EXPECTED_QPDF_VERSION} present; running combined dest+OBJR /P-drop assertions"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_file = combined_outline_dest_objr_fixture();
+    let src = src_file.path();
+
+    let q_out = tmp.path().join("q.pdf");
+    let f_out = tmp.path().join("f.pdf");
+
+    // `--object-streams=disable` (NOT `--qdf`) keeps the annotation object
+    // greppable in the raw output WITHOUT running qpdf's QDF normaliser — which
+    // would delete flpdf's dangling /P and mask the regression. The assertions
+    // read this raw output, never a re-normalized form.
+    let q_run = run_qpdf(&[
+        "--object-streams=disable",
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1,3",
+        "--",
+        q_out.to_str().unwrap(),
+    ]);
+    assert!(
+        q_run.status.success(),
+        "qpdf --pages should succeed on the combined fixture (exit {:?}): {}",
+        q_run.status.code(),
+        String::from_utf8_lossy(&q_run.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            src.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1,3",
+            "--",
+            f_out.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Assert on the RAW output of each tool (not --qdf-normalized): the removed
+    // page is kept as `null` because the surviving outline /Dest still
+    // references it, but the OBJR-survived annotation's dangling /P to it must
+    // still be dropped — exactly what qpdf does.
+    for (path, tool) in [(&q_out, "qpdf"), (&f_out, "flpdf")] {
+        let raw = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        let rm_obj = raw_object_with(&raw, "(rm)", tool);
+        assert!(
+            rm_obj.contains("/Type /Annot"),
+            "{tool}: the (rm) object should be the surviving annotation, got:\n{rm_obj}"
+        );
+        assert!(
+            !rm_obj.contains("/P "),
+            "{tool}: annotation /P to the nulled removed page must be dropped, got:\n{rm_obj}"
+        );
+    }
+}

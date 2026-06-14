@@ -32,6 +32,11 @@
 //! annotation's `/P` and the removed page is absent from the output (not emitted
 //! as `null`). The annotation survives via the OBJR `/Obj`, which qpdf keeps.
 //!
+//! qpdf drops the annotation's `/P` even when the removed page is *also*
+//! referenced by a surviving outline item or named destination: there the page
+//! object is kept as `null` (the destination still points at it), but the
+//! annotation's `/P` is still dropped.
+//!
 //! # Scope
 //!
 //! Only the `/P` of annotations reached through a structure-tree OBJR `/Obj` is
@@ -43,8 +48,10 @@
 //! - A direct (inline) `/Obj` dictionary: `/Obj` is by spec an indirect
 //!   reference, so an inline object is malformed and left unchanged.
 //! - An OBJR `/Obj` target without a `/P`, or whose `/P` is not a reference.
-//! - A `/P` that does not resolve to a page object (e.g. a non-annotation OBJR
-//!   `/Obj` target whose `/P` names a different relationship) is left unchanged.
+//! - A `/P` that resolves to a live non-page object (e.g. a non-annotation OBJR
+//!   `/Obj` target whose `/P` names a different relationship, such as a
+//!   structure element's parent) is left unchanged. A `/P` resolving to `null`
+//!   *is* treated as a removed page and dropped (see the note above).
 
 use crate::page_tree_rebuild::RebuildResult;
 use crate::ref_chain::resolve_ref_chain;
@@ -132,10 +139,19 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
     // Normalize a possible reference-to-reference chain to the terminal page ref.
     let (p_concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
     let page_ref = terminal.unwrap_or(p_ref);
-    // /P must resolve to a page. An OBJR /Obj can reference a non-annotation
-    // object whose /P means something else (e.g. a /Type /StructElem whose /P is
-    // the parent structure element); such a /P is left unchanged.
-    if !is_page_dict(&p_concrete) {
+    // /P must resolve to a page (or to `null`). An OBJR /Obj can reference a
+    // non-annotation object whose /P means something else (e.g. a
+    // /Type /StructElem whose /P is the parent structure element); such a /P,
+    // which resolves to a live non-page object, is left unchanged.
+    //
+    // A removed page that a surviving outline / named destination still
+    // references is replaced with `null` *in place* by the earlier null-out pass
+    // ([`crate::outline_dest_remap`]) before this pass runs, so its /P resolves
+    // to `null` here rather than to a /Type /Page dict. That is still a removed
+    // page and its /P must be dropped (qpdf parity). Only the null-out pass nulls
+    // objects before this pass runs — the other extraction passes drop keys, not
+    // objects — so a `null` terminal here unambiguously means a removed page.
+    if !is_page_dict(&p_concrete) && !matches!(p_concrete, Object::Null) {
         return Ok(false);
     }
     match surviving.get(&page_ref) {
@@ -468,6 +484,30 @@ mod tests {
         assert!(
             matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
             "a /P resolving to a non-page object must be left unchanged",
+        );
+    }
+
+    #[test]
+    fn p_to_nulled_removed_page_still_dropped() {
+        // A removed page that a surviving outline / named destination still
+        // references is replaced with `null` in place by the earlier null-out
+        // pass (crate::outline_dest_remap) BEFORE this pass runs. The /P then
+        // resolves to Object::Null rather than a /Type /Page dict — but it is
+        // still a removed page, and qpdf drops the annotation's /P. Object 4 is
+        // `null` and is not in `surviving`, so /P must be dropped (matching qpdf;
+        // requiring /Type /Page here would wrongly keep the dangling /P).
+        let mut objs = base();
+        objs.insert(4, "null".into());
+        objs.insert(
+            30,
+            "<< /Type /Annot /Subtype /Text /P 4 0 R /Rect [0 0 10 10] >>".into(),
+        );
+        let mut pdf = open(&objs);
+        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
+            .expect("drop");
+        assert!(
+            annot(&mut pdf, 30).get("P").is_none(),
+            "a /P to a removed page nulled by the dest null-out pass must still be dropped",
         );
     }
 
