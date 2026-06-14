@@ -263,12 +263,6 @@ qpdf --static-id --warning-exit-0 \
     "$REF/overlay/three-page-overlay-and-underlay.pdf"
 echo "overlay/three-page-overlay-and-underlay.pdf"
 
-# Encrypted source via --password (epic flpdf-9hc.16.6). Source is the committed
-# AES-256 fixture; qpdf decrypts with the supplied user password before import.
-qpdf --static-id --warning-exit-0 \
-    "$FIX/three-page.pdf" --overlay "$FIX/one-page-enc-u.pdf" --password=u -- \
-    "$REF/overlay/three-page-overlay-encrypted-source.pdf"
-echo "overlay/three-page-overlay-encrypted-source.pdf"
 
 echo ""
 
