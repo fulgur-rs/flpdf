@@ -1089,11 +1089,14 @@ fn write_first_page_xref_stream(
     let first_xref_num = relocation.first_xref_slot;
     // First-half range: objects `[second_half_count, /Size)`.
     let index_start = relocation.second_half_count;
-    let index_count = final_size.checked_sub(index_start).ok_or_else(|| {
+    let index_count = final_size.checked_sub(index_start).ok_or_else(||
+        // cov:ignore: unreachable invariant — `second_half_count` (index_start)
+        // is the count of second-half objects and `total_count` (final_size) is
+        // the full /Size, so index_start <= final_size always holds; the guard
+        // is defence-in-depth against a renumber/relocation inconsistency.
         crate::Error::Unsupported(
             "first-page xref /Index underflow (second-half count exceeds /Size)".to_string(),
-        )
-    })?;
+        ))?;
     let payload_len = (index_count as usize)
         .checked_mul(SPLIT_XREF_ENTRY_WIDTH)
         .ok_or_else(|| {
