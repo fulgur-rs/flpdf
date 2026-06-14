@@ -47,6 +47,11 @@
 //! same drop applies when the ring is reachable only through a surviving page's
 //! `/B` array rather than the catalog `/Threads`.
 //!
+//! qpdf drops the bead's `/P` even when the removed page is *also* referenced by
+//! a surviving outline item or named destination: there the page object is kept
+//! as `null` (the destination still points at it), but the bead's `/P` is still
+//! dropped.
+//!
 //! ## Surviving page under a duplicate selection
 //!
 //! For `qpdf in.pdf --pages in.pdf 1,1,3 -- out.pdf` (page 1 selected twice,
@@ -236,10 +241,13 @@ fn seed_from_surviving_pages<R: Read + Seek>(
 ///
 /// `/P` is by spec an indirect reference to the page the bead belongs to,
 /// possibly through a reference chain. The chain is resolved to its terminal
-/// page ref; a `/P` that does not resolve to a `/Type /Page` object (a
-/// non-reference, or a non-page target) is malformed and left unchanged. A
-/// surviving target is remapped to its new ref when the rebuild changed it; a
-/// removed target has the key dropped so the page is garbage-collected.
+/// page ref; a `/P` that resolves to a live non-page object (a non-reference,
+/// or a non-page target) is malformed and left unchanged. A `/P` resolving to
+/// `null` *is* treated as a removed page and dropped (a removed page kept alive
+/// by a surviving outline / named destination is nulled in place by the earlier
+/// null-out pass). A surviving target is remapped to its new ref when the
+/// rebuild changed it; a removed target has the key dropped so the page is
+/// garbage-collected.
 fn remap_or_drop_bead_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     bead: &mut Dictionary,
@@ -252,8 +260,16 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     let Some(page_ref) = p_terminal else {
         return Ok(false); // Non-reference /P: malformed, left unchanged.
     };
-    if !is_page_dict(&p_concrete) {
-        return Ok(false); // /P does not resolve to a page: left unchanged.
+    // A removed page that a surviving outline / named destination still
+    // references is replaced with `null` *in place* by the earlier null-out pass
+    // ([`crate::outline_dest_remap`], Step 4) before this pass (Step 6) runs, so
+    // its /P resolves to `null` here rather than to a /Type /Page dict. That is
+    // still a removed page and its /P must be dropped (qpdf parity). Only the
+    // null-out pass nulls objects before this pass runs — the other extraction
+    // passes drop keys, not objects — so a `null` terminal here unambiguously
+    // means a removed page.
+    if !is_page_dict(&p_concrete) && !matches!(p_concrete, Object::Null) {
+        return Ok(false); // /P does not resolve to a page (or null): left unchanged.
     }
     match surviving.get(&page_ref) {
         Some(&new) if new != page_ref => {
@@ -812,6 +828,36 @@ mod tests {
         assert!(
             matches!(p12, Some(Object::Reference(r)) if r.number == 30),
             "a /P resolving to a non-page object must be left unchanged, got {p12:?}"
+        );
+    }
+
+    #[test]
+    fn bead_p_to_nulled_removed_page_still_dropped() {
+        // A removed page that a surviving outline / named destination still
+        // references is replaced with `null` IN PLACE by the earlier null-out
+        // pass (crate::outline_dest_remap, pipeline Step 4) BEFORE this pass
+        // (Step 6) runs. The bead's /P then resolves to Object::Null rather than
+        // a /Type /Page dict — but it is still a removed page, and qpdf drops the
+        // bead's /P. Object 4 is `null` and is not in `surviving`, so /P must be
+        // dropped (matching qpdf; requiring /Type /Page here would wrongly keep
+        // the dangling /P). Mirrors objr_obj_annot_p's
+        // `p_to_nulled_removed_page_still_dropped`.
+        let mut objs = base_objs();
+        objs.insert(4, "null".into());
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("nulled-page /P drop");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
+        assert!(
+            p12.is_none(),
+            "a bead /P to a removed page nulled by the dest null-out pass must still be dropped, got {p12:?}"
+        );
+        // Beads on surviving pages are unaffected.
+        let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
+        assert!(
+            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            "surviving-page bead /P must be kept, got {p11:?}"
         );
     }
 
