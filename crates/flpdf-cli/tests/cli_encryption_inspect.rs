@@ -247,6 +247,24 @@ fn show_encryption_key_weak_correct_password_emits_no_weak_crypto_warning() {
 }
 
 #[test]
+fn show_encryption_key_weak_with_allow_weak_crypto_emits_no_warning() {
+    // qpdf emits no weak-crypto warning for this inspection regardless of
+    // flags, so the inspection path suppresses it even when the user *does*
+    // pass --allow-weak-crypto (the flag is a no-op here; the key is the same).
+    flpdf()
+        .args([
+            "show-encryption-key",
+            "--allow-weak-crypto",
+            "--password=user-v2",
+            V2_RC4,
+        ])
+        .assert()
+        .success()
+        .stdout("09d56583e16481df964f95df779c97d4\n")
+        .stderr(predicate::str::contains("weak crypto").not());
+}
+
+#[test]
 fn show_encryption_key_weak_wrong_password_still_errors() {
     // Forcing the weak-crypto gate open must not bypass authentication: a
     // wrong password still fails before any key can be derived (exit 2).
