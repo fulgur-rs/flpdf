@@ -105,11 +105,9 @@ fn three_page_generate_packs_first_half_container_before_e() {
 #[test]
 fn three_page_generate_keeps_catalog_standalone() {
     let bytes = linearize_generate("three-page.pdf");
-    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open");
 
-    // Locate the catalog and confirm it resolves as a plain /Type /Catalog dict
-    // (a compressed catalog would still resolve, but the standalone invariant is
-    // what we assert here — the catalog object must be directly addressable).
+    // The root must resolve to a /Type /Catalog dict ...
     let root = pdf.root_ref().expect("root ref present");
     let obj = pdf.resolve(root).expect("catalog resolves");
     let dict = obj.as_dict().expect("catalog is a dictionary");
@@ -119,6 +117,19 @@ fn three_page_generate_keeps_catalog_standalone() {
         .map(|n| n == b"Catalog")
         .unwrap_or(false);
     assert!(is_catalog, "root object must be the /Catalog");
+
+    // ... and it must be UNCOMPRESSED: a standalone indirect object is emitted
+    // as a top-level `<num> 0 obj` marker in the file body, whereas a compressed
+    // ObjStm member has no such marker (it lives inside the container's stream).
+    // qpdf keeps the linearized /Catalog standalone; assert the marker exists.
+    let marker = format!("\n{} 0 obj", root.number);
+    let present = bytes.windows(marker.len()).any(|w| w == marker.as_bytes());
+    assert!(
+        present,
+        "the /Catalog ({} 0 obj) must be a standalone (uncompressed) indirect \
+         object — no `{} 0 obj` marker means it was compressed into an ObjStm",
+        root.number, root.number
+    );
 }
 
 /// Two-page generate also packs a single first-half container before /E
