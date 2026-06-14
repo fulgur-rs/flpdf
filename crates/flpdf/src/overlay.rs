@@ -684,6 +684,63 @@ mod tests {
     }
 
     #[test]
+    fn apply_places_fx0_in_mediabox_and_source_in_trimbox() {
+        // Crafted dest with TrimBox != MediaBox pins the box-selection wiring:
+        // /Fx0 (the page) places into the dest MediaBox; the source places into
+        // the dest TrimBox (qpdf doUnderOverlayForPage). Expected matrices come
+        // from the oracle's crafted fixture:
+        //   /Fx0  BBox = dest TrimBox [10 10 500 600], rect = dest MediaBox
+        //         -> scale 1, tx = 306-255 = 51, ty = 396-305 = 91
+        //   src   BBox = src  TrimBox [20 20 220 100], rect = dest TrimBox
+        //         -> scale 1, tx = 255-120 = 135, ty = 305-60 = 245
+        let content_body = "<< /Length 1 >>\nstream\nx\nendstream";
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /CropBox [0 0 600 700] /TrimBox [10 10 500 600] \
+                     /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+                ),
+                (4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+                (5, content_body),
+            ],
+            1,
+        ));
+        let page_ref = ObjectRef::new(3, 0);
+        // Source XObject /BBox = the source page's TrimBox.
+        let src = insert_form_xobject(&mut pdf, [20, 20, 220, 100], b"src");
+
+        apply_overlays_to_page(
+            &mut pdf,
+            page_ref,
+            &[OverlaySource {
+                kind: OverlayKind::Overlay,
+                xobject_ref: src,
+            }],
+        )
+        .unwrap();
+
+        let page = pdf.resolve(page_ref).unwrap();
+        let contents_ref = match page.as_dict().unwrap().get("Contents") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
+        };
+        let stream = pdf.resolve(contents_ref).unwrap().into_stream().unwrap();
+        let text = String::from_utf8(stream.data).unwrap();
+        assert!(
+            text.contains("q\n1 0 0 1 51 91 cm\n/Fx0 Do\nQ\n"),
+            "Fx0 must place into the dest MediaBox: {text:?}"
+        );
+        assert!(
+            text.contains("q\n1 0 0 1 135 245 cm\n/Fx1 Do\nQ\n"),
+            "source must place into the dest TrimBox: {text:?}"
+        );
+    }
+
+    #[test]
     fn apply_rejects_non_page() {
         // Object 2 is /Type /Pages, not /Page -> /Fx0 conversion fails.
         let mut pdf = open(one_page_doc("x"));
