@@ -58,9 +58,7 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
         return None;
     }
     let common = a.len().min(b.len());
-    (0..common)
-        .find(|&i| a[i] != b[i])
-        .or(Some(common))
+    (0..common).find(|&i| a[i] != b[i]).or(Some(common))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -108,7 +106,12 @@ fn report(fixture: &str, actual: &[u8], expected: &[u8], what: &str) {
 fn assert_structural(fixture: &str, stem: &str) {
     let actual = mask_id1(&flpdf_linearized_objstm(fixture));
     let expected = mask_id1(&golden(stem));
-    report(fixture, &actual, &expected, "structural layout (ignoring /ID[1])");
+    report(
+        fixture,
+        &actual,
+        &expected,
+        "structural layout (ignoring /ID[1])",
+    );
 }
 
 fn assert_strict(fixture: &str, stem: &str) {

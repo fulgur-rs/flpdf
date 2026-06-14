@@ -201,6 +201,61 @@ pub(crate) fn write_object(
     out.extend_from_slice(b"\nendstream\nendobj\n");
 }
 
+// ---------------------------------------------------------------------------
+// First-pass region sizing (qpdf's two-pass writePad length-stabilisation).
+//
+// qpdf writes each linearized xref stream twice. The FIRST pass writes it
+// uncompressed with a deliberately wide field-2 (forcing 4 bytes per offset),
+// then pads the object to a fixed-width region with trailing spaces. The SECOND
+// pass writes the real compressed stream and pads with spaces to the SAME region
+// end, so the object that follows lands at a position independent of the
+// compressed length. These helpers compute that fixed region size.
+// ---------------------------------------------------------------------------
+
+/// Worst-case padding qpdf reserves after a first-pass (uncompressed) xref
+/// stream so the second-pass compressed stream always fits in the same region:
+/// `16 + 5*ceil(xref_bytes / 16384)` (zlib's worst-case expansion plus slack).
+/// Mirrors `QPDFWriter::calculateXrefStreamPadding`.
+pub(crate) fn calculate_xref_stream_padding(xref_bytes: usize) -> usize {
+    16 + 5 * xref_bytes.div_ceil(16384)
+}
+
+/// qpdf's first-pass `/W` widths: field 2 is forced wide enough for any offset
+/// in the first 4 GB (`max_offset = 1 << 25` ⇒ 4 bytes) so the reserved region
+/// is an upper bound on the second pass; field 3 sizes the object-stream index.
+/// Mirrors `QPDFWriter::writeXRefStream`'s pass-1 field sizing.
+pub(crate) fn first_pass_widths(
+    max_id: u32,
+    max_ostream_index: u64,
+    hint_length: u64,
+) -> XrefWidths {
+    let f1 = bytes_needed((1u64 << 25) + hint_length).max(bytes_needed(u64::from(max_id)));
+    [1, f1, bytes_needed(max_ostream_index)]
+}
+
+/// PNG-Up-predicted (uncompressed) payload length for `n_entries` rows: each row
+/// is one filter-tag byte plus `Σ/W` (`/Columns`) data bytes.
+fn first_pass_payload_len(n_entries: usize, widths: XrefWidths) -> usize {
+    (1 + columns(widths)) * n_entries
+}
+
+/// Byte length of the fixed region qpdf reserves for a first-pass xref stream:
+/// the uncompressed object's own byte length plus
+/// [`calculate_xref_stream_padding`]. The caller writes the second-pass
+/// compressed object and space-pads it to this length so the next object's
+/// offset is pinned. `dict.widths` must be the first-pass (wide) widths; the
+/// `/Prev` and `/ID` values are width-only placeholders here.
+pub(crate) fn first_pass_region_len(
+    object: ObjectRef,
+    dict: &XrefStreamDict,
+    n_entries: usize,
+) -> usize {
+    let payload_len = first_pass_payload_len(n_entries, dict.widths);
+    let mut buf = Vec::new();
+    write_object(&mut buf, object, dict, &vec![0u8; payload_len]);
+    buf.len() + calculate_xref_stream_padding(buf.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +323,45 @@ mod tests {
         0x60, 0x0e, 0x73, 0x37, 0x15, 0x98, 0x32, 0xba, 0x5a, 0xec, 0x69, 0x83, 0x87, 0xe2, 0xb7,
         0x95,
     ];
+
+    #[test]
+    fn calculate_padding_matches_qpdf() {
+        // 16 + 5*ceil(n/16384): one 16K block for any small xref stream.
+        assert_eq!(calculate_xref_stream_padding(0), 16);
+        assert_eq!(calculate_xref_stream_padding(370), 21);
+        assert_eq!(calculate_xref_stream_padding(16384), 21);
+        assert_eq!(calculate_xref_stream_padding(16385), 26);
+    }
+
+    #[test]
+    fn first_pass_widths_force_wide_field2() {
+        // 1<<25 dominates field 2 (4 bytes); field 3 sizes the objstm index.
+        assert_eq!(first_pass_widths(16, 3, 130), [1, 4, 1]);
+        assert_eq!(first_pass_widths(16, 0, 0), [1, 4, 1]);
+    }
+
+    /// The first-pass region size pins where the object after the first-half
+    /// xref lands. qpdf 11.9.0 three-page golden: first-half xref (obj 7) at
+    /// offset 216, catalog (obj 8) at 608, with a trailing newline outside the
+    /// region — so the region is `608 - 216 - 1 = 391` bytes (a 370-byte
+    /// uncompressed pass-1 object + 21 bytes of padding).
+    #[test]
+    fn first_pass_region_matches_three_page_golden() {
+        let widths = first_pass_widths(16, 3, 130);
+        assert_eq!(first_pass_payload_len(11, widths), 77);
+        let dict = XrefStreamDict {
+            widths,
+            index: Some((6, 11)),
+            info: Some(ObjectRef::new(15, 0)),
+            root: Some(ObjectRef::new(8, 0)),
+            size: 17,
+            // `/Prev` and `/ID` are space-/fixed-width fields, so only their
+            // widths (not values) affect the region size.
+            prev: Some(2356),
+            id: Some((&ID0, &ID1)),
+        };
+        assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
+    }
 
     #[test]
     fn bytes_needed_spans_byte_boundaries() {
