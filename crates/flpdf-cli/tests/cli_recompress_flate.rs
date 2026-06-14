@@ -49,9 +49,10 @@ fn largest_stream_payload(data: &[u8]) -> Vec<u8> {
 }
 
 /// Strip one trailing newline (`\n`, optionally preceded by `\r`) that the CLI
-/// writer appends before `endstream`. Applied symmetrically: the source fixture
-/// has no such newline, so this is a no-op there, but it normalizes the framing
-/// the writer adds to the output payload.
+/// writer appends before `endstream`. Applied ONLY to the writer's output, not
+/// to the source: the source fixture has no added newline before `endstream`, so
+/// stripping there could pop a real trailing byte of the compressed data if it
+/// happened to be `0x0a`, causing a false mismatch.
 fn strip_trailing_newline(mut v: Vec<u8>) -> Vec<u8> {
     if v.last() == Some(&b'\n') {
         v.pop();
@@ -63,9 +64,7 @@ fn strip_trailing_newline(mut v: Vec<u8>) -> Vec<u8> {
 }
 
 fn source_payload() -> Vec<u8> {
-    strip_trailing_newline(largest_stream_payload(
-        &std::fs::read(fixture_path()).unwrap(),
-    ))
+    largest_stream_payload(&std::fs::read(fixture_path()).unwrap())
 }
 
 fn output_payload(out: &[u8]) -> Vec<u8> {
@@ -116,5 +115,35 @@ fn cli_recompress_flate_reencodes_lone_flate() {
         out.windows(b"/Filter /FlateDecode".len())
             .any(|w| w == b"/Filter /FlateDecode"),
         "re-encoded stream must still declare a single /FlateDecode filter"
+    );
+}
+
+/// Regression: `--recompress-flate` must take effect even when nothing else
+/// forces a full rewrite. `--remove-unreferenced-resources=no` disables the
+/// auto full-rewrite promotion, and no `--full-rewrite`/`--qdf`/`--deterministic-id`
+/// is passed, so without the flag's own full-rewrite promotion the write would
+/// take the incremental path and copy the stream verbatim — silently ignoring
+/// `--recompress-flate`. Here the stream must be re-encoded (payload differs from
+/// the level-9 source). Only the stream payload is compared, so no `--static-id`
+/// is needed.
+#[test]
+fn cli_recompress_flate_promotes_to_full_rewrite_when_not_otherwise_forced() {
+    let temp = tempfile::tempdir().unwrap();
+    let out_path = temp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg("--remove-unreferenced-resources=no")
+        .arg("--recompress-flate")
+        .arg(fixture_path())
+        .arg(&out_path)
+        .assert()
+        .success();
+    let out = std::fs::read(&out_path).unwrap();
+    assert_ne!(
+        output_payload(&out),
+        source_payload(),
+        "--recompress-flate must re-encode the stream even without an explicit \
+         full-rewrite trigger (it should promote to a full rewrite)"
     );
 }

@@ -1940,7 +1940,16 @@ fn run_command(command: Commands) -> CliResult<()> {
             if options.stream_data.is_some() {
                 options.full_rewrite = true;
             }
+            // --recompress-flate only has an effect in the full-rewrite writer
+            // (it re-encodes lone /FlateDecode streams there). Promote to a full
+            // rewrite so the flag is not silently dropped on invocations that
+            // would otherwise take the incremental path (e.g. with
+            // --remove-unreferenced-resources=no on unencrypted input), matching
+            // the --stream-data promotion above.
             options.recompress_flate = cmd.recompress_flate;
+            if cmd.recompress_flate {
+                options.full_rewrite = true;
+            }
             // `rewrite --encrypt` / `--copy-encryption-from`: wire encryption
             // onto WriteOptions (shared with the top-level surface via
             // apply_encryption_options). Both force full_rewrite — the
