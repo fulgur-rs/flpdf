@@ -325,7 +325,16 @@ fn xobject_placement_box<R: Read + Seek>(
             )));
         }
     };
-    let arr = dict.get("BBox").and_then(Object::as_array).ok_or_else(|| {
+    // /BBox may be stored as an indirect reference; resolve it before reading
+    // (qpdf dereferences here, so a reference must not fall through as "no array").
+    let bbox_entry = dict.get("BBox").ok_or_else(|| {
+        Error::Unsupported(format!("Form XObject {xobject_ref} has no /BBox array"))
+    })?;
+    let resolved_bbox = match bbox_entry {
+        Object::Reference(r) => pdf.resolve(*r)?,
+        other => other.clone(),
+    };
+    let arr = resolved_bbox.as_array().ok_or_else(|| {
         Error::Unsupported(format!("Form XObject {xobject_ref} has no /BBox array"))
     })?;
     if arr.len() < 4 {
@@ -891,6 +900,31 @@ mod tests {
                 Object::Integer(20),
             ]),
         );
+        let r = next_object_ref(&pdf).unwrap();
+        pdf.set_object(r, Object::Dictionary(d));
+        assert_eq!(
+            xobject_placement_box(&mut pdf, r).unwrap(),
+            [0.0, 0.0, 10.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn xobject_bbox_resolves_indirect_reference() {
+        // /BBox stored as an indirect reference to the array object must be
+        // dereferenced, not rejected as "no array".
+        let mut pdf = open(one_page_doc("x"));
+        let bbox_ref = next_object_ref(&pdf).unwrap();
+        pdf.set_object(
+            bbox_ref,
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(10),
+                Object::Integer(20),
+            ]),
+        );
+        let mut d = Dictionary::new();
+        d.insert("BBox", Object::Reference(bbox_ref));
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
         assert_eq!(
