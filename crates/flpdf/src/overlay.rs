@@ -23,13 +23,6 @@
 //! `QUtil::double_to_string` (`%.5f` with trailing zeros and a trailing `.`
 //! stripped).
 
-// The per-page apply entry point and its helpers are consumed by the
-// overlay/underlay page-range mapping and CLI layers, which are not yet
-// implemented. Until those call sites land, allow the unused-code lint at the
-// module level (the public functions are exercised by unit tests here and the
-// feature-gated byte-comparison test).
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -42,7 +35,7 @@ use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
 /// destination page's own content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OverlayKind {
+pub enum OverlayKind {
     /// Drawn beneath the destination page content (before `/Fx0`).
     Underlay,
     /// Drawn above the destination page content (after `/Fx0`).
@@ -365,6 +358,9 @@ where
 ///
 /// Propagates any error from [`spec_page_sources`], [`page_ref_for`], or
 /// [`apply_overlays_to_page`].
+// Single-spec convenience wrapper used only by the feature-gated byte gate;
+// the CLI and `apply_overlay_specs` map specs directly via `spec_page_sources`.
+#[allow(dead_code)]
 fn apply_overlay_spec<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
@@ -385,7 +381,7 @@ where
 /// A single overlay/underlay specification: a source document, its kind, and its
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.
-pub(crate) struct OverlaySpec<RS: Read + Seek> {
+pub struct OverlaySpec<RS: Read + Seek> {
     /// The source document supplying the overlay/underlay pages.
     pub source: Pdf<RS>,
     /// Whether the source is drawn beneath or above the destination content.
@@ -444,26 +440,28 @@ fn apply_aggregated_sources<R: Read + Seek>(
 /// `QPDFJob::doUnderOverlay` handling of several `--overlay`/`--underlay` groups
 /// (qpdf 11.9.0).
 ///
-/// Each spec is mapped independently by [`spec_page_sources`] (its own page
-/// mapping and its own single cross-document copy, since each spec's `source` is
-/// a separate document). The per-destination-page sources from all specs are then
-/// aggregated **in declaration order** and each affected destination page is
-/// patched by [`apply_overlays_to_page`] exactly once. Within a page,
-/// `apply_overlays_to_page` groups by kind (underlays before overlays) while
-/// preserving declaration order inside each kind, so the resulting `/Fx1…/FxN`
-/// naming and draw order match qpdf: underlays (across specs, declaration order),
-/// then `/Fx0` (the page), then overlays (across specs, declaration order).
+/// Each [`OverlaySpec`] is mapped independently against `dest`: its `from`/`to`/
+/// `repeat` ranges select the source-to-destination page pairing, and each spec's
+/// source pages are imported into `dest` as Form XObjects in a single
+/// cross-document copy (a source page used on several destination pages is
+/// imported once and shared). The per-destination-page sources from all specs are
+/// then aggregated **in declaration order** and each affected destination page is
+/// rewritten exactly once: the page itself becomes Form XObject `/Fx0`, and the
+/// sources are named `/Fx1…/FxN` and drawn in qpdf order — underlays (across
+/// specs, declaration order), then `/Fx0` (the page), then overlays (across specs,
+/// declaration order).
 ///
-/// Destination pages not selected by any spec are left untouched.
+/// Destination pages not selected by any spec are left untouched. The specs'
+/// source documents are taken by `&mut` because importing reads (and may seek)
+/// them.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`spec_page_sources`] or [`apply_aggregated_sources`]
-/// (page-range resolution, cross-document copy, or per-page patching).
-pub(crate) fn apply_overlay_specs<RS, RT>(
-    dest: &mut Pdf<RT>,
-    specs: &mut [OverlaySpec<RS>],
-) -> Result<()>
+/// - [`Error::Unsupported`] when a page number resolves outside its document, a
+///   page lacks a usable placement box, or the object-number space is exhausted.
+/// - Any error propagated from page-range resolution, the cross-document copy, or
+///   [`Pdf::resolve`].
+pub fn apply_overlay_specs<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
 where
     RS: Read + Seek,
     RT: Read + Seek,
@@ -677,6 +675,40 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // because byte-identity requires flpdf's deflate output to match qpdf's classic
 // libz output (see CLAUDE.md DEFLATE carve-out). It lives inside the crate, not
 // in `tests/`, because the overlay entry points are `pub(crate)`.
+//
+// Overlay/underlay byte-identity matrix (flpdf-9hc.16.7). Each row is a
+// `qpdf 11.9.0 --static-id` invocation reproduced byte-for-byte at the library
+// layer; the golden recipes live in tests/golden/regenerate.sh. Goldens under
+// tests/golden/references/overlay/.
+//
+//   case                | kind     | source        | --from | --to  | --repeat
+//   --------------------|----------|---------------|--------|-------|---------
+//   one-page (.16.3)    | overlay  | one-page      | -      | -     | -
+//   two-page default    | overlay  | two-page      | -      | -     | -
+//   one-page repeat1    | overlay  | one-page      | -      | -     | 1
+//   two-page to=2-3     | overlay  | two-page      | -      | 2-3   | -
+//   two overlays (.16.5)| overlay×2| one + two     | -      | -     | -
+//   overlay+underlay    | over+und | one + two     | -      | -     | -
+//   two-page from=2     | overlay  | two-page      | 2      | -     | -
+//   underlay two-page   | underlay | two-page      | -      | -     | -
+//   rotated (.16.3 mtx) | overlay  | one-page-r90  | -      | -     | -
+//   one-page to=1-3 rpt1| overlay  | one-page      | -      | 1-3   | 1
+//
+// The rotated row is the matrix-transformed placement check: the source page
+// carries /Rotate 90, so its imported Form XObject gets a non-identity /Matrix
+// and the placement `cm` is fitted to the matrix-transformed bbox (a whole-file
+// byte match proves both the /Matrix import and the cm fragment).
+//
+// Explicit deferrals (NOT covered here, by design):
+//   - Encrypted-source --password byte-identity: deferred to flpdf-9hc.16.8
+//     (source version-floor propagation). qpdf raises the output version to
+//     max(dest, sources) for AES-256 sources; flpdf keeps the dest version, so
+//     those bytes diverge. The behavioral --password path is covered in
+//     crates/flpdf-cli/tests/cli_overlay.rs.
+//   - CLI-level byte-identity: deferred to flpdf-9hc.33. The flpdf CLI emits
+//     NewlineBeforeEndstream::Yes and exposes no ::Never (qpdf's default), so
+//     every CLI-written stream diverges. These gates write through the library
+//     entry points with NewlineBeforeEndstream::Never instead.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
     use super::{
@@ -858,6 +890,88 @@ mod byte_gate {
         .unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-two-page-to2-3.pdf");
+    }
+
+    #[test]
+    fn overlay_two_page_from2_is_byte_identical() {
+        // dest=three-page, overlay source=two-page, --from=2: the source range
+        // starts at page 2, so p1<-s2 and then the source is exhausted (p2, p3
+        // untouched).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr("2"),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-two-page-from2.pdf");
+    }
+
+    #[test]
+    fn underlay_two_page_default_is_byte_identical() {
+        // dest=three-page, single --underlay source=two-page, defaults: p1<-s1,
+        // p2<-s2, p3 untouched. The source is drawn BENEATH the page (Fx1 placed
+        // before Fx0 in the new content stream).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Underlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-underlay-two-page.pdf");
+    }
+
+    #[test]
+    fn overlay_rotated_source_is_byte_identical() {
+        // dest=three-page, overlay source=one-page-r90 (a +90-rotated page). The
+        // imported Form XObject carries a non-identity /Matrix encoding the
+        // rotation, and the placement `cm` must fit the matrix-TRANSFORMED bbox
+        // (the visual extent), not the raw /BBox. A whole-file byte match proves
+        // both the /Matrix import and the matrix-transformed cm fragment.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("one-page-r90.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-rotated.pdf");
+    }
+
+    #[test]
+    fn overlay_one_page_to1_3_repeat1_is_byte_identical() {
+        // dest=three-page, overlay source=one-page, --to=1-3 --repeat=1: every
+        // dest page is selected and the single source page cycles via --repeat,
+        // so all three pages share the SAME imported XObject.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr("1-3"),
+            Some(&pr("1")),
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-to-repeat.pdf");
     }
 
     /// Build a default-range [`OverlaySpec`] over a fixture document.

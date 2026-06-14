@@ -150,6 +150,7 @@ pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};
+pub use overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
 pub use page_annotation_enum::{
     enumerate_document_annotations, enumerate_page_annotations, EnumeratedAnnotation,
 };

@@ -113,6 +113,26 @@ else
     echo "Skipping lone-flate-l9.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
+    echo "Generating one-page-enc-u.pdf ..."
+    # AES-256 (R6) encrypted source for the overlay --password path. AES key
+    # material is random => this fixture is NON-deterministic and is COMMITTED;
+    # if regenerated, re-bless overlay/three-page-overlay-encrypted-source.pdf.
+    qpdf --encrypt u o 256 -- --warning-exit-0 \
+        "$FIX/one-page.pdf" "$FIX/one-page-enc-u.pdf"
+else
+    echo "Skipping one-page-enc-u.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/one-page-r90.pdf" ]]; then
+    echo "Generating one-page-r90.pdf ..."
+    # +90-rotated single page; the Form /Matrix encodes the rotation so the
+    # placement uses the matrix-transformed (visual) bbox. Deterministic.
+    qpdf "$FIX/one-page.pdf" --rotate=+90:1 -- "$FIX/one-page-r90.pdf"
+else
+    echo "Skipping one-page-r90.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -251,6 +271,29 @@ qpdf --static-id --warning-exit-0 \
     --underlay "$FIX/two-page.pdf" -- \
     "$REF/overlay/three-page-overlay-and-underlay.pdf"
 echo "overlay/three-page-overlay-and-underlay.pdf"
+
+# Matrix coverage (epic flpdf-9hc.16.7): --from range, pure --underlay, rotated
+# source (matrix-transformed placement), and --to + --repeat together.
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/two-page.pdf" --from=2 -- \
+    "$REF/overlay/three-page-overlay-two-page-from2.pdf"
+echo "overlay/three-page-overlay-two-page-from2.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --underlay "$FIX/two-page.pdf" -- \
+    "$REF/overlay/three-page-underlay-two-page.pdf"
+echo "overlay/three-page-underlay-two-page.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page-r90.pdf" -- \
+    "$REF/overlay/three-page-overlay-rotated.pdf"
+echo "overlay/three-page-overlay-rotated.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" --to=1-3 --repeat=1 -- \
+    "$REF/overlay/three-page-overlay-to-repeat.pdf"
+echo "overlay/three-page-overlay-to-repeat.pdf"
+
 
 echo ""
 
