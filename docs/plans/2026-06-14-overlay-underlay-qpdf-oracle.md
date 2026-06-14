@@ -187,3 +187,28 @@ getMatrixForFormXObjectPlacement fits the form's /BBox AFTER applying the form's
 => placement = transform the /BBox 4 corners by /Matrix, take the bounding rect,
 then scale-to-fit+centre THAT. Identity /Matrix => transformed == raw (the
 simple gate is unaffected). A byte-level rotated golden is deferred to .16.7.
+
+## Page mapping (--from/--to/--repeat) — CONFIRMED algorithm + XObject sharing
+
+from_pages   = --from applied to source (default all source pages, in range order)
+to_pages     = --to   applied to dest   (default all dest pages, in range order)
+repeat_pages = --repeat applied to source (default EMPTY)
+  for i, dest in enumerate(to_pages):
+      src = from_pages[i]                         if i < len(from_pages)
+          = repeat_pages[(i-len(from_pages)) % len(repeat_pages)]  elif repeat non-empty
+          = (skip: this dest page gets NO overlay) else
+Confirmed (qpdf 11.9.0, dest=three-page):
+  two-page default -> p1<-s1,p2<-s2,p3 none
+  one-page --repeat=1 -> p1,p2,p3 all <- s1
+  two-page --to=2-3 -> p2<-s1,p3<-s2 (p1 none; pairing is against the --to LIST)
+  two-page --from=2 -> p1<-s2 (then exhausted, p2,p3 none)
+  one-page --to=1,3 -> p1<-s1 (p3 in --to but source exhausted+no repeat -> none)
+  two-page --repeat=2 -> p1<-s1,p2<-s2,p3<-s2
+
+XObject SHARING (byte-identity critical): a source page used on multiple dest
+pages is imported ONCE and the SAME XObject ref is shared. repeat1 golden:
+page1 Fx1=obj9, page2 Fx1=obj9, page3 Fx1=obj9 (shared); Fx0 differs per page
+(8/11/13, each page's own content). Content streams are per-page distinct objects
+even when byte-identical (no dedupe). => import distinct source pages once, cache
+by source-page index, reuse the ref across dest pages. Only dest pages that
+actually receive a source are touched (others left fully untouched, no Fx0).
