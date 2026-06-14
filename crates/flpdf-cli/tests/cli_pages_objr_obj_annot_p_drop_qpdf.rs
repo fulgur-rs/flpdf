@@ -331,6 +331,22 @@ fn objr_obj_annot_p_to_removed_page_dropped_and_page_gced_like_qpdf() {
 
     assert_facts(&q_qdf, "qpdf");
     assert_facts(&f_qdf, "flpdf");
+
+    // Also assert directly on flpdf's RAW output. `assert_facts` reads the
+    // qpdf --qdf-normalized form, but that normaliser deletes a dangling /P (and
+    // GCs/keeps objects), so a /P-keeping regression could pass the normalized
+    // missing-/P check. The raw output is flpdf's actual bytes: the removed-page
+    // annotation (carrying `(rm)`) must have no /P there.
+    let f_raw = String::from_utf8_lossy(&std::fs::read(&f_out).unwrap()).into_owned();
+    let rm_obj = raw_object_with(&f_raw, "(rm)", "flpdf");
+    assert!(
+        rm_obj.contains("/Type /Annot"),
+        "flpdf: the (rm) object should be the annotation, got:\n{rm_obj}"
+    );
+    assert!(
+        !rm_obj.contains("/P "),
+        "flpdf: removed-page annotation's /P must be dropped in the raw output, got:\n{rm_obj}"
+    );
 }
 
 /// Build a 3-page PDF whose removed page 2 (object 4) is referenced by BOTH a

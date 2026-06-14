@@ -319,11 +319,16 @@ fn process_elem_dict<R: Read + Seek>(
     // reference; a separate pass (objr_obj_annot_p) drops its dangling /P
     // back-reference to a removed page. /Obj is by spec an indirect reference;
     // normalize a reference chain to its terminal ref. A non-reference /Obj is
-    // malformed and ignored. Only OBJR dicts carry /Obj, so no /Type check is
-    // needed.
+    // malformed and ignored. Collection is gated on the structural-reference
+    // classifier (is_mcr_or_objr) so a private/extension /Obj key on a plain
+    // structure element is not pulled into the OBJR-only /P-drop scope; only OBJR
+    // actually carries /Obj, so in practice this collects exactly OBJR /Obj kids.
     if let Some(Object::Reference(obj)) = dict.get("Obj") {
-        let terminal = terminal_ref_of_chain(pdf, *obj)?;
-        state.objr_obj_targets.push(terminal);
+        let obj = *obj;
+        if is_mcr_or_objr(pdf, &dict)? {
+            let terminal = terminal_ref_of_chain(pdf, obj)?;
+            state.objr_obj_targets.push(terminal);
+        }
     }
 
     // Recurse only into a real structure element's /K kids. Classifying a dict
@@ -521,6 +526,23 @@ mod tests {
         assert!(
             matches!(objr_obj, Some(Object::Reference(r)) if r.number == 5),
             "OBJR /Obj must be kept, got {objr_obj:?}"
+        );
+    }
+
+    #[test]
+    fn non_objr_obj_key_not_collected() {
+        // A non-OBJR structure dictionary carrying a private/extension /Obj key
+        // must NOT contribute an /Obj target: collection is gated on /Type /OBJR
+        // so it stays within the OBJR-only /P-drop scope. Object 20 is a
+        // /Type /StructElem with an /Obj key; object 5 must not be collected.
+        let mut objs = base_objs();
+        objs.insert(20, "<< /Type /StructElem /S /P /Obj 5 0 R >>".into());
+        let mut pdf = open(&objs);
+
+        let targets = drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("ok");
+        assert!(
+            !targets.contains(&ObjectRef::new(5, 0)),
+            "a non-OBJR /Obj key must not be collected, got {targets:?}"
         );
     }
 
