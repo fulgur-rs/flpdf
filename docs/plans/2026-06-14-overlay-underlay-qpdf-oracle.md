@@ -119,3 +119,38 @@ inspector (the quick awk counter used during oracle was buggy).
   inside /Fx0). Float formatting IS achievable byte-identical (5dp trim).
 - .16.5: multi-compose = naming under-then-over, draw under->Fx0->over.
 - .16.7: byte parity is now in-scope (feature-gated qpdf-zlib-compat), not a caveat.
+
+## flpdf infrastructure map (for implementation; verified by code survey)
+
+- Foreign deep copy (qpdf copyForeignObject): `object_copy::copy_objects(&mut
+  source, &mut target, &BTreeSet<ObjectRef>) -> BTreeMap<ObjectRef,ObjectRef>`
+  (object_copy.rs:76). Pre-allocates target numbers as max(target)+1 in
+  **BTreeSet sorted order of source refs**. THIS ORDER may differ from qpdf's
+  copyForeignObject traversal order -> the prime object-numbering byte-identity
+  risk; verify at .16.3 with the compat baseline.
+- Page object closure: `page_closure::extend_page_object_closure(pdf, page_ref,
+  &mut BTreeSet)` (boundary-respecting; used by page_merge::merge_documents).
+- Raw content streams (undecoded): `pages::page_content_stream_entries(pdf,
+  page_ref) -> Vec<(Option<ObjectRef>, Stream)>` (pages.rs:166).
+  Decoded+coalesced content: `pages::page_content_bytes` (pages.rs:92). qpdf's
+  form XObject stream holds DECODED page content (re-compressed on write);
+  verify qpdf's inter-stream separator with multi-contents-one-page.pdf at .16.3.
+- Box accessors with inheritance + fallback: `PageObjectHelper::{media_box,
+  crop_box,trim_box,...}` (page_object_helper.rs); `rotate()`, `resources()`
+  (walks /Parent). trim_box already falls back CropBox->MediaBox.
+- /Group and /UserUnit: NO existing helper (zero grep hits). Read /Group from
+  the page dict directly and copy as-is when present. UserUnit unsupported in
+  flpdf and absent in fixtures -> defer (identity); note as edge case.
+- Object construction + allocation: appearance.rs:119-171 +
+  `next_object_ref()` (max(refs)+1, then set_object). NOTE qpdf
+  getFormXObjectForPage does NOT add /FormType; flpdf appearance.rs DOES — for
+  overlay byte-identity OMIT /FormType.
+- Compat baseline byte test template: crates/flpdf-cli/tests/
+  compat_baseline_static_id.rs (BLESS=1 to bless golden, ByteComparator,
+  first-diff). golden under tests/golden/. Run with qpdf-zlib-compat feature.
+
+## Form XObject dict (EXACT, from QDF) — keys in sorted order, NO /FormType
+
+  /BBox /Matrix /Resources /Subtype(/Form) /Type(/XObject) [+/Group if present]
+  (+ /Length added by writer). qpdf dicts are std::map => keys WRITTEN SORTED.
+  /Matrix always emitted (identity [1 0 0 1 0 0] when no rotate/userunit).
