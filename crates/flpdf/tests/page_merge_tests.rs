@@ -3350,6 +3350,122 @@ fn top_level_field_in_annots_unselected_pdf() -> Vec<u8> {
     )
 }
 
+/// Resolve the `/AcroForm /Fields` entry whose `/T` partial name equals `name`
+/// (resolving an indirect `/T`) and return its `/Kids` length. Panics if no field
+/// matches or the matched field carries no `/Kids` array. Unlike
+/// [`sole_field_kids_count`] this selects a field by name, so it works when the
+/// output holds several top-level fields (e.g. a primary terminal field alongside
+/// a renamed non-terminal secondary field).
+fn field_kids_count_by_name(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, name: &[u8]) -> usize {
+    let cat = catalog_dict(doc);
+    let acroform = match cat.get("AcroForm") {
+        Some(Object::Reference(r)) => doc.resolve(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Dictionary(d)) => d.clone(),
+        other => panic!("expected /AcroForm, got {other:?}"),
+    };
+    let fields = match acroform.get("Fields") {
+        Some(Object::Array(arr)) => arr.clone(),
+        Some(Object::Reference(r)) => match doc.resolve(*r).unwrap() {
+            Object::Array(arr) => arr,
+            other => panic!("expected indirect /Fields array, got {other:?}"),
+        },
+        other => panic!("expected /Fields array, got {other:?}"),
+    };
+    for item in fields {
+        let field_ref = match item {
+            Object::Reference(r) => r,
+            other => panic!("expected field ref, got {other:?}"),
+        };
+        let field = doc.resolve(field_ref).unwrap().into_dict().unwrap();
+        let field_name = match field.get("T") {
+            Some(Object::String(s)) => s.clone(),
+            Some(Object::Reference(r)) => doc
+                .resolve(*r)
+                .unwrap()
+                .as_string()
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if field_name == name {
+            return match field.get("Kids") {
+                Some(Object::Array(arr)) => arr.len(),
+                other => panic!("field {name:?} has no /Kids array, got {other:?}"),
+            };
+        }
+    }
+    panic!("no /AcroForm field named {name:?}");
+}
+
+// Composition of the two orthogonal AcroForm merge transforms (regression for a
+// gap noted in PR #329's review): a SECONDARY input's non-terminal field that
+// BOTH needs `/Kids` trimming (a widget on an unselected page) AND collides with
+// the primary's field name. The single-input trim tests above exercise only the
+// primary, and the `+N` rename tests above use only flat terminal fields; this is
+// the first case where trim and rename must both land on one surviving field.
+//
+// Primary  (input 0): `form_pdf(b"parent")` — a 1-page terminal flat field
+//   `parent`; selecting page 0 keeps it verbatim (it seeds the rename `used` set).
+// Secondary(input 1): `nonterminal_field_multi_page_pdf()` — a 2-page non-terminal
+//   field `parent` whose `/Kids` are a widget on page 0 and a widget on page 1;
+//   selecting page 0 only trims the page-1 widget and nulls its orphaned page.
+//
+// The merge trims `/Kids` during the per-input loop, then renames the colliding
+// `/T` (`parent` → `parent+1`) in `build_merged_acroform` afterwards (the
+// trim-then-rename order is structural). Both effects must coexist on the same
+// surviving field.
+#[test]
+fn merge_trims_and_renames_secondary_nonterminal_field() {
+    let mut a = Pdf::open_mem_owned(form_pdf(b"parent")).unwrap();
+    let mut b = Pdf::open_mem_owned(nonterminal_field_multi_page_pdf()).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    // Rename half: the primary `parent` is kept verbatim; the secondary's
+    // colliding `parent` is renamed `parent+1`.
+    assert_eq!(
+        acroform_field_names(&mut doc),
+        vec![b"parent".to_vec(), b"parent+1".to_vec()],
+        "primary keeps its name; the colliding secondary field is renamed +1"
+    );
+
+    // Trim half: the renamed non-terminal field keeps only its page-0 widget; the
+    // page-1 widget was trimmed from `/Kids`.
+    assert_eq!(
+        field_kids_count_by_name(&mut doc, b"parent+1"),
+        1,
+        "the renamed field's /Kids must be trimmed to the surviving-page widget"
+    );
+
+    // The trimmed widget's unselected page is nulled, not left as an off-tree
+    // orphan: only the two selected pages (one per input) survive as live
+    // /Type /Page objects.
+    assert_eq!(
+        count_live_page_objects(&mut doc),
+        2,
+        "no orphan /Type /Page from the secondary's trimmed page-1 widget"
+    );
+    let refs = pages::page_refs(&mut doc).unwrap();
+    assert_eq!(
+        refs.len(),
+        2,
+        "output carries exactly the two selected pages"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // Task 7: remaining error/boundary arms (empty selection, duplicate selection,
 // --empty blank-primary base).
