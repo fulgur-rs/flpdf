@@ -72,6 +72,47 @@ else
     echo "Skipping attachment-two-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/lone-flate-l9.pdf" ]]; then
+    echo "Generating lone-flate-l9.pdf ..."
+    # A single-page PDF whose content stream is large enough that zlib level 9
+    # and level 6 produce DIFFERENT compressed bytes (a tiny stream would not,
+    # giving a false-green parity test). The content is fully deterministic
+    # (no RNG). qpdf re-encodes it to a lone /FlateDecode at level 9; flpdf must
+    # PRESERVE those bytes verbatim (qpdf's default), so re-encoding at level 6
+    # would diverge. --object-streams=disable keeps the content stream as an
+    # individual body object (classic xref, no ObjStm) so the parity is direct.
+    TMPDIR_L9="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR_L9"' EXIT
+    python3 - "$TMPDIR_L9/raw.pdf" <<'PY'
+import sys
+ops = b""
+for i in range(600):
+    ops += b"%d %d %d %d re f\n" % (i % 500, (i * 7) % 700, (i * 3) % 40 + 5, (i * 5) % 40 + 5)
+def obj(n, body): return b"%d 0 obj\n" % n + body + b"\nendobj\n"
+o1 = obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+o2 = obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+o3 = obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>")
+o4 = obj(4, b"<< /Length %d >>\nstream\n" % len(ops) + ops + b"\nendstream")
+body = b"%PDF-1.4\n"
+offsets = []
+for o in (o1, o2, o3, o4):
+    offsets.append(len(body)); body += o
+xref_pos = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for off in offsets:
+    body += b"%010d 00000 n \n" % off
+body += b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref_pos
+open(sys.argv[1], "wb").write(body)
+PY
+    qpdf --recompress-flate --compression-level=9 --object-streams=disable \
+        --stream-data=compress --static-id --warning-exit-0 \
+        "$TMPDIR_L9/raw.pdf" "$FIX/lone-flate-l9.pdf"
+    trap - EXIT
+    rm -rf "$TMPDIR_L9"
+else
+    echo "Skipping lone-flate-l9.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -84,7 +125,8 @@ mkdir -p \
     "$REF/three-page" \
     "$REF/linearized-one-page" \
     "$REF/encrypted-r4-three-page" \
-    "$REF/attachment-two-page"
+    "$REF/attachment-two-page" \
+    "$REF/lone-flate-l9"
 
 echo "=== Generating reference outputs ==="
 
@@ -149,8 +191,18 @@ qpdf --static-id --warning-exit-0 \
     "$FIX/attachment-two-page.pdf" "$REF/attachment-two-page/static-id.pdf"
 echo "attachment-two-page/static-id.pdf"
 
+# --- lone-flate-l9: static-id (plain) + linearize. Both PRESERVE the level-9
+#     lone /FlateDecode streams verbatim (qpdf default; no --recompress-flate). ---
+qpdf --static-id --warning-exit-0 \
+    "$FIX/lone-flate-l9.pdf" "$REF/lone-flate-l9/static-id.pdf"
+echo "lone-flate-l9/static-id.pdf"
+
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/lone-flate-l9.pdf" "$REF/lone-flate-l9/linearize.pdf"
+echo "lone-flate-l9/linearize.pdf"
+
 echo ""
-echo "=== All 13 references generated ==="
+echo "=== All 15 references generated ==="
 
 # ---------------------------------------------------------------------------
 # Phase 3: Size check (fail if any reference exceeds 100 KB)
