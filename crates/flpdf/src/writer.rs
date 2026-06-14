@@ -361,6 +361,24 @@ pub struct WriteOptions {
     /// [`compress_streams`]: WriteOptions::compress_streams
     pub stream_data: Option<StreamDataMode>,
 
+    /// Re-encode streams that are already a lone `/FlateDecode`.
+    ///
+    /// By default (`false`) a stream whose source filter is a single
+    /// `/FlateDecode` is emitted **verbatim** under [`CompressStreams::Yes`] —
+    /// its already-compressed bytes are preserved rather than decoded and
+    /// re-encoded. This mirrors qpdf, which does not recompress a lone-Flate
+    /// stream unless `--recompress-flate` is given.
+    ///
+    /// Set to `true` to force such streams through a decode + re-encode pass
+    /// (equivalent to `qpdf --recompress-flate`). Has no effect under
+    /// [`CompressStreams::No`] / [`StreamDataMode::Uncompress`] (which always
+    /// decode) or [`StreamDataMode::Preserve`] (which never decodes).
+    ///
+    /// A lone-Flate stream that carries an external-file reference (`/F`) is
+    /// always re-encoded regardless of this flag: its in-body bytes are not the
+    /// canonical data, so they are never preserved verbatim.
+    pub recompress_flate: bool,
+
     /// Encrypt the output with the supplied [`crate::EncryptParams`] (qpdf
     /// `--encrypt …` equivalent).
     ///
@@ -2945,6 +2963,27 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // than flpdf's unconditional decode/re-encode.
             let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
             let mut reencoded = match effective_stream_policy(options) {
+                // qpdf preserves an already-lone-/FlateDecode stream verbatim
+                // under the compress policy (no decode + re-encode) unless
+                // recompression is explicitly requested. Normalize /Length to
+                // the raw data length (a source may carry an indirect /Length).
+                //
+                // Exclude external streams: a `/F` entry means the canonical data
+                // lives in an external file and the in-body bytes are not
+                // authoritative, so preserving them verbatim would keep a stale
+                // external reference. Such streams fall through to the re-encode
+                // arm, which embeds the decoded data and strips `/F` / `/FFilter`
+                // / `/FDecodeParms` (see `apply_stream_compress_policy`).
+                Some(CompressStreams::Yes)
+                    if source_filter_is_lone_flate
+                        && !options.recompress_flate
+                        && stream.dict.get("F").is_none() =>
+                {
+                    let mut stream = stream;
+                    let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
+                    stream.dict.insert("Length", Object::Integer(len));
+                    Object::Stream(stream)
+                }
                 Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
                 // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
                 // `stream` is owned (moved out of the resolved `object`) and is
@@ -3581,6 +3620,16 @@ pub(crate) fn write_stream_to_buf_qpdf_order(
 ) {
     stream.dict.write_pdf_stream(buf, refiltered);
     write_stream_payload(buf, &stream.data, policy);
+}
+
+/// Emit a preserved (verbatim) stream body: the `dict` in qpdf's stream-dict key
+/// order (`/Length` pulled out and written last; no re-filtering) followed by the
+/// raw `data` framed with no newline before `endstream`. Used to emit an
+/// already-lone-/FlateDecode stream without decode + re-encode. The caller is
+/// responsible for setting `dict`'s `/Length` to `data.len()`.
+pub(crate) fn write_preserved_stream(buf: &mut Vec<u8>, dict: &Dictionary, data: &[u8]) {
+    dict.write_pdf_stream(buf, false);
+    write_stream_payload(buf, data, NewlineBeforeEndstream::Never);
 }
 
 /// Emit the `\nstream\n<payload><EOL>endstream` framing shared by

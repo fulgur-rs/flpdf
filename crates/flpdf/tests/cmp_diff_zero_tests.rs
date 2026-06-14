@@ -98,3 +98,10 @@ fn two_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
 fn three_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
     assert_cmp_diff_zero("three-page.pdf", "three-page");
 }
+
+#[test]
+fn lone_flate_l9_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
+    // A lone /FlateDecode source compressed at level 9: flpdf must preserve the
+    // bytes verbatim (qpdf default), so re-encoding at level 6 would diverge.
+    assert_cmp_diff_zero("lone-flate-l9.pdf", "lone-flate-l9");
+}

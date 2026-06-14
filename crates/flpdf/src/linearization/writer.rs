@@ -478,6 +478,34 @@ fn append_body_object(
     // an already-Flate source is preserved with `/Length` last. Capture the
     // source decision before the policy rewrites the dict.
     let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
+
+    // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
+    // compress policy (no decode + re-encode) unless recompression is requested.
+    // Emit the dict (lexicographic, /Length last — `refiltered = false`) with
+    // /Length normalized to the raw data length, then the data verbatim. Clone
+    // only the (small) dict, never the stream data.
+    //
+    // Exclude external streams (`/F`): their in-body bytes are not authoritative,
+    // so they fall through to `apply_stream_compress_policy`, which embeds the
+    // decoded data and strips `/F` / `/FFilter` / `/FDecodeParms` (matches the
+    // plain full-rewrite path).
+    if matches!(policy, CompressStreams::Yes)
+        && source_filter_is_lone_flate
+        && !options.recompress_flate
+        && stream.dict.get("F").is_none()
+    {
+        let offset = bytes.len();
+        bytes.extend_from_slice(
+            format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes(),
+        );
+        let mut dict = stream.dict.clone();
+        let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
+        dict.insert("Length", Object::Integer(len));
+        crate::writer::write_preserved_stream(bytes, &dict, &stream.data);
+        bytes.extend_from_slice(b"\nendobj\n");
+        return offset;
+    }
+
     let reencoded = apply_stream_compress_policy(stream, policy);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm

@@ -62,9 +62,9 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 | three-page.pdf | plain | 261c0e31280434aa | diverge | diverge | diverge |
 | three-page.pdf | static-id | 261c0e31280434aa | diverge | diverge | match |
 | three-page.pdf | linearize | cc4903e1dc9b2372 | diverge | diverge | diverge |
-| linearized-one-page.pdf | plain | 31180d37257abf16 | diverge | diverge | diverge |
-| attachment-two-page.pdf | plain | 90e0aad41c003854 | diverge | diverge | diverge |
-| attachment-two-page.pdf | static-id | 90e0aad41c003854 | diverge | diverge | match |
+| linearized-one-page.pdf | plain | 21c145333c95ee8a | diverge | diverge | diverge |
+| attachment-two-page.pdf | plain | 17c1f26ffd1f808f | diverge | diverge | diverge |
+| attachment-two-page.pdf | static-id | 17c1f26ffd1f808f | diverge | match | match |
 | one-page.pdf | stream-data-uncompress | 2459b51d8e02a0ee | diverge | diverge | diverge |
 | two-page.pdf | stream-data-uncompress | 62b2ffa29d429247 | diverge | diverge | diverge |
 | three-page.pdf | stream-data-uncompress | 316464990dd79893 | diverge | diverge | diverge |
