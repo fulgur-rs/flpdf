@@ -76,6 +76,7 @@ pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
 pub mod page_extract;
+pub(crate) mod page_form_xobject;
 pub mod page_label_document_helper;
 pub mod page_merge;
 pub mod page_object_helper;
