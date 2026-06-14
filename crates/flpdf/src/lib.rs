@@ -69,6 +69,7 @@ pub mod objr_obj_annot_p;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
+pub(crate) mod overlay;
 pub mod page_annotation_enum;
 pub mod page_annotation_flatten;
 pub mod page_closure;
