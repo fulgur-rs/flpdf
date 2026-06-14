@@ -237,6 +237,21 @@ qpdf --static-id --warning-exit-0 \
     "$REF/overlay/three-page-overlay-two-page-to2-3.pdf"
 echo "overlay/three-page-overlay-two-page-to2-3.pdf"
 
+# Multi-spec composition (epic flpdf-9hc.16.5):
+#  - two --overlay flags compose left-to-right (both onto the same pages).
+#  - --overlay + --underlay: underlay below, overlay above, page in the middle.
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    --overlay "$FIX/two-page.pdf" -- \
+    "$REF/overlay/three-page-two-overlays.pdf"
+echo "overlay/three-page-two-overlays.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    --underlay "$FIX/two-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-and-underlay.pdf"
+echo "overlay/three-page-overlay-and-underlay.pdf"
+
 echo ""
 
 # ---------------------------------------------------------------------------
