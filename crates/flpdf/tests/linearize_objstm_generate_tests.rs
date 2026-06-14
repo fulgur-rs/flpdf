@@ -68,8 +68,8 @@ fn first_objstm_marker_offset(bytes: &[u8]) -> Option<usize> {
 }
 
 /// The first-half (Part-3) ObjStm container holding the first-page shared dicts
-/// + `/Pages` + `/Info` must be emitted BEFORE `/E`, and the document round-trips
-/// (every object, including compressed members, resolves).
+/// (plus the `/Pages` tree and `/Info`) must be emitted BEFORE `/E`, and the
+/// document round-trips (every object, including compressed members, resolves).
 #[test]
 fn three_page_generate_packs_first_half_container_before_e() {
     let bytes = linearize_generate("three-page.pdf");

@@ -1109,18 +1109,20 @@ impl LinearizationPlan {
             .into_iter()
             .chain([self.info_ref, self.pages_tree_ref].into_iter().flatten())
             .collect();
-        if !excluded_from_part4.is_empty() {
-            plan.part4_batches = std::mem::take(&mut plan.part4_batches)
-                .into_iter()
-                .filter_map(|batch| {
-                    let kept: Vec<ObjectRef> = batch
-                        .into_iter()
-                        .filter(|r| !excluded_from_part4.contains(r))
-                        .collect();
-                    (!kept.is_empty()).then_some(kept)
-                })
-                .collect();
-        }
+        // Filter the excluded refs out of every Part-4 batch (dropping any batch
+        // that becomes empty).  When `excluded_from_part4` is empty this is a
+        // harmless no-op, so no guard is needed — avoiding an unreachable
+        // empty-set branch (a linearizable document always has a /Catalog).
+        plan.part4_batches = std::mem::take(&mut plan.part4_batches)
+            .into_iter()
+            .filter_map(|batch| {
+                let kept: Vec<ObjectRef> = batch
+                    .into_iter()
+                    .filter(|r| !excluded_from_part4.contains(r))
+                    .collect();
+                (!kept.is_empty()).then_some(kept)
+            })
+            .collect();
 
         // cov:ignore-start: defensive — this method is only invoked when
         // `part3_batches` is non-empty (multi-page docs with first-page shared
