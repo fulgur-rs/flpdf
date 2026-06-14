@@ -1432,6 +1432,48 @@ fn main() {
         std::process::exit(1);
     }
 
+    // `--overlay`/`--underlay` groups are stripped from argv before clap by
+    // `extract_overlay_groups`, so a stripped group leaves no trace for the
+    // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
+    // top-level default/`--linearize` rewrite branches) consume `overlay_specs`;
+    // every other command/mode would silently ignore it. Reject that here so an
+    // overlay on, e.g., `check`/`--show-npages`/`--pages` fails loudly instead of
+    // being dropped. The top-level predicate mirrors the dispatch chain below
+    // (the rewrite branch is the final `else`, reached only when no inspection,
+    // attachment, json, or page-op mode is selected) and must stay in sync with
+    // it; `--pages`/`--linearize` combinations are rejected later with their own
+    // specific diagnostics.
+    if !overlay_specs.is_empty() {
+        let target_is_rewrite = match &args.command {
+            Some(Commands::Rewrite(_)) => true,
+            Some(_) => false,
+            None => {
+                args.json.is_none()
+                    && args.dump_object.is_none()
+                    && !args.show_info
+                    && !args.show_catalog
+                    && !args.show_metadata
+                    && !args.show_outline
+                    && !args.show_fonts
+                    && !args.show_npages
+                    && !args.show_pages
+                    && !args.check
+                    && !args.list_attachments
+                    && args.show_attachment.is_none()
+                    && args.remove_attachment.is_none()
+                    && args.add_attachment.is_empty()
+                    && args.copy_attachments_from.is_empty()
+            }
+        };
+        if !target_is_rewrite {
+            eprintln!(
+                "flpdf: --overlay/--underlay can only be used with rewrite output, \
+                 not with inspection or other commands"
+            );
+            std::process::exit(2);
+        }
+    }
+
     // JSON mode takes the first branch, but this is unambiguous: clap's
     // conflicts_with_all on --json (plus args_conflicts_with_subcommands on
     // Cli) guarantees no other top-level mode or subcommand can be set at
