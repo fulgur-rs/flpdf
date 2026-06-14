@@ -260,8 +260,9 @@ fn map_overlay_pages(
     pairs
 }
 
-/// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
+/// Map a single overlay/underlay spec to its per-destination-page sources
+/// **without applying them**, mirroring qpdf's `QPDFJob::doUnderOverlay` source
+/// preparation for one `--overlay`/`--underlay` group (qpdf 11.9.0).
 ///
 /// `from`, `to`, and `repeat` are the spec's page ranges. `from` (default all
 /// source pages) selects source pages; `to` (default all destination pages)
@@ -273,37 +274,36 @@ fn map_overlay_pages(
 /// single cross-document copy via [`import_pages_as_form_xobjects`] (so an object
 /// shared by several source pages is copied once), and the imported Form XObject
 /// reference is shared across every destination page that uses that source page
-/// (qpdf imports each source page once and reuses the object). Each paired
-/// destination page is then patched by [`apply_overlays_to_page`] with a single
-/// [`OverlaySource`] of the given `kind`. Destination pages not in the mapping
-/// are left untouched.
+/// (qpdf imports each source page once and reuses the object). The result is a
+/// `Vec<(dest_page, OverlaySource)>` in `to` order: each entry pairs a 1-based
+/// destination page number with an [`OverlaySource`] of the given `kind` carrying
+/// the shared imported XObject reference. No destination page is modified here;
+/// the caller aggregates these across specs and applies them.
 ///
 /// # Errors
 ///
 /// - [`Error::Unsupported`] when a resolved page number falls outside `dest` or
 ///   `source` (the page lists and counts are read once up front, so this only
 ///   triggers on an internally inconsistent mapping), or any error propagated
-///   from [`PageRange::resolve`], [`import_pages_as_form_xobjects`], or
-///   [`apply_overlays_to_page`].
-fn apply_overlay_spec<RS, RT>(
+///   from [`PageRange::resolve`] or [`import_pages_as_form_xobjects`].
+fn spec_page_sources<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
     kind: OverlayKind,
     from: &PageRange,
     to: &PageRange,
     repeat: Option<&PageRange>,
-) -> Result<()>
+) -> Result<Vec<(u32, OverlaySource)>>
 where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    // Snapshot both page lists before mutating `dest`. The applied patches change
-    // page dictionaries in place but never reorder or remove page objects, so the
-    // 1-based page numbers and the captured refs stay valid throughout.
+    // Snapshot the source page list and the dest page count before mutating
+    // `dest`. The applied patches change page dictionaries in place but never
+    // reorder or remove page objects, so the 1-based page numbers stay valid.
     let source_pages = page_refs(source)?;
-    let dest_pages = page_refs(dest)?;
     let n_source = u32_len(source_pages.len());
-    let n_dest = u32_len(dest_pages.len());
+    let n_dest = u32_len(page_refs(dest)?.len());
 
     let from_pages = from.resolve(n_source)?;
     let to_pages = to.resolve(n_dest)?;
@@ -338,15 +338,149 @@ where
         .zip(imported_refs)
         .collect();
 
-    for &(dest_page, source_page) in &pairs {
-        // `source_page` came from `pairs`, so it is one of `distinct_sources` and
-        // is always present in the map; index directly.
-        let xobject_ref = imported[&source_page];
-        let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
-        apply_overlays_to_page(dest, dest_ref, &[OverlaySource { kind, xobject_ref }])?;
-    }
+    Ok(pairs
+        .iter()
+        .map(|&(dest_page, source_page)| {
+            // `source_page` came from `pairs`, so it is one of `distinct_sources`
+            // and is always present in the map; index directly.
+            let xobject_ref = imported[&source_page];
+            (dest_page, OverlaySource { kind, xobject_ref })
+        })
+        .collect())
+}
 
+/// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
+/// `QPDFJob::doUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
+///
+/// A thin wrapper over [`spec_page_sources`] + [`apply_overlay_specs`]'s
+/// aggregation: the spec's per-destination-page sources are mapped, grouped by
+/// destination page, and each affected page is patched by
+/// [`apply_overlays_to_page`] exactly once. Destination pages not in the mapping
+/// are left untouched. See [`spec_page_sources`] for the page-mapping and
+/// XObject-sharing semantics.
+///
+/// # Errors
+///
+/// Propagates any error from [`spec_page_sources`], [`page_ref_for`], or
+/// [`apply_overlays_to_page`].
+fn apply_overlay_spec<RS, RT>(
+    dest: &mut Pdf<RT>,
+    source: &mut Pdf<RS>,
+    kind: OverlayKind,
+    from: &PageRange,
+    to: &PageRange,
+    repeat: Option<&PageRange>,
+) -> Result<()>
+where
+    RS: Read + Seek,
+    RT: Read + Seek,
+{
+    let sources = spec_page_sources(dest, source, kind, from, to, repeat)?;
+    apply_aggregated_sources(dest, group_sources_by_dest_page(&sources))
+}
+
+/// A single overlay/underlay specification: a source document, its kind, and its
+/// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
+/// on the qpdf command line.
+pub(crate) struct OverlaySpec<RS: Read + Seek> {
+    /// The source document supplying the overlay/underlay pages.
+    pub source: Pdf<RS>,
+    /// Whether the source is drawn beneath or above the destination content.
+    pub kind: OverlayKind,
+    /// `--from`: which source pages are used (default all source pages).
+    pub from: PageRange,
+    /// `--to`: which destination pages receive the source (default all).
+    pub to: PageRange,
+    /// `--repeat`: source pages cycled once `from` is exhausted (default none).
+    pub repeat: Option<PageRange>,
+}
+
+/// Group per-spec `(dest_page, source)` entries by destination page, preserving
+/// each entry's encounter order within its page.
+///
+/// `entries` must already be in the order the sources should be drawn/named on a
+/// page: across specs in declaration order, and within a spec in `--to` order.
+/// The returned [`BTreeMap`] iterates destination pages in ascending page order
+/// and, within a page, preserves that encounter order (so
+/// [`apply_overlays_to_page`]'s kind grouping yields underlays-then-overlays with
+/// each kind in declaration order).
+fn group_sources_by_dest_page(
+    entries: &[(u32, OverlaySource)],
+) -> BTreeMap<u32, Vec<OverlaySource>> {
+    let mut by_page: BTreeMap<u32, Vec<OverlaySource>> = BTreeMap::new();
+    for &(dest_page, source) in entries {
+        by_page.entry(dest_page).or_default().push(source);
+    }
+    by_page
+}
+
+/// Apply already-grouped overlay/underlay sources to `dest`, calling
+/// [`apply_overlays_to_page`] **exactly once** per destination page (so each page
+/// is converted to `/Fx0` only once). Pages are processed in ascending page
+/// order; the per-page source order from `by_page` is preserved.
+///
+/// # Errors
+///
+/// Propagates any error from [`page_refs`], [`page_ref_for`], or
+/// [`apply_overlays_to_page`].
+fn apply_aggregated_sources<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    by_page: BTreeMap<u32, Vec<OverlaySource>>,
+) -> Result<()> {
+    // Snapshot the dest page refs once; the patches mutate page dicts in place
+    // but never reorder or remove page objects, so 1-based numbers stay valid.
+    let dest_pages = page_refs(dest)?;
+    for (dest_page, sources) in by_page {
+        let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
+        apply_overlays_to_page(dest, dest_ref, &sources)?;
+    }
     Ok(())
+}
+
+/// Compose multiple overlay/underlay specs onto `dest`, mirroring qpdf's
+/// `QPDFJob::doUnderOverlay` handling of several `--overlay`/`--underlay` groups
+/// (qpdf 11.9.0).
+///
+/// Each spec is mapped independently by [`spec_page_sources`] (its own page
+/// mapping and its own single cross-document copy, since each spec's `source` is
+/// a separate document). The per-destination-page sources from all specs are then
+/// aggregated **in declaration order** and each affected destination page is
+/// patched by [`apply_overlays_to_page`] exactly once. Within a page,
+/// `apply_overlays_to_page` groups by kind (underlays before overlays) while
+/// preserving declaration order inside each kind, so the resulting `/Fx1…/FxN`
+/// naming and draw order match qpdf: underlays (across specs, declaration order),
+/// then `/Fx0` (the page), then overlays (across specs, declaration order).
+///
+/// Destination pages not selected by any spec are left untouched.
+///
+/// # Errors
+///
+/// Propagates any error from [`spec_page_sources`] or [`apply_aggregated_sources`]
+/// (page-range resolution, cross-document copy, or per-page patching).
+pub(crate) fn apply_overlay_specs<RS, RT>(
+    dest: &mut Pdf<RT>,
+    specs: &mut [OverlaySpec<RS>],
+) -> Result<()>
+where
+    RS: Read + Seek,
+    RT: Read + Seek,
+{
+    // Map every spec first, collecting its per-dest-page sources in declaration
+    // order. Each spec gets its own batch import into `dest` (separate documents
+    // => one foreign→local copy per source doc).
+    let mut entries: Vec<(u32, OverlaySource)> = Vec::new();
+    for spec in specs.iter_mut() {
+        let sources = spec_page_sources(
+            dest,
+            &mut spec.source,
+            spec.kind,
+            &spec.from,
+            &spec.to,
+            spec.repeat.as_ref(),
+        )?;
+        entries.extend(sources);
+    }
+    apply_aggregated_sources(dest, group_sources_by_dest_page(&entries))
 }
 
 /// Convert a page-list length to `u32`, the width [`PageRange::resolve`] expects.
@@ -537,7 +671,10 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // in `tests/`, because the overlay entry points are `pub(crate)`.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
-    use super::{apply_overlay_spec, apply_overlays_to_page, OverlayKind, OverlaySource};
+    use super::{
+        apply_overlay_spec, apply_overlay_specs, apply_overlays_to_page, OverlayKind,
+        OverlaySource, OverlaySpec,
+    };
     use crate::page_form_xobject::import_page_as_form_xobject;
     use crate::page_range::PageRange;
     use crate::pages::page_refs;
@@ -713,6 +850,49 @@ mod byte_gate {
         .unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-two-page-to2-3.pdf");
+    }
+
+    /// Build a default-range [`OverlaySpec`] over a fixture document.
+    fn spec(name: &str, kind: OverlayKind) -> OverlaySpec<std::io::BufReader<std::fs::File>> {
+        OverlaySpec {
+            source: fixture(name),
+            kind,
+            from: pr(""),
+            to: pr(""),
+            repeat: None,
+        }
+    }
+
+    #[test]
+    fn two_overlays_compose_byte_identical() {
+        // dest=three-page, --overlay one-page -- --overlay two-page --.
+        // Page 1: Fx0, Fx1(overlay one s1), Fx2(overlay two s1); page 2: Fx0,
+        // Fx1(overlay two s2); page 3 untouched.
+        let mut dest = fixture("three-page.pdf");
+        let mut specs = vec![
+            spec("one-page.pdf", OverlayKind::Overlay),
+            spec("two-page.pdf", OverlayKind::Overlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-two-overlays.pdf");
+    }
+
+    #[test]
+    fn overlay_and_underlay_compose_byte_identical() {
+        // dest=three-page, --overlay one-page -- --underlay two-page --.
+        // Page 1: Fx1(underlay two s1) drawn before Fx0, Fx2(overlay one s1)
+        // after; page 2: Fx1(underlay two s2) before Fx0; page 3 untouched.
+        // Naming is under-then-over across specs even though overlay is declared
+        // first.
+        let mut dest = fixture("three-page.pdf");
+        let mut specs = vec![
+            spec("one-page.pdf", OverlayKind::Overlay),
+            spec("two-page.pdf", OverlayKind::Underlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-and-underlay.pdf");
     }
 }
 
@@ -1619,5 +1799,228 @@ mod tests {
         assert_eq!(u32_len(5), 5);
         // A length above u32::MAX clamps instead of wrapping.
         assert_eq!(u32_len(usize::MAX), u32::MAX);
+    }
+
+    // ---- group_sources_by_dest_page (pure) -------------------------------
+
+    /// A synthetic [`OverlaySource`] of `kind` referencing object `n`.
+    fn src(kind: OverlayKind, n: u32) -> OverlaySource {
+        OverlaySource {
+            kind,
+            xobject_ref: ObjectRef::new(n, 0),
+        }
+    }
+
+    #[test]
+    fn group_sources_buckets_by_page_in_ascending_order() {
+        // Out-of-order dest pages bucket correctly; BTreeMap iterates ascending.
+        let entries = vec![
+            (3, src(OverlayKind::Overlay, 10)),
+            (1, src(OverlayKind::Overlay, 11)),
+            (3, src(OverlayKind::Overlay, 12)),
+        ];
+        let grouped = group_sources_by_dest_page(&entries);
+        let pages: Vec<u32> = grouped.keys().copied().collect();
+        assert_eq!(pages, vec![1, 3], "pages iterate in ascending order");
+        // Page 3 keeps both its sources in encounter order (10 before 12).
+        let p3: Vec<u32> = grouped[&3].iter().map(|s| s.xobject_ref.number).collect();
+        assert_eq!(p3, vec![10, 12]);
+    }
+
+    #[test]
+    fn group_sources_preserves_cross_spec_declaration_order_within_page() {
+        // Mirrors the overlay-and-underlay golden's page 1: spec1 contributes an
+        // OVERLAY (one, ref 11), spec2 an UNDERLAY (two, ref 19), both onto page
+        // 1, in that declaration order. The grouping must keep that order so
+        // apply_overlays_to_page can re-group by kind (under-then-over).
+        let entries = vec![
+            (1, src(OverlayKind::Overlay, 11)),
+            (1, src(OverlayKind::Underlay, 19)),
+        ];
+        let grouped = group_sources_by_dest_page(&entries);
+        let p1 = &grouped[&1];
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1[0].kind, OverlayKind::Overlay);
+        assert_eq!(p1[0].xobject_ref.number, 11);
+        assert_eq!(p1[1].kind, OverlayKind::Underlay);
+        assert_eq!(p1[1].xobject_ref.number, 19);
+    }
+
+    #[test]
+    fn group_sources_empty_is_empty() {
+        assert!(group_sources_by_dest_page(&[]).is_empty());
+    }
+
+    // ---- apply_overlay_specs (multi-spec driver, end-to-end in memory) ----
+
+    /// The full /Fx name → imported ref map and decoded content text of a patched
+    /// page, for asserting cross-spec naming and draw order.
+    fn page_fx_and_content<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        page_ref: ObjectRef,
+    ) -> (BTreeMap<String, ObjectRef>, String) {
+        let page = pdf.resolve(page_ref).unwrap();
+        let page_dict = page.as_dict().unwrap();
+        let xobj = page_dict
+            .get("Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let mut names = BTreeMap::new();
+        for (k, v) in xobj.iter() {
+            if let Object::Reference(r) = v {
+                names.insert(String::from_utf8(k.to_vec()).unwrap(), *r);
+            }
+        }
+        let contents_ref = match page_dict.get("Contents") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
+        };
+        let stream = pdf.resolve(contents_ref).unwrap().into_stream().unwrap();
+        (names, String::from_utf8(stream.data).unwrap())
+    }
+
+    /// Build an [`OverlaySpec`] with default ranges (`--from`/`--to` all, no
+    /// `--repeat`) over a freshly opened `source` document.
+    fn spec(
+        source: Pdf<std::io::Cursor<Vec<u8>>>,
+        kind: OverlayKind,
+    ) -> OverlaySpec<std::io::Cursor<Vec<u8>>> {
+        OverlaySpec {
+            source,
+            kind,
+            from: pr(""),
+            to: pr(""),
+            repeat: None,
+        }
+    }
+
+    #[test]
+    fn apply_overlay_specs_two_overlays_name_in_declaration_order() {
+        // Mirrors the three-page-two-overlays golden: dest=3 pages,
+        // spec1=overlay(one-page), spec2=overlay(two-page). Page 1 gets BOTH:
+        // Fx1=overlay-one(s1), Fx2=overlay-two(s1); page 2 gets only
+        // overlay-two(s2) as Fx1; page 3 untouched. apply_overlays_to_page must
+        // run exactly once per page (one /Fx0).
+        let mut dest = open(multi_page_doc(3));
+        let dest_pages = page_refs(&mut dest).unwrap();
+        let mut specs = vec![
+            spec(open(multi_page_doc(1)), OverlayKind::Overlay),
+            spec(open(multi_page_doc(2)), OverlayKind::Overlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        // Page 1: Fx0 + two overlays. Draw order Fx0 -> Fx1 -> Fx2.
+        let (names1, text1) = page_fx_and_content(&mut dest, dest_pages[0]);
+        let keys1: Vec<&str> = {
+            let mut k: Vec<&str> = names1.keys().map(String::as_str).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys1, vec!["Fx0", "Fx1", "Fx2"], "page 1 has Fx0..Fx2");
+        let p0 = text1.find("/Fx0 Do").unwrap();
+        let p1 = text1.find("/Fx1 Do").unwrap();
+        let p2 = text1.find("/Fx2 Do").unwrap();
+        assert!(p0 < p1 && p1 < p2, "overlays draw after /Fx0: {text1:?}");
+        // The two overlays come from DIFFERENT source documents -> distinct refs.
+        assert_ne!(names1["Fx1"], names1["Fx2"]);
+
+        // Page 2: only spec2's second source page (Fx1), single /Fx0.
+        let (names2, _text2) = page_fx_and_content(&mut dest, dest_pages[1]);
+        let mut keys2: Vec<&str> = names2.keys().map(String::as_str).collect();
+        keys2.sort();
+        assert_eq!(keys2, vec!["Fx0", "Fx1"], "page 2 has only one source");
+
+        // Page 3 untouched (both sources exhausted, no --repeat).
+        assert!(!is_patched(&mut dest, dest_pages[2]), "page 3 untouched");
+    }
+
+    #[test]
+    fn apply_overlay_specs_overlay_then_underlay_names_under_first() {
+        // Mirrors the three-page-overlay-and-underlay golden: spec1=overlay(one),
+        // spec2=underlay(two). On page 1 the UNDERLAY must be /Fx1 (drawn before
+        // /Fx0) and the OVERLAY /Fx2 (drawn after /Fx0), even though the overlay
+        // was declared first — apply_overlays_to_page groups under-then-over.
+        let mut dest = open(multi_page_doc(3));
+        let dest_pages = page_refs(&mut dest).unwrap();
+        let mut specs = vec![
+            spec(open(multi_page_doc(1)), OverlayKind::Overlay),
+            spec(open(multi_page_doc(2)), OverlayKind::Underlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let (names1, text1) = page_fx_and_content(&mut dest, dest_pages[0]);
+        let mut keys1: Vec<&str> = names1.keys().map(String::as_str).collect();
+        keys1.sort();
+        assert_eq!(keys1, vec!["Fx0", "Fx1", "Fx2"]);
+        // Draw order: Fx1 (underlay) -> Fx0 (page) -> Fx2 (overlay).
+        let f1 = text1.find("/Fx1 Do").unwrap();
+        let f0 = text1.find("/Fx0 Do").unwrap();
+        let f2 = text1.find("/Fx2 Do").unwrap();
+        assert!(
+            f1 < f0 && f0 < f2,
+            "under(Fx1) -> page(Fx0) -> over(Fx2): {text1:?}"
+        );
+
+        // Page 2: only the underlay's second source page, drawn before /Fx0.
+        let (names2, text2) = page_fx_and_content(&mut dest, dest_pages[1]);
+        let mut keys2: Vec<&str> = names2.keys().map(String::as_str).collect();
+        keys2.sort();
+        assert_eq!(keys2, vec!["Fx0", "Fx1"]);
+        assert!(
+            text2.find("/Fx1 Do").unwrap() < text2.find("/Fx0 Do").unwrap(),
+            "page 2 underlay draws before /Fx0: {text2:?}"
+        );
+    }
+
+    #[test]
+    fn apply_overlay_specs_applies_each_page_once() {
+        // Two overlay specs both targeting page 1 (each a single source page) must
+        // share ONE /Fx0 (the page is wrapped exactly once). Distinct Fx0 per call
+        // would indicate a double apply.
+        let mut dest = open(multi_page_doc(1));
+        let dest_pages = page_refs(&mut dest).unwrap();
+        let mut specs = vec![
+            spec(open(multi_page_doc(1)), OverlayKind::Overlay),
+            spec(open(multi_page_doc(1)), OverlayKind::Overlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let (names, text) = page_fx_and_content(&mut dest, dest_pages[0]);
+        let mut keys: Vec<&str> = names.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["Fx0", "Fx1", "Fx2"], "one /Fx0, two overlays");
+        // Exactly one "/Fx0 Do" — the page was converted to /Fx0 once.
+        assert_eq!(text.matches("/Fx0 Do").count(), 1, "single /Fx0 draw");
+    }
+
+    #[test]
+    fn apply_overlay_specs_empty_is_noop() {
+        // No specs leaves every dest page untouched.
+        let mut dest = open(multi_page_doc(2));
+        let dest_pages = page_refs(&mut dest).unwrap();
+        let mut specs: Vec<OverlaySpec<std::io::Cursor<Vec<u8>>>> = Vec::new();
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        assert!(!is_patched(&mut dest, dest_pages[0]));
+        assert!(!is_patched(&mut dest, dest_pages[1]));
+    }
+
+    #[test]
+    fn apply_overlay_specs_propagates_spec_error() {
+        // An out-of-range --from in any spec surfaces as an error from the driver.
+        let mut dest = open(multi_page_doc(2));
+        let mut specs = vec![OverlaySpec {
+            source: open(multi_page_doc(2)),
+            kind: OverlayKind::Overlay,
+            from: pr("5"),
+            to: pr(""),
+            repeat: None,
+        }];
+        let err = apply_overlay_specs(&mut dest, &mut specs);
+        assert!(matches!(err, Err(Error::Parse { .. })));
     }
 }
