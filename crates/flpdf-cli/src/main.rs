@@ -3489,6 +3489,23 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 
     let mut iter = args.into_iter().peekable();
     while let Some(arg) = iter.next() {
+        // qpdf requires the overlay/underlay file as a separate token (the file
+        // may be written `--file=FILE` INSIDE the group, but the flag itself is
+        // not an `=`-valued option). qpdf rejects `--overlay=FILE` with "overlay
+        // file not specified". The clap definitions keep `--overlay`/`--underlay`
+        // only for `--help`, and their parsed values are unused, so without this
+        // check an `--overlay=FILE` token would slip past clap and be a silent
+        // no-op. Reject the equals form here to match qpdf.
+        for prefix in ["--overlay=", "--underlay="] {
+            if arg.starts_with(prefix) {
+                let flag = prefix.trim_end_matches('=');
+                return Err(format!(
+                    "{flag}: the `{flag}=FILE` form is not supported; pass the file as a \
+                     separate token: `{flag} FILE … --`"
+                )
+                .into());
+            }
+        }
         let kind = match arg.as_str() {
             "--overlay" => Some(OverlayKind::Overlay),
             "--underlay" => Some(OverlayKind::Underlay),
