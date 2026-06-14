@@ -1370,7 +1370,7 @@ fn do_write_pass<R: Read + Seek>(
     relocation: &ObjStmRelocation,
     options: &WriteOptions,
     pass1_digest: bool,
-    id_writer: Option<crate::object::ReborrowableIdWriter>,
+    mut id_writer: Option<crate::object::ReborrowableIdWriter>,
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -1391,7 +1391,6 @@ fn do_write_pass<R: Read + Seek>(
     // deterministic-`/ID` final pass supplies `Some`; the ObjStm path leaves it
     // `None` and emits the placeholder for the still-patch-based xref-stream
     // trailers.
-    let mut id_writer = id_writer;
 
     // Part 1
     let param_dict_obj_number = renumber.param_dict_ref().number;
