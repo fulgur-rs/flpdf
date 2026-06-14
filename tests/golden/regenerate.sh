@@ -113,6 +113,17 @@ else
     echo "Skipping lone-flate-l9.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
+    echo "Generating one-page-enc-u.pdf ..."
+    # AES-256 (R6) encrypted source for the overlay --password path. AES key
+    # material is random => this fixture is NON-deterministic and is COMMITTED;
+    # if regenerated, re-bless overlay/three-page-overlay-encrypted-source.pdf.
+    qpdf --encrypt u o 256 -- --warning-exit-0 \
+        "$FIX/one-page.pdf" "$FIX/one-page-enc-u.pdf"
+else
+    echo "Skipping one-page-enc-u.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -251,6 +262,13 @@ qpdf --static-id --warning-exit-0 \
     --underlay "$FIX/two-page.pdf" -- \
     "$REF/overlay/three-page-overlay-and-underlay.pdf"
 echo "overlay/three-page-overlay-and-underlay.pdf"
+
+# Encrypted source via --password (epic flpdf-9hc.16.6). Source is the committed
+# AES-256 fixture; qpdf decrypts with the supplied user password before import.
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page-enc-u.pdf" --password=u -- \
+    "$REF/overlay/three-page-overlay-encrypted-source.pdf"
+echo "overlay/three-page-overlay-encrypted-source.pdf"
 
 echo ""
 
