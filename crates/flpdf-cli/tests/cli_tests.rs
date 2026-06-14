@@ -47,7 +47,11 @@ fn check_encrypted_fixture_rejects_wrong_password() {
 }
 
 #[test]
-fn check_rejects_rc4_encrypted_input_by_default() {
+fn check_inspects_rc4_encrypted_input_by_default() {
+    // qpdf treats `--check` as a read-only inspection: an RC4 (weak-crypto) file
+    // opened with the correct password is checked and exits 0 WITHOUT
+    // `--allow-weak-crypto` and with no weak-crypto warning (verified qpdf
+    // 11.9.0). flpdf previously hit the weak-crypto gate and exited 2 here.
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("rc4.pdf");
     std::fs::write(&input, encrypted_v1_owner_password_fixture()).unwrap();
@@ -56,26 +60,28 @@ fn check_rejects_rc4_encrypted_input_by_default() {
     cmd.args(["--check", "--password=owner"])
         .arg(&input)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("weak crypto"))
-        .stderr(predicate::str::contains("--allow-weak-crypto"));
+        .code(0)
+        .stdout(predicate::str::contains("File is encrypted\n"))
+        .stderr(predicate::str::contains("weak crypto").not());
 }
 
 #[test]
-fn check_allows_rc4_encrypted_input_with_warning_when_opted_in() {
+fn check_rc4_with_allow_weak_crypto_still_clean_no_warning() {
+    // `--allow-weak-crypto` makes no difference to `--check`: qpdf emits no
+    // weak-crypto warning for the inspection regardless of the flag (verified
+    // qpdf 11.9.0, exit 0 with and without it). So the flag neither downgrades
+    // to exit 3 nor adds a warning.
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("rc4.pdf");
     std::fs::write(&input, encrypted_v1_owner_password_fixture()).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    // Weak-crypto warning → exit 3 (qpdf-compatible: warnings found, no errors).
     cmd.args(["--check", "--allow-weak-crypto", "--password=owner"])
         .arg(&input)
         .assert()
-        .code(3)
+        .code(0)
         .stdout(predicate::str::contains("File is encrypted\n"))
-        .stderr(predicate::str::contains("WARNING: "))
-        .stderr(predicate::str::contains("weak crypto"));
+        .stderr(predicate::str::contains("weak crypto").not());
 }
 
 #[test]

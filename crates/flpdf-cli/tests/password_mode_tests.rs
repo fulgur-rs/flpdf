@@ -110,7 +110,9 @@ fn auto_mode_is_regression_free_for_legacy_ascii_password() {
         .arg(fixture("v2-rc4-128-r3.pdf"))
         .arg("--password=user-v2")
         .arg("--allow-weak-crypto");
-    // RC4 (weak crypto) triggers a warning → exit 3 (qpdf-compatible:
-    // warnings found, no errors).
-    cmd.assert().code(3);
+    // The legacy ASCII password authenticates under auto mode, so `check`
+    // inspects the file and exits 0. `check` treats weak (RC4) files as a
+    // read-only inspection with no weak-crypto warning, matching qpdf (which
+    // exits 0 here with or without --allow-weak-crypto).
+    cmd.assert().code(0);
 }
