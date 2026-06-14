@@ -30,7 +30,7 @@
 // feature-gated byte-comparison test).
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::page_form_xobject::{import_pages_as_form_xobjects, page_to_form_xobject};
@@ -321,8 +321,9 @@ where
     // imported XObject ref is then reused on every dest page that uses that
     // source page (qpdf imports each source page once).
     let mut distinct_sources: Vec<u32> = Vec::new();
+    let mut seen = BTreeSet::new();
     for &(_dest_page, source_page) in &pairs {
-        if !distinct_sources.contains(&source_page) {
+        if seen.insert(source_page) {
             distinct_sources.push(source_page);
         }
     }
