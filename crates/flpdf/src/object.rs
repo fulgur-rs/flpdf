@@ -632,6 +632,39 @@ impl Dictionary {
         out.extend_from_slice(b" >>");
     }
 
+    /// Serialize this dictionary like [`write_pdf`](Self::write_pdf) (compact,
+    /// plain lexicographic key order), but when `id_writer` is `Some` produce
+    /// the `/ID` *value* from that closure instead of serializing the stored
+    /// value (the ` /ID ` key token is still emitted at its sorted position).
+    ///
+    /// Every other key — and the `/ID` key itself when `id_writer` is `None` —
+    /// is written byte-for-byte identically to [`write_pdf`](Self::write_pdf),
+    /// so the two serializers agree except for the substituted `/ID` value.
+    /// This lets the caller compute the `/ID` directly from the bytes written so
+    /// far — used by the deterministic-`/ID` writer to emit a content-derived
+    /// identifier inline rather than via a placeholder-then-patch step. Unlike
+    /// the trailer, the cross-reference *stream* dictionary keeps `/ID` at its
+    /// lexicographic position (it is not forced last), so the closure runs
+    /// mid-iteration when the `/ID` key is reached.
+    pub(crate) fn write_pdf_with_id_writer(
+        &self,
+        out: &mut Vec<u8>,
+        id_writer: Option<TrailerIdWriter>,
+    ) {
+        out.extend_from_slice(b"<<");
+        let mut id_writer = id_writer;
+        for (key, value) in self.iter() {
+            out.extend_from_slice(b" /");
+            out.extend_from_slice(key);
+            out.push(b' ');
+            match (key == b"ID", id_writer.as_mut()) {
+                (true, Some(write_id)) => write_id(out),
+                _ => value.write_pdf(out),
+            }
+        }
+        out.extend_from_slice(b" >>");
+    }
+
     /// Serialize a stream's dictionary using qpdf's stream-dictionary key
     /// ordering, appending to `out`.
     ///

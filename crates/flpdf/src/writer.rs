@@ -2280,6 +2280,11 @@ pub(crate) fn write_deterministic_id_inline(
 /// internal invariant: callers always install the placeholder via
 /// [`apply_deterministic_id_placeholder`] before serializing the dictionary,
 /// so an absent placeholder indicates a writer bug rather than malformed input.
+// All write paths now direct-write the deterministic /ID inline via
+// `write_deterministic_id_inline`, so this byte-search patch has no remaining
+// non-test callers. It (and `apply_deterministic_id_placeholder`) are removed in
+// a follow-up cleanup; kept here, with its unit tests, until then.
+#[allow(dead_code)]
 fn patch_deterministic_id(
     bytes: &mut [u8],
     region_start: usize,
@@ -3472,25 +3477,30 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 options.deterministic_id,
             );
 
-            // The xref-stream dictionary begins here; the deterministic-/ID
-            // patch searches for its placeholder only within this dictionary
-            // (which precedes the compressed binary payload, so the placeholder
-            // cannot collide with it). qpdf does not produce byte-parity output
-            // for xref-stream form, but the same content-derived /ID keeps the
-            // output self-stable.
-            let xref_dict_region_start = bytes.len();
+            // The cross-reference stream dictionary is serialized in plain
+            // lexicographic order (so `/ID` is NOT last), and its compressed
+            // binary payload follows. When deterministic-/ID is requested,
+            // direct-write the real /ID inline at `/ID`'s sorted position,
+            // computed from the bytes written up to and including its opening
+            // `[` — the same digest range the placeholder-then-patch step used
+            // to target. qpdf does not produce byte-parity output for xref-stream
+            // form, but this content-derived /ID keeps the output self-stable.
             let xref_stream = crate::Stream::new(xref_dict, stream_data);
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
-            write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
-            bytes.extend_from_slice(b"\nendobj\n");
             if options.deterministic_id {
-                patch_deterministic_id(
+                let mut id_writer = |out: &mut Vec<u8>| {
+                    write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                };
+                write_stream_to_buf_with_id_writer(
                     &mut bytes,
-                    xref_dict_region_start,
-                    &det_id_info_suffix,
-                    det_id_source_id0,
+                    &xref_stream,
+                    options.newline_before_endstream,
+                    Some(&mut id_writer),
                 );
+            } else {
+                write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
             }
+            bytes.extend_from_slice(b"\nendobj\n");
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
         }
     }
@@ -3643,6 +3653,23 @@ pub fn write_stream_to_buf(
     policy: NewlineBeforeEndstream,
 ) {
     stream.dict.write_pdf(buf);
+    write_stream_payload(buf, &stream.data, policy);
+}
+
+/// Like [`write_stream_to_buf`] but serializes the stream dictionary via
+/// [`crate::object::Dictionary::write_pdf_with_id_writer`], so the `/ID` value
+/// (at its lexicographic position in the dictionary) can be produced by
+/// `id_writer` from the bytes written so far. With `id_writer = None` the output
+/// is byte-identical to [`write_stream_to_buf`]. Used by the cross-reference
+/// stream path to direct-write the deterministic `/ID` inline instead of
+/// emitting a placeholder and byte-searching for it afterwards.
+pub(crate) fn write_stream_to_buf_with_id_writer(
+    buf: &mut Vec<u8>,
+    stream: &crate::Stream,
+    policy: NewlineBeforeEndstream,
+    id_writer: Option<crate::object::TrailerIdWriter>,
+) {
+    stream.dict.write_pdf_with_id_writer(buf, id_writer);
     write_stream_payload(buf, &stream.data, policy);
 }
 
@@ -4445,6 +4472,84 @@ mod tests {
             id0, id1,
             "permanent and changing identifiers must differ in general"
         );
+    }
+
+    #[test]
+    fn write_pdf_with_id_writer_none_matches_write_pdf() {
+        // With `id_writer = None`, the serializer must be byte-identical to the
+        // plain `write_pdf` even when `/ID` is present — covering the fallback
+        // arm that production (always `Some`) never exercises.
+        let mut dict = Dictionary::new();
+        dict.insert("Size", Object::Integer(4));
+        dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
+        dict.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0xAB; 16]),
+                Object::String(vec![0xCD; 16]),
+            ]),
+        );
+
+        let mut plain = Vec::new();
+        dict.write_pdf(&mut plain);
+        let mut via_none = Vec::new();
+        dict.write_pdf_with_id_writer(&mut via_none, None);
+        assert_eq!(
+            via_none, plain,
+            "write_pdf_with_id_writer(None) must equal write_pdf byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn write_pdf_with_id_writer_keys_on_name_not_byte_pattern() {
+        // The direct-write path keys on the `/ID` dictionary *name*, not on a
+        // byte pattern. A preserved entry whose key sorts before `/ID` (here
+        // `/AA`) and whose string value embeds the literal `/ID ` token plus the
+        // all-zero placeholder array must survive verbatim, while only the real
+        // `/ID` value is produced by the closure. This is exactly the ambiguity
+        // the dropped byte-search `patch_deterministic_id` had to guard against.
+        let mut decoy_value = b"/ID ".to_vec();
+        write_deterministic_id_array(&mut decoy_value, &[0u8; 16], &[0u8; 16]);
+        let mut dict = Dictionary::new();
+        dict.insert("AA", Object::String(decoy_value.clone()));
+        dict.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0u8; 16]),
+                Object::String(vec![0u8; 16]),
+            ]),
+        );
+
+        let sentinel: &[u8] = b"[<DIGEST-FROM-CLOSURE>]";
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(sentinel);
+        let mut out = Vec::new();
+        dict.write_pdf_with_id_writer(&mut out, Some(&mut id_writer));
+
+        // The decoy value is serialized as a literal string `(...)` containing
+        // the `/ID ` token and the placeholder array — it must appear verbatim.
+        let mut decoy_serialized = Vec::new();
+        Object::String(decoy_value).write_pdf(&mut decoy_serialized);
+        assert!(
+            out.windows(decoy_serialized.len())
+                .any(|w| w == decoy_serialized.as_slice()),
+            "preserved decoy entry embedding /ID + placeholder must survive verbatim"
+        );
+        // The real /ID value is the closure output, not the stored array.
+        let id_token_pos = out
+            .windows(5)
+            .position(|w| w == b" /ID ")
+            .expect("real /ID key token must be present");
+        assert_eq!(
+            &out[id_token_pos + 5..id_token_pos + 5 + sentinel.len()],
+            sentinel,
+            "the real /ID value must be the closure output, not the stored array"
+        );
+        // The closure ran exactly once: the sentinel appears a single time.
+        let sentinel_count = out
+            .windows(sentinel.len())
+            .filter(|w| *w == sentinel)
+            .count();
+        assert_eq!(sentinel_count, 1, "id_writer must run exactly once");
     }
 
     #[test]
