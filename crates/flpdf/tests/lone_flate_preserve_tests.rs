@@ -6,9 +6,7 @@
 //! bytes at flpdf's compression level than the level-9 source.
 
 use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{
-    write_pdf_with_options, CompressStreams, NewlineBeforeEndstream, Pdf, WriteOptions,
-};
+use flpdf::{write_pdf_with_options, CompressStreams, NewlineBeforeEndstream, Pdf, WriteOptions};
 use std::path::Path;
 
 const FIXTURE: &str = "lone-flate-l9.pdf";
@@ -44,8 +42,10 @@ fn source_payload() -> Vec<u8> {
 }
 
 fn plain_rewrite(opts: WriteOptions) -> Vec<u8> {
-    let mut pdf =
-        Pdf::open(std::io::BufReader::new(std::fs::File::open(fixture_path()).unwrap())).unwrap();
+    let mut pdf = Pdf::open(std::io::BufReader::new(
+        std::fs::File::open(fixture_path()).unwrap(),
+    ))
+    .unwrap();
     let mut out = Vec::new();
     write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
     out
@@ -71,12 +71,16 @@ fn plain_full_rewrite_preserves_lone_flate_verbatim() {
 
 #[test]
 fn linearized_preserves_lone_flate_verbatim() {
-    let mut pdf =
-        Pdf::open(std::io::BufReader::new(std::fs::File::open(fixture_path()).unwrap())).unwrap();
+    let mut pdf = Pdf::open(std::io::BufReader::new(
+        std::fs::File::open(fixture_path()).unwrap(),
+    ))
+    .unwrap();
     let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
-    let mut pdf2 =
-        Pdf::open(std::io::BufReader::new(std::fs::File::open(fixture_path()).unwrap())).unwrap();
+    let mut pdf2 = Pdf::open(std::io::BufReader::new(
+        std::fs::File::open(fixture_path()).unwrap(),
+    ))
+    .unwrap();
     let mut opts = WriteOptions::default();
     opts.deterministic_id = true;
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
