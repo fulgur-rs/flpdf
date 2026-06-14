@@ -991,7 +991,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    /// Apply a parser-recorded indirect `/Length` ([`IndirectStreamLength`]) to a
+    /// Apply a parser-recorded indirect `/Length` ([`crate::parser::IndirectStreamLength`]) to a
     /// freshly parsed stream `object`, re-slicing `stream.data` to the
     /// xref-resolved authoritative length read from `bytes` (the raw object
     /// bytes).

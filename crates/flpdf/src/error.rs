@@ -105,7 +105,7 @@ pub enum EncryptedError {
     WeakCryptoNotAllowed,
 }
 
-/// Bridge from the low-level [`PrimitiveError`] to [`Error::Encrypted`].
+/// Bridge from the low-level `PrimitiveError` to [`Error::Encrypted`].
 ///
 /// This allows `?`-propagation from `security::primitives` functions directly
 /// into the public error type without exposing `PrimitiveError` in the public

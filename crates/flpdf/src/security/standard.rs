@@ -130,7 +130,7 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
 /// actually implement are accepted:
 ///
 /// - V=1 ⇒ R=2 and Length=40 (RC4-40, fixed)
-/// - V=2 ⇒ R∈{2,3} and Length∈[40,128] in 8-bit steps (RC4-{40..128})
+/// - V=2 ⇒ R∈{2,3} and Length∈`[40,128]` in 8-bit steps (RC4-{40..128})
 ///
 /// Other handlers (V=4 CF dispatch, V=5 R=5/R=6 AES-256) belong to other
 /// subtasks. Refusing them here prevents wrong-handler inputs from
@@ -567,7 +567,7 @@ pub(crate) fn cfm_to_object_key_alg(cfm: CryptFilterMethod) -> Option<ObjectKeyA
 /// PDF 1.7 §7.6.3.3 Algorithm 6 — Authenticate the user password.
 ///
 /// Returns the file encryption key on success, or
-/// [`Error::Encrypted(EncryptedError::BadPassword)`] if the password does not match.
+/// `Error::Encrypted(EncryptedError::BadPassword)` if the password does not match.
 pub(crate) fn check_user_password(
     password: &[u8],
     inputs: &StandardHandlerInputs<'_>,
@@ -639,7 +639,7 @@ pub(crate) fn check_user_password_v4(
 /// PDF 1.7 §7.6.3.3 Algorithm 7 — Authenticate the owner password.
 ///
 /// Returns the file encryption key on success, or
-/// [`Error::Encrypted(EncryptedError::BadPassword)`] if the password does not match.
+/// `Error::Encrypted(EncryptedError::BadPassword)` if the password does not match.
 pub(crate) fn check_owner_password(
     password: &[u8],
     inputs: &StandardHandlerInputs<'_>,
@@ -696,7 +696,7 @@ pub(crate) fn check_owner_password_v4(
 ///
 /// The V/R/Length matrix is the same as the reader-side [`StandardHandlerInputs`]
 /// accepts for V=1/V=2: V=1 ⇒ R=2/Length=40; V=2 ⇒ R∈{2,3} with R=2 fixed at
-/// Length=40 and R=3 spanning Length∈[40,128] in 8-bit steps.
+/// Length=40 and R=3 spanning Length∈`[40,128]` in 8-bit steps.
 pub(crate) struct V1V2EncryptParams<'a> {
     /// `/V` — algorithm version (1 or 2).
     pub v: i64,
