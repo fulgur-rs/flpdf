@@ -43,6 +43,8 @@
 //! - A direct (inline) `/Obj` dictionary: `/Obj` is by spec an indirect
 //!   reference, so an inline object is malformed and left unchanged.
 //! - An OBJR `/Obj` target without a `/P`, or whose `/P` is not a reference.
+//! - A `/P` that does not resolve to a page object (e.g. a non-annotation OBJR
+//!   `/Obj` target whose `/P` names a different relationship) is left unchanged.
 
 use crate::page_tree_rebuild::RebuildResult;
 use crate::ref_chain::resolve_ref_chain;
@@ -121,8 +123,14 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
         _ => return Ok(false),
     };
     // Normalize a possible reference-to-reference chain to the terminal page ref.
-    let (_, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
+    let (p_concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
     let page_ref = terminal.unwrap_or(p_ref);
+    // /P must resolve to a page. An OBJR /Obj can reference a non-annotation
+    // object whose /P means something else (e.g. a /Type /StructElem whose /P is
+    // the parent structure element); such a /P is left unchanged.
+    if !is_page_dict(&p_concrete) {
+        return Ok(false);
+    }
     match surviving.get(&page_ref) {
         Some(&new) => {
             if new != page_ref {
@@ -136,6 +144,13 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
             Ok(true)
         }
     }
+}
+
+/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
+fn is_page_dict(obj: &Object) -> bool {
+    obj.as_dict()
+        .and_then(|d| d.get("Type"))
+        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
 }
 
 #[cfg(test)]
@@ -386,6 +401,44 @@ mod tests {
         assert!(
             matches!(annot(&mut pdf, 30).get("P"), Some(Object::Integer(999))),
             "a non-reference /P must be left unchanged",
+        );
+    }
+
+    #[test]
+    fn p_resolving_to_non_page_left_unchanged() {
+        // A structure-tree OBJR /Obj can reference a non-annotation object whose
+        // /P means something other than "the page this is on" (here a
+        // /Type /StructElem whose /P is the parent structure element). Object 60
+        // is not a page and is not in `surviving`, so without the is_page_dict
+        // guard the /P would be wrongly dropped. The guard leaves it unchanged.
+        let mut objs = base();
+        objs.insert(
+            30,
+            "<< /Type /Annot /Subtype /Text /P 60 0 R /Rect [0 0 10 10] >>".into(),
+        );
+        objs.insert(60, "<< /Type /StructElem /S /P >>".into());
+        let mut pdf = open(&objs);
+        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
+            .expect("drop");
+        assert!(
+            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
+            "a /P resolving to a non-page object must be left unchanged",
+        );
+    }
+
+    #[test]
+    fn stream_target_skipped() {
+        // An OBJR /Obj can reference a stream (e.g. an XObject). Object::into_dict
+        // returns None for a stream, so the target is skipped via the
+        // `else { continue; }` arm with no stream-body corruption and no error.
+        let mut objs = base();
+        objs.insert(30, "<< /Length 3 >>\nstream\nabc\nendstream".into());
+        let mut pdf = open(&objs);
+        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
+            .expect("stream target skipped without error");
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(30, 0)), Ok(Object::Stream(_))),
+            "a stream OBJR /Obj target must be left unchanged",
         );
     }
 }
