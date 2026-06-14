@@ -373,6 +373,39 @@ struct Cli {
     #[command(flatten)]
     page_ops: PageOpArgs,
 
+    // ── Overlay / underlay flags (flpdf-9hc.16), top-level alias ──────────
+    // Mirror qpdf's top-level `qpdf in --overlay f -- out` form. Like the
+    // `rewrite` subcommand fields, the per-group boundaries are extracted from
+    // raw argv by `extract_overlay_groups` before clap parses; these fields
+    // exist only for `--help` documentation and to accept a leaked token.
+    /// Overlay pages from another file on top of the output (qpdf `--overlay`;
+    /// top-level alias of `rewrite --overlay`). Repeatable; terminate each
+    /// group with `--`.
+    #[arg(
+        long = "overlay",
+        num_args = 1..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "[--file=]FILE [sub-flags]",
+        help = "Overlay pages from FILE on top of the output (qpdf --overlay); \
+                repeatable, terminate each group with --"
+    )]
+    overlay: Vec<String>,
+
+    /// Underlay pages from another file beneath the output (qpdf `--underlay`;
+    /// top-level alias of `rewrite --underlay`). Repeatable; terminate each
+    /// group with `--`.
+    #[arg(
+        long = "underlay",
+        num_args = 1..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "[--file=]FILE [sub-flags]",
+        help = "Underlay pages from FILE beneath the output (qpdf --underlay); \
+                repeatable, terminate each group with --"
+    )]
+    underlay: Vec<String>,
+
     // ── Attachment flags (flpdf-9hc.10.9) ────────────────────────────────
     // Five qpdf-compatible attachment operations.  Each is a top-level flag
     // dispatched before the default rewrite branch.
@@ -1105,6 +1138,53 @@ struct RewriteCommand {
     /// --split-pages / --collate / --empty). See [`PageOpArgs`].
     #[command(flatten)]
     page_ops: PageOpArgs,
+
+    // ── Overlay / underlay flags (flpdf-9hc.16) ───────────────────────────
+    // qpdf --overlay / --underlay impose pages from another file on top of
+    // (overlay) or beneath (underlay) the destination pages. Both are
+    // REPEATABLE and each group is terminated by a bare `--`:
+    //   {--overlay|--underlay} [--file=]f [--password=p] [--to=R] [--from=R]
+    //                          [--repeat=R] --
+    //
+    // The repeated occurrences and their per-group boundaries are extracted
+    // from the raw argv by `extract_overlay_groups` BEFORE clap parses (clap's
+    // derive flattens repeated `Vec<String>` occurrences, losing the group
+    // boundary and the per-group declaration order needed for byte-identical
+    // composition). These two fields exist only so `--help` documents the
+    // flags and so a leaked token is accepted; the value vectors are not read.
+    /// Overlay pages from another file on top of the destination pages (qpdf
+    /// `--overlay`). Repeatable; terminate each group with `--`.
+    ///
+    /// Syntax: `--overlay [--file=]FILE [--password=PW] [--to=R] [--from=R]
+    ///          [--repeat=R] --`. Pages are stacked in order of appearance:
+    /// first underlays, then the original page, then overlays.
+    #[arg(
+        long = "overlay",
+        num_args = 1..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "[--file=]FILE [sub-flags]",
+        help = "Overlay pages from FILE on top of the output (qpdf --overlay); \
+                repeatable, terminate each group with --"
+    )]
+    overlay: Vec<String>,
+
+    /// Underlay pages from another file beneath the destination pages (qpdf
+    /// `--underlay`). Repeatable; terminate each group with `--`.
+    ///
+    /// Syntax: `--underlay [--file=]FILE [--password=PW] [--to=R] [--from=R]
+    ///          [--repeat=R] --`. Pages are stacked in order of appearance:
+    /// first underlays, then the original page, then overlays.
+    #[arg(
+        long = "underlay",
+        num_args = 1..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "[--file=]FILE [sub-flags]",
+        help = "Underlay pages from FILE beneath the output (qpdf --underlay); \
+                repeatable, terminate each group with --"
+    )]
+    underlay: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -1305,7 +1385,19 @@ fn warn_if_static_id(args: &Cli) {
 }
 
 fn main() {
-    let args = Cli::parse();
+    // Extract the `--overlay`/`--underlay` groups from the raw argv before clap
+    // parses (see `extract_overlay_groups`): clap's derive would flatten the
+    // repeated occurrences and lose the per-group boundaries and declaration
+    // order that byte-identical composition relies on. The residual argv (with
+    // those groups removed) is what clap sees.
+    let (residual_args, overlay_specs) = match extract_overlay_groups(std::env::args().collect()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("flpdf: {error}");
+            std::process::exit(2);
+        }
+    };
+    let args = Cli::parse_from(residual_args);
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
     // for deterministic test/parity output. The native `rewrite --static-id`
@@ -1348,7 +1440,7 @@ fn main() {
     let result = if args.json.is_some() {
         run_json(&args)
     } else if let Some(command) = args.command {
-        run_command(command)
+        run_command(command, &overlay_specs)
     } else if let Some(object_ref) = args.dump_object.as_deref() {
         run_dump_object(args.input, args.repair, &args.password, object_ref)
     } else if args.show_info {
@@ -1453,6 +1545,7 @@ fn main() {
             false,                              // generate_appearances (not on top-level surface)
             None,                               // flatten_annotations (not on top-level surface)
             false,                              // flatten_rotation (not on top-level surface)
+            &overlay_specs,
             options,
         );
         if result.is_ok() {
@@ -1497,6 +1590,17 @@ fn main() {
                 "flpdf: --copy-encryption-from is not applied in the \
                  --pages/--rotate/--split-pages/--collate pipeline; \
                  rerun without --copy-encryption-from or without the page operation"
+            );
+            std::process::exit(1);
+        }
+        // The page-op pipeline owns the write through a separate path that does
+        // not run the overlay/underlay page-stacking step; reject the
+        // combination rather than silently dropping the overlays.
+        if !overlay_specs.is_empty() {
+            eprintln!(
+                "flpdf: --overlay/--underlay is not applied in the \
+                 --pages/--rotate/--split-pages/--collate pipeline; \
+                 rerun without the page operation"
             );
             std::process::exit(1);
         }
@@ -1602,6 +1706,7 @@ fn main() {
             false,                              // generate_appearances (not on top-level surface)
             None,                               // flatten_annotations (not on top-level surface)
             false,                              // flatten_rotation (not on top-level surface)
+            &overlay_specs,
             options,
         )
     };
@@ -1810,7 +1915,7 @@ fn collect_datafile_object_refs(v2: &flpdf::json::JsonValue) -> Vec<ObjectRef> {
     out
 }
 
-fn run_command(command: Commands) -> CliResult<()> {
+fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
     match command {
         Commands::Check(cmd) => run_check(
             Some(cmd.input),
@@ -1996,6 +2101,17 @@ fn run_command(command: Commands) -> CliResult<()> {
                     );
                     std::process::exit(1);
                 }
+                // The page-op pipeline owns the write through a separate path
+                // that does not run the overlay/underlay page-stacking step;
+                // reject the combination rather than silently dropping it.
+                if !overlay_specs.is_empty() {
+                    eprintln!(
+                        "flpdf: --overlay/--underlay is not applied in the \
+                         --pages/--rotate/--split-pages/--collate pipeline; \
+                         rerun without the page operation"
+                    );
+                    std::process::exit(1);
+                }
                 // The page-operation pipeline owns the write and does not run
                 // the rewrite-only passes. Silently dropping them would make
                 // `rewrite --rotate=90 --normalize-content=y ...` partially
@@ -2079,6 +2195,7 @@ fn run_command(command: Commands) -> CliResult<()> {
                 cmd.generate_appearances,
                 cmd.flatten_annotations,
                 cmd.flatten_rotation,
+                overlay_specs,
                 options,
             )
         }
@@ -2723,10 +2840,19 @@ fn run_rewrite(
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
+    overlay_specs: &[OverlaySpec],
     options: WriteOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
+
+    // Overlay/underlay stacking mutates page dictionaries and adds objects that
+    // only surface on the full-rewrite path; the linearize path computes its
+    // object plan up front (before any such mutation), so the combination is
+    // rejected upfront. All overlay goldens use the plain full-rewrite path.
+    if linearize && !overlay_specs.is_empty() {
+        return Err("--overlay/--underlay cannot be combined with --linearize".into());
+    }
 
     // SCOPE BOUNDARY (flpdf-9hc.3.18 vs flpdf-9hc.4.10):
     // `--remove-restrictions` and `--decrypt` both add NO new decryption
@@ -2847,7 +2973,8 @@ fn run_rewrite(
             || remove_unref != CliRemoveUnreferencedResources::No
             || generate_appearances
             || flatten_annotations_mode.is_some()
-            || flatten_rotation;
+            || flatten_rotation
+            || !overlay_specs.is_empty();
         if needs_mutation {
             options.full_rewrite = true;
         }
@@ -2908,6 +3035,18 @@ fn run_rewrite(
         if flatten_rotation {
             let page_refs = pages::page_refs(&mut pdf)?;
             flatten_rotation_on_pages(&mut pdf, &page_refs)?;
+        }
+
+        // Step 7: overlay/underlay page stacking (--overlay / --underlay).
+        // qpdf applies this as its page-stacking step, after page selection and
+        // the other content transforms and before writing; mirror that ordering
+        // so the output graph (and thus the bytes) matches qpdf. Each source is
+        // opened (with its --password) and imported into the in-memory document
+        // here; the new objects only surface because full_rewrite was forced on
+        // above.
+        if !overlay_specs.is_empty() {
+            let mut built = build_overlay_specs(overlay_specs, repair)?;
+            flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 
         let mut out = File::create(output)?;
@@ -3139,9 +3278,7 @@ fn resolve_page_specs(
 // ===========================================================================
 
 /// Whether a segment introduces overlay content (drawn on top) or underlay (below).
-// CLI wiring is in a later subtask (.16.6); allow dead_code until then.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverlayKind {
     Overlay,
     Underlay,
@@ -3152,8 +3289,6 @@ enum OverlayKind {
 /// Range strings (`from`, `to`, `repeat`) are raw qpdf page-range syntax;
 /// `None` means the option was absent. Default range semantics are applied
 /// by the caller during page-mapping.
-// CLI wiring is in a later subtask (.16.6); allow dead_code until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OverlaySpec {
     kind: OverlayKind,
@@ -3182,8 +3317,6 @@ struct OverlaySpec {
 ///
 /// Returns an error if the token slice is empty, a file is missing or duplicated,
 /// a range is syntactically invalid, a flag is duplicated, or an unknown `--` flag appears.
-// CLI wiring is in a later subtask (.16.6); allow dead_code until then.
-#[allow(dead_code)]
 fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<OverlaySpec> {
     let flag = match kind {
         OverlayKind::Overlay => "--overlay",
@@ -3284,6 +3417,125 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
         to,
         repeat,
     })
+}
+
+/// Split the `--overlay`/`--underlay` groups out of the raw argument vector,
+/// preserving their declaration order and per-group boundaries.
+///
+/// clap's derive collects repeated `Vec<String>` occurrences into one flat
+/// vector, which loses both the boundary between successive `--overlay`/
+/// `--underlay` groups and their interleaved declaration order — information
+/// the byte-identical composition (underlays-then-overlays naming across
+/// groups, drawn in qpdf order) depends on. So the groups are extracted from
+/// the raw argv here, *before* clap parses, and the residual vector (with every
+/// `--overlay`/`--underlay` flag, its tokens, and its terminating `--` removed)
+/// is handed to clap. The returned `OverlaySpec`s are in CLI declaration order.
+///
+/// A group runs from its `--overlay`/`--underlay` flag up to (but not
+/// including) the next bare `--` token, which qpdf requires to terminate it.
+/// Tokens such as `--password=…` that merely start with `--` do not terminate a
+/// group; only a token equal to `--` does.
+///
+/// # Errors
+///
+/// Returns an error if a group is not terminated by a `--` token, or if
+/// [`parse_overlay_segment`] rejects the captured tokens (missing/duplicate
+/// file, invalid page range, unknown sub-flag, …).
+fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<OverlaySpec>)> {
+    let mut residual: Vec<String> = Vec::with_capacity(args.len());
+    let mut specs: Vec<OverlaySpec> = Vec::new();
+
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        let kind = match arg.as_str() {
+            "--overlay" => Some(OverlayKind::Overlay),
+            "--underlay" => Some(OverlayKind::Underlay),
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            residual.push(arg);
+            continue;
+        };
+
+        // Collect tokens up to (and consuming) the terminating bare `--`.
+        let mut tokens: Vec<String> = Vec::new();
+        let mut terminated = false;
+        for tok in iter.by_ref() {
+            if tok == "--" {
+                terminated = true;
+                break;
+            }
+            tokens.push(tok);
+        }
+        if !terminated {
+            let flag = match kind {
+                OverlayKind::Overlay => "--overlay",
+                OverlayKind::Underlay => "--underlay",
+            };
+            return Err(format!(
+                "{flag}: overlay/underlay group must be terminated by a `--` token"
+            )
+            .into());
+        }
+        specs.push(parse_overlay_segment(kind, &tokens)?);
+    }
+
+    Ok((residual, specs))
+}
+
+/// Build the library [`flpdf::OverlaySpec`]s from the parsed CLI segments,
+/// opening each source PDF (with its per-segment `--password`).
+///
+/// Source files are opened read-only; an authentication failure or unreadable
+/// file is surfaced as a CLI error. Default page-range semantics match qpdf:
+/// `--from`/`--to` default to all source/destination pages (an empty range
+/// string), and `--repeat` is absent by default (`None`, i.e. no repetition).
+///
+/// # Errors
+///
+/// Returns an error if a source PDF cannot be opened/authenticated or if a
+/// stored page-range string fails to parse (already validated by
+/// [`parse_overlay_segment`], so a parse failure here would be an internal
+/// inconsistency).
+fn build_overlay_specs(
+    specs: &[OverlaySpec],
+    repair: bool,
+) -> CliResult<Vec<flpdf::OverlaySpec<BufReader<File>>>> {
+    let mut built = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let path = PathBuf::from(&spec.file);
+        let file = File::open(&path).map_err(|error| error_with_file(&path, error.into()))?;
+        let options = PdfOpenOptions {
+            repair,
+            password: spec
+                .password
+                .as_ref()
+                .map(|p| p.as_bytes().to_vec())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let source = Pdf::open_with_options(BufReader::new(file), options)
+            .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
+
+        let kind = match spec.kind {
+            OverlayKind::Overlay => flpdf::OverlayKind::Overlay,
+            OverlayKind::Underlay => flpdf::OverlayKind::Underlay,
+        };
+        let from = PageRange::parse(spec.from.as_deref().unwrap_or(""))?;
+        let to = PageRange::parse(spec.to.as_deref().unwrap_or(""))?;
+        let repeat = match &spec.repeat {
+            Some(r) => Some(PageRange::parse(r)?),
+            None => None,
+        };
+        built.push(flpdf::OverlaySpec {
+            source,
+            kind,
+            from,
+            to,
+            repeat,
+        });
+    }
+    Ok(built)
 }
 
 /// Parse `--collate` value: `n` or `i,j,k,...`. flpdf's [`collate`] supports a
@@ -4968,5 +5220,194 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("duplicate --password="), "got: {err}");
+    }
+
+    // --- extract_overlay_groups -----------------------------------------
+
+    #[test]
+    fn extract_no_overlay_leaves_args_untouched() {
+        let argv = strs(&["flpdf", "rewrite", "--static-id", "in.pdf", "out.pdf"]);
+        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
+        assert_eq!(residual, argv);
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn extract_single_overlay_group() {
+        let argv = strs(&[
+            "flpdf",
+            "rewrite",
+            "in.pdf",
+            "--overlay",
+            "over.pdf",
+            "--",
+            "out.pdf",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        // The flag, its tokens, and the terminating `--` are removed.
+        assert_eq!(residual, strs(&["flpdf", "rewrite", "in.pdf", "out.pdf"]));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].kind, OverlayKind::Overlay);
+        assert_eq!(specs[0].file, "over.pdf");
+    }
+
+    #[test]
+    fn extract_two_overlay_groups_preserves_boundaries_and_order() {
+        // The design-mandated case: two groups must split, not flatten.
+        let argv = strs(&["--overlay", "a.pdf", "--", "--overlay", "b.pdf", "--"]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert!(
+            residual.is_empty(),
+            "all overlay tokens stripped: {residual:?}"
+        );
+        assert_eq!(
+            specs.len(),
+            2,
+            "two distinct groups, not one flattened list"
+        );
+        assert_eq!(specs[0].file, "a.pdf");
+        assert_eq!(specs[1].file, "b.pdf");
+    }
+
+    #[test]
+    fn extract_mixed_overlay_underlay_preserves_declaration_order() {
+        // Mixed kinds must keep CLI declaration order (overlay then underlay);
+        // the library re-groups under-then-over internally.
+        let argv = strs(&[
+            "in.pdf",
+            "--overlay",
+            "one.pdf",
+            "--",
+            "--underlay",
+            "two.pdf",
+            "--",
+            "out.pdf",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(residual, strs(&["in.pdf", "out.pdf"]));
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].kind, OverlayKind::Overlay);
+        assert_eq!(specs[0].file, "one.pdf");
+        assert_eq!(specs[1].kind, OverlayKind::Underlay);
+        assert_eq!(specs[1].file, "two.pdf");
+    }
+
+    #[test]
+    fn extract_captures_sub_flags_per_group() {
+        let argv = strs(&[
+            "--overlay",
+            "--file=src.pdf",
+            "--password=pw",
+            "--from=1",
+            "--to=2-3",
+            "--repeat=1",
+            "--",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert!(residual.is_empty());
+        assert_eq!(specs.len(), 1);
+        let s = &specs[0];
+        assert_eq!(s.file, "src.pdf");
+        assert_eq!(s.password.as_deref(), Some("pw"));
+        assert_eq!(s.from.as_deref(), Some("1"));
+        assert_eq!(s.to.as_deref(), Some("2-3"));
+        assert_eq!(s.repeat.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn extract_unterminated_group_errors() {
+        // No bare `--` after the file => qpdf requires the terminator.
+        let argv = strs(&["--overlay", "over.pdf", "out.pdf"]);
+        let err = extract_overlay_groups(argv).unwrap_err().to_string();
+        assert!(err.contains("terminated by a `--`"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_propagates_segment_parse_errors() {
+        // An invalid page range inside a group surfaces the segment error.
+        let argv = strs(&["--overlay", "over.pdf", "--to=abc!", "--"]);
+        let err = extract_overlay_groups(argv).unwrap_err().to_string();
+        assert!(err.contains("invalid --to="), "got: {err}");
+    }
+
+    #[test]
+    fn extract_password_sub_flag_not_mistaken_for_terminator() {
+        // `--password=…` starts with `--` but only a bare `--` terminates.
+        let argv = strs(&["--overlay", "src.pdf", "--password=--weird", "--"]);
+        let (_residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].password.as_deref(), Some("--weird"));
+    }
+
+    // --- build_overlay_specs --------------------------------------------
+
+    fn compat_fixture(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(name)
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+
+    #[test]
+    fn build_overlay_specs_opens_source_and_maps_fields() {
+        // A bare unencrypted source with all ranges set: opens the Pdf, maps the
+        // kind, and parses from/to/repeat (repeat present here).
+        let cli_specs = vec![OverlaySpec {
+            kind: OverlayKind::Underlay,
+            file: compat_fixture("one-page.pdf"),
+            password: None,
+            from: Some("1".into()),
+            to: Some("1-2".into()),
+            repeat: Some("1".into()),
+        }];
+        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].kind, flpdf::OverlayKind::Underlay);
+        // repeat is Some when the segment supplied --repeat.
+        assert!(built[0].repeat.is_some());
+    }
+
+    #[test]
+    fn build_overlay_specs_defaults_ranges_when_absent() {
+        // No from/to/repeat: from/to default to the empty (all-pages) range and
+        // repeat stays None.
+        let cli_specs = vec![OverlaySpec {
+            kind: OverlayKind::Overlay,
+            file: compat_fixture("one-page.pdf"),
+            password: None,
+            from: None,
+            to: None,
+            repeat: None,
+        }];
+        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
+        assert!(
+            built[0].repeat.is_none(),
+            "repeat None when --repeat absent"
+        );
+    }
+
+    #[test]
+    fn build_overlay_specs_missing_file_errors() {
+        let cli_specs = vec![OverlaySpec {
+            kind: OverlayKind::Overlay,
+            file: "/nonexistent/overlay/source.pdf".into(),
+            password: None,
+            from: None,
+            to: None,
+            repeat: None,
+        }];
+        // `flpdf::OverlaySpec` is not Debug (it holds a `Pdf`), so match the Ok
+        // arm explicitly instead of `unwrap_err()`.
+        let err = match build_overlay_specs(&cli_specs, false) {
+            Ok(_) => panic!("expected error for a missing source file"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("source.pdf"),
+            "error should name the unreadable file: {err}"
+        );
     }
 }
