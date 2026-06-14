@@ -3249,7 +3249,7 @@ fn run_page_extraction(
 
     // Step 5: struct-tree /Pg drop (the structural-reference drop family —
     // must run before the prune so the now-unreferenced page is swept).
-    drop_struct_elem_dangling_pg(&mut pdf, &result)?;
+    let _objr_obj_targets = drop_struct_elem_dangling_pg(&mut pdf, &result)?;
 
     // Step 6: article-thread bead /P drop (same structural-reference drop
     // family). A bead whose /P targets a removed page has the /P dropped (the
