@@ -3487,7 +3487,7 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
     let mut residual: Vec<String> = Vec::with_capacity(args.len());
     let mut specs: Vec<OverlaySpec> = Vec::new();
 
-    let mut iter = args.into_iter().peekable();
+    let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         // qpdf requires the overlay/underlay file as a separate token (the file
         // may be written `--file=FILE` INSIDE the group, but the flag itself is
