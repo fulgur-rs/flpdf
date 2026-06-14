@@ -11,7 +11,7 @@ This file provides instructions and context for AI coding agents working on this
   qpdf がやることを、qpdf のやり方で、qpdf と同じ順序・同じ構造で行う。
 - **独自改善をしない**: 「より効率的」「より綺麗」「より Rust らしい」という理由で
   qpdf と異なる実装・出力にしない。最適化・設計改善・リファクタの自由度は v1.0 到達後に
-  再検討する（pre-1.0 互換性方針と整合 — `bd memories pre-1.0` 参照）。
+  再検討する（pre-v1.0 では後方/前方互換も考慮しない）。
 - **qpdf が oracle（正解）**: 出力が qpdf と 1 バイトでも異なれば flpdf 側のバグと
   みなす。判断に迷ったら qpdf のソース・観測挙動を正とし、自分の好み・規格解釈より優先する
   （ISO 32000 はあくまで補助。qpdf が規格と違う挙動をするなら qpdf に合わせる）。
@@ -27,8 +27,10 @@ feature flag（`qpdf-zlib-compat`）に隔離してある。デフォルトは m
 - byte-identical を厳密に検証する場面（compat baseline 等）では `qpdf-zlib-compat`
   feature（zlib バックエンド）を使う。
 - **この 1 点が唯一の例外**。これ以外で byte-identical を崩す逸脱は認めない。
-- 関連の運用上の注意は `bd memories zlib` 参照（llvm-cov / patch-coverage は
-  `qpdf-zlib-compat` なしで回す等）。
+- 関連の運用注意: llvm-cov / patch-coverage は `qpdf-zlib-compat` なしで回す
+  （compat baseline は miniz 固定のため、feature を付けた計測は失敗する）。
+
+この方針の bd メモリ版（`bd prime` で自動注入）: `bd recall pre-v1-0-qpdf-byte-identical-qtest-parity`。
 
 ## Coding Rules
 
