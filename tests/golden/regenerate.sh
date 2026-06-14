@@ -218,6 +218,25 @@ qpdf --static-id --warning-exit-0 \
     "$REF/overlay/three-page-overlay-one-page.pdf"
 echo "overlay/three-page-overlay-one-page.pdf"
 
+# Page-range mapping variants (epic flpdf-9hc.16.4):
+#  - default: 2-page source onto 3-page dest -> p1<-s1, p2<-s2, p3 untouched.
+#  - --repeat=1: 1-page source repeated onto all 3 dest pages.
+#  - --to=2-3: 2-page source paired with dest pages 2,3 (p1 untouched).
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/two-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-two-page.pdf"
+echo "overlay/three-page-overlay-two-page.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" --repeat=1 -- \
+    "$REF/overlay/three-page-overlay-one-page-repeat1.pdf"
+echo "overlay/three-page-overlay-one-page-repeat1.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/two-page.pdf" --to=2-3 -- \
+    "$REF/overlay/three-page-overlay-two-page-to2-3.pdf"
+echo "overlay/three-page-overlay-two-page-to2-3.pdf"
+
 echo ""
 
 # ---------------------------------------------------------------------------
