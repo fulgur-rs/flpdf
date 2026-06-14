@@ -587,7 +587,7 @@ mod tests {
         // /Contents replaced with a new single stream (identity placements).
         let contents_ref = match page_dict.get("Contents") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("Contents should be a reference, got {other:?}"),
+            other => panic!("Contents should be a reference, got {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
         let stream = pdf
             .resolve(contents_ref)
@@ -612,7 +612,7 @@ mod tests {
         // /Fx0 is a Form XObject carrying the original page resources (font ref).
         let fx0_ref = match xobj.get("Fx0") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("Fx0 should be a reference, got {other:?}"),
+            other => panic!("Fx0 should be a reference, got {other:?}"), // cov:ignore: defensive — apply always inserts /Fx0 as a reference
         };
         let fx0 = pdf.resolve(fx0_ref).unwrap().into_stream().unwrap();
         assert_eq!(
@@ -656,11 +656,11 @@ mod tests {
         // Underlay is named /Fx1 (first non-page name), overlay /Fx2.
         let fx1 = match xobj.get("Fx1") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("Fx1 missing: {other:?}"),
+            other => panic!("Fx1 missing: {other:?}"), // cov:ignore: defensive — apply names the first source /Fx1
         };
         let fx2 = match xobj.get("Fx2") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("Fx2 missing: {other:?}"),
+            other => panic!("Fx2 missing: {other:?}"), // cov:ignore: defensive — apply names the second source /Fx2
         };
         assert_eq!(fx1, underlay, "underlay must be /Fx1");
         assert_eq!(fx2, overlay, "overlay must be /Fx2");
@@ -668,7 +668,7 @@ mod tests {
         // Draw order: underlay (/Fx1) -> /Fx0 -> overlay (/Fx2).
         let contents_ref = match page_dict.get("Contents") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("Contents ref: {other:?}"),
+            other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
         let stream = pdf.resolve(contents_ref).unwrap().into_stream().unwrap();
         let text = String::from_utf8(stream.data).unwrap();
@@ -686,6 +686,22 @@ mod tests {
         // Object 2 is /Type /Pages, not /Page -> /Fx0 conversion fails.
         let mut pdf = open(one_page_doc("x"));
         let err = apply_overlays_to_page(&mut pdf, ObjectRef::new(2, 0), &[]);
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn page_box_or_err_errors_when_box_absent() {
+        // A /Type /Page with no /MediaBox (or any inheritable box) must error
+        // instead of returning a placement rectangle.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+            1,
+        ));
+        let err = page_box_or_err(&mut pdf, ObjectRef::new(3, 0), BoxKind::Media);
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
