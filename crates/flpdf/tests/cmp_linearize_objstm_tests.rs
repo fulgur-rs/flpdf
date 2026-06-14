@@ -124,13 +124,13 @@ fn assert_strict(fixture: &str, stem: &str) {
 // qpdf-matching compressed cross-reference streams (flpdf-4z56). Ignored until
 // the integration lands so the baseline commit (goldens + test) stays green.
 #[test]
-#[ignore = "compressed xref-stream layout pending flpdf-4z56 writer integration"]
+#[ignore = "byte-identical up to the ObjStm container; container dict/offset-table parity pending flpdf-0i0s"]
 fn two_page_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("two-page.pdf", "two-page");
 }
 
 #[test]
-#[ignore = "compressed xref-stream layout pending flpdf-4z56 writer integration"]
+#[ignore = "byte-identical up to the ObjStm container; container dict/offset-table parity pending flpdf-0i0s"]
 fn three_page_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("three-page.pdf", "three-page");
 }

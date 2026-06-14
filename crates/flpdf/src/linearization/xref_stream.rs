@@ -60,13 +60,6 @@ fn bytes_needed(value: u64) -> u8 {
     width
 }
 
-/// Compute qpdf's `/W` widths from the maximum field-2 and field-3 values.
-///
-/// Field 1 (the type) is always a single byte: the only types are 0, 1, and 2.
-pub(crate) fn xref_widths(max_field2: u64, max_field3: u64) -> XrefWidths {
-    [1, bytes_needed(max_field2), bytes_needed(max_field3)]
-}
-
 /// Total row width (`/Columns`) for the given field widths.
 fn columns(widths: XrefWidths) -> usize {
     widths[0] as usize + widths[1] as usize + widths[2] as usize
@@ -586,14 +579,6 @@ mod tests {
         assert_eq!(bytes_needed(256), 2);
         assert_eq!(bytes_needed(65_535), 2);
         assert_eq!(bytes_needed(65_536), 3);
-    }
-
-    #[test]
-    fn xref_widths_are_minimal_with_one_byte_type() {
-        // three-page: max offset 2226 -> 2 bytes; max field3 (objstm index) 3 -> 1 byte.
-        assert_eq!(xref_widths(2226, 3), [1, 2, 1]);
-        // A larger offset widens field2 only.
-        assert_eq!(xref_widths(70_000, 0), [1, 3, 1]);
     }
 
     #[test]
