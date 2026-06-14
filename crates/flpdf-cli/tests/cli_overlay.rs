@@ -40,7 +40,7 @@ fn run_overlay_ok(dest: &str, overlay_args: &[&str]) -> Vec<u8> {
     for a in overlay_args {
         cmd.arg(a);
     }
-    cmd.arg(out.to_str().unwrap());
+    cmd.arg(&out);
     cmd.assert().success();
 
     std::fs::read(&out).expect("output file present after success")
@@ -58,7 +58,8 @@ fn overlay_succeeds_and_output_parses_with_same_page_count() {
     std::fs::write(&path, &bytes).unwrap();
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--show-npages", path.to_str().unwrap()])
+        .arg("--show-npages")
+        .arg(&path)
         .assert()
         .success()
         .stdout(predicate::str::contains("3"));
