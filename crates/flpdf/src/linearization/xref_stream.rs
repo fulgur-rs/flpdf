@@ -18,12 +18,14 @@
 //! feature). The structural encoding (rows, predictor, key order, field widths)
 //! is backend-independent.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
 use crate::object::ObjectRef;
+use crate::Result;
 
 /// One cross-reference stream entry — a single `/W`-formatted row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +258,99 @@ pub(crate) fn first_pass_region_len(
     buf.len() + calculate_xref_stream_padding(buf.len())
 }
 
+/// qpdf's second-pass `/W` widths for a stream: field 2 holds `max_offset +
+/// hint_length` (or the largest object number), field 3 the global maximum
+/// object-stream member index. `hint_length` is 0 for the main (second-half)
+/// stream and `/H[1]` for the first-page stream (mirrors `writeXRefStream`).
+pub(crate) fn second_pass_widths(
+    max_offset: u64,
+    hint_length: u64,
+    max_id: u32,
+    max_ostream_index: u64,
+) -> XrefWidths {
+    let f1 = bytes_needed(max_offset + hint_length).max(bytes_needed(u64::from(max_id)));
+    [1, f1, bytes_needed(max_ostream_index)]
+}
+
+/// Build the cross-reference stream entries for object numbers
+/// `start .. start + count` from the offset and compressed-member maps.
+///
+/// Object 0 is the free-list head (type 0, all-zero — qpdf writes generation 0,
+/// not 65535, because the narrow field-3 cannot hold 65535). A number present in
+/// `offs` is uncompressed (type 1, byte offset); one present in `member_new` is
+/// compressed (type 2, container + index). Any gap falls back to a free entry.
+pub(crate) fn build_entries(
+    offs: &BTreeMap<u32, usize>,
+    member_new: &BTreeMap<u32, (u32, u32)>,
+    start: u32,
+    count: u32,
+) -> Vec<XrefStreamEntry> {
+    (start..start + count)
+        .map(|number| {
+            if number != 0 {
+                if let Some(&off) = offs.get(&number) {
+                    return XrefStreamEntry {
+                        entry_type: 1,
+                        field2: off as u64,
+                        field3: 0,
+                    };
+                }
+                if let Some(&(container, index)) = member_new.get(&number) {
+                    return XrefStreamEntry {
+                        entry_type: 2,
+                        field2: u64::from(container),
+                        field3: u64::from(index),
+                    };
+                }
+            }
+            XrefStreamEntry {
+                entry_type: 0,
+                field2: 0,
+                field3: 0,
+            }
+        })
+        .collect()
+}
+
+/// Maximum byte offset among a stream's entries (field 2 of its type-1 rows);
+/// type-2 rows carry small container numbers, so this is the file-offset
+/// magnitude that sizes field 2.
+pub(crate) fn max_entry_offset(entries: &[XrefStreamEntry]) -> u64 {
+    entries
+        .iter()
+        .filter(|e| e.entry_type == 1)
+        .map(|e| e.field2)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Encode a cross-reference stream object and pad it with trailing spaces to
+/// exactly `region_len` bytes (qpdf's pass-2 `writePad`), so the next object
+/// lands at a fixed offset regardless of the compressed length.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if the encoded object already exceeds
+/// `region_len` (the reserved region was sized too small — a writer bug).
+pub(crate) fn write_padded_region(
+    object: ObjectRef,
+    dict: &XrefStreamDict,
+    payload: &[u8],
+    region_len: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(region_len);
+    write_object(&mut buf, object, dict, payload);
+    if buf.len() > region_len {
+        return Err(crate::Error::Unsupported(format!(
+            "linearized xref stream object ({} bytes) exceeds its reserved region \
+             ({region_len} bytes)",
+            buf.len()
+        )));
+    }
+    buf.resize(region_len, b' ');
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +456,127 @@ mod tests {
             id: Some((&ID0, &ID1)),
         };
         assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
+    }
+
+    #[test]
+    fn second_pass_widths_match_three_page() {
+        // first-half stream: max entry offset 1153 + hint 130 = 1283 -> 2 bytes;
+        // objstm index 3 -> 1 byte; max id 16 -> 1 byte. => [1 2 1].
+        assert_eq!(second_pass_widths(1153, 130, 16, 3), [1, 2, 1]);
+        // main stream: max entry offset 2226, hint 0 -> 2 bytes => [1 2 1].
+        assert_eq!(second_pass_widths(2226, 0, 16, 3), [1, 2, 1]);
+        // a >64 KB offset widens field 2 to 3 bytes.
+        assert_eq!(second_pass_widths(70_000, 0, 16, 3), [1, 3, 1]);
+    }
+
+    #[test]
+    fn build_entries_reproduce_golden_object_maps() {
+        // First half (objs 6..16): obj6..12 uncompressed, obj13..16 in container 12.
+        let mut offs = BTreeMap::new();
+        for (n, off) in [
+            (6, 15),
+            (7, 216),
+            (8, 608),
+            (9, 677),
+            (10, 807),
+            (11, 1000),
+            (12, 1153),
+        ] {
+            offs.insert(n, off);
+        }
+        let mut members = BTreeMap::new();
+        for (n, idx) in [(13, 0u32), (14, 1), (15, 2), (16, 3)] {
+            members.insert(n, (12u32, idx));
+        }
+        assert_eq!(
+            build_entries(&offs, &members, 6, 11),
+            three_page_obj7_entries()
+        );
+
+        // Second half (objs 0..6): obj0 free, obj1..5 uncompressed.
+        let mut offs2 = BTreeMap::new();
+        for (n, off) in [(1, 1540), (2, 1731), (3, 1883), (4, 2074), (5, 2226)] {
+            offs2.insert(n, off);
+        }
+        assert_eq!(
+            build_entries(&offs2, &BTreeMap::new(), 0, 6),
+            three_page_obj5_entries()
+        );
+    }
+
+    #[test]
+    fn build_entries_fills_gaps_with_free_entries() {
+        // A non-zero number that is neither in `offs` nor `member_new` falls
+        // back to a free (type-0) entry. Defensive: a well-formed linearized
+        // layout has no such gap, but the encoder must not emit a stale offset.
+        let mut offs = BTreeMap::new();
+        offs.insert(1u32, 100usize);
+        let entries = build_entries(&offs, &BTreeMap::new(), 1, 3);
+        assert_eq!(
+            entries,
+            vec![
+                XrefStreamEntry {
+                    entry_type: 1,
+                    field2: 100,
+                    field3: 0
+                },
+                XrefStreamEntry {
+                    entry_type: 0,
+                    field2: 0,
+                    field3: 0
+                },
+                XrefStreamEntry {
+                    entry_type: 0,
+                    field2: 0,
+                    field3: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn max_entry_offset_ignores_compressed_rows() {
+        let entries = three_page_obj7_entries();
+        // The container-number field2 of the type-2 rows (12) must not be
+        // mistaken for an offset; the max offset is obj12's 1153.
+        assert_eq!(max_entry_offset(&entries), 1153);
+        assert_eq!(max_entry_offset(&[]), 0);
+    }
+
+    #[test]
+    fn write_padded_region_pads_to_length() {
+        let dict = XrefStreamDict {
+            widths: [1, 2, 1],
+            index: None,
+            info: None,
+            root: None,
+            size: 6,
+            prev: None,
+            id: Some((&ID0, &ID1)),
+        };
+        let region = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
+        assert_eq!(region.len(), 400);
+        // The object bytes are intact, followed by ASCII-space padding.
+        assert!(region.starts_with(b"5 0 obj\n<< /Type /XRef /Length 7"));
+        assert!(region.ends_with(b"   "));
+        assert!(region[region.len() - 1] == b' ');
+    }
+
+    #[test]
+    fn write_padded_region_rejects_oversized_object() {
+        let dict = XrefStreamDict {
+            widths: [1, 2, 1],
+            index: None,
+            info: None,
+            root: None,
+            size: 6,
+            prev: None,
+            id: Some((&ID0, &ID1)),
+        };
+        // A 10-byte region cannot hold the object; the writer must error rather
+        // than silently overflow the reserved region.
+        let err = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 10).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(_)));
     }
 
     #[test]
