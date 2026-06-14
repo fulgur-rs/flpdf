@@ -1033,6 +1033,10 @@ impl LinearizationPlan {
         // — which flpdf keeps plain — straddling `/E`).  A Preserve run over a
         // source with NO ObjStms likewise has no batches, so nothing is folded.
         if !plan.part3_batches.is_empty() {
+            // cov:ignore-start: the `?` error arm is unreachable in tests —
+            // `canonicalise_first_half_batch` only propagates a
+            // `pdf.resolve_borrowed` failure on /Info or the /Pages tree, which
+            // does not occur for well-formed inputs.
             self.canonicalise_first_half_batch(
                 pdf,
                 &ctx,
@@ -1040,6 +1044,7 @@ impl LinearizationPlan {
                 config.batch_size_cap.get(),
                 &mut plan,
             )?;
+            // cov:ignore-end
         }
 
         Ok(plan)
