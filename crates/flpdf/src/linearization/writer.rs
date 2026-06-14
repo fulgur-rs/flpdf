@@ -127,7 +127,7 @@ impl ObjStmLayout {
     ///
     /// This is the single source of truth for *which* objects are ObjStm
     /// members and *in what order* — consumed both by
-    /// [`RenumberMap::relocate_objstm_members`] (slot allocation) and by
+    /// [`RenumberMap::place_objstm_members_per_half`] (slot allocation) and by
     /// [`ObjStmLayout::build_from_batches`] (container construction), so the
     /// two never disagree about membership or pair-table order.
     fn resolve_batches<R: Read + Seek>(
@@ -167,7 +167,7 @@ impl ObjStmLayout {
     }
 
     /// The flat batch order (Part-3 then Part-4) fed to
-    /// [`RenumberMap::relocate_objstm_members`].
+    /// [`RenumberMap::place_objstm_members_per_half`].
     fn flat_batches(
         batch_plan: &crate::linearization::plan::ObjStmBatchPlan,
     ) -> Vec<Vec<ObjectRef>> {
@@ -180,11 +180,12 @@ impl ObjStmLayout {
     }
 
     /// Build the layout from an already-resolved batch plan, mapping every
-    /// member + container through the **relocated** `renumber` map.
+    /// member + container through the **placed** `renumber` map.
     ///
     /// `container_numbers` are the per-batch container object numbers returned
-    /// by [`RenumberMap::relocate_objstm_members`] (Part-3 batches first, then
-    /// Part-4), so the layout never re-derives numbers independently.  Every
+    /// by [`RenumberMap::place_objstm_members_per_half`] (Part-3 batches first,
+    /// then Part-4), so the layout never re-derives numbers independently.
+    /// Every
     /// member ref is mapped through `renumber`; a missing entry is a planner /
     /// renumber inconsistency and is surfaced loudly.
     fn build_from_batches(
@@ -846,8 +847,12 @@ struct FirstPageXrefPatch {
     obj_offset: usize,
     /// Object number the first-page xref stream itself was assigned.
     first_xref_num: u32,
-    /// Number of dense-table entries the stream covers: `[0, first_count)`.
-    first_count: u32,
+    /// First object number the stream's `/Index` covers (= the second-half
+    /// object count, the half-split point).
+    index_start: u32,
+    /// Number of dense-table entries the stream covers: the first half,
+    /// `[index_start, index_start + index_count)`.
+    index_count: u32,
     /// Byte range of the raw (uncompressed) entry payload — overwritten with
     /// the real type-1/2 entries once offsets are final.
     data_range: std::ops::Range<usize>,
@@ -1045,21 +1050,20 @@ fn patch_linearized_deterministic_id(
 /// unchanged from the original split implementation) and the file's trailing
 /// `startxref` points at the main xref, so the chain is acyclic.
 ///
-/// `/Index [0, first_count]`: objects `0 ..= first_xref_slot`, all type-1
-/// (param dict, hint, catalog, Part-2, Part-3-plain objects, and the
-/// first-page xref object itself), so the stream carries a single contiguous
-/// range with no type-1-after-type-2 interleave.
+/// `/Index [second_half_count, first_half_count]`: the FIRST-half object range
+/// `second_half_count ..< /Size`, all type-1 (param dict, first-page xref
+/// object, catalog, hint, Part-2, Part-3-plain objects), so the stream carries
+/// a single contiguous range with no type-1-after-type-2 interleave.
 ///
-/// Note: every ObjStm container and member is numbered **above**
-/// `first_xref_slot` (and above `main_xref_slot`) by
-/// [`RenumberMap::relocate_objstm_members`], so none of them fall in this
-/// range — they live exclusively in the main xref's `/Index`.  Part-3
-/// (page-1 shared) objects are additionally kept *plain* by the planner
+/// Note: under the per-half compressed-last layout every ObjStm container and
+/// member is numbered in the SECOND half (below `second_half_count`) by
+/// [`RenumberMap::place_objstm_members_per_half`], so none of them fall in
+/// this first-half range — they live exclusively in the main xref's `/Index`.
+/// Part-3 (page-1 shared) objects are additionally kept *plain* by the planner
 /// (`LinearizationPlan::objstm_batches` unconditionally clears
-/// `part3_batches`), so no Part-3 ObjStm container is ever
-/// emitted before `/E`.  Re-enabling Part-3 packing requires reconciling
-/// container numbering with this split-xref range; until then this range is
-/// exactly the Part-3-plain set.
+/// `part3_batches`), so no Part-3 ObjStm container is ever emitted before
+/// `/E`.  Re-homing first-page shared members into a first-half container is a
+/// separate packing change; until then this first-half range is all type-1.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
@@ -1071,10 +1075,14 @@ fn write_first_page_xref_stream(
 ) -> Result<FirstPageXrefPatch> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
-    let first_count = first_xref_num
-        .checked_add(1)
-        .ok_or_else(|| crate::Error::Unsupported("xref /Index overflow".to_string()))?;
-    let payload_len = (first_count as usize)
+    // First-half range: objects `[second_half_count, /Size)`.
+    let index_start = relocation.second_half_count;
+    let index_count = final_size.checked_sub(index_start).ok_or_else(|| {
+        crate::Error::Unsupported(
+            "first-page xref /Index underflow (second-half count exceeds /Size)".to_string(),
+        )
+    })?;
+    let payload_len = (index_count as usize)
         .checked_mul(SPLIT_XREF_ENTRY_WIDTH)
         .ok_or_else(|| {
             crate::Error::Unsupported("first-page xref payload length overflow".to_string())
@@ -1096,8 +1104,8 @@ fn write_first_page_xref_stream(
     d1.insert(
         "Index",
         Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(i64::from(first_count)),
+            Object::Integer(i64::from(index_start)),
+            Object::Integer(i64::from(index_count)),
         ]),
     );
     d1.insert("Root", Object::Reference(catalog_new_ref));
@@ -1143,7 +1151,8 @@ fn write_first_page_xref_stream(
     Ok(FirstPageXrefPatch {
         obj_offset,
         first_xref_num,
-        first_count,
+        index_start,
+        index_count,
         data_range: data_start..data_end,
     })
 }
@@ -1151,13 +1160,13 @@ fn write_first_page_xref_stream(
 /// Overwrite the first-page xref stream's placeholder entry payload in place,
 /// now that every downstream object offset is known.
 ///
-/// The first-page xref's `/Index [0, first_count)` covers only the type-1
-/// plain objects (members live in the main xref's range), so the encoder only
-/// needs `xref_offsets` plus the first-page xref object's own offset.  Because
-/// the payload was emitted at its final byte length, this is a pure in-place
-/// patch — no offsets shift, the hint-stream convergence loop is untouched.
-/// The first-page stream has no `/Prev` (it is the chain leaf), so nothing
-/// else needs patching here.
+/// The first-page xref's `/Index [index_start, index_count)` covers the
+/// first-half objects, all type-1 (members live in the second half = the main
+/// xref's range), so the encoder only needs `xref_offsets` plus the
+/// first-page xref object's own offset.  Because the payload was emitted at its
+/// final byte length, this is a pure in-place patch — no offsets shift, the
+/// hint-stream convergence loop is untouched.  The first-page stream has no
+/// `/Prev` (it is the chain leaf), so nothing else needs patching here.
 fn patch_first_page_xref(
     bytes: &mut [u8],
     patch: &FirstPageXrefPatch,
@@ -1167,7 +1176,7 @@ fn patch_first_page_xref(
     let mut offs = xref_offsets.clone();
     offs.insert(patch.first_xref_num, patch.obj_offset);
 
-    let data = encode_split_xref_slice(&offs, member_new, 0, patch.first_count);
+    let data = encode_split_xref_slice(&offs, member_new, patch.index_start, patch.index_count);
     if data.len() != patch.data_range.len() {
         return Err(crate::Error::Unsupported(format!(
             "first-page xref payload length drift: encoded {} bytes, reserved {}",
@@ -1184,13 +1193,15 @@ fn patch_first_page_xref(
     Ok(())
 }
 
-/// Emit the **main (Part-6) cross-reference stream** at end-of-body, followed
-/// by the trailing `startxref`/`%%EOF`.
+/// Emit the **main (second-half) cross-reference stream** at end-of-body,
+/// followed by the trailing `startxref`/`%%EOF`.
 ///
-/// `/Index [main_xref_slot, Size − main_xref_slot]`: objects `main_xref_slot
-/// ..= last`, type-1 (the main xref object + remaining Part-4 containers)
-/// then type-2 (all ObjStm members) — a single contiguous range with no
-/// type-1-after-type-2 interleave.
+/// `/Index [0, second_half_count]`: the SECOND-half object range
+/// `0 ..< second_half_count`, type-0 (the free object 0) then type-1 (the
+/// second-half uncompressed objects, the main xref object itself, and the
+/// ObjStm container) then type-2 (all ObjStm members) — a single contiguous
+/// range with no type-1-after-type-2 interleave under the per-half
+/// compressed-last layout.
 ///
 /// The `/Prev` chain stays main → first-page (unchanged from the original
 /// split implementation; qpdf accepts either direction and the first-page
@@ -1204,7 +1215,7 @@ fn write_main_xref_stream_and_trailer(
     xref_offsets: &BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
     relocation: &ObjStmRelocation,
-    total_count: u32, // /Size (relocated renumber.len() + 1) — already final
+    total_count: u32, // /Size (placed renumber.len() + 1) — already final
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
@@ -1214,15 +1225,14 @@ fn write_main_xref_stream_and_trailer(
     let first_xref_num = relocation.first_xref_slot;
     let main_xref_num = relocation.main_xref_slot;
 
-    let main_count = final_size
-        .checked_sub(main_xref_num)
-        .ok_or_else(|| crate::Error::Unsupported("xref /Index underflow".to_string()))?;
+    // Second-half range: objects `[0, second_half_count)`.
+    let main_count = relocation.second_half_count;
     let main_xref_offset = bytes.len();
     let mut offs2 = xref_offsets.clone();
     offs2.insert(first_xref_num, first_page_obj_offset);
     offs2.insert(main_xref_num, main_xref_offset);
 
-    let main_data = encode_split_xref_slice(&offs2, member_new, main_xref_num, main_count);
+    let main_data = encode_split_xref_slice(&offs2, member_new, 0, main_count);
     let mut enc_dict2 = Dictionary::new();
     enc_dict2.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
     let main_encoded = crate::filters::encode_stream_data(&enc_dict2, &main_data)?;
@@ -1241,7 +1251,7 @@ fn write_main_xref_stream_and_trailer(
     d2.insert(
         "Index",
         Object::Array(vec![
-            Object::Integer(i64::from(main_xref_num)),
+            Object::Integer(0),
             Object::Integer(i64::from(main_count)),
         ]),
     );
@@ -1923,7 +1933,7 @@ pub fn write_linearized<R: Read + Seek>(
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
     // ------------------------------------------------------------------
-    // ObjStm relocation (flpdf-56u).
+    // ObjStm per-half compressed-last placement.
     //
     // qpdf's linearization checker forbids an uncompressed (type-1) xref
     // entry appearing after a compressed (type-2) one within a cross-
@@ -1931,18 +1941,22 @@ pub fn write_linearized<R: Read + Seek>(
     // members at their low Part-3 slots while containers sit above
     // `renumber.len()`, which interleaves type-1 and type-2 entries.
     //
-    // Fix: resolve the writer-filtered batch plan ONCE, then relocate every
-    // member to a contiguous high-numbered block (qpdf "container < members,
-    // members trailing") and number each container directly below its
-    // members.  The resulting `local_renumber` is used everywhere downstream;
-    // when there are no ObjStm batches it is byte-identical to the input map
-    // (the relocation early-returns), so the Disable / non-ObjStm path is
-    // completely unchanged.
+    // Fix: resolve the writer-filtered batch plan ONCE, then place every
+    // member + container so that, within each file half, the compressed
+    // objects are numbered LAST (qpdf 11.9.0's per-half compressed-last
+    // order) — see [`RenumberMap::place_objstm_members_per_half`].  The two
+    // split xref streams then divide the object-number space by file half:
+    // the main (second-half) xref covers `[0, second_half_count)` and the
+    // first-page (first-half) xref covers `[second_half_count, /Size)`.  The
+    // resulting `local_renumber` is used everywhere downstream; when there are
+    // no ObjStm batches it is byte-identical to the input map (the placement
+    // early-returns), so the Disable / non-ObjStm path is completely
+    // unchanged.
     // ------------------------------------------------------------------
     let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
     let flat_batches = ObjStmLayout::flat_batches(&resolved_batch_plan);
     let mut local_renumber = renumber.clone();
-    let relocation = local_renumber.relocate_objstm_members(&flat_batches);
+    let relocation = local_renumber.place_objstm_members_per_half(&flat_batches);
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;
 

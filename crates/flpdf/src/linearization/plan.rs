@@ -945,35 +945,33 @@ impl LinearizationPlan {
         // Safety valve: Part-3 page-1 shared objects stay plain indirect
         // (flpdf-9hc.5.8.4 investigation; tracked as flpdf-ihb).
         //
-        // Part-3 first-page shared-object ObjStm packing is structurally
-        // incompatible with flpdf-56u's split-xref tail relocation and cannot
-        // pass `qpdf --check-linearization`.  qpdf's `checkHSharedObject`
+        // Part-3 first-page shared-object ObjStm packing places a container +
+        // members in the FIRST half (before /E).  qpdf's `checkHSharedObject`
         // (QPDF_linearization.cc) builds its index→object map *positionally*:
         // the first `nshared_first_page` shared hint entries are assigned
         // object numbers starting from `pages.at(0).getObjectID()` and
         // incrementing by 1, so the first-page shared objects (or their
-        // ObjStm container) must occupy a contiguous low object-number block
-        // immediately after the first-page object.  flpdf-56u's
-        // `relocate_objstm_members` moves every ObjStm member + container to a
-        // high contiguous *tail* block (so the split first-page/main xref
-        // `/Index` ranges never interleave type-1 after type-2).  Those two
-        // constraints are mutually exclusive without redesigning the 56u
-        // relocation, which is out of scope for 5.8.4.  Empirically, removing
-        // this clear makes qpdf report "object count mismatch for page 0" and
-        // "shared object … in hint table but not computed list".
+        // ObjStm container) must occupy a contiguous object-number block
+        // relative to the first-page object.  The per-half compressed-last
+        // renumber (`RenumberMap::place_objstm_members_per_half`) currently
+        // homes every batch's container + members in the SECOND half (every
+        // batch is a Part-4 container emitted after /E), so re-enabling Part-3
+        // packing requires re-homing first-page shared members into a
+        // first-half container AND reconciling the hint-table positional
+        // numbering — a packing change tracked as a separate flpdf-ihb
+        // subtask.  Empirically, removing this clear makes qpdf report "object
+        // count mismatch for page 0" and "shared object … in hint table but
+        // not computed list".
         //
         // NOTE: qpdf itself *does* pack some Part-3 first-page shared objects
-        // (e.g. the font/resource dicts referenced by page 1) into an ObjStm.
-        // flpdf cannot match that member set while keeping
-        // `qpdf --check-linearization` clean, because 56u's split-xref tail
-        // relocation is incompatible with qpdf's positional shared-object
-        // numbering (above).  Matching qpdf's member set requires a
-        // section-aware renumber redesign — tracked as flpdf-ihb, and NOT
-        // required for epic 5.8 acceptance (the brainstorming-confirmed target
-        // is observable-equivalent: qpdf-clean + boundaries + round-trip + 3
+        // (e.g. the font/resource dicts referenced by page 1) into a first-half
+        // ObjStm.  Matching that member set requires the first-half packing +
+        // hint-table reconciliation above (flpdf-ihb), and is NOT required for
+        // epic 5.8 acceptance (the brainstorming-confirmed target is
+        // observable-equivalent: qpdf-clean + boundaries + round-trip + 3
         // modes, not byte/member-set parity).  Part-4 (rest-of-document)
-        // packing is unaffected.  Re-enable by removing this clear once
-        // flpdf-ihb lands a section-aware renumber layout.
+        // packing is unaffected.  Re-enable by removing this clear once the
+        // first-half packing subtask lands.
         plan.part3_batches.clear();
 
         Ok(plan)
