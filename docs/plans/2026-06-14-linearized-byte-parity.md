@@ -17,7 +17,7 @@ Let `param_slot` = the param-dict object number (renumber map; 3/5/7 for one/two
 
 qpdf's `--linearize --deterministic-id` lays the classic (stream-free) file out as:
 
-```
+```text
 0:            %PDF-1.3\n%<4 binary bytes>\n                       (15-byte header)
 15:           {param_slot} 0 obj\n<< /Linearized 1 /L .. /H [ .. .. ] /O .. /E .. /N .. /T .. >>\nendobj\n
               <spaces padding so the next line starts at offset 216>
@@ -257,10 +257,12 @@ git commit -am "docs(flpdf): record linearized byte-parity in compat registry (f
 **Step 1: Full relevant test run**
 
 ```bash
+cargo check -p flpdf --features qpdf-zlib-compat
 cargo test -p flpdf --features qpdf-zlib-compat
 cargo test -p flpdf                         # default backend still green
 cargo test -p flpdf-cli                     # cli_linearize_qpdf.rs regression (needs qpdf)
 ```
+
 Expected: all PASS; `cli_linearize_qpdf.rs` qpdf `--check-linearization` zero-warning regression stays green.
 
 **Step 2: fmt + clippy**
@@ -275,6 +277,7 @@ cargo clippy --all-targets --features qpdf-zlib-compat -- -D warnings
 ```bash
 scripts/patch-coverage.sh --base main
 ```
+
 Expected: flpdf changed lines 100% covered. Add tests or `// cov:ignore: <reason>` for any genuinely untestable lines (note the reason in the PR description).
 
 **Step 4:** Confirm `git status` clean, all work committed.
