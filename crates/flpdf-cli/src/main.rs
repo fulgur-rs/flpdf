@@ -3921,13 +3921,15 @@ fn run_requires_password(input: &PathBuf, repair: bool, password: &PasswordArgs)
 ///
 /// Authenticate, then print the derived file encryption key as lowercase
 /// hex. Not encrypted or wrong password → error (exit 2), matching qpdf
-/// (which errors when it cannot derive the key).
+/// (which errors when it cannot derive the key). Weak-crypto (RC4 / R=5) files
+/// are inspectable with the correct password and no `--allow-weak-crypto`,
+/// matching qpdf's read-only treatment (see [`open_pdf_for_inspection`]).
 fn run_show_encryption_key(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<()> {
-    let pdf = open_pdf(input, repair, password)?;
+    let pdf = open_pdf_for_inspection(input, repair, password)?;
     match pdf.encryption_file_key() {
         Some(key) => {
             println!("{}", hex_lower(key));
@@ -3943,11 +3945,15 @@ fn run_show_encryption_key(
 /// `show-encryption FILE [--password ...]`: qpdf `--show-encryption`.
 ///
 /// See the subcommand `long_about` for the exact format and the documented
-/// divergences from qpdf (no recovered cleartext user password).
+/// divergences from qpdf (no recovered cleartext user password). Weak-crypto
+/// (RC4 / R=5) files are inspectable with the correct password and no
+/// `--allow-weak-crypto`, matching qpdf's read-only treatment (see
+/// [`open_pdf_for_inspection`]).
 fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     // qpdf prints "File is not encrypted" and exits 0 for plaintext files.
-    // open_pdf succeeds for plaintext input, so detect that case first.
-    let mut pdf = open_pdf(input, repair, password)?;
+    // open_pdf_for_inspection succeeds for plaintext input, so detect that
+    // case first.
+    let mut pdf = open_pdf_for_inspection(input, repair, password)?;
     let Some(info) = pdf.encryption_info()? else {
         println!("File is not encrypted");
         return Ok(());
@@ -4038,15 +4044,51 @@ fn open_pdf(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
+    open_pdf_impl(input, repair, password, false)
+}
+
+/// Open for the read-only encryption inspections (`show-encryption`,
+/// `show-encryption-key`).
+///
+/// Like [`open_pdf`] but forces the weak-crypto gate open, so an RC4 / R=5 file
+/// authenticated with the CORRECT password is inspectable without
+/// `--allow-weak-crypto`. qpdf treats these as read-only inspections rather than
+/// a write policy: it derives and prints the key / encryption block for a weak
+/// file with the correct password and emits no weak-crypto warning (verified
+/// qpdf 11.9.0). This mirrors the `requires-password` / `is-encrypted` alignment
+/// (flpdf-63g); authentication still runs first, so a wrong password fails
+/// exactly as before.
+fn open_pdf_for_inspection(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<Pdf<BufReader<File>>> {
+    open_pdf_impl(input, repair, password, true)
+}
+
+fn open_pdf_impl(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+    force_allow_weak_crypto: bool,
+) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
-    let pdf = Pdf::open_with_options(BufReader::new(file), pdf_open_options(repair, password)?)
+    let mut options = pdf_open_options(repair, password)?;
+    if force_allow_weak_crypto {
+        options.allow_weak_crypto = true;
+    }
+    let pdf = Pdf::open_with_options(BufReader::new(file), options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
 
     for diagnostic in pdf.repair_diagnostics().entries() {
         let location = diagnostic_location(input, diagnostic.offset);
         eprintln!("WARNING: {location}: {}", diagnostic.message);
     }
-    if pdf.uses_weak_crypto() {
+    // Skip the weak-crypto warning on the forced (inspection) path: the user
+    // supplied no `--allow-weak-crypto` flag to acknowledge, and qpdf emits no
+    // such warning for `--show-encryption[-key]`. On the normal path a weak
+    // file only opens when the user did pass the flag, so the warning is apt.
+    if pdf.uses_weak_crypto() && !force_allow_weak_crypto {
         eprintln!(
             "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied",
             input.display()
