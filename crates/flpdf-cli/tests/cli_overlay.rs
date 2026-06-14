@@ -274,6 +274,25 @@ fn overlay_on_non_rewrite_subcommand_is_rejected() {
 }
 
 #[test]
+fn overlay_equals_form_is_rejected() {
+    // qpdf rejects `--overlay=FILE` (the file must be a separate token). flpdf
+    // must too, so the equals form is never a silent no-op via clap.
+    let one = fixture("one-page.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("o.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(fixture("three-page.pdf"))
+        .arg(format!("--overlay={one}"))
+        .arg("--")
+        .arg(out.to_str().unwrap())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not supported"));
+}
+
+#[test]
 fn overlay_on_top_level_inspection_is_rejected() {
     // Top-level inspection mode (--show-npages) with an overlay group must also
     // fail rather than drop the overlay.
