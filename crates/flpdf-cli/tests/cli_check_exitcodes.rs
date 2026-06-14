@@ -718,3 +718,61 @@ fn decode_memory_limit_requires_check() {
         .code(2)
         .stderr(predicate::str::contains("--check"));
 }
+
+// ---------------------------------------------------------------------------
+// Tests: weak-crypto files are inspectable by `--check` (read-only parity)
+//
+// qpdf treats `--check` as a read-only inspection, like `--show-encryption`,
+// `--requires-password`, and `--is-encrypted`: an RC4 / R=5 file opened with the
+// CORRECT password and NO `--allow-weak-crypto` is checked and exits 0 with no
+// weak-crypto warning. Verified with qpdf 11.9.0:
+//   qpdf --check --password=user-v2 tests/fixtures/encrypted/v2-rc4-128-r3.pdf
+//   → exit 0, prints the check block + "No syntax or stream encoding errors
+//     found", and emits NO weak-crypto warning on stderr.
+// flpdf previously hit the weak-crypto gate here and exited 2.
+// ---------------------------------------------------------------------------
+
+/// RC4 (weak crypto) fixture inspectable with the correct user password.
+const WEAK_RC4_FIXTURE: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
+
+#[test]
+fn check_weak_rc4_correct_password_exits_0_as_inspection() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--password=user-v2", WEAK_RC4_FIXTURE])
+        .assert()
+        // exit 0: opened as a read-only inspection, no errors, no warnings.
+        .code(0)
+        // The trailing reassurance note is printed only on a clean exit-0 run,
+        // so its presence proves both that the file opened AND that the
+        // weak-crypto warning was suppressed (otherwise it would be exit 3).
+        .stdout(predicate::str::contains(
+            "No syntax or stream encoding errors found",
+        ))
+        // No weak-crypto error/warning surfaced anywhere — qpdf emits none.
+        .stderr(predicate::str::contains("weak crypto").not());
+}
+
+#[test]
+fn check_subcommand_weak_rc4_correct_password_exits_0() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["check", "--password=user-v2", WEAK_RC4_FIXTURE])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains(
+            "No syntax or stream encoding errors found",
+        ))
+        .stderr(predicate::str::contains("weak crypto").not());
+}
+
+/// Forcing the weak-crypto gate open for the inspection must NOT bypass
+/// authentication: a wrong password still fails (exit 2), exactly as before.
+#[test]
+fn check_weak_rc4_wrong_password_still_exits_2() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--password=wrong", WEAK_RC4_FIXTURE])
+        .assert()
+        .code(2);
+}

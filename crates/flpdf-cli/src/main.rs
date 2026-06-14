@@ -2077,10 +2077,28 @@ fn run_check(
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
-    let options = pdf_open_options(repair, password)?;
+    let mut options = pdf_open_options(repair, password)?;
+    // qpdf treats `--check` as a read-only inspection, like `--show-encryption`,
+    // `--requires-password`, and `--is-encrypted`: an RC4 / R=5 (weak-crypto)
+    // file opened with the correct password is checked without
+    // `--allow-weak-crypto` and exits 0 with no weak-crypto warning (verified
+    // qpdf 11.9.0). Force the gate open here. Authentication still runs first,
+    // so a wrong password fails exactly as before.
+    options.allow_weak_crypto = true;
     let report = check_reader_with_options_and_limits(BufReader::new(file), options, decode_limits)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    // The library always emits a weak-crypto advisory when a weak file opens
+    // (flpdf check.rs: "encrypted PDF uses weak crypto; processing continued").
+    // Because `--check` forces the gate open as an inspection rather than the
+    // user opting in, suppress that advisory so the run matches qpdf's clean
+    // exit 0; qpdf emits no such warning for `--check`.
+    let is_weak_crypto_advisory = |d: &flpdf::Diagnostic| {
+        d.severity == Severity::Warning && d.message.contains("weak crypto")
+    };
     for diagnostic in report.diagnostics.entries() {
+        if is_weak_crypto_advisory(diagnostic) {
+            continue;
+        }
         let location = diagnostic_location(&input, diagnostic.offset);
         match diagnostic.severity {
             Severity::Warning => eprintln!("WARNING: {location}: {}", diagnostic.message),
@@ -2101,7 +2119,7 @@ fn run_check(
         .diagnostics
         .entries()
         .iter()
-        .any(|d| d.severity == Severity::Warning);
+        .any(|d| d.severity == Severity::Warning && !is_weak_crypto_advisory(d));
 
     if !report.valid {
         // Errors found — exit 2.  The error diagnostics above are already in

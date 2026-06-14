@@ -31,9 +31,10 @@ const V5_R6_HEX_KEY: &str = "fc459408a5282b7c59daa5162f860e82315679cc04942ef5799
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const R4_HEX_KEY: &str = "43ca065209d492256d845f57f8b95da2";
 
-/// RC4 fixture (weak crypto) — used to prove the post-key weak-crypto gate is
-/// honored consistently on the hex-key path (qpdf parity: a raw key does NOT
-/// bypass `--allow-weak-crypto`).
+/// RC4 fixture (weak crypto). Exercises the hex-key path against the
+/// weak-crypto gate: the gate is honored on processing/write paths (`rewrite`),
+/// but NOT on the read-only `--check` inspection, which opens weak files like
+/// qpdf (a raw key does not change either behavior).
 const V2_RC4: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
 
 fn flpdf() -> Command {
@@ -251,12 +252,41 @@ fn hex_key_uppercase_and_whitespace_tolerant() {
 }
 
 #[test]
-fn hex_key_weak_crypto_gate_still_honored() {
-    // A raw key does NOT bypass the weak-crypto gate. An RC4 file opened with
-    // a hex key and no --allow-weak-crypto must still be rejected with
-    // WeakCryptoNotAllowed (qpdf parity; keep existing post-key behavior).
+fn hex_key_rewrite_weak_crypto_gate_still_honored() {
+    // A raw key does NOT bypass the weak-crypto gate on processing/write paths.
+    // An RC4 file opened with a hex key and no --allow-weak-crypto must still be
+    // rejected with WeakCryptoNotAllowed. `rewrite` routes through the gated
+    // `open_pdf`; `check` no longer does (it now treats weak files as a
+    // read-only inspection — see `hex_key_check_weak_rc4_inspectable_exit_0`).
     // The exact key value is irrelevant: the gate fires after the key is
     // accepted, before decryption, so any well-formed hex triggers it.
+    let out = tempfile::NamedTempFile::new().unwrap();
+    let assert = flpdf()
+        .args([
+            "rewrite",
+            "--password=00112233445566778899aabbccddeeff",
+            "--password-is-hex-key",
+            V2_RC4,
+            out.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("weak crypto"),
+        "RC4 file with a hex key on a write path must still hit the weak-crypto gate, got: {stderr}"
+    );
+}
+
+#[test]
+fn hex_key_check_weak_rc4_inspectable_exit_0() {
+    // `--check` is a read-only inspection (qpdf parity), so a weak (RC4) file
+    // opened via a raw hex key is checked and exits 0 with NO weak-crypto
+    // warning — the gate is not engaged on this inspection path. Verified with
+    // qpdf 11.9.0:
+    //   qpdf --check --password-is-hex-key --password=<key> v2-rc4-128-r3.pdf
+    //   → exit 0, no weak-crypto warning (--allow-weak-crypto makes no
+    //   difference). This exercises the hex-key library branch under --check.
     let assert = flpdf()
         .args([
             "check",
@@ -265,11 +295,11 @@ fn hex_key_weak_crypto_gate_still_honored() {
             V2_RC4,
         ])
         .assert()
-        .failure();
+        .code(0);
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(
-        stderr.contains("weak crypto"),
-        "RC4 file with a hex key must still hit the weak-crypto gate, got: {stderr}"
+        !stderr.contains("weak crypto"),
+        "--check must not engage the weak-crypto gate (read-only inspection), got: {stderr}"
     );
 }
 
