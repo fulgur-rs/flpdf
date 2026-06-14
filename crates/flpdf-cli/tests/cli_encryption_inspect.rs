@@ -20,9 +20,9 @@
 //! | encrypted/v4-aes-128-r4       | (none/wrong)| 0      | 0      | (auth fails) |
 //! | encrypted/v4-aes-128-r4       | user-v4-aes | 0      | 3      | 5042ec…  |
 //! | encrypted/v5-aes-256-r6       | user-v5-r6  | 0      | 3      | fc4594…  |
-//! | encrypted/v2-rc4-128-r3 (weak)| user-v2     | 0      | 3      | (weak)   |
+//! | encrypted/v2-rc4-128-r3 (weak)| user-v2     | 0      | 3      | 09d565…  |
 //! | encrypted/v2-rc4-128-r3 (weak)| (none/wrong)| 0      | 0      | (auth fails) |
-//! | encrypted/v5-aes-256-r5 (weak)| user-v5-r5  | 0      | 3      | (weak)   |
+//! | encrypted/v5-aes-256-r5 (weak)| user-v5-r5  | 0      | 3      | c3d812…  |
 //! | encrypted/v5-aes-256-r5 (weak)| (none/wrong)| 0      | 0      | (auth fails) |
 //! | fixtures/minimal.pdf          | —           | 2      | 2      | n/a      |
 //!
@@ -30,7 +30,10 @@
 //!   `qpdf --show-encryption-key --check --password=… FIXTURE`.
 //! Weak-crypto (RC4 / R=5) req-pw codes verified with
 //!   `qpdf --requires-password [--password=…] FIXTURE` (flpdf-63g): qpdf does
-//! NOT require `--allow-weak-crypto` for this read-only inspection.
+//! NOT require `--allow-weak-crypto` for this read-only inspection. The same
+//! applies to `show-encryption` / `show-encryption-key`: qpdf derives the key
+//! and prints the encryption block for a weak file with the correct password
+//! and no `--allow-weak-crypto`, so flpdf does too (flpdf-ysb5).
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -205,6 +208,54 @@ fn show_encryption_key_wrong_password_errors() {
         .code(2);
 }
 
+// Weak-crypto (RC4 / R=5): qpdf derives and prints the key for a weak file
+// authenticated with the correct password WITHOUT --allow-weak-crypto, treating
+// key display as a read-only inspection (qpdf `--show-encryption
+// --show-encryption-key`, verified qpdf 11.9.0). flpdf previously errored
+// (exit 2) because show-encryption-key opened via the weak-crypto-gated path
+// (flpdf-ysb5; same alignment as requires-password in flpdf-63g). Reference
+// keys captured from qpdf 11.9.0.
+
+#[test]
+fn show_encryption_key_weak_rc4_correct_password_matches_qpdf() {
+    flpdf()
+        .args(["show-encryption-key", "--password=user-v2", V2_RC4])
+        .assert()
+        .success()
+        .stdout("09d56583e16481df964f95df779c97d4\n");
+}
+
+#[test]
+fn show_encryption_key_weak_r5_correct_password_matches_qpdf() {
+    flpdf()
+        .args(["show-encryption-key", "--password=user-v5-r5", V5_R5])
+        .assert()
+        .success()
+        .stdout("c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614\n");
+}
+
+#[test]
+fn show_encryption_key_weak_correct_password_emits_no_weak_crypto_warning() {
+    // The gate is forced open for this read-only inspection, so the
+    // "processing because --allow-weak-crypto was supplied" warning must NOT
+    // fire (the user supplied no such flag, and qpdf emits no warning here).
+    flpdf()
+        .args(["show-encryption-key", "--password=user-v2", V2_RC4])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("weak crypto").not());
+}
+
+#[test]
+fn show_encryption_key_weak_wrong_password_still_errors() {
+    // Forcing the weak-crypto gate open must not bypass authentication: a
+    // wrong password still fails before any key can be derived (exit 2).
+    flpdf()
+        .args(["show-encryption-key", "--password=wrong", V2_RC4])
+        .assert()
+        .code(2);
+}
+
 // ---------------------------------------------------------------------------
 // show-encryption: parseable, contains the DESIGN-required fields, and the
 // qpdf `--show-encryption` lines are emitted verbatim.
@@ -294,6 +345,59 @@ file encryption method: AESv2
         expected_qpdf_block,
         "qpdf-compatible block diverged from qpdf 11.9.0 output"
     );
+}
+
+// Weak-crypto (RC4 / R=5): qpdf `--show-encryption` opens a weak file
+// authenticated with the correct password WITHOUT --allow-weak-crypto and
+// prints the full block (exit 0), treating it as a read-only inspection
+// (verified qpdf 11.9.0). flpdf previously errored (exit 2) via the
+// weak-crypto-gated open path (flpdf-ysb5).
+
+#[test]
+fn show_encryption_weak_rc4_correct_password_exits_0() {
+    let out = flpdf()
+        .args(["show-encryption", "--password=user-v2", V2_RC4])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    for needle in ["R = 3", "P = -4", "Supplied password is user password"] {
+        assert!(
+            text.contains(needle),
+            "show-encryption (weak RC4) output missing {needle:?}; full output:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn show_encryption_weak_r5_correct_password_exits_0() {
+    let out = flpdf()
+        .args(["show-encryption", "--password=user-v5-r5", V5_R5])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    for needle in ["R = 5", "Supplied password is user password"] {
+        assert!(
+            text.contains(needle),
+            "show-encryption (weak R5) output missing {needle:?}; full output:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn show_encryption_weak_correct_password_emits_no_weak_crypto_warning() {
+    // Read-only inspection forces the gate open; the false "--allow-weak-crypto
+    // was supplied" warning must not fire (qpdf emits none here).
+    flpdf()
+        .args(["show-encryption", "--password=user-v2", V2_RC4])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("weak crypto").not());
 }
 
 #[test]
