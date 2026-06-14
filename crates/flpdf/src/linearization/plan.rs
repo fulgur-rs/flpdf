@@ -1083,9 +1083,15 @@ impl LinearizationPlan {
             .collect();
         let mut first_half_extra: Vec<ObjectRef> = Vec::new();
         for candidate in [self.info_ref, self.pages_tree_ref].into_iter().flatten() {
+            // cov:ignore-start: idempotency / exclusion guard — /Info and the
+            // /Pages tree are never first-page SHARED objects (they are not in
+            // the planner's Part-3 set) and are not indirect-/Length stream
+            // targets, so neither predicate fires on real documents; the guard
+            // keeps the fold idempotent if a caller ever pre-seeds them.
             if existing_part3.contains(&candidate) || length_exclusions.contains(&candidate) {
                 continue;
             }
+            // cov:ignore-end
             let obj = pdf.resolve_borrowed(candidate)?;
             if is_eligible_for_objstm(candidate, obj, ctx) {
                 first_half_extra.push(candidate);
@@ -1111,9 +1117,15 @@ impl LinearizationPlan {
                 .collect();
         }
 
+        // cov:ignore-start: defensive — this method is only invoked when
+        // `part3_batches` is non-empty (multi-page docs with first-page shared
+        // objects), and such docs always have an eligible /Pages tree (a plain
+        // dict) to fold, so `first_half_extra` is non-empty in practice; the
+        // early return guards the degenerate "no eligible /Info or /Pages" case.
         if first_half_extra.is_empty() {
             return Ok(());
         }
+        // cov:ignore-end
 
         // Flatten the existing Part-3 members (preserving order), append the
         // extras, and re-chunk by the cap so no container exceeds the limit.
