@@ -438,7 +438,13 @@ pub fn parse_pdf_version(v: &str) -> Option<(u8, u8)> {
 /// Rule (mirrors qpdf):
 /// 1. If `options.force_version` is set, use it verbatim.
 /// 2. Otherwise start from `max(source, min_version_option)`.
-/// 3. If `linearize` is true, apply an additional `max(…, "1.2")` floor
+/// 3. If `object_streams` is true, apply a `max(…, "1.5")` floor. Cross-
+///    reference and object streams were introduced in PDF 1.5, so qpdf raises
+///    the minimum to 1.5 (`setMinimumPDFVersion("1.5")`) whenever it actually
+///    emits one. The caller passes whether the output *really* contains an
+///    object stream (not merely whether the mode requests it), so a generate
+///    request that packs nothing leaves the version untouched, matching qpdf.
+/// 4. If `linearize` is true, apply an additional `max(…, "1.2")` floor
 ///    (linearized PDFs require at least PDF 1.2).
 ///
 /// If the version strings cannot be parsed the function falls back to the
@@ -465,6 +471,7 @@ pub fn effective_pdf_version<'a>(
     source: &'a str,
     options: &'a WriteOptions,
     linearize: bool,
+    object_streams: bool,
 ) -> &'a str {
     // --force-version wins outright, but only when the value is a valid version string.
     // Silently ignore invalid values (same treatment as invalid min_version) so that
@@ -489,6 +496,14 @@ pub fn effective_pdf_version<'a>(
         }
     }
 
+    // Apply object-stream floor (object streams require >= 1.5).
+    if object_streams {
+        let objstm_floor = (1u8, 5u8);
+        if objstm_floor > best {
+            best = objstm_floor;
+        }
+    }
+
     // Apply linearize floor (PDF spec requires >= 1.2).
     if linearize {
         let lin_floor = (1u8, 2u8);
@@ -506,6 +521,11 @@ pub fn effective_pdf_version<'a>(
         if parse_pdf_version(min_v) == Some(best) {
             return min_v.as_str();
         }
+    }
+    // Object-stream floor "1.5" — reached when best == (1,5) and neither source
+    // nor min_version matched (object streams forced the version up).
+    if best == (1u8, 5u8) {
+        return "1.5";
     }
     // Linearize floor "1.2" — only reached when best == (1,2) and neither
     // source nor min_version matched.
@@ -2494,7 +2514,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         ));
     }
 
-    let mut version = effective_pdf_version(pdf.version(), options, false).to_owned();
+    // Object-stream floor passes `false`: the full-rewrite generate path does
+    // not yet raise the header to 1.5 when it packs ObjStm containers (tracked
+    // separately). This preserves the existing non-linearized behaviour; the
+    // 1.5 floor is wired only on the linearized ObjStm path for now.
+    let mut version = effective_pdf_version(pdf.version(), options, false, false).to_owned();
 
     // ── encryption preflight (flpdf-9hc.4.9 / 4.11 / 4.16 / 4.17) ─────────
     // --encrypt supports xref-stream form and ObjStm containers (flpdf-9hc.4.16
