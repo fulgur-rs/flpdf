@@ -6,7 +6,7 @@
 //! # RC4 notice
 //! `rc4` is a broken stream cipher. Its use in PDF is legacy (PDF 1.x–1.6
 //! encryption). Higher-level code MUST gate RC4 usage behind an
-//! `--allow-weak-crypto` flag before calling [`rc4`].
+//! `--allow-weak-crypto` flag before calling [`rc4()`].
 //!
 //! # Dead-code notice
 //! Several primitives in this module support encrypted-PDF handling

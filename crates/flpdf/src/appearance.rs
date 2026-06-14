@@ -1737,7 +1737,7 @@ fn resolve_combo_display<R: Read + Seek>(
     value
 }
 
-/// Resolve an /Opt value (possibly indirect) to a Vec<Object> array.
+/// Resolve an /Opt value (possibly indirect) to a `Vec<Object>` array.
 fn resolve_opt_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     opt_val: Option<Object>,

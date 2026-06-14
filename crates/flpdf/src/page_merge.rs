@@ -1208,7 +1208,7 @@ struct PrimaryAcroForm {
 /// Read the primary input's `/AcroForm /DR` and `/DA`, returning them with the
 /// set of indirect objects they reach (to fold into the primary copy closure).
 /// The `/DR` / `/DA` values are returned verbatim (still in the source's
-/// numbering); [`finalize_primary_acroform`] remaps them after the copy.
+/// numbering); [`build_merged_acroform`] remaps them after the copy.
 fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryAcroForm> {
     let entries = source.acroform().acroform_inherited_entries()?;
     let mut out = PrimaryAcroForm::default();

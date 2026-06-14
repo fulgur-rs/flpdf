@@ -1830,7 +1830,7 @@ struct EncryptionContext {
     /// [`WriteOptions::static_aes_iv`].
     static_aes_iv: bool,
     /// Whether the `/Metadata` stream is encrypted alongside the rest of the
-    /// document (mirrors [`EncryptParams::encrypt_metadata`]). When `false`
+    /// document (mirrors [`crate::EncryptParams::encrypt_metadata`]). When `false`
     /// (qpdf `--cleartext-metadata`, V=4/V=5 only), the `/Metadata` stream in
     /// [`metadata_ref`](Self::metadata_ref) is left in the clear and tagged
     /// with `/Crypt /Identity` instead of being run through the cipher.
@@ -2006,7 +2006,7 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
     })
 }
 
-/// Build an [`EncryptionContext`] from a donor [`CopyEncryptionSource`]
+/// Build an [`EncryptionContext`] from a donor [`crate::CopyEncryptionSource`]
 /// (the `--copy-encryption-from` path).
 ///
 /// Unlike [`build_encryption_context`], this function does **not** derive a
