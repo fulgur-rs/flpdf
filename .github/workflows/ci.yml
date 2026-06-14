@@ -35,6 +35,15 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # flpdf is published to docs.rs, so broken intra-doc links are a quality
+      # regression. --document-private-items is required: these breaks can live
+      # entirely on pub(crate)/private items while the public docs.rs build
+      # stays clean, so without it the gate misses private-only rot. Named
+      # rustdoc lints (not `-D warnings`) keep the gate stable across stable-
+      # toolchain bumps — same rationale as the fuzz job pinning its nightly.
+      - name: Doc links
+        run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links -D rustdoc::invalid_html_tags" cargo doc --workspace --no-deps --document-private-items
+
   test:
     name: Test (${{ matrix.os }})
     needs: quality
