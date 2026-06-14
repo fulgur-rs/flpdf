@@ -65,6 +65,7 @@ pub mod linearization;
 pub mod name_number_tree;
 pub mod object;
 pub mod object_copy;
+pub mod objr_obj_annot_p;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
@@ -143,6 +144,7 @@ pub use name_number_tree::{
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
+pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};

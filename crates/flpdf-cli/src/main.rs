@@ -3,7 +3,8 @@
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::{
-    acroform_field_prune::prune_acroform_after_subset, outline_dest_remap::remap_outline_and_dests,
+    acroform_field_prune::prune_acroform_after_subset,
+    objr_obj_annot_p::drop_objr_obj_annot_dangling_p, outline_dest_remap::remap_outline_and_dests,
     page_collate::collate, page_combine::CombinedPlan, page_rotate::apply_rotate_to_pages,
     page_split::split_pages, page_tree_rebuild::rebuild_page_tree,
     struct_tree_pg::drop_struct_elem_dangling_pg, subset_prune::prune_after_subset,
@@ -3152,6 +3153,7 @@ fn parse_collate_n(raw: &str) -> CliResult<usize> {
 ///   4. outline_dest_remap::remap_outline_and_dests
 ///   5. struct_tree_pg::drop_struct_elem_dangling_pg
 ///   6. thread_bead_p::drop_thread_bead_dangling_p
+///      6.5. objr_obj_annot_p::drop_objr_obj_annot_dangling_p
 ///   7. subset_prune::prune_after_subset (Auto/Yes/No)
 ///   8. acroform_field_prune::prune_acroform_after_subset
 ///   9. write (or split_pages when --split-pages is set)
@@ -3282,13 +3284,19 @@ fn run_page_extraction(
 
     // Step 5: struct-tree /Pg drop (the structural-reference drop family —
     // must run before the prune so the now-unreferenced page is swept).
-    drop_struct_elem_dangling_pg(&mut pdf, &result)?;
+    let objr_obj_targets = drop_struct_elem_dangling_pg(&mut pdf, &result)?;
 
     // Step 6: article-thread bead /P drop (same structural-reference drop
     // family). A bead whose /P targets a removed page has the /P dropped (the
     // bead and its ring are kept); must also run before the prune so the
     // now-unreferenced page is swept.
     drop_thread_bead_dangling_p(&mut pdf, &result)?;
+
+    // Step 6.5: drop the dangling /P on annotations kept alive only through a
+    // struct-tree OBJR /Obj (same structural-reference drop family). The OBJR
+    // /Obj targets were collected by Step 5's struct-tree walk. Must run before
+    // the prune so the now-unreferenced removed page is swept.
+    drop_objr_obj_annot_dangling_p(&mut pdf, &result, &objr_obj_targets)?;
 
     // Step 7: unreferenced-resource prune + xref GC (8.9).
     prune_after_subset(&mut pdf, remove_unref.into())?;
