@@ -205,6 +205,22 @@ echo ""
 echo "=== All 15 references generated ==="
 
 # ---------------------------------------------------------------------------
+# Phase 2b: Overlay / underlay reference outputs (epic flpdf-9hc.16)
+# ---------------------------------------------------------------------------
+
+mkdir -p "$REF/overlay"
+
+# Simplest overlay: 1-page source onto page 1 of a 3-page dest (identity cm,
+# same MediaBox). --static-id pins the trailer /ID. Source exhausts after page 1
+# (no --repeat) so pages 2-3 are untouched. This is the .16.3 byte-identity gate.
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-one-page.pdf"
+echo "overlay/three-page-overlay-one-page.pdf"
+
+echo ""
+
+# ---------------------------------------------------------------------------
 # Phase 3: Size check (fail if any reference exceeds 100 KB)
 # ---------------------------------------------------------------------------
 
