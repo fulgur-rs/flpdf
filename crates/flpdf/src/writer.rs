@@ -2106,11 +2106,13 @@ pub(crate) const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
 /// fixed-width hex form qpdf emits: `[<id0_hex><id1_hex>]`, exactly
 /// [`DETERMINISTIC_ID_ARRAY_LEN`] bytes with no inner spaces. Building the
 /// bytes by hand (rather than via [`Object::write_pdf`]) guarantees the hex
-/// form even when a digest happens to be all-printable, which keeps the
-/// placeholder and the final value the same length — a hard requirement for the
-/// linearized writer's placeholder-then-patch scheme to leave every later byte
-/// offset intact. (The flat write paths instead direct-write the final value
-/// via [`write_deterministic_id_inline`], with no placeholder.)
+/// form even when a digest happens to be all-printable, so the value is always
+/// the same fixed width regardless of its bytes. The classic linearized writer
+/// calls this directly to emit the final identifier at each `/ID` site in its
+/// last write pass (qpdf's 2-pass scheme); the ObjStm linearized writer uses it
+/// for both the all-zero placeholder and the patched-in final value, whose equal
+/// width leaves every later byte offset intact. (The flat write paths instead
+/// direct-write the final value via [`write_deterministic_id_inline`].)
 pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16]) {
     out.push(b'[');
     for id in [id0, id1] {
@@ -2127,7 +2129,7 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id
 /// length other than 16), in which case qpdf reuses the changing identifier as
 /// the permanent one. The 16-byte constraint keeps the serialized `/ID` array
 /// at the fixed [`DETERMINISTIC_ID_ARRAY_LEN`] the linearized writer's
-/// placeholder-then-patch step depends on.
+/// fixed-width `/ID` emission depends on.
 pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<[u8; 16]> {
     match trailer.get("ID") {
         Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
