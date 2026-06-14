@@ -3585,7 +3585,7 @@ mod tests {
         // carry a lone /FlateDecode (embedded, not external) and none of the
         // external-file keys. If the /F exclusion were missing, the stream would
         // be preserved verbatim and still carry /F / /FFilter / /FDecodeParms.
-        let mut reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("output must reparse");
         let refs = reopened.live_object_refs();
         let stream = refs
             .into_iter()
