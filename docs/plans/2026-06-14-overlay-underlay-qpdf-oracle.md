@@ -212,3 +212,16 @@ page1 Fx1=obj9, page2 Fx1=obj9, page3 Fx1=obj9 (shared); Fx0 differs per page
 even when byte-identical (no dedupe). => import distinct source pages once, cache
 by source-page index, reuse the ref across dest pages. Only dest pages that
 actually receive a source are touched (others left fully untouched, no Fx0).
+
+## Multi-spec composition (.16.5) — CONFIRMED
+
+Each spec is mapped independently (.16.4). Per dest page, aggregate the sources
+from ALL specs that map to it and call apply_overlays_to_page ONCE (a page is
+converted to /Fx0 exactly once). Naming/draw order within the page is by kind:
+underlays (across specs, declaration order) then overlays (across specs,
+declaration order), drawn under->/Fx0->over. Confirmed (dest=three-page):
+  --overlay one -- --overlay two --: p1 Fx0,Fx1(o1 s1),Fx2(o2 s1); p2 Fx0,Fx1(o2 s2).
+  --overlay one -- --underlay two --: p1 Fx0,Fx1(UNDER two s1),Fx2(OVER one s1);
+    p2 Fx0,Fx1(under two s2). => under-then-over naming across specs.
+Each spec's source file is a separate document => one batch copy_objects per spec
+(per source doc). Call apply once per dest page with the combined source list.
