@@ -154,3 +154,36 @@ inspector (the quick awk counter used during oracle was buggy).
   /BBox /Matrix /Resources /Subtype(/Form) /Type(/XObject) [+/Group if present]
   (+ /Length added by writer). qpdf dicts are std::map => keys WRITTEN SORTED.
   /Matrix always emitted (identity [1 0 0 1 0 0] when no rotate/userunit).
+
+## CRITICAL: object numbering is set by the writer, not at creation time
+
+flpdf's writer renumbers every object via `rewrite_renumber::CatalogFirstRenumber`
+(writer.rs:2520) reproducing qpdf's BFS write order: trailer /Root first then
+trailer indirect entries in lexicographic key order (/Info => obj 2); each
+dequeued object enqueues its references descending dict entries in LEXICOGRAPHIC
+byte order of keys and array elements in order; streams walk only the dict.
+=> The new objects' creation-time numbers (next_object_ref / copy_objects order)
+DO NOT affect final bytes. Final numbering follows the post-overlay GRAPH. Verified
+against the golden: obj4=page1, 5=page2, 6=page3, 7=page1 new /Contents, 8=Fx0,
+9=Fx1, 10=page2 content, 11=page2 /Font dict, 12/13 page3, 14/15 fonts — exactly
+the BFS-by-lexicographic-keys order. So .16.3 only needs the GRAPH + bytes to
+match; numbering follows automatically.
+
+## Golden for the .16.3 byte gate (simplest case)
+
+qpdf --static-id --warning-exit-0 three-page.pdf --overlay one-page.pdf -- OUT
+Real numbering above. obj7 (new /Contents) = "q\n1 0 0 1 0 0 cm\n/Fx0 Do\nQ\nq\n
+1 0 0 1 0 0 cm\n/Fx1 Do\nQ\n" (54 bytes) FlateDecode-compressed to Length 35.
+
+## placeFormXObject uses the MATRIX-TRANSFORMED bbox (rotated pages)
+
+getMatrixForFormXObjectPlacement fits the form's /BBox AFTER applying the form's
+/Matrix (the visual extent), not the raw /BBox. So a +90 page (Form /Matrix
+[0 -1 1 0 0 w], /BBox [0 0 612 792]) presents a 792x612 box. Empirical
+(qpdf 11.9.0, rotated source overlaid onto 612x792):
+  cm = 0.77273 0 0 0.77273 0 159.54545
+  (transformed bbox [0 0 792 612]; scale=min(612/792,792/612)=0.77273;
+   tx=306-0.77273*396=0; ty=396-0.77273*306=159.54545)
+=> placement = transform the /BBox 4 corners by /Matrix, take the bounding rect,
+then scale-to-fit+centre THAT. Identity /Matrix => transformed == raw (the
+simple gate is unaffected). A byte-level rotated golden is deferred to .16.7.
