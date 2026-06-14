@@ -3498,6 +3498,123 @@ mod tests {
             .expect("preserve-mode linearized output must pass the checker");
     }
 
+    /// Build a linearizable single-page PDF whose Catalog `/Metadata` points at
+    /// a body stream that is BOTH a lone `/FlateDecode` AND an external-file
+    /// stream (`/F`, `/FFilter`, `/FDecodeParms`). The in-body bytes are a
+    /// FlateDecode of `payload`, so the compress policy can decode and re-embed
+    /// them.
+    fn tiny_pdf_with_external_file_lone_flate_stream(payload: &[u8]) -> Vec<u8> {
+        // Compress the payload with flpdf's own encoder so the in-body bytes
+        // decode back to `payload` under the compress policy.
+        let mut enc_dict = Dictionary::new();
+        enc_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let compressed =
+            crate::filters::encode_stream_data(&enc_dict, payload).expect("flate encode");
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>\nendobj\n",
+        );
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+        );
+        offs.push(pdf.len() as u64);
+        let content: &[u8] = b"BT /F1 12 Tf (hi) Tj ET\n";
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // Object 5: the external-file lone-/FlateDecode body stream.
+        offs.push(pdf.len() as u64);
+        let stream_header = format!(
+            "5 0 obj\n<< /Filter /FlateDecode /F (external.bin) /FFilter /FlateDecode \
+             /FDecodeParms << /Predictor 1 >> /Length {} >>\nstream\n",
+            compressed.len()
+        );
+        pdf.extend_from_slice(stream_header.as_bytes());
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// The lone-/FlateDecode verbatim-preserve fast path in
+    /// [`append_body_object`] must EXCLUDE external-file streams (`/F`): such a
+    /// stream is re-encoded via the compress policy (embedding the decoded
+    /// payload and stripping `/F` / `/FFilter` / `/FDecodeParms`), NOT preserved
+    /// verbatim. This pins the exclusion OUTCOME of the
+    /// `&& stream.dict.get("F").is_none()` guard on the linearized body path,
+    /// mirroring the plain full-rewrite path's
+    /// `full_rewrite_strips_external_file_ref_from_reencoded_stream`. Without the
+    /// `/F` exclusion the stream would be preserved verbatim and still carry the
+    /// external-file keys.
+    #[test]
+    fn linearized_compress_mode_reencodes_external_file_lone_flate_stream() {
+        let payload: &[u8] = b"flpdf linearized external-file lone-flate exclusion payload";
+        let src = tiny_pdf_with_external_file_lone_flate_stream(payload);
+
+        // Default WriteOptions => compress_streams = Yes, recompress_flate =
+        // false: exactly the conditions under which a lone-/FlateDecode body
+        // stream WITHOUT /F is preserved verbatim. The /F here must force the
+        // re-encode (exclusion) branch instead.
+        let out = linearize_with(&src, |o| o.deterministic_id = true);
+
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output must pass the linearization checker");
+
+        // Locate the re-emitted stream by its decoded payload. Its dict must
+        // carry a lone /FlateDecode (embedded, not external) and none of the
+        // external-file keys. If the /F exclusion were missing, the stream would
+        // be preserved verbatim and still carry /F / /FFilter / /FDecodeParms.
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("output must reparse");
+        let refs = reopened.live_object_refs();
+        let stream = refs
+            .into_iter()
+            .find_map(|r| {
+                let stream = reopened.resolve(r).ok()?.into_stream()?;
+                let decoded =
+                    crate::filters::decode_stream_data(&stream.dict, &stream.data).ok()?;
+                decoded
+                    .windows(payload.len())
+                    .any(|w| w == payload)
+                    .then_some(stream)
+            })
+            .expect(
+                "the external-file stream's decoded payload must be embedded in the output \
+                 (proving it was re-encoded, not preserved verbatim)",
+            );
+
+        for key in ["F", "FFilter", "FDecodeParms"] {
+            assert!(
+                stream.dict.get(key).is_none(),
+                "re-encoded external-file stream must not carry /{key}"
+            );
+        }
+        assert!(
+            is_lone_flate(stream.dict.get("Filter")),
+            "re-encoded external-file stream must declare a lone /FlateDecode filter"
+        );
+    }
+
     #[test]
     fn deterministic_id_linearized_xref_stream_is_self_stable() {
         // The classic-table path is covered by `..._is_self_stable`; this one
