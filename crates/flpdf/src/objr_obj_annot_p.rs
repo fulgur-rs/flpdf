@@ -89,11 +89,18 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
 
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     for &start in objr_obj_targets {
+        // Skip a duplicate start ref before resolving the (potentially I/O-bound,
+        // decryption-involving) chain.
+        if !visited.insert(start) {
+            continue;
+        }
         // Normalize a reference chain so the visited key and the write-back
         // target are the terminal annotation ref, never an intermediate holder.
         let (concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(start))?;
         let annot_ref = terminal.unwrap_or(start);
-        if !visited.insert(annot_ref) {
+        // A distinct start that resolves to an already-processed terminal is
+        // skipped too (two OBJR /Obj entries can reach the same annotation).
+        if annot_ref != start && !visited.insert(annot_ref) {
             continue;
         }
         let Some(mut annot) = concrete.into_dict() else {
@@ -367,6 +374,44 @@ mod tests {
         assert!(
             matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 7),
             "remapped /P 7 must survive the duplicate target; dedup guard prevents re-drop",
+        );
+    }
+
+    #[test]
+    fn distinct_starts_to_same_terminal_deduped_non_identity() {
+        // Two DISTINCT start refs reach the same annotation: a direct one (30)
+        // and a holder chain (40 -> 30). With a NON-identity page remap (3 -> 7),
+        // the terminal-ref dedup is load-bearing. Pass for start 30 remaps /P
+        // 3 -> 7; the start-40 pass resolves to the already-processed terminal 30
+        // and must be skipped. Without the terminal dedup, the start-40 pass
+        // re-reads the remapped /P 7, finds no surviving entry keyed by 7, and
+        // would erroneously DROP /P.
+        let mut objs = base();
+        objs.insert(
+            7,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+        objs.insert(
+            30,
+            "<< /Type /Annot /Subtype /Text /P 3 0 R /Rect [0 0 10 10] >>".into(),
+        );
+        objs.insert(40, "30 0 R".into());
+        let mut pdf = open(&objs);
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(7, 0)]);
+        let result = RebuildResult {
+            new_kids: vec![ObjectRef::new(7, 0)],
+            ref_map,
+        };
+        drop_objr_obj_annot_dangling_p(
+            &mut pdf,
+            &result,
+            &[ObjectRef::new(30, 0), ObjectRef::new(40, 0)],
+        )
+        .expect("drop");
+        assert!(
+            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 7),
+            "remapped /P 7 must survive a distinct start reaching the same terminal",
         );
     }
 

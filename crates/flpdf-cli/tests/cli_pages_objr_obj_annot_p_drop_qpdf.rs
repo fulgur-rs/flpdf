@@ -43,11 +43,12 @@ fn qpdf_available() -> bool {
         return false;
     }
     match Shell::new(QPDF).arg("--version").output() {
-        Ok(out) => {
+        Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             stdout.lines().next().map(str::trim)
                 == Some(&format!("qpdf version {EXPECTED_QPDF_VERSION}"))
         }
+        Ok(_) => false,
         Err(_) => false,
     }
 }
