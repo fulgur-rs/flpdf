@@ -179,6 +179,14 @@ fn three_page_linearized_structurally_byte_identical_to_qpdf() {
     assert_linearize_structurally_byte_identical("three-page.pdf", "three-page");
 }
 
+#[test]
+fn lone_flate_l9_linearized_structurally_byte_identical_to_qpdf() {
+    // Lone /FlateDecode (level 9) preserved verbatim on the linearized path. The
+    // structural comparison includes the stream bytes (only /ID[1] is masked), so
+    // it verifies preservation; /ID[1] for a new fixture is a separate divergence.
+    assert_linearize_structurally_byte_identical("lone-flate-l9.pdf", "lone-flate-l9");
+}
+
 // --------------------------------------------------------------------------
 // Body content-stream recompression parity (flpdf-9hc.13.10, divergence A).
 //
