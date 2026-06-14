@@ -23,13 +23,6 @@
 //! `QUtil::double_to_string` (`%.5f` with trailing zeros and a trailing `.`
 //! stripped).
 
-// The per-page apply entry point and its helpers are consumed by the
-// overlay/underlay page-range mapping and CLI layers, which are not yet
-// implemented. Until those call sites land, allow the unused-code lint at the
-// module level (the public functions are exercised by unit tests here and the
-// feature-gated byte-comparison test).
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -42,7 +35,7 @@ use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
 /// destination page's own content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OverlayKind {
+pub enum OverlayKind {
     /// Drawn beneath the destination page content (before `/Fx0`).
     Underlay,
     /// Drawn above the destination page content (after `/Fx0`).
@@ -365,6 +358,9 @@ where
 ///
 /// Propagates any error from [`spec_page_sources`], [`page_ref_for`], or
 /// [`apply_overlays_to_page`].
+// Single-spec convenience wrapper used only by the feature-gated byte gate;
+// the CLI and `apply_overlay_specs` map specs directly via `spec_page_sources`.
+#[allow(dead_code)]
 fn apply_overlay_spec<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
@@ -385,7 +381,7 @@ where
 /// A single overlay/underlay specification: a source document, its kind, and its
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.
-pub(crate) struct OverlaySpec<RS: Read + Seek> {
+pub struct OverlaySpec<RS: Read + Seek> {
     /// The source document supplying the overlay/underlay pages.
     pub source: Pdf<RS>,
     /// Whether the source is drawn beneath or above the destination content.
@@ -444,26 +440,28 @@ fn apply_aggregated_sources<R: Read + Seek>(
 /// `QPDFJob::doUnderOverlay` handling of several `--overlay`/`--underlay` groups
 /// (qpdf 11.9.0).
 ///
-/// Each spec is mapped independently by [`spec_page_sources`] (its own page
-/// mapping and its own single cross-document copy, since each spec's `source` is
-/// a separate document). The per-destination-page sources from all specs are then
-/// aggregated **in declaration order** and each affected destination page is
-/// patched by [`apply_overlays_to_page`] exactly once. Within a page,
-/// `apply_overlays_to_page` groups by kind (underlays before overlays) while
-/// preserving declaration order inside each kind, so the resulting `/Fx1…/FxN`
-/// naming and draw order match qpdf: underlays (across specs, declaration order),
-/// then `/Fx0` (the page), then overlays (across specs, declaration order).
+/// Each [`OverlaySpec`] is mapped independently against `dest`: its `from`/`to`/
+/// `repeat` ranges select the source-to-destination page pairing, and each spec's
+/// source pages are imported into `dest` as Form XObjects in a single
+/// cross-document copy (a source page used on several destination pages is
+/// imported once and shared). The per-destination-page sources from all specs are
+/// then aggregated **in declaration order** and each affected destination page is
+/// rewritten exactly once: the page itself becomes Form XObject `/Fx0`, and the
+/// sources are named `/Fx1…/FxN` and drawn in qpdf order — underlays (across
+/// specs, declaration order), then `/Fx0` (the page), then overlays (across specs,
+/// declaration order).
 ///
-/// Destination pages not selected by any spec are left untouched.
+/// Destination pages not selected by any spec are left untouched. The specs'
+/// source documents are taken by `&mut` because importing reads (and may seek)
+/// them.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`spec_page_sources`] or [`apply_aggregated_sources`]
-/// (page-range resolution, cross-document copy, or per-page patching).
-pub(crate) fn apply_overlay_specs<RS, RT>(
-    dest: &mut Pdf<RT>,
-    specs: &mut [OverlaySpec<RS>],
-) -> Result<()>
+/// - [`Error::Unsupported`] when a page number resolves outside its document, a
+///   page lacks a usable placement box, or the object-number space is exhausted.
+/// - Any error propagated from page-range resolution, the cross-document copy, or
+///   [`Pdf::resolve`].
+pub fn apply_overlay_specs<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
 where
     RS: Read + Seek,
     RT: Read + Seek,
