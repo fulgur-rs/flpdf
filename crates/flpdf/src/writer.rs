@@ -2230,6 +2230,32 @@ pub(crate) fn compute_deterministic_id(
     (id0, id1)
 }
 
+/// Direct-write qpdf's deterministic `/ID` array value INLINE at the current
+/// output position, computing it from the bytes written so far.
+///
+/// Mirrors `QPDFWriter::generateID`: push `[`, MD5-digest the bytes written so
+/// far (inclusive of the `[`, the range [`compute_deterministic_id`] expects),
+/// compute the two-level identifier, then write `<id0_hex><id1_hex>]`. This
+/// replaces the placeholder-then-byte-search scheme on the flat write paths, so
+/// a crafted placeholder-shaped byte run elsewhere can never be mistaken for the
+/// real `/ID`. The emitted bytes are identical to
+/// [`write_deterministic_id_array`] for the same computed id.
+pub(crate) fn write_deterministic_id_inline(
+    out: &mut Vec<u8>,
+    info_suffix: &[u8],
+    source_id0: Option<[u8; 16]>,
+) {
+    out.push(b'[');
+    let id_array_offset = out.len() - 1; // index of the just-pushed `[`
+    let (id0, id1) = compute_deterministic_id(out, id_array_offset, info_suffix, source_id0);
+    for id in [&id0, &id1] {
+        out.push(b'<');
+        push_hex_lower(out, id);
+        out.push(b'>');
+    }
+    out.push(b']');
+}
+
 /// Overwrite the deterministic `/ID` placeholder in `bytes` with the final
 /// two-level qpdf identifier, in place.
 ///
@@ -4322,6 +4348,72 @@ mod tests {
         assert_eq!(
             a.1, d.1,
             "truncating at the NUL must equal hashing the pre-NUL bytes alone"
+        );
+    }
+
+    #[test]
+    fn write_deterministic_id_inline_matches_placeholder_then_patch() {
+        // Inline direct-write must equal the legacy placeholder-then-patch result
+        // for an identical prefix: same digest range (inclusive of `[`), same id.
+        let prefix =
+            b"%PDF-1.7\n1 0 obj<</X 1>>endobj\ntrailer << /Size 4 /Root 1 0 R /ID ".to_vec();
+
+        let mut inline = prefix.clone();
+        write_deterministic_id_inline(&mut inline, b"", None);
+
+        // Legacy path: place the all-zero placeholder, then compute over [..='[']
+        // (id_array_offset is the offset of the placeholder's opening `[`).
+        let id_array_offset = prefix.len();
+        let mut legacy_buf = prefix.clone();
+        write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
+        let (id0, id1) = compute_deterministic_id(&legacy_buf, id_array_offset, b"", None);
+        let mut expect = prefix.clone();
+        write_deterministic_id_array(&mut expect, &id0, &id1);
+
+        assert_eq!(
+            inline, expect,
+            "inline direct-write must equal placeholder+patch output"
+        );
+        // And it must NOT be the all-zero placeholder.
+        let mut placeholder = prefix.clone();
+        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
+        assert_ne!(
+            inline, placeholder,
+            "inline must write the real id, not the placeholder"
+        );
+    }
+
+    #[test]
+    fn write_deterministic_id_inline_preserves_source_permanent_id() {
+        // With a source permanent identifier supplied, /ID[0] (permanent) must
+        // equal that source id and /ID[1] (changing) is the two-level digest, so
+        // the inline write matches the placeholder-then-patch bytes for the same
+        // computed id. Mirrors the full-buffer equivalence of the prior test.
+        let prefix =
+            b"%PDF-1.7\n1 0 obj<</X 1>>endobj\ntrailer << /Size 4 /Root 1 0 R /ID ".to_vec();
+        let src0 = [0xAAu8; 16];
+
+        let id_array_offset = prefix.len();
+        let mut legacy_buf = prefix.clone();
+        write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
+        let (id0, id1) = compute_deterministic_id(&legacy_buf, id_array_offset, b"", Some(src0));
+        let mut expect = prefix.clone();
+        write_deterministic_id_array(&mut expect, &src0, &id1);
+
+        let mut inline = prefix.clone();
+        write_deterministic_id_inline(&mut inline, b"", Some(src0));
+
+        assert_eq!(
+            inline, expect,
+            "inline write with a source id must equal placeholder+patch output"
+        );
+        assert_eq!(
+            id0, src0,
+            "/ID[0] must be the supplied permanent identifier"
+        );
+        assert_ne!(
+            id0, id1,
+            "permanent and changing identifiers must differ in general"
         );
     }
 
