@@ -166,19 +166,6 @@ impl ObjStmLayout {
         })
     }
 
-    /// The flat batch order (Part-3 then Part-4) fed to
-    /// [`RenumberMap::place_objstm_members_per_half`].
-    fn flat_batches(
-        batch_plan: &crate::linearization::plan::ObjStmBatchPlan,
-    ) -> Vec<Vec<ObjectRef>> {
-        batch_plan
-            .part3_batches
-            .iter()
-            .chain(&batch_plan.part4_batches)
-            .cloned()
-            .collect()
-    }
-
     /// Build the layout from an already-resolved batch plan, mapping every
     /// member + container through the **placed** `renumber` map.
     ///
@@ -1600,23 +1587,31 @@ fn do_write_pass<R: Read + Seek>(
         0..0
     };
 
-    // Catalog (qpdf `lc_root`).  On the classic (non-ObjStm) path qpdf emits
-    // the document catalog at the very start of the first-page section —
-    // physically before the primary hint stream and the page objects — so the
-    // first-page region is numbered in ascending order (Catalog, Hint, Page,
-    // Resources, ...).  Emitting it here (rather than in the Part-5 remaining
-    // body after /E) is what aligns flpdf's physical layout with qpdf's.  The
-    // ObjStm path keeps the catalog in the Part-4 body (its split-xref layout
-    // relocates the tail differently), so only the classic path moves it.
+    // Catalog (qpdf `lc_root`).  qpdf emits the document catalog at the very
+    // start of the first-page section — physically before the primary hint
+    // stream and the page objects — so the first-page region is numbered in
+    // ascending order (Catalog, Hint, Page, Resources, ...).  This holds
+    // whenever the catalog is a *standalone* object: on the classic path, and
+    // on the ObjStm path under the per-half compressed-last numbering the
+    // catalog is a first-half standalone object (qpdf keeps it uncompressed),
+    // so its bytes must land in the first-page section before /E to match its
+    // first-half object number.  When the catalog is instead an ObjStm *member*
+    // (the single-page fallback, where it joins a second-half Part-4 container),
+    // it must NOT be emitted here — its bytes live inside that container, after
+    // /E.  Emitting it early (rather than in the Part-5 remaining body after /E)
+    // is what aligns flpdf's physical layout with qpdf's.
+    let catalog_is_member = plan
+        .root_ref
+        .is_some_and(|c| objstm_layout.member_to_container.contains_key(&c));
     let mut catalog_emitted_early = false;
-    if objstm_layout.is_empty() {
-        if let Some(catalog_orig) = plan.root_ref {
+    if let Some(catalog_orig) = plan.root_ref {
+        if !catalog_is_member {
             let object = pdf.resolve_borrowed(catalog_orig)?;
             let renumbered = renumber_object(object, 0, renumber)?;
             let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
             xref_offsets.insert(catalog_new_ref.number, offset);
             catalog_emitted_early = true;
-        } // cov:ignore: llvm-cov attributes 0 to this `if let` closing brace; the block body (catalog emit) runs and is covered above.
+        }
     }
 
     // Hint stream object.
@@ -2052,9 +2047,15 @@ pub fn write_linearized<R: Read + Seek>(
     // unchanged.
     // ------------------------------------------------------------------
     let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
-    let flat_batches = ObjStmLayout::flat_batches(&resolved_batch_plan);
     let mut local_renumber = renumber.clone();
-    let relocation = local_renumber.place_objstm_members_per_half(&flat_batches);
+    // Part-3 batches are numbered last within the FIRST half (qpdf packs the
+    // first-page shared dicts + /Pages tree + /Info there); Part-4 batches last
+    // within the SECOND half.  Passing them separately lets the renumber place
+    // each container + members in the correct half.
+    let relocation = local_renumber.place_objstm_members_per_half(
+        &resolved_batch_plan.part3_batches,
+        &resolved_batch_plan.part4_batches,
+    );
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;
 
@@ -2132,8 +2133,10 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Build initial placeholder hint tables (all lengths = 0).
     // ------------------------------------------------------------------
-    let po_table_initial = PageOffsetHintTable::from_plan(plan, renumber);
-    let so_table_initial = SharedObjectHintTable::from_plan(plan, renumber);
+    let po_table_initial =
+        PageOffsetHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+    let so_table_initial =
+        SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
     let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial)?;
     let mut current_hint_compressed = hint_bytes_initial.compressed;
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
@@ -2349,8 +2352,10 @@ pub fn write_linearized<R: Read + Seek>(
         // ------------------------------------------------------------------
         // Patch hint tables.
         // ------------------------------------------------------------------
-        let mut po_table = PageOffsetHintTable::from_plan(plan, renumber);
-        let mut so_table = SharedObjectHintTable::from_plan(plan, renumber);
+        let mut po_table =
+            PageOffsetHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+        let mut so_table =
+            SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
 
         // location_of_first_page = byte offset of the hint stream object itself.
         //
@@ -2409,42 +2414,59 @@ pub fn write_linearized<R: Read + Seek>(
             // a hint table with `least_length = 0` / `header.location = 0` if
             // we substituted zeros.  Bubble Err so the writer fails loudly
             // and the caller can surface the broken plan.
-            let shared_section_lens: Vec<u64> = plan
-                .shared_hints
+            // Iterate the FOLDED shared list (the same list the hint tables are
+            // built from): first-page ObjStm members are folded into a single
+            // container entry whose byte length is the container object's own
+            // length.  A folded container entry carries the container's *new*
+            // object number directly (see
+            // `LinearizationPlan::canonical_shared_hints`) and has NO original
+            // mapping in the renumber map; every other entry carries an original
+            // ref that resolves through the renumber map.  We discriminate by
+            // that resolution (`new_for_original` is `None` only for the
+            // synthetic container ref), so a real original ref whose number
+            // happens to coincide with a container's new number is never
+            // mistaken for a container.
+            let folded_shared = plan.canonical_shared_hints(&objstm_layout.member_to_container);
+            let first_half_container_numbers: std::collections::BTreeSet<u32> = objstm_layout
+                .part3
                 .iter()
-                .map(|h| -> Result<u64> {
-                    // Shared objects packed into an ObjStm have no standalone
-                    // bytes — they are serialised inside their container.  We
-                    // attribute 0 to such members here: it is a known
-                    // approximation of the Annex F.4 shared-object length
-                    // field, which qpdf validates leniently (the contained
-                    // objects are still reachable via the type-2 xref and the
-                    // container's own bytes are accounted for in the page
-                    // section length).  The strict missing-entry error is
-                    // still raised for *non-member* objects, where an absent
-                    // probe length really does signal a planner / renumber
-                    // or probe-coverage bug.
-                    if objstm_layout
-                        .member_to_container
-                        .contains_key(&h.object_ref)
-                    {
-                        return Ok(0);
-                    }
-                    let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "shared hint object {} has no renumber entry",
-                            h.object_ref
-                        ))
-                    })?;
-                    let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "shared hint object {} (new #{}) has no probed byte length",
-                            h.object_ref, new_ref.number
-                        ))
-                    })?;
-                    Ok(len as u64)
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .map(|c| c.container_new_num)
+                .collect();
+            let shared_section_lens: Vec<u64> =
+                folded_shared
+                    .iter()
+                    .map(|h| -> Result<u64> {
+                        // Folded container entry: synthetic ref (no original
+                        // mapping) whose number is a first-half container.  Use the
+                        // container object's own byte length.
+                        if renumber.new_for_original(h.object_ref).is_none()
+                            && first_half_container_numbers.contains(&h.object_ref.number)
+                        {
+                            let len = byte_lengths.get(&h.object_ref.number).copied().ok_or_else(
+                                || {
+                                    crate::Error::Unsupported(format!(
+                                        "shared hint container (new #{}) has no probed byte length",
+                                        h.object_ref.number
+                                    ))
+                                },
+                            )?;
+                            return Ok(len as u64);
+                        }
+                        let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "shared hint object {} has no renumber entry",
+                                h.object_ref
+                            ))
+                        })?;
+                        let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "shared hint object {} (new #{}) has no probed byte length",
+                                h.object_ref, new_ref.number
+                            ))
+                        })?;
+                        Ok(len as u64)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
             let least = shared_section_lens.iter().copied().min().unwrap_or(0);
             let max = shared_section_lens.iter().copied().max().unwrap_or(0);
@@ -2536,12 +2558,11 @@ pub fn write_linearized<R: Read + Seek>(
             // it does not match Annex F.4.5 / qpdf's HSharedObjectEntry layout
             // and was previously emitting an extra 32 bits per entry that
             // qpdf misinterpreted as the next entry's length delta).
-            // `nobjects_minus_one` stays at 0 from `from_plan`.
-            for (i, _hint) in plan.shared_hints.iter().enumerate() {
-                if i < so_table.objects.len() {
-                    so_table.objects[i].length_minus_least =
-                        (shared_section_lens[i].saturating_sub(least)) as u32;
-                }
+            // `nobjects_minus_one` stays at 0 from `from_plan`.  `so_table.objects`
+            // and `shared_section_lens` are both built from the folded shared
+            // list, so zipping keeps the per-object length deltas aligned.
+            for (obj, &len) in so_table.objects.iter_mut().zip(&shared_section_lens) {
+                obj.length_minus_least = (len.saturating_sub(least)) as u32;
             }
         }
 

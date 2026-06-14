@@ -45,6 +45,7 @@
 
 use super::plan::LinearizationPlan;
 use super::renumber::RenumberMap;
+use crate::ObjectRef;
 
 // ---------------------------------------------------------------------------
 // Header
@@ -209,8 +210,16 @@ impl SharedObjectHintTable {
     /// must construct consistently.  Silently writing
     /// `first_object_number = 0` would emit a header pointing at PDF
     /// object 0 (the free-list head), which is invalid.
-    pub fn from_plan(plan: &LinearizationPlan, renumber: &RenumberMap) -> Self {
-        let shared_count = plan.shared_hints.len() as u32;
+    pub fn from_plan(
+        plan: &LinearizationPlan,
+        renumber: &RenumberMap,
+        member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+    ) -> Self {
+        // Fold first-page ObjStm members into their container (one shared entry
+        // per container) so the table matches qpdf's positional shared list.
+        // With no ObjStm packing this equals `plan.shared_hints`.
+        let shared_hints = plan.canonical_shared_hints(member_to_container);
+        let shared_count = shared_hints.len() as u32;
 
         // ------------------------------------------------------------------
         // Degenerate case: no shared objects.
@@ -295,11 +304,15 @@ impl SharedObjectHintTable {
         // file layout and causing "in computed list but not hint table"
         // warnings for those objects.
         //
-        // `first_page_entries` = |part2| + |part3| (objects in [start, /E)).
-        // The remainder (section_entries - first_page_entries) are in
-        // the "end of file section" (Part 8 in qpdf's internal terminology).
+        // `first_page_entries` = the folded shared entries physically in the
+        // first-page section (Part-2 + Part-3, with packed Part-3 members folded
+        // into their first-half container).  The remainder
+        // (section_entries - first_page_entries) are the Part-8 (after-/E)
+        // shared objects.  Computing it as `shared_count - |part8|` keeps the
+        // count consistent with the folded list regardless of ObjStm packing.
         // ------------------------------------------------------------------
-        let first_page_entries = (plan.part2_objects.len() + plan.part3_objects.len()) as u32;
+        let first_page_entries =
+            shared_count.saturating_sub(plan.part4_other_pages_shared.len() as u32);
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
@@ -339,12 +352,12 @@ impl SharedObjectHintTable {
         // ------------------------------------------------------------------
         // Step 5: build per-shared-object entries.
         //
-        // Entries are in plan.shared_hints order (= Part-3 order).
+        // Entries are in folded `shared_hints` order (Part-2, then Part-3 with
+        // packed members folded into their container, then Part-8).
         // All byte-dependent fields are 0 (placeholder).
         // signature_present is always false; signature is always None.
         // ------------------------------------------------------------------
-        let objects: Vec<SharedObjectEntry> = plan
-            .shared_hints
+        let objects: Vec<SharedObjectEntry> = shared_hints
             .iter()
             .map(|_hint| SharedObjectEntry {
                 length_minus_least: 0, // placeholder — populated by writer
@@ -527,7 +540,7 @@ mod tests {
     fn degenerate_groups_and_objects_are_empty() {
         let plan = single_page_no_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert!(
             table.groups.is_empty(),
@@ -543,7 +556,7 @@ mod tests {
     fn degenerate_header_all_zero() {
         let plan = single_page_no_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(table.header.first_object_number, 0);
         assert_eq!(table.header.location, 0);
@@ -562,7 +575,7 @@ mod tests {
     fn two_page_section_entries_equals_shared_hint_count() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(
             table.header.section_entries, 4,
@@ -574,7 +587,7 @@ mod tests {
     fn two_page_first_page_entries_equals_section_entries() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // All shared objects are in the first-page section (before /E).
         // first_page_entries must equal section_entries so qpdf doesn't
@@ -589,7 +602,7 @@ mod tests {
     fn two_page_first_object_number_is_zero_when_no_part8() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // When part4_other_pages_shared is empty (no Part-8 shared objects),
         // first_object_number must be 0 per ISO 32000-1 Implementation Note 131:
@@ -606,7 +619,7 @@ mod tests {
     fn two_page_bits_group_object_count() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // One object per group (we never group multiple shared objects
         // together), so the greatest `nobjects_minus_one` across groups is
@@ -618,7 +631,7 @@ mod tests {
     fn two_page_groups_one_per_shared_object() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(
             table.groups.len(),
@@ -638,7 +651,7 @@ mod tests {
     fn two_page_objects_count_matches_shared_hints() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(
             table.objects.len(),
@@ -651,7 +664,7 @@ mod tests {
     fn two_page_signature_always_absent() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         for entry in &table.objects {
             assert!(
@@ -666,7 +679,7 @@ mod tests {
     fn two_page_placeholder_fields_are_zero() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(table.header.location, 0);
         assert_eq!(table.header.least_length, 0);
@@ -685,7 +698,7 @@ mod tests {
     fn partial_first_page_section_entries_is_four() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(
             table.header.section_entries, 4,
@@ -697,7 +710,7 @@ mod tests {
     fn partial_first_page_first_page_entries_equals_section_entries() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // All shared objects (4 = 1 part2 + 3 part3) are physically in the first-page section.
         // first_page_entries must equal section_entries = 4 so that qpdf
@@ -712,7 +725,7 @@ mod tests {
     fn partial_first_page_groups_one_per_shared_object() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(
             table.groups.len(),
@@ -728,7 +741,7 @@ mod tests {
     fn partial_first_page_bits_group_object_count() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // 1-object-per-group model — see two_page_bits_group_object_count.
         assert_eq!(table.header.bits_group_object_count, 0);
@@ -738,7 +751,7 @@ mod tests {
     fn partial_first_page_first_object_number_is_zero_when_no_part8() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // Two-page plan with 3 part3 objects but no part4_other_pages_shared.
         // first_object_number must be 0 — value is meaningless when
@@ -754,7 +767,7 @@ mod tests {
     fn partial_first_page_objects_count_is_three() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(table.objects.len(), 4);
     }
@@ -829,7 +842,7 @@ mod tests {
     fn part8_shared_first_page_entries_less_than_section_entries() {
         let plan = two_page_with_part8_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // first_page_entries = |part2| + |part3| = 1 + 1 = 2
         // section_entries = |shared_hints| = 4
@@ -854,7 +867,7 @@ mod tests {
     fn part8_shared_first_object_number_is_new_number_of_part8_first() {
         let plan = two_page_with_part8_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // part4_other_pages_shared[0] = 9 0 R.
         // first_object_number must point to its renumbered slot.
@@ -873,7 +886,7 @@ mod tests {
     fn part8_shared_groups_count_equals_total_shared_hints() {
         let plan = two_page_with_part8_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         assert_eq!(
             table.groups.len(),
@@ -915,7 +928,7 @@ mod tests {
     fn part8_shared_from_plan_returns_member_renumber_slot_before_objstm_patch() {
         let plan = two_page_with_part8_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // from_plan: member's renumber slot (before writer patch)
         let member_slot = renumber
@@ -938,7 +951,7 @@ mod tests {
     fn part8_shared_objstm_patch_uses_container_num_not_member_slot() {
         let plan = two_page_with_part8_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let mut table = SharedObjectHintTable::from_plan(&plan, &renumber);
+        let mut table = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
 
         // Simulate the writer's ObjStm-aware patch: container numbers are
         // allocated above the RenumberMap range (renumber.len() + 1, +2 …).
