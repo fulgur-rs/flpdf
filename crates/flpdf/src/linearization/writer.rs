@@ -1495,6 +1495,14 @@ fn do_write_pass<R: Read + Seek>(
         if objstm_layout.member_to_container.contains_key(original_ref) {
             continue;
         }
+        // The catalog is emitted early in the first-page section (classic path).
+        // If it is also reachable from the first-page closure (e.g. a page or
+        // annotation references back to it), it can appear in part2_objects;
+        // skip it here so it is not emitted a second time (which would leave a
+        // duplicate `N 0 obj` and point xref_offsets at the wrong copy).
+        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
+            continue;
+        }
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
             return Err(crate::Error::Unsupported(format!(
                 "part2 object {} has no renumber entry",
@@ -1516,6 +1524,12 @@ fn do_write_pass<R: Read + Seek>(
     // plain indirect; their container is emitted below, still before /E.
     for original_ref in &plan.part3_objects {
         if objstm_layout.member_to_container.contains_key(original_ref) {
+            continue;
+        }
+        // Skip the catalog if it was emitted early (see the part2 loop above):
+        // a catalog reachable from the first-page closure could otherwise be
+        // emitted twice.
+        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
             continue;
         }
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
@@ -2947,6 +2961,159 @@ mod tests {
         let doc = build_linearized();
         Pdf::open(Cursor::new(doc.bytes))
             .expect("linearized output must be parseable by Pdf::open");
+    }
+
+    // -----------------------------------------------------------------------
+    // 15b. A catalog reachable from the first-page closure is emitted exactly
+    //      once. The classic path emits the catalog early in the first-page
+    //      section; if the catalog is also pulled into part2/part3 (e.g. a page
+    //      references back to it), the part2/part3 loops must skip it so it is
+    //      not written twice (duplicate `N 0 obj`, corrupt xref_offsets).
+    // -----------------------------------------------------------------------
+    fn catalog_backref_pdf_bytes() -> Vec<u8> {
+        // The page carries a custom `/X 1 0 R` back-reference to the catalog,
+        // so the first-page closure reaches the catalog and lands it in
+        // part2_objects.
+        let content = b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n";
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0usize; 6];
+        offs[1] = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offs[2] = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offs[3] = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /X 1 0 R >>\nendobj\n",
+        );
+        offs[4] = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offs[5] = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn catalog_reachable_from_first_page_emitted_once() {
+        let mut pdf =
+            Pdf::open(Cursor::new(catalog_backref_pdf_bytes())).expect("backref PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        // Precondition: the `/X` back-reference puts the catalog (obj 1) into the
+        // single page's PRIVATE first-page set (part2) — the case the part2 loop
+        // skip guards against double-emitting.
+        assert!(
+            plan.part2_objects.contains(&ObjectRef::new(1, 0)),
+            "test precondition: the catalog must land in part2 (page-0 private)"
+        );
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut pdf2 =
+            Pdf::open(Cursor::new(catalog_backref_pdf_bytes())).expect("backref PDF must parse");
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+            .expect("write_linearized");
+        doc.back_patch().expect("back_patch");
+        // The catalog must be emitted exactly once (`/Type /Catalog` is unique
+        // to the catalog dict); a double emission would make it appear twice.
+        let needle = b"/Type /Catalog";
+        let count = doc
+            .bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        assert_eq!(count, 1, "catalog must be emitted exactly once, found {count}");
+        // The output must still be a well-formed, re-parseable PDF.
+        Pdf::open(Cursor::new(doc.bytes)).expect("output must be parseable");
+    }
+
+    /// Two pages that BOTH back-reference the catalog (obj 1), so the catalog is
+    /// reachable from more than one page and lands in the first-page SHARED set
+    /// (part3) rather than the page-0 private set. Exercises the part3 loop's
+    /// catalog skip (the part2 case is covered above).
+    fn catalog_backref_two_page_pdf_bytes() -> Vec<u8> {
+        let content = b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n";
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0usize; 8];
+        offs[1] = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offs[2] = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>\nendobj\n");
+        offs[3] = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /X 1 0 R >>\nendobj\n",
+        );
+        offs[4] = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offs[5] = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+        offs[6] = pdf.len();
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 7 0 R /Resources << /Font << /F1 5 0 R >> >> /X 1 0 R >>\nendobj\n",
+        );
+        offs[7] = pdf.len();
+        pdf.extend_from_slice(
+            format!("7 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn shared_catalog_in_part3_emitted_once() {
+        let mut pdf = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
+            .expect("two-page backref PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        // Precondition: a catalog reachable from BOTH pages is shared, so it
+        // lands in part3 (first-page shared) — exercising the part3 loop skip.
+        assert!(
+            plan.part3_objects.contains(&ObjectRef::new(1, 0)),
+            "test precondition: the shared catalog must land in part3"
+        );
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut pdf2 = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
+            .expect("two-page backref PDF must parse");
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+            .expect("write_linearized");
+        doc.back_patch().expect("back_patch");
+        let needle = b"/Type /Catalog";
+        let count = doc
+            .bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        assert_eq!(count, 1, "shared catalog must be emitted exactly once, found {count}");
+        Pdf::open(Cursor::new(doc.bytes)).expect("output must be parseable");
     }
 
     // -------------------------------------------------------------------
