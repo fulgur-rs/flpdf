@@ -3124,6 +3124,168 @@ fn resolve_page_specs(
     Ok(out)
 }
 
+// ===========================================================================
+// --overlay / --underlay segment parser (flpdf-9hc.16.1)
+//
+// qpdf 11.9.0 grammar (--help=overlay-underlay):
+//   {--overlay|--underlay} [--file=]FILE [--password=PW]
+//       [--to=RANGE] [--from=RANGE] [--repeat=RANGE] --
+//
+// qpdf defaults (observed, NOT encoded here — deferral to .16.4):
+//   --from=1-z, --to=1-z, --repeat="" (no repeat; surplus dest pages blank).
+//   The task instruction note "default --repeat=z" contradicts qpdf observation
+//   and is intentionally NOT adopted. Unspecified options stay None here; the
+//   default interpretation is applied in .16.4.
+// ===========================================================================
+
+/// Whether a segment introduces overlay content (drawn on top) or underlay (below).
+// CLI wiring is in a later subtask (.16.6); allow dead_code until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverlayKind {
+    Overlay,
+    Underlay,
+}
+
+/// Parsed result of a single `--overlay … --` or `--underlay … --` segment.
+///
+/// Range strings (`from`, `to`, `repeat`) are raw qpdf page-range syntax;
+/// `None` means the option was absent. Default range semantics are applied
+/// by the caller during page-mapping.
+// CLI wiring is in a later subtask (.16.6); allow dead_code until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlaySpec {
+    kind: OverlayKind,
+    /// Path to the overlay/underlay source PDF.
+    file: String,
+    /// Password for the source PDF, if supplied via `--password=`.
+    password: Option<String>,
+    /// Raw `--from=` page-range string (source pages to cycle through).
+    from: Option<String>,
+    /// Raw `--to=` page-range string (destination pages to receive content).
+    to: Option<String>,
+    /// Raw `--repeat=` page-range string (source pages to repeat for surplus dest).
+    repeat: Option<String>,
+}
+
+/// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
+///
+/// Grammar: `[--file=]FILE [--password=PW] [--to=R] [--from=R] [--repeat=R]`
+///
+/// - `FILE` is mandatory (exactly one, either via `--file=PATH` or bare).
+/// - `--password=`, `--to=`, `--from=`, `--repeat=` are each optional; duplicates error.
+/// - Range values are validated via [`PageRange::parse`] (syntax only; defaults not applied).
+/// - Unknown `--xxx` tokens, duplicate files, or an empty token list all produce an error.
+///
+/// # Errors
+///
+/// Returns an error if the token slice is empty, a file is missing or duplicated,
+/// a range is syntactically invalid, a flag is duplicated, or an unknown `--` flag appears.
+// CLI wiring is in a later subtask (.16.6); allow dead_code until then.
+#[allow(dead_code)]
+fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<OverlaySpec> {
+    let flag = match kind {
+        OverlayKind::Overlay => "--overlay",
+        OverlayKind::Underlay => "--underlay",
+    };
+
+    if tokens.is_empty() {
+        return Err(format!("{flag}: no source file given in the segment").into());
+    }
+
+    let mut file: Option<String> = None;
+    let mut password: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut repeat: Option<String> = None;
+
+    for tok in tokens {
+        if let Some(path) = tok.strip_prefix("--file=") {
+            if file.is_some() {
+                return Err(format!("{flag}: duplicate file in segment").into());
+            }
+            file = Some(path.to_string());
+            continue;
+        }
+        if let Some(pw) = tok.strip_prefix("--password=") {
+            if file.is_none() {
+                return Err(format!(
+                    "{flag}: --password= must follow the source file in the segment"
+                )
+                .into());
+            }
+            if password.is_some() {
+                return Err(format!("{flag}: duplicate --password= in segment").into());
+            }
+            password = Some(pw.to_string());
+            continue;
+        }
+        if let Some(r) = tok.strip_prefix("--to=") {
+            if file.is_none() {
+                return Err(
+                    format!("{flag}: --to= must follow the source file in the segment").into(),
+                );
+            }
+            if to.is_some() {
+                return Err(format!("{flag}: duplicate --to= in segment").into());
+            }
+            PageRange::parse(r)
+                .map_err(|e| format!("{flag}: invalid --to= page range {r:?}: {e}"))?;
+            to = Some(r.to_string());
+            continue;
+        }
+        if let Some(r) = tok.strip_prefix("--from=") {
+            if file.is_none() {
+                return Err(
+                    format!("{flag}: --from= must follow the source file in the segment").into(),
+                );
+            }
+            if from.is_some() {
+                return Err(format!("{flag}: duplicate --from= in segment").into());
+            }
+            PageRange::parse(r)
+                .map_err(|e| format!("{flag}: invalid --from= page range {r:?}: {e}"))?;
+            from = Some(r.to_string());
+            continue;
+        }
+        if let Some(r) = tok.strip_prefix("--repeat=") {
+            if file.is_none() {
+                return Err(format!(
+                    "{flag}: --repeat= must follow the source file in the segment"
+                )
+                .into());
+            }
+            if repeat.is_some() {
+                return Err(format!("{flag}: duplicate --repeat= in segment").into());
+            }
+            PageRange::parse(r)
+                .map_err(|e| format!("{flag}: invalid --repeat= page range {r:?}: {e}"))?;
+            repeat = Some(r.to_string());
+            continue;
+        }
+        if tok.starts_with("--") {
+            return Err(format!("{flag}: unsupported token {tok:?} in segment").into());
+        }
+        // Bare (non-flag) token: must be the file path (exactly one allowed).
+        if file.is_some() {
+            return Err(format!("{flag}: duplicate file in segment").into());
+        }
+        file = Some(tok.clone());
+    }
+
+    let file = file.ok_or_else(|| format!("{flag}: no source file given in the segment"))?;
+
+    Ok(OverlaySpec {
+        kind,
+        file,
+        password,
+        from,
+        to,
+        repeat,
+    })
+}
+
 /// Parse `--collate` value: `n` or `i,j,k,...`. flpdf's [`collate`] supports a
 /// single chunk size `n`; the comma form is parsed but only the first value is
 /// honoured (a documented divergence — full per-input groups are out of
@@ -4567,4 +4729,244 @@ fn run_copy_attachments_from(
     let mut out = File::create(&output)?;
     write_pdf_with_options(&mut target, &mut out, &options)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- parse_overlay_segment ------------------------------------------
+
+    #[test]
+    fn overlay_bare_file() {
+        let spec = parse_overlay_segment(OverlayKind::Overlay, &strs(&["over.pdf"])).unwrap();
+        assert_eq!(
+            spec,
+            OverlaySpec {
+                kind: OverlayKind::Overlay,
+                file: "over.pdf".into(),
+                password: None,
+                from: None,
+                to: None,
+                repeat: None,
+            }
+        );
+    }
+
+    #[test]
+    fn underlay_bare_file() {
+        let spec = parse_overlay_segment(OverlayKind::Underlay, &strs(&["under.pdf"])).unwrap();
+        assert_eq!(spec.kind, OverlayKind::Underlay);
+        assert_eq!(spec.file, "under.pdf");
+    }
+
+    #[test]
+    fn overlay_file_flag_form() {
+        let spec =
+            parse_overlay_segment(OverlayKind::Overlay, &strs(&["--file=over.pdf"])).unwrap();
+        assert_eq!(spec.file, "over.pdf");
+        assert_eq!(spec.password, None);
+    }
+
+    #[test]
+    fn overlay_password() {
+        let spec = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["over.pdf", "--password=secret"]),
+        )
+        .unwrap();
+        assert_eq!(spec.file, "over.pdf");
+        assert_eq!(spec.password, Some("secret".into()));
+    }
+
+    #[test]
+    fn overlay_from_to_repeat() {
+        let spec = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["src.pdf", "--from=1-3", "--to=2-4", "--repeat=1"]),
+        )
+        .unwrap();
+        assert_eq!(spec.from, Some("1-3".into()));
+        assert_eq!(spec.to, Some("2-4".into()));
+        assert_eq!(spec.repeat, Some("1".into()));
+    }
+
+    #[test]
+    fn overlay_all_flags_via_file_flag() {
+        let spec = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&[
+                "--file=src.pdf",
+                "--password=pw",
+                "--to=1",
+                "--from=1-z",
+                "--repeat=z",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(spec.file, "src.pdf");
+        assert_eq!(spec.password, Some("pw".into()));
+        assert_eq!(spec.to, Some("1".into()));
+        assert_eq!(spec.from, Some("1-z".into()));
+        assert_eq!(spec.repeat, Some("z".into()));
+    }
+
+    #[test]
+    fn overlay_empty_tokens_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--overlay"), "got: {err}");
+        assert!(err.contains("no source file"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_missing_file_with_password_error() {
+        // --password= before any file token
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--password=pw"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--overlay"), "got: {err}");
+        assert!(err.contains("must follow"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_file_bare_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["a.pdf", "b.pdf"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate file"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_file_flag_error() {
+        let err = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["--file=a.pdf", "--file=b.pdf"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate file"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_file_mixed_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["a.pdf", "--file=b.pdf"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate file"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_to_error() {
+        let err = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["src.pdf", "--to=1", "--to=2"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate --to="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_from_error() {
+        let err = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["src.pdf", "--from=1", "--from=2"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate --from="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_repeat_error() {
+        let err = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["src.pdf", "--repeat=1", "--repeat=z"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate --repeat="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_unknown_flag_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["src.pdf", "--bogus=x"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--overlay"), "got: {err}");
+        assert!(err.contains("unsupported token"), "got: {err}");
+    }
+
+    #[test]
+    fn underlay_unknown_flag_error_prefix() {
+        let err = parse_overlay_segment(OverlayKind::Underlay, &strs(&["src.pdf", "--unknown"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--underlay"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_invalid_range_to_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["src.pdf", "--to=abc!"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid --to="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_invalid_range_from_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["src.pdf", "--from=abc!"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid --from="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_invalid_range_repeat_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["src.pdf", "--repeat=abc!"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid --repeat="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_option_before_file_to_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--to=1", "src.pdf"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must follow"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_option_before_file_from_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--from=1", "src.pdf"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must follow"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_option_before_file_repeat_error() {
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--repeat=1", "src.pdf"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must follow"), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_duplicate_password_error() {
+        let err = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["src.pdf", "--password=a", "--password=b"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate --password="), "got: {err}");
+    }
 }
