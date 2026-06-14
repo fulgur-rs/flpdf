@@ -293,17 +293,19 @@ fn spec_page_sources<RS, RT>(
     from: &PageRange,
     to: &PageRange,
     repeat: Option<&PageRange>,
+    n_dest: u32,
 ) -> Result<Vec<(u32, OverlaySource)>>
 where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    // Snapshot the source page list and the dest page count before mutating
-    // `dest`. The applied patches change page dictionaries in place but never
-    // reorder or remove page objects, so the 1-based page numbers stay valid.
+    // Snapshot the source page list before mutating `dest`. The applied patches
+    // change page dictionaries in place but never reorder or remove page
+    // objects, so the 1-based page numbers stay valid. `n_dest` is the
+    // destination page count, computed once by the caller (it does not change
+    // while sources are being mapped).
     let source_pages = page_refs(source)?;
     let n_source = u32_len(source_pages.len());
-    let n_dest = u32_len(page_refs(dest)?.len());
 
     let from_pages = from.resolve(n_source)?;
     let to_pages = to.resolve(n_dest)?;
@@ -375,7 +377,8 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    let sources = spec_page_sources(dest, source, kind, from, to, repeat)?;
+    let n_dest = u32_len(page_refs(dest)?.len());
+    let sources = spec_page_sources(dest, source, kind, from, to, repeat, n_dest)?;
     apply_aggregated_sources(dest, group_sources_by_dest_page(&sources))
 }
 
@@ -468,6 +471,10 @@ where
     // Map every spec first, collecting its per-dest-page sources in declaration
     // order. Each spec gets its own batch import into `dest` (separate documents
     // => one foreign→local copy per source doc).
+    // The dest page count is invariant while specs are mapped (sources are
+    // applied only after the loop), so query the page tree once up front
+    // instead of re-walking it per spec.
+    let n_dest = u32_len(page_refs(dest)?.len());
     let mut entries: Vec<(u32, OverlaySource)> = Vec::new();
     for spec in specs.iter_mut() {
         let sources = spec_page_sources(
@@ -477,6 +484,7 @@ where
             &spec.from,
             &spec.to,
             spec.repeat.as_ref(),
+            n_dest,
         )?;
         entries.extend(sources);
     }
