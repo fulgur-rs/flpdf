@@ -569,6 +569,14 @@ fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
 /// from the bytes written so far (the deterministic-`/ID` direct-write path).
 pub(crate) type TrailerIdWriter<'a> = &'a mut dyn FnMut(&mut Vec<u8>);
 
+/// Like [`TrailerIdWriter`] but with the borrow lifetime (`'r`) and the closure
+/// data lifetime (`'d`) decoupled, so the same `Option<&mut dyn FnMut>` can be
+/// reborrowed (`as_deref_mut`) and forwarded to more than one callee. The
+/// linearized writer emits `/ID` at two trailer sites in one pass, so it needs
+/// this two-lifetime form; the single-lifetime [`TrailerIdWriter`] suffices for
+/// the flat path's single trailer.
+pub(crate) type ReborrowableIdWriter<'r, 'd> = &'r mut (dyn FnMut(&mut Vec<u8>) + 'd);
+
 /// PDF dictionary, keyed by raw byte slices (PDF names are arbitrary byte strings).
 ///
 /// Backed by a `BTreeMap`, so iteration order is the lexicographic order of the keys —
