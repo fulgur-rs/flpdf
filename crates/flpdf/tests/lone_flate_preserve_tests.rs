@@ -105,3 +105,22 @@ fn uncompress_policy_decodes_lone_flate() {
         "Uncompress must emit decoded raw content, not preserved compressed bytes"
     );
 }
+
+#[test]
+fn recompress_flate_reencodes_lone_flate() {
+    let mut opts = base_opts();
+    opts.recompress_flate = true;
+    let out = plain_rewrite(opts);
+    let payload = largest_stream_payload(&out);
+    assert_ne!(
+        payload,
+        source_payload(),
+        "recompress_flate=true must re-encode the lone /FlateDecode stream"
+    );
+    // It must still be a single /FlateDecode (re-encoded), not raw bytes.
+    assert!(
+        out.windows(b"/Filter /FlateDecode".len())
+            .any(|w| w == b"/Filter /FlateDecode"),
+        "re-encoded stream must still declare a single /FlateDecode filter"
+    );
+}
