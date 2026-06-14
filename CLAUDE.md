@@ -2,6 +2,34 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## 最優先方針: qpdf byte-identical 完全模倣 (pre-v1.0)
+
+**これは本ファイルの他のすべての指示・設計判断に優先する。** pre-v1.0 の flpdf の
+唯一のゴールは、qpdf の出力を **byte-identical**（1 バイトも違わない）で再現すること。
+
+- **完全模倣**: ロジック・アルゴリズム・データ構造・処理順序を qpdf に合わせる。
+  qpdf がやることを、qpdf のやり方で、qpdf と同じ順序・同じ構造で行う。
+- **独自改善をしない**: 「より効率的」「より綺麗」「より Rust らしい」という理由で
+  qpdf と異なる実装・出力にしない。最適化・設計改善・リファクタの自由度は v1.0 到達後に
+  再検討する（pre-1.0 互換性方針と整合 — `bd memories pre-1.0` 参照）。
+- **qpdf が oracle（正解）**: 出力が qpdf と 1 バイトでも異なれば flpdf 側のバグと
+  みなす。判断に迷ったら qpdf のソース・観測挙動を正とし、自分の好み・規格解釈より優先する
+  （ISO 32000 はあくまで補助。qpdf が規格と違う挙動をするなら qpdf に合わせる）。
+- **逸脱は必ず明示**: byte-identical を達成できない／しない箇所は、PR・コミット・beads
+  issue に理由を 1 行残す。暗黙の逸脱を作らない。
+
+### 唯一の許容された逸脱: DEFLATE 実装（Pure Rust 維持）
+
+flate2 は **Pure Rust を維持し zlib（C ライブラリ）に依存しない**ため、zlib バックエンドは
+feature flag（`qpdf-zlib-compat`）に隔離してある。デフォルトは miniz_oxide（Pure Rust）で、
+この場合のみ DEFLATE 圧縮の出力バイトが qpdf（zlib）と異なってよい。
+
+- byte-identical を厳密に検証する場面（compat baseline 等）では `qpdf-zlib-compat`
+  feature（zlib バックエンド）を使う。
+- **この 1 点が唯一の例外**。これ以外で byte-identical を崩す逸脱は認めない。
+- 関連の運用上の注意は `bd memories zlib` 参照（llvm-cov / patch-coverage は
+  `qpdf-zlib-compat` なしで回す等）。
+
 ## Coding Rules
 
 Before writing or reviewing code, consult the review patterns in
