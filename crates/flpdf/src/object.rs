@@ -564,6 +564,11 @@ fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
     out.push(b'>');
 }
 
+/// Callback that writes a trailer's `/ID` array value at the current output
+/// position, used by [`Dictionary::write_pdf_trailer`] to emit a value computed
+/// from the bytes written so far (the deterministic-`/ID` direct-write path).
+pub(crate) type TrailerIdWriter<'a> = &'a mut dyn FnMut(&mut Vec<u8>);
+
 /// PDF dictionary, keyed by raw byte slices (PDF names are arbitrary byte strings).
 ///
 /// Backed by a `BTreeMap`, so iteration order is the lexicographic order of the keys —
@@ -683,7 +688,15 @@ impl Dictionary {
     /// `qpdf --static-id` 11.9.0: `<< /Info .. /Root .. /Size N /ID [..] >>`.
     /// Layout otherwise matches [`write_pdf`](Self::write_pdf) (compact, one
     /// line). If `/ID` is absent the output is plain sorted order.
-    pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>) {
+    ///
+    /// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
+    /// (the `b" /ID "` key token is still emitted) instead of serializing the
+    /// dictionary's stored `/ID` value. This lets the caller compute the `/ID`
+    /// directly from the bytes written so far — used by the deterministic-`/ID`
+    /// writer to emit qpdf's content-derived identifier inline rather than via a
+    /// placeholder-then-patch step. The closure runs only when the `/ID` key is
+    /// present in the dictionary; if it is absent, `id_writer` is ignored.
+    pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>, id_writer: Option<TrailerIdWriter>) {
         out.extend_from_slice(b"<<");
         let mut id_value: Option<&Object> = None;
         for (key, value) in self.iter() {
@@ -698,7 +711,10 @@ impl Dictionary {
         }
         if let Some(value) = id_value {
             out.extend_from_slice(b" /ID ");
-            value.write_pdf(out);
+            match id_writer {
+                Some(write_id) => write_id(out),
+                None => value.write_pdf(out),
+            }
         }
         out.extend_from_slice(b" >>");
     }
@@ -849,7 +865,7 @@ mod stream_dict_order_tests {
         d.insert(b"Info", Object::reference(ObjectRef::new(2, 0)));
         d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
         let mut out = Vec::new();
-        d.write_pdf_trailer(&mut out);
+        d.write_pdf_trailer(&mut out, None);
         assert_eq!(
             out,
             b"<< /Info 2 0 R /Root 1 0 R /Size 8 /ID [ 1 2 ] >>".to_vec()
@@ -863,7 +879,7 @@ mod stream_dict_order_tests {
         d.insert(b"Size", Object::Integer(3));
         d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
         let mut out = Vec::new();
-        d.write_pdf_trailer(&mut out);
+        d.write_pdf_trailer(&mut out, None);
         assert_eq!(out, b"<< /Root 1 0 R /Size 3 >>".to_vec());
     }
 

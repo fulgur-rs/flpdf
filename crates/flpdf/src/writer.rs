@@ -3291,22 +3291,38 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 // extra leading newline) to match the qpdf reference.
                 write_qdf_trailer(&mut bytes, &trailer);
                 bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+                if options.deterministic_id {
+                    // The qdf trailer still emits the all-zero /ID placeholder,
+                    // so locate it and overwrite it with the content-derived
+                    // identifier in place.
+                    patch_deterministic_id(
+                        &mut bytes,
+                        trailer_region_start,
+                        &det_id_info_suffix,
+                        det_id_source_id0,
+                    );
+                }
             } else {
                 // qpdf classic trailer: the dict sits on the `trailer ` line
                 // (single space, not its own line) with keys sorted but /ID
                 // forced last — `trailer << /Info .. /Root .. /Size N /ID [..]
                 // >>` (verified against qpdf 11.9.0 static-id goldens).
                 bytes.extend_from_slice(b"trailer ");
-                trailer.write_pdf_trailer(&mut bytes);
+                if options.deterministic_id {
+                    // Direct-write the real /ID inline (computed from the bytes
+                    // written up to and including its opening `[`) instead of
+                    // emitting the placeholder and byte-searching for it later.
+                    // The bytes are identical to the placeholder-then-patch
+                    // result for the same computed id, so output stays
+                    // byte-for-byte equal to qpdf 11.9.0.
+                    let mut id_writer = |out: &mut Vec<u8>| {
+                        write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                    };
+                    trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+                } else {
+                    trailer.write_pdf_trailer(&mut bytes, None);
+                }
                 bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-            }
-            if options.deterministic_id {
-                patch_deterministic_id(
-                    &mut bytes,
-                    trailer_region_start,
-                    &det_id_info_suffix,
-                    det_id_source_id0,
-                );
             }
         }
 
@@ -4533,6 +4549,90 @@ mod tests {
             trailer_id_pair(&out).1,
             expected_changing_id(&out, b"").to_vec(),
             "/ID[1] must be the two-level deterministic digest"
+        );
+    }
+
+    #[test]
+    fn classic_trailer_deterministic_id_is_direct_written_no_placeholder() {
+        // The classic (non-qdf) xref-table trailer must DIRECT-WRITE the real
+        // deterministic /ID inline, never leaving the all-zero placeholder for a
+        // later byte-search patch. A clean fixture (no decoy keys) is used so the
+        // only 70-byte `[<0..><0..>]` run that could appear would be a leftover
+        // placeholder.
+        let src = build_det_id_source("/Info 3 0 R", &["3 0 obj\n<< /Title (Doc) >>\nendobj\n"]);
+        let out = write_det_id(&src);
+
+        // (a) No all-zero /ID placeholder survives anywhere in the output.
+        let mut placeholder = Vec::new();
+        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
+        assert_eq!(placeholder.len(), 70, "placeholder must be 70 bytes");
+        assert!(
+            out.windows(placeholder.len())
+                .all(|window| window != placeholder.as_slice()),
+            "the all-zero /ID placeholder must not appear — /ID is direct-written"
+        );
+
+        // (b) The /ID array is the real digest and is deterministic across runs.
+        let out2 = write_det_id(&src);
+        assert_eq!(
+            out, out2,
+            "classic-trailer deterministic-id output must be byte-stable"
+        );
+        let (id0, id1) = trailer_id_pair(&out);
+        assert_eq!(
+            id1,
+            expected_changing_id(&out, b" Doc").to_vec(),
+            "/ID[1] must be the two-level deterministic digest, not a placeholder"
+        );
+        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+        assert_ne!(
+            id1,
+            vec![0u8; 16],
+            "/ID[1] must not be the zero placeholder"
+        );
+    }
+
+    #[test]
+    fn qdf_trailer_deterministic_id_is_placeholder_patched_and_stable() {
+        // The qdf classic-table trailer still uses the placeholder-then-patch
+        // path (unchanged this task): it emits the all-zero /ID placeholder, then
+        // `patch_deterministic_id` overwrites it in place. Verify the patched /ID
+        // is the two-level digest and is byte-stable across runs.
+        let src = build_det_id_source("/Info 3 0 R", &["3 0 obj\n<< /Title (Doc) >>\nendobj\n"]);
+        let opts = WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            qdf: true,
+            ..WriteOptions::default()
+        };
+        let write = |f: &[u8]| {
+            let mut pdf = crate::Pdf::open_mem(f).expect("fixture must open");
+            let mut out = Vec::new();
+            write_pdf_with_options(&mut pdf, &mut out, &opts).expect("qdf deterministic write");
+            out
+        };
+        let o1 = write(&src);
+        let o2 = write(&src);
+        assert_eq!(o1, o2, "qdf deterministic-id output must be byte-stable");
+        // qdf forces an uncompressed classic xref table — confirm we exercised
+        // the Table-arm qdf branch (not the xref-stream form).
+        assert!(
+            o1.windows(b"trailer ".len()).any(|w| w == b"trailer "),
+            "qdf output must use a classic `trailer` (Table xref form)"
+        );
+
+        // The patched /ID must be the two-level digest, not the placeholder.
+        let (id0, id1) = trailer_id_pair(&o1);
+        assert_eq!(
+            id1,
+            expected_changing_id(&o1, b" Doc").to_vec(),
+            "qdf /ID[1] must be the two-level deterministic digest"
+        );
+        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+        assert_ne!(
+            id1,
+            vec![0u8; 16],
+            "/ID[1] must not be the zero placeholder"
         );
     }
 
