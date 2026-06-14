@@ -5,9 +5,14 @@
 //! source open + `flpdf::OverlaySpec` build (`build_overlay_specs`), the
 //! `run_rewrite` overlay-stacking step, and the write — and assert observable
 //! outcomes (exit status, page count, presence of the overlay XObject markers).
-//! Byte-identity to qpdf is verified separately and is currently blocked at the
-//! CLI level (see `cli_overlay_byte.rs` for the diagnosis); these tests guard
-//! the wiring against regression regardless of that blocker.
+//!
+//! Byte-identity to qpdf is proven at the library layer (the `overlay::byte_gate`
+//! tests in `crates/flpdf/src/overlay.rs`, run with `qpdf-zlib-compat`). The CLI
+//! binary's default output is intentionally not byte-identical to qpdf — the CLI
+//! emits `NewlineBeforeEndstream::Yes` framing whereas qpdf's default is `Never`,
+//! a pre-existing project-wide divergence documented in
+//! `tests/golden/compat-matrix.md` (CLI byte-equal "diverge for every row").
+//! These tests therefore assert wiring behavior, not output bytes.
 
 use std::path::{Path, PathBuf};
 
@@ -202,4 +207,51 @@ fn top_level_overlay_alias_succeeds() {
         .success();
     let bytes = std::fs::read(&out).unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("/Fx0"));
+}
+
+#[test]
+fn overlay_encrypted_source_with_correct_password_succeeds() {
+    // The source is AES-256 encrypted (user password "u"). The segment's
+    // --password= must be threaded to the source open so the page can be
+    // imported as the overlay XObject. (Output is not byte-compared here — see
+    // the module doc; byte-identity for a higher-version source is tracked
+    // separately as version-floor propagation.)
+    let enc = fixture("one-page-enc-u.pdf");
+    let bytes = run_overlay_ok("three-page.pdf", &["--overlay", &enc, "--password=u", "--"]);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("/Fx0"), "page must become /Fx0");
+    assert!(
+        text.contains("/Fx1"),
+        "decrypted source must import as /Fx1"
+    );
+}
+
+#[test]
+fn overlay_encrypted_source_with_wrong_password_fails() {
+    let enc = fixture("one-page-enc-u.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("o.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(fixture("three-page.pdf"))
+        .args(["--overlay", &enc, "--password=wrong", "--"])
+        .arg(out.to_str().unwrap())
+        .assert()
+        .failure();
+}
+
+#[test]
+fn overlay_encrypted_source_without_password_fails() {
+    let enc = fixture("one-page-enc-u.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("o.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(fixture("three-page.pdf"))
+        .args(["--overlay", &enc, "--"])
+        .arg(out.to_str().unwrap())
+        .assert()
+        .failure();
 }

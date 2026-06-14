@@ -18,13 +18,6 @@ name = "flpdf"
 path = "src/main.rs"
 doc = false
 
-[features]
-# Forward flpdf's classic-libz deflate backend so the CLI binary built by the
-# overlay byte-comparison tests produces output byte-identical to qpdf (which
-# links zlib). Default builds stay Pure Rust (miniz_oxide); see CLAUDE.md's
-# DEFLATE carve-out. Test/parity only.
-qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
-
 [dependencies]
 clap.workspace = true
 flpdf = { path = "../flpdf", version = "0.1.6" }
