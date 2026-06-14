@@ -1052,6 +1052,11 @@ struct RewriteCommand {
     #[arg(long = "stream-data", value_enum)]
     stream_data: Option<CliStreamDataMode>,
 
+    /// Re-encode streams that are already a lone /FlateDecode (default: preserve
+    /// them verbatim, matching qpdf). Mirrors `qpdf --recompress-flate`.
+    #[arg(long = "recompress-flate")]
+    recompress_flate: bool,
+
     /// Flatten annotations into page content (qpdf `--flatten-annotations`).
     ///
     /// MODE is `all`, `screen`, or `print`:
@@ -1935,6 +1940,7 @@ fn run_command(command: Commands) -> CliResult<()> {
             if options.stream_data.is_some() {
                 options.full_rewrite = true;
             }
+            options.recompress_flate = cmd.recompress_flate;
             // `rewrite --encrypt` / `--copy-encryption-from`: wire encryption
             // onto WriteOptions (shared with the top-level surface via
             // apply_encryption_options). Both force full_rewrite — the
