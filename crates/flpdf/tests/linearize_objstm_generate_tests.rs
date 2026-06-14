@@ -58,10 +58,7 @@ fn parse_e_offset(bytes: &[u8]) -> usize {
 /// Count `/Type /ObjStm` container markers in the file body.
 fn count_objstm_markers(bytes: &[u8]) -> usize {
     let needle = b"/Type /ObjStm";
-    bytes
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
+    bytes.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
 /// Byte offset of the first `/Type /ObjStm` container marker.

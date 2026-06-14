@@ -558,10 +558,17 @@ impl RenumberMap {
         }
         // Hint sentinel sits after the last first-half plain object when its
         // recorded index equals the first-half length (e.g. nothing follows it).
+        // cov:ignore-start: unreachable in practice — `from_plan` always places
+        // the Part-2 first-page objects (page dict + content, never ObjStm
+        // members) in the first half AFTER the hint slot, so `first_half_plain`
+        // is non-empty past the hint index and the loop above always emits the
+        // hint sentinel; this fallback guards the degenerate empty-first-page
+        // case that the planner does not produce.
         if hint_index_in_first_half as usize >= first_half_plain.len() {
             new_hint_slot = new_by_new_number.len() as u32;
             new_by_new_number.push(SENTINEL);
         }
+        // cov:ignore-end
         // (8) Part-3 ObjStm containers, batch-ordered (type-1) — last
         //     uncompressed objects of the first half.
         for batch in first_half_batches {
@@ -1207,5 +1214,32 @@ mod tests {
             "first-page xref ({}) must precede the Part-3 container ({container})",
             relocation.first_xref_slot
         );
+    }
+
+    /// An empty inner batch (defence-in-depth: the writer normally filters these
+    /// upstream) must be skipped — it yields no container slot and no members,
+    /// so only the non-empty batch produces a container.
+    #[test]
+    fn per_half_skips_empty_batches() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+
+        // A first-half batch list with one empty and one non-empty batch, and a
+        // second-half list with one empty and one non-empty batch.
+        let first_half_batches = vec![vec![], vec![ObjectRef::new(5, 0)]];
+        let second_half_batches = vec![vec![], vec![ObjectRef::new(4, 0)]];
+        let relocation =
+            rn.place_objstm_members_per_half(&first_half_batches, &second_half_batches);
+
+        // Empty batches contribute no container numbers: one first-half + one
+        // second-half = exactly two containers.
+        assert_eq!(
+            relocation.container_numbers.len(),
+            2,
+            "empty batches must be skipped; only the two non-empty batches yield containers"
+        );
+        // Both non-empty members are present in the placed map.
+        assert!(rn.new_for_original(ObjectRef::new(5, 0)).is_some());
+        assert!(rn.new_for_original(ObjectRef::new(4, 0)).is_some());
     }
 }

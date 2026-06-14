@@ -3249,4 +3249,84 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // canonical_shared_hints: fold first-page ObjStm members into a container
+    // -----------------------------------------------------------------------
+
+    /// Two members of the same first-half container that reference DIFFERENT
+    /// pages must fold into ONE container entry whose `referencing_pages` is the
+    /// sorted union of both members' pages (exercises the merge-insert path).
+    #[test]
+    fn canonical_shared_hints_folds_members_and_unions_pages() {
+        let page = ObjectRef::new(3, 0);
+        let content = ObjectRef::new(9, 0);
+        let font_dict = ObjectRef::new(1, 0);
+        let font = ObjectRef::new(2, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page, content],
+            part3_objects: vec![font_dict, font],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: content,
+                    referencing_pages: vec![],
+                },
+                // font_dict referenced by page 1; font by page 2 — different
+                // pages, so the union must contain both (forces the insert).
+                SharedObjectHintEntry {
+                    object_ref: font_dict,
+                    referencing_pages: vec![1],
+                },
+                SharedObjectHintEntry {
+                    object_ref: font,
+                    referencing_pages: vec![2],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Both font_dict and font live in container 12 (the first-half ObjStm).
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(font_dict, (12, 0));
+        m2c.insert(font, (12, 1));
+
+        let folded = plan.canonical_shared_hints(&m2c);
+        // page, content, and ONE container entry = 3 entries (members folded).
+        assert_eq!(
+            folded.len(),
+            3,
+            "members must fold into one container entry"
+        );
+        assert_eq!(folded[0].object_ref, page);
+        assert_eq!(folded[1].object_ref, content);
+        // The container entry carries the container's new number (12).
+        assert_eq!(folded[2].object_ref, ObjectRef::new(12, 0));
+        // Its referencing_pages is the sorted union {1, 2}.
+        assert_eq!(
+            folded[2].referencing_pages,
+            vec![1, 2],
+            "container entry must union both members' referencing pages"
+        );
+    }
+
+    /// With an empty member-to-container map (no ObjStm packing) the folded list
+    /// is a verbatim clone of `shared_hints` (classic path unchanged).
+    #[test]
+    fn canonical_shared_hints_empty_map_is_identity() {
+        let page = ObjectRef::new(3, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page],
+            shared_hints: vec![SharedObjectHintEntry {
+                object_ref: page,
+                referencing_pages: vec![],
+            }],
+            ..Default::default()
+        };
+        let folded = plan.canonical_shared_hints(&BTreeMap::new());
+        assert_eq!(folded, plan.shared_hints);
+    }
 }

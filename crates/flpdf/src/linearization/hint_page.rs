@@ -882,4 +882,35 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
         assert_eq!(table.header.bits_shared_object_id, 3);
     }
+
+    // -----------------------------------------------------------------------
+    // page0_object_count_with_objstm: count container, not packed members;
+    // count Part-3 objects left plain individually
+    // -----------------------------------------------------------------------
+
+    /// When some Part-3 objects are packed into a first-half container and others
+    /// stay plain, page 0's object count = |part2| + |part3 left plain| +
+    /// |distinct containers|.  This exercises both the packed (container) and
+    /// the plain branch of `page0_object_count_with_objstm`.
+    #[test]
+    fn page0_count_mixes_plain_and_packed_part3() {
+        let page = ObjectRef::new(3, 0);
+        let content = ObjectRef::new(9, 0);
+        let packed_a = ObjectRef::new(1, 0);
+        let packed_b = ObjectRef::new(2, 0);
+        let plain_part3 = ObjectRef::new(5, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page, content],
+            part3_objects: vec![packed_a, packed_b, plain_part3],
+            ..Default::default()
+        };
+        // packed_a + packed_b → container 12; plain_part3 left plain.
+        let mut m2c: std::collections::BTreeMap<ObjectRef, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        m2c.insert(packed_a, (12, 0));
+        m2c.insert(packed_b, (12, 1));
+
+        // |part2| (2) + |part3 plain| (1: plain_part3) + |containers| (1) = 4.
+        assert_eq!(page0_object_count_with_objstm(&plan, &m2c), 4);
+    }
 }

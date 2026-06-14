@@ -1099,9 +1099,12 @@ fn write_first_page_xref_stream(
         ))?;
     let payload_len = (index_count as usize)
         .checked_mul(SPLIT_XREF_ENTRY_WIDTH)
-        .ok_or_else(|| {
-            crate::Error::Unsupported("first-page xref payload length overflow".to_string())
-        })?;
+        .ok_or_else(||
+            // cov:ignore: unreachable — `index_count` is a /Size-bounded u32 and
+            // SPLIT_XREF_ENTRY_WIDTH is a small constant, so the product fits
+            // usize on every supported target; the guard defends against an
+            // implausibly large object count.
+            crate::Error::Unsupported("first-page xref payload length overflow".to_string()))?;
 
     let obj_offset = bytes.len();
 
@@ -2446,27 +2449,33 @@ pub fn write_linearized<R: Read + Seek>(
                             && first_half_container_numbers.contains(&h.object_ref.number)
                         {
                             let len = byte_lengths.get(&h.object_ref.number).copied().ok_or_else(
-                                || {
-                                    crate::Error::Unsupported(format!(
-                                        "shared hint container (new #{}) has no probed byte length",
-                                        h.object_ref.number
-                                    ))
-                                },
+                                ||
+                                // cov:ignore: unreachable — a first-half container
+                                // is always emitted (and probed) before this
+                                // back-patch, so its byte length is present; the
+                                // guard defends against a layout/probe mismatch.
+                                crate::Error::Unsupported(format!(
+                                    "shared hint container (new #{}) has no probed byte length",
+                                    h.object_ref.number
+                                )),
                             )?;
                             return Ok(len as u64);
                         }
-                        let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
+                        let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(||
+                            // cov:ignore: unreachable — non-container shared hints
+                            // are plan objects with a renumber entry; absence
+                            // signals a planner/renumber inconsistency.
                             crate::Error::Unsupported(format!(
                                 "shared hint object {} has no renumber entry",
                                 h.object_ref
-                            ))
-                        })?;
-                        let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
+                            )))?;
+                        let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(||
+                            // cov:ignore: unreachable — every plain shared object
+                            // is emitted (and probed) before this back-patch.
                             crate::Error::Unsupported(format!(
                                 "shared hint object {} (new #{}) has no probed byte length",
                                 h.object_ref, new_ref.number
-                            ))
-                        })?;
+                            )))?;
                         Ok(len as u64)
                     })
                     .collect::<Result<Vec<_>>>()?;
