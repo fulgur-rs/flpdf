@@ -56,11 +56,22 @@ const PLACEHOLDER: &[u8] = b"0000000000";
 /// Number of pad bytes reserved after `endobj\n` so the dict can be rewritten
 /// with variable-width decimal values without shifting Part 1's total length.
 ///
-/// = `7 fields × (PLACEHOLDER_WIDTH − 1)` = 63.  This is the tight upper bound
-/// on bytes saved by compaction: each of the 7 numeric fields shrinks by at
-/// most `PLACEHOLDER_WIDTH − 1` characters (= 10 − 1 for value `0` rendered
-/// as the single byte `b"0"`).
-pub const PARAM_DICT_TRAILING_PAD: usize = 7 * (PLACEHOLDER_WIDTH - 1);
+/// Two requirements drive this value:
+///
+/// 1. **Compaction reserve.** It must be at least `7 × (PLACEHOLDER_WIDTH − 1)`
+///    = 63, the tight upper bound on bytes saved by compaction: each of the 7
+///    numeric fields shrinks by at most `PLACEHOLDER_WIDTH − 1` characters
+///    (= 10 − 1 for value `0` rendered as the single byte `b"0"`).
+/// 2. **First-page xref alignment.** qpdf lands the first-page `xref` keyword
+///    at a fixed offset (observed: 216 for the 15-byte `%PDF-1.3` header and a
+///    single-digit param-dict object number, i.e. `{n} 0 obj\n` = 8 bytes plus
+///    the 118-byte max-width dict body plus `\nendobj\n` = 8 bytes). The
+///    first-page xref is emitted immediately after this trailing pad, so the
+///    pad width fixes that offset. Padding to 66 reaches qpdf's 216 target:
+///    `15 + 8 + (118 + 8 + 66) + 1` = the position of the `xref` keyword after
+///    the leading `\n`. 66 also exceeds the 63-byte compaction reserve, so the
+///    variable-width back-patch never overflows the region.
+pub const PARAM_DICT_TRAILING_PAD: usize = 66;
 
 // ---------------------------------------------------------------------------
 // Part1Placeholders

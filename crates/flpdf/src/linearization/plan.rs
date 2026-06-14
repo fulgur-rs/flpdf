@@ -135,9 +135,24 @@ fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> 
     Ok(())
 }
 
+/// Returns whether a resolved object is a page-tree node we must not descend
+/// into during a subtree expansion (a `/Type /Page` leaf or `/Type /Pages`
+/// interior node). Used to stop a `/Resources` subtree walk from pulling in
+/// sibling pages if a resource value cross-links back into the page tree.
+fn is_page_tree_node(obj: &Object) -> bool {
+    matches!(obj, Object::Dictionary(d)
+        if matches!(d.get("Type"), Some(Object::Name(n))
+            if n.as_slice() == b"Pages" || n.as_slice() == b"Page"))
+}
+
 /// Compute the transitive closure of objects reachable from `root`.
 ///
-/// Returns the list in BFS discovery order (root first).
+/// Returns the list in discovery order (root first). The walk is breadth-first
+/// over the object graph in general, with one exception for page leaves: a
+/// page's `/Resources` subtree is expanded depth-first and placed ahead of its
+/// `/Contents`. This reproduces qpdf's physical ordering for the first-page
+/// section, where the Resources dictionary (and the fonts/XObjects it points
+/// at) precede the content stream.
 ///
 /// ### `/Parent` / `/Kids` handling
 ///
@@ -172,6 +187,57 @@ fn compute_closure<R: Read + Seek>(
 
         if is_pages_node || is_page_leaf {
             if let Some(dict) = obj.as_dict() {
+                // For a page leaf, expand the `/Resources` subtree depth-first
+                // and append it to `order` *before* the generic key loop runs.
+                // flpdf's `Dictionary` is a `BTreeMap`, so a plain key walk
+                // would visit `/Contents` (alphabetically first) before
+                // `/Resources`; qpdf instead numbers the Resources dictionary
+                // and the fonts/XObjects it references ahead of the content
+                // stream. Reproducing that order here is what makes the
+                // first-page object numbering match qpdf (e.g. one-page:
+                // Page, Resources, Font, Content). The depth-first walk is
+                // required because the content stream sits at depth 1 while a
+                // font hangs at depth 2 under `/Resources`; a breadth-first
+                // pass would otherwise emit the content stream first.
+                if is_page_leaf {
+                    if let Some(resources) = dict.get("Resources") {
+                        let mut seeds = Vec::new();
+                        collect_direct_refs(resources, 0, &mut seeds)?;
+                        // DFS via an explicit stack (no recursion) so deeply
+                        // nested resource graphs cannot overflow the stack.
+                        // The visited set bounds cycles; `is_page_tree_node`
+                        // stops the walk if a resource value cross-links back
+                        // into the page tree, so we never pull in sibling pages.
+                        let mut stack: Vec<ObjectRef> = seeds.into_iter().rev().collect();
+                        while let Some(r) = stack.pop() {
+                            if !visited.insert(r) {
+                                continue;
+                            }
+                            let child = pdf.resolve(r)?;
+                            // Stop at a page-tree boundary BEFORE adding `r` to
+                            // the closure: a resource that malformedly cross-links
+                            // to a sibling `/Page` or the `/Pages` node must be
+                            // kept in `visited` (so it is never revisited) but
+                            // excluded from the first-page closure entirely — per
+                            // the page-closure boundary rule, we neither descend
+                            // into it nor pull the boundary node itself into
+                            // Part 2/3.
+                            if is_page_tree_node(&child) {
+                                continue;
+                            }
+                            order.push(r);
+                            let mut child_refs = Vec::new();
+                            collect_direct_refs(&child, 0, &mut child_refs)?;
+                            // Push in reverse so the first reference is popped
+                            // first, preserving left-to-right discovery order.
+                            for cr in child_refs.into_iter().rev() {
+                                if !visited.contains(&cr) {
+                                    stack.push(cr);
+                                }
+                            }
+                        }
+                    }
+                } // cov:ignore: llvm-cov attributes 0 to this `if is_page_leaf` closing brace; the block body (the /Resources DFS) runs and is covered above.
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
                         // Pages → sibling pages — never follow.
@@ -473,8 +539,9 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
         // ----------------------------------------------------------------
-        // Maintain BFS order from first_page_closure for Part 2 (page dict
-        // first, then resources, fonts, images, etc.).
+        // Maintain closure discovery order from first_page_closure for Part 2
+        // (page dict first, then its `/Resources` subtree, then `/Contents`,
+        // matching qpdf's first-page object numbering).
         //
         // The page-1 dictionary itself is pinned to Part 2 even if another
         // page directly references it; the linearization layout requires
@@ -1622,6 +1689,120 @@ mod tests {
         // Both should be reachable from page 1 (single page → no sharing).
         assert!(in_part2_a, "XObject A must be in Part 2");
         assert!(in_part2_b, "XObject B must be in Part 2");
+    }
+
+    // -----------------------------------------------------------------------
+    // 8b. First-page closure /Resources DFS — defensive branch coverage.
+    //
+    // The page-leaf `/Resources` subtree walk (a) dedups via the visited set
+    // when the same object is reached twice before it is popped, and (b) stops
+    // at any page-tree node a resource value cross-links to, so it never pulls
+    // in sibling pages. These fixtures exercise both guards directly.
+    // -----------------------------------------------------------------------
+
+    /// Page whose inline `/Resources` lists the SAME object ref twice, so the
+    /// DFS stack holds two copies of obj 4 before either is popped — exercising
+    /// the `visited.insert` dedup `continue` in the subtree walk.
+    fn resources_duplicate_ref_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]               /Resources << /A 4 0 R /B 4 0 R >> >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font /Helvetica >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n                 {off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// Page whose `/Resources` value cross-links back to the `/Pages` node, so
+    /// the subtree walk must STOP there (the `is_page_tree_node` guard) instead
+    /// of pulling the page tree into the first-page closure.
+    fn resources_crosslink_page_tree_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        // /Resources references obj 2 (the Pages node) — a malformed cross-link.
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]               /Resources << /Bad 2 0 R >> >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n                 {off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn resources_subtree_dedups_duplicate_ref() {
+        let mut pdf = Pdf::open(Cursor::new(resources_duplicate_ref_pdf_bytes()))
+            .expect("duplicate-ref PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        // The doubly-referenced resource object appears exactly once across all
+        // parts (the visited-set dedup prevents a duplicate).
+        assert!(plan.parts_are_disjoint());
+        let res = ObjectRef::new(4, 0);
+        assert!(
+            plan.part2_objects.contains(&res),
+            "the resource object must be in the first-page section exactly once"
+        );
+        assert_eq!(
+            plan.part2_objects.iter().filter(|r| **r == res).count(),
+            1,
+            "duplicate /Resources ref must not duplicate the object in Part 2"
+        );
+    }
+
+    #[test]
+    fn resources_subtree_stops_at_page_tree_crosslink() {
+        let mut pdf = Pdf::open(Cursor::new(resources_crosslink_page_tree_pdf_bytes()))
+            .expect("crosslink PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        // The walk reaches the /Pages node via the bad /Resources link but does
+        // not descend into it (no sibling-page content pulled in); the plan is
+        // still well-formed and disjoint.
+        assert!(plan.parts_are_disjoint());
+        // The page itself is the first-page anchor.
+        assert!(
+            plan.part2_objects.contains(&ObjectRef::new(3, 0)),
+            "the page leaf must anchor the first-page section"
+        );
+        // The cross-linked /Pages node (obj 2) must be EXCLUDED from the
+        // first-page closure entirely — it is a page-tree boundary, so it is
+        // kept in `visited` but neither descended into nor added to Part 2/3.
+        // (Before the boundary check moved ahead of `order.push`, the node was
+        // wrongly pulled into Part 2.)
+        let pages_node = ObjectRef::new(2, 0);
+        assert!(
+            !plan.part2_objects.contains(&pages_node) && !plan.part3_objects.contains(&pages_node),
+            "the cross-linked /Pages node must not be pulled into the first-page section"
+        );
     }
 
     // -----------------------------------------------------------------------

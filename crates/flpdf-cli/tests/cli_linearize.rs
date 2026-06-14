@@ -496,12 +496,17 @@ fn effective_version_force_version() {
 }
 
 // ---------------------------------------------------------------------------
-// 13. Part 1 trailer startxref must be 0; Part 6 startxref must be the real
-//     main xref offset (qpdf linearized PDF convention, ISO 32000-1 Annex F).
+// 13. Part 1 trailer startxref must be 0; the file's FINAL startxref must point
+//     at the FIRST-PAGE xref (the first standalone `xref` keyword, near the top
+//     of the file), matching qpdf's classic linearized layout.  qpdf chains a
+//     reader: final startxref → first-page xref → its /Prev → main xref, so a
+//     web reader resolves page 1 from the leading bytes.  (Previously this test
+//     asserted the final startxref equalled the LAST/main xref — flpdf's old
+//     non-qpdf layout.)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn linearize_part1_startxref_is_zero_main_startxref_is_real() {
+fn linearize_part1_startxref_is_zero_final_startxref_points_at_first_page_xref() {
     let input = write_temp(&minimal_pdf_bytes());
     let outdir = tempfile::tempdir().unwrap();
     let output = outdir.path().join("linearized.pdf");
@@ -548,24 +553,33 @@ fn linearize_part1_startxref_is_zero_main_startxref_is_real() {
         "Part 1 first trailer startxref must be 0 (qpdf linearized convention)"
     );
 
-    // Last startxref → Part 6 main trailer: must point at the last standalone
-    // `xref` keyword (not the `xref` that appears inside `startxref`).
+    // Final startxref → Part 6 main trailer: must point at the FIRST standalone
+    // `xref` keyword (the first-page xref), not the last (main) one.
     let last_pos = bytes
         .windows(needle.len())
         .rposition(|w| w == needle)
         .expect("must have at least two startxref");
-    let main_val: usize = parse_val(last_pos);
+    let final_val: usize = parse_val(last_pos);
+    let is_standalone_xref = |i: usize| -> bool {
+        &bytes[i..i + 4] == b"xref"
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 4 >= bytes.len() || bytes[i + 4].is_ascii_whitespace())
+    };
+    let first_xref_pos = (0..bytes.len().saturating_sub(3))
+        .find(|&i| is_standalone_xref(i))
+        .expect("must have at least one standalone xref keyword");
     let last_xref_pos = (0..bytes.len().saturating_sub(3))
         .rev()
-        .find(|&i| {
-            &bytes[i..i + 4] == b"xref"
-                && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-                && (i + 4 >= bytes.len() || bytes[i + 4].is_ascii_whitespace())
-        })
+        .find(|&i| is_standalone_xref(i))
         .expect("must have at least one standalone xref keyword");
+    assert!(
+        first_xref_pos < last_xref_pos,
+        "first-page xref ({first_xref_pos}) must precede the main xref ({last_xref_pos})"
+    );
     assert_eq!(
-        main_val, last_xref_pos,
-        "Part 6 main startxref ({main_val}) must equal last xref keyword offset ({last_xref_pos})"
+        final_val, first_xref_pos,
+        "final startxref ({final_val}) must equal the FIRST-PAGE xref keyword \
+         offset ({first_xref_pos}) — qpdf classic linearized layout"
     );
 }
 
