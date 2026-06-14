@@ -174,3 +174,16 @@ match; numbering follows automatically.
 qpdf --static-id --warning-exit-0 three-page.pdf --overlay one-page.pdf -- OUT
 Real numbering above. obj7 (new /Contents) = "q\n1 0 0 1 0 0 cm\n/Fx0 Do\nQ\nq\n
 1 0 0 1 0 0 cm\n/Fx1 Do\nQ\n" (54 bytes) FlateDecode-compressed to Length 35.
+
+## placeFormXObject uses the MATRIX-TRANSFORMED bbox (rotated pages)
+
+getMatrixForFormXObjectPlacement fits the form's /BBox AFTER applying the form's
+/Matrix (the visual extent), not the raw /BBox. So a +90 page (Form /Matrix
+[0 -1 1 0 0 w], /BBox [0 0 612 792]) presents a 792x612 box. Empirical
+(qpdf 11.9.0, rotated source overlaid onto 612x792):
+  cm = 0.77273 0 0 0.77273 0 159.54545
+  (transformed bbox [0 0 792 612]; scale=min(612/792,792/612)=0.77273;
+   tx=306-0.77273*396=0; ty=396-0.77273*306=159.54545)
+=> placement = transform the /BBox 4 corners by /Matrix, take the bounding rect,
+then scale-to-fit+centre THAT. Identity /Matrix => transformed == raw (the
+simple gate is unaffected). A byte-level rotated golden is deferred to .16.7.

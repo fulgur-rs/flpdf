@@ -192,15 +192,15 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     //    into the page /MediaBox.
     let mut content = String::new();
     for (name, xref) in &underlay_names {
-        let bbox = xobject_bbox(dest, *xref)?;
+        let bbox = xobject_placement_box(dest, *xref)?;
         content.push_str(&place_form_xobject(bbox, page_box_array(&trim_box), name));
     }
     {
-        let bbox = xobject_bbox(dest, fx0_ref)?;
+        let bbox = xobject_placement_box(dest, fx0_ref)?;
         content.push_str(&place_form_xobject(bbox, page_box_array(&media_box), "Fx0"));
     }
     for (name, xref) in &overlay_names {
-        let bbox = xobject_bbox(dest, *xref)?;
+        let bbox = xobject_placement_box(dest, *xref)?;
         content.push_str(&place_form_xobject(bbox, page_box_array(&trim_box), name));
     }
 
@@ -254,10 +254,67 @@ fn page_box_array(b: &PageBox) -> [f64; 4] {
     [b.llx, b.lly, b.urx, b.ury]
 }
 
-/// Read the imported Form XObject's `/BBox` as a numeric `[llx lly urx ury]`
-/// array. Non-numeric elements contribute `0.0` (matching qpdf's numeric
-/// coercion); an array shorter than four elements is an error.
-fn xobject_bbox<R: Read + Seek>(pdf: &mut Pdf<R>, xobject_ref: ObjectRef) -> Result<[f64; 4]> {
+/// Coerce a PDF numeric object to `f64`, matching qpdf's numeric coercion
+/// (non-numeric values, including indirect references, contribute `0.0`).
+fn as_f64(o: &Object) -> f64 {
+    o.as_integer()
+        .map(|i| i as f64)
+        .or_else(|| o.as_real())
+        .unwrap_or(0.0)
+}
+
+/// Read a Form XObject dictionary's `/Matrix` as `[a b c d e f]`, defaulting to
+/// the identity when `/Matrix` is absent or not a 6+ element array. The Form
+/// XObjects built by [`page_to_form_xobject`] always carry a direct `/Matrix`
+/// array, so no indirect-reference resolution is needed here.
+fn matrix_or_identity(dict: &Dictionary) -> [f64; 6] {
+    match dict.get("Matrix").and_then(Object::as_array) {
+        Some(m) if m.len() >= 6 => [
+            as_f64(&m[0]),
+            as_f64(&m[1]),
+            as_f64(&m[2]),
+            as_f64(&m[3]),
+            as_f64(&m[4]),
+            as_f64(&m[5]),
+        ],
+        _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    }
+}
+
+/// Apply PDF matrix `m = [a b c d e f]` to the four corners of `bbox` and return
+/// the axis-aligned bounding rectangle `[llx lly urx ury]` of the result. A
+/// point `(x, y)` maps to `(a*x + c*y + e, b*x + d*y + f)`.
+fn transform_bbox(bbox: [f64; 4], m: [f64; 6]) -> [f64; 4] {
+    let [llx, lly, urx, ury] = bbox;
+    let [a, b, c, d, e, f] = m;
+    let pt = |x: f64, y: f64| (a * x + c * y + e, b * x + d * y + f);
+    let corners = [pt(llx, lly), pt(urx, lly), pt(urx, ury), pt(llx, ury)];
+    let mut min_x = corners[0].0;
+    let mut max_x = corners[0].0;
+    let mut min_y = corners[0].1;
+    let mut max_y = corners[0].1;
+    for &(x, y) in &corners[1..] {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    [min_x, min_y, max_x, max_y]
+}
+
+/// Read the imported Form XObject's placement box: its `/BBox` transformed by the
+/// XObject's `/Matrix`, returned as the bounding rectangle `[llx lly urx ury]`.
+///
+/// qpdf's `getMatrixForFormXObjectPlacement` fits the matrix-transformed `/BBox`
+/// (not the raw `/BBox`) into the destination rectangle, so a rotated page —
+/// whose `/Matrix` swaps width and height — is scaled and centred by its visual
+/// extent. Non-numeric `/BBox` elements coerce to `0.0` (matching qpdf); a
+/// `/BBox` shorter than four elements is an error; an absent or malformed
+/// `/Matrix` is treated as the identity.
+fn xobject_placement_box<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    xobject_ref: ObjectRef,
+) -> Result<[f64; 4]> {
     let obj = pdf.resolve(xobject_ref)?;
     let dict = match &obj {
         Object::Stream(s) => &s.dict,
@@ -277,13 +334,13 @@ fn xobject_bbox<R: Read + Seek>(pdf: &mut Pdf<R>, xobject_ref: ObjectRef) -> Res
             arr.len()
         )));
     }
-    let n = |o: &Object| -> f64 {
-        o.as_integer()
-            .map(|i| i as f64)
-            .or_else(|| o.as_real())
-            .unwrap_or(0.0)
-    };
-    Ok([n(&arr[0]), n(&arr[1]), n(&arr[2]), n(&arr[3])])
+    let bbox = [
+        as_f64(&arr[0]),
+        as_f64(&arr[1]),
+        as_f64(&arr[2]),
+        as_f64(&arr[3]),
+    ];
+    Ok(transform_bbox(bbox, matrix_or_identity(dict)))
 }
 
 /// Resolve `page_ref` to an owned page `Dictionary`, erroring when it is not a
@@ -780,7 +837,7 @@ mod tests {
         );
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Stream(Stream::new(dict, Vec::new())));
-        let bbox = xobject_bbox(&mut pdf, r).unwrap();
+        let bbox = xobject_placement_box(&mut pdf, r).unwrap();
         assert_eq!(bbox, [0.0, 1.5, 300.0, 144.0]);
     }
 
@@ -793,7 +850,7 @@ mod tests {
         let r1 = next_object_ref(&pdf).unwrap();
         pdf.set_object(r1, Object::Stream(Stream::new(d1, Vec::new())));
         assert!(matches!(
-            xobject_bbox(&mut pdf, r1),
+            xobject_placement_box(&mut pdf, r1),
             Err(Error::Unsupported(_))
         ));
 
@@ -803,7 +860,7 @@ mod tests {
         let r2 = next_object_ref(&pdf).unwrap();
         pdf.set_object(r2, Object::Stream(Stream::new(d2, Vec::new())));
         assert!(matches!(
-            xobject_bbox(&mut pdf, r2),
+            xobject_placement_box(&mut pdf, r2),
             Err(Error::Unsupported(_))
         ));
     }
@@ -814,7 +871,7 @@ mod tests {
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Integer(42));
         assert!(matches!(
-            xobject_bbox(&mut pdf, r),
+            xobject_placement_box(&mut pdf, r),
             Err(Error::Unsupported(_))
         ));
     }
@@ -836,7 +893,10 @@ mod tests {
         );
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
-        assert_eq!(xobject_bbox(&mut pdf, r).unwrap(), [0.0, 0.0, 10.0, 20.0]);
+        assert_eq!(
+            xobject_placement_box(&mut pdf, r).unwrap(),
+            [0.0, 0.0, 10.0, 20.0]
+        );
     }
 
     #[test]
@@ -848,5 +908,106 @@ mod tests {
             page_dictionary(&mut pdf, r),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn transform_bbox_identity_is_unchanged() {
+        let id = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(
+            transform_bbox([10.0, 20.0, 300.0, 400.0], id),
+            [10.0, 20.0, 300.0, 400.0]
+        );
+    }
+
+    #[test]
+    fn transform_bbox_rotate_90_swaps_extent() {
+        // qpdf's getMatrixForTransformations for a +90 page is [0 -1 1 0 0 w].
+        // Mapping (x,y) -> (y, w - x) turns a 612x792 box into a 792x612 box.
+        let m90 = [0.0, -1.0, 1.0, 0.0, 0.0, 612.0];
+        assert_eq!(
+            transform_bbox([0.0, 0.0, 612.0, 792.0], m90),
+            [0.0, 0.0, 792.0, 612.0]
+        );
+    }
+
+    #[test]
+    fn matrix_or_identity_reads_present_absent_and_short() {
+        // Present 6-element /Matrix is read verbatim.
+        let mut present = Dictionary::new();
+        present.insert(
+            "Matrix",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(-1),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Real(612.0),
+            ]),
+        );
+        assert_eq!(
+            matrix_or_identity(&present),
+            [0.0, -1.0, 1.0, 0.0, 0.0, 612.0]
+        );
+        // Absent /Matrix falls back to the identity.
+        assert_eq!(
+            matrix_or_identity(&Dictionary::new()),
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
+        // A /Matrix with fewer than six elements falls back to the identity.
+        let mut short = Dictionary::new();
+        short.insert(
+            "Matrix",
+            Object::Array(vec![Object::Integer(1), Object::Integer(0)]),
+        );
+        assert_eq!(matrix_or_identity(&short), [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn place_uses_matrix_transformed_bbox_for_rotated_form() {
+        // A +90-rotated 612x792 page (Form /Matrix [0 -1 1 0 0 612], /BBox
+        // [0 0 612 792]) presents a 792x612 visual box. Placed into a 612x792
+        // rect it shrinks to fit and centres exactly as qpdf 11.9.0 emits:
+        //   0.77273 0 0 0.77273 0 159.54545
+        // (scale=min(612/792,792/612)=0.77273; tx=306-0.77273*396=0;
+        //  ty=396-0.77273*306=159.54545). Verified against qpdf --overlay output.
+        let transformed =
+            transform_bbox([0.0, 0.0, 612.0, 792.0], [0.0, -1.0, 1.0, 0.0, 0.0, 612.0]);
+        let frag = place_form_xobject(transformed, [0.0, 0.0, 612.0, 792.0], "Fx1");
+        assert_eq!(frag, "q\n0.77273 0 0 0.77273 0 159.54545 cm\n/Fx1 Do\nQ\n");
+    }
+
+    #[test]
+    fn xobject_placement_box_applies_form_matrix() {
+        // A Form XObject carrying a +90 /Matrix reports its matrix-transformed
+        // (visual) bounding box, not the raw /BBox.
+        let mut pdf = open(one_page_doc("x"));
+        let mut d = Dictionary::new();
+        d.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        d.insert(
+            "Matrix",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(-1),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+            ]),
+        );
+        let r = next_object_ref(&pdf).unwrap();
+        pdf.set_object(r, Object::Dictionary(d));
+        assert_eq!(
+            xobject_placement_box(&mut pdf, r).unwrap(),
+            [0.0, 0.0, 792.0, 612.0]
+        );
     }
 }
