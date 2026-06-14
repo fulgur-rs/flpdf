@@ -3034,7 +3034,10 @@ mod tests {
             .windows(needle.len())
             .filter(|w| *w == needle)
             .count();
-        assert_eq!(count, 1, "catalog must be emitted exactly once, found {count}");
+        assert_eq!(
+            count, 1,
+            "catalog must be emitted exactly once, found {count}"
+        );
         // The output must still be a well-formed, re-parseable PDF.
         Pdf::open(Cursor::new(doc.bytes)).expect("output must be parseable");
     }
@@ -3051,7 +3054,9 @@ mod tests {
         offs[1] = pdf.len();
         pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
         offs[2] = pdf.len();
-        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>\nendobj\n",
+        );
         offs[3] = pdf.len();
         pdf.extend_from_slice(
             b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
@@ -3112,7 +3117,10 @@ mod tests {
             .windows(needle.len())
             .filter(|w| *w == needle)
             .count();
-        assert_eq!(count, 1, "shared catalog must be emitted exactly once, found {count}");
+        assert_eq!(
+            count, 1,
+            "shared catalog must be emitted exactly once, found {count}"
+        );
         Pdf::open(Cursor::new(doc.bytes)).expect("output must be parseable");
     }
 
