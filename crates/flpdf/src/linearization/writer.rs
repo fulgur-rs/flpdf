@@ -856,7 +856,28 @@ struct FirstPageXrefPatch {
     /// Byte range of the raw (uncompressed) entry payload — overwritten with
     /// the real type-1/2 entries once offsets are final.
     data_range: std::ops::Range<usize>,
+    /// Byte range of the fixed-width `/Prev` value field — overwritten with the
+    /// main (Part-6) xref stream offset (left-justified, space-padded) once it
+    /// is known.  The first-half xref is the chain leaf the file's trailing
+    /// `startxref` points at; its `/Prev` chains forward to the main xref
+    /// (qpdf's first-half → main direction).
+    prev_range: std::ops::Range<usize>,
 }
+
+/// Fixed digit width of the first-half xref stream's `/Prev` placeholder.
+///
+/// The plain `Object::Integer` serializer emits this sentinel as a contiguous
+/// run of exactly this many ASCII digits.  [`patch_first_page_xref`] then
+/// overwrites the run in place with the real main-xref offset, left-justified
+/// and space-padded back to this width, so no downstream byte shifts (the field
+/// stays the same size; the trailing space separates it from the next key).
+/// Ten digits hold any offset up to ~10 GB, far beyond any realistic PDF.
+const FIRST_PAGE_XREF_PREV_WIDTH: usize = 10;
+
+/// Sentinel `/Prev` placeholder value: the smallest integer with exactly
+/// [`FIRST_PAGE_XREF_PREV_WIDTH`] decimal digits, so the serializer reserves a
+/// fixed-width digit run that [`patch_first_page_xref`] back-patches in place.
+const FIRST_PAGE_XREF_PREV_SENTINEL: i64 = 1_000_000_000;
 
 /// Encode the dense-table slice `[start, start+count)` as `W=[1,8,4]` xref
 /// entry bytes.  Type-1 for plain objects with a known offset, type-2 for
@@ -1045,10 +1066,14 @@ fn patch_linearized_deterministic_id(
 /// length is invariant, no extra convergence variable is introduced — the
 /// hint stream remains the sole degree of freedom.
 ///
-/// This stream carries **no** `/Prev`: it is the leaf of the xref chain.
-/// The main (Part-6) xref at EOF holds `/Prev → here` (chain main → first,
-/// unchanged from the original split implementation) and the file's trailing
-/// `startxref` points at the main xref, so the chain is acyclic.
+/// This stream is the **target of the file's trailing `startxref`** and holds
+/// `/Prev → main xref` (qpdf's first-half → main chain direction): the main
+/// (Part-6) xref at EOF carries no `/Prev`, so the chain is acyclic.  The
+/// `/Prev` value is a fixed-width placeholder ([`FIRST_PAGE_XREF_PREV_SENTINEL`],
+/// [`FIRST_PAGE_XREF_PREV_WIDTH`] digits) back-patched in place by
+/// [`patch_first_page_xref`] once the main xref offset is known; because the
+/// field width is invariant, the patch shifts no downstream bytes (the
+/// hint-stream convergence loop is untouched).
 ///
 /// `/Index [second_half_count, first_half_count]`: the FIRST-half object range
 /// `second_half_count ..< /Size`, all type-1 (param dict, first-page xref
@@ -1115,6 +1140,11 @@ fn write_first_page_xref_stream(
     if let Some(id) = split_xref_common_id(source_trailer) {
         d1.insert("ID", id);
     }
+    // `/Prev → main xref` (qpdf chains first-half → main).  Emitted as a
+    // fixed-width sentinel digit run so `patch_first_page_xref` can overwrite it
+    // in place with the real main-xref offset without shifting any byte (the
+    // main xref is written after this stream, so its offset is not yet known).
+    d1.insert("Prev", Object::Integer(FIRST_PAGE_XREF_PREV_SENTINEL));
     // The payload is stored uncompressed so /Length is the constant
     // `payload_len` regardless of the offsets it will later carry.
     d1.insert("Length", Object::Integer(payload_len as i64));
@@ -1148,12 +1178,47 @@ fn write_first_page_xref_stream(
         "first-page xref payload range mislocated"
     );
 
+    // Locate the fixed-width `/Prev` sentinel run inside the just-emitted dict
+    // (between the object header and `stream\n`).  The serializer wrote the
+    // sentinel as a contiguous `FIRST_PAGE_XREF_PREV_WIDTH`-digit decimal run;
+    // find `/Prev`, skip whitespace to the first ASCII digit, and reserve the
+    // next `FIRST_PAGE_XREF_PREV_WIDTH` bytes for in-place back-patching.
+    let dict_region = &bytes[obj_offset..data_start];
+    let prev_kw = b"/Prev";
+    let prev_kw_rel = dict_region
+        .windows(prev_kw.len())
+        .position(|w| w == prev_kw)
+        // cov:ignore-start: unreachable invariant — `/Prev` was just inserted
+        // into `d1` above, so the serialized dict always contains the keyword.
+        .ok_or_else(|| {
+            crate::Error::Unsupported(
+                "first-page xref stream: `/Prev` keyword not found after emission".to_string(),
+            )
+        })?;
+    // cov:ignore-end
+    let mut prev_digit_rel = prev_kw_rel + prev_kw.len();
+    while prev_digit_rel < dict_region.len() && !dict_region[prev_digit_rel].is_ascii_digit() {
+        prev_digit_rel += 1;
+    }
+    let prev_start = obj_offset + prev_digit_rel;
+    let prev_end = prev_start + FIRST_PAGE_XREF_PREV_WIDTH;
+    if prev_end > data_start {
+        // cov:ignore-start: unreachable invariant — the `/Prev` sentinel is a
+        // fixed `FIRST_PAGE_XREF_PREV_WIDTH`-digit run inside the dict (before
+        // `stream\n`), so its field never reaches the payload boundary.
+        return Err(crate::Error::Unsupported(
+            "first-page xref stream: `/Prev` placeholder runs past the dict body".to_string(),
+        ));
+        // cov:ignore-end
+    }
+
     Ok(FirstPageXrefPatch {
         obj_offset,
         first_xref_num,
         index_start,
         index_count,
         data_range: data_start..data_end,
+        prev_range: prev_start..prev_end,
     })
 }
 
@@ -1165,13 +1230,19 @@ fn write_first_page_xref_stream(
 /// xref's range), so the encoder only needs `xref_offsets` plus the
 /// first-page xref object's own offset.  Because the payload was emitted at its
 /// final byte length, this is a pure in-place patch — no offsets shift, the
-/// hint-stream convergence loop is untouched.  The first-page stream has no
-/// `/Prev` (it is the chain leaf), so nothing else needs patching here.
+/// hint-stream convergence loop is untouched.
+///
+/// The stream's `/Prev → main xref` is also back-patched here (the first-half
+/// xref is written before the main xref, so its offset was a fixed-width
+/// sentinel at emit time).  The real `main_xref_offset` is written
+/// left-justified and space-padded back to [`FIRST_PAGE_XREF_PREV_WIDTH`], so
+/// the field width is invariant and no byte shifts.
 fn patch_first_page_xref(
     bytes: &mut [u8],
     patch: &FirstPageXrefPatch,
     xref_offsets: &BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
+    main_xref_offset: usize,
 ) -> Result<()> {
     let mut offs = xref_offsets.clone();
     offs.insert(patch.first_xref_num, patch.obj_offset);
@@ -1190,6 +1261,31 @@ fn patch_first_page_xref(
         ));
     }
     bytes[patch.data_range.clone()].copy_from_slice(&data);
+
+    // Back-patch `/Prev → main xref`.  Format left-justified and space-padded to
+    // the reserved fixed width; reject (rather than truncate) if the offset's
+    // decimal form does not fit — the sentinel width is sized far above any
+    // realistic offset, so this only fires on a writer bug.
+    if patch.prev_range.end > bytes.len() {
+        // cov:ignore-start: unreachable invariant — `prev_range` was located
+        // inside the same buffer during emission, which only grows afterward.
+        return Err(crate::Error::Unsupported(
+            "first-page xref /Prev patch range out of bounds".to_string(),
+        ));
+        // cov:ignore-end
+    }
+    let prev_str = format!("{main_xref_offset:<FIRST_PAGE_XREF_PREV_WIDTH$}");
+    if prev_str.len() != patch.prev_range.len() {
+        // cov:ignore-start: unreachable invariant — FIRST_PAGE_XREF_PREV_WIDTH
+        // (10 digits ≈ 10 GB) exceeds any realistic offset, so the formatted
+        // value never overflows the reserved field.
+        return Err(crate::Error::Unsupported(format!(
+            "first-page xref /Prev value ({main_xref_offset}) exceeds reserved width \
+             ({FIRST_PAGE_XREF_PREV_WIDTH} digits)"
+        )));
+        // cov:ignore-end
+    }
+    bytes[patch.prev_range.clone()].copy_from_slice(prev_str.as_bytes());
     Ok(())
 }
 
@@ -1203,12 +1299,13 @@ fn patch_first_page_xref(
 /// range with no type-1-after-type-2 interleave under the per-half
 /// compressed-last layout.
 ///
-/// The `/Prev` chain stays main → first-page (unchanged from the original
-/// split implementation; qpdf accepts either direction and the first-page
-/// stream's own `/Prev` points back here).  Returns `(main_xref_offset,
-/// first_page_obj_offset)` so the caller's `/Prev` / `/T` contract is
-/// preserved: `/T = first_page_obj_offset − 1` (caller applies the
-/// `saturating_sub(1)`), matching qpdf's "byte before the first-page xref".
+/// The main xref carries **no** `/Prev`: it is the end of qpdf's first-half →
+/// main chain (the first-page stream's own `/Prev` points forward here).  The
+/// file's trailing `startxref` targets the **first-page** xref (the chain leaf
+/// a linearized reader consults first), not this main xref.  Returns
+/// `(main_xref_offset, main_xref_offset)`: the caller computes `/T =
+/// main_xref_offset − 1` (via `saturating_sub(1)`), matching qpdf's
+/// `xref_zero_offset` (the byte just before the main xref stream object).
 #[allow(clippy::too_many_arguments)]
 fn write_main_xref_stream_and_trailer(
     bytes: &mut Vec<u8>,
@@ -1262,22 +1359,22 @@ fn write_main_xref_stream_and_trailer(
     if let Some(id) = split_xref_common_id(source_trailer) {
         d2.insert("ID", id);
     }
-    // /Prev → first-page xref stream object offset (qpdf chains main → first).
-    d2.insert("Prev", Object::Integer(first_page_obj_offset as i64));
+    // No `/Prev`: the main xref is the end of qpdf's first-half → main chain
+    // (the first-page xref carries `/Prev → here`).
     d2.insert("Length", Object::Integer(main_encoded.len() as i64));
     d2.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
     bytes.extend_from_slice(format!("{main_xref_num} 0 obj\n").as_bytes());
     Object::Stream(Stream::new(d2, main_encoded)).write_pdf(bytes);
     bytes.extend_from_slice(b"\nendobj\n");
-    bytes.extend_from_slice(format!("startxref\n{main_xref_offset}\n%%EOF\n").as_bytes());
+    // Trailing `startxref` → the **first-page** xref stream (qpdf's chain leaf).
+    bytes.extend_from_slice(format!("startxref\n{first_page_obj_offset}\n%%EOF\n").as_bytes());
 
     // `/T` rule for the split linearized file is the byte just before the
-    // **first-page** cross-reference stream (the object the main xref's
-    // `/Prev` chains back to).  The caller computes `/T =
-    // second_return.saturating_sub(1)`, so return `first_page_obj_offset`
-    // here.  The first element is the main xref offset (used as the file's
-    // trailing `startxref` / convergence diagnostics).
-    Ok((main_xref_offset, first_page_obj_offset))
+    // **main** cross-reference stream (qpdf's `xref_zero_offset`).  The caller
+    // computes `/T = second_return.saturating_sub(1)`, so return
+    // `main_xref_offset` as the second element.  The first element is also the
+    // main xref offset (used for convergence diagnostics / `last_xref`).
+    Ok((main_xref_offset, main_xref_offset))
 }
 
 /// Emit the primary hint-stream object and return its start byte offset.
@@ -1728,8 +1825,8 @@ fn do_write_pass<R: Read + Seek>(
         result
     } else {
         // The first-page xref stream was already emitted before /E; record
-        // where it landed so the main xref's /Prev (main → first) and /T can
-        // point at it.
+        // where it landed so the file's trailing `startxref` (qpdf's chain leaf)
+        // can point at it and its `/Prev → main xref` can be back-patched.
         let patch = first_page_xref_patch.as_ref().ok_or_else(|| {
             crate::Error::Unsupported(
                 "linearization writer: ObjStm path produced no first-page xref patch \
@@ -1767,10 +1864,11 @@ fn do_write_pass<R: Read + Seek>(
         id_ranges.push(main_section_start..bytes.len());
 
         // Every downstream object offset is now known, so back-patch the
-        // first-page xref's placeholder entry payload in place.  The payload
-        // length was reserved exactly, so this shifts no bytes and the
-        // hint-stream convergence loop is unaffected.
-        patch_first_page_xref(&mut bytes, patch, &xref_offsets, &member_new)?;
+        // first-page xref's placeholder entry payload AND its `/Prev → main
+        // xref` field in place.  Both ranges were reserved at their final byte
+        // length, so this shifts no bytes and the hint-stream convergence loop
+        // is unaffected.  `result.0` is the main xref offset.
+        patch_first_page_xref(&mut bytes, patch, &xref_offsets, &member_new, result.0)?;
 
         result
     };
