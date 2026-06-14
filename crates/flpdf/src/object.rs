@@ -905,6 +905,25 @@ mod stream_dict_order_tests {
         );
     }
 
+    /// With an `id_writer`, the trailer substitutes the `/ID` *value* from the
+    /// closure while still forcing `/ID` last in qpdf's order; every other key
+    /// stays byte-identical to the `None` arm. Production only ever passes
+    /// `Some` (the deterministic-`/ID` direct-write), so this pins that contract.
+    #[test]
+    fn trailer_id_writer_substitutes_value_but_keeps_id_last() {
+        let mut d = Dictionary::new();
+        d.insert(b"Size", Object::Integer(8));
+        d.insert(
+            b"ID",
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+        );
+        d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
+        let mut out = Vec::new();
+        let mut id_writer = |o: &mut Vec<u8>| o.extend_from_slice(b"[<aa><bb>]");
+        d.write_pdf_trailer(&mut out, Some(&mut id_writer));
+        assert_eq!(out, b"<< /Root 1 0 R /Size 8 /ID [<aa><bb>] >>".to_vec());
+    }
+
     /// A trailer without `/ID` is plain sorted order (no special handling).
     #[test]
     fn trailer_without_id_is_sorted() {

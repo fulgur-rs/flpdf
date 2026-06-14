@@ -80,6 +80,7 @@ pub(crate) fn write_deterministic_id_inline(
     out.push(b']'); // note: closing '>' of id1 written below
 }
 ```
+
 NOTE during impl: ensure the byte sequence is exactly `[<id0><id1>]` (32 hex each,
 no inner spaces) — mirror `write_deterministic_id_array`. Fix the `>`/`]` ordering
 so it emits `<id0_hex><id1_hex>]` (the snippet above is a sketch; match

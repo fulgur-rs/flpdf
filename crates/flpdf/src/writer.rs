@@ -4431,6 +4431,33 @@ mod tests {
     }
 
     #[test]
+    fn write_stream_to_buf_with_id_writer_none_matches_write_stream_to_buf() {
+        // The xref-stream helper documents byte-identity with `write_stream_to_buf`
+        // when `id_writer = None`; production only ever passes `Some`, so this pins
+        // the documented `None` contract across both the dictionary and the payload
+        // framing (the helper is otherwise unreachable with `None`).
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::Integer(3));
+        dict.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0xAB; 16]),
+                Object::String(vec![0xCD; 16]),
+            ]),
+        );
+        let stream = crate::Stream::new(dict, b"abc".to_vec());
+
+        let mut expected = Vec::new();
+        write_stream_to_buf(&mut expected, &stream, NewlineBeforeEndstream::Yes);
+        let mut actual = Vec::new();
+        write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
+        assert_eq!(
+            actual, expected,
+            "write_stream_to_buf_with_id_writer(None) must equal write_stream_to_buf"
+        );
+    }
+
+    #[test]
     fn write_pdf_with_id_writer_keys_on_name_not_byte_pattern() {
         // The direct-write path keys on the `/ID` dictionary *name*, not on a
         // byte pattern. A preserved entry whose key sorts before `/ID` (here
