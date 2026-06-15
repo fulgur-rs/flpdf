@@ -274,6 +274,7 @@ echo "lone-flate-l9/linearize.pdf"
 mkdir -p "$REF/shared-stream-objstm"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/shared-stream-objstm.pdf" "$REF/shared-stream-objstm/linearize-objstm.pdf"
+qpdf --check "$REF/shared-stream-objstm/linearize-objstm.pdf" >/dev/null
 echo "shared-stream-objstm/linearize-objstm.pdf"
 
 echo ""

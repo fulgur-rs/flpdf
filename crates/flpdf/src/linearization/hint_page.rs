@@ -301,9 +301,13 @@ impl PageOffsetHintTable {
     /// not back-patched, so a placeholder zero would bake an incorrect
     /// header / entries into the table).  Also panics if the plan has zero
     /// pages — these all indicate a malformed `LinearizationPlan` that the
-    /// caller is expected to construct consistently.  The `renumber` map orders
-    /// the folded first-page shared-hint section by physical object number, the
-    /// order qpdf's `checkHSharedObject` walks shared objects positionally.
+    /// caller is expected to construct consistently.
+    ///
+    /// # Shared-hint ordering
+    ///
+    /// The `renumber` map orders the folded first-page shared-hint section by
+    /// physical object number — the order in which a linearized-PDF reader
+    /// walks first-page shared objects positionally.
     pub fn from_plan(
         plan: &LinearizationPlan,
         renumber: &RenumberMap,

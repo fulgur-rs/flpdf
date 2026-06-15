@@ -909,14 +909,14 @@ impl LinearizationPlan {
         // generation `u16::MAX`; a plain entry carries an original ref resolved
         // through `renumber`. Part-8 entries (after the boundary) stay in place.
         let boundary = first_page_out_end.unwrap_or(out.len());
-        out[..boundary].sort_by_key(|e| {
+        out[..boundary].sort_unstable_by_key(|e| {
             if e.object_ref.generation == u16::MAX {
                 e.object_ref.number
             } else {
                 renumber
                     .new_for_original(e.object_ref)
-                    .map(|r| r.number)
-                    .unwrap_or(u32::MAX)
+                    .expect("shared hint object must exist in RenumberMap")
+                    .number
             }
         });
 
@@ -1221,7 +1221,7 @@ impl LinearizationPlan {
             .flat_map(|b| b.iter().copied())
             .collect();
         members.extend(first_half_extra);
-        members.sort_by_key(|r| r.number);
+        members.sort_unstable_by_key(|r| r.number);
         plan.part3_batches = members.chunks(cap).map(|chunk| chunk.to_vec()).collect();
 
         Ok(())
