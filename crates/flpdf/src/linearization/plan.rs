@@ -820,7 +820,8 @@ impl LinearizationPlan {
     /// number (generation 0).  The shared-object / page-offset hint encoders
     /// key shared objects by their position in this list (qpdf assigns the
     /// physical object numbers positionally from the first page object), so the
-    /// synthetic ref is never resolved through a [`RenumberMap`].
+    /// synthetic ref is never resolved through a
+    /// [`RenumberMap`](crate::linearization::renumber::RenumberMap).
     ///
     /// An empty `member_to_container` yields a clone of `shared_hints` (the
     /// no-ObjStm / classic path is unchanged).
