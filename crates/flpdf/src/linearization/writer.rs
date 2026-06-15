@@ -2143,16 +2143,16 @@ pub fn write_linearized<R: Read + Seek>(
     // `computeDeterministicIDData`, qpdf 11.9.0; the hint stream is written only
     // afterwards). That pass-1 buffer is loop-invariant (it carries no hint
     // stream, so it never depends on hint convergence), so build it once here and
-    // digest it. The resulting identifier is the same the ObjStm path's
-    // [`patch_linearized_deterministic_id`] would compute, but the classic path
-    // emits it directly at both `/ID` sites in the final pass — no placeholder,
-    // no post-write byte scan. The pass-1 buffer itself keeps the all-zero `/ID`
-    // placeholder (its trailer writers get `id_writer = None`), exactly as qpdf's
-    // pass 1 does, so the digest depends only on the input and is stable.
-    //
-    // The ObjStm / xref-stream path is left on the placeholder-then-patch scheme
-    // (qpdf's pass-1 layout there uses xref streams, out of scope here); it
-    // keeps `classic_det_id = None`.
+    // digest it. This pass-1 digest is now computed for *both* paths whenever
+    // `--deterministic-id` is set. The classic (stream-free) path emits it
+    // directly at both `/ID` sites in the final pass — no placeholder, no
+    // post-write byte scan. The ObjStm / xref-stream path still uses the
+    // placeholder-then-patch scheme ([`patch_linearized_deterministic_id`]
+    // overwrites the all-zero placeholders below), but with this same value, so
+    // both paths reach byte-parity with qpdf's `/ID`. The pass-1 buffer itself
+    // keeps the all-zero `/ID` placeholder (its trailer writers get
+    // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
+    // only on the input and is stable.
     let classic_det_id: Option<([u8; 16], [u8; 16])> = if options.deterministic_id {
         let pass1_part1 = build_pass1_part1(&part1);
         let (pass1_bytes, ..) = do_write_pass(
@@ -2585,9 +2585,12 @@ pub fn write_linearized<R: Read + Seek>(
             // identifier computed above at both `/ID` sites (qpdf's 2-pass
             // scheme): the closure emits the fixed-width hex form, the same
             // width as the placeholder, so every downstream offset is
-            // unchanged. Other paths pass `None` and emit the stored value (a
-            // placeholder for the ObjStm deterministic path, patched afterwards;
-            // the real value otherwise).
+            // unchanged. When `--deterministic-id` is off, `classic_det_id` is
+            // `None`, so `id_writer` is `None` and the stored value is emitted.
+            // On the ObjStm deterministic path `id_writer` is `Some` here too,
+            // but only the classic trailer writers consume it (the xref-stream
+            // writers ignore it), so that path's `/ID` stays an all-zero
+            // placeholder and is patched afterwards.
             let mut det_id_closure;
             let id_writer: Option<crate::object::TrailerIdWriter> = match classic_det_id {
                 Some((id0, id1)) => {
@@ -2647,14 +2650,12 @@ pub fn write_linearized<R: Read + Seek>(
     // The classic (stream-free) path already direct-wrote the identifier in the
     // final pass (qpdf's 2-pass scheme; see `classic_det_id` above), so nothing
     // remains to patch there. The ObjStm / xref-stream path still uses the
-    // placeholder-then-patch scheme: qpdf's pass-1 layout there uses xref
-    // streams (a different, out-of-scope reconstruction), so byte-parity with
-    // qpdf's `/ID` is not pursued on that path. Keep the prior, self-stable
-    // behaviour — digest the final buffer itself (`None` digests `final_bytes`
-    // in place, no clone). The placeholder is fixed-width, so the overwrite
-    // shifts no byte offset, and the digest covers a placeholder-bearing buffer
-    // that is a deterministic function of the input, so the `/ID` stays a stable
-    // content fingerprint.
+    // placeholder-then-patch scheme: its `/ID` lives in the xref-stream dicts,
+    // which the final pass emits with all-zero placeholders. We overwrite them
+    // with the pass-1 digest computed above (`classic_det_id`) — the same value
+    // the classic path direct-wrote — so this path reaches byte-parity with
+    // qpdf's `/ID` too. The placeholders are fixed-width, so the overwrite
+    // shifts no byte offset.
     // ------------------------------------------------------------------
     if let (false, Some((id0, id1))) = (objstm_layout.is_empty(), classic_det_id) {
         // ObjStm / xref-stream path: the final pass wrote the all-zero `/ID`
