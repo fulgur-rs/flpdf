@@ -969,25 +969,18 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 fn patch_linearized_deterministic_id(
     bytes: &mut [u8],
     id_ranges: &[std::ops::Range<usize>],
-    info_suffix: &[u8],
-    source_id0: Option<[u8; 16]>,
+    id0: &[u8; 16],
+    id1: &[u8; 16],
 ) {
-    use crate::writer::{
-        compute_deterministic_id, write_deterministic_id_array, DETERMINISTIC_ID_ARRAY_LEN,
-    };
+    use crate::writer::{write_deterministic_id_array, DETERMINISTIC_ID_ARRAY_LEN};
 
-    // Digest the final buffer itself in place (no clone). `compute_deterministic_id`
-    // returns owned ids, so this read-only borrow ends before the in-place `/ID`
-    // patch loop below takes a mutable borrow.
-    // There is no single `[` cutoff (the array recurs at several sites), so the
-    // whole buffer is the digest range: pass the last index as the inclusive
-    // end. (Digest stays global so body-content changes still alter the /ID.)
-    let (id0, id1) = compute_deterministic_id(bytes, bytes.len() - 1, info_suffix, source_id0);
-
+    // The identifier is precomputed from qpdf's pass-1 buffer (see the `det_id`
+    // computation in `write_linearized`); here we only overwrite the all-zero
+    // `/ID` placeholders the final pass wrote at the xref-stream dict sites.
     let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
     write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
     let mut final_id = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
-    write_deterministic_id_array(&mut final_id, &id0, &id1);
+    write_deterministic_id_array(&mut final_id, id0, id1);
 
     // Patch each known `/ID` section in isolation. Body bytes outside these
     // spans are never inspected, so a placeholder-shaped byte run in user data
@@ -1143,27 +1136,54 @@ fn patch_first_page_xref(
     member_new: &BTreeMap<u32, (u32, u32)>,
     main_xref_offset: usize,
     hint_length: usize,
+    pass1: bool,
 ) -> Result<()> {
     // The first-page xref object's own offset is the region start.
     let mut offs = xref_offsets.clone();
     offs.insert(patch.first_xref_num, patch.region.start);
 
-    let entries =
-        xref_stream::build_entries(&offs, member_new, patch.index_start, patch.index_count);
-    let widths = xref_stream::second_pass_widths(
-        xref_stream::max_entry_offset(&entries),
-        hint_length as u64,
-        patch.max_id,
-        patch.max_ostream_index,
-    );
-    let payload = xref_stream::encode_payload(&entries, widths);
+    let (widths, payload, prev) = if pass1 {
+        // qpdf's pass-1 first-half xref: UNCOMPRESSED, the forced-wide field
+        // (`1 << 25` ⇒ `/W [1 4 1]`), `/Prev 0`, and entries only for the objects
+        // written BEFORE it (the param dict + the xref object itself); every
+        // forward reference is a type-0 zero record, since pass 1 does not
+        // back-patch.
+        let pass1_offs: BTreeMap<u32, usize> = offs
+            .iter()
+            .filter(|(_, &off)| off <= patch.region.start)
+            .map(|(&n, &off)| (n, off))
+            .collect();
+        // Pass 1 does not back-patch forward references: every object after the
+        // xref — including ObjStm members — is a type-0 zero record, so the
+        // member map is empty here (members are not yet "resolved" in pass 1).
+        let entries = xref_stream::build_entries(
+            &pass1_offs,
+            &BTreeMap::new(),
+            patch.index_start,
+            patch.index_count,
+        );
+        let widths = xref_stream::first_pass_widths(patch.max_id, patch.max_ostream_index, 0);
+        let payload = xref_stream::encode_payload_uncompressed(&entries, widths);
+        (widths, payload, 0u64)
+    } else {
+        let entries =
+            xref_stream::build_entries(&offs, member_new, patch.index_start, patch.index_count);
+        let widths = xref_stream::second_pass_widths(
+            xref_stream::max_entry_offset(&entries),
+            hint_length as u64,
+            patch.max_id,
+            patch.max_ostream_index,
+        );
+        let payload = xref_stream::encode_payload(&entries, widths);
+        (widths, payload, main_xref_offset as u64)
+    };
     let dict = xref_stream::XrefStreamDict {
         widths,
         index: Some((patch.index_start, patch.index_count)),
         info: patch.info_new_ref,
         root: Some(patch.catalog_new_ref),
         size: patch.size,
-        prev: Some(main_xref_offset as u64),
+        prev: Some(prev),
         id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
     };
     // cov:ignore: the `?` below never fires — write_padded_region errors only if
@@ -1214,6 +1234,7 @@ fn write_main_xref_stream_and_trailer(
     source_trailer: &Dictionary,
     first_page_obj_offset: usize,
     max_ostream_index: u64,
+    pass1: bool,
 ) -> Result<(usize, usize)> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -1230,13 +1251,21 @@ fn write_main_xref_stream_and_trailer(
 
     let entries = xref_stream::build_entries(&offs2, member_new, 0, main_count);
     // The main xref's `writeXRefStream` is called with `hint_length = 0` in qpdf.
+    // Its `max_offset` is its own (already known) offset, so the field stays
+    // narrow in both passes; only compression differs.
     let widths = xref_stream::second_pass_widths(
         xref_stream::max_entry_offset(&entries),
         0,
         max_id,
         max_ostream_index,
     );
-    let payload = xref_stream::encode_payload(&entries, widths);
+    // Pass 1 (deterministic-/ID digest) writes the uncompressed PNG-predicted
+    // payload (qpdf's `skip_compression`); the final pass Flate-compresses it.
+    let payload = if pass1 {
+        xref_stream::encode_payload_uncompressed(&entries, widths)
+    } else {
+        xref_stream::encode_payload(&entries, widths)
+    };
 
     // Main (second-half) xref: no `/Index`, `/Info`, `/Root`, or `/Prev` — it is
     // the chain terminal, reached only via the first-page stream's `/Prev`. Its
@@ -1776,6 +1805,7 @@ fn do_write_pass<R: Read + Seek>(
             source_trailer,
             first_page_obj_offset,
             max_ostream_index,
+            pass1_digest,
         )?;
         // Main xref stream object is the second (and last) `/ID` site on the
         // ObjStm path.  Its span extends through the trailing
@@ -1795,6 +1825,7 @@ fn do_write_pass<R: Read + Seek>(
             &member_new,
             result.0,
             hint_stream_obj_total_len,
+            pass1_digest,
         )?; // cov:ignore: propagates patch_first_page_xref's unreachable region-overflow error arm.
 
         result
@@ -2116,52 +2147,51 @@ pub fn write_linearized<R: Read + Seek>(
     // `computeDeterministicIDData`, qpdf 11.9.0; the hint stream is written only
     // afterwards). That pass-1 buffer is loop-invariant (it carries no hint
     // stream, so it never depends on hint convergence), so build it once here and
-    // digest it. The resulting identifier is the same the ObjStm path's
-    // [`patch_linearized_deterministic_id`] would compute, but the classic path
-    // emits it directly at both `/ID` sites in the final pass — no placeholder,
-    // no post-write byte scan. The pass-1 buffer itself keeps the all-zero `/ID`
-    // placeholder (its trailer writers get `id_writer = None`), exactly as qpdf's
-    // pass 1 does, so the digest depends only on the input and is stable.
-    //
-    // The ObjStm / xref-stream path is left on the placeholder-then-patch scheme
-    // (qpdf's pass-1 layout there uses xref streams, out of scope here); it
-    // keeps `classic_det_id = None`.
-    let classic_det_id: Option<([u8; 16], [u8; 16])> =
-        if options.deterministic_id && objstm_layout.is_empty() {
-            let pass1_part1 = build_pass1_part1(&part1);
-            let (pass1_bytes, ..) = do_write_pass(
-                plan,
-                renumber,
-                pdf,
-                &pass1_part1,
-                catalog_new_ref,
-                hint_stream_new_num,
-                total_count,
-                info_new_ref,
-                first_page_object_new_num,
-                // The hint stream is absent in pass 1, so its payload / `/S`
-                // offset are never emitted; pass empty / zero placeholders.
-                &[],
-                0,
-                &source_trailer,
-                &objstm_layout,
-                &relocation,
-                options,
-                true,
-                None,
-            )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeed on these same inputs, so it cannot introduce a new Err.
-                // Whole-buffer digest: a linearized file repeats `/ID` at several
-                // sites, so there is no single `[` cutoff; pass the last index as the
-                // inclusive end (matching the prior patch step's digest range).
-            Some(crate::writer::compute_deterministic_id(
-                &pass1_bytes,
-                pass1_bytes.len() - 1,
-                &det_id_info_suffix,
-                det_id_source_id0,
-            ))
-        } else {
-            None
-        };
+    // digest it. This pass-1 digest is now computed for *both* paths whenever
+    // `--deterministic-id` is set. The classic (stream-free) path emits it
+    // directly at both `/ID` sites in the final pass — no placeholder, no
+    // post-write byte scan. The ObjStm / xref-stream path still uses the
+    // placeholder-then-patch scheme ([`patch_linearized_deterministic_id`]
+    // overwrites the all-zero placeholders below), but with this same value, so
+    // both paths reach byte-parity with qpdf's `/ID`. The pass-1 buffer itself
+    // keeps the all-zero `/ID` placeholder (its trailer writers get
+    // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
+    // only on the input and is stable.
+    let classic_det_id: Option<([u8; 16], [u8; 16])> = if options.deterministic_id {
+        let pass1_part1 = build_pass1_part1(&part1);
+        let (pass1_bytes, ..) = do_write_pass(
+            plan,
+            renumber,
+            pdf,
+            &pass1_part1,
+            catalog_new_ref,
+            hint_stream_new_num,
+            total_count,
+            info_new_ref,
+            first_page_object_new_num,
+            // The hint stream is absent in pass 1, so its payload / `/S`
+            // offset are never emitted; pass empty / zero placeholders.
+            &[],
+            0,
+            &source_trailer,
+            &objstm_layout,
+            &relocation,
+            options,
+            true,
+            None,
+        )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeed on these same inputs, so it cannot introduce a new Err.
+            // Whole-buffer digest: a linearized file repeats `/ID` at several
+            // sites, so there is no single `[` cutoff; pass the last index as the
+            // inclusive end (matching the prior patch step's digest range).
+        Some(crate::writer::compute_deterministic_id(
+            &pass1_bytes,
+            pass1_bytes.len() - 1,
+            &det_id_info_suffix,
+            det_id_source_id0,
+        ))
+    } else {
+        None
+    };
 
     // ------------------------------------------------------------------
     // Convergence loop (max 3 iterations).
@@ -2559,9 +2589,12 @@ pub fn write_linearized<R: Read + Seek>(
             // identifier computed above at both `/ID` sites (qpdf's 2-pass
             // scheme): the closure emits the fixed-width hex form, the same
             // width as the placeholder, so every downstream offset is
-            // unchanged. Other paths pass `None` and emit the stored value (a
-            // placeholder for the ObjStm deterministic path, patched afterwards;
-            // the real value otherwise).
+            // unchanged. When `--deterministic-id` is off, `classic_det_id` is
+            // `None`, so `id_writer` is `None` and the stored value is emitted.
+            // On the ObjStm deterministic path `id_writer` is `Some` here too,
+            // but only the classic trailer writers consume it (the xref-stream
+            // writers ignore it), so that path's `/ID` stays an all-zero
+            // placeholder and is patched afterwards.
             let mut det_id_closure;
             let id_writer: Option<crate::object::TrailerIdWriter> = match classic_det_id {
                 Some((id0, id1)) => {
@@ -2621,22 +2654,19 @@ pub fn write_linearized<R: Read + Seek>(
     // The classic (stream-free) path already direct-wrote the identifier in the
     // final pass (qpdf's 2-pass scheme; see `classic_det_id` above), so nothing
     // remains to patch there. The ObjStm / xref-stream path still uses the
-    // placeholder-then-patch scheme: qpdf's pass-1 layout there uses xref
-    // streams (a different, out-of-scope reconstruction), so byte-parity with
-    // qpdf's `/ID` is not pursued on that path. Keep the prior, self-stable
-    // behaviour — digest the final buffer itself (`None` digests `final_bytes`
-    // in place, no clone). The placeholder is fixed-width, so the overwrite
-    // shifts no byte offset, and the digest covers a placeholder-bearing buffer
-    // that is a deterministic function of the input, so the `/ID` stays a stable
-    // content fingerprint.
+    // placeholder-then-patch scheme: its `/ID` lives in the xref-stream dicts,
+    // which the final pass emits with all-zero placeholders. We overwrite them
+    // with the pass-1 digest computed above (`classic_det_id`) — the same value
+    // the classic path direct-wrote — so this path reaches byte-parity with
+    // qpdf's `/ID` too. The placeholders are fixed-width, so the overwrite
+    // shifts no byte offset.
     // ------------------------------------------------------------------
-    if options.deterministic_id && !objstm_layout.is_empty() {
-        patch_linearized_deterministic_id(
-            &mut final_bytes,
-            &final_id_ranges,
-            &det_id_info_suffix,
-            det_id_source_id0,
-        );
+    if let (false, Some((id0, id1))) = (objstm_layout.is_empty(), classic_det_id) {
+        // ObjStm / xref-stream path: the final pass wrote the all-zero `/ID`
+        // placeholder at both xref-stream dict sites; overwrite them with the
+        // identifier digested from qpdf's pass-1 buffer (byte-identical to qpdf's
+        // value). The classic path direct-wrote it via `id_writer` already.
+        patch_linearized_deterministic_id(&mut final_bytes, &final_id_ranges, &id0, &id1);
     }
 
     // ------------------------------------------------------------------

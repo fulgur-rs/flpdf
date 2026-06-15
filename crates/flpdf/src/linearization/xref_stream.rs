@@ -119,6 +119,17 @@ pub(crate) fn encode_payload(entries: &[XrefStreamEntry], widths: XrefWidths) ->
     flate_compress(&png_up_predict(&rows, columns(widths)))
 }
 
+/// PNG-Up-predicted rows WITHOUT Flate — qpdf's pass-1 (`skip_compression`) xref
+/// stream payload. qpdf still declares `/Filter /FlateDecode` on the pass-1
+/// object (an invalid but throwaway buffer used only to size the region and seed
+/// the deterministic `/ID`), so the payload is the predictor output alone.
+pub(crate) fn encode_payload_uncompressed(
+    entries: &[XrefStreamEntry],
+    widths: XrefWidths,
+) -> Vec<u8> {
+    png_up_predict(&build_rows(entries, widths), columns(widths))
+}
+
 /// Stream-dictionary metadata for a cross-reference stream, in qpdf key order.
 pub(crate) struct XrefStreamDict<'a> {
     /// `/W` field widths.
