@@ -250,11 +250,12 @@ impl ObjStmLayout {
 
 /// Build (and FlateDecode-wrap) the ObjStm container stream object for one
 /// scheduled container, resolving + renumbering each member from `pdf`.
-fn build_objstm_container_object<R: Read + Seek>(
+fn append_objstm_container_object<R: Read + Seek>(
+    bytes: &mut Vec<u8>,
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-) -> Result<Object> {
+) -> Result<usize> {
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
         let object = pdf.resolve_borrowed(orig)?;
@@ -265,7 +266,29 @@ fn build_objstm_container_object<R: Read + Seek>(
     // Linearized output always uses FlateDecode for ObjStm containers —
     // the linearization writer does not expose a CompressStreams knob.
     let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes)?;
-    Ok(Object::Stream(stream))
+
+    // Emit the container dict in qpdf 11.9.0's fixed key order
+    // (`/Type /ObjStm /Length /Filter /N /First`); the generic `BTreeMap`-backed
+    // [`Object::Stream`] serializer would alphabetise the keys instead. Framing
+    // mirrors [`append_hint_stream_object`].
+    let offset = bytes.len();
+    // Write the header directly into `bytes` to avoid temporary `String`
+    // allocations from `format!`.
+    use std::io::Write as _;
+    let _ = write!(
+        bytes,
+        "{} 0 obj\n<< /Type /ObjStm /Length {} /Filter /FlateDecode /N {} /First {} >>\nstream\n",
+        container.container_new_num,
+        stream.data.len(),
+        body.n_members,
+        body.first_offset,
+    );
+    bytes.extend_from_slice(&stream.data);
+    // No newline before `endstream` — qpdf's default (NewlineBeforeEndstream is
+    // Never on this path); the ObjStm body's own trailing newline is inside the
+    // compressed data.
+    bytes.extend_from_slice(b"endstream\nendobj\n");
+    Ok(offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,9 +1628,7 @@ fn do_write_pass<R: Read + Seek>(
     // qpdf 11.9 /E placement, which includes the Part-3 ObjStm) stays
     // consistent.  The container itself is a plain indirect object.
     for container in &objstm_layout.part3 {
-        let container_obj = build_objstm_container_object(container, renumber, pdf)?;
-        let container_ref = ObjectRef::new(container.container_new_num, 0);
-        let offset = append_object(&mut bytes, container_ref, &container_obj);
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -1654,9 +1675,7 @@ fn do_write_pass<R: Read + Seek>(
 
     // Part-4 ObjStm containers (after /E, in the remaining body).
     for container in &objstm_layout.part4 {
-        let container_obj = build_objstm_container_object(container, renumber, pdf)?;
-        let container_ref = ObjectRef::new(container.container_new_num, 0);
-        let offset = append_object(&mut bytes, container_ref, &container_obj);
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
         xref_offsets.insert(container.container_new_num, offset);
     }
 
