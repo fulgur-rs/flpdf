@@ -1201,15 +1201,22 @@ impl LinearizationPlan {
         }
         // cov:ignore-end
 
-        // Flatten the existing Part-3 members (preserving order), append the
-        // extras, and re-chunk by the cap so no container exceeds the limit.
-        // qpdf's default cap (100) keeps everything in one first-half container.
+        // Flatten the existing Part-3 members, append the extras, then order the
+        // whole set by ascending source object number and re-chunk by the cap so
+        // no container exceeds the limit.  qpdf packs first-half ObjStm container
+        // members in ascending object number of the source document (measured
+        // against qpdf 11.9.0: a first-page shared /Pages tree with a lower
+        // source number than a shared font dict is packed before it), so the
+        // member set must be source-number sorted rather than left in
+        // Part-3-then-extras order.  qpdf's default cap (100) keeps everything in
+        // one first-half container.
         let mut members: Vec<ObjectRef> = plan
             .part3_batches
             .iter()
             .flat_map(|b| b.iter().copied())
             .collect();
         members.extend(first_half_extra);
+        members.sort_by_key(|r| r.number);
         plan.part3_batches = members.chunks(cap).map(|chunk| chunk.to_vec()).collect();
 
         Ok(())
