@@ -849,6 +849,11 @@ impl LinearizationPlan {
 
         // The first-page section of `shared_hints` is the leading part2 ++ part3
         // entries; trailing entries are Part-8 (`part4_other_pages_shared`, after /E).
+        // Invariant: this split is only correct because `Self::new` builds
+        // `shared_hints` as exactly `part2_entries ++ part3_entries ++
+        // part4_shared_entries` (one entry per object, no filter). Keep the two
+        // in lockstep — reordering the construction there silently breaks this
+        // boundary.
         let first_page_input = self.part2_objects.len() + self.part3_objects.len();
 
         // Position (index into the output list) at which each container was
@@ -3483,9 +3488,9 @@ mod tests {
     /// A Part-8 entry (`part4_other_pages_shared`, after /E) is NOT sorted into
     /// the first-page section: only the leading part2 ++ part3 entries are
     /// reordered by physical object number. Here a plain ineligible shared
-    /// stream (`image`, physical-numbered after the container) must sort AFTER
-    /// the folded container within the first-page section, while the trailing
-    /// Part-8 entry stays last regardless of its physical number.
+    /// stream (`image`), physically numbered BEFORE the container, must sort
+    /// BEFORE the folded container within the first-page section, while the
+    /// trailing Part-8 entry stays last regardless of its physical number.
     #[test]
     fn canonical_shared_hints_orders_first_page_and_keeps_part8_last() {
         let page = ObjectRef::new(8, 0);
