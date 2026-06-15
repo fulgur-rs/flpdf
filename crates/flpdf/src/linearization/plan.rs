@@ -817,7 +817,9 @@ impl LinearizationPlan {
     /// and in order.
     ///
     /// The container entry's `object_ref` carries the container's *new* object
-    /// number (generation 0).  The shared-object / page-offset hint encoders
+    /// number with generation `u16::MAX` — a sentinel no live object uses,
+    /// marking it as a synthetic container entry rather than a resolvable PDF
+    /// object.  The shared-object / page-offset hint encoders
     /// key shared objects by their position in this list (qpdf assigns the
     /// physical object numbers positionally from the first page object), so the
     /// synthetic ref is never resolved through a

@@ -7,7 +7,7 @@
 ## ゴールと方針
 flpdf の `--linearize --object-streams=generate`（および `preserve`）出力を qpdf 11.9.0 と
 **byte-identical** にする（CLAUDE.md 最優先方針: pre-v1.0 は qpdf 完全模倣。唯一の例外は
-DEFLAT 実装で、厳密な byte 比較は `qpdf-zlib-compat` feature=zlib バックエンドで行う）。
+DEFLATE 実装で、厳密な byte 比較は `qpdf-zlib-compat` feature=zlib バックエンドで行う）。
 
 これは epic **flpdf-vvjr**（ObjStm linearized 完全 byte-parity）の最終段。まず `bd prime` を実行し、
 次を読む: `bd show flpdf-6pcx`（次の作業）、`bd show flpdf-ihb.1`（計測済み qpdf リファレンス＋設計 spec、
