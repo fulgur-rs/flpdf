@@ -2390,7 +2390,8 @@ pub fn write_linearized<R: Read + Seek>(
             // real original ref whose number happens to coincide with a
             // container's new number can never be mistaken for a container (and
             // vice versa).
-            let folded_shared = plan.canonical_shared_hints(&objstm_layout.member_to_container);
+            let folded_shared =
+                plan.canonical_shared_hints(&objstm_layout.member_to_container, renumber);
             let shared_section_lens: Vec<u64> =
                 folded_shared
                     .iter()

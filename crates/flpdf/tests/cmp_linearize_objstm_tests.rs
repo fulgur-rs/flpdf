@@ -131,6 +131,11 @@ fn three_page_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("three-page.pdf", "three-page");
 }
 
+#[test]
+fn shared_stream_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("shared-stream-objstm.pdf", "shared-stream-objstm");
+}
+
 // Full byte-identity, including the deterministic /ID[1] (digested from qpdf's
 // pass-1 xref-stream buffer; flpdf-9ntt).
 #[test]
@@ -141,4 +146,9 @@ fn two_page_objstm_byte_identical_to_qpdf() {
 #[test]
 fn three_page_objstm_byte_identical_to_qpdf() {
     assert_strict("three-page.pdf", "three-page");
+}
+
+#[test]
+fn shared_stream_objstm_byte_identical_to_qpdf() {
+    assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
 }
