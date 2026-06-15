@@ -1558,7 +1558,9 @@ fn do_write_pass<R: Read + Seek>(
     let mut catalog_emitted_early = false;
     if let Some(catalog_orig) = plan.root_ref {
         debug_assert!(
-            !objstm_layout.member_to_container.contains_key(&catalog_orig),
+            !objstm_layout
+                .member_to_container
+                .contains_key(&catalog_orig),
             "planner invariant: /Catalog is never an ObjStm member"
         );
         let object = pdf.resolve_borrowed(catalog_orig)?;

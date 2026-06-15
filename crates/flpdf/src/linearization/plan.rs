@@ -1076,8 +1076,10 @@ impl LinearizationPlan {
         plan.part4_batches = std::mem::take(&mut plan.part4_batches)
             .into_iter()
             .filter_map(|batch| {
-                let kept: Vec<ObjectRef> =
-                    batch.into_iter().filter(|r| !excluded.contains(r)).collect();
+                let kept: Vec<ObjectRef> = batch
+                    .into_iter()
+                    .filter(|r| !excluded.contains(r))
+                    .collect();
                 (!kept.is_empty()).then_some(kept)
             })
             .collect();
