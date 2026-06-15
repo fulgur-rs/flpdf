@@ -439,11 +439,11 @@ pub fn parse_pdf_version(v: &str) -> Option<(u8, u8)> {
 /// 1. If `options.force_version` is set, use it verbatim.
 /// 2. Otherwise start from `max(source, min_version_option)`.
 /// 3. If `object_streams` is true, apply a `max(…, "1.5")` floor. Cross-
-///    reference and object streams were introduced in PDF 1.5, so qpdf raises
-///    the minimum to 1.5 (`setMinimumPDFVersion("1.5")`) whenever it actually
-///    emits one. The caller passes whether the output *really* contains an
-///    object stream (not merely whether the mode requests it), so a generate
-///    request that packs nothing leaves the version untouched, matching qpdf.
+///    reference and object streams were introduced in PDF 1.5, so the output
+///    must use at least 1.5 whenever such streams are actually emitted. The
+///    caller passes whether the output *really* contains an object stream (not
+///    merely whether the mode requests it), so a generate request that packs
+///    nothing leaves the version untouched, matching qpdf.
 /// 4. If `linearize` is true, apply an additional `max(…, "1.2")` floor
 ///    (linearized PDFs require at least PDF 1.2).
 ///
@@ -2514,10 +2514,9 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         ));
     }
 
-    // Object-stream floor passes `false`: the full-rewrite generate path does
-    // not yet raise the header to 1.5 when it packs ObjStm containers (tracked
-    // separately). This preserves the existing non-linearized behaviour; the
-    // 1.5 floor is wired only on the linearized ObjStm path for now.
+    // Pass `false` here because full-rewrite ObjStm emission is only known
+    // after planning. The required PDF 1.5 floor is applied below from the
+    // final xref form, which becomes `Stream` when ObjStm batches are emitted.
     let mut version = effective_pdf_version(pdf.version(), options, false, false).to_owned();
 
     // ── encryption preflight (flpdf-9hc.4.9 / 4.11 / 4.16 / 4.17) ─────────
