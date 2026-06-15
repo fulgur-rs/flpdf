@@ -803,6 +803,80 @@ impl LinearizationPlan {
             .collect()
     }
 
+    /// Fold first-page-section ObjStm members into their containers to match
+    /// qpdf's shared-object hint list.
+    ///
+    /// When the first-page shared dicts are packed into a first-half ObjStm
+    /// container, qpdf lists the *container* (one entry) in the shared-object
+    /// hint table — not each compressed member.  This rewrites
+    /// [`shared_hints`](Self::shared_hints): every member present in
+    /// `member_to_container` is replaced by a single entry for its container
+    /// (placed at the first member's position, with the `referencing_pages` of
+    /// all that container's members unioned), and the second-and-later members
+    /// of the same container are dropped.  Non-member entries are kept verbatim
+    /// and in order.
+    ///
+    /// The container entry's `object_ref` carries the container's *new* object
+    /// number with generation `u16::MAX` — a sentinel no live object uses,
+    /// marking it as a synthetic container entry rather than a resolvable PDF
+    /// object.  The shared-object / page-offset hint encoders
+    /// key shared objects by their position in this list (qpdf assigns the
+    /// physical object numbers positionally from the first page object), so the
+    /// synthetic ref is never resolved through a
+    /// [`RenumberMap`](crate::linearization::renumber::RenumberMap).
+    ///
+    /// An empty `member_to_container` yields a clone of `shared_hints` (the
+    /// no-ObjStm / classic path is unchanged).
+    pub(crate) fn canonical_shared_hints(
+        &self,
+        member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
+    ) -> Vec<SharedObjectHintEntry> {
+        if member_to_container.is_empty() {
+            return self.shared_hints.clone();
+        }
+
+        // Position (index into the output list) at which each container was
+        // first emitted, so later members of the same container fold into it.
+        let mut container_pos: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut out: Vec<SharedObjectHintEntry> = Vec::with_capacity(self.shared_hints.len());
+
+        for entry in &self.shared_hints {
+            match member_to_container.get(&entry.object_ref) {
+                Some(&(container_num, _idx)) => {
+                    if let Some(&pos) = container_pos.get(&container_num) {
+                        // Fold into the already-emitted container entry: union
+                        // the referencing pages (dedup, keep ascending order).
+                        let merged: &mut Vec<u32> = &mut out[pos].referencing_pages;
+                        for &p in &entry.referencing_pages {
+                            if let Err(insert_at) = merged.binary_search(&p) {
+                                merged.insert(insert_at, p);
+                            }
+                        }
+                    } else {
+                        // First member of this container: emit one entry for the
+                        // container, carrying its new object number. The
+                        // generation is the sentinel `u16::MAX`: no live object
+                        // ever uses it, so consumers can identify this synthetic
+                        // container entry unambiguously — even when `container_num`
+                        // coincides with a surviving original object's number,
+                        // which would otherwise resolve through a `RenumberMap`.
+                        let mut pages = entry.referencing_pages.clone();
+                        pages.sort_unstable();
+                        pages.dedup();
+                        container_pos.insert(container_num, out.len());
+                        out.push(SharedObjectHintEntry {
+                            object_ref: ObjectRef::new(container_num, u16::MAX),
+                            referencing_pages: pages,
+                        });
+                    }
+                }
+                None => out.push(entry.clone()),
+            }
+        }
+
+        out
+    }
+
     /// Useful for callers that want to verify the disjoint invariant.
     /// Uses the three fine-grained Part-4 sub-partitions as the canonical
     /// source of truth.
@@ -905,13 +979,14 @@ impl LinearizationPlan {
     /// | Mode | Result |
     /// |------|--------|
     /// | `Disable` | Both batch lists are empty (no ObjStms emitted). |
-    /// | `Generate` | Part-3 objects stay plain indirect (`part3_batches` is empty); eligible Part-4 objects are packed into `part4_batches`. |
+    /// | `Generate` | Eligible Part-3 (first-page shared) objects are packed into `part3_batches`; eligible Part-4 objects are packed into `part4_batches` (then canonicalised, see Note). |
     /// | `Preserve` | Existing source ObjStm membership is re-used for Part-4, but any member in `part2_objects` or ineligible per [`is_eligible_for_objstm`] is silently dropped. Members that span the Part-3/Part-4 boundary are split into separate batches per part. If the source document contained no ObjStms, both batch lists are **empty** — Preserve does **not** fall through to Generate; it mirrors the behaviour of the non-linearized `writer::object_streams::plan_preserve` and qpdf's `--object-streams=preserve` semantics (preserve means "keep what was there", not "invent new ObjStms"). |
     ///
-    /// **Note:** regardless of mode, `part3_batches` is unconditionally
-    /// cleared by the Part-3 safety valve at the end of `objstm_batches`,
-    /// so Part-3 page-1 shared objects always remain plain indirect until a
-    /// section-aware renumber layout lands.
+    /// **Note:** after the per-mode packing, the member set is canonicalised to
+    /// qpdf 11.9.0's linearized layout (see `canonicalise_first_half_batch`):
+    /// the `/Pages` tree and `/Info` dictionary are folded into the first-half
+    /// (Part-3) batch and `/Catalog` is kept standalone, so the resulting
+    /// container membership matches qpdf for both Generate and Preserve.
     ///
     /// # Invariants
     ///
@@ -942,41 +1017,161 @@ impl LinearizationPlan {
             }
         };
 
-        // Safety valve: Part-3 page-1 shared objects stay plain indirect
-        // (flpdf-9hc.5.8.4 investigation; tracked as flpdf-ihb).
+        // Canonicalise the first-half ObjStm member set to qpdf's linearized
+        // layout.  qpdf 11.9.0 packs exactly the first page's shared resource
+        // dicts (its `/Font` dict + `/Font`) PLUS the `/Pages` tree and `/Info`
+        // dictionary into ONE first-half ObjStm container, and keeps the
+        // document `/Catalog` standalone (uncompressed).  flpdf's planner emits
+        // the first-page shared objects as `part3_batches` and would otherwise
+        // route `/Pages`/`/Info`/`/Catalog` through `part4_batches`; here we
+        // fold `/Pages` + `/Info` into the first-half (Part-3) batch and drop
+        // `/Catalog`/`/Pages`/`/Info` from the Part-4 batches so the resulting
+        // container membership matches qpdf for both Generate and Preserve.
         //
-        // Part-3 first-page shared-object ObjStm packing is structurally
-        // incompatible with flpdf-56u's split-xref tail relocation and cannot
-        // pass `qpdf --check-linearization`.  qpdf's `checkHSharedObject`
-        // (QPDF_linearization.cc) builds its index→object map *positionally*:
-        // the first `nshared_first_page` shared hint entries are assigned
-        // object numbers starting from `pages.at(0).getObjectID()` and
-        // incrementing by 1, so the first-page shared objects (or their
-        // ObjStm container) must occupy a contiguous low object-number block
-        // immediately after the first-page object.  flpdf-56u's
-        // `relocate_objstm_members` moves every ObjStm member + container to a
-        // high contiguous *tail* block (so the split first-page/main xref
-        // `/Index` ranges never interleave type-1 after type-2).  Those two
-        // constraints are mutually exclusive without redesigning the 56u
-        // relocation, which is out of scope for 5.8.4.  Empirically, removing
-        // this clear makes qpdf report "object count mismatch for page 0" and
-        // "shared object … in hint table but not computed list".
+        // qpdf re-derives this canonical partition regardless of the source
+        // ObjStm boundaries (observed: `--object-streams=preserve` on a
+        // single-container source still emits the canonical first-half
+        // container).  Apply it only when there is already a first-half
+        // (Part-3) batch to augment — i.e. the document has first-page SHARED
+        // objects (multi-page).  Single-page files have no first-page shared
+        // objects (`part3_batches` is empty), so qpdf's first-half member set
+        // does not apply: `/Pages` + `/Info` stay in the second-half Part-4
+        // container, matching flpdf's prior single-page output (and avoiding a
+        // first-half container that would leave the page-private resource dicts
+        // — which flpdf keeps plain — straddling `/E`).  A Preserve run over a
+        // source with NO ObjStms likewise has no batches, so nothing is folded.
         //
-        // NOTE: qpdf itself *does* pack some Part-3 first-page shared objects
-        // (e.g. the font/resource dicts referenced by page 1) into an ObjStm.
-        // flpdf cannot match that member set while keeping
-        // `qpdf --check-linearization` clean, because 56u's split-xref tail
-        // relocation is incompatible with qpdf's positional shared-object
-        // numbering (above).  Matching qpdf's member set requires a
-        // section-aware renumber redesign — tracked as flpdf-ihb, and NOT
-        // required for epic 5.8 acceptance (the brainstorming-confirmed target
-        // is observable-equivalent: qpdf-clean + boundaries + round-trip + 3
-        // modes, not byte/member-set parity).  Part-4 (rest-of-document)
-        // packing is unaffected.  Re-enable by removing this clear once
-        // flpdf-ihb lands a section-aware renumber layout.
-        plan.part3_batches.clear();
+        // The document `/Catalog`, however, is NEVER compressed by qpdf in any
+        // object-stream mode, so its Part-4 exclusion is unconditional — the
+        // `/Pages` + `/Info` first-half fold is what depends on a first-half
+        // batch existing.  Without this, a single-page / no-first-page-shared
+        // Generate document (where `part3_batches` is empty and
+        // `canonicalise_first_half_batch` is skipped) would pack an eligible
+        // `/Catalog` into a Part-4 ObjStm container.
+        if let Some(catalog_ref) = self.root_ref {
+            Self::drop_from_part4_batches(&mut plan, &BTreeSet::from([catalog_ref]));
+        }
+
+        if !plan.part3_batches.is_empty() {
+            // cov:ignore-start: the `?` error arm is unreachable in tests —
+            // `canonicalise_first_half_batch` only propagates a
+            // `pdf.resolve_borrowed` failure on /Info or the /Pages tree, which
+            // does not occur for well-formed inputs.
+            self.canonicalise_first_half_batch(
+                pdf,
+                &ctx,
+                &length_exclusions,
+                config.batch_size_cap.get(),
+                &mut plan,
+            )?;
+            // cov:ignore-end
+        }
 
         Ok(plan)
+    }
+
+    /// Remove every ref in `excluded` from each Part-4 ObjStm batch, dropping any
+    /// batch left empty.  An empty `excluded` set is a harmless no-op.
+    fn drop_from_part4_batches(plan: &mut ObjStmBatchPlan, excluded: &BTreeSet<ObjectRef>) {
+        plan.part4_batches = std::mem::take(&mut plan.part4_batches)
+            .into_iter()
+            .filter_map(|batch| {
+                let kept: Vec<ObjectRef> = batch
+                    .into_iter()
+                    .filter(|r| !excluded.contains(r))
+                    .collect();
+                (!kept.is_empty()).then_some(kept)
+            })
+            .collect();
+    }
+
+    /// Fold the `/Pages` tree and `/Info` dictionary into the first-half
+    /// (Part-3) ObjStm batch(es) and exclude `/Catalog`, `/Pages`, and `/Info`
+    /// from the Part-4 batches, matching qpdf 11.9.0's linearized member set
+    /// ({first-page `/Font` dict, `/Font`, `/Info`, `/Pages` tree} in one
+    /// first-half container, `/Catalog` standalone).
+    ///
+    /// The combined first-half member set (existing Part-3 members, then
+    /// `/Info`, then the `/Pages` tree) is re-chunked into batches of at most
+    /// `cap` members, so the qpdf single-container layout holds for the default
+    /// cap (100) while a smaller cap still produces conforming containers.
+    ///
+    /// Refs that are not eligible per [`is_eligible_for_objstm`] (or absent)
+    /// are left as plain indirects; only eligible refs are moved.
+    fn canonicalise_first_half_batch<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        ctx: &crate::writer::object_streams::EligibilityContext,
+        length_exclusions: &BTreeSet<ObjectRef>,
+        cap: usize,
+        plan: &mut ObjStmBatchPlan,
+    ) -> crate::Result<()> {
+        // Objects qpdf never compresses in a linearized file: the document
+        // Catalog stays a standalone indirect object.
+        let catalog_ref = self.root_ref;
+
+        // First-half shared dicts qpdf packs alongside the Part-3 font/resource
+        // dicts: the /Info dictionary and the /Pages tree.  Collect the eligible
+        // ones (skip free/length-exclusion/ineligible refs) in qpdf's order
+        // (Info before Pages-tree, matching the measured member set
+        // {Font dict, Font, Info, Pages-tree}).  Skip any already present in the
+        // existing Part-3 batches so the fold is idempotent.
+        let existing_part3: BTreeSet<ObjectRef> = plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let mut first_half_extra: Vec<ObjectRef> = Vec::new();
+        for candidate in [self.info_ref, self.pages_tree_ref].into_iter().flatten() {
+            // cov:ignore-start: idempotency / exclusion guard — /Info and the
+            // /Pages tree are never first-page SHARED objects (they are not in
+            // the planner's Part-3 set) and are not indirect-/Length stream
+            // targets, so neither predicate fires on real documents; the guard
+            // keeps the fold idempotent if a caller ever pre-seeds them.
+            if existing_part3.contains(&candidate) || length_exclusions.contains(&candidate) {
+                continue;
+            }
+            // cov:ignore-end
+            let obj = pdf.resolve_borrowed(candidate)?;
+            if is_eligible_for_objstm(candidate, obj, ctx) {
+                first_half_extra.push(candidate);
+            }
+        }
+
+        // Exclude /Catalog, /Pages, /Info from the Part-4 batches: /Catalog
+        // stays standalone, /Pages and /Info migrate into the first-half batch.
+        let excluded_from_part4: BTreeSet<ObjectRef> = catalog_ref
+            .into_iter()
+            .chain([self.info_ref, self.pages_tree_ref].into_iter().flatten())
+            .collect();
+        // Filter the excluded refs out of every Part-4 batch (dropping any batch
+        // that becomes empty).  When `excluded_from_part4` is empty this is a
+        // harmless no-op, so no guard is needed — avoiding an unreachable
+        // empty-set branch (a linearizable document always has a /Catalog).
+        Self::drop_from_part4_batches(plan, &excluded_from_part4);
+
+        // cov:ignore-start: defensive — this method is only invoked when
+        // `part3_batches` is non-empty (multi-page docs with first-page shared
+        // objects), and such docs always have an eligible /Pages tree (a plain
+        // dict) to fold, so `first_half_extra` is non-empty in practice; the
+        // early return guards the degenerate "no eligible /Info or /Pages" case.
+        if first_half_extra.is_empty() {
+            return Ok(());
+        }
+        // cov:ignore-end
+
+        // Flatten the existing Part-3 members (preserving order), append the
+        // extras, and re-chunk by the cap so no container exceeds the limit.
+        // qpdf's default cap (100) keeps everything in one first-half container.
+        let mut members: Vec<ObjectRef> = plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        members.extend(first_half_extra);
+        plan.part3_batches = members.chunks(cap).map(|chunk| chunk.to_vec()).collect();
+
+        Ok(())
     }
 
     /// Generate mode: pack eligible Part-3 and Part-4 objects into fresh ObjStm batches.
@@ -2347,15 +2542,25 @@ mod tests {
             .flat_map(|b| b.iter().copied())
             .collect();
 
-        // Permanent qpdf-observable-equivalent behavior: Part-3 page-1 shared
-        // objects are NOT packed (qpdf's own --object-streams=generate leaves
-        // them uncompressed) — part3_batches is empty and the Resources dict
-        // (7 0 R) stays a plain indirect object. flpdf-ihb tracks the
-        // qpdf-superseding "pack Part-3 too" option (non-epic, P3).
+        // qpdf 11.9.0 packs the first-page shared dicts into a first-half
+        // ObjStm: the Resources dict (7 0 R) and the Font it references are
+        // Part-3 objects and MUST appear in part3_batches.  The /Pages tree
+        // (2 0 R) is folded into the same first-half batch; the /Catalog
+        // (1 0 R) stays standalone.
         let resources_ref = ObjectRef::new(7, 0);
         assert!(
-            all_part3_batched.is_empty(),
-            "part3_batches must be empty (Part-3 stays plain indirect; matches qpdf)"
+            all_part3_batched.contains(&resources_ref),
+            "Part-3 Resources dict 7 0 R must be packed into part3_batches"
+        );
+        let pages_tree = plan.pages_tree_ref.expect("fixture has a /Pages tree");
+        assert!(
+            all_part3_batched.contains(&pages_tree),
+            "the /Pages tree ({pages_tree}) must be folded into the first-half batch"
+        );
+        let catalog = plan.root_ref.expect("fixture has a /Catalog");
+        assert!(
+            !all_part3_batched.contains(&catalog) && !all_part4_batched.contains(&catalog),
+            "the /Catalog ({catalog}) must stay standalone (in no batch)"
         );
         assert!(
             !all_part4_batched.contains(&resources_ref),
@@ -2739,71 +2944,48 @@ mod tests {
             "ineligible /Type /XRef dict (6 0 R) must not appear in part4_batches"
         );
 
-        // ── Invariant 3: Part-3 packing is disabled (permanent) ───────────────
-        // Part-3 page-1 shared objects stay plain indirect, matching qpdf's
-        // own --object-streams=generate (which does not compress them). 5 0 R
-        // (Resources, Part-3) must appear in NO batch — neither part3_batches
-        // (cleared) nor misrouted into part4_batches.
+        // ── Invariant 3: Part-3 first-page shared objects ARE packed ──────────
+        // qpdf 11.9.0 packs the first-page shared Resources dict (5 0 R) into a
+        // first-half ObjStm; the /Pages tree (2 0 R) is folded into the same
+        // first-half batch.  5 0 R must appear in part3_batches and NOT be
+        // misrouted into part4_batches.
         assert!(
-            all_part3_batched.is_empty(),
-            "part3_batches must be empty (Part-3 stays plain indirect; matches qpdf)"
+            all_part3_batched.contains(&resources_ref),
+            "Part-3 Resources dict 5 0 R must be packed into part3_batches"
         );
         assert!(
             !all_part4_batched.contains(&resources_ref),
             "Part-3 object 5 0 R must NOT be misrouted into part4_batches"
         );
 
-        // ── Invariant 4: Part 4 eligible members go to part4_batches ─────────
-        // 2 0 R (Pages) from ObjStm 7 and 4 0 R (Page 2) from ObjStm 8 → part4_batches.
+        // ── Invariant 4: /Pages tree is folded into the first-half batch ──────
+        // 2 0 R (Pages) is folded into part3_batches (the qpdf member set), so
+        // it must NOT remain in part4_batches.  4 0 R (Page 2) is a Part-4
+        // page-private dict and stays in part4_batches at the planner level
+        // (the writer drops it later via the page-private filter).
         let pages_ref = ObjectRef::new(2, 0);
         assert!(
-            all_part4_batched.contains(&pages_ref),
-            "Part-4 eligible object 2 0 R (Pages) must appear in part4_batches"
+            all_part3_batched.contains(&pages_ref),
+            "the /Pages tree (2 0 R) must be folded into part3_batches"
         );
         assert!(
-            !all_part3_batched.contains(&pages_ref),
-            "Part-4 object 2 0 R must NOT appear in part3_batches"
+            !all_part4_batched.contains(&pages_ref),
+            "the /Pages tree (2 0 R) must NOT remain in part4_batches"
         );
         assert!(
             all_part4_batched.contains(&page2_ref),
             "Part-4 eligible object 4 0 R (Page 2) must appear in part4_batches"
         );
 
-        // ── Invariant 5: Part-4 batches draw from one source ObjStm ───────────
-        // Part-3 packing is permanently disabled (matches qpdf), so ObjStm 7
-        // contributes only [2 0 R] to part4 (5 0 R is Part-3 → not packed);
-        // ObjStm 8 contributes [4 0 R] to part4. part3_batches is empty.
+        // ── Invariant 5: /Catalog stays standalone ────────────────────────────
+        // qpdf keeps the document /Catalog uncompressed; it must appear in no
+        // batch.  (In this fixture the Catalog 1 0 R was not in any source
+        // ObjStm, but the canonicalisation guards against it regardless.)
+        let catalog_ref = plan.root_ref.expect("fixture has a /Catalog");
         assert!(
-            batch_plan.part3_batches.is_empty(),
-            "part3_batches must be empty (Part-3 stays plain indirect; matches qpdf)"
+            !all_part3_batched.contains(&catalog_ref) && !all_part4_batched.contains(&catalog_ref),
+            "the /Catalog ({catalog_ref}) must stay standalone (in no batch)"
         );
-
-        // ── Invariant 6: Source-index ordering within each source ObjStm ──────
-        // ObjStm 7 members in source-index order: 2 (idx 0), 3 (idx 1), 5 (idx 2).
-        // After filtering: 2 goes to part4; 3 is Part-2; 5 is Part-3 (never
-        // packed; matches qpdf). Within the part4 contribution from ObjStm 7,
-        // ordering must respect idx.
-        // Here only obj 2 survives to part4 from ObjStm 7, so the batch from ObjStm 7
-        // to part4 is [2 0 R] — a single element, trivially sorted.
-        // ObjStm 8 part4 contribution: [4 0 R] (idx 0, sole survivor) — also trivial.
-        // We verify via the full batch list that containers are visited in ascending
-        // container number order (7 before 8), so the pages_ref batch appears before
-        // or the same as the page2_ref batch in part4_batches.
-        let pages_batch_idx = batch_plan
-            .part4_batches
-            .iter()
-            .position(|b| b.contains(&pages_ref));
-        let page2_batch_idx = batch_plan
-            .part4_batches
-            .iter()
-            .position(|b| b.contains(&page2_ref));
-        if let (Some(pi), Some(p2i)) = (pages_batch_idx, page2_batch_idx) {
-            assert!(
-                pi <= p2i,
-                "batch from ObjStm 7 (pages_ref) must appear before or equal to batch from ObjStm 8 (page2_ref); \
-                 got indices {pi} vs {p2i} (container numbers must be visited in ascending order)"
-            );
-        }
 
         // ── Invariant 7: No overlap between part3_batches and part4_batches ────
         let overlap: Vec<ObjectRef> = all_part3_batched
@@ -2852,11 +3034,11 @@ mod tests {
     /// exceed the cap are split into multiple batches per part.
     #[test]
     fn objstm_batches_preserve_cap_splits_large_groups() {
-        // Part-3 packing is permanently disabled (matches qpdf's own
-        // --object-streams=generate), so ObjStm 7 contributes only 2 0 R to
-        // part4 (5 0 R is Part-3 → not packed); ObjStm 8 contributes 4 0 R to
-        // part4. With cap=1, each eligible member that lands in part4 forms
-        // its own batch (at most 1 per batch).
+        // qpdf 11.9.0 packs the first-page shared Resources dict (5 0 R) plus
+        // the /Pages tree (2 0 R) into the first-half ObjStm; ObjStm 8
+        // contributes Page 2 (4 0 R) to part4.  With cap=1 the combined
+        // first-half member set is re-chunked so each batch holds at most one
+        // member.
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
@@ -2895,16 +3077,16 @@ mod tests {
         let pages_ref = ObjectRef::new(2, 0);
         let page2_ref = ObjectRef::new(4, 0);
         assert!(
-            batch_plan.part3_batches.is_empty(),
-            "Part-3 (5 0 R) is never packed; part3_batches must be empty (matches qpdf)"
+            !batch_plan.part3_batches.is_empty(),
+            "Part-3 (5 0 R) is packed into the first-half ObjStm; part3_batches must be non-empty"
         );
         assert!(
-            !all_batched.contains(&resources_ref),
-            "Part-3 object 5 0 R must NOT be batched (stays plain indirect; matches qpdf)"
+            all_batched.contains(&resources_ref),
+            "Part-3 Resources dict 5 0 R must be batched (packed into the first-half ObjStm)"
         );
         assert!(
             all_batched.contains(&pages_ref),
-            "2 0 R must be batched even with cap=1"
+            "2 0 R (/Pages tree, folded into the first-half batch) must be batched even with cap=1"
         );
         assert!(
             all_batched.contains(&page2_ref),
@@ -3075,20 +3257,171 @@ mod tests {
             .flat_map(|b| b.iter().copied())
             .collect();
 
-        // Verify no part3 object appears in part4_batches and vice versa.
+        // The first-half (Part-3) batch holds the Part-3 objects (Resources
+        // 5 0 R + Font 8 0 R) PLUS the /Pages tree (2 0 R), folded in by the
+        // qpdf member-set canonicalisation.  No /Info in this fixture.
         let part3_set: std::collections::BTreeSet<ObjectRef> =
             plan.part3_objects.iter().copied().collect();
+        let pages_tree = plan
+            .pages_tree_ref
+            .expect("two-page fixture has a /Pages tree");
         for r in &all_part3_batched {
             assert!(
-                part3_set.contains(r),
-                "object {r} in part3_batches must come from part3_objects"
+                part3_set.contains(r) || *r == pages_tree,
+                "object {r} in part3_batches must be a Part-3 object or the folded /Pages tree"
             );
         }
+        // The /Pages tree was folded into the first-half batch.
+        assert!(
+            all_part3_batched.contains(&pages_tree),
+            "the /Pages tree ({pages_tree}) must be folded into the first-half batch"
+        );
+        // No Part-3 object, the /Pages tree, or the /Catalog may appear in
+        // part4_batches (Catalog stays standalone; Pages migrates to part3).
+        let catalog = plan.root_ref.expect("fixture has a /Catalog");
         for r in &all_part4_batched {
             assert!(
                 !part3_set.contains(r),
                 "part3 object {r} must not appear in part4_batches"
             );
+            assert_ne!(
+                *r, pages_tree,
+                "the /Pages tree must not remain in part4_batches"
+            );
+            assert_ne!(
+                *r, catalog,
+                "the /Catalog must stay standalone, not in part4_batches"
+            );
         }
+    }
+
+    /// Single-page Generate (no first-page shared objects, so `part3_batches` is
+    /// empty and `canonicalise_first_half_batch` never runs): the document
+    /// `/Catalog` must still be excluded from the Part-4 ObjStm batches, because
+    /// qpdf never compresses the Catalog.  Guards the unconditional Catalog
+    /// exclusion in `objstm_batches` against regressing back under the
+    /// `part3_batches`-non-empty gate.
+    #[test]
+    fn objstm_batches_generate_keeps_catalog_standalone_single_page() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        // Single page → no first-page SHARED objects → no first-half batch.
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+        assert!(
+            batch_plan.part3_batches.is_empty(),
+            "single-page document has no first-page shared objects (no Part-3 batch)"
+        );
+
+        let all_part3_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let all_part4_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part4_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        let catalog = plan.root_ref.expect("fixture has a /Catalog");
+        assert!(
+            !all_part3_batched.contains(&catalog) && !all_part4_batched.contains(&catalog),
+            "the /Catalog ({catalog}) must stay standalone (in no ObjStm batch), \
+             even when there is no first-half Part-3 batch"
+        );
+
+        // The /Pages tree is an eligible plain dict in Part-4 here (it is not
+        // folded into the first half without a Part-3 batch), so it remains
+        // batched — confirming only the Catalog was filtered out, not the whole
+        // batch.
+        let pages_tree = ObjectRef::new(2, 0);
+        assert!(
+            all_part4_batched.contains(&pages_tree),
+            "the /Pages tree (2 0 R) must remain in part4_batches when there is \
+             no first-half batch to fold it into"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // canonical_shared_hints: fold first-page ObjStm members into a container
+    // -----------------------------------------------------------------------
+
+    /// Two members of the same first-half container that reference DIFFERENT
+    /// pages must fold into ONE container entry whose `referencing_pages` is the
+    /// sorted union of both members' pages (exercises the merge-insert path).
+    #[test]
+    fn canonical_shared_hints_folds_members_and_unions_pages() {
+        let page = ObjectRef::new(3, 0);
+        let content = ObjectRef::new(9, 0);
+        let font_dict = ObjectRef::new(1, 0);
+        let font = ObjectRef::new(2, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page, content],
+            part3_objects: vec![font_dict, font],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: content,
+                    referencing_pages: vec![],
+                },
+                // font_dict referenced by page 1; font by page 2 — different
+                // pages, so the union must contain both (forces the insert).
+                SharedObjectHintEntry {
+                    object_ref: font_dict,
+                    referencing_pages: vec![1],
+                },
+                SharedObjectHintEntry {
+                    object_ref: font,
+                    referencing_pages: vec![2],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Both font_dict and font live in container 12 (the first-half ObjStm).
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(font_dict, (12, 0));
+        m2c.insert(font, (12, 1));
+
+        let folded = plan.canonical_shared_hints(&m2c);
+        // page, content, and ONE container entry = 3 entries (members folded).
+        assert_eq!(
+            folded.len(),
+            3,
+            "members must fold into one container entry"
+        );
+        assert_eq!(folded[0].object_ref, page);
+        assert_eq!(folded[1].object_ref, content);
+        // The container entry carries the container's new number (12) with the
+        // sentinel generation u16::MAX (so it is never mistaken for a real
+        // object numbered 12).
+        assert_eq!(folded[2].object_ref, ObjectRef::new(12, u16::MAX));
+        // Its referencing_pages is the sorted union {1, 2}.
+        assert_eq!(
+            folded[2].referencing_pages,
+            vec![1, 2],
+            "container entry must union both members' referencing pages"
+        );
+    }
+
+    /// With an empty member-to-container map (no ObjStm packing) the folded list
+    /// is a verbatim clone of `shared_hints` (classic path unchanged).
+    #[test]
+    fn canonical_shared_hints_empty_map_is_identity() {
+        let page = ObjectRef::new(3, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page],
+            shared_hints: vec![SharedObjectHintEntry {
+                object_ref: page,
+                referencing_pages: vec![],
+            }],
+            ..Default::default()
+        };
+        let folded = plan.canonical_shared_hints(&BTreeMap::new());
+        assert_eq!(folded, plan.shared_hints);
     }
 }

@@ -176,6 +176,12 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/two-page.pdf" "$REF/two-page/linearize.pdf"
 echo "two-page/linearize.pdf"
 
+# Linearized + object streams (cross-reference *stream* path; header floored to
+# 1.5). The byte-identity gate for this output is feature-gated on qpdf-zlib-compat.
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/two-page.pdf" "$REF/two-page/linearize-objstm.pdf"
+echo "two-page/linearize-objstm.pdf"
+
 # --- three-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/plain.pdf"
@@ -188,6 +194,12 @@ echo "three-page/static-id.pdf"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/linearize.pdf"
 echo "three-page/linearize.pdf"
+
+# Linearized + object streams (cross-reference *stream* path; header floored to
+# 1.5). The byte-identity gate for this output is feature-gated on qpdf-zlib-compat.
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/three-page.pdf" "$REF/three-page/linearize-objstm.pdf"
+echo "three-page/linearize-objstm.pdf"
 
 # --- linearized-one-page: plain only (re-linearize would be redundant) ---
 qpdf --deterministic-id --warning-exit-0 \
@@ -222,7 +234,7 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
 echo "lone-flate-l9/linearize.pdf"
 
 echo ""
-echo "=== All 15 references generated ==="
+echo "=== All references generated ==="
 
 # ---------------------------------------------------------------------------
 # Phase 2b: Overlay / underlay reference outputs (epic flpdf-9hc.16)

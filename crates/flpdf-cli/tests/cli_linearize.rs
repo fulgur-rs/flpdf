@@ -457,8 +457,8 @@ fn parse_pdf_version_valid() {
 fn effective_version_source_inherit() {
     use flpdf::{effective_pdf_version, WriteOptions};
     let opts = WriteOptions::default();
-    assert_eq!(effective_pdf_version("1.3", &opts, false), "1.3");
-    assert_eq!(effective_pdf_version("1.7", &opts, false), "1.7");
+    assert_eq!(effective_pdf_version("1.3", &opts, false, false), "1.3");
+    assert_eq!(effective_pdf_version("1.7", &opts, false, false), "1.7");
 }
 
 #[test]
@@ -466,9 +466,31 @@ fn effective_version_linearize_floor() {
     use flpdf::{effective_pdf_version, WriteOptions};
     let opts = WriteOptions::default();
     // Source 1.0 + linearize → should be bumped to 1.2.
-    assert_eq!(effective_pdf_version("1.0", &opts, true), "1.2");
+    assert_eq!(effective_pdf_version("1.0", &opts, true, false), "1.2");
     // Source 1.3 + linearize → stays 1.3.
-    assert_eq!(effective_pdf_version("1.3", &opts, true), "1.3");
+    assert_eq!(effective_pdf_version("1.3", &opts, true, false), "1.3");
+}
+
+#[test]
+fn effective_version_objstm_floor() {
+    use flpdf::{effective_pdf_version, WriteOptions};
+    let opts = WriteOptions::default();
+    // Object streams force the header up to 1.5 (qpdf parity).
+    assert_eq!(effective_pdf_version("1.3", &opts, false, true), "1.5");
+    // Combined with linearize the 1.5 floor still dominates the 1.2 floor.
+    assert_eq!(effective_pdf_version("1.0", &opts, true, true), "1.5");
+    // A source already above 1.5 is left untouched.
+    assert_eq!(effective_pdf_version("1.7", &opts, false, true), "1.7");
+    // Object streams requested but none emitted (object_streams=false) → no floor.
+    assert_eq!(effective_pdf_version("1.3", &opts, true, false), "1.3");
+    // min_version owning the 1.5 result returns the option string, not the literal.
+    let mut min_opts = WriteOptions::default();
+    min_opts.min_version = Some("1.5".to_string());
+    assert_eq!(effective_pdf_version("1.3", &min_opts, false, true), "1.5");
+    // force_version overrides the object-stream floor outright.
+    let mut forced = WriteOptions::default();
+    forced.force_version = Some("1.0".to_string());
+    assert_eq!(effective_pdf_version("1.3", &forced, false, true), "1.0");
 }
 
 #[test]
@@ -477,10 +499,10 @@ fn effective_version_min_version() {
     let mut opts = WriteOptions::default();
     opts.min_version = Some("1.7".to_string());
     // Source 1.3, min 1.7 → 1.7
-    assert_eq!(effective_pdf_version("1.3", &opts, false), "1.7");
+    assert_eq!(effective_pdf_version("1.3", &opts, false, false), "1.7");
     // Source 1.7, min 1.3 → stays 1.7
     opts.min_version = Some("1.3".to_string());
-    assert_eq!(effective_pdf_version("1.7", &opts, false), "1.7");
+    assert_eq!(effective_pdf_version("1.7", &opts, false, false), "1.7");
 }
 
 #[test]
@@ -489,10 +511,10 @@ fn effective_version_force_version() {
     let mut opts = WriteOptions::default();
     opts.force_version = Some("1.4".to_string());
     // force overrides everything, even source 1.7
-    assert_eq!(effective_pdf_version("1.7", &opts, false), "1.4");
+    assert_eq!(effective_pdf_version("1.7", &opts, false, false), "1.4");
     // force overrides linearize floor
     opts.force_version = Some("1.0".to_string());
-    assert_eq!(effective_pdf_version("1.3", &opts, true), "1.0");
+    assert_eq!(effective_pdf_version("1.3", &opts, true, false), "1.0");
 }
 
 // ---------------------------------------------------------------------------

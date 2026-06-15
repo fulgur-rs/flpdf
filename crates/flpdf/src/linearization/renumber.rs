@@ -94,17 +94,29 @@ const SENTINEL: ObjectRef = ObjectRef {
     generation: 0,
 };
 
-/// Slot numbers reserved by [`RenumberMap::relocate_objstm_members`] for the
-/// split linearized xref-stream layout.
+/// Slot numbers reserved by [`RenumberMap::place_objstm_members_per_half`] for
+/// the split linearized xref-stream layout.
 ///
 /// All zero (the [`Default`]) when there were no ObjStm batches — the writer
 /// then keeps its classic Part-1 mini-xref + single Part-6 path verbatim.
+///
+/// Under the per-half compressed-last layout the two cross-reference streams
+/// split the object-number space by file half: the main (second-half) xref
+/// covers `[0, second_half_count)` and the first-page (first-half) xref covers
+/// `[second_half_count, /Size)`.  Within each half the ObjStm container objects
+/// (type-1) are numbered last among the uncompressed objects and the members
+/// (type-2) last of all, so each `/Index` range is strictly `type-0?/type-1*`
+/// then `type-2*` — the ordering qpdf's linearization checker requires.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjStmRelocation {
-    /// Object number of the first-page (Part-1) cross-reference stream.
+    /// Object number of the first-page (first-half) cross-reference stream.
     pub first_xref_slot: u32,
-    /// Object number of the main (Part-6) cross-reference stream.
+    /// Object number of the main (second-half) cross-reference stream.
     pub main_xref_slot: u32,
+    /// Number of objects in the second half (= the first object number of the
+    /// first half).  The main xref's `/Index` covers `[0, second_half_count)`
+    /// and the first-page xref's `/Index` covers `[second_half_count, /Size)`.
+    pub second_half_count: u32,
     /// Per-batch ObjStm container object numbers, in flat (Part-3 then
     /// Part-4) batch order.
     pub container_numbers: Vec<u32>,
@@ -343,133 +355,243 @@ impl RenumberMap {
     }
 
     // -----------------------------------------------------------------------
-    // ObjStm container-slot allocation (flpdf-56u)
+    // ObjStm per-half compressed-last placement
     // -----------------------------------------------------------------------
 
-    /// Relocate every ObjStm member to a contiguous block of the **highest**
-    /// object numbers, with the per-batch container objects numbered directly
-    /// **below** their members, mirroring qpdf's linearized+ObjStm renumber
-    /// order ("container < members, members trailing").
+    /// Renumber the ObjStm container(s) + members so that, within each file
+    /// half, the compressed objects are numbered **last** — qpdf 11.9.0's
+    /// `writeLinearized` per-half compressed-last order.
     ///
-    /// `batches` is the writer's resolved batch order: an ordered list of
-    /// batches, each a list of member original refs in pair-table order.  The
-    /// first slice of `batches` is the Part-3 (first-page section) batches,
-    /// the remainder Part-4 — but this method does not need that split; it
-    /// only needs a stable global order.
+    /// `first_half_batches` are the Part-3 (first-page section) ObjStm batches
+    /// — their container + members are numbered LAST within the first half —
+    /// and `second_half_batches` are the Part-4 (rest-of-document) batches —
+    /// numbered last within the second half.  Both are ordered lists of member
+    /// original refs in pair-table order.
     ///
-    /// After relocation:
+    /// # Layout
     ///
-    /// * every non-member object keeps its relative order and is compacted so
-    ///   the low slots stay contiguous (param dict / hint stream / catalog /
-    ///   Part-2 / Part-3-plain / Part-4 — all **type-1** in the xref stream);
-    /// * for each batch, one fresh container slot is appended (type-1),
-    ///   immediately followed by that batch's member slots (type-2).
+    /// [`from_plan`](Self::from_plan) already numbers the second-half objects
+    /// (qpdf part7/part8 + the promoted Pages/Info "part9 head") at the LOW
+    /// slots `1..param_dict_slot`, and the first-half objects (param dict,
+    /// catalog, hint stream, Part-2, Part-3-plain, remaining Part-4) at the
+    /// HIGH slots `param_dict_slot..`.  This method preserves that
+    /// second-half-low / first-half-high spine and rebuilds it as:
     ///
-    /// In addition, two fresh slots are reserved **between** the non-member
-    /// block and the container block — one for the linearized first-page
-    /// (Part-1) cross-reference *stream* object and one for the main (Part-6)
-    /// cross-reference *stream* object.  Both are type-1 entries numbered
-    /// below every container/member, so each of the two split xref streams
-    /// can carry a single contiguous `/Index` range with no type-1-after-
-    /// type-2 interleave (qpdf's linearization rule).
+    /// **Second half** (covered by the main xref, `/Index [0, second_half_count)`):
+    /// 1. every second-half non-member object, compacted in order (type-1);
+    /// 2. the main (second-half) cross-reference *stream* slot (type-1);
+    /// 3. every second-half (Part-4) ObjStm container, batch-ordered (type-1);
+    /// 4. every second-half (Part-4) ObjStm member, batch-ordered (type-2).
     ///
-    /// Returns an [`ObjStmRelocation`] carrying the two reserved xref-stream
-    /// object numbers and the per-batch container object numbers (in
-    /// `batches` order), so the writer can build its `ObjStmLayout` and emit
-    /// the split xref streams against the *relocated* map without re-deriving
+    /// **First half** (covered by the first-page xref, `/Index [second_half_count, /Size)`):
+    /// 5. the linearization parameter dictionary slot (type-1, reserved);
+    /// 6. the first-page (first-half) cross-reference *stream* slot (type-1);
+    /// 7. every first-half non-member object, compacted in order, with the
+    ///    hint-stream slot re-inserted at its original relative position
+    ///    (all type-1);
+    /// 8. every first-half (Part-3) ObjStm container, batch-ordered (type-1);
+    /// 9. every first-half (Part-3) ObjStm member, batch-ordered (type-2).
+    ///
+    /// Within each half the container(s) (type-1) precede every member
+    /// (type-2) and the members are the highest numbers of that half, so the
+    /// main xref's single `/Index` range is strictly `type-0? type-1* type-2*`
+    /// and the first-page xref's range is `type-1* type-2*` — the
+    /// non-interleaved ordering qpdf's linearization checker requires.  This
+    /// matches qpdf 11.9.0's `writeLinearized` per-half compressed-last order:
+    /// the first-page shared dicts (+ `/Pages` tree + `/Info`) live in a
+    /// first-half container numbered right after the first page, so `/O` (the
+    /// first-page object number) equals qpdf's value.
+    ///
+    /// Returns an [`ObjStmRelocation`] carrying the two xref-stream object
+    /// numbers, the per-batch container object numbers in container-consumption
+    /// order (Part-3 batches first, then Part-4 — the order the writer's
+    /// `ObjStmLayout` container builder consumes them), and `second_half_count`
+    /// (the half-split point), so the writer can build its `ObjStmLayout` and
+    /// emit the split xref streams against the placed map without re-deriving
     /// numbers independently.
     ///
     /// The param-dict and hint-stream sentinel reservations are preserved
-    /// (their slot numbers are recomputed to track the compaction).
+    /// (their slot numbers are recomputed to track the new layout).
     ///
     /// # Panics
     ///
     /// Panics if a member ref is not present in the map (a planner / renumber
     /// inconsistency the caller must not paper over).
-    pub fn relocate_objstm_members(&mut self, batches: &[Vec<ObjectRef>]) -> ObjStmRelocation {
-        // Fast path: nothing to relocate — leave the map byte-identical.
-        if batches.iter().all(|b| b.is_empty()) {
+    pub fn place_objstm_members_per_half(
+        &mut self,
+        first_half_batches: &[Vec<ObjectRef>],
+        second_half_batches: &[Vec<ObjectRef>],
+    ) -> ObjStmRelocation {
+        // Fast path: nothing to place — leave the map byte-identical.
+        let no_first = first_half_batches.iter().all(|b| b.is_empty());
+        let no_second = second_half_batches.iter().all(|b| b.is_empty());
+        if no_first && no_second {
             return ObjStmRelocation::default();
         }
 
-        let member_set: BTreeSet<ObjectRef> =
-            batches.iter().flat_map(|b| b.iter().copied()).collect();
+        let member_set: BTreeSet<ObjectRef> = first_half_batches
+            .iter()
+            .chain(second_half_batches)
+            .flat_map(|b| b.iter().copied())
+            .collect();
 
-        // Walk the existing layout (ascending new number, slot 0 skipped) and
-        // rebuild it: keep slot 0, then re-emit every non-member slot
-        // (sentinels included) in order, recording the new positions of the
-        // two reservations.  Member slots are dropped here and re-appended in
-        // batch order below.
+        // The half boundary in `from_plan`'s output: slots `1..old_param_slot`
+        // are the second half (part7/part8 + promoted Pages/Info), and
+        // `old_param_slot..` are the first half (param dict head onward).
         let old_param_slot = self.param_dict_slot;
         let old_hint_slot = self.hint_stream_slot;
 
-        let mut new_by_new_number: Vec<ObjectRef> = Vec::with_capacity(self.by_new_number.len());
-        new_by_new_number.push(SENTINEL); // slot 0
-        let mut new_param_slot = 0u32;
-        let mut new_hint_slot = 0u32;
-
+        // Partition the existing non-member, non-sentinel objects by half,
+        // preserving order.  The first-half walk also records where the hint
+        // sentinel sits relative to its first-half neighbours so it can be
+        // re-inserted at the same relative position below.  Members are dropped
+        // here regardless of which half `from_plan` put them in (e.g. the
+        // /Pages tree and /Info are promoted to the second half by `from_plan`
+        // but are first-half ObjStm members under the qpdf member set); they
+        // are re-placed in their batch's half below.
+        let mut second_half_plain: Vec<ObjectRef> = Vec::new();
+        let mut first_half_plain: Vec<ObjectRef> = Vec::new();
+        // Index into `first_half_plain` at which the hint sentinel belongs
+        // (i.e. how many first-half plain objects precede it).
+        let mut hint_index_in_first_half: u32 = 0;
         for (old_idx, &original) in self.by_new_number.iter().enumerate().skip(1) {
             let old_idx = old_idx as u32;
             if old_idx == old_param_slot {
-                new_param_slot = new_by_new_number.len() as u32;
-                new_by_new_number.push(SENTINEL);
+                // The param dict is the first-half head — handled explicitly
+                // when rebuilding below, not stored in either plain list.
                 continue;
             }
             if old_idx == old_hint_slot {
-                new_hint_slot = new_by_new_number.len() as u32;
-                new_by_new_number.push(SENTINEL);
+                // The hint stream is a first-half object; remember its relative
+                // position so its number tracks the surrounding first-half
+                // objects.
+                hint_index_in_first_half = first_half_plain.len() as u32;
                 continue;
             }
             if original.number == 0 {
-                // An unexpected sentinel (defence-in-depth) — keep it.
-                new_by_new_number.push(SENTINEL);
+                // An unexpected sentinel (defence-in-depth) — drop it; it
+                // carries no object and the two real sentinels are handled
+                // above.
                 continue;
             }
             if member_set.contains(&original) {
-                continue; // relocated to the tail below
+                continue; // re-placed as an ObjStm member in its half below
             }
-            new_by_new_number.push(original);
+            if old_idx < old_param_slot {
+                second_half_plain.push(original);
+            } else {
+                first_half_plain.push(original);
+            }
         }
 
-        // Reserve the two split xref-stream object numbers, BELOW every
-        // container and member, so both `/Index` ranges stay non-interleaved.
-        let first_xref_slot = new_by_new_number.len() as u32;
-        new_by_new_number.push(SENTINEL);
+        // `container_numbers` must be returned in `build_from_batches` order
+        // (Part-3 batches first, then Part-4).  The Part-3 containers are
+        // numbered in the FIRST half (high numbers) and Part-4 in the SECOND
+        // half (low numbers), so the returned vector is NOT ascending; the
+        // writer maps each batch to its container by position, not by value.
+        let count_nonempty =
+            |batches: &[Vec<ObjectRef>]| batches.iter().filter(|b| !b.is_empty()).count();
+        let mut first_half_container_numbers: Vec<u32> =
+            Vec::with_capacity(count_nonempty(first_half_batches));
+        let mut second_half_container_numbers: Vec<u32> =
+            Vec::with_capacity(count_nonempty(second_half_batches));
+
+        // Helper: append a half's container slots (type-1) then member slots
+        // (type-2), recording the container numbers in batch order.
+        let assert_member = |member: ObjectRef, by_original: &BTreeMap<ObjectRef, ObjectRef>| {
+            assert!(
+                by_original.contains_key(&member),
+                "place_objstm_members_per_half: member {member:?} not present in \
+                 RenumberMap (planner / renumber inconsistency)"
+            );
+        };
+
+        // Rebuild the table in per-half compressed-last order.
+        let mut new_by_new_number: Vec<ObjectRef> = Vec::with_capacity(self.by_new_number.len());
+        new_by_new_number.push(SENTINEL); // slot 0
+
+        // --- Second half ---
+        // (1) second-half non-members (type-1).
+        for &original in &second_half_plain {
+            new_by_new_number.push(original);
+        }
+        // (2) main (second-half) xref stream slot (type-1).
         let main_xref_slot = new_by_new_number.len() as u32;
         new_by_new_number.push(SENTINEL);
-
-        // Append the container block first, then the member block
-        // (flpdf-9hc.5.8.4).  qpdf forbids a type-1 (uncompressed) xref entry
-        // after a type-2 (compressed) one within a single cross-reference
-        // stream.  Containers are type-1 and members are type-2, so with TWO
-        // or more containers (Part-3 + Part-4 once Part-3 packing is enabled)
-        // the original interleaved `[container, members, container, members]`
-        // order would place a later container's type-1 entry after an earlier
-        // batch's type-2 members — the interleave qpdf rejects.  Emitting
-        // every container first, then every member, keeps the main xref
-        // stream's `/Index` range strictly `type-1* type-2*` (still the
-        // single-container 56u layout when there is only one batch).
-        let mut container_numbers: Vec<u32> = Vec::with_capacity(batches.len());
-        for batch in batches {
+        // (3) Part-4 ObjStm containers, batch-ordered (type-1).
+        for batch in second_half_batches {
             if batch.is_empty() {
                 continue;
             }
             let container_num = new_by_new_number.len() as u32;
             new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
-            container_numbers.push(container_num);
+            second_half_container_numbers.push(container_num);
         }
-        for batch in batches {
+        // (4) Part-4 ObjStm members, batch-ordered (type-2) — last of the half.
+        for batch in second_half_batches {
             for &member in batch {
-                assert!(
-                    self.by_original.contains_key(&member),
-                    "relocate_objstm_members: member {member:?} not present in RenumberMap \
-                     (planner / renumber inconsistency)"
-                );
+                assert_member(member, &self.by_original);
                 new_by_new_number.push(member);
             }
         }
 
-        // Rebuild the forward index from the relocated table.
+        // The first first-half number = number of objects emitted so far
+        // (slot 0 is the unused sentinel, so the count IS the next index).
+        let second_half_count = new_by_new_number.len() as u32;
+
+        // --- First half ---
+        // (5) linearization parameter dictionary (type-1, reserved).
+        let new_param_slot = new_by_new_number.len() as u32;
+        new_by_new_number.push(SENTINEL);
+        // (6) first-page (first-half) xref stream slot (type-1).
+        let first_xref_slot = new_by_new_number.len() as u32;
+        new_by_new_number.push(SENTINEL);
+        // (7) first-half non-members, with the hint sentinel re-inserted at its
+        //     recorded relative position (all type-1).
+        let mut new_hint_slot = 0u32;
+        for (i, &original) in first_half_plain.iter().enumerate() {
+            if i as u32 == hint_index_in_first_half {
+                new_hint_slot = new_by_new_number.len() as u32;
+                new_by_new_number.push(SENTINEL);
+            }
+            new_by_new_number.push(original);
+        }
+        // Hint sentinel sits after the last first-half plain object when its
+        // recorded index equals the first-half length (e.g. nothing follows it).
+        // cov:ignore-start: unreachable in practice — `from_plan` always places
+        // the Part-2 first-page objects (page dict + content, never ObjStm
+        // members) in the first half AFTER the hint slot, so `first_half_plain`
+        // is non-empty past the hint index and the loop above always emits the
+        // hint sentinel; this fallback guards the degenerate empty-first-page
+        // case that the planner does not produce.
+        if hint_index_in_first_half as usize >= first_half_plain.len() {
+            new_hint_slot = new_by_new_number.len() as u32;
+            new_by_new_number.push(SENTINEL);
+        }
+        // cov:ignore-end
+        // (8) Part-3 ObjStm containers, batch-ordered (type-1) — last
+        //     uncompressed objects of the first half.
+        for batch in first_half_batches {
+            if batch.is_empty() {
+                continue;
+            }
+            let container_num = new_by_new_number.len() as u32;
+            new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
+            first_half_container_numbers.push(container_num);
+        }
+        // (9) Part-3 ObjStm members, batch-ordered (type-2) — last of all.
+        for batch in first_half_batches {
+            for &member in batch {
+                assert_member(member, &self.by_original);
+                new_by_new_number.push(member);
+            }
+        }
+
+        // Container numbers in `build_from_batches` order: Part-3 then Part-4.
+        let mut container_numbers = first_half_container_numbers;
+        container_numbers.extend(second_half_container_numbers);
+
+        // Rebuild the forward index from the placed table.
         let mut new_by_original: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
         for (idx, &original) in new_by_new_number.iter().enumerate().skip(1) {
             if original.number == 0 {
@@ -478,7 +600,7 @@ impl RenumberMap {
             let prev = new_by_original.insert(original, ObjectRef::new(idx as u32, 0));
             assert!(
                 prev.is_none(),
-                "relocate_objstm_members: duplicate original {original:?} after relocation"
+                "place_objstm_members_per_half: duplicate original {original:?} after placement"
             );
         }
 
@@ -490,6 +612,7 @@ impl RenumberMap {
         ObjStmRelocation {
             first_xref_slot,
             main_xref_slot,
+            second_half_count,
             container_numbers,
         }
     }
@@ -949,25 +1072,25 @@ mod tests {
         let _ = RenumberMap::from_plan(&plan);
     }
 
-    /// With two ObjStm batches the relocated layout must
-    /// place **all** container slots before **all** member slots, so each
-    /// split-xref `/Index` range stays strictly `type-1* type-2*` (qpdf
-    /// rejects a type-1 entry after a type-2 one in a cross-reference
-    /// stream).  The single-batch (Part-4-only) layout is a
-    /// degenerate case of the same rule.
+    /// With two SECOND-half (Part-4) ObjStm batches the per-half placement
+    /// must, within the second half, number the main xref slot first, then
+    /// **all** container slots, then **all** member slots — so the main xref's
+    /// single `/Index` range stays strictly `type-1* type-2*` (qpdf rejects a
+    /// type-1 entry after a type-2 one in a cross-reference stream).  The
+    /// single-batch layout is a degenerate case of the same rule.
     #[test]
-    fn relocate_orders_all_containers_before_all_members() {
+    fn per_half_orders_main_xref_then_containers_then_members() {
         let plan = two_page_plan();
         let mut rn = RenumberMap::from_plan(&plan);
 
-        // Two batches: emulate a Part-3 batch (5 0 R) and a Part-4 batch
-        // (4 0 R, 7 0 R).  Both refs are present in the map (part3_objects /
-        // part4_other_pages_private of two_page_plan).
-        let batches = vec![
+        // Two Part-4 (second-half) batches; no Part-3 (first-half) batch.  All
+        // refs are present in the map (part3_objects / part4_other_pages_private
+        // of two_page_plan).
+        let second_half_batches = vec![
             vec![ObjectRef::new(5, 0)],
             vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
         ];
-        let relocation = rn.relocate_objstm_members(&batches);
+        let relocation = rn.place_objstm_members_per_half(&[], &second_half_batches);
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -976,7 +1099,7 @@ mod tests {
         );
         let c0 = relocation.container_numbers[0];
         let c1 = relocation.container_numbers[1];
-        let members: Vec<u32> = batches
+        let members: Vec<u32> = second_half_batches
             .iter()
             .flatten()
             .map(|&m| rn.new_for_original(m).unwrap().number)
@@ -995,11 +1118,128 @@ mod tests {
             c0 + 1,
             "container slots must be contiguous, batch-ordered"
         );
-        // Reserved split-xref slots stay below the container block.
+        // The main (second-half) xref slot precedes the container block.
         assert!(
             relocation.main_xref_slot < c0,
             "main xref slot ({}) must precede the container block ({c0})",
             relocation.main_xref_slot
         );
+        // Per-half split: every container and member lives in the SECOND half
+        // (below `second_half_count`); the param dict and first-page xref open
+        // the FIRST half (at / just above `second_half_count`).
+        let max_member = *members.iter().max().unwrap();
+        assert!(
+            max_member < relocation.second_half_count,
+            "members ({members:?}) must be numbered in the second half \
+             (below second_half_count = {})",
+            relocation.second_half_count
+        );
+        assert_eq!(
+            rn.param_dict_ref().number,
+            relocation.second_half_count,
+            "the param dict opens the first half"
+        );
+        assert_eq!(
+            relocation.first_xref_slot,
+            relocation.second_half_count + 1,
+            "the first-page xref slot follows the param dict at the first half head"
+        );
+        // The first-page xref number is strictly above every second-half
+        // object, so the first-half `/Index` range carries no member.
+        assert!(
+            relocation.first_xref_slot > max_member,
+            "first-page xref slot ({}) must be above every member ({members:?})",
+            relocation.first_xref_slot
+        );
+    }
+
+    /// A FIRST-half (Part-3) batch must be numbered LAST within the first half:
+    /// its container + members sit ABOVE the param dict, first-page xref, and
+    /// every first-half plain object, and the members are the highest numbers
+    /// of the whole map.  This is the qpdf member-set layout (first-page shared
+    /// dicts + /Pages + /Info compressed into a first-half container).
+    #[test]
+    fn per_half_places_part3_batch_in_first_half() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+
+        // One Part-3 (first-half) batch: 5 0 R + 8 0 R (both part3_objects).
+        let first_half_batches = vec![vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)]];
+        let relocation = rn.place_objstm_members_per_half(&first_half_batches, &[]);
+
+        assert_eq!(
+            relocation.container_numbers.len(),
+            1,
+            "one non-empty Part-3 batch yields one container number"
+        );
+        let container = relocation.container_numbers[0];
+        let members: Vec<u32> = first_half_batches
+            .iter()
+            .flatten()
+            .map(|&m| rn.new_for_original(m).unwrap().number)
+            .collect();
+
+        // The container + members live in the FIRST half (>= second_half_count).
+        assert!(
+            container >= relocation.second_half_count,
+            "Part-3 container ({container}) must be in the first half \
+             (>= second_half_count = {})",
+            relocation.second_half_count
+        );
+        // No Part-4 batch → the main xref slot is the last second-half object,
+        // so second_half_count = main_xref_slot + 1.
+        assert_eq!(
+            relocation.second_half_count,
+            relocation.main_xref_slot + 1,
+            "with no Part-4 batch the second half ends at the main xref slot"
+        );
+        // The container precedes its members, and the members are the highest
+        // numbers in the whole map.
+        let min_member = *members.iter().min().unwrap();
+        let max_member = *members.iter().max().unwrap();
+        assert!(
+            container < min_member,
+            "container ({container}) must precede its members ({members:?})"
+        );
+        assert_eq!(
+            max_member as usize,
+            rn.len(),
+            "Part-3 members must be the highest object numbers"
+        );
+        // The param dict and first-page xref open the first half, BELOW the
+        // container — so the first-page xref's `/Index` range is type-1* (the
+        // first-half plain objects + container) then type-2* (the members).
+        assert!(
+            relocation.first_xref_slot < container,
+            "first-page xref ({}) must precede the Part-3 container ({container})",
+            relocation.first_xref_slot
+        );
+    }
+
+    /// An empty inner batch (defence-in-depth: the writer normally filters these
+    /// upstream) must be skipped — it yields no container slot and no members,
+    /// so only the non-empty batch produces a container.
+    #[test]
+    fn per_half_skips_empty_batches() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+
+        // A first-half batch list with one empty and one non-empty batch, and a
+        // second-half list with one empty and one non-empty batch.
+        let first_half_batches = vec![vec![], vec![ObjectRef::new(5, 0)]];
+        let second_half_batches = vec![vec![], vec![ObjectRef::new(4, 0)]];
+        let relocation =
+            rn.place_objstm_members_per_half(&first_half_batches, &second_half_batches);
+
+        // Empty batches contribute no container numbers: one first-half + one
+        // second-half = exactly two containers.
+        assert_eq!(
+            relocation.container_numbers.len(),
+            2,
+            "empty batches must be skipped; only the two non-empty batches yield containers"
+        );
+        // Both non-empty members are present in the placed map.
+        assert!(rn.new_for_original(ObjectRef::new(5, 0)).is_some());
+        assert!(rn.new_for_original(ObjectRef::new(4, 0)).is_some());
     }
 }

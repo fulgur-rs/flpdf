@@ -111,12 +111,15 @@ fn id_words(bytes: &[u8]) -> (String, String) {
 // byte-exact goldens below are pinned for the default backend only; the
 // backend-agnostic structural checks (no placeholder, run-stability) run under
 // either backend.
+// Re-blessed for flpdf-0i0s: the ObjStm member offset table is now qpdf's
+// single-line, space-separated form (was one pair per line), changing the
+// container bytes and therefore this content-derived /ID + SHA-256.
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_SHA256: &str = "e480d6fd27d6bb208831d396251aabd46e58a52f1674666ea9ddf9b9ea27da99";
+const GOLDEN_SHA256: &str = "34171a26bab760023203993ac1384b1306aaf4fdac2ebd8b6f2f44bb48ec12da";
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_ID0: &str = "9cfb68d5a05f0b57804815a19c1d17cc";
+const GOLDEN_ID0: &str = "31ab51ff9932a74cddcd868b6427232b";
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_ID1: &str = "9cfb68d5a05f0b57804815a19c1d17cc";
+const GOLDEN_ID1: &str = "31ab51ff9932a74cddcd868b6427232b";
 
 #[test]
 fn xref_stream_deterministic_id_has_no_zero_placeholder() {
