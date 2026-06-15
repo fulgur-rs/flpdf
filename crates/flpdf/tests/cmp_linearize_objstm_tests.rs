@@ -134,13 +134,13 @@ fn three_page_objstm_structurally_byte_identical_to_qpdf() {
 // Strict (incl. /ID[1]) needs qpdf's pass-1 xref-stream reconstruction for the
 // deterministic-/ID digest (flpdf-4z56 sub-step 2). Ignored until that lands.
 #[test]
-#[ignore = "deterministic /ID[1] byte-parity pending qpdf pass-1 xref reconstruction"]
+#[ignore = "deterministic /ID[1] byte-parity pending qpdf pass-1 xref-stream digest (flpdf-9ntt)"]
 fn two_page_objstm_byte_identical_to_qpdf() {
     assert_strict("two-page.pdf", "two-page");
 }
 
 #[test]
-#[ignore = "deterministic /ID[1] byte-parity pending qpdf pass-1 xref reconstruction"]
+#[ignore = "deterministic /ID[1] byte-parity pending qpdf pass-1 xref-stream digest (flpdf-9ntt)"]
 fn three_page_objstm_byte_identical_to_qpdf() {
     assert_strict("three-page.pdf", "three-page");
 }
