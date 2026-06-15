@@ -1549,28 +1549,23 @@ fn do_write_pass<R: Read + Seek>(
     // Catalog (qpdf `lc_root`).  qpdf emits the document catalog at the very
     // start of the first-page section — physically before the primary hint
     // stream and the page objects — so the first-page region is numbered in
-    // ascending order (Catalog, Hint, Page, Resources, ...).  This holds
-    // whenever the catalog is a *standalone* object: on the classic path, and
-    // on the ObjStm path under the per-half compressed-last numbering the
-    // catalog is a first-half standalone object (qpdf keeps it uncompressed),
-    // so its bytes must land in the first-page section before /E to match its
-    // first-half object number.  When the catalog is instead an ObjStm *member*
-    // (the single-page fallback, where it joins a second-half Part-4 container),
-    // it must NOT be emitted here — its bytes live inside that container, after
-    // /E.  Emitting it early (rather than in the Part-5 remaining body after /E)
-    // is what aligns flpdf's physical layout with qpdf's.
-    let catalog_is_member = plan
-        .root_ref
-        .is_some_and(|c| objstm_layout.member_to_container.contains_key(&c));
+    // ascending order (Catalog, Hint, Page, Resources, ...).  qpdf keeps the
+    // catalog uncompressed (a standalone indirect object) in every mode, and
+    // the planner enforces this by excluding `/Catalog` from every ObjStm
+    // container (see `objstm_batches`).  So the catalog is always a first-half
+    // standalone object whose bytes must land in the first-page section before
+    // /E to match its first-half object number.
     let mut catalog_emitted_early = false;
     if let Some(catalog_orig) = plan.root_ref {
-        if !catalog_is_member {
-            let object = pdf.resolve_borrowed(catalog_orig)?;
-            let renumbered = renumber_object(object, 0, renumber)?;
-            let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
-            xref_offsets.insert(catalog_new_ref.number, offset);
-            catalog_emitted_early = true;
-        }
+        debug_assert!(
+            !objstm_layout.member_to_container.contains_key(&catalog_orig),
+            "planner invariant: /Catalog is never an ObjStm member"
+        );
+        let object = pdf.resolve_borrowed(catalog_orig)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
+        let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
+        xref_offsets.insert(catalog_new_ref.number, offset);
+        catalog_emitted_early = true;
     }
 
     // Hint stream object.

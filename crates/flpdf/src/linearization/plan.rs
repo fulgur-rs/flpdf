@@ -1040,6 +1040,18 @@ impl LinearizationPlan {
         // first-half container that would leave the page-private resource dicts
         // — which flpdf keeps plain — straddling `/E`).  A Preserve run over a
         // source with NO ObjStms likewise has no batches, so nothing is folded.
+        //
+        // The document `/Catalog`, however, is NEVER compressed by qpdf in any
+        // object-stream mode, so its Part-4 exclusion is unconditional — the
+        // `/Pages` + `/Info` first-half fold is what depends on a first-half
+        // batch existing.  Without this, a single-page / no-first-page-shared
+        // Generate document (where `part3_batches` is empty and
+        // `canonicalise_first_half_batch` is skipped) would pack an eligible
+        // `/Catalog` into a Part-4 ObjStm container.
+        if let Some(catalog_ref) = self.root_ref {
+            Self::drop_from_part4_batches(&mut plan, &BTreeSet::from([catalog_ref]));
+        }
+
         if !plan.part3_batches.is_empty() {
             // cov:ignore-start: the `?` error arm is unreachable in tests —
             // `canonicalise_first_half_batch` only propagates a
@@ -1056,6 +1068,19 @@ impl LinearizationPlan {
         }
 
         Ok(plan)
+    }
+
+    /// Remove every ref in `excluded` from each Part-4 ObjStm batch, dropping any
+    /// batch left empty.  An empty `excluded` set is a harmless no-op.
+    fn drop_from_part4_batches(plan: &mut ObjStmBatchPlan, excluded: &BTreeSet<ObjectRef>) {
+        plan.part4_batches = std::mem::take(&mut plan.part4_batches)
+            .into_iter()
+            .filter_map(|batch| {
+                let kept: Vec<ObjectRef> =
+                    batch.into_iter().filter(|r| !excluded.contains(r)).collect();
+                (!kept.is_empty()).then_some(kept)
+            })
+            .collect();
     }
 
     /// Fold the `/Pages` tree and `/Info` dictionary into the first-half
@@ -1121,16 +1146,7 @@ impl LinearizationPlan {
         // that becomes empty).  When `excluded_from_part4` is empty this is a
         // harmless no-op, so no guard is needed — avoiding an unreachable
         // empty-set branch (a linearizable document always has a /Catalog).
-        plan.part4_batches = std::mem::take(&mut plan.part4_batches)
-            .into_iter()
-            .filter_map(|batch| {
-                let kept: Vec<ObjectRef> = batch
-                    .into_iter()
-                    .filter(|r| !excluded_from_part4.contains(r))
-                    .collect();
-                (!kept.is_empty()).then_some(kept)
-            })
-            .collect();
+        Self::drop_from_part4_batches(plan, &excluded_from_part4);
 
         // cov:ignore-start: defensive — this method is only invoked when
         // `part3_batches` is non-empty (multi-page docs with first-page shared
@@ -3275,6 +3291,54 @@ mod tests {
                 "the /Catalog must stay standalone, not in part4_batches"
             );
         }
+    }
+
+    /// Single-page Generate (no first-page shared objects, so `part3_batches` is
+    /// empty and `canonicalise_first_half_batch` never runs): the document
+    /// `/Catalog` must still be excluded from the Part-4 ObjStm batches, because
+    /// qpdf never compresses the Catalog.  Guards the unconditional Catalog
+    /// exclusion in `objstm_batches` against regressing back under the
+    /// `part3_batches`-non-empty gate.
+    #[test]
+    fn objstm_batches_generate_keeps_catalog_standalone_single_page() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+        // Single page → no first-page SHARED objects → no first-half batch.
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+        assert!(
+            batch_plan.part3_batches.is_empty(),
+            "single-page document has no first-page shared objects (no Part-3 batch)"
+        );
+
+        let all_part3_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part3_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let all_part4_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
+            .part4_batches
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+
+        let catalog = plan.root_ref.expect("fixture has a /Catalog");
+        assert!(
+            !all_part3_batched.contains(&catalog) && !all_part4_batched.contains(&catalog),
+            "the /Catalog ({catalog}) must stay standalone (in no ObjStm batch), \
+             even when there is no first-half Part-3 batch"
+        );
+
+        // The /Pages tree is an eligible plain dict in Part-4 here (it is not
+        // folded into the first half without a Part-3 batch), so it remains
+        // batched — confirming only the Catalog was filtered out, not the whole
+        // batch.
+        let pages_tree = ObjectRef::new(2, 0);
+        assert!(
+            all_part4_batched.contains(&pages_tree),
+            "the /Pages tree (2 0 R) must remain in part4_batches when there is \
+             no first-half batch to fold it into"
+        );
     }
 
     // -----------------------------------------------------------------------
