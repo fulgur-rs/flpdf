@@ -834,7 +834,7 @@ impl LinearizationPlan {
     /// object.  A plain entry carries an original ref whose physical number is
     /// resolved through `renumber`; a synthetic container entry already carries
     /// its new number, so it is never resolved through the
-    /// [`RenumberMap`](crate::linearization::renumber::RenumberMap).
+    /// [`RenumberMap`].
     ///
     /// An empty `member_to_container` yields a clone of `shared_hints` (the
     /// no-ObjStm / classic path is unchanged).
