@@ -120,17 +120,13 @@ fn assert_strict(fixture: &str, stem: &str) {
     report(fixture, &actual, &expected, "full bytes");
 }
 
-// The structural (layout) milestone goes green once the linearized writer emits
-// qpdf-matching compressed cross-reference streams (flpdf-4z56). Ignored until
-// the integration lands so the baseline commit (goldens + test) stays green.
+// Structural (layout) byte-identity: everything except the changing /ID[1].
 #[test]
-#[ignore = "byte-identical up to the ObjStm container; container dict/offset-table parity pending flpdf-0i0s"]
 fn two_page_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("two-page.pdf", "two-page");
 }
 
 #[test]
-#[ignore = "byte-identical up to the ObjStm container; container dict/offset-table parity pending flpdf-0i0s"]
 fn three_page_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("three-page.pdf", "three-page");
 }

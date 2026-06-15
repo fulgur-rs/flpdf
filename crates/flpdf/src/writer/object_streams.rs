@@ -366,12 +366,18 @@ pub(crate) fn emit_objstm_body_from_resolved(
         objects_section.push(b'\n');
     }
 
-    // Build the pair table: "<number> <offset>\n" for each member.
+    // Build the pair table: `<number> <offset>` for each member, all
+    // space-separated on a single line with one trailing newline before the
+    // objects section — qpdf 11.9.0's `/Type /ObjStm` layout (a newline after
+    // each pair, as flpdf used to emit, is valid PDF but not byte-identical).
     let mut pair_table: Vec<u8> = Vec::new();
-    for ((obj_ref, _), offset) in members.iter().zip(offsets.iter()) {
-        let entry = format!("{} {}\n", obj_ref.number, offset);
-        pair_table.extend_from_slice(entry.as_bytes());
+    for (i, ((obj_ref, _), offset)) in members.iter().zip(offsets.iter()).enumerate() {
+        if i > 0 {
+            pair_table.push(b' ');
+        }
+        pair_table.extend_from_slice(format!("{} {}", obj_ref.number, offset).as_bytes());
     }
+    pair_table.push(b'\n');
 
     let first_offset = pair_table.len();
 
@@ -968,20 +974,16 @@ mod tests {
 
         assert_eq!(body.n_members, 3);
 
-        // Parse the pair table to get reported offsets.
+        // The pair table is qpdf's single-line, space-separated `num offset`
+        // sequence terminated by one newline (not one pair per line).
         let pair_table_bytes = &body.bytes[..body.first_offset];
+        assert_eq!(pair_table_bytes.last(), Some(&b'\n'));
+        assert!(!pair_table_bytes[..pair_table_bytes.len() - 1].contains(&b'\n'));
         let pair_table_str = std::str::from_utf8(pair_table_bytes).unwrap();
-        let mut reported_offsets: Vec<usize> = Vec::new();
-        for line in pair_table_str.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            assert_eq!(
-                parts.len(),
-                2,
-                "pair table line must have 2 tokens: {line:?}"
-            );
-            let offset: usize = parts[1].parse().unwrap();
-            reported_offsets.push(offset);
-        }
+        let tokens: Vec<&str> = pair_table_str.split_whitespace().collect();
+        assert_eq!(tokens.len(), 6, "3 members -> 6 tokens (num + offset each)");
+        let reported_offsets: Vec<usize> =
+            tokens.chunks(2).map(|p| p[1].parse().unwrap()).collect();
         assert_eq!(reported_offsets.len(), 3);
 
         // Verify that each reported offset matches the actual start position
