@@ -218,7 +218,7 @@ impl SharedObjectHintTable {
         // Fold first-page ObjStm members into their container (one shared entry
         // per container) so the table matches qpdf's positional shared list.
         // With no ObjStm packing this equals `plan.shared_hints`.
-        let shared_hints = plan.canonical_shared_hints(member_to_container);
+        let shared_hints = plan.canonical_shared_hints(member_to_container, renumber);
         let shared_count = shared_hints.len() as u32;
 
         // ------------------------------------------------------------------

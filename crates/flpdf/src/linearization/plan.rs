@@ -30,6 +30,7 @@
 //!
 //! The four parts are always disjoint (invariant preserved by construction).
 
+use crate::linearization::renumber::RenumberMap;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm,
@@ -811,18 +812,28 @@ impl LinearizationPlan {
     /// hint table — not each compressed member.  This rewrites
     /// [`shared_hints`](Self::shared_hints): every member present in
     /// `member_to_container` is replaced by a single entry for its container
-    /// (placed at the first member's position, with the `referencing_pages` of
-    /// all that container's members unioned), and the second-and-later members
-    /// of the same container are dropped.  Non-member entries are kept verbatim
-    /// and in order.
+    /// (with the `referencing_pages` of all that container's members unioned),
+    /// and the second-and-later members of the same container are dropped.
+    /// Non-member entries are kept verbatim.
+    ///
+    /// The first-page section of the result is then emitted in **ascending
+    /// physical object-number order**.  qpdf's `checkHSharedObject` walks the
+    /// first-page shared entries positionally, starting from the first page
+    /// object, so the hint list must follow the order in which
+    /// [`RenumberMap::place_objstm_members_per_half`](crate::linearization::renumber::RenumberMap::place_objstm_members_per_half)
+    /// numbers the first half (plain objects first, then containers, then
+    /// compressed members).  A plain (ineligible) shared stream can therefore be
+    /// numbered *before* the container of the eligible dicts even when the
+    /// container appeared earlier in `shared_hints`; the sort restores the
+    /// physical order.  Part-8 entries (`part4_other_pages_shared`, after /E)
+    /// are left in place.
     ///
     /// The container entry's `object_ref` carries the container's *new* object
     /// number with generation `u16::MAX` — a sentinel no live object uses,
     /// marking it as a synthetic container entry rather than a resolvable PDF
-    /// object.  The shared-object / page-offset hint encoders
-    /// key shared objects by their position in this list (qpdf assigns the
-    /// physical object numbers positionally from the first page object), so the
-    /// synthetic ref is never resolved through a
+    /// object.  A plain entry carries an original ref whose physical number is
+    /// resolved through `renumber`; a synthetic container entry already carries
+    /// its new number, so it is never resolved through the
     /// [`RenumberMap`](crate::linearization::renumber::RenumberMap).
     ///
     /// An empty `member_to_container` yields a clone of `shared_hints` (the
@@ -830,17 +841,27 @@ impl LinearizationPlan {
     pub(crate) fn canonical_shared_hints(
         &self,
         member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
+        renumber: &RenumberMap,
     ) -> Vec<SharedObjectHintEntry> {
         if member_to_container.is_empty() {
             return self.shared_hints.clone();
         }
 
+        // The first-page section of `shared_hints` is the leading part2 ++ part3
+        // entries; trailing entries are Part-8 (`part4_other_pages_shared`, after /E).
+        let first_page_input = self.part2_objects.len() + self.part3_objects.len();
+
         // Position (index into the output list) at which each container was
         // first emitted, so later members of the same container fold into it.
         let mut container_pos: BTreeMap<u32, usize> = BTreeMap::new();
         let mut out: Vec<SharedObjectHintEntry> = Vec::with_capacity(self.shared_hints.len());
+        let mut first_page_out_end: Option<usize> = None;
 
-        for entry in &self.shared_hints {
+        for (input_idx, entry) in self.shared_hints.iter().enumerate() {
+            if input_idx == first_page_input {
+                // Crossed into the Part-8 region: freeze the first-page boundary.
+                first_page_out_end = Some(out.len());
+            }
             match member_to_container.get(&entry.object_ref) {
                 Some(&(container_num, _idx)) => {
                     if let Some(&pos) = container_pos.get(&container_num) {
@@ -873,6 +894,26 @@ impl LinearizationPlan {
                 None => out.push(entry.clone()),
             }
         }
+
+        // Reorder the first-page section to ascending physical object number —
+        // the order qpdf's `checkHSharedObject` walks (positionally from the
+        // first page object). `place_objstm_members_per_half` numbers the first
+        // half as plain… then containers…, so a plain ObjStm-ineligible shared
+        // stream is numbered BEFORE the container of the eligible dicts. A
+        // folded container entry carries its new number with the sentinel
+        // generation `u16::MAX`; a plain entry carries an original ref resolved
+        // through `renumber`. Part-8 entries (after the boundary) stay in place.
+        let boundary = first_page_out_end.unwrap_or(out.len());
+        out[..boundary].sort_by_key(|e| {
+            if e.object_ref.generation == u16::MAX {
+                e.object_ref.number
+            } else {
+                renumber
+                    .new_for_original(e.object_ref)
+                    .map(|r| r.number)
+                    .unwrap_or(u32::MAX)
+            }
+        });
 
         out
     }
@@ -3387,7 +3428,12 @@ mod tests {
         m2c.insert(font_dict, (12, 0));
         m2c.insert(font, (12, 1));
 
-        let folded = plan.canonical_shared_hints(&m2c);
+        // The first-page section is ordered by physical object number. With
+        // this plan `RenumberMap::from_plan` assigns page=3, content=4 (Part 2),
+        // and the container is numbered 12, so the post-sort order is
+        // [page, content, container].
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded = plan.canonical_shared_hints(&m2c, &renumber);
         // page, content, and ONE container entry = 3 entries (members folded).
         assert_eq!(
             folded.len(),
@@ -3421,7 +3467,77 @@ mod tests {
             }],
             ..Default::default()
         };
-        let folded = plan.canonical_shared_hints(&BTreeMap::new());
+        // The empty-map branch returns before using `renumber`, so any map works.
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded = plan.canonical_shared_hints(&BTreeMap::new(), &renumber);
         assert_eq!(folded, plan.shared_hints);
+    }
+
+    /// A Part-8 entry (`part4_other_pages_shared`, after /E) is NOT sorted into
+    /// the first-page section: only the leading part2 ++ part3 entries are
+    /// reordered by physical object number. Here a plain ineligible shared
+    /// stream (`image`, physical-numbered after the container) must sort AFTER
+    /// the folded container within the first-page section, while the trailing
+    /// Part-8 entry stays last regardless of its physical number.
+    #[test]
+    fn canonical_shared_hints_orders_first_page_and_keeps_part8_last() {
+        let page = ObjectRef::new(8, 0);
+        let content = ObjectRef::new(9, 0);
+        let image = ObjectRef::new(10, 0);
+        let font_dict = ObjectRef::new(1, 0);
+        let other_shared = ObjectRef::new(7, 0);
+        let plan = LinearizationPlan {
+            // part2 ++ part3 form the first-page section; font_dict is the only
+            // ObjStm-eligible member (folded into container 11).
+            part2_objects: vec![page, content, image],
+            part3_objects: vec![font_dict],
+            // Part-8: one other-pages shared object.
+            part4_other_pages_shared: vec![other_shared],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: content,
+                    referencing_pages: vec![],
+                },
+                // font_dict is eligible → folds into container 11, which is
+                // physically numbered AFTER the plain `image` stream.
+                SharedObjectHintEntry {
+                    object_ref: font_dict,
+                    referencing_pages: vec![1],
+                },
+                SharedObjectHintEntry {
+                    object_ref: image,
+                    referencing_pages: vec![1],
+                },
+                // Part-8 entry (after /E): must remain last after the sort.
+                SharedObjectHintEntry {
+                    object_ref: other_shared,
+                    referencing_pages: vec![2],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // font_dict lives in container 11 (the first-half ObjStm).
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(font_dict, (11, 0));
+
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded = plan.canonical_shared_hints(&m2c, &renumber);
+
+        // 3 plain first-page entries (page, content, image) + 1 folded
+        // container + 1 Part-8 entry = 5 (only font_dict folded away).
+        assert_eq!(folded.len(), 5, "only the eligible member folds");
+        // First-page section ordered by physical number: page, content come
+        // first (Part 2), then `image` (last Part 2), then the container 11.
+        assert_eq!(folded[0].object_ref, page);
+        assert_eq!(folded[1].object_ref, content);
+        assert_eq!(folded[2].object_ref, image);
+        assert_eq!(folded[3].object_ref, ObjectRef::new(11, u16::MAX));
+        // Part-8 entry stays last (not pulled into the first-page sort).
+        assert_eq!(folded[4].object_ref, other_shared);
     }
 }

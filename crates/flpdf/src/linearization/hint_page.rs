@@ -301,12 +301,12 @@ impl PageOffsetHintTable {
     /// not back-patched, so a placeholder zero would bake an incorrect
     /// header / entries into the table).  Also panics if the plan has zero
     /// pages — these all indicate a malformed `LinearizationPlan` that the
-    /// caller is expected to construct consistently.  The `_renumber` parameter
-    /// is retained for API stability (the `RenumberMap` is no longer needed
-    /// internally since `shared_object_ids` are now 0-based hint table indices).
+    /// caller is expected to construct consistently.  The `renumber` map orders
+    /// the folded first-page shared-hint section by physical object number, the
+    /// order qpdf's `checkHSharedObject` walks shared objects positionally.
     pub fn from_plan(
         plan: &LinearizationPlan,
-        _renumber: &RenumberMap,
+        renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
     ) -> Self {
         assert!(
@@ -327,7 +327,7 @@ impl PageOffsetHintTable {
         // that references a compressed first-page shared object points at the
         // container's index, and page 0's object_count counts the container —
         // not its members.  With no ObjStm packing this is `plan.shared_hints`.
-        let shared_hints = plan.canonical_shared_hints(member_to_container);
+        let shared_hints = plan.canonical_shared_hints(member_to_container, renumber);
 
         // ------------------------------------------------------------------
         // Step 1: collect object counts per page from the plan.
