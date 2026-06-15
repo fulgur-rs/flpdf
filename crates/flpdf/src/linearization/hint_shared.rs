@@ -308,11 +308,33 @@ impl SharedObjectHintTable {
         // first-page section (Part-2 + Part-3, with packed Part-3 members folded
         // into their first-half container).  The remainder
         // (section_entries - first_page_entries) are the Part-8 (after-/E)
-        // shared objects.  Computing it as `shared_count - |part8|` keeps the
-        // count consistent with the folded list regardless of ObjStm packing.
+        // shared objects, counted in the SAME folded form as `shared_count`:
+        // `part4_other_pages_shared` members packed into a second-half ObjStm
+        // container fold to one shared entry per container (see
+        // [`LinearizationPlan::canonical_shared_hints`]), so subtracting the
+        // unfolded `part4_other_pages_shared.len()` would over-count the Part-8
+        // region and undercount `first_page_entries`.  Mirror the fold here so
+        // the count stays consistent with the folded list regardless of ObjStm
+        // packing.
         // ------------------------------------------------------------------
-        let first_page_entries =
-            shared_count.saturating_sub(plan.part4_other_pages_shared.len() as u32);
+        let part8_entries = {
+            let mut seen_containers = std::collections::BTreeSet::new();
+            let mut count = 0u32;
+            for r in &plan.part4_other_pages_shared {
+                match member_to_container.get(r) {
+                    // One folded entry per distinct second-half container.
+                    Some(&(container_num, _)) => {
+                        if seen_containers.insert(container_num) {
+                            count += 1;
+                        }
+                    }
+                    // Plain (uncompressed) Part-8 object: its own entry.
+                    None => count += 1,
+                }
+            }
+            count
+        };
+        let first_page_entries = shared_count.saturating_sub(part8_entries);
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
@@ -879,6 +901,34 @@ mod tests {
                 .number,
             "first_object_number must equal the renumbered slot of \
              part4_other_pages_shared[0] (9 0 R) when Part-8 shared objects exist"
+        );
+    }
+
+    #[test]
+    fn part8_shared_folded_container_does_not_overcount_first_page_entries() {
+        // Two Part-8 (after-/E) shared objects packed into ONE second-half
+        // ObjStm container.  `canonical_shared_hints` folds them into a single
+        // shared entry, so `section_entries` is 3 (part2 + part3 + 1 folded
+        // Part-8).  `first_page_entries` must stay 2 (part2 + part3): subtracting
+        // the unfolded `part4_other_pages_shared.len()` (2) would wrongly yield 1
+        // and tell qpdf a first-page entry belongs to Part 8.
+        let plan = two_page_with_part8_shared();
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut member_to_container: std::collections::BTreeMap<ObjectRef, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        member_to_container.insert(ObjectRef::new(9, 0), (42, 0));
+        member_to_container.insert(ObjectRef::new(10, 0), (42, 1));
+        let table = SharedObjectHintTable::from_plan(&plan, &renumber, &member_to_container);
+
+        assert_eq!(
+            table.header.section_entries, 3,
+            "two Part-8 members folded into one container → section_entries = \
+             part2(1) + part3(1) + folded part8(1) = 3"
+        );
+        assert_eq!(
+            table.header.first_page_entries, 2,
+            "first_page_entries must stay |part2| + |part3| = 2 even when the \
+             Part-8 members fold into a single container"
         );
     }
 
