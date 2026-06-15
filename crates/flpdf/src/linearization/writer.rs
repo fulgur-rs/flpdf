@@ -2069,7 +2069,13 @@ pub fn write_linearized<R: Read + Seek>(
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;
 
-    let eff_version = effective_pdf_version(pdf.version(), options, true);
+    // Floor the header to 1.5 only when the output actually carries an ObjStm
+    // container (qpdf raises the minimum on real emission, not on mode). When
+    // both batch lists are empty the placement early-returned and no container
+    // is written, so the non-ObjStm linearized goldens stay at the 1.2 floor.
+    let emits_object_streams = !resolved_batch_plan.part3_batches.is_empty()
+        || !resolved_batch_plan.part4_batches.is_empty();
+    let eff_version = effective_pdf_version(pdf.version(), options, true, emits_object_streams);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
     let part1_dict_region = part1.dict_writable_region.clone();
