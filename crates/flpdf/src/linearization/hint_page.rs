@@ -274,16 +274,24 @@ fn page0_object_count_with_objstm(
     }
 
     // /Info and the /Pages tree are folded into the first-half ObjStm container
-    // alongside the Part-3 members (`canonicalise_first_half_batch`, both
-    // Generate and Preserve).  When the existing Part-3 members exactly fill a
-    // batch, these extras can land in a SEPARATE first-half container; that
-    // container is otherwise invisible here because /Info and /Pages are not in
-    // `part3_objects`, which would undercount the first-page section.  Count
-    // their first-half container too.  (Left uncompressed they live after /E, so
-    // the plain case correctly adds nothing.)
-    for r in [plan.info_ref, plan.pages_tree_ref].into_iter().flatten() {
-        if let Some(&(container_num, _)) = member_to_container.get(&r) {
-            first_page_containers.insert(container_num);
+    // alongside the Part-3 members — but ONLY when a first-half (Part-3) batch
+    // exists to canonicalize.  `canonicalise_first_half_batch` runs only when
+    // `part3_batches` is non-empty (a multi-page document with first-page shared
+    // objects), which is exactly when at least one Part-3 object was packed into
+    // a first-half container, i.e. `first_page_containers` is non-empty here.
+    //
+    // In that case /Info and /Pages live in the first-half section: when they
+    // exactly fill a separate chunk they form their own first-half container,
+    // invisible to the `part3_objects` scan above (they are not Part-3 objects),
+    // so it must be counted.  When there is NO first-half Part-3 container (e.g.
+    // single-page `--object-streams=generate`), /Info and /Pages remain in the
+    // second-half Part-4 batches and are emitted AFTER /E, so they must NOT be
+    // counted toward page 0 even though they are compressed.
+    if !first_page_containers.is_empty() {
+        for r in [plan.info_ref, plan.pages_tree_ref].into_iter().flatten() {
+            if let Some(&(container_num, _)) = member_to_container.get(&r) {
+                first_page_containers.insert(container_num);
+            }
         }
     }
 
@@ -984,5 +992,34 @@ mod tests {
 
         // |part2| (1) + |part3 plain| (0) + |containers| (1) = 2.
         assert_eq!(page0_object_count_with_objstm(&plan, &m2c), 2);
+    }
+
+    /// ObjStm enabled but no first-half Part-3 container (e.g. single-page
+    /// `--object-streams=generate`, where `canonicalise_first_half_batch` does
+    /// not run): /Info and /Pages stay in second-half Part-4 batches, emitted
+    /// after /E.  They must NOT be counted toward page 0 even though they are
+    /// compressed — counting them would over-report the first-page object count
+    /// and break the page-offset hint table.
+    #[test]
+    fn page0_count_excludes_second_half_info_pages_when_no_first_half_container() {
+        let page = ObjectRef::new(3, 0);
+        let info = ObjectRef::new(7, 0);
+        let pages = ObjectRef::new(8, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page],
+            part3_objects: vec![], // single page: no first-page shared objects
+            info_ref: Some(info),
+            pages_tree_ref: Some(pages),
+            ..Default::default()
+        };
+        // /Info + /Pages packed into a SECOND-half (Part-4) container 20.
+        let mut m2c: std::collections::BTreeMap<ObjectRef, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        m2c.insert(info, (20, 0));
+        m2c.insert(pages, (20, 1));
+
+        // |part2| (1) + |part3 plain| (0) + |first-half containers| (0) = 1.
+        // The Part-4 container 20 (after /E) must not be counted.
+        assert_eq!(page0_object_count_with_objstm(&plan, &m2c), 1);
     }
 }
