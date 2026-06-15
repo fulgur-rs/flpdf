@@ -113,6 +113,40 @@ else
     echo "Skipping lone-flate-l9.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/shared-stream-objstm.pdf" ]]; then
+    echo "Generating shared-stream-objstm.pdf ..."
+    # 2-page PDF where page 0 shares with page 1 BOTH an ObjStm-eligible font
+    # dict (obj 5) AND an ObjStm-ineligible image XObject stream (obj 6). The
+    # eligible dict packs into a first-half container; the ineligible stream
+    # stays a plain first-half object numbered BEFORE the container. Exercises
+    # flpdf-ihb.2: folded shared-hint order must match physical object number.
+    python3 - "$FIX/shared-stream-objstm.pdf" <<'PY'
+import sys
+def obj(n, body): return b"%d 0 obj\n" % n + body + b"\nendobj\n"
+img = b"\xff"
+c0 = b"BT /F1 12 Tf 100 700 Td (Page0) Tj ET\nq 1 0 0 1 0 0 cm /Im0 Do Q\n"
+c1 = b"BT /F1 12 Tf 100 700 Td (Page1) Tj ET\nq 1 0 0 1 0 0 cm /Im0 Do Q\n"
+res = b"<< /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >>"
+o1 = obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+o2 = obj(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")
+o3 = obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources " + res + b" /Contents 7 0 R >>")
+o4 = obj(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources " + res + b" /Contents 8 0 R >>")
+o5 = obj(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+o6 = obj(6, b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length %d >>\nstream\n" % len(img) + img + b"\nendstream")
+o7 = obj(7, b"<< /Length %d >>\nstream\n" % len(c0) + c0 + b"\nendstream")
+o8 = obj(8, b"<< /Length %d >>\nstream\n" % len(c1) + c1 + b"\nendstream")
+body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"; offs=[]
+for o in (o1,o2,o3,o4,o5,o6,o7,o8): offs.append(len(body)); body+=o
+xref=len(body); n=len(offs)+1
+body += b"xref\n0 %d\n0000000000 65535 f \n" % n
+for off in offs: body += b"%010d 00000 n \n" % off
+body += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xref)
+open(sys.argv[1],"wb").write(body)
+PY
+else
+    echo "Skipping shared-stream-objstm.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
     echo "Generating one-page-enc-u.pdf ..."
     # AES-256 (R6) encrypted source for the overlay --password path. AES key
@@ -232,6 +266,15 @@ echo "lone-flate-l9/static-id.pdf"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/lone-flate-l9.pdf" "$REF/lone-flate-l9/linearize.pdf"
 echo "lone-flate-l9/linearize.pdf"
+
+# --- shared-stream-objstm: linearized + object streams. Page 0 shares an
+#     ObjStm-eligible font dict AND an ObjStm-ineligible image stream with
+#     page 1; the folded shared-object hint table must list the plain stream
+#     before the container in physical object-number order (flpdf-ihb.2). ---
+mkdir -p "$REF/shared-stream-objstm"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/shared-stream-objstm.pdf" "$REF/shared-stream-objstm/linearize-objstm.pdf"
+echo "shared-stream-objstm/linearize-objstm.pdf"
 
 echo ""
 echo "=== All references generated ==="
