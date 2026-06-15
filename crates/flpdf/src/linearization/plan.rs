@@ -852,13 +852,18 @@ impl LinearizationPlan {
                         }
                     } else {
                         // First member of this container: emit one entry for the
-                        // container, carrying its new object number.
+                        // container, carrying its new object number. The
+                        // generation is the sentinel `u16::MAX`: no live object
+                        // ever uses it, so consumers can identify this synthetic
+                        // container entry unambiguously — even when `container_num`
+                        // coincides with a surviving original object's number,
+                        // which would otherwise resolve through a `RenumberMap`.
                         let mut pages = entry.referencing_pages.clone();
                         pages.sort_unstable();
                         pages.dedup();
                         container_pos.insert(container_num, out.len());
                         out.push(SharedObjectHintEntry {
-                            object_ref: ObjectRef::new(container_num, 0),
+                            object_ref: ObjectRef::new(container_num, u16::MAX),
                             referencing_pages: pages,
                         });
                     }
@@ -3323,8 +3328,10 @@ mod tests {
         );
         assert_eq!(folded[0].object_ref, page);
         assert_eq!(folded[1].object_ref, content);
-        // The container entry carries the container's new number (12).
-        assert_eq!(folded[2].object_ref, ObjectRef::new(12, 0));
+        // The container entry carries the container's new number (12) with the
+        // sentinel generation u16::MAX (so it is never mistaken for a real
+        // object numbered 12).
+        assert_eq!(folded[2].object_ref, ObjectRef::new(12, u16::MAX));
         // Its referencing_pages is the sorted union {1, 2}.
         assert_eq!(
             folded[2].referencing_pages,

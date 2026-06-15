@@ -2428,30 +2428,22 @@ pub fn write_linearized<R: Read + Seek>(
             // built from): first-page ObjStm members are folded into a single
             // container entry whose byte length is the container object's own
             // length.  A folded container entry carries the container's *new*
-            // object number directly (see
-            // `LinearizationPlan::canonical_shared_hints`) and has NO original
-            // mapping in the renumber map; every other entry carries an original
-            // ref that resolves through the renumber map.  We discriminate by
-            // that resolution (`new_for_original` is `None` only for the
-            // synthetic container ref), so a real original ref whose number
-            // happens to coincide with a container's new number is never
-            // mistaken for a container.
+            // object number with the sentinel generation `u16::MAX` (see
+            // `LinearizationPlan::canonical_shared_hints`); every other entry
+            // carries a real original ref (generation 0).  We discriminate by
+            // that sentinel — no live object uses generation `u16::MAX` — so a
+            // real original ref whose number happens to coincide with a
+            // container's new number can never be mistaken for a container (and
+            // vice versa).
             let folded_shared = plan.canonical_shared_hints(&objstm_layout.member_to_container);
-            let first_half_container_numbers: std::collections::BTreeSet<u32> = objstm_layout
-                .part3
-                .iter()
-                .map(|c| c.container_new_num)
-                .collect();
             let shared_section_lens: Vec<u64> =
                 folded_shared
                     .iter()
                     .map(|h| -> Result<u64> {
-                        // Folded container entry: synthetic ref (no original
-                        // mapping) whose number is a first-half container.  Use the
-                        // container object's own byte length.
-                        if renumber.new_for_original(h.object_ref).is_none()
-                            && first_half_container_numbers.contains(&h.object_ref.number)
-                        {
+                        // Folded container entry: the synthetic ref's sentinel
+                        // generation identifies it. Use the container object's
+                        // own byte length.
+                        if h.object_ref.generation == u16::MAX {
                             // cov:ignore-start: unreachable — a first-half
                             // container is always emitted (and probed) before
                             // this back-patch, so its byte length is present; the
