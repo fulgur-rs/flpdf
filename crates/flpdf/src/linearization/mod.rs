@@ -14,6 +14,15 @@ pub mod plan;
 pub mod renumber;
 pub mod writer;
 
+// The qpdf-faithful cross-reference *stream* encoder is staged ahead of its
+// writer integration: the linearized writer still emits the legacy uncompressed
+// `/W [1 8 4]` xref stream, and switching it over to this compressed
+// (`/Predictor 12`, `/W [1 2 1]`) encoder requires reconciling the variable
+// compressed length with the offset back-patch loop. Until that integration the
+// encoder is exercised only by its own unit tests, so `dead_code` is allowed.
+#[allow(dead_code)]
+mod xref_stream;
+
 pub use back_patch::back_patch_param_dict;
 pub use check::{
     check_linearization, check_linearization_bytes, check_linearization_path, CheckResult,
