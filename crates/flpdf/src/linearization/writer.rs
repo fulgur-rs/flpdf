@@ -272,13 +272,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     // [`Object::Stream`] serializer would alphabetise the keys instead. Framing
     // mirrors [`append_hint_stream_object`].
     let offset = bytes.len();
-    bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
-    bytes.extend_from_slice(b"<< /Type /ObjStm");
-    bytes.extend_from_slice(format!(" /Length {}", stream.data.len()).as_bytes());
-    bytes.extend_from_slice(b" /Filter /FlateDecode");
-    bytes.extend_from_slice(format!(" /N {}", body.n_members).as_bytes());
-    bytes.extend_from_slice(format!(" /First {}", body.first_offset).as_bytes());
-    bytes.extend_from_slice(b" >>\nstream\n");
+    // Write the header directly into `bytes` to avoid temporary `String`
+    // allocations from `format!`.
+    use std::io::Write as _;
+    let _ = write!(
+        bytes,
+        "{} 0 obj\n<< /Type /ObjStm /Length {} /Filter /FlateDecode /N {} /First {} >>\nstream\n",
+        container.container_new_num,
+        stream.data.len(),
+        body.n_members,
+        body.first_offset,
+    );
     bytes.extend_from_slice(&stream.data);
     // No newline before `endstream` — qpdf's default (NewlineBeforeEndstream is
     // Never on this path); the ObjStm body's own trailing newline is inside the

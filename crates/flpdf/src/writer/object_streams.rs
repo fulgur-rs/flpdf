@@ -371,11 +371,14 @@ pub(crate) fn emit_objstm_body_from_resolved(
     // objects section — qpdf 11.9.0's `/Type /ObjStm` layout (a newline after
     // each pair, as flpdf used to emit, is valid PDF but not byte-identical).
     let mut pair_table: Vec<u8> = Vec::new();
+    use std::io::Write as _;
     for (i, ((obj_ref, _), offset)) in members.iter().zip(offsets.iter()).enumerate() {
         if i > 0 {
             pair_table.push(b' ');
         }
-        pair_table.extend_from_slice(format!("{} {}", obj_ref.number, offset).as_bytes());
+        // Write directly into `pair_table` to avoid a temporary `String`
+        // allocation per member.
+        let _ = write!(pair_table, "{} {}", obj_ref.number, offset);
     }
     pair_table.push(b'\n');
 
