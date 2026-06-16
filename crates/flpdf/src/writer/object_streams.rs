@@ -211,7 +211,13 @@ fn compressible_objgens<R: std::io::Read + std::io::Seek>(
                     continue;
                 }
                 let resolved = pdf.resolve_borrowed(r)?.clone();
-                result.push(r);
+                // Streams and signature value dictionaries cannot be stored
+                // inside an object stream, so they are excluded from the result —
+                // but their dictionaries are still traversed for child references
+                // (QPDF.cc:2439-2445).
+                if !matches!(resolved, Object::Stream(_)) && !is_signature_dict(&resolved) {
+                    result.push(r);
+                }
                 push_children(&resolved, &mut stack);
             }
             // Direct (inline) container: traversed for its children but never
@@ -223,24 +229,46 @@ fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     Ok(result)
 }
 
+/// Returns `true` for a signature value dictionary: `/Type /Sig` carrying both
+/// `/ByteRange` and `/Contents` (matching qpdf's `isDictionaryOfType("/Sig")`
+/// guard at QPDF.cc:2440). The signed byte range must stay outside any object
+/// stream.
+fn is_signature_dict(obj: &Object) -> bool {
+    let Some(dict) = obj.as_dict() else {
+        return false;
+    };
+    dict_type_is(dict, b"Sig") && dict.get("ByteRange").is_some() && dict.get("Contents").is_some()
+}
+
 /// Push an object's child values onto the DFS stack so they pop in qpdf's
 /// traversal order: dictionary values in ascending key order, array items in
 /// index order. (A LIFO stack pops in reverse insertion order, so children are
 /// pushed reversed.)
 fn push_children(obj: &Object, stack: &mut Vec<Object>) {
     match obj {
-        Object::Dictionary(d) => {
-            let values: Vec<&Object> = d.iter().map(|(_k, v)| v).collect();
-            for v in values.into_iter().rev() {
-                stack.push(v.clone());
-            }
-        }
+        Object::Dictionary(d) => push_dict_children(d, stack, false),
+        // A stream is traversed via its dictionary; the data bytes are opaque.
+        Object::Stream(s) => push_dict_children(&s.dict, stack, true),
         Object::Array(items) => {
             for v in items.iter().rev() {
                 stack.push(v.clone());
             }
         }
         _ => {}
+    }
+}
+
+/// Push a dictionary's values onto the DFS stack in ascending-key pop order.
+/// For a stream dictionary (`is_stream`), `/Length` is omitted from the
+/// traversal, matching qpdf (QPDF.cc:2451): an indirect length holder must not
+/// be pulled into the compressible set via the stream.
+fn push_dict_children(d: &Dictionary, stack: &mut Vec<Object>, is_stream: bool) {
+    let entries: Vec<(&[u8], &Object)> = d.iter().collect();
+    for (key, value) in entries.into_iter().rev() {
+        if is_stream && key == b"Length" {
+            continue;
+        }
+        stack.push(value.clone());
     }
 }
 
@@ -615,6 +643,128 @@ mod tests {
             order,
             vec![ref0(1), ref0(2), ref0(5), ref0(4), ref0(3)],
             "eligible objects must be in qpdf depth-first traversal order, not numeric order"
+        );
+    }
+
+    /// Build a classic-xref PDF from pre-formatted object bodies (the bytes
+    /// between `N 0 obj\n` and `\nendobj`), `/Root 1 0 R`. Object numbers must be
+    /// `1..=bodies.len()` and supplied in ascending order.
+    fn pdf_from_bodies(bodies: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = bodies.len() as u32 + 1; // + free object 0
+        let mut offsets: Vec<usize> = vec![0; total as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for num in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[num as usize]).as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    /// One-page document whose page `/Contents` is a stream (obj 4); the stream
+    /// dictionary references obj 5 via `/Meta`, and obj 5 is reachable ONLY
+    /// through that stream dictionary.
+    fn pdf_with_content_stream() -> Vec<u8> {
+        pdf_from_bodies(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Length 3 /Meta 5 0 R >>\nstream\nq Q\nendstream".to_vec(),
+            ),
+            (5, b"<< /Type /Metadata /Marker 5 >>".to_vec()),
+        ])
+    }
+
+    /// qpdf's `getCompressibleObjGens` excludes stream objects from the result
+    /// (streams cannot live inside an object stream, QPDF.cc:2439), even though
+    /// it still traverses their dictionaries for children.
+    #[test]
+    fn compressible_objgens_excludes_stream_objects() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(pdf_with_content_stream())).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(4)),
+            "the content stream (obj 4) must not be a compressible object; got {order:?}"
+        );
+    }
+
+    /// qpdf traverses a stream's DICTIONARY for child references (QPDF.cc:2445),
+    /// so an object reachable only through a stream dictionary is still found.
+    #[test]
+    fn compressible_objgens_traverses_stream_dictionary_children() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(pdf_with_content_stream())).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            order.contains(&ref0(5)),
+            "obj 5, reachable only via the stream dict's /Meta, must be found; got {order:?}"
+        );
+    }
+
+    /// qpdf omits a stream's `/Length` from the traversal (QPDF.cc:2451), so an
+    /// object reachable ONLY as an indirect length holder is not pulled into the
+    /// compressible set. obj 5 here is the indirect `/Length` target of stream 4
+    /// and is reachable nowhere else.
+    #[test]
+    fn compressible_objgens_omits_indirect_stream_length_holder() {
+        let bytes = pdf_from_bodies(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            ),
+            (4, b"<< /Length 5 0 R >>\nstream\nq Q\nendstream".to_vec()),
+            (5, b"3".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(5)),
+            "indirect /Length holder (obj 5) must be omitted from the traversal; got {order:?}"
+        );
+    }
+
+    /// qpdf excludes a signature value dictionary — `/Type /Sig` with both
+    /// `/ByteRange` and `/Contents` — from the compressible set (QPDF.cc:2440),
+    /// because the signed byte range must not move into an object stream.
+    #[test]
+    fn compressible_objgens_excludes_signature_dictionaries() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(4)),
+            "signature dictionary (obj 4) must be excluded from the compressible set; got {order:?}"
         );
     }
 
