@@ -2545,6 +2545,8 @@ fn write_reencoded_object(
             && is_lone_flate(s.dict.get("Filter"));
         write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
     } else {
+        // cov:ignore: callers only invoke this on stream objects, and
+        // reencode_stream_for_compress always returns Object::Stream.
         reencoded.write_pdf(bytes);
     }
 }
@@ -3132,6 +3134,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                     );
                 } else {
+                    // cov:ignore: this arm only runs in the stream branch, and
+                    // reencode_stream_for_compress always returns Object::Stream.
                     reencoded.write_pdf_qdf(&mut bytes, 0);
                 }
             } else {
@@ -3543,9 +3547,9 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     use crate::rewrite_renumber::{renumber_refs_in_place, GenerateRenumber};
     use std::collections::HashSet;
 
-    if pdf.root_ref().is_none() {
-        return Err(crate::Error::Missing("/Root"));
-    }
+    // `ok_or` (eager) keeps the error construction on the covered happy path;
+    // `Error::Missing` is a cheap `&'static str` variant, so no `or_fun_call`.
+    let root_ref = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
     refuse_signed_full_rewrite(pdf, options)?;
 
     // ── object-stream assignment + generate-mode numbering ───────────────────
@@ -3556,17 +3560,18 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     // 3. enqueueObject walk with the object-stream branch => container-first
     //    numbering (members ascending-source within each container).
     let renumber = GenerateRenumber::build(pdf, &groups)?;
-    let root_ref = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
     let new_root = renumber.new_for_original(root_ref).ok_or_else(|| {
+        // cov:ignore: GenerateRenumber::build seeds /Root first, so it is always
+        // mapped; this guards against a future build change.
         crate::Error::Unsupported("generate: /Root absent from renumber map".to_string())
     })?;
 
     // ── per-container member tables + type-2 xref entries ────────────────────
-    /// One ObjStm container: its assigned object number and its members'
-    /// original refs in ascending-NEW (= ascending-source) emission order.
+    /// One ObjStm container: its assigned object number and its members as
+    /// `(original, new)` ref pairs in ascending-NEW (= ascending-source) order.
     struct ContainerPlan {
         number: u32,
-        members: Vec<ObjectRef>,
+        members: Vec<(ObjectRef, ObjectRef)>,
     }
     // Member original refs (skipped from plain emission — they serialize inside
     // their container) and NEW member number -> (container number, index).
@@ -3575,23 +3580,37 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let mut containers: Vec<ContainerPlan> = Vec::with_capacity(groups.len());
     for (gi, group) in groups.iter().enumerate() {
         let number = renumber.container_number(gi).ok_or_else(|| {
+            // cov:ignore: every group's members come from `compressible_objgens`
+            // (all reachable), so each group is reached and numbered.
             crate::Error::Unsupported(
                 "generate: ObjStm container group was never reached".to_string(),
             )
         })?;
-        // qpdf serializes a container's members in ascending source-object order
-        // (`std::set<QPDFObjGen>`), and the generate-mode numbering assigns new
-        // numbers in that same order — so sorting by the NEW number reproduces it.
-        let mut members = group.clone();
-        members.sort_by_key(|&old| renumber.new_for_original(old).map(|r| r.number));
-        for (index, &old) in members.iter().enumerate() {
+        // Resolve each member's NEW ref once. qpdf serializes a container's
+        // members in ascending source-object order (`std::set<QPDFObjGen>`), and
+        // the generate-mode numbering assigns new numbers in that same order — so
+        // sorting by the NEW number reproduces it.
+        let mut members: Vec<(ObjectRef, ObjectRef)> = group
+            .iter()
+            .map(|&old| {
+                renumber
+                    .new_for_original(old)
+                    .map(|new| (old, new))
+                    .ok_or_else(|| {
+                        // cov:ignore: members come from the same walk that built
+                        // the map, so each is present.
+                        crate::Error::Unsupported(
+                            "generate: ObjStm member absent from renumber map".to_string(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        members.sort_by_key(|&(_, new)| new.number);
+        for (index, &(old, new)) in members.iter().enumerate() {
             member_set.insert(old);
-            let new = renumber.new_for_original(old).ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "generate: ObjStm member absent from renumber map".to_string(),
-                )
-            })?;
             let index = u32::try_from(index).map_err(|_| {
+                // cov:ignore: a single ObjStm holds at most 100 members, far
+                // below u32::MAX.
                 crate::Error::Unsupported("generate: ObjStm member index overflows u32".to_string())
             })?;
             member_xref.insert(new.number, (number, index));
@@ -3616,17 +3635,19 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     }
     for (gi, c) in containers.iter().enumerate() {
         if emit.insert(c.number, Emit::Container(gi)).is_some() {
+            // cov:ignore: container numbers and plain-object numbers are disjoint
+            // by construction (members are excluded above), so this never fires.
             return Err(crate::Error::Unsupported(
                 "generate: container object number collides with a plain object".to_string(),
             ));
         }
     }
 
-    // ── header (xref-stream form => PDF 1.5 floor) ───────────────────────────
-    let mut version = effective_pdf_version(pdf.version(), options, false, true).to_owned();
-    if parse_pdf_version(&version).is_none_or(|v| v < (1, 5)) {
-        version = "1.5".to_string();
-    }
+    // ── header ───────────────────────────────────────────────────────────────
+    // Pass `object_streams = true`: xref streams require PDF 1.5, and
+    // `effective_pdf_version` applies that floor (above any lower source /
+    // --force-version), so no separate clamp is needed here.
+    let version = effective_pdf_version(pdf.version(), options, false, true).to_owned();
 
     // deterministic-/ID seed inputs, captured from the ORIGINAL trailer before
     // the emit loop borrows `pdf` (qpdf reads these from the source trailer).
@@ -3671,18 +3692,13 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
             }
             Emit::Container(gi) => {
                 // Resolve each member, rewrite its internal references to NEW
-                // numbers, and pair with its NEW ref so the ObjStm pair table
-                // records the renumbered member number.
+                // numbers, and pair with its (precomputed) NEW ref so the ObjStm
+                // pair table records the renumbered member number.
                 let plan = &containers[*gi];
                 let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(plan.members.len());
-                for &old in &plan.members {
+                for &(old, new) in &plan.members {
                     let mut obj = pdf.resolve(old)?;
                     renumber_refs_in_place(&mut obj, &renumber)?;
-                    let new = renumber.new_for_original(old).ok_or_else(|| {
-                        crate::Error::Unsupported(
-                            "generate: ObjStm member absent from renumber map".to_string(),
-                        )
-                    })?;
                     resolved.push((new, obj));
                 }
                 let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
@@ -3724,9 +3740,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         .max()
         .unwrap_or(0);
     let xref_object_number = max_object_number.checked_add(1).ok_or_else(|| {
+        // cov:ignore: would require ~u32::MAX live objects (a multi-GB PDF).
         crate::Error::Unsupported("generate: xref stream object number overflows u32".to_string())
     })?;
     let size = xref_object_number.checked_add(1).ok_or_else(|| {
+        // cov:ignore: see above — unreachable below u32::MAX objects.
         crate::Error::Unsupported("generate: xref /Size overflows u32".to_string())
     })?;
 
@@ -3796,14 +3814,19 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
             id_trailer.insert("ID", id.clone());
         }
         apply_encrypt_trailer_entries(&mut id_trailer, pdf, options, None, false);
+        // `apply_encrypt_trailer_entries` always sets /ID to a two-element array
+        // of strings here (apply_static_id / apply_random_id), so the non-String
+        // / non-pair fallbacks below are defensive only.
         let (id0, id1): (Vec<u8>, Vec<u8>) = match id_trailer.get("ID") {
             Some(Object::Array(arr)) if arr.len() == 2 => {
                 let take = |o: &Object| match o {
                     Object::String(s) => s.clone(),
+                    // cov:ignore: /ID elements are always strings here.
                     _ => QPDF_STATIC_ID.to_vec(),
                 };
                 (take(&arr[0]), take(&arr[1]))
             }
+            // cov:ignore: /ID is always a two-element array here.
             _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()),
         };
         let dict = xref_stream::XrefStreamDict {
