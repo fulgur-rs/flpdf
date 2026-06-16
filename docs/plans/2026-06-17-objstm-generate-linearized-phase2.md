@@ -94,9 +94,23 @@ being patched.
 * **(2) FIRST — validate the remap** into `from_pdf` categorization on
   `gen_mixed_shared` (reproduce part6/part7) before touching writer.rs / hints.
   Load-bearing; if awkward, the approach shifts.
-* **(1) renumber discriminator** — need a golden where a part7 container coexists
-  with a part8 UNCOMPRESSED object (e.g. a stream XObject shared by pages 1&2):
-  qpdf = `part7-container, part8-plain, xref`; flpdf-current swaps them.
+* **(1) renumber discriminator — CONFIRMED** via
+  `gen_part7_part8_discriminator.py 2 250 2` (260 eligible → 3 containers; a pure
+  part7 container coexists with the shared Form XObject X, a part8 *uncompressed*
+  stream). qpdf 11.9.0 second-half numbering: `Page1=1, c1=2, container3[part7]=3,
+  Page2=4, c2=5, X[part8]=6, container7[part8]=7, xref=8`, members 9+ — the part7
+  container is numbered BEFORE the part8 plain X and sits in page-1's private group
+  (after c1, before Page2) by ObjGen. flpdf-current's
+  `place_objstm_members_per_half` does `[all plain in part order][all containers]
+  [xref][members]` → `…X=5, xref=6, container3=7, container7=8`, swapping them.
+  The earlier 3-page fixture did not discriminate (its lone part8 container was the
+  last uncompressed object). **Fix:** make containers first-class part-vector
+  objects (synthetic ObjGen = `max_source_objid + 1 + even_split_index`) injected
+  into `from_pdf` so each lands in its routed part at its ObjGen position (a part7
+  container into its owning page's private group); `place_objstm_members_per_half`
+  then only relocates the *members* (type-2) to after each half's xref. Net
+  second-half = `[part7 incl. containers][part8 incl. containers + plain X][part9]
+  → xref → members`, matching qpdf.
 * **(4) hint tables in scope** — `hint_page.rs` page-0 nobjects now counts the
   container as one object; `hint_shared.rs` nshared shifts. ihb.3 IS this
   consistency. Not a follow-up.
