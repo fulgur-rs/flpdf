@@ -160,18 +160,19 @@ fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// Write a complete cross-reference stream indirect object
-/// (`<num> 0 obj … endobj\n`) to `out`, with `dict`'s keys in qpdf's fixed order
-/// and `payload` as the already-encoded stream body.
-pub(crate) fn write_object(
+/// Write the xref-stream object header and every dictionary key up to (but not
+/// including) `/ID`, in qpdf's fixed order: `/Type /Length /Filter /DecodeParms
+/// /W [/Index] [/Info] [/Root] /Size [/Prev]`. The caller appends `/ID` (concrete
+/// or inline-written) and the ` >>\nstream\n…` framing.
+fn write_object_dict_prefix(
     out: &mut Vec<u8>,
     object: ObjectRef,
     dict: &XrefStreamDict,
-    payload: &[u8],
+    payload_len: usize,
 ) {
     out.extend_from_slice(format!("{} {} obj\n", object.number, object.generation).as_bytes());
     out.extend_from_slice(b"<< /Type /XRef");
-    out.extend_from_slice(format!(" /Length {}", payload.len()).as_bytes());
+    out.extend_from_slice(format!(" /Length {payload_len}").as_bytes());
     out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
     out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
     out.extend_from_slice(b" /Predictor 12 >>");
@@ -195,6 +196,27 @@ pub(crate) fn write_object(
     if let Some(prev) = dict.prev {
         out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
     }
+}
+
+/// Append the ` >>\nstream\n<payload>\nendstream\nendobj\n` framing that closes a
+/// cross-reference stream object (the `\n` before `endstream` is qpdf's fixed
+/// xref-stream framing, independent of the `NewlineBeforeEndstream` policy).
+fn write_object_framing(out: &mut Vec<u8>, payload: &[u8]) {
+    out.extend_from_slice(b" >>\nstream\n");
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+}
+
+/// Write a complete cross-reference stream indirect object
+/// (`<num> 0 obj … endobj\n`) to `out`, with `dict`'s keys in qpdf's fixed order
+/// and `payload` as the already-encoded stream body.
+pub(crate) fn write_object(
+    out: &mut Vec<u8>,
+    object: ObjectRef,
+    dict: &XrefStreamDict,
+    payload: &[u8],
+) {
+    write_object_dict_prefix(out, object, dict, payload.len());
     if let Some((id0, id1)) = dict.id {
         out.extend_from_slice(b" /ID [<");
         push_hex(out, id0);
@@ -202,9 +224,27 @@ pub(crate) fn write_object(
         push_hex(out, id1);
         out.extend_from_slice(b">]");
     }
-    out.extend_from_slice(b" >>\nstream\n");
-    out.extend_from_slice(payload);
-    out.extend_from_slice(b"\nendstream\nendobj\n");
+    write_object_framing(out, payload);
+}
+
+/// Like [`write_object`] but writes the trailer `/ID` via `id_writer` at its
+/// fixed position (after `/Size`/`/Prev`), so a content-derived deterministic
+/// `/ID` can be computed from the bytes written up to the array's `[`. The
+/// `id_writer` must emit the full `[<hex0><hex1>]` array value. `dict.id` is
+/// ignored. Used by the non-linearized generate writer for `--deterministic-id`
+/// (which is not byte-parity with qpdf for xref-stream form, but must be
+/// self-stable).
+pub(crate) fn write_object_with_id_writer(
+    out: &mut Vec<u8>,
+    object: ObjectRef,
+    dict: &XrefStreamDict,
+    payload: &[u8],
+    id_writer: &mut dyn FnMut(&mut Vec<u8>),
+) {
+    write_object_dict_prefix(out, object, dict, payload.len());
+    out.extend_from_slice(b" /ID ");
+    id_writer(out);
+    write_object_framing(out, payload);
 }
 
 // ---------------------------------------------------------------------------

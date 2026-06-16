@@ -1,13 +1,15 @@
 //! End-to-end checks for the deterministic-`/ID` cross-reference *stream* path.
 //!
-//! The xref-stream dictionary serializes its keys in plain lexicographic order
-//! (so `/ID` is NOT last) and is followed by a compressed binary payload. The
-//! writer direct-writes the deterministic `/ID` inline at `/ID`'s sorted
-//! position, computed from the bytes up to and including its opening `[`. This
-//! is flpdf's own content-derived identifier (not qpdf byte-parity for the
-//! xref-stream form), so the regression baseline below is flpdf's own output:
-//! the golden SHA-256 / `/ID` words were captured from the writer on the exact
-//! fixture and pin byte-stability across changes.
+//! `ObjectStreamMode::Generate` routes to the non-linearized generate writer,
+//! which emits qpdf's fixed-key-order xref stream (`/Type /Length /Filter
+//! /DecodeParms /W [/Index] [/Info] /Root /Size /ID`, with `/ID` last) and a
+//! `/Predictor 12` `/W [1 2 1]` compressed payload. The writer direct-writes the
+//! deterministic `/ID` inline at its position, computed from the bytes up to and
+//! including the array's opening `[`. This is flpdf's own content-derived
+//! identifier (qpdf does not produce byte-parity for the xref-stream form), so
+//! the regression baseline below is flpdf's own output: the golden SHA-256 /
+//! `/ID` words were captured from the writer on the exact fixture and pin
+//! byte-stability across changes.
 
 use flpdf::{write_pdf_with_options, ObjectStreamMode, Pdf, WriteOptions};
 #[cfg(not(feature = "qpdf-zlib-compat"))]
@@ -111,15 +113,18 @@ fn id_words(bytes: &[u8]) -> (String, String) {
 // byte-exact goldens below are pinned for the default backend only; the
 // backend-agnostic structural checks (no placeholder, run-stability) run under
 // either backend.
-// Re-blessed for flpdf-0i0s: the ObjStm member offset table is now qpdf's
-// single-line, space-separated form (was one pair per line), changing the
-// container bytes and therefore this content-derived /ID + SHA-256.
+// Re-blessed for flpdf-g6hb.1: non-linearized --object-streams=generate now uses
+// qpdf's generate-mode numbering (ObjStm container numbered first, members
+// renumbered ascending-source) and qpdf's `/Predictor 12` `/W [1 2 1]` xref
+// stream (was `/W [1 8 4]`, no predictor, container-above-max). Both change the
+// container/xref bytes and therefore this content-derived /ID + SHA-256. The new
+// output is qpdf --check clean (verified manually on the fixture).
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_SHA256: &str = "34171a26bab760023203993ac1384b1306aaf4fdac2ebd8b6f2f44bb48ec12da";
+const GOLDEN_SHA256: &str = "c52eae32856edaa0dba4654be7c82fea0d7c9d0ca30b9d9b223db7c63b926080";
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_ID0: &str = "31ab51ff9932a74cddcd868b6427232b";
+const GOLDEN_ID0: &str = "1b4312b11114463904503773ef543ad9";
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_ID1: &str = "31ab51ff9932a74cddcd868b6427232b";
+const GOLDEN_ID1: &str = "1b4312b11114463904503773ef543ad9";
 
 #[test]
 fn xref_stream_deterministic_id_has_no_zero_placeholder() {

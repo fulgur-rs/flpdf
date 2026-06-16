@@ -188,6 +188,123 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
     }
 }
 
+/// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
+/// (libqpdf/QPDF.cc:2392): a depth-first walk from the trailer, descending into
+/// dictionary values in ascending key order and array items in order. This
+/// traversal order — not object-number order — decides which objects co-locate
+/// in a generated object stream when more than one container is needed, so the
+/// port must reproduce it exactly.
+///
+/// Returns each reachable indirect object's reference in first-visit order.
+pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<Vec<ObjectRef>> {
+    let mut visited: BTreeSet<u32> = BTreeSet::new();
+    let mut result: Vec<ObjectRef> = Vec::new();
+    // The encryption dictionary is excluded from the result, matching qpdf's
+    // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
+    // plain indirect object so the rest of the file can be decrypted. Read it
+    // from the trailer's `/Encrypt` reference (it is still traversed for any
+    // child references, like a stream or signature dictionary).
+    let encrypt_ref = match pdf.trailer().get("Encrypt") {
+        Some(Object::Reference(r)) => Some(*r),
+        _ => None,
+    };
+    // qpdf seeds the stack with the trailer dictionary itself (a direct object).
+    let mut stack: Vec<Object> = vec![Object::Dictionary(pdf.trailer().clone())];
+
+    while let Some(obj) = stack.pop() {
+        match obj {
+            Object::Reference(r) => {
+                if !visited.insert(r.number) {
+                    continue;
+                }
+                // Borrow (do not clone) the resolved object: it is only read
+                // within this iteration to test eligibility and push its
+                // children, so cloning would needlessly copy a stream's entire
+                // data payload (potentially megabytes).
+                let resolved = pdf.resolve_borrowed(r)?;
+                // Streams, signature value dictionaries, and the encryption
+                // dictionary cannot be stored inside an object stream, so they
+                // are excluded from the result — but they are still traversed for
+                // child references (QPDF.cc:2437-2445).
+                if !matches!(resolved, Object::Stream(_))
+                    && !is_signature_dict(resolved)
+                    && Some(r) != encrypt_ref
+                {
+                    result.push(r);
+                }
+                push_children(resolved, &mut stack);
+            }
+            // Direct (inline) container: traversed for its children but never
+            // contributes a reference (it has no object number of its own).
+            other => push_children(&other, &mut stack),
+        }
+    }
+
+    Ok(result)
+}
+
+/// Distribute `eligible` objects into object-stream groups using qpdf's
+/// `generateObjectStreams` algorithm (QPDFWriter.cc:1969-2005): pick
+/// `ceil(n / 100)` streams so none exceeds 100 members, then spread the objects
+/// approximately evenly — `n_per = ceil(n / streams)` consecutive members per
+/// stream — in the given (traversal) order. Returns one inner `Vec` per stream;
+/// an empty input yields no streams. (qpdf is `(n + 99) / 100` then
+/// `n / streams` rounded up; `div_ceil` expresses both directly.)
+pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectRef>> {
+    let n = eligible.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let n_streams = n.div_ceil(100);
+    let n_per = n.div_ceil(n_streams);
+    eligible.chunks(n_per).map(|chunk| chunk.to_vec()).collect()
+}
+
+/// Returns `true` for a signature value dictionary: `/Type /Sig` carrying both
+/// `/ByteRange` and `/Contents` (matching qpdf's `isDictionaryOfType("/Sig")`
+/// guard at QPDF.cc:2440). The signed byte range must stay outside any object
+/// stream.
+fn is_signature_dict(obj: &Object) -> bool {
+    let Some(dict) = obj.as_dict() else {
+        return false; // cov:ignore: callers gate on non-stream resolved dicts
+    };
+    dict_type_is(dict, b"Sig") && dict.get("ByteRange").is_some() && dict.get("Contents").is_some()
+}
+
+/// Push an object's child values onto the DFS stack so they pop in qpdf's
+/// traversal order: dictionary values in ascending key order, array items in
+/// index order. (A LIFO stack pops in reverse insertion order, so children are
+/// pushed reversed.)
+fn push_children(obj: &Object, stack: &mut Vec<Object>) {
+    match obj {
+        Object::Dictionary(d) => push_dict_children(d, stack, false),
+        // A stream is traversed via its dictionary; the data bytes are opaque.
+        Object::Stream(s) => push_dict_children(&s.dict, stack, true),
+        Object::Array(items) => {
+            for v in items.iter().rev() {
+                stack.push(v.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Push a dictionary's values onto the DFS stack in ascending-key pop order.
+/// For a stream dictionary (`is_stream`), `/Length` is omitted from the
+/// traversal, matching qpdf (QPDF.cc:2451): an indirect length holder must not
+/// be pulled into the compressible set via the stream.
+fn push_dict_children(d: &Dictionary, stack: &mut Vec<Object>, is_stream: bool) {
+    let entries: Vec<(&[u8], &Object)> = d.iter().collect();
+    for (key, value) in entries.into_iter().rev() {
+        if is_stream && key == b"Length" {
+            continue;
+        }
+        stack.push(value.clone());
+    }
+}
+
 /// Collect the set of ObjectRefs that serve as indirect /Length targets of any
 /// ObjStm stream in the document.  ISO 32000-1 §7.5.7 prohibits those objects
 /// from being stored inside an ObjStm themselves.
@@ -491,6 +608,300 @@ mod tests {
 
     fn ref1(n: u32) -> ObjectRef {
         ObjectRef::new(n, 1)
+    }
+
+    /// Build a minimal classic-xref PDF with `n` pages whose `/Kids` are listed
+    /// in DESCENDING object number, so the document's depth-first traversal
+    /// order (Catalog, Pages, then kids in array order) differs from numeric
+    /// object-number order. Object layout: 1=Catalog, 2=Pages, 3..n+2=Page
+    /// dicts. Mirrors `docs/plans/tools/gen_multipage.py --reverse`.
+    fn reverse_kids_pdf(n: u32) -> Vec<u8> {
+        let page_nums: Vec<u32> = (3..3 + n).collect();
+        let mut objs: Vec<(u32, Vec<u8>)> = Vec::new();
+        objs.push((1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()));
+        let kids: Vec<u8> = page_nums
+            .iter()
+            .rev()
+            .flat_map(|k| format!("{k} 0 R ").into_bytes())
+            .collect();
+        objs.push((
+            2,
+            format!(
+                "<< /Type /Pages /Count {n} /Kids [ {} ] >>",
+                String::from_utf8(kids).unwrap().trim_end()
+            )
+            .into_bytes(),
+        ));
+        for k in &page_nums {
+            objs.push((
+                *k,
+                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /PageMark {k} >>")
+                    .into_bytes(),
+            ));
+        }
+
+        let mut out: Vec<u8> = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = n + 3; // objects 0..=n+2
+        let mut offsets: Vec<usize> = vec![0; total as usize];
+        for (num, body) in &objs {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for num in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[num as usize]).as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    /// qpdf's `QPDF::getCompressibleObjGens` (QPDF.cc:2392) walks the document
+    /// from the trailer depth-first, so the eligible objects come back in
+    /// traversal order — Catalog, Pages, then page dicts in `/Kids` array order
+    /// — NOT object-number order. Verified empirically against qpdf 11.9.0: on a
+    /// 130-page reverse-`/Kids` fixture the first object stream holds the pages
+    /// reached first in the array walk, not the lowest-numbered pages.
+    #[test]
+    fn compressible_objgens_is_qpdf_dfs_traversal_order() {
+        let bytes = reverse_kids_pdf(3);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        // Catalog(1), Pages(2), then kids in array order [5,4,3] (descending).
+        assert_eq!(
+            order,
+            vec![ref0(1), ref0(2), ref0(5), ref0(4), ref0(3)],
+            "eligible objects must be in qpdf depth-first traversal order, not numeric order"
+        );
+    }
+
+    /// Build a classic-xref PDF from pre-formatted object bodies (the bytes
+    /// between `N 0 obj\n` and `\nendobj`), `/Root 1 0 R`. Object numbers must be
+    /// `1..=bodies.len()` and supplied in ascending order.
+    fn pdf_from_bodies(bodies: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = bodies.len() as u32 + 1; // + free object 0
+        let mut offsets: Vec<usize> = vec![0; total as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for num in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[num as usize]).as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    /// One-page document whose page `/Contents` is a stream (obj 4); the stream
+    /// dictionary references obj 5 via `/Meta`, and obj 5 is reachable ONLY
+    /// through that stream dictionary.
+    fn pdf_with_content_stream() -> Vec<u8> {
+        pdf_from_bodies(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Length 3 /Meta 5 0 R >>\nstream\nq Q\nendstream".to_vec(),
+            ),
+            (5, b"<< /Type /Metadata /Marker 5 >>".to_vec()),
+        ])
+    }
+
+    /// qpdf's `getCompressibleObjGens` excludes stream objects from the result
+    /// (streams cannot live inside an object stream, QPDF.cc:2439), even though
+    /// it still traverses their dictionaries for children.
+    #[test]
+    fn compressible_objgens_excludes_stream_objects() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(pdf_with_content_stream())).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(4)),
+            "the content stream (obj 4) must not be a compressible object; got {order:?}"
+        );
+    }
+
+    /// qpdf traverses a stream's DICTIONARY for child references (QPDF.cc:2445),
+    /// so an object reachable only through a stream dictionary is still found.
+    #[test]
+    fn compressible_objgens_traverses_stream_dictionary_children() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(pdf_with_content_stream())).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            order.contains(&ref0(5)),
+            "obj 5, reachable only via the stream dict's /Meta, must be found; got {order:?}"
+        );
+    }
+
+    /// qpdf omits a stream's `/Length` from the traversal (QPDF.cc:2451), so an
+    /// object reachable ONLY as an indirect length holder is not pulled into the
+    /// compressible set. obj 5 here is the indirect `/Length` target of stream 4
+    /// and is reachable nowhere else.
+    #[test]
+    fn compressible_objgens_omits_indirect_stream_length_holder() {
+        let bytes = pdf_from_bodies(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            ),
+            (4, b"<< /Length 5 0 R >>\nstream\nq Q\nendstream".to_vec()),
+            (5, b"3".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(5)),
+            "indirect /Length holder (obj 5) must be omitted from the traversal; got {order:?}"
+        );
+    }
+
+    /// qpdf excludes a signature value dictionary — `/Type /Sig` with both
+    /// `/ByteRange` and `/Contents` — from the compressible set (QPDF.cc:2440),
+    /// because the signed byte range must not move into an object stream.
+    #[test]
+    fn compressible_objgens_excludes_signature_dictionaries() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(4)),
+            "signature dictionary (obj 4) must be excluded from the compressible set; got {order:?}"
+        );
+    }
+
+    /// qpdf's `generateObjectStreams` (QPDFWriter.cc:1981) picks
+    /// `ceil(n/100)` streams then spreads objects evenly
+    /// (`n_per = ceil(n/streams)`), never greedily filling 100 then spilling.
+    #[test]
+    fn even_split_stream_counts_and_sizes() {
+        let refs = |n: u32| -> Vec<ObjectRef> { (1..=n).map(ref0).collect() };
+        let sizes = |n: u32| -> Vec<usize> {
+            even_split_into_streams(&refs(n))
+                .iter()
+                .map(|s| s.len())
+                .collect()
+        };
+        assert_eq!(sizes(0), Vec::<usize>::new(), "no objects -> no streams");
+        assert_eq!(sizes(100), vec![100], "exactly 100 -> a single stream");
+        assert_eq!(
+            sizes(101),
+            vec![51, 50],
+            "101 -> two even streams, not 100+1"
+        );
+        assert_eq!(
+            sizes(102),
+            vec![51, 51],
+            "102 -> two even streams, not 100+2"
+        );
+        assert_eq!(sizes(200), vec![100, 100], "200 -> two full streams");
+        assert_eq!(sizes(201), vec![67, 67, 67], "201 -> three even streams");
+    }
+
+    /// End-to-end check that the DFS order + even split reproduce qpdf 11.9.0's
+    /// measured object-stream partition. On a 130-page reverse-`/Kids` document
+    /// (132 eligible objects) qpdf emits two streams of 66; the first holds the
+    /// objects reached first in the array walk — Catalog, Pages, and source
+    /// pages 69..132 — NOT the lowest-numbered objects.
+    #[test]
+    fn even_split_matches_qpdf_partition_on_130_page_reverse() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let groups = even_split_into_streams(&eligible);
+
+        assert_eq!(groups.len(), 2, "132 eligible -> 2 streams");
+        assert_eq!((groups[0].len(), groups[1].len()), (66, 66));
+
+        let nums = |g: &[ObjectRef]| -> BTreeSet<u32> { g.iter().map(|r| r.number).collect() };
+        let expected0: BTreeSet<u32> = [1u32, 2].into_iter().chain(69..=132).collect();
+        let expected1: BTreeSet<u32> = (3..=68).collect();
+        assert_eq!(
+            nums(&groups[0]),
+            expected0,
+            "stream 1 = Catalog,Pages,69..132"
+        );
+        assert_eq!(nums(&groups[1]), expected1, "stream 2 = pages 3..68");
+    }
+
+    /// End-to-end renumber check against qpdf 11.9.0's MEASURED output on the
+    /// 130-page reverse-`/Kids` fixture (`--object-streams=generate --static-id`):
+    /// each ObjStm container is numbered immediately before its members, and the
+    /// members are numbered in ascending SOURCE object order. Measured anchors —
+    /// container 1 holds {Catalog,Pages,69..132}; container 68 holds {3..68}:
+    /// `Catalog(1)->2`, `Pages(2)->3`, `src69->4`, `src132->67`, `src3->69`,
+    /// `src68->134`.
+    #[test]
+    fn generate_renumber_matches_qpdf_on_130_page_reverse() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let groups = even_split_into_streams(&eligible);
+        let rn = crate::rewrite_renumber::GenerateRenumber::build(&mut pdf, &groups).unwrap();
+
+        let n = |src: u32| rn.new_for_original(ref0(src)).map(|r| r.number);
+        assert_eq!(n(1), Some(2), "Catalog");
+        assert_eq!(n(2), Some(3), "Pages");
+        assert_eq!(n(69), Some(4), "first member of container 1 after Pages");
+        assert_eq!(n(132), Some(67), "last member of container 1");
+        assert_eq!(n(3), Some(69), "first member of container 2");
+        assert_eq!(n(68), Some(134), "last member of container 2");
+        assert_eq!(
+            rn.container_numbers(),
+            vec![1, 68],
+            "containers numbered just before their members, in encounter order"
+        );
+    }
+
+    /// qpdf excludes the encryption dictionary from the compressible set
+    /// (`m->trailer.getKey("/Encrypt")`, QPDF.cc:2402/2437): it must stay a
+    /// plain indirect so a reader can decrypt the rest of the file. The
+    /// `encrypted-r4-three-page` fixture references its `/Encrypt` dictionary at
+    /// object 12.
+    #[test]
+    fn compressible_objgens_excludes_encryption_dictionary() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/encrypted-r4-three-page.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(12)),
+            "the /Encrypt dictionary (obj 12) must be excluded from the compressible set; got {order:?}"
+        );
     }
 
     fn typed_dict(type_name: &[u8]) -> Object {

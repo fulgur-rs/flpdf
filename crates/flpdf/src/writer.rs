@@ -1642,9 +1642,9 @@ fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
 /// here. Every other indirect value (notably `/Info`, which the renumber walk
 /// always seeds) is rewritten through `map`; a value absent from the map is an
 /// error rather than a stale number leaking into the output.
-fn remap_trailer_refs(
+fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
     trailer: &mut Dictionary,
-    map: &crate::rewrite_renumber::CatalogFirstRenumber,
+    map: &M,
     deleted: &[ObjectRef],
 ) -> Result<()> {
     // Collect the (key, old_ref) pairs first; the trailer holds only a handful
@@ -2477,6 +2477,82 @@ fn encrypt_stream_payload_for_writer(
     Ok(())
 }
 
+/// Re-encode a resolved stream object per the effective compression policy,
+/// returning the re-encoded object and whether the **source** filter chain was
+/// already a lone `/FlateDecode`.
+///
+/// This is the byte-critical choke point shared by `write_pdf_full_rewrite` and
+/// the non-linearized generate emit path (`write_pdf_generate`). Keeping it in
+/// one place prevents the two paths from drifting on qpdf's re-filter rules:
+///
+/// * `CompressStreams::Yes` on an already-lone-`/FlateDecode` source (and no
+///   `/F` external-data entry, no `--recompress-flate`) is **preserved verbatim**
+///   — qpdf does not decode + re-encode it — with `/Length` normalized to the raw
+///   data length.
+/// * any other `Yes`/`No` policy decodes and re-encodes via
+///   [`apply_stream_compress_policy`].
+/// * preserve mode (`None`) passes the dict + raw bytes through unchanged.
+///
+/// The returned bool feeds [`write_reencoded_object`], which only appends a
+/// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
+/// already a lone `/FlateDecode`.
+fn reencode_stream_for_compress(stream: crate::Stream, options: &WriteOptions) -> (Object, bool) {
+    let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
+    let reencoded = match effective_stream_policy(options) {
+        // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
+        // compress policy (no decode + re-encode) unless recompression is
+        // explicitly requested. Normalize /Length to the raw data length (a
+        // source may carry an indirect /Length).
+        //
+        // Exclude external streams: a `/F` entry means the canonical data lives
+        // in an external file and the in-body bytes are not authoritative, so
+        // preserving them verbatim would keep a stale external reference. Such
+        // streams fall through to the re-encode arm, which embeds the decoded
+        // data and strips `/F` / `/FFilter` / `/FDecodeParms`.
+        Some(CompressStreams::Yes)
+            if source_filter_is_lone_flate
+                && !options.recompress_flate
+                && stream.dict.get("F").is_none() =>
+        {
+            let mut stream = stream;
+            let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
+            stream.dict.insert("Length", Object::Integer(len));
+            Object::Stream(stream)
+        }
+        Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
+        // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
+        None => Object::Stream(stream),
+    };
+    (reencoded, source_filter_is_lone_flate)
+}
+
+/// Append a re-encoded object's body to `bytes` in qpdf's **non-qdf**
+/// serialization order. For a stream, a regenerated lone `/Filter /FlateDecode`
+/// is emitted last (and `/Length` first) only when the compress policy
+/// re-encoded a source that was NOT already a lone `/FlateDecode`
+/// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
+/// its lexicographic order with `/Length` last. Non-stream objects serialize
+/// normally. Shared by `write_pdf_full_rewrite` and `write_pdf_generate`.
+fn write_reencoded_object(
+    bytes: &mut Vec<u8>,
+    reencoded: &Object,
+    source_filter_is_lone_flate: bool,
+    options: &WriteOptions,
+) {
+    match reencoded {
+        Object::Stream(s) => {
+            let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
+                && !source_filter_is_lone_flate
+                && is_lone_flate(s.dict.get("Filter"));
+            write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
+        }
+        // cov:ignore-start: unreachable — callers only pass stream objects and
+        // reencode_stream_for_compress always returns Object::Stream.
+        other => other.write_pdf(bytes),
+        // cov:ignore-end
+    }
+}
+
 fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
@@ -2491,6 +2567,23 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // 6. xref: for Stream form, insert Compressed entries for members.
     //    For Table form with non-empty batches: return Err (5.7 guard).
     // ─────────────────────────────────────────────────────────────────────────
+
+    // Non-linearized --object-streams=generate is byte-identical to qpdf only
+    // with qpdf's generate-mode numbering (container numbered immediately before
+    // its members, members ascending-source, even split into ceil(n/100)
+    // containers). That layout differs structurally from this path's
+    // Catalog-first + containers-above-max scheme, so route it to the dedicated
+    // emitter. Restricted to the plain case: --qdf forces ObjStm off (it always
+    // emits a classic xref table), and --encrypt / --copy-encryption-from keep
+    // the containers-above-max scheme here (their /Encrypt slot allocation
+    // depends on it).
+    if matches!(options.object_streams, ObjectStreamMode::Generate)
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && !options.qdf
+    {
+        return write_pdf_generate(pdf, out, options);
+    }
 
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
@@ -2947,36 +3040,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // dict order with /Length last. Capture that from the source filter
             // so the output ordering tracks qpdf's re-filter decision rather
             // than flpdf's unconditional decode/re-encode.
-            let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
-            let mut reencoded = match effective_stream_policy(options) {
-                // qpdf preserves an already-lone-/FlateDecode stream verbatim
-                // under the compress policy (no decode + re-encode) unless
-                // recompression is explicitly requested. Normalize /Length to
-                // the raw data length (a source may carry an indirect /Length).
-                //
-                // Exclude external streams: a `/F` entry means the canonical data
-                // lives in an external file and the in-body bytes are not
-                // authoritative, so preserving them verbatim would keep a stale
-                // external reference. Such streams fall through to the re-encode
-                // arm, which embeds the decoded data and strips `/F` / `/FFilter`
-                // / `/FDecodeParms` (see `apply_stream_compress_policy`).
-                Some(CompressStreams::Yes)
-                    if source_filter_is_lone_flate
-                        && !options.recompress_flate
-                        && stream.dict.get("F").is_none() =>
-                {
-                    let mut stream = stream;
-                    let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
-                    stream.dict.insert("Length", Object::Integer(len));
-                    Object::Stream(stream)
-                }
-                Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
-                // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
-                // `stream` is owned (moved out of the resolved `object`) and is
-                // not used after this match, so we can move it directly instead
-                // of cloning the (potentially large) data buffer.
-                None => Object::Stream(stream),
-            };
+            // Re-encode per the compress policy via the shared choke point so
+            // this path and the generate emit path cannot drift on qpdf's
+            // re-filter rules. `reencoded` is owned and `mut` because the
+            // encryption step below may rewrite the stream payload in place.
+            let (mut reencoded, source_filter_is_lone_flate) =
+                reencode_stream_for_compress(stream, options);
 
             // flpdf-9hc.4.9: encrypt the stream payload AFTER any filter
             // re-encoding, so the encryption operates on the on-disk bytes.
@@ -3007,8 +3076,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 }
             }
 
-            if let Object::Stream(ref s) = reencoded {
-                if options.qdf {
+            if options.qdf {
+                if let Object::Stream(ref s) = reencoded {
                     // QDF: split the stream's /Length into a separate
                     // indirect length-holder object so flpdf::fix_qdf
                     // (qdf_fix.rs) — which only ever rewrites an INDIRECT
@@ -3067,29 +3136,22 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                     );
                 } else {
-                    // Emit qpdf's re-filtered stream-dict order (/Length, then a
-                    // regenerated /Filter /FlateDecode) only when all hold:
-                    //  - the compress policy re-encodes (CompressStreams::Yes),
-                    //  - the source was NOT already a lone /FlateDecode (qpdf
-                    //    preserves those, keeping /Length last), and
-                    //  - the *final* dict carries a lone /FlateDecode, so we
-                    //    never drop a /Crypt chain (encryption) or a fallback
-                    //    filter (decode/encode failure) by re-appending /Filter.
-                    let refiltered =
-                        matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
-                            && !source_filter_is_lone_flate
-                            && is_lone_flate(s.dict.get("Filter"));
-                    write_stream_to_buf_qpdf_order(
-                        &mut bytes,
-                        s,
-                        options.newline_before_endstream,
-                        refiltered,
-                    );
+                    // cov:ignore-start: unreachable — this arm is inside the
+                    // stream branch and reencode_stream_for_compress always
+                    // returns Object::Stream.
+                    reencoded.write_pdf_qdf(&mut bytes, 0);
+                    // cov:ignore-end
                 }
-            } else if options.qdf {
-                reencoded.write_pdf_qdf(&mut bytes, 0);
             } else {
-                reencoded.write_pdf(&mut bytes);
+                // Non-qdf: shared choke point — qpdf's re-filtered key order for
+                // re-encoded streams, lexicographic order otherwise. Identical to
+                // the generate emit path (`write_pdf_generate`).
+                write_reencoded_object(
+                    &mut bytes,
+                    &reencoded,
+                    source_filter_is_lone_flate,
+                    options,
+                );
             }
         } else if options.qdf {
             object.write_pdf_qdf(&mut bytes, 0);
@@ -3459,6 +3521,336 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
         }
     }
+
+    out.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Resolve a `generate`-path internal invariant or fail with a
+/// `generate:`-prefixed [`crate::Error::Unsupported`]. The `None` arm is
+/// unreachable for well-formed input — the generate pipeline (DFS eligibility +
+/// even split + `GenerateRenumber`) maintains each invariant — but returning a
+/// diagnostic beats a panic if a future change breaks one. Keeping it a helper
+/// makes every call site a single (covered) expression instead of a multi-line
+/// `ok_or_else` closure whose error body would never execute.
+fn generate_invariant<T>(value: Option<T>, what: &str) -> Result<T> {
+    value.ok_or_else(|| crate::Error::Unsupported(format!("generate: {what}")))
+}
+
+/// Non-linearized `--object-streams=generate`, byte-identical to qpdf 11.9.0.
+///
+/// qpdf assigns object streams up front (`QPDF::getCompressibleObjGens` DFS +
+/// `QPDFWriter::generateObjectStreams` even split into `ceil(n/100)` containers),
+/// then renumbers so each container is numbered immediately before its members,
+/// members serialize in ascending source-object order, and reachable
+/// uncompressed objects take the trailing numbers. The cross-reference is emitted
+/// as a stream (type-2 entries require it) with the header floored to 1.5.
+///
+/// Scope: the plain (non-encrypt / non-copy-encryption / non-qdf) case; the
+/// caller (`write_pdf_full_rewrite`) routes only those here.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Missing`] when the trailer has no `/Root`, refuses
+/// signed inputs (a full rewrite invalidates signatures), and propagates load /
+/// renumber / encode errors.
+fn write_pdf_generate<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriteOptions,
+) -> Result<()> {
+    use crate::rewrite_renumber::{renumber_refs_in_place, GenerateRenumber};
+    use std::collections::HashSet;
+
+    // `ok_or` (eager) keeps the error construction on the covered happy path;
+    // `Error::Missing` is a cheap `&'static str` variant, so no `or_fun_call`.
+    let root_ref = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
+    refuse_signed_full_rewrite(pdf, options)?;
+
+    // ── object-stream assignment + generate-mode numbering ───────────────────
+    // 1. getCompressibleObjGens DFS from the trailer => eligible list, ordered.
+    let eligible = object_streams::compressible_objgens(pdf)?;
+    // 2. generateObjectStreams even split => one group per container.
+    let groups = object_streams::even_split_into_streams(&eligible);
+    // 3. enqueueObject walk with the object-stream branch => container-first
+    //    numbering (members ascending-source within each container).
+    let renumber = GenerateRenumber::build(pdf, &groups)?;
+    let new_root = generate_invariant(
+        renumber.new_for_original(root_ref),
+        "/Root absent from renumber map",
+    )?; // cov:ignore: error arm is an unreachable internal invariant
+
+    // ── per-container member tables + type-2 xref entries ────────────────────
+    /// One ObjStm container: its assigned object number and its members as
+    /// `(original, new)` ref pairs in ascending-NEW (= ascending-source) order.
+    struct ContainerPlan {
+        number: u32,
+        members: Vec<(ObjectRef, ObjectRef)>,
+    }
+    // Member original refs (skipped from plain emission — they serialize inside
+    // their container) and NEW member number -> (container number, index).
+    let mut member_set: HashSet<ObjectRef> = HashSet::new();
+    let mut member_xref: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+    let mut containers: Vec<ContainerPlan> = Vec::with_capacity(groups.len());
+    for (gi, group) in groups.iter().enumerate() {
+        let number = generate_invariant(
+            renumber.container_number(gi),
+            "ObjStm container group was never reached",
+        )?; // cov:ignore: error arm is an unreachable internal invariant
+            // Resolve each member's NEW ref once. qpdf serializes a container's
+            // members in ascending source-object order (`std::set<QPDFObjGen>`), and
+            // the generate-mode numbering assigns new numbers in that same order — so
+            // sorting by the NEW number reproduces it.
+        let mut members: Vec<(ObjectRef, ObjectRef)> = group
+            .iter()
+            .map(|&old| {
+                let new = generate_invariant(
+                    renumber.new_for_original(old),
+                    "ObjStm member absent from renumber map",
+                )?; // cov:ignore: error arm is an unreachable internal invariant
+                Ok((old, new))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        members.sort_by_key(|&(_, new)| new.number);
+        for (index, &(old, new)) in members.iter().enumerate() {
+            member_set.insert(old);
+            // A single ObjStm holds at most 100 members, so `index` fits u32.
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            member_xref.insert(new.number, (number, index));
+        }
+        containers.push(ContainerPlan { number, members });
+    }
+
+    // Emission dispatch keyed on NEW object number: a container body or a plain
+    // (uncompressed) object. Compressed members are skipped here. qpdf writes
+    // objects in ascending new number, so iterating the BTreeMap drives the body
+    // order directly.
+    enum Emit {
+        Container(usize),
+        Plain(ObjectRef),
+    }
+    let mut emit: BTreeMap<u32, Emit> = BTreeMap::new();
+    for (new, old) in renumber.pairs() {
+        if member_set.contains(&old) {
+            continue;
+        }
+        emit.insert(new.number, Emit::Plain(old));
+    }
+    for (gi, c) in containers.iter().enumerate() {
+        // Container and plain-object numbers are disjoint by construction (members
+        // are excluded above), so the insert never clobbers; `then_some` turns a
+        // (would-be) clobber into the helper's diagnostic instead of a panic.
+        generate_invariant(
+            emit.insert(c.number, Emit::Container(gi))
+                .is_none()
+                .then_some(()),
+            "container object number collides with a plain object",
+        )?; // cov:ignore: error arm is an unreachable internal invariant
+    }
+
+    // ── header ───────────────────────────────────────────────────────────────
+    // Pass `object_streams = true`: xref streams require PDF 1.5, and
+    // `effective_pdf_version` applies that floor (above any lower source /
+    // --force-version), so no separate clamp is needed here.
+    let version = effective_pdf_version(pdf.version(), options, false, true).to_owned();
+
+    // deterministic-/ID seed inputs, captured from the ORIGINAL trailer before
+    // the emit loop borrows `pdf` (qpdf reads these from the source trailer).
+    let (det_id_source_id0, det_id_info_suffix): (Option<[u8; 16]>, Vec<u8>) =
+        if options.deterministic_id {
+            (
+                source_permanent_id(pdf.trailer()),
+                deterministic_id_info_suffix(pdf),
+            )
+        } else {
+            (None, Vec::new())
+        };
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
+    bytes.extend_from_slice(QPDF_BINARY_MARKER);
+
+    // ── bodies in ascending new number ───────────────────────────────────────
+    // `offsets` records the byte offset of every emitted body (containers and
+    // plain objects). Members are absent (they live inside containers) and get
+    // type-2 xref entries from `member_xref` instead.
+    let mut offsets: BTreeMap<u32, usize> = BTreeMap::new();
+    for (&number, what) in &emit {
+        let emit_offset = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        match what {
+            Emit::Plain(old) => {
+                let mut object = pdf.resolve(*old)?;
+                renumber_refs_in_place(&mut object, &renumber)?;
+                match object {
+                    Object::Stream(stream) => {
+                        let (reencoded, source_filter_is_lone_flate) =
+                            reencode_stream_for_compress(stream, options);
+                        write_reencoded_object(
+                            &mut bytes,
+                            &reencoded,
+                            source_filter_is_lone_flate,
+                            options,
+                        );
+                    }
+                    // cov:ignore-start: every reachable non-stream object is
+                    // ObjStm-eligible (a container member), so a plain object —
+                    // one not routed into a container — is always a stream.
+                    other => other.write_pdf(&mut bytes),
+                    // cov:ignore-end
+                }
+            }
+            Emit::Container(gi) => {
+                // Resolve each member, rewrite its internal references to NEW
+                // numbers, and pair with its (precomputed) NEW ref so the ObjStm
+                // pair table records the renumbered member number.
+                let plan = &containers[*gi];
+                let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(plan.members.len());
+                for &(old, new) in &plan.members {
+                    let mut obj = pdf.resolve(old)?;
+                    renumber_refs_in_place(&mut obj, &renumber)?;
+                    resolved.push((new, obj));
+                }
+                let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
+                let stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+                // Emit the container dict in qpdf 11.9.0's fixed key order
+                // (`/Type /ObjStm /Length L [/Filter /FlateDecode] /N n /First f`);
+                // the BTreeMap-backed `Object::Stream` serializer would
+                // alphabetize the keys instead. `/Filter` is present iff the body
+                // was compressed (`CompressStreams::Yes`).
+                bytes.extend_from_slice(b"<< /Type /ObjStm /Length ");
+                bytes.extend_from_slice(stream.data.len().to_string().as_bytes());
+                if stream.dict.get("Filter").is_some() {
+                    bytes.extend_from_slice(b" /Filter /FlateDecode");
+                }
+                bytes.extend_from_slice(
+                    format!(" /N {} /First {} >>", body.n_members, body.first_offset).as_bytes(),
+                );
+                write_stream_payload(&mut bytes, &stream.data, options.newline_before_endstream);
+            }
+        }
+        bytes.extend_from_slice(b"\nendobj\n");
+        offsets.insert(number, emit_offset);
+    }
+
+    // ── cross-reference stream ───────────────────────────────────────────────
+    // qpdf emits a PNG-Up-predicted (`/Predictor 12`), minimal-`/W`,
+    // fixed-key-order xref stream. Reuse the linearized encoder, which already
+    // reproduces that shape byte-for-byte (the generic `build_xref_stream_bytes`
+    // uses `/W [1 8 4]` without a predictor and is NOT byte-identical to qpdf).
+    use crate::linearization::xref_stream;
+    let xref_offset = bytes.len();
+    // Highest object number across plain bodies, containers, AND compressed
+    // members. Numbering is contiguous `1..=M`; the xref stream itself takes
+    // `M + 1` and `/Size` is `M + 2`.
+    let max_object_number = offsets
+        .keys()
+        .chain(member_xref.keys())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    // Both overflows need ~u32::MAX live objects (a multi-GB PDF); unreachable
+    // for any real input, but surfaced as a diagnostic rather than a panic.
+    let xref_object_number = generate_invariant(
+        max_object_number.checked_add(1),
+        "xref stream number overflows u32",
+    )?; // cov:ignore: error arm needs ~u32::MAX objects — a multi-GB PDF
+    let size = generate_invariant(
+        xref_object_number.checked_add(1),
+        "xref /Size overflows u32",
+    )?; // cov:ignore: error arm needs ~u32::MAX objects — a multi-GB PDF
+
+    // The xref stream object describes itself with a type-1 entry at its own
+    // offset; add it to the offset map so `build_entries` emits that row.
+    let mut offs = offsets;
+    offs.insert(xref_object_number, xref_offset);
+
+    let entries = xref_stream::build_entries(&offs, &member_xref, 0, size);
+    // Minimal `/W` widths: field 2 sizes the largest type-1 byte offset (no hint
+    // stream, so `hint_length = 0`), field 3 the largest ObjStm member index.
+    // Single xref => no `/Prev` chain and no two-pass padding.
+    let max_offset = xref_stream::max_entry_offset(&entries);
+    let max_ostream_index = member_xref
+        .values()
+        .map(|&(_, index)| u64::from(index))
+        .max()
+        .unwrap_or(0);
+    let widths =
+        xref_stream::second_pass_widths(max_offset, 0, max_object_number, max_ostream_index);
+    let payload = xref_stream::encode_payload(&entries, widths);
+
+    // Trailer-derived dict entries: /Info (remapped to its new number) and the
+    // two-element /ID. /Root is the renumbered catalog. qpdf omits /Index on a
+    // single full-range xref stream.
+    let skip_refs = pdf.deleted_object_refs();
+    let mut trailer = pdf.trailer().clone();
+    strip_incremental_trailer_keys(&mut trailer);
+    remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
+    let info_ref = match trailer.get("Info") {
+        Some(Object::Reference(r)) => Some(*r),
+        _ => None,
+    };
+
+    let xref_ref = ObjectRef::new(xref_object_number, 0);
+    if options.deterministic_id {
+        // qpdf does not produce byte-parity output for xref-stream form, but the
+        // content-derived /ID must be self-stable. Write it INLINE at the /ID
+        // position so the digest covers the bytes up to the array's `[` —
+        // matching `compute_deterministic_id`'s contract on every other path.
+        let dict = xref_stream::XrefStreamDict {
+            widths,
+            index: None,
+            info: info_ref,
+            root: Some(new_root),
+            size,
+            prev: None,
+            id: None,
+        };
+        let mut id_writer = |out: &mut Vec<u8>| {
+            write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+        };
+        xref_stream::write_object_with_id_writer(
+            &mut bytes,
+            xref_ref,
+            &dict,
+            &payload,
+            &mut id_writer,
+        );
+    } else {
+        // static => preserved source /ID[0] (or the pi constant when absent) + pi
+        // /ID[1]; random otherwise. Both flow through
+        // `apply_encrypt_trailer_entries`, so this path and the full-rewrite path
+        // agree on the /ID bytes.
+        let mut id_trailer = Dictionary::new();
+        if let Some(id) = pdf.trailer().get("ID") {
+            id_trailer.insert("ID", id.clone());
+        }
+        apply_encrypt_trailer_entries(&mut id_trailer, pdf, options, None, false);
+        // `apply_encrypt_trailer_entries` always sets /ID to a two-element array
+        // of strings here (apply_static_id / apply_random_id), so the non-String
+        // / non-pair fallbacks below are defensive only.
+        let (id0, id1): (Vec<u8>, Vec<u8>) = match id_trailer.get("ID") {
+            Some(Object::Array(arr)) if arr.len() == 2 => {
+                let take = |o: &Object| match o {
+                    Object::String(s) => s.clone(),
+                    _ => QPDF_STATIC_ID.to_vec(), // cov:ignore: /ID elements are always strings here
+                };
+                (take(&arr[0]), take(&arr[1]))
+            }
+            _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()), // cov:ignore: /ID is always a 2-string array here
+        };
+        let dict = xref_stream::XrefStreamDict {
+            widths,
+            index: None,
+            info: info_ref,
+            root: Some(new_root),
+            size,
+            prev: None,
+            id: Some((&id0, &id1)),
+        };
+        xref_stream::write_object(&mut bytes, xref_ref, &dict, &payload);
+    }
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
 
     out.write_all(&bytes)?;
     Ok(())

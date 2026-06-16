@@ -264,29 +264,48 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
         "Generate mode must pack both eligible objects (Catalog + Pages) into ObjStm; /N = {n}"
     );
 
-    // Verify objects still resolve correctly from the ObjStm container.
+    // Verify objects still resolve correctly from the ObjStm container, following
+    // /Root rather than hard-coding object numbers. qpdf's generate-mode
+    // numbering puts the ObjStm container FIRST (obj 1), then renumbers its
+    // members ascending-source — so the Catalog becomes obj 2 and Pages obj 3,
+    // and /Root points at 2 0 R (verified against qpdf 11.9.0 on this fixture).
     let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
-    let catalog = reopened2.resolve(ObjectRef::new(1, 0)).unwrap();
-    match &catalog {
+    let root_ref = reopened2
+        .root_ref()
+        .expect("trailer must have a resolvable /Root");
+    assert_eq!(
+        root_ref,
+        ObjectRef::new(2, 0),
+        "container-first numbering: /Root must be 2 0 R (obj 1 is the ObjStm container)"
+    );
+    let catalog = reopened2.resolve(root_ref).unwrap();
+    let pages_ref = match &catalog {
         Object::Dictionary(d) => {
             assert_eq!(
                 d.get("Type"),
                 Some(&Object::Name(b"Catalog".to_vec())),
-                "Object 1 must be the Catalog"
+                "/Root must resolve to the Catalog"
             );
+            match d.get("Pages") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("Catalog /Pages must be an indirect ref, got {other:?}"),
+            }
         }
-        other => panic!("Object 1 should be a Dictionary, got {:?}", other),
-    }
-    let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
+        other => panic!("/Root should resolve to a Dictionary, got {:?}", other),
+    };
+    let pages = reopened2.resolve(pages_ref).unwrap();
     match &pages {
         Object::Dictionary(d) => {
             assert_eq!(
                 d.get("Type"),
                 Some(&Object::Name(b"Pages".to_vec())),
-                "Object 2 must be the Pages dict"
+                "Catalog /Pages must resolve to the Pages dict"
             );
         }
-        other => panic!("Object 2 should be a Dictionary, got {:?}", other),
+        other => panic!(
+            "Catalog /Pages should resolve to a Dictionary, got {:?}",
+            other
+        ),
     }
 }
 
