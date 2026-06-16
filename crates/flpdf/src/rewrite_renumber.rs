@@ -30,6 +30,29 @@ use crate::object::{Object, ObjectRef, MAX_INLINE_DEPTH};
 use crate::reader::Pdf;
 use crate::Error;
 
+/// Maps an original object reference to its assigned new reference.
+///
+/// Implemented by both renumber schemes ([`CatalogFirstRenumber`] for plain
+/// rewrite, [`GenerateRenumber`] for `--object-streams=generate`) so that
+/// [`renumber_refs_in_place`] can rewrite an object's internal references under
+/// either numbering without duplication.
+pub(crate) trait NewNumberLookup {
+    /// Return the new reference assigned to `original`, if it was reachable.
+    fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef>;
+}
+
+impl NewNumberLookup for CatalogFirstRenumber {
+    fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
+        self.old_to_new.get(&original).copied()
+    }
+}
+
+impl NewNumberLookup for GenerateRenumber {
+    fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
+        self.old_to_new.get(&original).copied()
+    }
+}
+
 /// A map from original object references to their qpdf-style Catalog-first
 /// numbers, plus the visitation order that produced them.
 pub(crate) struct CatalogFirstRenumber {
@@ -145,6 +168,23 @@ impl GenerateRenumber {
     /// entry.
     pub(crate) fn container_numbers(&self) -> Vec<u32> {
         self.container_new.iter().flatten().copied().collect()
+    }
+
+    /// The container object number assigned to input group `group_index`, or
+    /// `None` if the index is out of range or that group was never reached.
+    /// Unlike [`Self::container_numbers`], this preserves the group→number
+    /// correspondence even when some group went unreached.
+    pub(crate) fn container_number(&self, group_index: usize) -> Option<u32> {
+        self.container_new.get(group_index).copied().flatten()
+    }
+
+    /// Iterate `(new_ref, old_ref)` pairs for every reachable input object
+    /// (object-stream members and plain objects alike). Container objects are
+    /// synthetic and have no original ref, so they are not included; obtain their
+    /// numbers via [`Self::container_number`]. Yield order is unspecified (backed
+    /// by a hash map); callers that need ordering sort by the new number.
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
+        self.old_to_new.iter().map(|(&old, &new)| (new, old))
     }
 
     /// Compute the generate-mode renumbering for `pdf` given the object-stream
@@ -342,14 +382,14 @@ fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) -> cr
 /// inline structural nesting exceeds [`MAX_INLINE_DEPTH`] (leaving an over-deep
 /// reference un-rewritten would point it at the wrong renumbered object, so we
 /// refuse rather than emit a corrupt PDF).
-pub(crate) fn renumber_refs_in_place(
+pub(crate) fn renumber_refs_in_place<M: NewNumberLookup>(
     obj: &mut Object,
-    map: &CatalogFirstRenumber,
+    map: &M,
 ) -> crate::Result<()> {
     rewrite(obj, 0, map)
 }
 
-fn rewrite(obj: &mut Object, depth: usize, map: &CatalogFirstRenumber) -> crate::Result<()> {
+fn rewrite<M: NewNumberLookup>(obj: &mut Object, depth: usize, map: &M) -> crate::Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
             "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \

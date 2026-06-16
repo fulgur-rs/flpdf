@@ -167,6 +167,31 @@ else
     echo "Skipping one-page-r90.pdf (already exists)"
 fi
 
+# No-stream multipage fixtures for NON-linearized --object-streams=generate
+# byte-parity (flpdf-g6hb.1). Every reachable object is an ObjStm-eligible dict
+# (no content streams), so the output body is just the ObjStm container(s) plus
+# the xref stream — isolating the generate-mode numbering (container-first,
+# members ascending-source, even split) from plain-object emission.
+#  - 5-page natural: 7 eligible => 1 container (n<=100 single-stream shape).
+#  - 130-page reverse: 132 eligible => 2 containers of 66 (ceil(n/100) even
+#    split); /Kids listed in descending object number so the getCompressibleObjGens
+#    DFS grouping differs from numeric order.
+if [[ ! -f "$FIX/objstm-gen-nostream-5.pdf" ]]; then
+    echo "Generating objstm-gen-nostream-5.pdf ..."
+    python3 "$ROOT/docs/plans/tools/gen_multipage.py" 5 natural \
+        > "$FIX/objstm-gen-nostream-5.pdf"
+else
+    echo "Skipping objstm-gen-nostream-5.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/objstm-gen-nostream-130rev.pdf" ]]; then
+    echo "Generating objstm-gen-nostream-130rev.pdf ..."
+    python3 "$ROOT/docs/plans/tools/gen_multipage.py" 130 reverse \
+        > "$FIX/objstm-gen-nostream-130rev.pdf"
+else
+    echo "Skipping objstm-gen-nostream-130rev.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -180,7 +205,9 @@ mkdir -p \
     "$REF/linearized-one-page" \
     "$REF/encrypted-r4-three-page" \
     "$REF/attachment-two-page" \
-    "$REF/lone-flate-l9"
+    "$REF/lone-flate-l9" \
+    "$REF/objstm-gen-nostream-5" \
+    "$REF/objstm-gen-nostream-130rev"
 
 echo "=== Generating reference outputs ==="
 
@@ -234,6 +261,25 @@ echo "three-page/linearize.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/linearize-objstm.pdf"
 echo "three-page/linearize-objstm.pdf"
+
+# NON-linearized --object-streams=generate (cross-reference *stream* form, header
+# floored to 1.5). --static-id keeps /ID byte-stable: /ID[0] is the preserved
+# source identifier (or the pi constant when the source has none) and /ID[1] is
+# the pi constant — both reproducible, so the parity gate is strict (no /ID
+# masking). Gated on qpdf-zlib-compat (flpdf-g6hb.1). three-page interleaves
+# plain content streams with the ObjStm container; the no-stream fixtures isolate
+# the numbering.
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" "$REF/three-page/generate.pdf"
+echo "three-page/generate.pdf"
+
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/objstm-gen-nostream-5.pdf" "$REF/objstm-gen-nostream-5/generate.pdf"
+echo "objstm-gen-nostream-5/generate.pdf"
+
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/objstm-gen-nostream-130rev.pdf" "$REF/objstm-gen-nostream-130rev/generate.pdf"
+echo "objstm-gen-nostream-130rev/generate.pdf"
 
 # --- linearized-one-page: plain only (re-linearize would be redundant) ---
 qpdf --deterministic-id --warning-exit-0 \

@@ -196,7 +196,7 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 /// port must reproduce it exactly.
 ///
 /// Returns each reachable indirect object's reference in first-visit order.
-fn compressible_objgens<R: std::io::Read + std::io::Seek>(
+pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<u32> = BTreeSet::new();
@@ -248,7 +248,7 @@ fn compressible_objgens<R: std::io::Read + std::io::Seek>(
 /// stream — in the given (traversal) order. Returns one inner `Vec` per stream;
 /// an empty input yields no streams. (qpdf is `(n + 99) / 100` then
 /// `n / streams` rounded up; `div_ceil` expresses both directly.)
-fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectRef>> {
+pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectRef>> {
     let n = eligible.len();
     if n == 0 {
         return Vec::new();
