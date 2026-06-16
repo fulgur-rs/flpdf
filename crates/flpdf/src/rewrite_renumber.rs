@@ -111,6 +111,158 @@ impl CatalogFirstRenumber {
     }
 }
 
+/// Generate-mode renumbering: the Catalog-first BFS extended with qpdf's
+/// object-stream branch (`QPDFWriter::enqueueObject` QPDFWriter.cc:1097-1118 +
+/// `assignCompressedObjectNumbers` 1057). When the walk first reaches a member
+/// of an object stream, the stream's container is numbered immediately, then
+/// every member of that container is numbered consecutively in ascending source
+/// object order (qpdf stores members in a `std::set<QPDFObjGen>`). Containers
+/// are therefore numbered in the order their first member is encountered.
+///
+/// The container membership comes from the caller (the `compressible_objgens`
+/// traversal split into even groups); this type only assigns the numbers in
+/// qpdf's order.
+//
+// Consumed by the upcoming generate-mode writer wiring; suppress dead_code
+// until that code lands (mirrors `object_streams`).
+#[allow(dead_code)]
+pub(crate) struct GenerateRenumber {
+    old_to_new: HashMap<ObjectRef, ObjectRef>,
+    /// New object number assigned to each input group's container, in group
+    /// order. `container_new[i]` is `None` only if group `i` was never reached.
+    container_new: Vec<Option<u32>>,
+}
+
+#[allow(dead_code)]
+impl GenerateRenumber {
+    /// Return the new reference assigned to `original`, if it was reachable.
+    pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
+        self.old_to_new.get(&original).copied()
+    }
+
+    /// The assigned container object numbers, in input-group order. Panics-free
+    /// accessor used by tests and the emitter; a never-reached group yields no
+    /// entry.
+    pub(crate) fn container_numbers(&self) -> Vec<u32> {
+        self.container_new.iter().flatten().copied().collect()
+    }
+
+    /// Compute the generate-mode renumbering for `pdf` given the object-stream
+    /// `groups` (each inner slice is one container's members, in any order; they
+    /// are numbered ascending-source within the container).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when the trailer has no `/Root`, and
+    /// propagates load errors from the object walk.
+    pub(crate) fn build<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        groups: &[Vec<ObjectRef>],
+    ) -> crate::Result<Self> {
+        // member -> group index, and per-group members sorted ascending-source.
+        let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
+        let mut groups_sorted: Vec<Vec<ObjectRef>> = Vec::with_capacity(groups.len());
+        for (gi, group) in groups.iter().enumerate() {
+            let mut sorted = group.clone();
+            sorted.sort_unstable_by_key(|r| (r.number, r.generation));
+            for &m in &sorted {
+                member_to_group.insert(m, gi);
+            }
+            groups_sorted.push(sorted);
+        }
+
+        let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+        let mut container_new: Vec<Option<u32>> = vec![None; groups.len()];
+        let mut next: u32 = 1;
+        let mut queue: VecDeque<ObjectRef> = VecDeque::new();
+
+        // Seeds match the plain Catalog-first walk: `/Root` first, then the
+        // remaining indirect trailer entries in lexicographic key order.
+        let root = pdf.root_ref().ok_or_else(|| {
+            Error::Unsupported("generate rewrite: trailer has no /Root".to_string())
+        })?;
+        let mut seeds: Vec<ObjectRef> = vec![root];
+        for (key, value) in pdf.trailer().iter() {
+            if matches!(key, b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size") {
+                continue;
+            }
+            if let Object::Reference(r) = value {
+                seeds.push(*r);
+            }
+        }
+
+        for seed in seeds {
+            enqueue_gen(
+                seed,
+                &member_to_group,
+                &groups_sorted,
+                &mut old_to_new,
+                &mut container_new,
+                &mut next,
+                &mut queue,
+            );
+        }
+
+        while let Some(cur) = queue.pop_front() {
+            let obj = pdf.resolve_borrowed(cur)?;
+            collect_refs(obj, 0, &mut |r| {
+                enqueue_gen(
+                    r,
+                    &member_to_group,
+                    &groups_sorted,
+                    &mut old_to_new,
+                    &mut container_new,
+                    &mut next,
+                    &mut queue,
+                );
+            })?;
+        }
+
+        Ok(Self {
+            old_to_new,
+            container_new,
+        })
+    }
+}
+
+/// Generate-mode enqueue: number a plain object directly, or — for an
+/// object-stream member — reserve the container number then number all members
+/// of that container ascending-source. A member already numbered as part of its
+/// container batch is a no-op. Members are pushed to the queue so their child
+/// references are traversed (qpdf reaches further containers' members this way).
+#[allow(dead_code, clippy::too_many_arguments)]
+fn enqueue_gen(
+    r: ObjectRef,
+    member_to_group: &HashMap<ObjectRef, usize>,
+    groups_sorted: &[Vec<ObjectRef>],
+    old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
+    container_new: &mut [Option<u32>],
+    next: &mut u32,
+    queue: &mut VecDeque<ObjectRef>,
+) {
+    if old_to_new.contains_key(&r) {
+        return;
+    }
+    match member_to_group.get(&r) {
+        Some(&gi) => {
+            if container_new[gi].is_none() {
+                container_new[gi] = Some(*next);
+                *next += 1;
+                for &m in &groups_sorted[gi] {
+                    old_to_new.insert(m, ObjectRef::new(*next, 0));
+                    *next += 1;
+                    queue.push_back(m);
+                }
+            }
+        }
+        None => {
+            old_to_new.insert(r, ObjectRef::new(*next, 0));
+            *next += 1;
+            queue.push_back(r);
+        }
+    }
+}
+
 /// Assign `original` a new number on first encounter and enqueue it for the BFS
 /// walk. Repeated calls for the same reference are no-ops.
 fn enqueue(

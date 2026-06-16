@@ -839,6 +839,35 @@ mod tests {
         assert_eq!(nums(&groups[1]), expected1, "stream 2 = pages 3..68");
     }
 
+    /// End-to-end renumber check against qpdf 11.9.0's MEASURED output on the
+    /// 130-page reverse-`/Kids` fixture (`--object-streams=generate --static-id`):
+    /// each ObjStm container is numbered immediately before its members, and the
+    /// members are numbered in ascending SOURCE object order. Measured anchors —
+    /// container 1 holds {Catalog,Pages,69..132}; container 68 holds {3..68}:
+    /// `Catalog(1)->2`, `Pages(2)->3`, `src69->4`, `src132->67`, `src3->69`,
+    /// `src68->134`.
+    #[test]
+    fn generate_renumber_matches_qpdf_on_130_page_reverse() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let groups = even_split_into_streams(&eligible);
+        let rn = crate::rewrite_renumber::GenerateRenumber::build(&mut pdf, &groups).unwrap();
+
+        let n = |src: u32| rn.new_for_original(ref0(src)).map(|r| r.number);
+        assert_eq!(n(1), Some(2), "Catalog");
+        assert_eq!(n(2), Some(3), "Pages");
+        assert_eq!(n(69), Some(4), "first member of container 1 after Pages");
+        assert_eq!(n(132), Some(67), "last member of container 1");
+        assert_eq!(n(3), Some(69), "first member of container 2");
+        assert_eq!(n(68), Some(134), "last member of container 2");
+        assert_eq!(
+            rn.container_numbers(),
+            vec![1, 68],
+            "containers numbered just before their members, in encounter order"
+        );
+    }
+
     fn typed_dict(type_name: &[u8]) -> Object {
         let mut d = Dictionary::new();
         d.insert("Type", Object::Name(type_name.to_vec()));
