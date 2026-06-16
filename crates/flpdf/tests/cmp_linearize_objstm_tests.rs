@@ -152,3 +152,52 @@ fn three_page_objstm_byte_identical_to_qpdf() {
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
 }
+
+// ---- Phase-2 (flpdf-g6hb.2): >cap global even-split + part routing ----------
+//
+// sharedfonts-100: 104 eligible first-page-shared dicts → 2 containers (50+51),
+// BOTH in part6 (first half). Exercises the global even-split membership fix
+// without second-half container numbering (finding-4): no part4 containers, so
+// the existing per-half renumber suffices.
+#[test]
+fn sharedfonts100_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-sharedfonts-100.pdf",
+        "objstm-lin-sharedfonts-100",
+    );
+}
+
+#[test]
+fn sharedfonts100_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-sharedfonts-100.pdf",
+        "objstm-lin-sharedfonts-100",
+    );
+}
+
+// mixed-60-70 / threepage-2-120 / disc-2-250-2 carry SECOND-HALF ObjStm
+// containers (part7/part8). qpdf numbers those among the second-half
+// uncompressed objects (before the main xref), interleaved by part; flpdf's
+// current `place_objstm_members_per_half` numbers them after the xref
+// (finding-4). Un-ignore once the renumber relocates members-only and lets
+// containers flow through their part position (Stage B).
+#[test]
+#[ignore = "finding-4: second-half container numbering (Stage B)"]
+fn mixed_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("objstm-lin-mixed-60-70.pdf", "objstm-lin-mixed-60-70");
+}
+
+#[test]
+#[ignore = "finding-4: second-half container numbering (Stage B)"]
+fn threepage_shared_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-threepage-2-120.pdf",
+        "objstm-lin-threepage-2-120",
+    );
+}
+
+#[test]
+#[ignore = "finding-4: second-half container numbering (Stage B)"]
+fn disc_part7_part8_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
+}

@@ -192,6 +192,29 @@ else
     echo "Skipping objstm-gen-nostream-130rev.pdf (already exists)"
 fi
 
+# Linearized generate-mode >cap fixtures (flpdf-g6hb.2). Each forces a distinct
+# qpdf even-split + part-routing scenario:
+#  - sharedfonts-100: 104 first-page-shared dicts => 2 containers (50+51), both part6.
+#  - mixed-60-70:     first-page-shared + page-1-only => part6 + part7 containers.
+#  - threepage-2-120: fonts shared by pages 1&2 (not page 0) => part6 + part8.
+#  - disc-2-250-2:    pure part7 container + a part8 uncompressed Form XObject
+#                     (the renumber finding-4 discriminator).
+declare -A G6HB2_FIX=(
+    [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
+    [objstm-lin-mixed-60-70]="gen_mixed_shared.py 60 70"
+    [objstm-lin-threepage-2-120]="gen_three_page_shared.py 2 120"
+    [objstm-lin-disc-2-250-2]="gen_part7_part8_discriminator.py 2 250 2"
+)
+for stem in "${!G6HB2_FIX[@]}"; do
+    if [[ ! -f "$FIX/$stem.pdf" ]]; then
+        echo "Generating $stem.pdf ..."
+        # shellcheck disable=SC2086
+        python3 "$ROOT/docs/plans/tools/"${G6HB2_FIX[$stem]} > "$FIX/$stem.pdf"
+    else
+        echo "Skipping $stem.pdf (already exists)"
+    fi
+done
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -322,6 +345,18 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/shared-stream-objstm.pdf" "$REF/shared-stream-objstm/linearize-objstm.pdf"
 qpdf --check "$REF/shared-stream-objstm/linearize-objstm.pdf" >/dev/null
 echo "shared-stream-objstm/linearize-objstm.pdf"
+
+# Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
+# above for each scenario. Compared structurally (and strictly where flpdf
+# reaches byte-identity) by cmp_linearize_objstm_tests under qpdf-zlib-compat.
+for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
+            objstm-lin-threepage-2-120 objstm-lin-disc-2-250-2; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"
+    qpdf --check "$REF/$stem/linearize-objstm.pdf" >/dev/null
+    echo "$stem/linearize-objstm.pdf"
+done
 
 echo ""
 echo "=== All references generated ==="
