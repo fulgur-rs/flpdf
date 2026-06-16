@@ -188,6 +188,62 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
     }
 }
 
+/// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
+/// (libqpdf/QPDF.cc:2392): a depth-first walk from the trailer, descending into
+/// dictionary values in ascending key order and array items in order. This
+/// traversal order — not object-number order — decides which objects co-locate
+/// in a generated object stream when more than one container is needed, so the
+/// port must reproduce it exactly.
+///
+/// Returns each reachable indirect object's reference in first-visit order.
+fn compressible_objgens<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<Vec<ObjectRef>> {
+    let mut visited: BTreeSet<u32> = BTreeSet::new();
+    let mut result: Vec<ObjectRef> = Vec::new();
+    // qpdf seeds the stack with the trailer dictionary itself (a direct object).
+    let mut stack: Vec<Object> = vec![Object::Dictionary(pdf.trailer().clone())];
+
+    while let Some(obj) = stack.pop() {
+        match obj {
+            Object::Reference(r) => {
+                if !visited.insert(r.number) {
+                    continue;
+                }
+                let resolved = pdf.resolve_borrowed(r)?.clone();
+                result.push(r);
+                push_children(&resolved, &mut stack);
+            }
+            // Direct (inline) container: traversed for its children but never
+            // contributes a reference (it has no object number of its own).
+            other => push_children(&other, &mut stack),
+        }
+    }
+
+    Ok(result)
+}
+
+/// Push an object's child values onto the DFS stack so they pop in qpdf's
+/// traversal order: dictionary values in ascending key order, array items in
+/// index order. (A LIFO stack pops in reverse insertion order, so children are
+/// pushed reversed.)
+fn push_children(obj: &Object, stack: &mut Vec<Object>) {
+    match obj {
+        Object::Dictionary(d) => {
+            let values: Vec<&Object> = d.iter().map(|(_k, v)| v).collect();
+            for v in values.into_iter().rev() {
+                stack.push(v.clone());
+            }
+        }
+        Object::Array(items) => {
+            for v in items.iter().rev() {
+                stack.push(v.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Collect the set of ObjectRefs that serve as indirect /Length targets of any
 /// ObjStm stream in the document.  ISO 32000-1 §7.5.7 prohibits those objects
 /// from being stored inside an ObjStm themselves.
@@ -491,6 +547,75 @@ mod tests {
 
     fn ref1(n: u32) -> ObjectRef {
         ObjectRef::new(n, 1)
+    }
+
+    /// Build a minimal classic-xref PDF with `n` pages whose `/Kids` are listed
+    /// in DESCENDING object number, so the document's depth-first traversal
+    /// order (Catalog, Pages, then kids in array order) differs from numeric
+    /// object-number order. Object layout: 1=Catalog, 2=Pages, 3..n+2=Page
+    /// dicts. Mirrors `docs/plans/tools/gen_multipage.py --reverse`.
+    fn reverse_kids_pdf(n: u32) -> Vec<u8> {
+        let page_nums: Vec<u32> = (3..3 + n).collect();
+        let mut objs: Vec<(u32, Vec<u8>)> = Vec::new();
+        objs.push((1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()));
+        let kids: Vec<u8> = page_nums
+            .iter()
+            .rev()
+            .flat_map(|k| format!("{k} 0 R ").into_bytes())
+            .collect();
+        objs.push((
+            2,
+            format!(
+                "<< /Type /Pages /Count {n} /Kids [ {} ] >>",
+                String::from_utf8(kids).unwrap().trim_end()
+            )
+            .into_bytes(),
+        ));
+        for k in &page_nums {
+            objs.push((
+                *k,
+                format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /PageMark {k} >>")
+                    .into_bytes(),
+            ));
+        }
+
+        let mut out: Vec<u8> = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = n + 3; // objects 0..=n+2
+        let mut offsets: Vec<usize> = vec![0; total as usize];
+        for (num, body) in &objs {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for num in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[num as usize]).as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    /// qpdf's `QPDF::getCompressibleObjGens` (QPDF.cc:2392) walks the document
+    /// from the trailer depth-first, so the eligible objects come back in
+    /// traversal order — Catalog, Pages, then page dicts in `/Kids` array order
+    /// — NOT object-number order. Verified empirically against qpdf 11.9.0: on a
+    /// 130-page reverse-`/Kids` fixture the first object stream holds the pages
+    /// reached first in the array walk, not the lowest-numbered pages.
+    #[test]
+    fn compressible_objgens_is_qpdf_dfs_traversal_order() {
+        let bytes = reverse_kids_pdf(3);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        // Catalog(1), Pages(2), then kids in array order [5,4,3] (descending).
+        assert_eq!(
+            order,
+            vec![ref0(1), ref0(2), ref0(5), ref0(4), ref0(3)],
+            "eligible objects must be in qpdf depth-first traversal order, not numeric order"
+        );
     }
 
     fn typed_dict(type_name: &[u8]) -> Object {

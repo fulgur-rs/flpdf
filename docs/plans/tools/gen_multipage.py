@@ -22,8 +22,13 @@ kids = b" ".join(b"%d 0 R" % n for n in kids_order)
 objs[pages_num] = b"<< /Type /Pages /Count %d /Kids [ %s ] >>" % (N, kids)
 for n in page_nums:
     # Minimal page dict; no content stream (keeps every object a non-stream =
-    # eligible). MediaBox inline. Parent points back to pages tree.
-    objs[n] = b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] >>" % pages_num
+    # eligible). MediaBox inline. Parent points back to pages tree. /PageMark
+    # carries the source object number so the page stays identifiable after
+    # qpdf renumbers it — lets us recover DFS stream grouping from output.
+    objs[n] = (
+        b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] /PageMark %d >>"
+        % (pages_num, n)
+    )
 
 # Serialize as a classic xref-table PDF.
 out = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
