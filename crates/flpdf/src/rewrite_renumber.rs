@@ -225,12 +225,9 @@ impl GenerateRenumber {
         // path (the encryption writer emits it as a plaintext indirect object),
         // not through the renumber walk. Seeding it here would assign it a
         // walk-order number and diverge from qpdf.
-        let root = pdf.root_ref().ok_or_else(|| {
-            // cov:ignore-start: callers (the generate writer) check /Root before
-            // build; this mirrors CatalogFirstRenumber's guard for direct callers.
-            Error::Unsupported("generate rewrite: trailer has no /Root".to_string())
-            // cov:ignore-end
-        })?;
+        let root = pdf
+            .root_ref()
+            .ok_or_else(|| Error::Unsupported("generate: trailer has no /Root".to_string()))?;
         let mut seeds: Vec<ObjectRef> = vec![root];
         for (key, value) in pdf.trailer().iter() {
             if matches!(key, b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size") {
@@ -295,14 +292,17 @@ fn enqueue_gen(
     }
     match member_to_group.get(&r) {
         Some(&gi) => {
-            if container_new[gi].is_none() {
-                container_new[gi] = Some(*next);
+            // The `old_to_new` guard above means we only reach here on a member's
+            // first encounter, so its container is not yet numbered. Number the
+            // container, then every member of that container consecutively in
+            // ascending-source order.
+            debug_assert!(container_new[gi].is_none());
+            container_new[gi] = Some(*next);
+            *next += 1;
+            for &m in &groups_sorted[gi] {
+                old_to_new.insert(m, ObjectRef::new(*next, 0));
                 *next += 1;
-                for &m in &groups_sorted[gi] {
-                    old_to_new.insert(m, ObjectRef::new(*next, 0));
-                    *next += 1;
-                    queue.push_back(m);
-                }
+                queue.push_back(m);
             }
         }
         None => {

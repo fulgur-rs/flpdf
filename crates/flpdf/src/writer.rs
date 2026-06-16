@@ -2539,15 +2539,16 @@ fn write_reencoded_object(
     source_filter_is_lone_flate: bool,
     options: &WriteOptions,
 ) {
-    if let Object::Stream(s) = reencoded {
-        let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
-            && !source_filter_is_lone_flate
-            && is_lone_flate(s.dict.get("Filter"));
-        write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
-    } else {
+    match reencoded {
+        Object::Stream(s) => {
+            let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
+                && !source_filter_is_lone_flate
+                && is_lone_flate(s.dict.get("Filter"));
+            write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
+        }
         // cov:ignore-start: unreachable — callers only pass stream objects and
         // reencode_stream_for_compress always returns Object::Stream.
-        reencoded.write_pdf(bytes);
+        other => other.write_pdf(bytes),
         // cov:ignore-end
     }
 }
@@ -3525,6 +3526,17 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     Ok(())
 }
 
+/// Resolve a `generate`-path internal invariant or fail with a
+/// `generate:`-prefixed [`crate::Error::Unsupported`]. The `None` arm is
+/// unreachable for well-formed input — the generate pipeline (DFS eligibility +
+/// even split + `GenerateRenumber`) maintains each invariant — but returning a
+/// diagnostic beats a panic if a future change breaks one. Keeping it a helper
+/// makes every call site a single (covered) expression instead of a multi-line
+/// `ok_or_else` closure whose error body would never execute.
+fn generate_invariant<T>(value: Option<T>, what: &str) -> Result<T> {
+    value.ok_or_else(|| crate::Error::Unsupported(format!("generate: {what}")))
+}
+
 /// Non-linearized `--object-streams=generate`, byte-identical to qpdf 11.9.0.
 ///
 /// qpdf assigns object streams up front (`QPDF::getCompressibleObjGens` DFS +
@@ -3563,12 +3575,10 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     // 3. enqueueObject walk with the object-stream branch => container-first
     //    numbering (members ascending-source within each container).
     let renumber = GenerateRenumber::build(pdf, &groups)?;
-    let new_root = renumber.new_for_original(root_ref).ok_or_else(|| {
-        // cov:ignore-start: GenerateRenumber::build seeds /Root first, so it is
-        // always mapped; this guards against a future build change.
-        crate::Error::Unsupported("generate: /Root absent from renumber map".to_string())
-        // cov:ignore-end
-    })?;
+    let new_root = generate_invariant(
+        renumber.new_for_original(root_ref),
+        "/Root absent from renumber map",
+    )?;
 
     // ── per-container member tables + type-2 xref entries ────────────────────
     /// One ObjStm container: its assigned object number and its members as
@@ -3583,14 +3593,10 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let mut member_xref: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
     let mut containers: Vec<ContainerPlan> = Vec::with_capacity(groups.len());
     for (gi, group) in groups.iter().enumerate() {
-        let number = renumber.container_number(gi).ok_or_else(|| {
-            // cov:ignore-start: every group's members come from
-            // `compressible_objgens` (all reachable), so each group is numbered.
-            crate::Error::Unsupported(
-                "generate: ObjStm container group was never reached".to_string(),
-            )
-            // cov:ignore-end
-        })?;
+        let number = generate_invariant(
+            renumber.container_number(gi),
+            "ObjStm container group was never reached",
+        )?;
         // Resolve each member's NEW ref once. qpdf serializes a container's
         // members in ascending source-object order (`std::set<QPDFObjGen>`), and
         // the generate-mode numbering assigns new numbers in that same order — so
@@ -3598,28 +3604,18 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         let mut members: Vec<(ObjectRef, ObjectRef)> = group
             .iter()
             .map(|&old| {
-                renumber
-                    .new_for_original(old)
-                    .map(|new| (old, new))
-                    .ok_or_else(|| {
-                        // cov:ignore-start: members come from the same walk that
-                        // built the map, so each is present.
-                        crate::Error::Unsupported(
-                            "generate: ObjStm member absent from renumber map".to_string(),
-                        )
-                        // cov:ignore-end
-                    })
+                let new = generate_invariant(
+                    renumber.new_for_original(old),
+                    "ObjStm member absent from renumber map",
+                )?;
+                Ok((old, new))
             })
             .collect::<Result<Vec<_>>>()?;
         members.sort_by_key(|&(_, new)| new.number);
         for (index, &(old, new)) in members.iter().enumerate() {
             member_set.insert(old);
-            let index = u32::try_from(index).map_err(|_| {
-                // cov:ignore-start: a single ObjStm holds at most 100 members,
-                // far below u32::MAX.
-                crate::Error::Unsupported("generate: ObjStm member index overflows u32".to_string())
-                // cov:ignore-end
-            })?;
+            // A single ObjStm holds at most 100 members, so `index` fits u32.
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
             member_xref.insert(new.number, (number, index));
         }
         containers.push(ContainerPlan { number, members });
@@ -3641,14 +3637,15 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         emit.insert(new.number, Emit::Plain(old));
     }
     for (gi, c) in containers.iter().enumerate() {
-        if emit.insert(c.number, Emit::Container(gi)).is_some() {
-            // cov:ignore-start: container numbers and plain-object numbers are
-            // disjoint by construction (members are excluded above).
-            return Err(crate::Error::Unsupported(
-                "generate: container object number collides with a plain object".to_string(),
-            ));
-            // cov:ignore-end
-        }
+        // Container and plain-object numbers are disjoint by construction (members
+        // are excluded above), so the insert never clobbers; `then_some` turns a
+        // (would-be) clobber into the helper's diagnostic instead of a panic.
+        generate_invariant(
+            emit.insert(c.number, Emit::Container(gi))
+                .is_none()
+                .then_some(()),
+            "container object number collides with a plain object",
+        )?;
     }
 
     // ── header ───────────────────────────────────────────────────────────────
@@ -3685,17 +3682,22 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
             Emit::Plain(old) => {
                 let mut object = pdf.resolve(*old)?;
                 renumber_refs_in_place(&mut object, &renumber)?;
-                if let Object::Stream(stream) = object {
-                    let (reencoded, source_filter_is_lone_flate) =
-                        reencode_stream_for_compress(stream, options);
-                    write_reencoded_object(
-                        &mut bytes,
-                        &reencoded,
-                        source_filter_is_lone_flate,
-                        options,
-                    );
-                } else {
-                    object.write_pdf(&mut bytes);
+                match object {
+                    Object::Stream(stream) => {
+                        let (reencoded, source_filter_is_lone_flate) =
+                            reencode_stream_for_compress(stream, options);
+                        write_reencoded_object(
+                            &mut bytes,
+                            &reencoded,
+                            source_filter_is_lone_flate,
+                            options,
+                        );
+                    }
+                    // cov:ignore-start: every reachable non-stream object is
+                    // ObjStm-eligible (a container member), so a plain object —
+                    // one not routed into a container — is always a stream.
+                    other => other.write_pdf(&mut bytes),
+                    // cov:ignore-end
                 }
             }
             Emit::Container(gi) => {
@@ -3747,16 +3749,16 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         .copied()
         .max()
         .unwrap_or(0);
-    let xref_object_number = max_object_number.checked_add(1).ok_or_else(|| {
-        // cov:ignore-start: would require ~u32::MAX live objects (a multi-GB PDF).
-        crate::Error::Unsupported("generate: xref stream object number overflows u32".to_string())
-        // cov:ignore-end
-    })?;
-    let size = xref_object_number.checked_add(1).ok_or_else(|| {
-        // cov:ignore-start: see above — unreachable below u32::MAX objects.
-        crate::Error::Unsupported("generate: xref /Size overflows u32".to_string())
-        // cov:ignore-end
-    })?;
+    // Both overflows need ~u32::MAX live objects (a multi-GB PDF); unreachable
+    // for any real input, but surfaced as a diagnostic rather than a panic.
+    let xref_object_number = generate_invariant(
+        max_object_number.checked_add(1),
+        "xref stream number overflows u32",
+    )?;
+    let size = generate_invariant(
+        xref_object_number.checked_add(1),
+        "xref /Size overflows u32",
+    )?;
 
     // The xref stream object describes itself with a type-1 entry at its own
     // offset; add it to the offset map so `build_entries` emits that row.
