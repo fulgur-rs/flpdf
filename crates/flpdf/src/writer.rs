@@ -3578,7 +3578,7 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let new_root = generate_invariant(
         renumber.new_for_original(root_ref),
         "/Root absent from renumber map",
-    )?;
+    )?; // cov:ignore: error arm is an unreachable internal invariant
 
     // ── per-container member tables + type-2 xref entries ────────────────────
     /// One ObjStm container: its assigned object number and its members as
@@ -3596,18 +3596,18 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         let number = generate_invariant(
             renumber.container_number(gi),
             "ObjStm container group was never reached",
-        )?;
-        // Resolve each member's NEW ref once. qpdf serializes a container's
-        // members in ascending source-object order (`std::set<QPDFObjGen>`), and
-        // the generate-mode numbering assigns new numbers in that same order — so
-        // sorting by the NEW number reproduces it.
+        )?; // cov:ignore: error arm is an unreachable internal invariant
+            // Resolve each member's NEW ref once. qpdf serializes a container's
+            // members in ascending source-object order (`std::set<QPDFObjGen>`), and
+            // the generate-mode numbering assigns new numbers in that same order — so
+            // sorting by the NEW number reproduces it.
         let mut members: Vec<(ObjectRef, ObjectRef)> = group
             .iter()
             .map(|&old| {
                 let new = generate_invariant(
                     renumber.new_for_original(old),
                     "ObjStm member absent from renumber map",
-                )?;
+                )?; // cov:ignore: error arm is an unreachable internal invariant
                 Ok((old, new))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3645,7 +3645,7 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
                 .is_none()
                 .then_some(()),
             "container object number collides with a plain object",
-        )?;
+        )?; // cov:ignore: error arm is an unreachable internal invariant
     }
 
     // ── header ───────────────────────────────────────────────────────────────
@@ -3754,11 +3754,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let xref_object_number = generate_invariant(
         max_object_number.checked_add(1),
         "xref stream number overflows u32",
-    )?;
+    )?; // cov:ignore: error arm needs ~u32::MAX objects — a multi-GB PDF
     let size = generate_invariant(
         xref_object_number.checked_add(1),
         "xref /Size overflows u32",
-    )?;
+    )?; // cov:ignore: error arm needs ~u32::MAX objects — a multi-GB PDF
 
     // The xref stream object describes itself with a type-1 entry at its own
     // offset; add it to the offset map so `build_entries` emits that row.
