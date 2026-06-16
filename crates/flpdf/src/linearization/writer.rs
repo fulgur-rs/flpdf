@@ -139,19 +139,22 @@ impl ObjStmLayout {
         let config = planner_config_from_options(options);
         let batch_plan = plan.objstm_batches(pdf, &config)?;
 
-        // Writer-level invariant (qpdf linearization rule, not encoded by the
-        // 5.8.1 planner): per-page *private* objects must remain plain
-        // indirects — qpdf rejects a linearized file whose page dictionaries
-        // are compressed.  Drop any `part4_other_pages_private` member here.
-        let other_pages_private: std::collections::BTreeSet<ObjectRef> =
-            plan.part4_other_pages_private.iter().copied().collect();
+        // Writer-level invariant (qpdf linearization rule): a page DICTIONARY may
+        // never be compressed — the linearization layout addresses pages by file
+        // offset. qpdf compresses page-*private* non-dictionary objects (fonts,
+        // etc.) normally, so only the page dictionaries themselves are excluded.
+        // The Generate membership already erases them (QPDFWriter.cc:2141), so
+        // this is a no-op there; it guards a Preserve source whose ObjStm somehow
+        // carried a page dict.
+        let page_dicts: std::collections::BTreeSet<ObjectRef> =
+            crate::pages::page_refs(pdf)?.into_iter().collect();
         let filter_batches = |batches: Vec<Vec<ObjectRef>>| -> Vec<Vec<ObjectRef>> {
             batches
                 .into_iter()
                 .filter_map(|batch| {
                     let kept: Vec<ObjectRef> = batch
                         .into_iter()
-                        .filter(|r| !other_pages_private.contains(r))
+                        .filter(|r| !page_dicts.contains(r))
                         .collect();
                     if kept.is_empty() {
                         None
