@@ -177,7 +177,14 @@ impl GenerateRenumber {
         let mut queue: VecDeque<ObjectRef> = VecDeque::new();
 
         // Seeds match the plain Catalog-first walk: `/Root` first, then the
-        // remaining indirect trailer entries in lexicographic key order.
+        // remaining indirect trailer entries in lexicographic key order. The
+        // skipped keys mirror qpdf's `getTrimmedTrailer` (QPDFWriter.cc), which
+        // removes `/ID`, `/Encrypt`, `/Prev`, etc. before the enqueue walk. In
+        // particular `/Encrypt` is intentionally NOT seeded here: like qpdf,
+        // flpdf numbers and emits the encryption dictionary through a separate
+        // path (the encryption writer emits it as a plaintext indirect object),
+        // not through the renumber walk. Seeding it here would assign it a
+        // walk-order number and diverge from qpdf.
         let root = pdf.root_ref().ok_or_else(|| {
             Error::Unsupported("generate rewrite: trailer has no /Root".to_string())
         })?;
