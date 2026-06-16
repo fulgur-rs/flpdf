@@ -201,6 +201,15 @@ fn compressible_objgens<R: std::io::Read + std::io::Seek>(
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
+    // The encryption dictionary is excluded from the result, matching qpdf's
+    // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
+    // plain indirect object so the rest of the file can be decrypted. Read it
+    // from the trailer's `/Encrypt` reference (it is still traversed for any
+    // child references, like a stream or signature dictionary).
+    let encrypt_ref = match pdf.trailer().get("Encrypt") {
+        Some(Object::Reference(r)) => Some(*r),
+        _ => None,
+    };
     // qpdf seeds the stack with the trailer dictionary itself (a direct object).
     let mut stack: Vec<Object> = vec![Object::Dictionary(pdf.trailer().clone())];
 
@@ -211,11 +220,14 @@ fn compressible_objgens<R: std::io::Read + std::io::Seek>(
                     continue;
                 }
                 let resolved = pdf.resolve_borrowed(r)?.clone();
-                // Streams and signature value dictionaries cannot be stored
-                // inside an object stream, so they are excluded from the result —
-                // but their dictionaries are still traversed for child references
-                // (QPDF.cc:2439-2445).
-                if !matches!(resolved, Object::Stream(_)) && !is_signature_dict(&resolved) {
+                // Streams, signature value dictionaries, and the encryption
+                // dictionary cannot be stored inside an object stream, so they
+                // are excluded from the result — but they are still traversed for
+                // child references (QPDF.cc:2437-2445).
+                if !matches!(resolved, Object::Stream(_))
+                    && !is_signature_dict(&resolved)
+                    && Some(r) != encrypt_ref
+                {
                     result.push(r);
                 }
                 push_children(&resolved, &mut stack);
@@ -865,6 +877,26 @@ mod tests {
             rn.container_numbers(),
             vec![1, 68],
             "containers numbered just before their members, in encounter order"
+        );
+    }
+
+    /// qpdf excludes the encryption dictionary from the compressible set
+    /// (`m->trailer.getKey("/Encrypt")`, QPDF.cc:2402/2437): it must stay a
+    /// plain indirect so a reader can decrypt the rest of the file. The
+    /// `encrypted-r4-three-page` fixture references its `/Encrypt` dictionary at
+    /// object 12.
+    #[test]
+    fn compressible_objgens_excludes_encryption_dictionary() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/encrypted-r4-three-page.pdf"
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let order = compressible_objgens(&mut pdf).unwrap();
+        assert!(
+            !order.contains(&ref0(12)),
+            "the /Encrypt dictionary (obj 12) must be excluded from the compressible set; got {order:?}"
         );
     }
 
