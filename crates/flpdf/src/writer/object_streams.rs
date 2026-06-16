@@ -264,7 +264,7 @@ pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectR
 /// stream.
 fn is_signature_dict(obj: &Object) -> bool {
     let Some(dict) = obj.as_dict() else {
-        return false;
+        return false; // cov:ignore: callers gate on non-stream resolved dicts
     };
     dict_type_is(dict, b"Sig") && dict.get("ByteRange").is_some() && dict.get("Contents").is_some()
 }

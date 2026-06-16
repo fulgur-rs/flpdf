@@ -2545,9 +2545,10 @@ fn write_reencoded_object(
             && is_lone_flate(s.dict.get("Filter"));
         write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
     } else {
-        // cov:ignore: callers only invoke this on stream objects, and
+        // cov:ignore-start: unreachable — callers only pass stream objects and
         // reencode_stream_for_compress always returns Object::Stream.
         reencoded.write_pdf(bytes);
+        // cov:ignore-end
     }
 }
 
@@ -3134,9 +3135,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                     );
                 } else {
-                    // cov:ignore: this arm only runs in the stream branch, and
-                    // reencode_stream_for_compress always returns Object::Stream.
+                    // cov:ignore-start: unreachable — this arm is inside the
+                    // stream branch and reencode_stream_for_compress always
+                    // returns Object::Stream.
                     reencoded.write_pdf_qdf(&mut bytes, 0);
+                    // cov:ignore-end
                 }
             } else {
                 // Non-qdf: shared choke point — qpdf's re-filtered key order for
@@ -3561,9 +3564,10 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     //    numbering (members ascending-source within each container).
     let renumber = GenerateRenumber::build(pdf, &groups)?;
     let new_root = renumber.new_for_original(root_ref).ok_or_else(|| {
-        // cov:ignore: GenerateRenumber::build seeds /Root first, so it is always
-        // mapped; this guards against a future build change.
+        // cov:ignore-start: GenerateRenumber::build seeds /Root first, so it is
+        // always mapped; this guards against a future build change.
         crate::Error::Unsupported("generate: /Root absent from renumber map".to_string())
+        // cov:ignore-end
     })?;
 
     // ── per-container member tables + type-2 xref entries ────────────────────
@@ -3580,11 +3584,12 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let mut containers: Vec<ContainerPlan> = Vec::with_capacity(groups.len());
     for (gi, group) in groups.iter().enumerate() {
         let number = renumber.container_number(gi).ok_or_else(|| {
-            // cov:ignore: every group's members come from `compressible_objgens`
-            // (all reachable), so each group is reached and numbered.
+            // cov:ignore-start: every group's members come from
+            // `compressible_objgens` (all reachable), so each group is numbered.
             crate::Error::Unsupported(
                 "generate: ObjStm container group was never reached".to_string(),
             )
+            // cov:ignore-end
         })?;
         // Resolve each member's NEW ref once. qpdf serializes a container's
         // members in ascending source-object order (`std::set<QPDFObjGen>`), and
@@ -3597,11 +3602,12 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
                     .new_for_original(old)
                     .map(|new| (old, new))
                     .ok_or_else(|| {
-                        // cov:ignore: members come from the same walk that built
-                        // the map, so each is present.
+                        // cov:ignore-start: members come from the same walk that
+                        // built the map, so each is present.
                         crate::Error::Unsupported(
                             "generate: ObjStm member absent from renumber map".to_string(),
                         )
+                        // cov:ignore-end
                     })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3609,9 +3615,10 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         for (index, &(old, new)) in members.iter().enumerate() {
             member_set.insert(old);
             let index = u32::try_from(index).map_err(|_| {
-                // cov:ignore: a single ObjStm holds at most 100 members, far
-                // below u32::MAX.
+                // cov:ignore-start: a single ObjStm holds at most 100 members,
+                // far below u32::MAX.
                 crate::Error::Unsupported("generate: ObjStm member index overflows u32".to_string())
+                // cov:ignore-end
             })?;
             member_xref.insert(new.number, (number, index));
         }
@@ -3635,11 +3642,12 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     }
     for (gi, c) in containers.iter().enumerate() {
         if emit.insert(c.number, Emit::Container(gi)).is_some() {
-            // cov:ignore: container numbers and plain-object numbers are disjoint
-            // by construction (members are excluded above), so this never fires.
+            // cov:ignore-start: container numbers and plain-object numbers are
+            // disjoint by construction (members are excluded above).
             return Err(crate::Error::Unsupported(
                 "generate: container object number collides with a plain object".to_string(),
             ));
+            // cov:ignore-end
         }
     }
 
@@ -3740,12 +3748,14 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         .max()
         .unwrap_or(0);
     let xref_object_number = max_object_number.checked_add(1).ok_or_else(|| {
-        // cov:ignore: would require ~u32::MAX live objects (a multi-GB PDF).
+        // cov:ignore-start: would require ~u32::MAX live objects (a multi-GB PDF).
         crate::Error::Unsupported("generate: xref stream object number overflows u32".to_string())
+        // cov:ignore-end
     })?;
     let size = xref_object_number.checked_add(1).ok_or_else(|| {
-        // cov:ignore: see above — unreachable below u32::MAX objects.
+        // cov:ignore-start: see above — unreachable below u32::MAX objects.
         crate::Error::Unsupported("generate: xref /Size overflows u32".to_string())
+        // cov:ignore-end
     })?;
 
     // The xref stream object describes itself with a type-1 entry at its own
@@ -3821,13 +3831,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
             Some(Object::Array(arr)) if arr.len() == 2 => {
                 let take = |o: &Object| match o {
                     Object::String(s) => s.clone(),
-                    // cov:ignore: /ID elements are always strings here.
-                    _ => QPDF_STATIC_ID.to_vec(),
+                    _ => QPDF_STATIC_ID.to_vec(), // cov:ignore: /ID elements are always strings here
                 };
                 (take(&arr[0]), take(&arr[1]))
             }
-            // cov:ignore: /ID is always a two-element array here.
-            _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()),
+            _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()), // cov:ignore: /ID is always a 2-string array here
         };
         let dict = xref_stream::XrefStreamDict {
             widths,

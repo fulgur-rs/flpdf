@@ -226,7 +226,10 @@ impl GenerateRenumber {
         // not through the renumber walk. Seeding it here would assign it a
         // walk-order number and diverge from qpdf.
         let root = pdf.root_ref().ok_or_else(|| {
+            // cov:ignore-start: callers (the generate writer) check /Root before
+            // build; this mirrors CatalogFirstRenumber's guard for direct callers.
             Error::Unsupported("generate rewrite: trailer has no /Root".to_string())
+            // cov:ignore-end
         })?;
         let mut seeds: Vec<ObjectRef> = vec![root];
         for (key, value) in pdf.trailer().iter() {
