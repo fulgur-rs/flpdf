@@ -110,10 +110,56 @@ This is larger than "swap `chunks(cap)` for even split". Recommended split:
 Regression guard for both: the change must be a byte no-op on all 9 existing
 `linearize-objstm` goldens (<= 17 eligible => single container).
 
-## Open question for Phase 1
+## Model corrections (verified 2026-06-16 — these overrule looser statements above)
 
-qpdf's generate-mode renumbering is driven by its writer enqueue walk, not just
-the stream assignment. The exact interleaving of *non-eligible* (uncompressed)
-objects in the renumber sequence must be measured (the 120-page fixture has only
-container + members + xref; add a fixture with uncompressed-but-reachable streams
-to pin where they land).
+Two measurements refined the model; both matter for not writing wrong code:
+
+### A. Within-stream numbering is by SOURCE object number, not traversal order
+
+`object_stream_to_objects[stream]` is `std::set<QPDFObjGen>` keyed on the
+**source** objgen (assignment runs before renumber). New numbers are assigned by
+iterating that set, i.e. ascending source number. The getCompressibleObjGens DFS
+order therefore only decides **which stream** an object lands in (the `n_per`
+grouping when n > 100); it does **not** order members within a stream.
+
+Consequence: for `n <= 100` (one stream) the DFS order is irrelevant — output is
+fully determined by ascending source number. A discriminating fixture for the DFS
+grouping **must be > 100 eligible**. (A reverse-/Kids fixture with n<=100 would
+pass under pure source-number sorting and give false confidence.)
+
+Verified: reverse-/Kids 5-page fixture (7 eligible, 1 stream) — qpdf numbers
+members in ascending source order (src3->4 … src7->8), regardless of /Kids order.
+
+### B. flpdf diverges from qpdf at EVERY scale, not just > cap
+
+Even a 7-eligible single-stream file diverges:
+
+| | container | members | Root |
+|---|---|---|---|
+| qpdf | obj 1 (FIRST) | renumbered 2-8, ascending source | 2 0 R |
+| flpdf (HEAD) | obj 8 (LAST) | source numbers preserved 1-7 | 1 0 R |
+
+So the core gap is qpdf's **generate-mode renumbering scheme** (container numbered
+*before* its members; members renumbered consecutively in ascending source order;
+xref stream last), which flpdf does not do at all. Even distribution (> 100) is a
+refinement on top, not the main divergence. flpdf non-linearized generate has
+never been byte-identical to qpdf.
+
+## Phase 1 decomposition (revised)
+
+- **Step A — generate-mode renumbering** (validate on a SMALL n<=100 fixture).
+  Container-first numbering, members renumbered ascending-source after it, xref
+  last. One container, so NO even-split / NO DFS needed yet. First RED:
+  byte-parity (qpdf-zlib-compat) of `--object-streams=generate` on a ~7-object
+  fixture == qpdf. This is the smallest byte-verifiable increment.
+- **Step B — even distribution + DFS grouping for n > 100** (validate on a > 100
+  discriminating fixture where DFS order != numeric order). Adds ceil/ceil n_per
+  split and getCompressibleObjGens DFS to decide membership; within-stream stays
+  ascending source number.
+
+## Open question (Step A)
+
+Exact interleaving of *non-eligible* (uncompressed) reachable objects in the
+renumber sequence must be measured (the fixtures so far have only container +
+members + xref). Add a fixture with an uncompressed-but-reachable stream and pin
+where its new number lands relative to the container.
