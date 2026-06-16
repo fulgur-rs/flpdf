@@ -1484,6 +1484,165 @@ impl LinearizationPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Linearized generate-mode ObjStm membership + container part routing
+//
+// These mirror qpdf 11.9.0's linearized `--object-streams=generate` pipeline:
+//   * `objstm_membership_linearized` = `generateObjectStreams` (global even
+//     split over `getCompressibleObjGens`) then the linearized erasure of every
+//     page dictionary and the root Catalog (QPDFWriter.cc:2141-2161).
+//   * `route_objstm_containers` = `filterCompressedObjects`
+//     (QPDF_optimization.cc:340-380) folding each member's obj_users onto its
+//     container, then `calculateLinearizationData`'s `lc_*` categorization
+//     (QPDF_linearization.cc:963-1200) applied to the container's union.
+// ---------------------------------------------------------------------------
+
+/// Linearization part a generate-mode ObjStm container is routed to, by the
+/// union of its members' page users.
+///
+/// `FirstPage` is qpdf part 6 (first-page section), `OtherPagePrivate` part 7,
+/// `OtherPageShared` part 8, and `Rest` part 9. The open-document / outline /
+/// thumbnail categories qpdf checks *before* `in_first_page` are not modeled
+/// (see [`route_objstm_containers`]).
+// The linearized generate writer that consumes this routing is the next
+// flpdf-g6hb.2 step; the layer is validated standalone by the routing unit
+// tests below (qpdf-11.9.0-measured part6/part7/part8) before wiring.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerPart {
+    /// qpdf part 6 — the container holds at least one first-page object.
+    FirstPage,
+    /// qpdf part 7 — the container's members are private to exactly one
+    /// non-first page.
+    OtherPagePrivate,
+    /// qpdf part 8 — the container's members are shared by two or more
+    /// non-first pages.
+    OtherPageShared,
+    /// qpdf part 9 — the container reaches no page (trailer-only members).
+    Rest,
+}
+
+/// Compute the linearized generate-mode ObjStm membership.
+///
+/// Runs qpdf's `generateObjectStreams` even split
+/// ([`compressible_objgens`](crate::writer::object_streams::compressible_objgens)
+/// →
+/// [`even_split_into_streams`](crate::writer::object_streams::even_split_into_streams),
+/// hard-coded 100 per stream — *not* the planner cap) over the whole document,
+/// then erases every page dictionary and the root Catalog from the resulting
+/// containers (qpdf's linearized exclusion at QPDFWriter.cc:2141-2161; the
+/// `/Pages` tree node and `/Info` dictionary are *not* erased — they stay ObjStm
+/// members). Containers are returned in even-split order; each inner vector is
+/// one container's surviving members in even-split (DFS) order. A container left
+/// empty by the erasure is dropped.
+///
+/// # Errors
+///
+/// Propagates reader errors from the compressible-set traversal or the page-tree
+/// walk used to build the erase set.
+#[allow(dead_code)] // consumed by the linearized generate writer (flpdf-g6hb.2 next step)
+pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> crate::Result<Vec<Vec<ObjectRef>>> {
+    let eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
+
+    // Erase set: every page dictionary plus the root Catalog. qpdf cannot place
+    // a page dict in an ObjStm (the linearization layout addresses pages by
+    // file offset) and never compresses the Catalog in a linearized file.
+    let mut erase: BTreeSet<ObjectRef> = crate::pages::page_refs(pdf)?.into_iter().collect();
+    if let Some(root) = pdf.root_ref() {
+        erase.insert(root);
+    }
+
+    Ok(streams
+        .into_iter()
+        .map(|stream| {
+            stream
+                .into_iter()
+                .filter(|r| !erase.contains(r))
+                .collect::<Vec<ObjectRef>>()
+        })
+        .filter(|container| !container.is_empty())
+        .collect())
+}
+
+/// Route each ObjStm container to a linearization part by the union of its
+/// members' page users.
+///
+/// Mirrors qpdf's `filterCompressedObjects` (the container inherits the union of
+/// every member's obj_users) followed by the `lc_*` categorization: a container
+/// holding any first-page object is part 6 ([`ContainerPart::FirstPage`]);
+/// otherwise it is part 7 / part 8 / part 9 by the number of *distinct non-first*
+/// pages its members reach (one → [`ContainerPart::OtherPagePrivate`], two or
+/// more → [`ContainerPart::OtherPageShared`], none →
+/// [`ContainerPart::Rest`]).
+///
+/// The page-user signals (first-page closure and the per-object referencing-page
+/// map) are recomputed exactly as [`LinearizationPlan::from_pdf`] derives them.
+///
+/// # Deviation
+///
+/// qpdf checks `in_open_document` (/OpenAction, /AcroForm, /ViewerPreferences,
+/// /PageMode, /Threads), `in_outlines`, and the thumbnail categories *before*
+/// `in_first_page`, so such a member would route its whole container to part 4 /
+/// part 9. That is not modeled here: those objects do not occur in the supported
+/// corpus, and the always-first-page objects (/Info, /Catalog, the /Pages tree)
+/// are DFS-early and therefore always land in the first container, which is
+/// first-page regardless. See `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`.
+///
+/// # Errors
+///
+/// Propagates reader errors from the page-tree walk or the per-page closures.
+#[allow(dead_code)] // consumed by the linearized generate writer (flpdf-g6hb.2 next step)
+pub(crate) fn route_objstm_containers<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    containers: &[Vec<ObjectRef>],
+) -> crate::Result<Vec<ContainerPart>> {
+    let page_refs = crate::pages::page_refs(pdf)?;
+
+    let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
+        Some(&first_page) => compute_closure(pdf, first_page)?.into_iter().collect(),
+        // cov:ignore: a linearizable document always has at least one page, so
+        // the page-less branch never fires on the generate-mode call path.
+        None => BTreeSet::new(),
+    };
+
+    // obj_user page map: object -> set of page indices whose closure reaches it.
+    let mut referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
+    for &r in &first_page_set {
+        referenced_pages.entry(r).or_default().insert(0);
+    }
+    for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
+        for r in compute_closure(pdf, page_ref)? {
+            referenced_pages
+                .entry(r)
+                .or_default()
+                .insert(page_idx as u32);
+        }
+    }
+
+    Ok(containers
+        .iter()
+        .map(|members| {
+            if members.iter().any(|m| first_page_set.contains(m)) {
+                return ContainerPart::FirstPage;
+            }
+            let mut other_pages: BTreeSet<u32> = BTreeSet::new();
+            for m in members {
+                if let Some(pages) = referenced_pages.get(m) {
+                    other_pages.extend(pages.iter().copied().filter(|&p| p != 0));
+                }
+            }
+            match other_pages.len() {
+                0 => ContainerPart::Rest,
+                1 => ContainerPart::OtherPagePrivate,
+                _ => ContainerPart::OtherPageShared,
+            }
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -3551,5 +3710,240 @@ mod tests {
         assert_eq!(folded[3].object_ref, ObjectRef::new(11, u16::MAX));
         // Part-8 entry stays last (not pulled into the first-page sort).
         assert_eq!(folded[4].object_ref, other_shared);
+    }
+
+    // -- Linearized generate-mode membership + container part routing --------
+    //
+    // These exercise `objstm_membership_linearized` + `route_objstm_containers`
+    // against the qpdf-11.9.0-measured ground truth (the Rust builders below are
+    // ports of docs/plans/tools/gen_mixed_shared.py and gen_three_page_shared.py;
+    // the routing assertions match `qpdf --linearize --object-streams=generate`).
+
+    /// Serialize objects (sorted by number) into a classic-xref PDF body with a
+    /// `/Root 1 0 R /Info 6 0 R`-style trailer. `info_obj` is the /Info object
+    /// number; `max_obj` is the highest object number present.
+    fn assemble_classic_pdf(bodies: Vec<(u32, String)>, info_obj: u32, max_obj: u32) -> Vec<u8> {
+        let mut bodies = bodies;
+        bodies.sort_by_key(|(n, _)| *n);
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n");
+        let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+        for (n, body) in &bodies {
+            offsets.insert(*n, pdf.len() as u64);
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = pdf.len() as u64;
+        let size = max_obj + 1;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for n in 1..size {
+            xref.push_str(&format!("{:010} 00000 n \n", offsets[&n]));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R /Info {info_obj} 0 R >>\n\
+                 startxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// Port of `gen_mixed_shared.py s p`: 2 pages, page 0 references `s` shared
+    /// fonts, page 1 references those `s` shared fonts plus `p` page-1-only fonts,
+    /// trailer carries /Info. Layout: 1=Catalog 2=Pages 3=Page0 4=Page1 5=Info,
+    /// 6..=5+s shared fonts, then `p` page-1-only fonts, then the two content
+    /// streams. Font keys `/S#`,`/P#` sort lexically (matching the python).
+    fn mixed_shared_pdf_bytes(s: u32, p: u32) -> Vec<u8> {
+        let shared0 = 6u32;
+        let p1only0 = shared0 + s;
+        let c0 = p1only0 + p;
+        let c1 = c0 + 1;
+        let shared_res: String = (0..s)
+            .map(|i| format!("/S{} {} 0 R", i + 1, shared0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let p1_extra: String = (0..p)
+            .map(|i| format!("/P{} {} 0 R", i + 1, p1only0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut bodies: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Count 2 /Kids [ 3 0 R 4 0 R ] >>".to_string()),
+            (5, "<< /Producer (flpdf-g6hb mixed fixture) >>".to_string()),
+            (3, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {shared_res} >> >> /Contents {c0} 0 R >>"
+            )),
+            (4, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {shared_res} {p1_extra} >> >> /Contents {c1} 0 R >>"
+            )),
+        ];
+        for i in 0..s {
+            let n = shared0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /S{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for i in 0..p {
+            let n = p1only0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /P{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for (cnum, label) in [(c0, "Page0"), (c1, "Page1")] {
+            let stream = format!("BT /S1 12 Tf 72 720 Td ({label}) Tj ET");
+            bodies.push((
+                cnum,
+                format!(
+                    "<< /Length {} >>\nstream\n{stream}\nendstream",
+                    stream.len()
+                ),
+            ));
+        }
+        assemble_classic_pdf(bodies, 5, c1)
+    }
+
+    /// Port of `gen_three_page_shared.py p0 g`: 3 pages, page 0 references `p0`
+    /// private fonts, pages 1 AND 2 both reference the same `g` shared fonts
+    /// (reach {1,2}, never page 0). Layout: 1=Catalog 2=Pages 3=Page0 4=Page1
+    /// 5=Page2 6=Info, 7..=6+p0 page-0 fonts, then `g` shared fonts, then three
+    /// content streams.
+    fn three_page_shared_pdf_bytes(p0: u32, g: u32) -> Vec<u8> {
+        let p0_0 = 7u32;
+        let g0 = p0_0 + p0;
+        let c0 = g0 + g;
+        let c1 = c0 + 1;
+        let c2 = c1 + 1;
+        let p0_res: String = (0..p0)
+            .map(|i| format!("/A{} {} 0 R", i + 1, p0_0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let g_res: String = (0..g)
+            .map(|i| format!("/G{} {} 0 R", i + 1, g0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut bodies: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Count 3 /Kids [ 3 0 R 4 0 R 5 0 R ] >>".to_string()),
+            (6, "<< /Producer (flpdf-g6hb three-page shared fixture) >>".to_string()),
+            (3, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {p0_res} >> >> /Contents {c0} 0 R >>"
+            )),
+            (4, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {g_res} >> >> /Contents {c1} 0 R >>"
+            )),
+            (5, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {g_res} >> >> /Contents {c2} 0 R >>"
+            )),
+        ];
+        for i in 0..p0 {
+            let n = p0_0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /A{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for i in 0..g {
+            let n = g0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /G{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for (cnum, label) in [(c0, "Page0"), (c1, "Page1"), (c2, "Page2")] {
+            let stream = format!("BT /A1 12 Tf 72 720 Td ({label}) Tj ET");
+            bodies.push((
+                cnum,
+                format!(
+                    "<< /Length {} >>\nstream\n{stream}\nendstream",
+                    stream.len()
+                ),
+            ));
+        }
+        assemble_classic_pdf(bodies, 6, c2)
+    }
+
+    #[test]
+    fn linearized_membership_even_splits_then_erases_page_dicts_and_root() {
+        // gen_mixed_shared 60 70: 135 eligible => 2 streams (68 + 67); erase
+        // Catalog + Page0 + Page1 (all in stream 0) => 65 + 67 members.
+        let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        assert_eq!(
+            containers.len(),
+            2,
+            "135 eligible => 2 even-split containers"
+        );
+        assert_eq!(
+            containers[0].len(),
+            65,
+            "stream 0 loses Catalog+Page0+Page1"
+        );
+        assert_eq!(containers[1].len(), 67, "stream 1 untouched by the erasure");
+        // No page dict or root survives in any container.
+        let root = pdf.root_ref().unwrap();
+        let pages: BTreeSet<ObjectRef> = crate::pages::page_refs(&mut pdf)
+            .unwrap()
+            .into_iter()
+            .collect();
+        for c in &containers {
+            for m in c {
+                assert!(*m != root && !pages.contains(m), "{m:?} must be erased");
+            }
+        }
+    }
+
+    #[test]
+    fn linearized_routes_mixed_shared_first_page_then_other_page_private() {
+        // qpdf measured: stream 0 (shared fonts + Pages + Info) => part6;
+        // stream 1 (page-1-only fonts) => part7.
+        let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::FirstPage, ContainerPart::OtherPagePrivate]
+        );
+    }
+
+    #[test]
+    fn linearized_routes_three_page_shared_first_page_then_other_page_shared() {
+        // qpdf measured: stream 0 (page-0-private fonts + Pages + Info) => part6;
+        // stream 1 (fonts shared by pages 1 & 2, reach {1,2}) => part8.
+        let mut pdf = Pdf::open(Cursor::new(three_page_shared_pdf_bytes(2, 120))).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::FirstPage, ContainerPart::OtherPageShared]
+        );
+    }
+
+    #[test]
+    fn linearized_routes_trailer_only_container_to_rest() {
+        // A container whose members reach no page (here /Info, which is
+        // trailer-only and not in any page closure) is qpdf part 9 — lc_other.
+        // This does not arise from the even split on a font corpus (/Info is
+        // DFS-early and co-located with first-page objects), but the routing is
+        // exercised directly here.
+        let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
+        let info_ref = pdf.trailer().get_ref("Info").unwrap();
+        let synthetic = vec![vec![info_ref]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(routes, vec![ContainerPart::Rest]);
     }
 }
