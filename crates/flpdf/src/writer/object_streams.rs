@@ -219,18 +219,22 @@ pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
                 if !visited.insert(r.number) {
                     continue;
                 }
-                let resolved = pdf.resolve_borrowed(r)?.clone();
+                // Borrow (do not clone) the resolved object: it is only read
+                // within this iteration to test eligibility and push its
+                // children, so cloning would needlessly copy a stream's entire
+                // data payload (potentially megabytes).
+                let resolved = pdf.resolve_borrowed(r)?;
                 // Streams, signature value dictionaries, and the encryption
                 // dictionary cannot be stored inside an object stream, so they
                 // are excluded from the result — but they are still traversed for
                 // child references (QPDF.cc:2437-2445).
                 if !matches!(resolved, Object::Stream(_))
-                    && !is_signature_dict(&resolved)
+                    && !is_signature_dict(resolved)
                     && Some(r) != encrypt_ref
                 {
                     result.push(r);
                 }
-                push_children(&resolved, &mut stack);
+                push_children(resolved, &mut stack);
             }
             // Direct (inline) container: traversed for its children but never
             // contributes a reference (it has no object number of its own).
