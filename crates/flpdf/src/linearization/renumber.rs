@@ -379,8 +379,10 @@ impl RenumberMap {
     ///
     /// **Second half** (covered by the main xref, `/Index [0, second_half_count)`):
     /// 1. every second-half non-member object, compacted in order (type-1);
-    /// 2. the main (second-half) cross-reference *stream* slot (type-1);
-    /// 3. every second-half (Part-4) ObjStm container, batch-ordered (type-1);
+    /// 2. every second-half (Part-4) ObjStm container, batch-ordered (type-1) —
+    ///    numbered AMONG the uncompressed objects, before the xref (qpdf counts
+    ///    containers in `second_half_uncompressed`);
+    /// 3. the main (second-half) cross-reference *stream* slot (type-1);
     /// 4. every second-half (Part-4) ObjStm member, batch-ordered (type-2).
     ///
     /// **First half** (covered by the first-page xref, `/Index [second_half_count, /Size)`):
@@ -515,10 +517,14 @@ impl RenumberMap {
         for &original in &second_half_plain {
             new_by_new_number.push(original);
         }
-        // (2) main (second-half) xref stream slot (type-1).
-        let main_xref_slot = new_by_new_number.len() as u32;
-        new_by_new_number.push(SENTINEL);
-        // (3) Part-4 ObjStm containers, batch-ordered (type-1).
+        // (2) Part-4 ObjStm containers, batch-ordered (type-1). qpdf numbers the
+        //     second-half ObjStm containers AMONG the uncompressed objects —
+        //     BEFORE the main xref stream — because a container is itself a
+        //     plain (type-1) object with a real file offset
+        //     (QPDFWriter.cc:2578-2592: `second_half_uncompressed` counts the
+        //     containers, and the xref is numbered after them). Emitting them
+        //     before the xref is what makes a second-half container's object
+        //     number match qpdf (finding-4 in the Phase-2 design doc).
         for batch in second_half_batches {
             if batch.is_empty() {
                 continue;
@@ -527,6 +533,10 @@ impl RenumberMap {
             new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
             second_half_container_numbers.push(container_num);
         }
+        // (3) main (second-half) xref stream slot (type-1) — after every
+        //     uncompressed object (plain + containers), before the members.
+        let main_xref_slot = new_by_new_number.len() as u32;
+        new_by_new_number.push(SENTINEL);
         // (4) Part-4 ObjStm members, batch-ordered (type-2) — last of the half.
         for batch in second_half_batches {
             for &member in batch {
@@ -1073,13 +1083,14 @@ mod tests {
     }
 
     /// With two SECOND-half (Part-4) ObjStm batches the per-half placement
-    /// must, within the second half, number the main xref slot first, then
-    /// **all** container slots, then **all** member slots — so the main xref's
-    /// single `/Index` range stays strictly `type-1* type-2*` (qpdf rejects a
-    /// type-1 entry after a type-2 one in a cross-reference stream).  The
-    /// single-batch layout is a degenerate case of the same rule.
+    /// must, within the second half, number **all** container slots first (among
+    /// the uncompressed objects, matching qpdf's `second_half_uncompressed`
+    /// count), then the main xref slot, then **all** member slots — so the main
+    /// xref's single `/Index` range stays strictly `type-1* type-2*` (qpdf
+    /// rejects a type-1 entry after a type-2 one in a cross-reference stream).
+    /// The single-batch layout is a degenerate case of the same rule.
     #[test]
-    fn per_half_orders_main_xref_then_containers_then_members() {
+    fn per_half_orders_containers_then_main_xref_then_members() {
         let plan = two_page_plan();
         let mut rn = RenumberMap::from_plan(&plan);
 
@@ -1118,10 +1129,18 @@ mod tests {
             c0 + 1,
             "container slots must be contiguous, batch-ordered"
         );
-        // The main (second-half) xref slot precedes the container block.
+        // The container block precedes the main (second-half) xref slot: qpdf
+        // numbers second-half ObjStm containers among the uncompressed objects,
+        // before the xref stream (finding-4).
         assert!(
-            relocation.main_xref_slot < c0,
-            "main xref slot ({}) must precede the container block ({c0})",
+            c1 < relocation.main_xref_slot,
+            "container block ({c0}, {c1}) must precede the main xref slot ({})",
+            relocation.main_xref_slot
+        );
+        // The main xref slot still precedes every member (type-1 before type-2).
+        assert!(
+            relocation.main_xref_slot < min_member,
+            "main xref slot ({}) must precede all members ({members:?})",
             relocation.main_xref_slot
         );
         // Per-half split: every container and member lives in the SECOND half
