@@ -115,6 +115,43 @@ being patched.
   container as one object; `hint_shared.rs` nshared shifts. ihb.3 IS this
   consistency. Not a follow-up.
 
+## Progress (2026-06-17)
+
+* **Stage A — global even-split membership** (commit 78bf8c1): `objstm_batches_generate`
+  now = `objstm_membership_linearized` + `route_objstm_containers`. `objstm-lin-sharedfonts-100`
+  (2 part6 containers, 50+51) is **strictly** byte-identical to qpdf (incl. deterministic
+  `/ID[1]`) — end-to-end proof the membership+routing pipeline is sound. 6 existing
+  linearize-objstm goldens unchanged.
+* **Stage B.1 — page-private compression** (e1036b8): `resolve_batches` now drops only page
+  DICTIONARIES, not all `part4_other_pages_private` (qpdf compresses page-private fonts).
+* **Stage B.2 — second-half container numbering** (d0b505f): `place_objstm_members_per_half`
+  numbers second-half containers before the main xref. `mixed`'s object numbering now matches
+  qpdf exactly; residual is 2 bytes of layout.
+
+### Next-session order (advisor-revised — supersedes the 2→1→4 ordering above)
+
+1. **ihb.3 hint tables FIRST, then re-measure.** `mixed`/`threepage` residual = hint stream
+   1 byte over-long (`/H [.. 133]` vs `132`) + 1 padding byte before the first-page xref
+   (obj 73 @ 217 vs 216). Do NOT assume these are independent: qpdf's pass-1 lindict
+   reserved-space estimate can include the hint-stream size, so fixing the hint-table count
+   (page0 nobjects must count the part6 container; nshared shifts — `hint_page.rs`/`hint_shared.rs`)
+   may also remove the padding byte. Fix hint table → regenerate `mixed` → only then chase any
+   surviving padding byte.
+2. **`part4_batches` must be PART-ordered, not even-split-ordered.** `objstm_batches_generate`
+   currently pushes non-FirstPage containers in even-split (ObjGen) order; B.2 emits them in
+   that order. qpdf places part7 → part8 → part9, each at its position among **all** second-half
+   uncompressed objects (part rank, then page-group for part7, then ObjGen). `disc` passes the
+   part-order check only coincidentally (stream1→part7, stream2→part8). The general fix —
+   position each second-half container at its qpdf part-position — **subsumes both B.2's swap and
+   `disc`'s interleaving**. Do not un-ignore `disc` until this lands.
+3. **Regression-lock B.2:** B.2 has no green test (only `mixed`, ignored). Getting `mixed` green
+   (step 1) locks the swap against silent CI-green refactors — higher priority than `disc`.
+4. When un-ignoring, add the **strict** variants too (sf100 has both); the part7/8 ignored set
+   must be surfaced in the PR body (ignored tests are invisible in green CI).
+5. B.1 touched `resolve_batches` (shared with Preserve): a page-private font in a *source* ObjStm
+   now stays compressed under Preserve (was dropped) — more correct, but add/verify a Preserve
+   byte-parity check. (The existing Preserve suite stayed green, but has no fixture with that shape.)
+
 ## Explicit deviation (逸脱明示)
 
 Container routing for `open_document` (/OpenAction,/AcroForm,/ViewerPreferences,
