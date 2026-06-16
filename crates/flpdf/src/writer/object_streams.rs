@@ -229,6 +229,23 @@ fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     Ok(result)
 }
 
+/// Distribute `eligible` objects into object-stream groups using qpdf's
+/// `generateObjectStreams` algorithm (QPDFWriter.cc:1969-2005): pick
+/// `ceil(n / 100)` streams so none exceeds 100 members, then spread the objects
+/// approximately evenly — `n_per = ceil(n / streams)` consecutive members per
+/// stream — in the given (traversal) order. Returns one inner `Vec` per stream;
+/// an empty input yields no streams. (qpdf is `(n + 99) / 100` then
+/// `n / streams` rounded up; `div_ceil` expresses both directly.)
+fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectRef>> {
+    let n = eligible.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let n_streams = n.div_ceil(100);
+    let n_per = n.div_ceil(n_streams);
+    eligible.chunks(n_per).map(|chunk| chunk.to_vec()).collect()
+}
+
 /// Returns `true` for a signature value dictionary: `/Type /Sig` carrying both
 /// `/ByteRange` and `/Contents` (matching qpdf's `isDictionaryOfType("/Sig")`
 /// guard at QPDF.cc:2440). The signed byte range must stay outside any object
@@ -766,6 +783,60 @@ mod tests {
             !order.contains(&ref0(4)),
             "signature dictionary (obj 4) must be excluded from the compressible set; got {order:?}"
         );
+    }
+
+    /// qpdf's `generateObjectStreams` (QPDFWriter.cc:1981) picks
+    /// `ceil(n/100)` streams then spreads objects evenly
+    /// (`n_per = ceil(n/streams)`), never greedily filling 100 then spilling.
+    #[test]
+    fn even_split_stream_counts_and_sizes() {
+        let refs = |n: u32| -> Vec<ObjectRef> { (1..=n).map(ref0).collect() };
+        let sizes = |n: u32| -> Vec<usize> {
+            even_split_into_streams(&refs(n))
+                .iter()
+                .map(|s| s.len())
+                .collect()
+        };
+        assert_eq!(sizes(0), Vec::<usize>::new(), "no objects -> no streams");
+        assert_eq!(sizes(100), vec![100], "exactly 100 -> a single stream");
+        assert_eq!(
+            sizes(101),
+            vec![51, 50],
+            "101 -> two even streams, not 100+1"
+        );
+        assert_eq!(
+            sizes(102),
+            vec![51, 51],
+            "102 -> two even streams, not 100+2"
+        );
+        assert_eq!(sizes(200), vec![100, 100], "200 -> two full streams");
+        assert_eq!(sizes(201), vec![67, 67, 67], "201 -> three even streams");
+    }
+
+    /// End-to-end check that the DFS order + even split reproduce qpdf 11.9.0's
+    /// measured object-stream partition. On a 130-page reverse-`/Kids` document
+    /// (132 eligible objects) qpdf emits two streams of 66; the first holds the
+    /// objects reached first in the array walk — Catalog, Pages, and source
+    /// pages 69..132 — NOT the lowest-numbered objects.
+    #[test]
+    fn even_split_matches_qpdf_partition_on_130_page_reverse() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let groups = even_split_into_streams(&eligible);
+
+        assert_eq!(groups.len(), 2, "132 eligible -> 2 streams");
+        assert_eq!((groups[0].len(), groups[1].len()), (66, 66));
+
+        let nums = |g: &[ObjectRef]| -> BTreeSet<u32> { g.iter().map(|r| r.number).collect() };
+        let expected0: BTreeSet<u32> = [1u32, 2].into_iter().chain(69..=132).collect();
+        let expected1: BTreeSet<u32> = (3..=68).collect();
+        assert_eq!(
+            nums(&groups[0]),
+            expected0,
+            "stream 1 = Catalog,Pages,69..132"
+        );
+        assert_eq!(nums(&groups[1]), expected1, "stream 2 = pages 3..68");
     }
 
     fn typed_dict(type_name: &[u8]) -> Object {
