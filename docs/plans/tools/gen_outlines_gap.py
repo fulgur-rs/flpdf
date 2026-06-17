@@ -19,6 +19,7 @@ import sys
 #   Catalog, Outlines, items(K), Pages, Page0, shared(S), Page1
 S = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+use_outlines = len(sys.argv) > 3 and sys.argv[3] == "--use-outlines"
 
 catalog, pages, page0, page1, outlines = 1, 2, 3, 4, 5
 o0 = 6
@@ -29,7 +30,10 @@ c0 = shared0 + S
 c1 = c0 + 1
 
 objs = {}
-objs[catalog] = b"<< /Type /Catalog /Outlines %d 0 R /Pages %d 0 R >>" % (outlines, pages)
+if use_outlines:
+    objs[catalog] = b"<< /Type /Catalog /PageMode /UseOutlines /Outlines %d 0 R /Pages %d 0 R >>" % (outlines, pages)
+else:
+    objs[catalog] = b"<< /Type /Catalog /Outlines %d 0 R /Pages %d 0 R >>" % (outlines, pages)
 objs[pages] = b"<< /Type /Pages /Count 2 /Kids [ %d 0 R %d 0 R ] >>" % (page0, page1)
 objs[outlines] = b"<< /Type /Outlines /First %d 0 R /Last %d 0 R /Count %d >>" % (
     item_nums[0],
