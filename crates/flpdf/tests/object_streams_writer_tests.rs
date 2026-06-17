@@ -652,3 +652,50 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
         }
     }
 }
+
+// flpdf-zbf9: a plain (non-linearized) full rewrite of an ObjStm-bearing input
+// must drop the source's /Type /ObjStm and /Type /XRef containers rather than
+// re-emit them (write_pdf_full_rewrite's is_source_structural_container skip).
+// The output is rebuilt cleanly: members are repacked into a fresh container and
+// the xref is regenerated. Default features — no qpdf/zlib required.
+#[test]
+fn full_rewrite_objstm_input_drops_source_structural_containers() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+    let source = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "rewrite output must be valid: {:?}",
+        report.diagnostics.entries()
+    );
+
+    // Exactly one freshly-generated ObjStm container; a leaked source container
+    // would make two. (Plain rewrite emits a single regenerated xref stream, so
+    // unlike the linearized output there is no second XRef section to count.)
+    let n_objstm = output
+        .windows(b"/Type /ObjStm".len())
+        .filter(|w| *w == b"/Type /ObjStm")
+        .count();
+    assert_eq!(
+        n_objstm, 1,
+        "expected one generated ObjStm, leak would make two; found {n_objstm}"
+    );
+
+    // The drop must not strand any reference.
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    for r in reopened.object_refs() {
+        reopened
+            .resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve after rewrite: {e}"));
+    }
+}

@@ -359,3 +359,42 @@ fn disc_part7_part8_generate_round_trips() {
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
+
+// flpdf-zbf9: linearizing an ObjStm-bearing input must NOT leak the source's
+// /Type /ObjStm and /Type /XRef containers into the body. After the fix the
+// output carries exactly one freshly-generated ObjStm container and the two
+// regenerated linearization XRef streams (first-page + main) — the same clean
+// rebuild qpdf produces (verified against the golden marker counts). A leaked
+// source container would push either count up by one. (Default features:
+// structural marker count, no qpdf/zlib needed.)
+#[test]
+fn objstm_bearing_input_drops_source_structural_containers() {
+    let bytes = linearize_generate("three-page-objstm.pdf");
+
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 1,
+        "expected exactly one (freshly generated) ObjStm container; a stale source \
+         container would push this to 2, found {n_objstm}"
+    );
+
+    // Linearized output has two XRef streams: the first-page xref and the main
+    // xref. A leaked source XRef stream would make three.
+    let xref_needle = b"/Type /XRef";
+    let n_xref = bytes
+        .windows(xref_needle.len())
+        .filter(|w| *w == xref_needle)
+        .count();
+    assert_eq!(
+        n_xref, 2,
+        "expected the two regenerated linearization XRef streams; a leaked source \
+         XRef stream would push this to 3, found {n_xref}"
+    );
+
+    // The drop must not strand any reference: every object still resolves.
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in pdf.object_refs() {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve after drop: {e}"));
+    }
+}
