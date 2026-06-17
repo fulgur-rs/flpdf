@@ -2926,7 +2926,16 @@ pub fn write_linearized<R: Read + Seek>(
         final_last_xref_first_entry_offset = last_xref_first_entry_offset;
         final_bytes = bytes; // overwritten below if we do a final pass
 
-        let converged = new_compressed.len() == current_hint_compressed.len();
+        // Converge on the *framed* hint-object length, not just the compressed
+        // payload length. `append_hint_stream_object` writes the newline before
+        // `endstream` only when the payload does not already end in one (qpdf,
+        // QPDFWriter.cc:2327), so two payloads of equal length can still yield
+        // hint objects whose total byte length differs by one. Comparing the
+        // framed length guarantees ΔL=0 at the convergence point, so the final
+        // pass's framing exactly matches the offsets baked into the payload — the
+        // same predicate as `append_hint_stream_object` (`last() != b'\n'`).
+        let framed_len = |c: &[u8]| c.len() + usize::from(c.last() != Some(&b'\n'));
+        let converged = framed_len(&new_compressed) == framed_len(&current_hint_compressed);
 
         // Promote the freshly-patched stream as the next iteration input.
         current_hint_compressed = new_compressed;
