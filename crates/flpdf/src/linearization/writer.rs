@@ -1699,9 +1699,13 @@ fn do_write_pass<R: Read + Seek>(
             continue;
         }
         let Some(new_ref) = renumber.new_for_original(original_ref) else {
+            // cov:ignore-start: every part4 plain object is in the RenumberMap by
+            // construction (the plan and renumber derive from the same part vectors);
+            // this guards a planner/renumber inconsistency that cannot occur here.
             return Err(crate::Error::Unsupported(format!(
                 "part4 object {original_ref} has no renumber entry"
             )));
+            // cov:ignore-end
         };
         part4_emits.push((new_ref.number, Part4Emit::Plain(original_ref)));
     }
@@ -2185,10 +2189,18 @@ pub fn write_linearized<R: Read + Seek>(
         let membership = crate::linearization::plan::objstm_membership_linearized(pdf)?;
         let mut rank = std::collections::BTreeMap::new();
         for (split_index, members) in membership.iter().enumerate() {
-            if let Some(first) = members.first() {
-                if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(first) {
-                    rank.insert(container_num, split_index as u32);
-                }
+            // `objstm_membership_linearized` drops empty containers, so `first()`
+            // is always present.
+            let first = *members
+                .first()
+                .expect("objstm_membership_linearized never yields an empty container");
+            // It recomputes the even split from the source unconditionally, so it
+            // reports containers even on the Preserve path where no ObjStm is
+            // generated. Only rank containers the Generate layout actually
+            // materialized (members present in `member_to_container`); the
+            // Preserve path finds none and skips.
+            if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(&first) {
+                rank.insert(container_num, split_index as u32);
             }
         }
         rank
