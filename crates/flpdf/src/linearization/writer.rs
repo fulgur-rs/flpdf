@@ -945,22 +945,21 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 ///
 /// A linearized file repeats `/ID` across the first-page xref-stream dict and
 /// the main xref-stream dict; a file identifier is file-scoped, so both must
-/// carry the *same* value. The identifier is computed once from a single MD5
-/// over `bytes` itself (the placeholder is all-zero, so this digest depends only
-/// on the input and is stable across runs). Because the replacement is the same
-/// width as the placeholder, no byte offset shifts and the digest is never
-/// recomputed (the operation is acyclic). qpdf's pass-1 layout for xref-stream
-/// output differs from this final buffer (it uses xref streams, a different
-/// reconstruction out of scope here), so byte-parity with qpdf's `/ID` is not
-/// pursued on this path; the self-stable whole-final-buffer digest is kept.
+/// carry the *same* value. This function does **not** compute the identifier:
+/// `id0`/`id1` are precomputed by [`write_linearized`] from a digest over a
+/// reconstruction of qpdf's first write pass (the `det_id` computation; the
+/// pass-1 buffer is built by [`build_pass1_part1`] with qpdf's `writePad`
+/// length-stabilisation). That reconstruction is what reproduces qpdf's
+/// deterministic `/ID` byte-for-byte. Here we only overwrite the all-zero
+/// placeholders the final pass wrote at the xref-stream dict sites. Because the
+/// replacement is the same width as the placeholder, no byte offset shifts.
 ///
 /// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
 /// spans of the sections that actually emit a `/ID` (collected by the writer as
 /// it lays them down). Scanning the whole buffer would corrupt the output if a
 /// content stream, string, or metadata object happened to contain the same
 /// fixed-width placeholder byte sequence; restricting the search to the known
-/// `/ID` sections makes that misfire impossible. The digest still covers the
-/// whole buffer, so the identifier remains a content fingerprint.
+/// `/ID` sections makes that misfire impossible.
 ///
 /// # Panics
 ///
