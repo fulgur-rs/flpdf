@@ -2031,9 +2031,7 @@ fn second_half_container_anchors(
             } else if rest {
                 (2, 0) // part9 (rest)
             } else {
-                // cov:ignore: every Part-4 batch member belongs to some part
-                // (page-private, shared, or rest) by construction.
-                return None;
+                return None; // cov:ignore: every Part-4 batch member is page-private, shared, or rest
             };
             // `plain_ranked` is already in ascending rank order, so the last entry
             // with rank ≤ batch_rank is the container's group's last plain object
