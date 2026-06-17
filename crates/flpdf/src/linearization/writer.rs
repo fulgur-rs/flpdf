@@ -2002,7 +2002,7 @@ fn second_half_container_anchors(
         .iter()
         .map(|batch| {
             if batch.is_empty() {
-                return None;
+                return None; // cov:ignore: resolve_batches drops empty batches before this point
             }
             // The container's part is the UNION of its members' page ownership —
             // the even split can co-locate one page's privates with another's in
@@ -2031,6 +2031,8 @@ fn second_half_container_anchors(
             } else if rest {
                 (2, 0) // part9 (rest)
             } else {
+                // cov:ignore: every Part-4 batch member belongs to some part
+                // (page-private, shared, or rest) by construction.
                 return None;
             };
             // `plain_ranked` is already in ascending rank order, so the last entry
