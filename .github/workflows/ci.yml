@@ -149,6 +149,9 @@ jobs:
           # Pins linearized output structural byte-parity vs qpdf golden
           # (everything except the qpdf-internal /ID[1]; see flpdf-wb76).
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
+          # Pins linearized --object-streams=generate byte-parity vs qpdf goldens
+          # (structural + strict, incl. the in_open_document openaction oracle).
+          cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
           # Pins overlay/underlay output byte-identity vs committed qpdf goldens.
           # These gates live in lib unit tests (overlay::byte_gate) behind the
           # qpdf-zlib-compat cfg, so they must be run explicitly with --lib.

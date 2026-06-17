@@ -225,3 +225,28 @@ fn disc_part7_part8_objstm_structurally_byte_identical_to_qpdf() {
 fn disc_part7_part8_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
 }
+
+// openaction-80-80 (flpdf-1dmy, Stage A — in_open_document): the catalog's
+// /OpenAction subtree (an action dict + 80 "od-only" font dicts reachable ONLY
+// from /OpenAction) is qpdf's in_open_document category → lc_open_document →
+// part4 (FIRST half, right after the Catalog, before the first page). The 80
+// objects even-split into a container whose obj_user union is /OpenAction +
+// /Pages, so qpdf routes the whole container to part4. flpdf's page-closure-only
+// model used to drop it into part9 (second half), so /O (first_page_object) and
+// the H/E offset cascade diverged. Exercises the OpenDocument container routing
+// and the first-half part4-before-part6 numbering / emission.
+#[test]
+fn openaction_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-openaction-80-80.pdf",
+        "objstm-lin-openaction-80-80",
+    );
+}
+
+#[test]
+fn openaction_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-openaction-80-80.pdf",
+        "objstm-lin-openaction-80-80",
+    );
+}
