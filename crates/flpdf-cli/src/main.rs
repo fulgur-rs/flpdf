@@ -24,8 +24,8 @@ use flpdf::{
         JsonObjectSelector, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
-        check_linearization_path, write_linearized, LinearizationCheckError, LinearizationPlan,
-        RenumberMap,
+        check_linearization_path, show_linearization_path, write_linearized,
+        LinearizationCheckError, LinearizationPlan, RenumberMap, ShowLinearizationError,
     },
     normalize_content_stream, outline, pages,
     pages::coalesce_page_contents,
@@ -681,6 +681,11 @@ enum Commands {
         about = "Validate linearization structure (param dict, hint stream, offsets)"
     )]
     CheckLinearization(CheckLinearizationCommand),
+    #[command(
+        name = "show-linearization",
+        about = "Dump linearization parameter dict and hint tables (qpdf --show-linearization compatible)"
+    )]
+    ShowLinearization(ShowLinearizationCommand),
     #[command(name = "dump-object", about = "Dump one indirect object as PDF syntax")]
     DumpObject(DumpObjectCommand),
     #[command(about = "Show page structure summary or detail")]
@@ -791,6 +796,12 @@ struct CheckCommand {
 #[derive(Debug, ClapArgs)]
 struct CheckLinearizationCommand {
     /// Input PDF file to validate.
+    input: PathBuf,
+}
+
+#[derive(Debug, ClapArgs)]
+struct ShowLinearizationCommand {
+    /// Input PDF file whose linearization data is dumped.
     input: PathBuf,
 }
 
@@ -1983,6 +1994,20 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 std::process::exit(1);
             }
             Err(LinearizationCheckError::Io(e)) => Err(e.to_string().into()),
+        },
+        Commands::ShowLinearization(cmd) => match show_linearization_path(&cmd.input) {
+            Ok(dump) => {
+                // `dump` already ends with a trailing newline (the hint-table
+                // dump, or qpdf's "<name> is not linearized" line). qpdf prints
+                // both to stdout and exits 0; use print! to avoid a second LF.
+                print!("{dump}");
+                Ok(())
+            }
+            Err(ShowLinearizationError::Malformed { message }) => {
+                eprintln!("flpdf: malformed linearization data: {message}");
+                std::process::exit(ExitCode::Errors.as_i32());
+            }
+            Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
         },
         Commands::DumpObject(cmd) => {
             run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
