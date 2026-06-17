@@ -154,6 +154,74 @@ fn check_linearization_non_linearized_exits_1() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. show-linearization happy path: linearize, then dump the structure.
+//     Mirrors `qpdf --show-linearization`; must exit 0 and print the param
+//     block + the Page Offsets / Shared Objects hint table headers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn show_linearization_dumps_structure() {
+    let input = write_temp(&minimal_pdf_bytes());
+    let outdir = tempfile::tempdir().unwrap();
+    let output = outdir.path().join("linearized.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--static-id",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-linearization", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("linearization data:"))
+        .stdout(predicate::str::contains("Page Offsets Hint Table"))
+        .stdout(predicate::str::contains("Shared Objects Hint Table"));
+}
+
+// ---------------------------------------------------------------------------
+// 3c. show-linearization on a NON-linearized PDF: like qpdf, print
+//     "<name> is not linearized" to stdout and exit 0 (not an error).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn show_linearization_non_linearized_exits_0() {
+    let input = write_temp(&minimal_pdf_bytes());
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-linearization", input.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is not linearized"));
+}
+
+// ---------------------------------------------------------------------------
+// 3d. show-linearization on a missing file is an I/O error (exit 2).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn show_linearization_missing_file_exits_2() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-linearization",
+            "/tmp/this_file_does_not_exist_flpdf_showlin_test.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+// ---------------------------------------------------------------------------
 // 4. Regression: plain `rewrite` (no --linearize) still works
 // ---------------------------------------------------------------------------
 

@@ -6,6 +6,12 @@
 # read CRLF but compare against LF-rendered markdown.
 tests/golden/*.md text eol=lf
 
+# show-linearization text goldens are compared byte-for-byte against the
+# decoder's LF-terminated dump. Git autocrlf=true on Windows must NOT rewrite
+# them to CRLF or show_linearization_tests (one/two/three_page_dump_matches_
+# text_golden) read CRLF and diverge from the LF dump.
+tests/golden/references/**/show-linearization.txt text eol=lf
+
 # QDF fixtures are byte-exact golden artifacts (fix_qdf recomputes
 # xref offsets/lengths from raw bytes). Git autocrlf on Windows must NOT
 # rewrite their line endings or the byte-for-byte golden comparisons

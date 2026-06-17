@@ -559,7 +559,7 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 ///
 /// Returns `None` if no object header is found (e.g. truncated or
 /// non-PDF input).
-fn find_first_object_ref(file_bytes: &[u8]) -> Option<ObjectRef> {
+pub(crate) fn find_first_object_ref(file_bytes: &[u8]) -> Option<ObjectRef> {
     // Scan for "<num><ws+><gen><ws+>obj" anchored at a real line start.
     //
     // PDF spec (ISO 32000-1 §7.2.3) permits any non-empty whitespace
