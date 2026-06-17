@@ -315,12 +315,16 @@ impl SharedObjectHintTable {
                     if first_object_number == 0 {
                         first_object_number = renumber
                             .new_for_original(*r)
+                            // cov:ignore-start: a Part-8 shared object is always
+                            // in the RenumberMap (it is a live plan object), so
+                            // the lookup never misses for a well-formed plan.
                             .unwrap_or_else(|| {
                                 panic!(
                                     "Part-8 shared object {r:?} not found in RenumberMap \
                                      (plan/renumber inconsistency)"
                                 )
                             })
+                            // cov:ignore-end
                             .number;
                     }
                 }
