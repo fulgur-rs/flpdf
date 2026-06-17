@@ -198,9 +198,13 @@ struct LinParameters {
 impl LinParameters {
     /// qpdf's `adjusted_offset`: hint table locations disregard the hint stream
     /// itself, so any raw offset `>= H_offset` is increased by `H_length`.
+    ///
+    /// `wrapping_add` matches qpdf's C++ unsigned wraparound and avoids Rust's
+    /// debug-build overflow panic on a malformed offset/length; valid hint
+    /// tables never approach `u64::MAX`, so the displayed value is unchanged.
     fn adjusted_offset(&self, offset: u64) -> u64 {
         if offset >= self.h_offset {
-            offset + self.h_length
+            offset.wrapping_add(self.h_length)
         } else {
             offset
         }
@@ -314,6 +318,20 @@ fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
         e.nshared_objects = h.get_bits_u32(nbits_nshared_objects)?;
     }
     h.skip_to_next_byte();
+    // Bound the per-page shared-object refs before the nested (d)/(e) loops.
+    // With zero-width identifier/numerator fields each push reads 0 bits and
+    // never advances the reader, so an untrusted `nshared_objects` could
+    // otherwise drive unbounded time/allocation from a tiny stream. Cap the
+    // total against the bits remaining, keeping work O(stream length).
+    let remaining_bits = (h.buf.len() - h.byte_pos)
+        .saturating_mul(8)
+        .saturating_sub(h.bit_pos as usize);
+    let total_shared: u64 = entries.iter().map(|e| e.nshared_objects as u64).sum();
+    if total_shared > remaining_bits as u64 {
+        return Err(malformed!(
+            "page offset hint table claims {total_shared} shared-object refs but only {remaining_bits} bits remain"
+        ));
+    }
     // (d) shared_identifiers — nested: per page, read that page's count
     for e in entries.iter_mut() {
         for _ in 0..e.nshared_objects {
@@ -497,10 +515,13 @@ fn dump_page_offset(out: &mut String, p: &LinParameters, t: &HPageOffset) {
              content_offset: {}\n  \
              content_length: {}\n  \
              nshared_objects: {}\n",
-            pe.delta_nobjects + t.min_nobjects as u64,
-            pe.delta_page_length + t.min_page_length,
-            pe.delta_content_offset + t.min_content_offset,
-            pe.delta_content_length + t.min_content_length,
+            // wrapping_add: avoid Rust's debug overflow panic on malformed
+            // 64-bit deltas (matches qpdf's C++ unsigned wraparound); valid
+            // tables never overflow, so the displayed values are unchanged.
+            pe.delta_nobjects.wrapping_add(t.min_nobjects as u64),
+            pe.delta_page_length.wrapping_add(t.min_page_length),
+            pe.delta_content_offset.wrapping_add(t.min_content_offset),
+            pe.delta_content_length.wrapping_add(t.min_content_length),
             pe.nshared_objects,
         );
         for j in 0..pe.nshared_objects as usize {
@@ -534,14 +555,14 @@ fn dump_shared_object(out: &mut String, p: &LinParameters, t: &HSharedObject) {
         let _ = write!(
             out,
             "Shared Object {i}:\n  group length: {}\n",
-            se.delta_group_length + t.min_group_length
+            se.delta_group_length.wrapping_add(t.min_group_length)
         );
         // qpdf prints these only when set / non-zero.
         if se.signature_present {
             out.push_str("  signature present\n");
         }
         if se.nobjects_minus_one != 0 {
-            let _ = writeln!(out, "  nobjects: {}", se.nobjects_minus_one + 1);
+            let _ = writeln!(out, "  nobjects: {}", se.nobjects_minus_one.wrapping_add(1));
         }
     }
 }
@@ -1493,6 +1514,48 @@ mod tests {
         assert!(
             is_malformed,
             "expected Malformed for oversized nshared_total"
+        );
+    }
+
+    #[test]
+    fn page_offset_oversized_nshared_objects_is_malformed() {
+        // A single-page table whose `nshared_objects` column claims ~1e6 shared
+        // refs, but the stream ends right after that column. With zero-width
+        // identifier/numerator fields the nested loops would push ~1e6 entries
+        // from a tiny buffer; the per-page bound must reject it instead.
+        let mut b = HintStreamBuilder::new();
+        // 13-field header (5×32 + 8×16 = 36 bytes, byte-aligned).
+        b.write_bits(0, 32); // min_nobjects
+        b.write_bits(0, 32); // first_page_offset
+        b.write_bits(0, 16); // nbits_delta_nobjects = 0
+        b.write_bits(0, 32); // min_page_length
+        b.write_bits(0, 16); // nbits_delta_page_length = 0
+        b.write_bits(0, 32); // min_content_offset
+        b.write_bits(0, 16); // nbits_delta_content_offset = 0
+        b.write_bits(0, 32); // min_content_length
+        b.write_bits(0, 16); // nbits_delta_content_length = 0
+        b.write_bits(32, 16); // nbits_nshared_objects = 32
+        b.write_bits(0, 16); // nbits_shared_identifier = 0
+        b.write_bits(0, 16); // nbits_shared_numerator = 0
+        b.write_bits(1, 16); // shared_denominator
+                             // cols (a)/(b): 0-bit, nothing written. col (c):
+                             // nshared_objects for the single page.
+        b.write_bits(1_000_000, 32);
+        b.align_to_byte();
+        let buf = b.finish();
+        assert_eq!(
+            buf.len(),
+            40,
+            "36-byte header + 4-byte nshared_objects column"
+        );
+
+        let is_malformed = matches!(
+            read_h_page_offset(&buf, 1),
+            Err(ShowLinearizationError::Malformed { .. })
+        );
+        assert!(
+            is_malformed,
+            "expected Malformed for oversized per-page nshared_objects"
         );
     }
 
