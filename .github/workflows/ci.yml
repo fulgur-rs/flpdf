@@ -153,6 +153,11 @@ jobs:
           # These gates live in lib unit tests (overlay::byte_gate) behind the
           # qpdf-zlib-compat cfg, so they must be run explicitly with --lib.
           cargo test -p flpdf --features qpdf-zlib-compat --lib overlay::byte_gate
+          # Pins the CLI binary's linearized output byte-identity vs qpdf goldens
+          # end-to-end (argument parsing -> WriteOptions -> write path -> framing).
+          # Gated behind qpdf-zlib-compat, so it is compiled out of the default
+          # test workflow and must be run explicitly here.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical
 
       - name: Compat matrix baselines (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}

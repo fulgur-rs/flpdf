@@ -18,6 +18,14 @@ name = "flpdf"
 path = "src/main.rs"
 doc = false
 
+[features]
+default = []
+# Opt-in: build the `flpdf` binary against flpdf's zlib deflate backend so its
+# DEFLATE output matches qpdf's compress2() byte-for-byte. Used only for the
+# end-to-end byte-identical CLI tests (cli_byte_identical); production builds
+# stay Pure Rust (miniz_oxide). Forwards to flpdf's own `qpdf-zlib-compat`.
+qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
+
 [dependencies]
 clap.workspace = true
 flpdf = { path = "../flpdf", version = "0.1.6" }
