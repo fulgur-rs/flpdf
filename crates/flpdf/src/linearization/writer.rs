@@ -2295,24 +2295,52 @@ pub fn write_linearized<R: Read + Seek>(
             )));
         }
 
+        // First-page (Part-3) ObjStm container object numbers. A page-private
+        // object that the global even split placed in one of these is physically
+        // in page 0's first-page section, so its bytes belong to page 0 — not its
+        // owning page (mirrors the object-count fold in `hint_page`).
+        let first_page_container_nums: std::collections::BTreeSet<u32> = objstm_layout
+            .part3
+            .iter()
+            .map(|c| c.container_new_num)
+            .collect();
+        let plain_byte_len = |orig: &ObjectRef| -> u64 {
+            renumber
+                .new_for_original(*orig)
+                .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
+                .unwrap_or(0) as u64
+        };
         let per_page_byte_lengths: Vec<u64> = plan
             .per_page_private_objects
             .iter()
             .enumerate()
             .map(|(page_idx, privates)| {
-                let private_len: u64 = privates
-                    .iter()
-                    .map(|orig| {
-                        renumber
-                            .new_for_original(*orig)
-                            .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
-                            .unwrap_or(0) as u64
-                    })
-                    .sum();
                 if page_idx == 0 {
-                    private_len + part3_byte_len
+                    // Page 0: Part 2 (always plain) + Part 3 (plain + containers).
+                    let part2_len: u64 = privates.iter().map(plain_byte_len).sum();
+                    part2_len + part3_byte_len
                 } else {
-                    private_len
+                    // Pages 1..N: a private compressed into a part7 ObjStm has no
+                    // standalone bytes — its physical contribution is the
+                    // container object, counted ONCE. First-page containers are
+                    // excluded (their bytes are in page 0's section above).
+                    let mut len = 0u64;
+                    let mut containers: std::collections::BTreeSet<u32> =
+                        std::collections::BTreeSet::new();
+                    for orig in privates {
+                        match objstm_layout.member_to_container.get(orig) {
+                            Some(&(container_num, _)) => {
+                                if !first_page_container_nums.contains(&container_num) {
+                                    containers.insert(container_num);
+                                }
+                            }
+                            None => len += plain_byte_len(orig),
+                        }
+                    }
+                    len + containers
+                        .iter()
+                        .map(|c| byte_lengths.get(c).copied().unwrap_or(0) as u64)
+                        .sum::<u64>()
                 }
             })
             .collect();

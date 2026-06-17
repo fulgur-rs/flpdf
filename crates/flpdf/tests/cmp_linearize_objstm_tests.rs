@@ -175,20 +175,28 @@ fn sharedfonts100_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// mixed-60-70 / threepage-2-120 / disc-2-250-2 carry SECOND-HALF ObjStm
-// containers (part7/part8). qpdf numbers those among the second-half
-// uncompressed objects (before the main xref), interleaved by part; flpdf's
-// current `place_objstm_members_per_half` numbers them after the xref
-// (finding-4). Un-ignore once the renumber relocates members-only and lets
-// containers flow through their part position (Stage B).
+// mixed-60-70: a part7 (other-page-private) ObjStm container. Exercises the
+// second-half container numbering (finding-4), the page-private-font
+// compression, and the per-page object-count / page-length container folds.
+// Fully byte-identical to qpdf (structural + strict).
 #[test]
-#[ignore = "finding-4: second-half container numbering (Stage B)"]
 fn mixed_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("objstm-lin-mixed-60-70.pdf", "objstm-lin-mixed-60-70");
 }
 
 #[test]
-#[ignore = "finding-4: second-half container numbering (Stage B)"]
+fn mixed_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-mixed-60-70.pdf", "objstm-lin-mixed-60-70");
+}
+
+// threepage-2-120 (part8 other-page-shared container) and disc-2-250-2 (a part7
+// container coexisting with a part8 plain Form XObject) are not yet
+// byte-identical: threepage's residual is the shared-object hint table for a
+// part8 container; disc additionally needs second-half containers ordered by
+// PART (part7→part8→part9) rather than even-split order (they pass the part-order
+// check only coincidentally today). Tracked in the Phase-2 design doc.
+#[test]
+#[ignore = "part8 shared-object hint table (threepage); part-ordered second-half containers (disc)"]
 fn threepage_shared_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural(
         "objstm-lin-threepage-2-120.pdf",
