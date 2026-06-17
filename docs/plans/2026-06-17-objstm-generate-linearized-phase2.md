@@ -146,6 +146,22 @@ being patched.
    `disc`'s interleaving**. Do not un-ignore `disc` until this lands.
 3. **Regression-lock B.2:** B.2 has no green test (only `mixed`, ignored). Getting `mixed` green
    (step 1) locks the swap against silent CI-green refactors — higher priority than `disc`.
+
+### Status update (2026-06-17): sf100 + mixed + threepage byte-identical; only `disc` left
+
+Stages B.1–B.6 landed (`resolve_batches` page-dict-only filter; finding-4 swap; per-page
+object-count + byte-length container folds; lindict obj-number-digit pad; Part-8 shared-hint split).
+`disc` remains: flpdf emits second-half containers contiguously before the xref in batch order;
+qpdf interleaves them by PART. **Critical:** a container goes at the END of its part-group
+(qpdf's part vectors are ObjGen-sorted and the synthetic container ObjGen is the group's highest),
+NOT at its first member's position. Verified: golden `disc` page-1 group is `[Page1, c1,
+part7-container]` — `c1` precedes the container even though the B-font *members* precede `c1` in
+closure order. Build the second-half order as `for page i: [plain privates of i] + [page-i part7
+container]; then [part8 plain] + [part8 containers]; then [part9 plain] + [part9 containers]` — via
+either synthetic-ref injection at the group ends (from_plan numbers them in place; members relocate
+after the xref) or an explicit order computed in the writer. `mixed`/`threepage` are unaffected (a
+lone second-half container at the group end equals today's append). `part4_batches` must also be
+part-ordered (part7→part8→part9), not even-split order.
 4. When un-ignoring, add the **strict** variants too (sf100 has both); the part7/8 ignored set
    must be surfaced in the PR body (ignored tests are invisible in green CI).
 5. B.1 touched `resolve_batches` (shared with Preserve): a page-private font in a *source* ObjStm
