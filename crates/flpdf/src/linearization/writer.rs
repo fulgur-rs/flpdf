@@ -2889,8 +2889,13 @@ pub fn write_linearized<R: Read + Seek>(
                         ))
                     })? as u32;
                 // cov:ignore-end
-                let group_length: u64 = (info.first_object..info.first_object + info.nobjects)
-                    .map(|n| byte_lengths.get(&n).copied().unwrap_or(0) as u64)
+                // `u64` range bound prevents a `u32` overflow panic on a
+                // pathological (>4-billion-object) layout; for any realistic
+                // document the values fit in `u32`, so `n as u32` and the sum
+                // are byte-identical to the direct computation.
+                let group_length: u64 = (info.first_object as u64
+                    ..info.first_object as u64 + info.nobjects as u64)
+                    .map(|n| byte_lengths.get(&(n as u32)).copied().unwrap_or(0) as u64)
                     .sum();
                 Ok(OutlineHintTable {
                     first_object: info.first_object,
