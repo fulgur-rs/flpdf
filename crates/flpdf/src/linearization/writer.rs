@@ -2175,6 +2175,25 @@ pub fn write_linearized<R: Read + Seek>(
     let objstm_layout =
         ObjStmLayout::build_from_batches(&resolved_batch_plan, &container_numbers, renumber)?;
 
+    // Map each ObjStm container's new object number to its even-split allocation
+    // rank (qpdf numbers the container objects' pre-renumber identities in
+    // even-split order via `makeIndirectObject`). The page-offset hint table uses
+    // this to order each page's shared identifiers by pre-renumber object number
+    // (see `PageOffsetHintTable::from_plan`). Re-deriving the even-split here is
+    // deterministic and cheap relative to the convergence loop below.
+    let container_even_split_rank: std::collections::BTreeMap<u32, u32> = {
+        let membership = crate::linearization::plan::objstm_membership_linearized(pdf)?;
+        let mut rank = std::collections::BTreeMap::new();
+        for (split_index, members) in membership.iter().enumerate() {
+            if let Some(first) = members.first() {
+                if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(first) {
+                    rank.insert(container_num, split_index as u32);
+                }
+            }
+        }
+        rank
+    };
+
     // Highest object number actually used in the output.  After relocation
     // the renumber map already counts every plain object, every ObjStm
     // container, every member, AND both split xref-stream objects (the two
@@ -2219,8 +2238,12 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Build initial placeholder hint tables (all lengths = 0).
     // ------------------------------------------------------------------
-    let po_table_initial =
-        PageOffsetHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+    let po_table_initial = PageOffsetHintTable::from_plan(
+        plan,
+        renumber,
+        &objstm_layout.member_to_container,
+        &container_even_split_rank,
+    );
     let so_table_initial =
         SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
     let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial)?;
@@ -2467,8 +2490,12 @@ pub fn write_linearized<R: Read + Seek>(
         // ------------------------------------------------------------------
         // Patch hint tables.
         // ------------------------------------------------------------------
-        let mut po_table =
-            PageOffsetHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+        let mut po_table = PageOffsetHintTable::from_plan(
+            plan,
+            renumber,
+            &objstm_layout.member_to_container,
+            &container_even_split_rank,
+        );
         let mut so_table =
             SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
 

@@ -209,14 +209,19 @@ fn threepage_shared_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// disc-2-250-2: a pure part7 container coexisting with a part8 plain Form
-// XObject. Not yet byte-identical — qpdf orders the second-half ObjStm
-// containers by PART (part7→part8→part9), interleaved among the second-half
-// uncompressed objects, but flpdf currently emits them in even-split order
-// before the xref (they coincide only when even-split order == part order).
-// Tracked in the Phase-2 design doc.
+// disc-2-250-2: a pure part7 ObjStm container coexisting with a part8 plain Form
+// XObject AND a part8 container the even split filled with two pages' private
+// fonts. Exercises the deepest second-half machinery: part-ordered container
+// emission (the part7 container interleaved in its page's group), the
+// shared-object hint table including a part8 container of page-private members,
+// and per-page shared identifiers ordered by pre-renumber object number. Fully
+// byte-identical to qpdf (structural + strict).
 #[test]
-#[ignore = "disc: part-ordered second-half containers (Phase-2 follow-up)"]
 fn disc_part7_part8_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
+}
+
+#[test]
+fn disc_part7_part8_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
 }

@@ -379,6 +379,7 @@ impl PageOffsetHintTable {
         plan: &LinearizationPlan,
         renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+        container_even_split_rank: &std::collections::BTreeMap<u32, u32>,
     ) -> Self {
         assert!(
             !plan.page_hints.is_empty(),
@@ -469,6 +470,35 @@ impl PageOffsetHintTable {
                 shared_counts[idx] += 1;
                 shared_ids_per_page[idx].push(shared_idx as u32);
             }
+        }
+
+        // Order each page's shared identifiers the way qpdf does: by the shared
+        // object's PRE-RENUMBER object number (its position in qpdf's
+        // ObjGen-keyed `obj_user_to_objects`). A plain object keeps its source
+        // number; an ObjStm container's pre-renumber number is allocated AFTER
+        // every source object (qpdf's `makeIndirectObject` in
+        // `generateObjectStreams`), in even-split order — so all plain shared
+        // objects sort before all containers, plain by source number and
+        // containers by their even-split rank. Without this the identifiers come
+        // out in shared-table-index (physical-number) order, which differs when a
+        // page references both a plain shared object and a container, or two
+        // containers whose even-split order differs from their physical order.
+        let shared_sort_key = |shared_idx: u32| -> (u8, u32) {
+            let entry = &shared_hints[shared_idx as usize];
+            if entry.object_ref.generation == u16::MAX {
+                (
+                    1,
+                    container_even_split_rank
+                        .get(&entry.object_ref.number)
+                        .copied()
+                        .unwrap_or(0),
+                )
+            } else {
+                (0, entry.object_ref.number)
+            }
+        };
+        for ids in &mut shared_ids_per_page {
+            ids.sort_by_key(|&shared_idx| shared_sort_key(shared_idx));
         }
 
         // qpdf rejects page 0 entries that list shared identifiers
@@ -703,7 +733,12 @@ mod tests {
     fn single_page_entries_len_is_one() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(
             table.entries.len(),
@@ -716,7 +751,12 @@ mod tests {
     fn single_page_all_deltas_zero_so_bit_widths_zero() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // Single page → delta = 0 → bits = 0
         assert_eq!(table.header.bits_object_count_delta, 0);
@@ -728,7 +768,12 @@ mod tests {
     fn single_page_least_object_count() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.header.least_object_count, 3);
     }
@@ -737,7 +782,12 @@ mod tests {
     fn single_page_entry_object_count_minus_least_is_zero() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.entries[0].object_count_minus_least, 0);
     }
@@ -746,7 +796,12 @@ mod tests {
     fn single_page_placeholder_fields_are_zero() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.header.location_of_first_page, 0);
         assert_eq!(table.header.least_page_length, 0);
@@ -761,7 +816,12 @@ mod tests {
     fn single_page_denominator_is_four() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(
             table.header.denominator, 4,
@@ -773,7 +833,12 @@ mod tests {
     fn single_page_no_shared_objects() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.entries[0].shared_object_count, 0);
         assert!(table.entries[0].shared_object_ids.is_empty());
@@ -788,7 +853,12 @@ mod tests {
     fn two_page_entries_len_is_two() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.entries.len(), 2, "two-page plan must have 2 entries");
     }
@@ -797,7 +867,12 @@ mod tests {
     fn two_page_least_object_count() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // min(4, 5) = 4 (page 0 object_count = Part-2 + Part-3 = 2+2 = 4)
         assert_eq!(table.header.least_object_count, 4);
@@ -807,7 +882,12 @@ mod tests {
     fn two_page_bits_object_count_delta() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // delta = 5 - 4 = 1 → bits_needed(1) = 1
         assert_eq!(table.header.bits_object_count_delta, 1);
@@ -817,7 +897,12 @@ mod tests {
     fn two_page_entry_object_count_minus_least() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // page 0: 4 - 4 = 0
         assert_eq!(table.entries[0].object_count_minus_least, 0);
@@ -829,7 +914,12 @@ mod tests {
     fn two_page_shared_object_count_per_page() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // qpdf rejects "page 0 has shared identifier entries" — page 0 owns
         // shared objects physically (they sit in the first-page section
@@ -843,7 +933,12 @@ mod tests {
     fn two_page_bits_shared_object_count() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // greatest shared count = 2 → bits_needed(2) = 2
         assert_eq!(table.header.bits_shared_object_count, 2);
@@ -853,7 +948,12 @@ mod tests {
     fn two_page_bits_shared_object_id() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // shared_hints has 4 entries.
         // qpdf computes nbits_per_shared_object = nbits(nshared_total) = nbits(4) = 3,
@@ -866,7 +966,12 @@ mod tests {
     fn two_page_shared_object_ids_are_hint_indices() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         // Page 0 must NOT list shared identifiers (qpdf rejects them).
         assert!(
@@ -890,7 +995,12 @@ mod tests {
     fn two_page_shared_numerators_are_zero() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         for entry in &table.entries {
             for &num in &entry.shared_object_numerators {
@@ -903,7 +1013,12 @@ mod tests {
     fn numerators_len_matches_shared_count() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         for entry in &table.entries {
             assert_eq!(
@@ -918,7 +1033,12 @@ mod tests {
     fn two_page_denominator_is_four() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.header.denominator, 4);
     }
@@ -927,7 +1047,12 @@ mod tests {
     fn two_page_placeholder_fields_are_zero() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(table.header.location_of_first_page, 0);
         assert_eq!(table.header.least_page_length, 0);
@@ -958,7 +1083,12 @@ mod tests {
         // 0 shared hints → bits_needed(0) = 0 (same for both count and max_id)
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(table.header.bits_shared_object_id, 0);
     }
 
@@ -971,7 +1101,12 @@ mod tests {
         // for a two-page.pdf fixture with 4 shared objects.
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let table = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(table.header.bits_shared_object_id, 3);
     }
 
