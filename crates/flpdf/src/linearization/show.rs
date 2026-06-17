@@ -375,6 +375,19 @@ fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
     let min_group_length = h.get_bits(32)?;
     let nbits_delta_group_length = h.get_bits_u32(16)?;
 
+    // Each entry consumes at least one bit (the signature_present column below),
+    // so a well-formed table cannot claim more entries than there are bits left
+    // in the stream. Guard before allocating so a malformed `nshared_total`
+    // (up to u32::MAX) cannot drive a multi-gigabyte pre-allocation (OOM DoS).
+    let remaining_bits = (h.buf.len() - h.byte_pos)
+        .saturating_mul(8)
+        .saturating_sub(h.bit_pos as usize);
+    if nshared_total as usize > remaining_bits {
+        return Err(malformed!(
+            "shared-object hint table claims {nshared_total} entries but only {remaining_bits} bits remain"
+        ));
+    }
+
     let n = nshared_total as usize;
     let mut entries: Vec<HSharedObjectEntry> = (0..n)
         .map(|_| HSharedObjectEntry {
@@ -638,11 +651,19 @@ fn read_lin_parameters(dict: &crate::Dictionary, file_size: u64) -> ShowResult<L
 /// Returns `(s_offset, outline_offset)`.
 fn read_hint_offsets(hint_dict: &crate::Dictionary) -> ShowResult<(usize, Option<usize>)> {
     let s_offset = match hint_dict.get("S") {
-        Some(Object::Integer(n)) if *n >= 0 => *n as usize,
+        Some(Object::Integer(n)) if *n >= 0 => usize::try_from(*n)
+            // cov:ignore: on 64-bit usize is u64, so a non-negative /S offset
+            // always fits; this only fires on 32-bit targets.
+            .map_err(|_| malformed!("hint stream /S offset does not fit in platform usize"))?,
         _ => return Err(malformed!("hint stream /S offset is missing or invalid")),
     };
     let outline_offset: Option<usize> = match hint_dict.get("O") {
-        Some(Object::Integer(n)) if *n >= 0 => Some(*n as usize),
+        Some(Object::Integer(n)) if *n >= 0 => Some(
+            usize::try_from(*n)
+                // cov:ignore: on 64-bit usize is u64, so a non-negative /O offset
+                // always fits; this only fires on 32-bit targets.
+                .map_err(|_| malformed!("hint stream /O offset does not fit in platform usize"))?,
+        ),
         Some(Object::Integer(_)) => return Err(malformed!("hint stream /O offset is negative")),
         _ => None,
     };
@@ -686,6 +707,23 @@ fn show_with_pdf(
 
     // 2. Param-dict values (qpdf's LinParameters).
     let params = read_lin_parameters(&param_dict, file_size)?;
+
+    // qpdf's --show-linearization walks getAllPages() in
+    // checkLinearizationInternal; mirror that walk here, both for fidelity and
+    // to bound the per-page allocation in read_h_page_offset. A well-formed
+    // linearized file has /N equal to its page count, so this never rejects
+    // valid input; a malformed /N (up to u32::MAX) is reported as malformed
+    // rather than driving a multi-gigabyte pre-allocation (OOM DoS).
+    let page_count = crate::pages::page_refs(pdf)?.len();
+    if params.npages as usize != page_count {
+        // cov:ignore-start: /N disagreeing with the page tree — never emitted by
+        // flpdf's writer; this bounds read_h_page_offset against a malformed /N.
+        return Err(malformed!(
+            "/N ({}) does not match the document page count ({page_count})",
+            params.npages
+        ));
+        // cov:ignore-end
+    }
 
     // 3. Locate, resolve, and decompress the hint stream object at /H[0].
     //
@@ -1429,6 +1467,33 @@ mod tests {
         // The decoder must have skipped exactly 128 bits, leaving the nobjects
         // column aligned — proven by entry 1 decoding to 7, not garbage.
         assert_eq!(decoded.entries[1].nobjects_minus_one, 7);
+    }
+
+    #[test]
+    fn shared_object_oversized_nshared_total_is_malformed() {
+        // A 24-byte header (byte-aligned) claiming a huge nshared_total but with
+        // no column bytes following. Each entry needs at least one bit (the
+        // signature_present column), so the decoder must reject it as malformed
+        // rather than pre-allocating ~u32::MAX entries (OOM DoS guard).
+        let mut b = HintStreamBuilder::new();
+        b.write_bits(0, 32); // first_shared_obj
+        b.write_bits(0, 32); // first_shared_offset
+        b.write_bits(0, 32); // nshared_first_page
+        b.write_bits(1_000_000, 32); // nshared_total (far exceeds 0 remaining bits)
+        b.write_bits(0, 16); // nbits_nobjects
+        b.write_bits(0, 32); // min_group_length
+        b.write_bits(0, 16); // nbits_delta_group_length
+        let buf = b.finish();
+        assert_eq!(buf.len(), 24, "header is exactly 24 bytes, no column data");
+
+        let is_malformed = matches!(
+            read_h_shared_object(&buf),
+            Err(ShowLinearizationError::Malformed { .. })
+        );
+        assert!(
+            is_malformed,
+            "expected Malformed for oversized nshared_total"
+        );
     }
 
     // -----------------------------------------------------------------------
