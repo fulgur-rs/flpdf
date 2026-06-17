@@ -480,8 +480,9 @@ impl LinearizationPlan {
         // length-calc reject them ("found unknown object"). This mirrors the
         // plain rewrite path's emission-time skip (see
         // [`crate::writer::is_source_structural_container`]).
-        let mut all_refs: Vec<ObjectRef> = Vec::new();
-        for r in pdf.object_refs() {
+        let object_refs = pdf.object_refs();
+        let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
+        for r in object_refs {
             if r.number == 0 {
                 continue;
             }
