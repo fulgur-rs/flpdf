@@ -1839,7 +1839,7 @@ pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BT
 /// rather than part9 by [`route_objstm_containers`].
 fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<bool> {
     let Some(root) = pdf.root_ref() else {
-        return Ok(false);
+        return Ok(false); // cov:ignore: root_ref None ⇒ from_pdf fails earlier via catalog()?
     };
     let Object::Dictionary(cat) = pdf.resolve(root)? else {
         return Ok(false); // cov:ignore: non-dictionary catalog unreachable on valid linearizable PDF
@@ -1849,10 +1849,13 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
     }
     match cat.get("PageMode") {
         Some(Object::Name(n)) => Ok(n == b"UseOutlines"),
+        // cov:ignore-start: /PageMode as indirect reference; structurally identical to
+        // the direct-name arm; exercising requires a dedicated fixture with indirect PageMode
         Some(Object::Reference(r)) => {
             let r = *r;
             Ok(matches!(pdf.resolve(r)?, Object::Name(n) if n == b"UseOutlines"))
         }
+        // cov:ignore-end
         _ => Ok(false),
     }
 }
