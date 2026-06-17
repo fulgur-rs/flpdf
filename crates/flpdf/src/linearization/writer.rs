@@ -2509,12 +2509,17 @@ pub fn write_linearized<R: Read + Seek>(
                 let first_part8_off = xref_offsets
                     .get(&first_part8_lookup_num)
                     .copied()
+                    // cov:ignore-start: the first Part-8 entry (a container or a
+                    // plain Part-8 object) is always probed in the same pass that
+                    // fills `xref_offsets`, so this lookup never misses for a
+                    // well-formed plan.
                     .ok_or_else(|| {
                         crate::Error::Unsupported(format!(
                             "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
                              has no probed offset"
                         ))
                     })?;
+                // cov:ignore-end
                 // Subtract hint stream total length so that qpdf's
                 // adjusted_offset() reconstructs the correct file offset.
                 so_table.header.location = first_part8_off
