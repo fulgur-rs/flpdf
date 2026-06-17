@@ -45,6 +45,17 @@ else
     echo "Skipping encrypted-r4-three-page.pdf (already exists)"
 fi
 
+# ObjStm-bearing input (flpdf-zbf9): a cross-reference-stream + object-stream
+# input, used to verify the linearized writer drops the source's structural
+# containers (/Type /ObjStm, /Type /XRef) instead of leaking them.
+if [[ ! -f "$FIX/three-page-objstm.pdf" ]]; then
+    echo "Generating three-page-objstm.pdf ..."
+    qpdf --object-streams=generate --warning-exit-0 \
+        "$FIX/three-page.pdf" "$FIX/three-page-objstm.pdf"
+else
+    echo "Skipping three-page-objstm.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/attachment-two-page.pdf" ]]; then
     echo "Generating attachment-two-page.pdf ..."
     # 1) Create a private temp directory (avoids the world-writable /tmp
@@ -294,6 +305,15 @@ echo "three-page/linearize.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/linearize-objstm.pdf"
 echo "three-page/linearize-objstm.pdf"
+
+# --- three-page-objstm: linearize an ObjStm-bearing input (flpdf-zbf9) ---
+# qpdf drops the source structural containers; this golden is qpdf's OWN
+# linearization of the ObjStm-bearing input (NOT identical to three-page's,
+# since qpdf preserves each stream's input dict key order).
+mkdir -p "$REF/three-page-objstm"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-objstm.pdf"
+echo "three-page-objstm/linearize-objstm.pdf"
 
 # NON-linearized --object-streams=generate (cross-reference *stream* form, header
 # floored to 1.5). --static-id keeps /ID byte-stable: /ID[0] is the preserved

@@ -471,11 +471,25 @@ impl LinearizationPlan {
         // Step 1: collect all known object refs (Part 4 initial state).
         // The free-list head at object 0 is excluded per ISO 32000-1 §7.5.4.
         // ----------------------------------------------------------------
-        let all_refs: Vec<ObjectRef> = pdf
-            .object_refs()
-            .into_iter()
-            .filter(|r| r.number != 0)
-            .collect();
+        // Drop the source's structural containers (`/Type /ObjStm`, `/Type
+        // /XRef`) from the live object set. qpdf rebuilds the cross-reference
+        // and repacks ObjStm members into fresh containers, so the source
+        // containers are never live body objects (their members survive as
+        // individual objects via the compressed xref entries). Carrying them
+        // through would shift every offset and make qpdf's linearization
+        // length-calc reject them ("found unknown object"). This mirrors the
+        // plain rewrite path's emission-time skip (see
+        // [`crate::writer::is_source_structural_container`]).
+        let mut all_refs: Vec<ObjectRef> = Vec::new();
+        for r in pdf.object_refs() {
+            if r.number == 0 {
+                continue;
+            }
+            if crate::writer::is_source_structural_container(pdf.resolve_borrowed(r)?) {
+                continue;
+            }
+            all_refs.push(r);
+        }
 
         let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();

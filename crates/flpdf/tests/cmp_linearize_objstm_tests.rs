@@ -148,6 +148,25 @@ fn three_page_objstm_byte_identical_to_qpdf() {
     assert_strict("three-page.pdf", "three-page");
 }
 
+// flpdf-zbf9: linearizing an ObjStm-bearing input (qpdf --object-streams=generate
+// three-page.pdf). qpdf drops the source's stale /Type /ObjStm and /Type /XRef
+// containers (rebuilding the xref and repacking ObjStm members into fresh
+// containers), so the body carries no leaked structural objects. Note qpdf
+// PRESERVES each stream's dict key order from the input, so this is NOT identical
+// to the plain three-page golden (e.g. obj 11 is `/Filter /Length` here vs
+// `/Length /Filter` there); the oracle is qpdf's own linearization of the
+// ObjStm-bearing input. Before the fix the source containers leaked into the
+// body, shifting every offset (qpdf --check-linearization rejected the output).
+#[test]
+fn objstm_bearing_input_structurally_byte_identical_to_qpdf() {
+    assert_structural("three-page-objstm.pdf", "three-page-objstm");
+}
+
+#[test]
+fn objstm_bearing_input_byte_identical_to_qpdf() {
+    assert_strict("three-page-objstm.pdf", "three-page-objstm");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

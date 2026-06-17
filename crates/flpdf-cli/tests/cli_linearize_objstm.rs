@@ -618,12 +618,10 @@ fn acceptance_gate_generate_has_objstm_in_part4() {
 //    Validates (d) round-trip and (c) per-page-1 invariants on ObjStm input.
 // ---------------------------------------------------------------------------
 
+// flpdf-zbf9: linearizing an ObjStm-bearing input drops the source's structural
+// containers (/Type /ObjStm, /Type /XRef) from the live body, matching qpdf —
+// see LinearizationPlan::from_pdf / writer::is_source_structural_container.
 #[test]
-#[ignore = "flpdf-zbf9: linearizing an ObjStm-bearing input leaks the source's \
-ObjStm/XRef structural containers as live body objects; the new first-half ObjStm \
-layout repositions them where qpdf's linearization length-calc rejects them. Needs \
-source-structural-object dropping in the rewrite object model (orthogonal to \
-packing+renumber+hint)."]
 fn acceptance_gate_objstm_bearing_input() {
     if skip_if_qpdf_missing() {
         return;

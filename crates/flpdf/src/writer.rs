@@ -1170,6 +1170,34 @@ fn incremented_generation(generation: u16) -> u16 {
     generation.saturating_add(1)
 }
 
+/// True when `obj` is a source structural container: a cross-reference stream
+/// (`/Type /XRef`) or an object stream (`/Type /ObjStm`).
+///
+/// qpdf never carries these through to a rewritten or linearized body — the
+/// cross-reference is regenerated from scratch and ObjStm members are repacked
+/// into fresh containers, so the source containers are dropped while their
+/// members survive as individual objects.
+///
+/// Used by [`LinearizationPlan::from_pdf`](crate::linearization::LinearizationPlan),
+/// which seeds its object set from `object_refs()` (all objects, including the
+/// structural containers) and must filter them out explicitly. The plain
+/// full-rewrite path instead drives emission from the reachability-based
+/// `CatalogFirstRenumber`, which already excludes containers (unreachable from
+/// /Root); its own inline `/Type` guard there is purely defensive.
+///
+/// `/Type` is matched as a direct `/Name` (never resolved through an indirect
+/// reference): qpdf and every conforming writer emit `/Type` directly on these
+/// stream dicts.
+pub(crate) fn is_source_structural_container(obj: &Object) -> bool {
+    let Object::Stream(s) = obj else {
+        return false;
+    };
+    matches!(
+        s.dict.get("Type"),
+        Some(Object::Name(n)) if n.as_slice() == b"XRef" || n.as_slice() == b"ObjStm"
+    )
+}
+
 fn next_xref_stream_object_number(
     source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
 ) -> Result<u32> {
@@ -2977,7 +3005,12 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         // Skip xref-stream container objects — we'll rebuild the xref from
         // scratch below.  Skip ObjStm container objects — their members have
         // already been resolved into the cache as individual objects and are
-        // emitted in the main loop.
+        // emitted in the main loop. (Defensive: the reachability-based
+        // `CatalogFirstRenumber` already excludes structural containers, which
+        // are not reachable from /Root, so this only fires for a malformed input
+        // whose /Root graph reaches one. `LinearizationPlan::from_pdf` works from
+        // `object_refs()` — all objects — so it needs the explicit filter via
+        // `is_source_structural_container`.)
         if let Object::Stream(ref s) = object {
             let ty = s.dict.get("Type");
             let is_xref = matches!(ty, Some(Object::Name(n)) if n.as_slice() == b"XRef");
