@@ -847,6 +847,65 @@ impl LinearizationPlan {
     /// its new number, so it is never resolved through the
     /// [`RenumberMap`].
     ///
+    /// ObjStm container object numbers that are qpdf **part8** (other-page-shared)
+    /// objects: their members reach two or more pages but none is a first-page
+    /// (Part-2 / Part-3) object.
+    ///
+    /// The global even split can fill such a container entirely with objects that
+    /// are individually page-*private* (one page's privates co-located with
+    /// another's), so the container does not appear in `shared_hints` (built from
+    /// the per-object part2/part3/part4_shared partition) even though it is a
+    /// shared object that belongs in the shared-object hint table. This enumerates
+    /// those containers so the table and its entry counts include them.
+    pub(crate) fn part8_container_nums(
+        &self,
+        member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
+    ) -> BTreeSet<u32> {
+        let first_page: BTreeSet<ObjectRef> = self
+            .part2_objects
+            .iter()
+            .chain(&self.part3_objects)
+            .copied()
+            .collect();
+        let part4_shared: BTreeSet<ObjectRef> =
+            self.part4_other_pages_shared.iter().copied().collect();
+
+        let mut all_containers: BTreeSet<u32> = BTreeSet::new();
+        let mut container_pages: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let mut has_first_page_member: BTreeSet<u32> = BTreeSet::new();
+        let mut has_shared_member: BTreeSet<u32> = BTreeSet::new();
+        for (member, &(cnum, _)) in member_to_container {
+            all_containers.insert(cnum);
+            if first_page.contains(member) {
+                has_first_page_member.insert(cnum);
+            }
+            // A reach-≥2 (part4_other_pages_shared) member makes the container a
+            // shared object directly — used when `all_referenced_pages` is absent
+            // (e.g. manually-built plans) and as a robust signal otherwise.
+            if part4_shared.contains(member) {
+                has_shared_member.insert(cnum);
+            }
+            if let Some(pages) = self.all_referenced_pages.get(member) {
+                container_pages
+                    .entry(cnum)
+                    .or_default()
+                    .extend(pages.iter().copied().filter(|&p| p != 0));
+            }
+        }
+        // A container is part8 when no member is a first-page object AND it is
+        // shared — either it holds an explicitly-shared (reach-≥2) member, or its
+        // members span two or more pages (the even split co-located two pages'
+        // privates).
+        all_containers
+            .into_iter()
+            .filter(|cnum| {
+                !has_first_page_member.contains(cnum)
+                    && (has_shared_member.contains(cnum)
+                        || container_pages.get(cnum).is_some_and(|p| p.len() >= 2))
+            })
+            .collect()
+    }
+
     /// An empty `member_to_container` yields a clone of `shared_hints` (the
     /// no-ObjStm / classic path is unchanged).
     pub(crate) fn canonical_shared_hints(
@@ -920,7 +979,7 @@ impl LinearizationPlan {
         // generation `u16::MAX`; a plain entry carries an original ref resolved
         // through `renumber`. Part-8 entries (after the boundary) stay in place.
         let boundary = first_page_out_end.unwrap_or(out.len());
-        out[..boundary].sort_unstable_by_key(|e| {
+        let new_number = |e: &SharedObjectHintEntry| -> u32 {
             if e.object_ref.generation == u16::MAX {
                 e.object_ref.number
             } else {
@@ -929,7 +988,25 @@ impl LinearizationPlan {
                     .expect("shared hint object must exist in RenumberMap")
                     .number
             }
-        });
+        };
+        out[..boundary].sort_unstable_by_key(&new_number);
+
+        // Append any qpdf part8 (other-page-shared) ObjStm container that the
+        // even split filled entirely with page-PRIVATE objects: such a container
+        // never appears in `shared_hints` (no part2/part3/part4_shared member) but
+        // IS a shared object in qpdf's hint table. Skip containers already folded
+        // into `out` (those carry a part4_shared member). Then order the whole
+        // Part-8 section by physical object number, matching qpdf's ObjGen-keyed
+        // `lc_other_page_shared`.
+        for cnum in self.part8_container_nums(member_to_container) {
+            if !container_pos.contains_key(&cnum) {
+                out.push(SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(cnum, u16::MAX),
+                    referencing_pages: Vec::new(), // recomputed below
+                });
+            }
+        }
+        out[boundary..].sort_unstable_by_key(&new_number);
 
         // Recompute each entry's referencing pages from its FULL membership via
         // `all_referenced_pages` (excluding page 0, which owns the first-page
