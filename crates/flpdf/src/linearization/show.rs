@@ -1185,7 +1185,7 @@ mod tests {
     fn round_trip_page_offset_table() {
         let po = rich_page_offset_table();
         let so = rich_shared_object_table();
-        let encoded = encode_hint_stream(&po, &so).expect("encode");
+        let encoded = encode_hint_stream(&po, &so, None).expect("encode");
 
         let decoded = read_h_page_offset(&encoded.uncompressed, po.entries.len() as u32)
             .expect("decode page offset");
@@ -1250,7 +1250,7 @@ mod tests {
     fn round_trip_shared_object_table() {
         let po = rich_page_offset_table();
         let so = rich_shared_object_table();
-        let encoded = encode_hint_stream(&po, &so).expect("encode");
+        let encoded = encode_hint_stream(&po, &so, None).expect("encode");
 
         let decoded = read_h_shared_object(
             &encoded.uncompressed[encoded.shared_section_offset_in_uncompressed..],

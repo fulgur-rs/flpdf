@@ -250,3 +250,20 @@ fn openaction_objstm_byte_identical_to_qpdf() {
         "objstm-lin-openaction-80-80",
     );
 }
+
+// outlines-80-80 (flpdf-rm09, Stage B — in_outlines, part9): the catalog's
+// /Outlines subtree (an outline dict + 80 items reachable ONLY from /Outlines)
+// is qpdf's in_outlines category. With no /PageMode /UseOutlines, qpdf places it
+// in part9 (second half) via pushOutlinesToPart and emits the Outlines Hint Table
+// (HGeneric) + the hint dict /O key. The body placement already coincides with
+// flpdf's page-closure Rest path; this exercises the new outline hint table + /O.
+// Two pages share fonts so a first-page (part6) container coexists.
+#[test]
+fn outlines_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("objstm-lin-outlines-80-80.pdf", "objstm-lin-outlines-80-80");
+}
+
+#[test]
+fn outlines_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-outlines-80-80.pdf", "objstm-lin-outlines-80-80");
+}

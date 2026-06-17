@@ -63,7 +63,7 @@ use std::io::{Read, Seek};
 
 use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
 use crate::linearization::hint_shared::SharedObjectHintTable;
-use crate::linearization::hint_stream::encode_hint_stream;
+use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::LinearizationPlan;
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap};
@@ -1334,33 +1334,223 @@ fn write_main_xref_stream_and_trailer(
     Ok((main_xref_offset, main_xref_offset))
 }
 
+/// Serialize the hint-stream object dictionary + `stream\n` opener exactly as
+/// qpdf 11.9.0 orders it: `/Filter /FlateDecode /S {s}[ /O {o}] /Length {len}`.
+/// qpdf emits `/O` between `/S` and `/Length`, and only when the document has
+/// outlines (`if (O)`, QPDFWriter.cc:2307); `/S` carries the shared-object
+/// section offset, `/O` the outlines section offset (both within the
+/// uncompressed hint stream).
+///
+/// Shared by [`append_hint_stream_object`] (the emitter) and
+/// [`hint_stream_convergence_len`] (the convergence-length proxy) so the two
+/// cannot drift — a digit-width change in any dict value must move both.
+fn hint_stream_dict_prefix(
+    shared_section_offset: usize,
+    outline_section_offset: Option<usize>,
+    payload_len: usize,
+) -> String {
+    let outline_key = match outline_section_offset {
+        Some(o) => format!(" /O {o}"),
+        None => String::new(),
+    };
+    format!("<< /Filter /FlateDecode /S {shared_section_offset}{outline_key} /Length {payload_len} >>\nstream\n")
+}
+
+/// Variable byte length of the hint-stream object across convergence passes:
+/// the dict prefix (whose `/S`, `/O`, `/Length` decimal widths track the
+/// back-patched offsets), the compressed payload, and the conditional newline
+/// before `endstream`. The fixed scaffolding (`N G obj\n`, `endstream\nendobj\n`)
+/// is constant — the object number is pre-allocated — so it cancels in an
+/// equality and is omitted. Used as the convergence key so a digit-width change
+/// in any dict value (not just the payload length) is detected before the final
+/// pass bakes `/H[1]`-relative offsets against it.
+fn hint_stream_convergence_len(
+    compressed_payload: &[u8],
+    shared_section_offset: usize,
+    outline_section_offset: Option<usize>,
+) -> usize {
+    hint_stream_dict_prefix(
+        shared_section_offset,
+        outline_section_offset,
+        compressed_payload.len(),
+    )
+    .len()
+        + compressed_payload.len()
+        + usize::from(compressed_payload.last() != Some(&b'\n'))
+}
+
 /// Emit the primary hint-stream object and return its start byte offset.
 ///
 /// qpdf 11.9.0 serializes the hint-stream object dict in the key order
 /// `/Filter /S /Length` (observed against its `--check-linearization` golden
 /// output), which the generic `BTreeMap`-ordered [`Object::Stream`] serializer
-/// cannot reproduce. This emitter writes the dict literal by hand to match that
-/// order; the surrounding framing (`N G obj\n` … `\nstream\n` … `\nendstream\nendobj\n`)
-/// is byte-identical to [`append_object`].
+/// cannot reproduce. This emitter writes the dict literal by hand (via
+/// [`hint_stream_dict_prefix`]) to match that order; the surrounding framing
+/// (`N G obj\n` … `\nstream\n` … `\nendstream\nendobj\n`) is byte-identical to
+/// [`append_object`]. The newline before `endstream` is written only when the
+/// payload does not already end in one (qpdf, QPDFWriter.cc:2327).
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
     compressed_payload: &[u8],
     shared_section_offset: usize,
+    outline_section_offset: Option<usize>,
 ) -> usize {
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     bytes.extend_from_slice(
-        format!(
-            "<< /Filter /FlateDecode /S {} /Length {} >>\nstream\n",
+        hint_stream_dict_prefix(
             shared_section_offset,
+            outline_section_offset,
             compressed_payload.len(),
         )
         .as_bytes(),
     );
     bytes.extend_from_slice(compressed_payload);
-    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    // qpdf writes the newline before `endstream` only when the stream payload
+    // does not already end in one (QPDFWriter.cc:2327: `if (last_char != '\n')`).
+    // The hint payload is FlateDecode output, whose final byte is data-dependent;
+    // when it happens to be `\n` (e.g. with an Outlines hint table present) the
+    // unconditional newline would add a spurious byte and diverge from qpdf.
+    if compressed_payload.last() != Some(&b'\n') {
+        bytes.extend_from_slice(b"\n");
+    }
+    bytes.extend_from_slice(b"endstream\nendobj\n");
     offset
+}
+
+/// Loop-invariant inputs for the Outlines Hint Table (qpdf's `c_outline_data`).
+///
+/// `first_object` and `nobjects` depend only on membership + renumbering (stable
+/// across convergence iterations); the per-iteration offset/length are filled in
+/// from each probe pass to build the [`OutlineHintTable`].
+struct OutlineHintInfo {
+    /// Renumbered number of the first outline output unit (the ObjStm container —
+    /// or plain object — holding the `/Outlines` dictionary).
+    first_object: u32,
+    /// Number of distinct outline output units (qpdf's `cho.nobjects`).
+    nobjects: u32,
+}
+
+/// Compute the loop-invariant Outlines Hint Table inputs, or `None` when the
+/// document has no outlines (qpdf then omits the table and the `/O` key).
+///
+/// Mirrors qpdf's `pushOutlinesToPart` + `calculateHOutline`: the first unit is
+/// the object/container holding the `/Outlines` dict, and `nobjects` is the count
+/// of distinct output units the outline objects fold into. An outline object
+/// that is an ObjStm member folds to its container's new number
+/// ([`getUncompressedObject`](https://qpdf.readthedocs.io)); a plain one keeps
+/// its own renumbered number.
+///
+/// # Errors
+///
+/// Propagates reader errors from the outline closure or catalog resolution.
+fn compute_outline_hint_info<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    renumber: &RenumberMap,
+    objstm_layout: &ObjStmLayout,
+) -> Result<Option<OutlineHintInfo>> {
+    let outlines = crate::linearization::plan::outlines_set(pdf)?;
+    if outlines.is_empty() {
+        return Ok(None);
+    }
+    // The /Outlines dictionary reference (the first outline unit qpdf places).
+    // This helper runs only when outlines_set is non-empty (⟹ a /Outlines key),
+    // so the catalog is always a resolvable dictionary here.
+    let outlines_ref = pdf.root_ref().and_then(|r| match pdf.resolve_borrowed(r) {
+        Ok(Object::Dictionary(d)) => d.get_ref("Outlines"),
+        _ => None, // cov:ignore: catalog is always a dict when outlines exist
+    });
+    let Some(outlines_ref) = outlines_ref else {
+        // Defensive: a non-empty outline closure implies a /Outlines ref, so this
+        // is unreachable for a well-formed catalog.
+        return Ok(None); // cov:ignore: outlines_set non-empty ⟹ catalog /Outlines ref present
+    };
+    // Map an outline object to its output unit: its ObjStm container's new number
+    // when compressed, else its own renumbered number. The objstm corpus
+    // compresses all outline objects, so the plain branch (uncompressed outline,
+    // i.e. the deferred plain --linearize path) is not exercised here.
+    let unit_of = |r: ObjectRef| -> Option<u32> {
+        match objstm_layout.member_to_container.get(&r) {
+            Some(&(container_num, _)) => Some(container_num),
+            None => renumber.new_for_original(r).map(|nr| nr.number), // cov:ignore: plain (uncompressed) outline — deferred
+        }
+    };
+    let units: std::collections::BTreeSet<u32> =
+        outlines.iter().filter_map(|&r| unit_of(r)).collect();
+    let Some(first_object) = unit_of(outlines_ref) else {
+        // Defensive: the /Outlines dict is part of the closure and the plan, so it
+        // always has a unit.
+        return Ok(None); // cov:ignore: /Outlines dict always has a renumber/container entry
+    };
+    Ok(Some(OutlineHintInfo {
+        first_object,
+        nobjects: units.len() as u32,
+    }))
+}
+
+/// Build the per-pass Outlines Hint Table (qpdf's `calculateHOutline`).
+///
+/// `first_object_offset` is the first outline unit's probe offset MINUS the hint
+/// stream object length — the same `adjusted_offset` convention as the Shared
+/// Object table `location` (qpdf adds `/H[1]` back for offsets at or after the
+/// hint stream). `group_length` is the summed byte length of the `nobjects`
+/// consecutive output units starting at `first_object` (qpdf's
+/// `outputLengthNextN`).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if the first outline unit has no probed
+/// offset in `xref_offsets`, or if that offset is smaller than
+/// `hint_stream_obj_total_len` (either indicates an inconsistent layout, never
+/// produced for a well-formed plan).
+fn build_outline_hint_table(
+    info: &OutlineHintInfo,
+    xref_offsets: &BTreeMap<u32, usize>,
+    byte_lengths: &BTreeMap<u32, usize>,
+    hint_stream_obj_total_len: usize,
+) -> Result<OutlineHintTable> {
+    let first_off = xref_offsets
+        .get(&info.first_object)
+        .copied()
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "outline hint: first outline unit (#{}) has no probed offset",
+                info.first_object
+            ))
+        })?;
+    let adjusted_offset = first_off
+        .checked_sub(hint_stream_obj_total_len)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "outline hint: first unit offset ({first_off}) is less than the hint \
+             stream length ({hint_stream_obj_total_len})"
+            ))
+        })?;
+    // The HGeneric `first_object_offset` is a fixed 32-bit field (qpdf
+    // writeHGeneric). Reject (rather than silently truncate) an offset past
+    // 4 GiB, matching how the other fixed-width hint fields fail via
+    // `write_bits_checked`.
+    let first_object_offset = u32::try_from(adjusted_offset).map_err(|_| {
+        crate::Error::Unsupported(format!(
+            "outline hint: adjusted first unit offset ({adjusted_offset}) exceeds the \
+             32-bit Outlines Hint Table field"
+        ))
+    })?;
+    // `u64` range bound prevents a `u32` overflow panic on a pathological
+    // (>4-billion-object) layout; for any realistic document the values fit in
+    // `u32`, so `n as u32` and the sum are byte-identical to the direct
+    // computation.
+    let group_length: u64 = (info.first_object as u64
+        ..info.first_object as u64 + info.nobjects as u64)
+        .map(|n| byte_lengths.get(&(n as u32)).copied().unwrap_or(0) as u64)
+        .sum();
+    Ok(OutlineHintTable {
+        first_object: info.first_object,
+        first_object_offset,
+        nobjects: info.nobjects,
+        group_length: group_length as u32,
+    })
 }
 
 /// Build the pass-1 (digest) variant of an already-built [`Part1Bytes`].
@@ -1429,6 +1619,7 @@ fn do_write_pass<R: Read + Seek>(
     _first_page_object_new_num: u32,
     hint_compressed: &[u8],
     hint_shared_section_offset: usize,
+    hint_outline_section_offset: Option<usize>,
     source_trailer: &Dictionary,
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
@@ -1622,6 +1813,7 @@ fn do_write_pass<R: Read + Seek>(
             hint_new_ref,
             hint_compressed,
             hint_shared_section_offset,
+            hint_outline_section_offset,
         );
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
@@ -2295,9 +2487,28 @@ pub fn write_linearized<R: Read + Seek>(
     );
     let so_table_initial =
         SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
-    let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial)?;
+    // Outlines Hint Table inputs (qpdf in_outlines / calculateHOutline). Loop-
+    // invariant; `None` when the document has no outlines, in which case no `/O`
+    // key or outline table is emitted (byte-identical to the no-outline path).
+    let outline_info = compute_outline_hint_info(pdf, renumber, &objstm_layout)?;
+    // Initial placeholder outline table (offset/length zero): emitting it from
+    // iteration 0 means the hint stream already carries the outline section, so
+    // the convergence loop only has to settle the back-patched offset/length
+    // values (the compressed contribution still varies with them, so it is the
+    // loop — not byte-size stability — that absorbs the difference).
+    let outline_initial = outline_info.as_ref().map(|i| OutlineHintTable {
+        first_object: i.first_object,
+        first_object_offset: 0,
+        nobjects: i.nobjects,
+        group_length: 0,
+    });
+    // Bind `oi` so the call (with `?`) stays on one line — a multi-line `)?;`
+    // would leave the error-propagation region uncovered (the `?` never errs).
+    let oi = outline_initial.as_ref();
+    let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial, oi)?;
     let mut current_hint_compressed = hint_bytes_initial.compressed;
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
+    let mut current_hint_outline_o = hint_bytes_initial.outline_section_offset_in_uncompressed;
 
     // Capture the source trailer once; it does not change across iterations.
     //
@@ -2358,10 +2569,11 @@ pub fn write_linearized<R: Read + Seek>(
             total_count,
             info_new_ref,
             first_page_object_new_num,
-            // The hint stream is absent in pass 1, so its payload / `/S`
-            // offset are never emitted; pass empty / zero placeholders.
+            // The hint stream is absent in pass 1, so its payload / `/S` / `/O`
+            // offsets are never emitted; pass empty / zero / none placeholders.
             &[],
             0,
+            None,
             &source_trailer,
             &objstm_layout,
             &relocation,
@@ -2419,6 +2631,7 @@ pub fn write_linearized<R: Read + Seek>(
             first_page_object_new_num,
             &current_hint_compressed,
             current_hint_shared_s,
+            current_hint_outline_o,
             &source_trailer,
             &objstm_layout,
             &relocation,
@@ -2741,10 +2954,26 @@ pub fn write_linearized<R: Read + Seek>(
             }
         }
 
+        // Patch the Outlines Hint Table (qpdf calculateHOutline): fill the
+        // per-pass offset/length for the first outline unit (see
+        // `build_outline_hint_table`).
+        let outline_table = outline_info
+            .as_ref()
+            .map(|info| {
+                build_outline_hint_table(
+                    info,
+                    &xref_offsets,
+                    &byte_lengths,
+                    hint_stream_obj_total_len,
+                )
+            })
+            .transpose()?;
+
         // Re-encode hint stream with patched tables.
-        let new_hint_bytes = encode_hint_stream(&po_table, &so_table)?;
+        let new_hint_bytes = encode_hint_stream(&po_table, &so_table, outline_table.as_ref())?;
         let new_compressed = new_hint_bytes.compressed;
         let new_shared_s = new_hint_bytes.shared_section_offset_in_uncompressed;
+        let new_outline_o = new_hint_bytes.outline_section_offset_in_uncompressed;
 
         // Save this pass's structural metadata (offsets, byte length).  The
         // bytes themselves are *not* yet final — they were written using the
@@ -2760,11 +2989,26 @@ pub fn write_linearized<R: Read + Seek>(
         final_last_xref_first_entry_offset = last_xref_first_entry_offset;
         final_bytes = bytes; // overwritten below if we do a final pass
 
-        let converged = new_compressed.len() == current_hint_compressed.len();
+        // Converge on the full *hint-object* length, not just the compressed
+        // payload length. Two payloads of equal length can still frame into hint
+        // objects of different byte length: the conditional newline before
+        // `endstream` (qpdf, QPDFWriter.cc:2327) and the decimal widths of the
+        // dict values `/S`, `/O`, `/Length` (offsets into the uncompressed hint
+        // stream, which shift independently of payload length) both contribute.
+        // `hint_stream_convergence_len` captures every variable component, so
+        // convergence forces ΔL=0 — the final pass's `/H[1]` exactly matches the
+        // offsets baked into the payload (the constant scaffolding cancels).
+        let converged = hint_stream_convergence_len(&new_compressed, new_shared_s, new_outline_o)
+            == hint_stream_convergence_len(
+                &current_hint_compressed,
+                current_hint_shared_s,
+                current_hint_outline_o,
+            );
 
         // Promote the freshly-patched stream as the next iteration input.
         current_hint_compressed = new_compressed;
         current_hint_shared_s = new_shared_s;
+        current_hint_outline_o = new_outline_o;
 
         // Risk 1 (convergence): the ObjStm container FlateDecode lengths are
         // *stable* across iterations (the contained, renumbered objects do
@@ -2831,6 +3075,7 @@ pub fn write_linearized<R: Read + Seek>(
                 first_page_object_new_num,
                 &current_hint_compressed,
                 current_hint_shared_s,
+                current_hint_outline_o,
                 &source_trailer,
                 &objstm_layout,
                 &relocation,
@@ -4428,7 +4673,8 @@ mod tests {
     fn append_hint_stream_object_emits_qpdf_key_order() {
         let payload = vec![0u8; 53];
         let mut bytes = Vec::new();
-        let offset = append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46);
+        let offset =
+            append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46, None);
         assert_eq!(offset, 0, "emitter returns its start offset");
 
         let mut expected = Vec::new();
@@ -4437,5 +4683,93 @@ mod tests {
         expected.extend_from_slice(&payload);
         expected.extend_from_slice(b"\nendstream\nendobj\n");
         assert_eq!(bytes, expected, "hint-stream object framing + key order");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_outline_hint_table (qpdf calculateHOutline)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_outline_hint_table_uses_adjusted_offset_and_consecutive_lengths() {
+        // first_object = 3, nobjects = 2 → group_length sums units 3 and 4.
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 2,
+        };
+        let xref_offsets = BTreeMap::from([(3u32, 500usize), (4u32, 560usize)]);
+        let byte_lengths = BTreeMap::from([(3u32, 60usize), (4u32, 70usize), (5u32, 999usize)]);
+        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths, 144).unwrap();
+        assert_eq!(table.first_object, 3);
+        // adjusted_offset convention: probe offset MINUS hint stream length.
+        assert_eq!(table.first_object_offset, 500 - 144);
+        assert_eq!(table.nobjects, 2);
+        // outputLengthNextN: units 3 and 4 only (unit 5 excluded by nobjects).
+        assert_eq!(table.group_length, 60 + 70);
+    }
+
+    #[test]
+    fn build_outline_hint_table_errors_when_first_unit_has_no_probed_offset() {
+        let info = OutlineHintInfo {
+            first_object: 7,
+            nobjects: 1,
+        };
+        // `first_object` absent from xref_offsets → layout guard fires.
+        let err =
+            build_outline_hint_table(&info, &BTreeMap::new(), &BTreeMap::new(), 144).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("no probed offset")),
+            "expected 'no probed offset' Unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_outline_hint_table_errors_when_offset_below_hint_stream_length() {
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 1,
+        };
+        // Offset (100) < hint stream length (144) → adjusted_offset underflow guard.
+        let xref_offsets = BTreeMap::from([(3u32, 100usize)]);
+        let err =
+            build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new(), 144).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("less than the hint")),
+            "expected 'less than the hint stream length' Unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_outline_hint_table_missing_byte_length_counts_as_zero() {
+        // A unit in [first_object, first_object+nobjects) absent from byte_lengths
+        // contributes 0 (the `unwrap_or(0)` path) — exercised without the qpdf
+        // golden so default-feature coverage hits it.
+        let info = OutlineHintInfo {
+            first_object: 10,
+            nobjects: 3,
+        };
+        let xref_offsets = BTreeMap::from([(10u32, 1000usize)]);
+        let byte_lengths = BTreeMap::from([(10u32, 40usize), (12u32, 5usize)]); // 11 missing
+        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths, 200).unwrap();
+        assert_eq!(table.first_object_offset, 1000 - 200);
+        // 40 (unit 10) + 0 (unit 11 missing → unwrap_or(0)) + 5 (unit 12).
+        assert_eq!(table.group_length, 45);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn build_outline_hint_table_errors_when_offset_exceeds_32_bits() {
+        // Adjusted offset > u32::MAX (only representable as a usize on 64-bit)
+        // must be rejected, not silently truncated into the 32-bit HGeneric field.
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 1,
+        };
+        let huge = (u32::MAX as usize) + 100; // adjusted offset = huge - 0 = huge
+        let xref_offsets = BTreeMap::from([(3u32, huge)]);
+        let err = build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new(), 0).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("exceeds the")),
+            "expected 'exceeds the 32-bit ...' Unsupported error, got {err:?}"
+        );
     }
 }
