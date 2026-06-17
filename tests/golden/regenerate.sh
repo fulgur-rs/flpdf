@@ -199,11 +199,16 @@ fi
 #  - threepage-2-120: fonts shared by pages 1&2 (not page 0) => part6 + part8.
 #  - disc-2-250-2:    pure part7 container + a part8 uncompressed Form XObject
 #                     (the renumber finding-4 discriminator).
+#  - openaction-80-80: catalog /OpenAction -> 80 od-only font dicts reachable
+#                     only from the root /OpenAction key => qpdf in_open_document
+#                     (lc_open_document, part4, first half), plus 80 first-page
+#                     shared fonts. Forces the obj_user open_document category.
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-mixed-60-70]="gen_mixed_shared.py 60 70"
     [objstm-lin-threepage-2-120]="gen_three_page_shared.py 2 120"
     [objstm-lin-disc-2-250-2]="gen_part7_part8_discriminator.py 2 250 2"
+    [objstm-lin-openaction-80-80]="gen_open_action_gap.py 80 80"
 )
 for stem in "${!G6HB2_FIX[@]}"; do
     if [[ ! -f "$FIX/$stem.pdf" ]]; then
