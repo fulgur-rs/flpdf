@@ -150,3 +150,38 @@ fn two_page_generate_packs_first_half_container_before_e() {
         "the first-half ObjStm container (marker at {marker}) must be before /E ({e_off})"
     );
 }
+
+/// A `>cap` fixture that produces BOTH a first-half (part6) and a second-half
+/// (part7) ObjStm container. Exercises the second-half container path: the
+/// page-private-font compression, the per-page object-count fold, and the
+/// per-page byte-length fold (a page-1 private object compressed into the part7
+/// container contributes the container's bytes, not its own). Runs on every
+/// build (no qpdf-zlib-compat needed — only structure is asserted).
+#[test]
+fn mixed_generate_emits_part6_and_part7_containers_and_round_trips() {
+    let bytes = linearize_generate("objstm-lin-mixed-60-70.pdf");
+
+    // Two ObjStm containers: one before /E (part6, first-page shared) and one
+    // after /E (part7, page-1 private fonts).
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 2,
+        "mixed generate must emit two ObjStm containers (part6 + part7), found {n_objstm}"
+    );
+    let e_off = parse_e_offset(&bytes);
+    let first_marker = first_objstm_marker_offset(&bytes).expect("ObjStm marker present");
+    assert!(
+        first_marker < e_off,
+        "the first-half (part6) ObjStm container (marker at {first_marker}) must be before /E ({e_off})"
+    );
+
+    // Round-trip: every object resolves, including both containers' compressed
+    // members (the part7 container's members are page-1 private fonts).
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
