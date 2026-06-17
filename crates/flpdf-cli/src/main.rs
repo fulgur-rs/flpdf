@@ -172,6 +172,8 @@ struct Cli {
     show_npages: bool,
     #[arg(long)]
     show_pages: bool,
+    #[arg(long)]
+    show_linearization: bool,
 
     // ── JSON inspection flags ─────────────────────────────────────────────
     // These mirror qpdf's --json / --json-output / --json-key / --json-object
@@ -193,7 +195,7 @@ struct Cli {
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
               "dump_object",
               "show_info", "show_catalog", "show_metadata", "show_outline",
-              "show_fonts", "show_npages", "show_pages", "output",
+              "show_fonts", "show_npages", "show_pages", "show_linearization", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption_from",
               "add_attachment", "remove_attachment", "list_attachments",
@@ -311,7 +313,7 @@ struct Cli {
           conflicts_with_all = [
               "check", "dump_object", "show_info", "show_catalog",
               "show_metadata", "show_outline", "show_fonts",
-              "show_npages", "show_pages",
+              "show_npages", "show_pages", "show_linearization",
           ])]
     remove_restrictions: bool,
     /// Strip the `/Encrypt` dictionary from the output (top-level alias of
@@ -335,7 +337,7 @@ struct Cli {
           conflicts_with_all = [
               "check", "dump_object", "show_info", "show_catalog",
               "show_metadata", "show_outline", "show_fonts",
-              "show_npages", "show_pages",
+              "show_npages", "show_pages", "show_linearization",
           ])]
     decrypt: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
@@ -526,7 +528,7 @@ struct Cli {
         conflicts_with_all = [
             "check", "dump_object", "show_info", "show_catalog",
             "show_metadata", "show_outline", "show_fonts",
-            "show_npages", "show_pages",
+            "show_npages", "show_pages", "show_linearization",
             "linearize", "remove_restrictions", "decrypt", "qdf",
             "copy_encryption_from",
         ],
@@ -552,7 +554,7 @@ struct Cli {
             "encrypt",
             "check", "dump_object", "show_info", "show_catalog",
             "show_metadata", "show_outline", "show_fonts",
-            "show_npages", "show_pages",
+            "show_npages", "show_pages", "show_linearization",
             "linearize", "remove_restrictions", "decrypt", "qdf",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
@@ -681,11 +683,6 @@ enum Commands {
         about = "Validate linearization structure (param dict, hint stream, offsets)"
     )]
     CheckLinearization(CheckLinearizationCommand),
-    #[command(
-        name = "show-linearization",
-        about = "Dump linearization parameter dict and hint tables (qpdf --show-linearization compatible)"
-    )]
-    ShowLinearization(ShowLinearizationCommand),
     #[command(name = "dump-object", about = "Dump one indirect object as PDF syntax")]
     DumpObject(DumpObjectCommand),
     #[command(about = "Show page structure summary or detail")]
@@ -796,12 +793,6 @@ struct CheckCommand {
 #[derive(Debug, ClapArgs)]
 struct CheckLinearizationCommand {
     /// Input PDF file to validate.
-    input: PathBuf,
-}
-
-#[derive(Debug, ClapArgs)]
-struct ShowLinearizationCommand {
-    /// Input PDF file whose linearization data is dumped.
     input: PathBuf,
 }
 
@@ -1468,6 +1459,7 @@ fn main() {
                     && !args.show_fonts
                     && !args.show_npages
                     && !args.show_pages
+                    && !args.show_linearization
                     && !args.check
                     && !args.list_attachments
                     && args.show_attachment.is_none()
@@ -1510,6 +1502,8 @@ fn main() {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
         run_show_pages(args.input, args.repair, &args.password)
+    } else if args.show_linearization {
+        run_show_linearization(args.input)
     } else if args.check {
         run_check(
             args.input,
@@ -1994,20 +1988,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 std::process::exit(1);
             }
             Err(LinearizationCheckError::Io(e)) => Err(e.to_string().into()),
-        },
-        Commands::ShowLinearization(cmd) => match show_linearization_path(&cmd.input) {
-            Ok(dump) => {
-                // `dump` already ends with a trailing newline (the hint-table
-                // dump, or qpdf's "<name> is not linearized" line). qpdf prints
-                // both to stdout and exits 0; use print! to avoid a second LF.
-                print!("{dump}");
-                Ok(())
-            }
-            Err(ShowLinearizationError::Malformed { message }) => {
-                eprintln!("flpdf: malformed linearization data: {message}");
-                std::process::exit(ExitCode::Errors.as_i32());
-            }
-            Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
         },
         Commands::DumpObject(cmd) => {
             run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
@@ -4323,6 +4303,24 @@ fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs)
     }
 
     Ok(())
+}
+
+fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    match show_linearization_path(&input) {
+        Ok(dump) => {
+            // `dump` already ends with a trailing newline (the hint-table
+            // dump, or qpdf's "<name> is not linearized" line). qpdf prints
+            // both to stdout and exits 0; use print! to avoid a second LF.
+            print!("{dump}");
+            Ok(())
+        }
+        Err(ShowLinearizationError::Malformed { message }) => {
+            eprintln!("flpdf: malformed linearization data: {message}");
+            std::process::exit(ExitCode::Errors.as_i32());
+        }
+        Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
+    }
 }
 
 // ---------------------------------------------------------------------------

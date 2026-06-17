@@ -179,7 +179,7 @@ fn show_linearization_dumps_structure() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["show-linearization", output.to_str().unwrap()])
+        .args(["--show-linearization", output.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("linearization data:"))
@@ -198,7 +198,7 @@ fn show_linearization_non_linearized_exits_0() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["show-linearization", input.path().to_str().unwrap()])
+        .args(["--show-linearization", input.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("is not linearized"));
@@ -213,7 +213,7 @@ fn show_linearization_missing_file_exits_2() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "show-linearization",
+            "--show-linearization",
             "/tmp/this_file_does_not_exist_flpdf_showlin_test.pdf",
         ])
         .assert()
