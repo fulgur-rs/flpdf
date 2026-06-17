@@ -1126,7 +1126,9 @@ impl Default for LinearizationPlan {
 /// * `open_document_batches` — containers qpdf categorizes `in_open_document`
 ///   (qpdf part4: the open-document objects placed FIRST in the first half,
 ///   right after the Catalog and before the first-page section). A container
-///   lands here when any member is in [`open_document_set`].
+///   lands here when any member is reachable from the catalog's `/OpenAction`,
+///   `/AcroForm`, `/ViewerPreferences`, `/PageMode`, `/Threads`, or the
+///   trailer's `/Encrypt`.
 /// * `part3_batches` — containers that belong in the first-page section
 ///   (ISO 32000-1 Annex F Part 3 = qpdf part6: shared/catalog objects).
 /// * `part4_batches` — containers that belong after `/E` (Part 4 = qpdf
@@ -1655,20 +1657,30 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
     // indirect refs it contains; qpdf records indirect objects, not inline ones.
     let mut seeds: Vec<ObjectRef> = Vec::new();
     if let Some(enc) = pdf.trailer().get("Encrypt") {
+        // cov:ignore-start: /Encrypt is only meaningful for encrypted+linearized
+        // output (deferred to flpdf-j4ph); the linearize write path rejects
+        // encrypted input (`reject_encrypted_write`) before this helper runs, so
+        // it only ever sees plaintext documents (no trailer /Encrypt).
         collect_direct_refs(enc, 0, &mut seeds)?;
+        // cov:ignore-end
     }
-    if let Some(root) = pdf.root_ref() {
-        if let Object::Dictionary(catalog) = pdf.resolve_borrowed(root)? {
-            for key in [
-                b"ViewerPreferences".as_slice(),
-                b"PageMode",
-                b"Threads",
-                b"OpenAction",
-                b"AcroForm",
-            ] {
-                if let Some(v) = catalog.get(key) {
-                    collect_direct_refs(v, 0, &mut seeds)?;
-                }
+    // Resolve the catalog, propagating real read errors. `Pdf::open` guarantees
+    // a `/Root`, so the `Option` is `Some` in practice; a `/Root` that resolves
+    // to a non-dictionary (malformed) simply yields no open-document seeds.
+    let catalog = pdf
+        .root_ref()
+        .map(|root| pdf.resolve_borrowed(root))
+        .transpose()?;
+    if let Some(Object::Dictionary(catalog)) = catalog {
+        for key in [
+            b"ViewerPreferences".as_slice(),
+            b"PageMode",
+            b"Threads",
+            b"OpenAction",
+            b"AcroForm",
+        ] {
+            if let Some(v) = catalog.get(key) {
+                collect_direct_refs(v, 0, &mut seeds)?;
             }
         }
     }
@@ -4085,5 +4097,122 @@ mod tests {
         let synthetic = vec![vec![info_ref]];
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
         assert_eq!(routes, vec![ContainerPart::Rest]);
+    }
+
+    /// A catalog `/OpenAction` whose action's `/D` destination reaches a `/Page`
+    /// leaf (`[3 0 R /Fit]`) and whose `/Next` reaches a dict that references one
+    /// object twice. Exercises [`open_document_set`]'s page-boundary stop (the
+    /// page is dropped) and the `visited`-dedup short-circuit (the twice-referenced
+    /// object is queued twice but recorded once).
+    fn open_action_page_dest_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offs = [0u64; 7];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(
+            &mut pdf,
+            1,
+            "<< /Type /Catalog /OpenAction 5 0 R /Pages 2 0 R >>",
+        );
+        push(&mut pdf, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+        // Referenced only from the action's /Next; references object 6 twice.
+        push(&mut pdf, 4, "<< /A 6 0 R /B 6 0 R >>");
+        // The action: /D reaches the page (boundary), /Next reaches object 4.
+        push(
+            &mut pdf,
+            5,
+            "<< /Type /Action /S /GoTo /D [3 0 R /Fit] /Next 4 0 R >>",
+        );
+        push(&mut pdf, 6, "<< /Leaf true >>");
+
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 7\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn open_document_set_stops_at_page_and_dedups() {
+        let mut pdf = Pdf::open(Cursor::new(open_action_page_dest_pdf_bytes())).unwrap();
+        let set = open_document_set(&mut pdf).unwrap();
+        // The action (5), its /Next dict (4), and the twice-referenced leaf (6)
+        // are open-document; the /Page leaf (3) is dropped at the boundary and
+        // the /Pages tree (2) is never reached (not an open-document key).
+        let r = |n: u32| ObjectRef::new(n, 0);
+        assert_eq!(
+            set,
+            [r(4), r(5), r(6)].into_iter().collect::<BTreeSet<_>>(),
+            "open-document set = {{action, /Next dict, leaf}}; page leaf dropped"
+        );
+    }
+
+    #[test]
+    fn linearized_routes_open_document_container_before_page_categories() {
+        // A container holding an open-document member routes to part 4
+        // (OpenDocument) even when it ALSO holds a first-page member — qpdf checks
+        // in_open_document before in_first_page.
+        let mut pdf = Pdf::open(Cursor::new(open_action_page_dest_pdf_bytes())).unwrap();
+        // Object 5 is open-document; object 3 is the (first) page. A container
+        // with both must route to OpenDocument (open-document precedence).
+        let synthetic = vec![vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(routes, vec![ContainerPart::OpenDocument]);
+    }
+
+    /// A `/Root` that resolves to a NON-dictionary (a malformed catalog) yields
+    /// no open-document seeds — the `if let Some(Object::Dictionary(..))` does not
+    /// match and the helper returns an empty set. `Pdf::open` tolerates this (the
+    /// catalog-type error only surfaces during page enumeration).
+    fn non_dictionary_root_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offs = [0u64; 4];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(&mut pdf, 1, "42"); // /Root points here — an integer, not a dict
+        push(&mut pdf, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 4\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn open_document_set_empty_for_non_dictionary_catalog() {
+        let mut pdf = Pdf::open(Cursor::new(non_dictionary_root_pdf_bytes())).unwrap();
+        let set = open_document_set(&mut pdf).unwrap();
+        assert!(
+            set.is_empty(),
+            "a non-dictionary catalog must yield no open-document objects, got {set:?}"
+        );
     }
 }

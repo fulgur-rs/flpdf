@@ -117,8 +117,9 @@ pub struct ObjStmRelocation {
     /// first half).  The main xref's `/Index` covers `[0, second_half_count)`
     /// and the first-page xref's `/Index` covers `[second_half_count, /Size)`.
     pub second_half_count: u32,
-    /// Per-batch ObjStm container object numbers, in flat (Part-3 then
-    /// Part-4) batch order.
+    /// Per-batch ObjStm container object numbers, in flat (open-document, then
+    /// Part-3, then Part-4) batch order — the order the writer's ObjStm container
+    /// builder consumes them.
     pub container_numbers: Vec<u32>,
 }
 
@@ -497,10 +498,11 @@ impl RenumberMap {
         }
 
         // `container_numbers` must be returned in `build_from_batches` order
-        // (Part-3 batches first, then Part-4).  The Part-3 containers are
-        // numbered in the FIRST half (high numbers) and Part-4 in the SECOND
-        // half (low numbers), so the returned vector is NOT ascending; the
-        // writer maps each batch to its container by position, not by value.
+        // (open-document, then Part-3, then Part-4).  The open-document and
+        // Part-3 containers are numbered in the FIRST half (high numbers) and
+        // Part-4 in the SECOND half (low numbers), so the returned vector is NOT
+        // ascending; the writer maps each batch to its container by position,
+        // not by value.
         let count_nonempty =
             |batches: &[Vec<ObjectRef>]| batches.iter().filter(|b| !b.is_empty()).count();
         let mut first_half_container_numbers: Vec<u32> =
@@ -1317,27 +1319,33 @@ mod tests {
 
     /// An empty inner batch (defence-in-depth: the writer normally filters these
     /// upstream) must be skipped — it yields no container slot and no members,
-    /// so only the non-empty batch produces a container.
+    /// so only the non-empty batch produces a container. Covers all three batch
+    /// lists (open-document, first-half, second-half).
     #[test]
     fn per_half_skips_empty_batches() {
         let plan = two_page_plan();
         let mut rn = RenumberMap::from_plan(&plan);
 
-        // A first-half batch list with one empty and one non-empty batch, and a
-        // second-half list with one empty and one non-empty batch.
+        // Each batch list carries one empty and one non-empty batch.
+        let open_document_batches = vec![vec![], vec![ObjectRef::new(8, 0)]];
         let first_half_batches = vec![vec![], vec![ObjectRef::new(5, 0)]];
         let second_half_batches = vec![vec![], vec![ObjectRef::new(4, 0)]];
-        let relocation =
-            rn.place_objstm_members_per_half(&[], &first_half_batches, &second_half_batches, &[]);
+        let relocation = rn.place_objstm_members_per_half(
+            &open_document_batches,
+            &first_half_batches,
+            &second_half_batches,
+            &[],
+        );
 
-        // Empty batches contribute no container numbers: one first-half + one
-        // second-half = exactly two containers.
+        // Empty batches contribute no container numbers: one open-document + one
+        // first-half + one second-half = exactly three containers.
         assert_eq!(
             relocation.container_numbers.len(),
-            2,
-            "empty batches must be skipped; only the two non-empty batches yield containers"
+            3,
+            "empty batches must be skipped; only the three non-empty batches yield containers"
         );
-        // Both non-empty members are present in the placed map.
+        // Every non-empty member is present in the placed map.
+        assert!(rn.new_for_original(ObjectRef::new(8, 0)).is_some());
         assert!(rn.new_for_original(ObjectRef::new(5, 0)).is_some());
         assert!(rn.new_for_original(ObjectRef::new(4, 0)).is_some());
     }
