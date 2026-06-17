@@ -37,16 +37,18 @@ fn golden(stem: &str, kind: &str) -> Vec<u8> {
 fn run_cli(stem: &str, extra: &[&str]) -> Vec<u8> {
     let outdir = tempfile::tempdir().unwrap();
     let out = outdir.path().join("out.pdf");
-    let mut args = vec!["rewrite", "--linearize"];
-    args.extend_from_slice(extra);
-    args.push("--deterministic-id");
     let input = fixture(stem);
-    args.push(input.to_str().unwrap());
-    args.push(out.to_str().unwrap());
 
+    // Pass the paths through the builder API (`Path`/`PathBuf` are `AsRef<OsStr>`)
+    // rather than `to_str().unwrap()`, which would panic on a non-UTF-8 temp path.
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(&args)
+        .arg("rewrite")
+        .arg("--linearize")
+        .args(extra)
+        .arg("--deterministic-id")
+        .arg(&input)
+        .arg(&out)
         .assert()
         .success();
 
