@@ -278,6 +278,60 @@ fn openaction_generate_routes_open_document_container_to_first_half() {
     }
 }
 
+/// A fixture whose catalog `/Outlines` reaches an outline dict + 80 items that no
+/// page references (and no `/PageMode /UseOutlines`). qpdf categorizes them
+/// `in_outlines` and emits an Outlines Hint Table (qpdf's `HGeneric`) plus the
+/// hint-stream dict `/O` key. Pins the new outline hint table emission +
+/// round-trip (deflate-independent: the decoded `nobjects` / `first_object` do
+/// not depend on the compression backend, so this runs without qpdf-zlib-compat).
+#[test]
+fn outlines_generate_emits_outline_hint_table_and_o_key() {
+    let bytes = linearize_generate("objstm-lin-outlines-80-80.pdf");
+
+    // The hint-stream dictionary must carry the `/O` (outlines hint table) key.
+    let hint_dict_start = bytes
+        .windows(b"/Filter /FlateDecode /S ".len())
+        .position(|w| w == b"/Filter /FlateDecode /S ")
+        .expect("hint stream dict present");
+    let dict_end = hint_dict_start
+        + bytes[hint_dict_start..]
+            .windows(2)
+            .position(|w| w == b">>")
+            .expect("hint dict close");
+    let hint_dict = &bytes[hint_dict_start..dict_end];
+    assert!(
+        hint_dict.windows(4).any(|w| w == b" /O "),
+        "hint stream dict must carry the /O key when outlines exist: {:?}",
+        String::from_utf8_lossy(hint_dict)
+    );
+
+    // Decode the linearization data and assert the Outlines Hint Table is present
+    // with one output unit (the single ObjStm container holding all 81 outline
+    // objects). first_object = 3 is deflate-independent (object numbering).
+    let dump = flpdf::linearization::show_linearization_bytes(&bytes, "outlines.pdf")
+        .expect("show-linearization decode");
+    assert!(
+        dump.contains("Outlines Hint Table"),
+        "decoded linearization data must include the Outlines Hint Table:\n{dump}"
+    );
+    // `first_object: <n>` is emitted only by the outline (generic) table dump;
+    // object 3 is the single ObjStm container holding all 81 outline objects
+    // (deflate-independent — object numbering does not depend on the backend).
+    assert!(
+        dump.contains("first_object: 3"),
+        "outline hint table first_object must be the outline container (3):\n{dump}"
+    );
+
+    // Round-trip: every object resolves (the outline container's members included).
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
 /// A fixture with a PLAIN (uncompressed, stream) part8 object — a Form XObject
 /// shared by pages 1 & 2 — alongside a part7 container. Exercises the
 /// shared-object hint table's plain-Part-8 branch (`first_object_number` taken

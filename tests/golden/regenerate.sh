@@ -203,12 +203,17 @@ fi
 #                     only from the root /OpenAction key => qpdf in_open_document
 #                     (lc_open_document, part4, first half), plus 80 first-page
 #                     shared fonts. Forces the obj_user open_document category.
+#  - outlines-80-80:  catalog /Outlines -> outline dict + 80 items reachable only
+#                     from the root /Outlines key => qpdf in_outlines (lc_outlines,
+#                     part9 second half via pushOutlinesToPart, with the Outlines
+#                     hint table + hint dict /O), plus 80 first-page shared fonts.
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-mixed-60-70]="gen_mixed_shared.py 60 70"
     [objstm-lin-threepage-2-120]="gen_three_page_shared.py 2 120"
     [objstm-lin-disc-2-250-2]="gen_part7_part8_discriminator.py 2 250 2"
     [objstm-lin-openaction-80-80]="gen_open_action_gap.py 80 80"
+    [objstm-lin-outlines-80-80]="gen_outlines_gap.py 80 80"
 )
 for stem in "${!G6HB2_FIX[@]}"; do
     if [[ ! -f "$FIX/$stem.pdf" ]]; then
@@ -355,7 +360,8 @@ echo "shared-stream-objstm/linearize-objstm.pdf"
 # above for each scenario. Compared structurally (and strictly where flpdf
 # reaches byte-identity) by cmp_linearize_objstm_tests under qpdf-zlib-compat.
 for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
-            objstm-lin-threepage-2-120 objstm-lin-disc-2-250-2; do
+            objstm-lin-threepage-2-120 objstm-lin-disc-2-250-2 \
+            objstm-lin-openaction-80-80 objstm-lin-outlines-80-80; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"

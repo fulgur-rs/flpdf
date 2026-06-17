@@ -1685,6 +1685,25 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
         }
     }
 
+    closure_from_seeds(pdf, seeds)
+}
+
+/// Transitive closure of indirect objects reachable from `seeds`, stopping at
+/// `/Page` leaves.
+///
+/// Mirrors qpdf's `updateObjectMapsInternal` (QPDF_optimization.cc:271-337) used
+/// to record a document-level key's object users: it records every indirect
+/// object it reaches but neither records nor descends a non-top `/Page` leaf (a
+/// page boundary), so a destination like `[page /Fit]` drops the page. A single
+/// shared `visited` set suffices because the result is the union over all seeds.
+///
+/// # Errors
+///
+/// Propagates reader errors from resolving any reached object.
+fn closure_from_seeds<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    seeds: Vec<ObjectRef>,
+) -> crate::Result<BTreeSet<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut queue: VecDeque<ObjectRef> = seeds.into_iter().collect();
@@ -1710,6 +1729,34 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
         }
     }
     Ok(out)
+}
+
+/// Compute the set of objects qpdf categorizes `in_outlines`.
+///
+/// Mirrors qpdf's `optimize()` ou_root_key "/Outlines" users
+/// (QPDF_optimization.cc:103-110) and the `in_outlines` test in
+/// `calculateLinearizationData` (QPDF_linearization.cc:1092-1093): every indirect
+/// object reachable from the document catalog's `/Outlines` entry, with the same
+/// `/Page`-boundary traversal as [`open_document_set`].
+///
+/// qpdf categorizes `in_outlines` with HIGHER precedence than both
+/// `in_open_document` and `in_first_page` (QPDF_linearization.cc:1118-1122).
+///
+/// # Errors
+///
+/// Propagates reader errors from resolving the catalog or any reached object.
+pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
+    let mut seeds: Vec<ObjectRef> = Vec::new();
+    let catalog = pdf
+        .root_ref()
+        .map(|root| pdf.resolve_borrowed(root))
+        .transpose()?;
+    if let Some(Object::Dictionary(catalog)) = catalog {
+        if let Some(v) = catalog.get("Outlines") {
+            collect_direct_refs(v, 0, &mut seeds)?;
+        }
+    }
+    closure_from_seeds(pdf, seeds)
 }
 
 /// Route each ObjStm container to a linearization part by the union of its
@@ -4159,6 +4206,75 @@ mod tests {
             [r(4), r(5), r(6)].into_iter().collect::<BTreeSet<_>>(),
             "open-document set = {{action, /Next dict, leaf}}; page leaf dropped"
         );
+    }
+
+    /// A catalog `/Outlines` -> outline dict -> one item. [`outlines_set`] must
+    /// collect the outline dict + item and exclude the page tree.
+    fn outlines_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offs = [0u64; 7];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(
+            &mut pdf,
+            1,
+            "<< /Type /Catalog /Outlines 5 0 R /Pages 2 0 R >>",
+        );
+        push(&mut pdf, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+        // 4 is unused (keeps numbering parallel to the other crafted fixtures).
+        push(&mut pdf, 4, "<< /Unused true >>");
+        push(
+            &mut pdf,
+            5,
+            "<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>",
+        );
+        push(&mut pdf, 6, "<< /Title (Item) /Parent 5 0 R >>");
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 7\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn outlines_set_collects_outline_tree_and_excludes_pages() {
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes())).unwrap();
+        let set = outlines_set(&mut pdf).unwrap();
+        let r = |n: u32| ObjectRef::new(n, 0);
+        assert_eq!(
+            set,
+            [r(5), r(6)].into_iter().collect::<BTreeSet<_>>(),
+            "outlines set = {{outline dict, item}}; pages tree excluded"
+        );
+    }
+
+    #[test]
+    fn outlines_set_empty_when_no_outlines() {
+        // The two-page fixture has no /Outlines key, so the set is empty (no /O).
+        let mut pdf = Pdf::open(Cursor::new(two_page_shared_font_bytes())).unwrap();
+        assert!(outlines_set(&mut pdf).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outlines_set_empty_for_non_dictionary_catalog() {
+        // A /Root resolving to a non-dictionary yields no outline seeds (the
+        // `if let Some(Object::Dictionary(..))` does not match).
+        let mut pdf = Pdf::open(Cursor::new(non_dictionary_root_pdf_bytes())).unwrap();
+        assert!(outlines_set(&mut pdf).unwrap().is_empty());
     }
 
     #[test]
