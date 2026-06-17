@@ -265,76 +265,45 @@ impl SharedObjectHintTable {
         // When there ARE Part-8 shared objects, emit the renumbered object ID
         // of the first entry in `part4_other_pages_shared`.
         //
-        // Fail fast on plan/renumber inconsistency for the part8 case.
         // ------------------------------------------------------------------
-        let first_object_number: u32 = if plan.part4_other_pages_shared.is_empty() {
-            // No Part-8 shared objects: value is meaningless per Note 131.
-            // Emit 0 (qpdf also emits 0 in this path per line 1400-1403 of
-            // QPDF_linearization.cc: first_shared_obj is only set when
-            // part8 is non-empty).
-            0
-        } else {
-            let first_part8 = plan.part4_other_pages_shared[0];
-            renumber
-                .new_for_original(first_part8)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "first Part-8 shared object {:?} not found in RenumberMap \
-                         (plan/renumber inconsistency)",
-                        first_part8
-                    )
-                })
-                .number
-        };
-
-        // ------------------------------------------------------------------
-        // Step 2: count shared objects that are physically in the first-page
-        // section (before /E).
+        // Step 2: split the folded shared list into the first-page section and
+        // the Part-8 (after-/E) section, and find the first Part-8 object.
         //
-        // `shared_hints` is laid out as:
-        //   [part2 entries] + [part3 entries] + [part4_other_pages_shared entries]
-        //
-        // Only the part2 + part3 entries are physically in the first-page
-        // section (before /E).  The part4_other_pages_shared entries live
-        // after /E, so `first_page_entries` must NOT include them.
-        //
-        // Setting `first_page_entries = shared_count` (the old value) when
-        // there are part4 shared objects would tell qpdf that ALL shared
-        // objects are in the first-page section, contradicting the actual
-        // file layout and causing "in computed list but not hint table"
-        // warnings for those objects.
-        //
-        // `first_page_entries` = the folded shared entries physically in the
-        // first-page section (Part-2 + Part-3, with packed Part-3 members folded
-        // into their first-half container).  The remainder
-        // (section_entries - first_page_entries) are the Part-8 (after-/E)
-        // shared objects, counted in the SAME folded form as `shared_count`:
-        // `part4_other_pages_shared` members packed into a second-half ObjStm
-        // container fold to one shared entry per container (see
-        // [`LinearizationPlan::canonical_shared_hints`]), so subtracting the
-        // unfolded `part4_other_pages_shared.len()` would over-count the Part-8
-        // region and undercount `first_page_entries`.  Mirror the fold here so
-        // the count stays consistent with the folded list regardless of ObjStm
-        // packing.
-        // ------------------------------------------------------------------
-        let part8_entries = {
-            let mut seen_containers = std::collections::BTreeSet::new();
-            let mut count = 0u32;
-            for r in &plan.part4_other_pages_shared {
-                match member_to_container.get(r) {
-                    // One folded entry per distinct second-half container.
-                    Some(&(container_num, _)) => {
-                        if seen_containers.insert(container_num) {
-                            count += 1;
-                        }
-                    }
-                    // Plain (uncompressed) Part-8 object: its own entry.
-                    None => count += 1,
-                }
-            }
-            count
-        };
+        // `shared_hints` is `canonical_shared_hints` output: the first-page
+        // section (Part-2/Part-3, with eligible members folded into part6
+        // containers) followed by the Part-8 section. The Part-8 section is the
+        // plain `part4_other_pages_shared` objects PLUS the part8 ObjStm
+        // containers `canonical_shared_hints` appends — containers the global even
+        // split filled with page-private objects, which are shared objects qpdf
+        // lists even though no individual member is `part4_other_pages_shared`.
+        // So the Part-8 count is the part8 containers plus the plain (no-container)
+        // `part4_other_pages_shared` objects.
+        let part8_containers = plan.part8_container_nums(member_to_container);
+        let part8_plain = plan
+            .part4_other_pages_shared
+            .iter()
+            .filter(|r| !member_to_container.contains_key(r))
+            .count() as u32;
+        let part8_entries = part8_containers.len() as u32 + part8_plain;
         let first_page_entries = shared_count.saturating_sub(part8_entries);
+
+        // first_object_number (Annex F.4.1 item 1): the object number of the
+        // first object in the Part-8 section. `canonical_shared_hints` orders that
+        // section by physical object number, so it is the entry at index
+        // `first_page_entries` — 0 when there is no Part-8 section (meaningless per
+        // Implementation Note 131; qpdf emits 0 too).
+        let first_object_number: u32 =
+            shared_hints
+                .get(first_page_entries as usize)
+                .map_or(0, |e| {
+                    if e.object_ref.generation == u16::MAX {
+                        e.object_ref.number
+                    } else {
+                        renumber
+                            .new_for_original(e.object_ref)
+                            .map_or(0, |r| r.number)
+                    }
+                });
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.

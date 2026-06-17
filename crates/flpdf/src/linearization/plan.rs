@@ -430,6 +430,16 @@ pub struct LinearizationPlan {
     /// and to populate the Page Offset Hint Table's `page_length_minus_least`
     /// and `least_page_length` fields.
     pub per_page_private_objects: Vec<Vec<ObjectRef>>,
+
+    /// Full object → referencing-page inverse map: `all_referenced_pages[r]` is
+    /// the set of 0-based page indices whose closure reaches `r`.
+    ///
+    /// Used to compute a shared ObjStm container's referencing pages from its
+    /// FULL membership — the global even split can place a page's *private*
+    /// object inside a container in another section (the first-page part6
+    /// container or a part8 shared container), and the page then references that
+    /// container as a shared object. Keyed by original ref.
+    pub all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>>,
 }
 
 impl LinearizationPlan {
@@ -781,6 +791,7 @@ impl LinearizationPlan {
             page_hints,
             shared_hints,
             per_page_private_objects,
+            all_referenced_pages,
         })
     }
 
@@ -836,6 +847,65 @@ impl LinearizationPlan {
     /// its new number, so it is never resolved through the
     /// [`RenumberMap`].
     ///
+    /// ObjStm container object numbers that are qpdf **part8** (other-page-shared)
+    /// objects: their members reach two or more pages but none is a first-page
+    /// (Part-2 / Part-3) object.
+    ///
+    /// The global even split can fill such a container entirely with objects that
+    /// are individually page-*private* (one page's privates co-located with
+    /// another's), so the container does not appear in `shared_hints` (built from
+    /// the per-object part2/part3/part4_shared partition) even though it is a
+    /// shared object that belongs in the shared-object hint table. This enumerates
+    /// those containers so the table and its entry counts include them.
+    pub(crate) fn part8_container_nums(
+        &self,
+        member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
+    ) -> BTreeSet<u32> {
+        let first_page: BTreeSet<ObjectRef> = self
+            .part2_objects
+            .iter()
+            .chain(&self.part3_objects)
+            .copied()
+            .collect();
+        let part4_shared: BTreeSet<ObjectRef> =
+            self.part4_other_pages_shared.iter().copied().collect();
+
+        let mut all_containers: BTreeSet<u32> = BTreeSet::new();
+        let mut container_pages: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let mut has_first_page_member: BTreeSet<u32> = BTreeSet::new();
+        let mut has_shared_member: BTreeSet<u32> = BTreeSet::new();
+        for (member, &(cnum, _)) in member_to_container {
+            all_containers.insert(cnum);
+            if first_page.contains(member) {
+                has_first_page_member.insert(cnum);
+            }
+            // A reach-≥2 (part4_other_pages_shared) member makes the container a
+            // shared object directly — used when `all_referenced_pages` is absent
+            // (e.g. manually-built plans) and as a robust signal otherwise.
+            if part4_shared.contains(member) {
+                has_shared_member.insert(cnum);
+            }
+            if let Some(pages) = self.all_referenced_pages.get(member) {
+                container_pages
+                    .entry(cnum)
+                    .or_default()
+                    .extend(pages.iter().copied().filter(|&p| p != 0));
+            }
+        }
+        // A container is part8 when no member is a first-page object AND it is
+        // shared — either it holds an explicitly-shared (reach-≥2) member, or its
+        // members span two or more pages (the even split co-located two pages'
+        // privates).
+        all_containers
+            .into_iter()
+            .filter(|cnum| {
+                !has_first_page_member.contains(cnum)
+                    && (has_shared_member.contains(cnum)
+                        || container_pages.get(cnum).is_some_and(|p| p.len() >= 2))
+            })
+            .collect()
+    }
+
     /// An empty `member_to_container` yields a clone of `shared_hints` (the
     /// no-ObjStm / classic path is unchanged).
     pub(crate) fn canonical_shared_hints(
@@ -909,7 +979,7 @@ impl LinearizationPlan {
         // generation `u16::MAX`; a plain entry carries an original ref resolved
         // through `renumber`. Part-8 entries (after the boundary) stay in place.
         let boundary = first_page_out_end.unwrap_or(out.len());
-        out[..boundary].sort_unstable_by_key(|e| {
+        let new_number = |e: &SharedObjectHintEntry| -> u32 {
             if e.object_ref.generation == u16::MAX {
                 e.object_ref.number
             } else {
@@ -918,7 +988,62 @@ impl LinearizationPlan {
                     .expect("shared hint object must exist in RenumberMap")
                     .number
             }
-        });
+        };
+        out[..boundary].sort_unstable_by_key(&new_number);
+
+        // Append any qpdf part8 (other-page-shared) ObjStm container that the
+        // even split filled entirely with page-PRIVATE objects: such a container
+        // never appears in `shared_hints` (no part2/part3/part4_shared member) but
+        // IS a shared object in qpdf's hint table. Skip containers already folded
+        // into `out` (those carry a part4_shared member). Then order the whole
+        // Part-8 section by physical object number, matching qpdf's ObjGen-keyed
+        // `lc_other_page_shared`.
+        for cnum in self.part8_container_nums(member_to_container) {
+            if !container_pos.contains_key(&cnum) {
+                out.push(SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(cnum, u16::MAX),
+                    referencing_pages: Vec::new(), // recomputed below
+                });
+            }
+        }
+        out[boundary..].sort_unstable_by_key(&new_number);
+
+        // Recompute each entry's referencing pages from its FULL membership via
+        // `all_referenced_pages` (excluding page 0, which owns the first-page
+        // section and lists no shared identifiers). The fold above unions only
+        // the `shared_hints` inputs (part2/part3/part4_shared); the global even
+        // split can also place a page's PRIVATE object inside a shared container
+        // (the first-page part6 container, or a part8 container co-locating two
+        // pages' privates), and the page then references that container through
+        // the private object — a reference the input entries do not record. This
+        // is a no-op for documents whose containers hold only shared_hints
+        // objects (the union is identical).
+        if !self.all_referenced_pages.is_empty() {
+            let mut container_members: BTreeMap<u32, Vec<ObjectRef>> = BTreeMap::new();
+            for (&member, &(cnum, _)) in member_to_container {
+                container_members.entry(cnum).or_default().push(member);
+            }
+            let pages_excluding_first = |refs: &mut dyn Iterator<Item = ObjectRef>| -> Vec<u32> {
+                let mut pages: BTreeSet<u32> = BTreeSet::new();
+                for r in refs {
+                    if let Some(ps) = self.all_referenced_pages.get(&r) {
+                        pages.extend(ps.iter().copied().filter(|&p| p != 0));
+                    }
+                }
+                pages.into_iter().collect()
+            };
+            for entry in &mut out {
+                entry.referencing_pages = if entry.object_ref.generation == u16::MAX {
+                    let members = container_members
+                        .get(&entry.object_ref.number)
+                        .cloned()
+                        .unwrap_or_default();
+                    pages_excluding_first(&mut members.into_iter())
+                } else {
+                    pages_excluding_first(&mut std::iter::once(entry.object_ref))
+                };
+            }
+        }
 
         out
     }
@@ -981,6 +1106,7 @@ impl Default for LinearizationPlan {
             page_hints: Vec::new(),
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
+            all_referenced_pages: BTreeMap::new(),
         }
     }
 }
@@ -1053,65 +1179,59 @@ impl LinearizationPlan {
         let ctx = eligibility_context(pdf)?;
         let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
 
-        let mut plan = match config.mode {
+        let plan = match config.mode {
             ObjectStreamMode::Disable => unreachable!(),
             ObjectStreamMode::Generate => {
+                // The Generate path reproduces qpdf's linearized
+                // `generateObjectStreams` directly: a GLOBAL even split over the
+                // compressible set, with the page dictionaries + root Catalog
+                // erased and `/Info` / the `/Pages` tree kept as ordinary
+                // members. That membership is already qpdf-canonical, so it does
+                // NOT go through `canonicalise_first_half_batch` /
+                // `drop_from_part4_batches` (those reshape the per-part greedy
+                // batches the Generate path no longer produces).
                 self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions)?
             }
             ObjectStreamMode::Preserve => {
-                self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)?
+                let mut plan =
+                    self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)?;
+
+                // Canonicalise the first-half ObjStm member set to qpdf's
+                // linearized layout. qpdf packs the first page's shared resource
+                // dicts PLUS the `/Pages` tree and `/Info` into ONE first-half
+                // container and keeps the `/Catalog` standalone. flpdf's Preserve
+                // planner emits first-page shared objects as `part3_batches` and
+                // would otherwise route `/Pages`/`/Info`/`/Catalog` through
+                // `part4_batches`; fold `/Pages` + `/Info` into the first-half
+                // batch and drop `/Catalog`/`/Pages`/`/Info` from Part 4 so the
+                // membership matches qpdf. (The Generate path achieves the same
+                // layout structurally via the global even split, above.)
+                //
+                // The `/Catalog` is NEVER compressed by qpdf, so its Part-4
+                // exclusion is unconditional; the `/Pages` + `/Info` fold only
+                // applies when a first-half batch already exists (multi-page with
+                // first-page shared objects). A single-page / no-shared Preserve
+                // run leaves `/Pages` + `/Info` in the second half.
+                if let Some(catalog_ref) = self.root_ref {
+                    Self::drop_from_part4_batches(&mut plan, &BTreeSet::from([catalog_ref]));
+                }
+                if !plan.part3_batches.is_empty() {
+                    // cov:ignore-start: the `?` error arm is unreachable in tests
+                    // — `canonicalise_first_half_batch` only propagates a
+                    // `pdf.resolve_borrowed` failure on /Info or the /Pages tree,
+                    // which does not occur for well-formed inputs.
+                    self.canonicalise_first_half_batch(
+                        pdf,
+                        &ctx,
+                        &length_exclusions,
+                        config.batch_size_cap.get(),
+                        &mut plan,
+                    )?;
+                    // cov:ignore-end
+                }
+                plan
             }
         };
-
-        // Canonicalise the first-half ObjStm member set to qpdf's linearized
-        // layout.  qpdf 11.9.0 packs exactly the first page's shared resource
-        // dicts (its `/Font` dict + `/Font`) PLUS the `/Pages` tree and `/Info`
-        // dictionary into ONE first-half ObjStm container, and keeps the
-        // document `/Catalog` standalone (uncompressed).  flpdf's planner emits
-        // the first-page shared objects as `part3_batches` and would otherwise
-        // route `/Pages`/`/Info`/`/Catalog` through `part4_batches`; here we
-        // fold `/Pages` + `/Info` into the first-half (Part-3) batch and drop
-        // `/Catalog`/`/Pages`/`/Info` from the Part-4 batches so the resulting
-        // container membership matches qpdf for both Generate and Preserve.
-        //
-        // qpdf re-derives this canonical partition regardless of the source
-        // ObjStm boundaries (observed: `--object-streams=preserve` on a
-        // single-container source still emits the canonical first-half
-        // container).  Apply it only when there is already a first-half
-        // (Part-3) batch to augment — i.e. the document has first-page SHARED
-        // objects (multi-page).  Single-page files have no first-page shared
-        // objects (`part3_batches` is empty), so qpdf's first-half member set
-        // does not apply: `/Pages` + `/Info` stay in the second-half Part-4
-        // container, matching flpdf's prior single-page output (and avoiding a
-        // first-half container that would leave the page-private resource dicts
-        // — which flpdf keeps plain — straddling `/E`).  A Preserve run over a
-        // source with NO ObjStms likewise has no batches, so nothing is folded.
-        //
-        // The document `/Catalog`, however, is NEVER compressed by qpdf in any
-        // object-stream mode, so its Part-4 exclusion is unconditional — the
-        // `/Pages` + `/Info` first-half fold is what depends on a first-half
-        // batch existing.  Without this, a single-page / no-first-page-shared
-        // Generate document (where `part3_batches` is empty and
-        // `canonicalise_first_half_batch` is skipped) would pack an eligible
-        // `/Catalog` into a Part-4 ObjStm container.
-        if let Some(catalog_ref) = self.root_ref {
-            Self::drop_from_part4_batches(&mut plan, &BTreeSet::from([catalog_ref]));
-        }
-
-        if !plan.part3_batches.is_empty() {
-            // cov:ignore-start: the `?` error arm is unreachable in tests —
-            // `canonicalise_first_half_batch` only propagates a
-            // `pdf.resolve_borrowed` failure on /Info or the /Pages tree, which
-            // does not occur for well-formed inputs.
-            self.canonicalise_first_half_batch(
-                pdf,
-                &ctx,
-                &length_exclusions,
-                config.batch_size_cap.get(),
-                &mut plan,
-            )?;
-            // cov:ignore-end
-        }
 
         Ok(plan)
     }
@@ -1227,85 +1347,45 @@ impl LinearizationPlan {
         Ok(())
     }
 
-    /// Generate mode: pack eligible Part-3 and Part-4 objects into fresh ObjStm batches.
+    /// Generate mode: reproduce qpdf's linearized `generateObjectStreams`.
+    ///
+    /// A GLOBAL even split over the compressible set
+    /// ([`objstm_membership_linearized`]), with the page dictionaries + root
+    /// Catalog erased, then each container routed to a linearization part by the
+    /// union of its members' page users ([`route_objstm_containers`]). Containers
+    /// routed to part 6 ([`ContainerPart::FirstPage`]) become first-half
+    /// (`part3_batches`); every other container becomes second-half
+    /// (`part4_batches`). Within a container, members are ordered by ascending
+    /// source object number (qpdf's `object_stream_to_objects` is a
+    /// `std::set<QPDFObjGen>`).
+    ///
+    /// This replaces flpdf's earlier per-part greedy chunking, which diverged
+    /// from qpdf at `>cap` (see `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`).
+    ///
+    /// The `config` / `ctx` / `length_exclusions` arguments are unused: the
+    /// compressible-set traversal applies qpdf's own eligibility and a fixed
+    /// 100-per-stream split (not the planner cap).
     fn objstm_batches_generate<R: Read + Seek>(
         &self,
         pdf: &mut Pdf<R>,
-        config: &PlannerConfig,
-        ctx: &crate::writer::object_streams::EligibilityContext,
-        length_exclusions: &BTreeSet<ObjectRef>,
+        _config: &PlannerConfig,
+        _ctx: &crate::writer::object_streams::EligibilityContext,
+        _length_exclusions: &BTreeSet<ObjectRef>,
     ) -> crate::Result<ObjStmBatchPlan> {
-        use crate::XrefOffset;
+        let containers = objstm_membership_linearized(pdf)?;
+        let routes = route_objstm_containers(pdf, &containers)?;
 
-        let cap = config.batch_size_cap.get();
-
-        // Build a free-ref exclusion set so we don't accidentally pack deleted
-        // objects (resolves to Null but may be in object_refs()).
-        let source_entries = pdf.source_xref_entries();
-        let free_refs: BTreeSet<ObjectRef> = source_entries
-            .iter()
-            .filter_map(|(r, offset)| {
-                if matches!(offset, XrefOffset::Free { .. }) {
-                    Some(*r)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
-
-        // Pack Part 3 eligible objects.
-        let part3_batches = Self::pack_into_batches(
-            self.part3_objects.iter().copied(),
-            &part2_set,
-            &free_refs,
-            length_exclusions,
-            ctx,
-            pdf,
-            cap,
-        )?;
-
-        // Pack Part 4 eligible objects.  Part 4 is NOT a single flat group: a
-        // batch must never co-locate objects with different page ownership,
-        // otherwise the resulting ObjStm container cannot be placed in a single
-        // page-private span and the Page Offset Hint Table's object_count /
-        // byte_length (which assume per-page ownership) and the linearization
-        // order would be corrupted.  Batch each ownership group independently:
-        //   (1) each non-first page's private objects (per_page_private_objects
-        //       index >= 1; index 0 is part2_objects, already excluded),
-        //   (2) part4_other_pages_shared (qpdf part8),
-        //   (3) part4_rest (qpdf part9: pages tree / info / orphans).
+        let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
-        for page_private in self.per_page_private_objects.iter().skip(1) {
-            part4_batches.extend(Self::pack_into_batches(
-                page_private.iter().copied(),
-                &part2_set,
-                &free_refs,
-                length_exclusions,
-                ctx,
-                pdf,
-                cap,
-            )?);
+        for (mut members, route) in containers.into_iter().zip(routes) {
+            members.sort_unstable_by_key(|r| r.number);
+            match route {
+                ContainerPart::FirstPage => part3_batches.push(members),
+                ContainerPart::OtherPagePrivate
+                | ContainerPart::OtherPageShared
+                | ContainerPart::Rest => part4_batches.push(members),
+            }
         }
-        part4_batches.extend(Self::pack_into_batches(
-            self.part4_other_pages_shared.iter().copied(),
-            &part2_set,
-            &free_refs,
-            length_exclusions,
-            ctx,
-            pdf,
-            cap,
-        )?);
-        part4_batches.extend(Self::pack_into_batches(
-            self.part4_rest.iter().copied(),
-            &part2_set,
-            &free_refs,
-            length_exclusions,
-            ctx,
-            pdf,
-            cap,
-        )?);
 
         Ok(ObjStmBatchPlan {
             part3_batches,
@@ -1443,44 +1523,159 @@ impl LinearizationPlan {
             part4_batches,
         })
     }
+}
 
-    /// Helper: iterate `candidates`, filter by eligibility, and pack into cap-sized batches.
-    ///
-    /// Objects in `part2_set` or `free_refs` are skipped unconditionally.
-    fn pack_into_batches<R: Read + Seek>(
-        candidates: impl Iterator<Item = ObjectRef>,
-        part2_set: &BTreeSet<ObjectRef>,
-        free_refs: &BTreeSet<ObjectRef>,
-        length_exclusions: &BTreeSet<ObjectRef>,
-        ctx: &crate::writer::object_streams::EligibilityContext,
-        pdf: &mut Pdf<R>,
-        cap: usize,
-    ) -> crate::Result<Vec<Vec<ObjectRef>>> {
-        let mut current_batch: Vec<ObjectRef> = Vec::new();
-        let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
+// ---------------------------------------------------------------------------
+// Linearized generate-mode ObjStm membership + container part routing
+//
+// These mirror qpdf 11.9.0's linearized `--object-streams=generate` pipeline:
+//   * `objstm_membership_linearized` = `generateObjectStreams` (global even
+//     split over `getCompressibleObjGens`) then the linearized erasure of every
+//     page dictionary and the root Catalog (QPDFWriter.cc:2141-2161).
+//   * `route_objstm_containers` = `filterCompressedObjects`
+//     (QPDF_optimization.cc:340-380) folding each member's obj_users onto its
+//     container, then `calculateLinearizationData`'s `lc_*` categorization
+//     (QPDF_linearization.cc:963-1200) applied to the container's union.
+// ---------------------------------------------------------------------------
 
-        for obj_ref in candidates {
-            if part2_set.contains(&obj_ref) || free_refs.contains(&obj_ref) {
-                continue;
-            }
-            if length_exclusions.contains(&obj_ref) {
-                continue;
-            }
-            let obj = pdf.resolve_borrowed(obj_ref)?;
-            if !is_eligible_for_objstm(obj_ref, obj, ctx) {
-                continue;
-            }
-            current_batch.push(obj_ref);
-            if current_batch.len() >= cap {
-                batches.push(std::mem::take(&mut current_batch));
-            }
-        }
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
+/// Linearization part a generate-mode ObjStm container is routed to, by the
+/// union of its members' page users.
+///
+/// `FirstPage` is qpdf part 6 (first-page section), `OtherPagePrivate` part 7,
+/// `OtherPageShared` part 8, and `Rest` part 9. The open-document / outline /
+/// thumbnail categories qpdf checks *before* `in_first_page` are not modeled
+/// (see [`route_objstm_containers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerPart {
+    /// qpdf part 6 — the container holds at least one first-page object.
+    FirstPage,
+    /// qpdf part 7 — the container's members are private to exactly one
+    /// non-first page.
+    OtherPagePrivate,
+    /// qpdf part 8 — the container's members are shared by two or more
+    /// non-first pages.
+    OtherPageShared,
+    /// qpdf part 9 — the container reaches no page (trailer-only members).
+    Rest,
+}
 
-        Ok(batches)
+/// Compute the linearized generate-mode ObjStm membership.
+///
+/// Runs qpdf's `generateObjectStreams` even split
+/// ([`compressible_objgens`](crate::writer::object_streams::compressible_objgens)
+/// →
+/// [`even_split_into_streams`](crate::writer::object_streams::even_split_into_streams),
+/// hard-coded 100 per stream — *not* the planner cap) over the whole document,
+/// then erases every page dictionary and the root Catalog from the resulting
+/// containers (qpdf's linearized exclusion at QPDFWriter.cc:2141-2161; the
+/// `/Pages` tree node and `/Info` dictionary are *not* erased — they stay ObjStm
+/// members). Containers are returned in even-split order; each inner vector is
+/// one container's surviving members in even-split (DFS) order. A container left
+/// empty by the erasure is dropped.
+///
+/// # Errors
+///
+/// Propagates reader errors from the compressible-set traversal or the page-tree
+/// walk used to build the erase set.
+pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> crate::Result<Vec<Vec<ObjectRef>>> {
+    let eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
+
+    // Erase set: every page dictionary plus the root Catalog. qpdf cannot place
+    // a page dict in an ObjStm (the linearization layout addresses pages by
+    // file offset) and never compresses the Catalog in a linearized file.
+    let mut erase: BTreeSet<ObjectRef> = crate::pages::page_refs(pdf)?.into_iter().collect();
+    if let Some(root) = pdf.root_ref() {
+        erase.insert(root);
     }
+
+    Ok(streams
+        .into_iter()
+        .map(|stream| {
+            stream
+                .into_iter()
+                .filter(|r| !erase.contains(r))
+                .collect::<Vec<ObjectRef>>()
+        })
+        .filter(|container| !container.is_empty())
+        .collect())
+}
+
+/// Route each ObjStm container to a linearization part by the union of its
+/// members' page users.
+///
+/// Mirrors qpdf's `filterCompressedObjects` (the container inherits the union of
+/// every member's obj_users) followed by the `lc_*` categorization: a container
+/// holding any first-page object is part 6 ([`ContainerPart::FirstPage`]);
+/// otherwise it is part 7 / part 8 / part 9 by the number of *distinct non-first*
+/// pages its members reach (one → [`ContainerPart::OtherPagePrivate`], two or
+/// more → [`ContainerPart::OtherPageShared`], none →
+/// [`ContainerPart::Rest`]).
+///
+/// The page-user signals (first-page closure and the per-object referencing-page
+/// map) are recomputed exactly as [`LinearizationPlan::from_pdf`] derives them.
+///
+/// # Deviation
+///
+/// qpdf checks `in_open_document` (/OpenAction, /AcroForm, /ViewerPreferences,
+/// /PageMode, /Threads), `in_outlines`, and the thumbnail categories *before*
+/// `in_first_page`, so such a member would route its whole container to part 4 /
+/// part 9. That is not modeled here: those objects do not occur in the supported
+/// corpus, and the always-first-page objects (/Info, /Catalog, the /Pages tree)
+/// are DFS-early and therefore always land in the first container, which is
+/// first-page regardless. See `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`.
+///
+/// # Errors
+///
+/// Propagates reader errors from the page-tree walk or the per-page closures.
+pub(crate) fn route_objstm_containers<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    containers: &[Vec<ObjectRef>],
+) -> crate::Result<Vec<ContainerPart>> {
+    let page_refs = crate::pages::page_refs(pdf)?;
+
+    let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
+        Some(&first_page) => compute_closure(pdf, first_page)?.into_iter().collect(),
+        // A linearizable document always has at least one page, so the page-less
+        // branch never fires on the generate-mode call path.
+        None => BTreeSet::new(), // cov:ignore: page-less catalog unreachable here
+    };
+
+    // obj_user page map: object -> set of page indices whose closure reaches it.
+    let mut referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
+    for &r in &first_page_set {
+        referenced_pages.entry(r).or_default().insert(0);
+    }
+    for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
+        for r in compute_closure(pdf, page_ref)? {
+            referenced_pages
+                .entry(r)
+                .or_default()
+                .insert(page_idx as u32);
+        }
+    }
+
+    Ok(containers
+        .iter()
+        .map(|members| {
+            if members.iter().any(|m| first_page_set.contains(m)) {
+                return ContainerPart::FirstPage;
+            }
+            let mut other_pages: BTreeSet<u32> = BTreeSet::new();
+            for m in members {
+                if let Some(pages) = referenced_pages.get(m) {
+                    other_pages.extend(pages.iter().copied().filter(|&p| p != 0));
+                }
+            }
+            match other_pages.len() {
+                0 => ContainerPart::Rest,
+                1 => ContainerPart::OtherPagePrivate,
+                _ => ContainerPart::OtherPageShared,
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -3551,5 +3746,240 @@ mod tests {
         assert_eq!(folded[3].object_ref, ObjectRef::new(11, u16::MAX));
         // Part-8 entry stays last (not pulled into the first-page sort).
         assert_eq!(folded[4].object_ref, other_shared);
+    }
+
+    // -- Linearized generate-mode membership + container part routing --------
+    //
+    // These exercise `objstm_membership_linearized` + `route_objstm_containers`
+    // against the qpdf-11.9.0-measured ground truth (the Rust builders below are
+    // ports of docs/plans/tools/gen_mixed_shared.py and gen_three_page_shared.py;
+    // the routing assertions match `qpdf --linearize --object-streams=generate`).
+
+    /// Serialize objects (sorted by number) into a classic-xref PDF body with a
+    /// `/Root 1 0 R /Info 6 0 R`-style trailer. `info_obj` is the /Info object
+    /// number; `max_obj` is the highest object number present.
+    fn assemble_classic_pdf(bodies: Vec<(u32, String)>, info_obj: u32, max_obj: u32) -> Vec<u8> {
+        let mut bodies = bodies;
+        bodies.sort_by_key(|(n, _)| *n);
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n");
+        let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+        for (n, body) in &bodies {
+            offsets.insert(*n, pdf.len() as u64);
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = pdf.len() as u64;
+        let size = max_obj + 1;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for n in 1..size {
+            xref.push_str(&format!("{:010} 00000 n \n", offsets[&n]));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R /Info {info_obj} 0 R >>\n\
+                 startxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// Port of `gen_mixed_shared.py s p`: 2 pages, page 0 references `s` shared
+    /// fonts, page 1 references those `s` shared fonts plus `p` page-1-only fonts,
+    /// trailer carries /Info. Layout: 1=Catalog 2=Pages 3=Page0 4=Page1 5=Info,
+    /// 6..=5+s shared fonts, then `p` page-1-only fonts, then the two content
+    /// streams. Font keys `/S#`,`/P#` sort lexically (matching the python).
+    fn mixed_shared_pdf_bytes(s: u32, p: u32) -> Vec<u8> {
+        let shared0 = 6u32;
+        let p1only0 = shared0 + s;
+        let c0 = p1only0 + p;
+        let c1 = c0 + 1;
+        let shared_res: String = (0..s)
+            .map(|i| format!("/S{} {} 0 R", i + 1, shared0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let p1_extra: String = (0..p)
+            .map(|i| format!("/P{} {} 0 R", i + 1, p1only0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut bodies: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Count 2 /Kids [ 3 0 R 4 0 R ] >>".to_string()),
+            (5, "<< /Producer (flpdf-g6hb mixed fixture) >>".to_string()),
+            (3, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {shared_res} >> >> /Contents {c0} 0 R >>"
+            )),
+            (4, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {shared_res} {p1_extra} >> >> /Contents {c1} 0 R >>"
+            )),
+        ];
+        for i in 0..s {
+            let n = shared0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /S{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for i in 0..p {
+            let n = p1only0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /P{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for (cnum, label) in [(c0, "Page0"), (c1, "Page1")] {
+            let stream = format!("BT /S1 12 Tf 72 720 Td ({label}) Tj ET");
+            bodies.push((
+                cnum,
+                format!(
+                    "<< /Length {} >>\nstream\n{stream}\nendstream",
+                    stream.len()
+                ),
+            ));
+        }
+        assemble_classic_pdf(bodies, 5, c1)
+    }
+
+    /// Port of `gen_three_page_shared.py p0 g`: 3 pages, page 0 references `p0`
+    /// private fonts, pages 1 AND 2 both reference the same `g` shared fonts
+    /// (reach {1,2}, never page 0). Layout: 1=Catalog 2=Pages 3=Page0 4=Page1
+    /// 5=Page2 6=Info, 7..=6+p0 page-0 fonts, then `g` shared fonts, then three
+    /// content streams.
+    fn three_page_shared_pdf_bytes(p0: u32, g: u32) -> Vec<u8> {
+        let p0_0 = 7u32;
+        let g0 = p0_0 + p0;
+        let c0 = g0 + g;
+        let c1 = c0 + 1;
+        let c2 = c1 + 1;
+        let p0_res: String = (0..p0)
+            .map(|i| format!("/A{} {} 0 R", i + 1, p0_0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let g_res: String = (0..g)
+            .map(|i| format!("/G{} {} 0 R", i + 1, g0 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut bodies: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Count 3 /Kids [ 3 0 R 4 0 R 5 0 R ] >>".to_string()),
+            (6, "<< /Producer (flpdf-g6hb three-page shared fixture) >>".to_string()),
+            (3, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {p0_res} >> >> /Contents {c0} 0 R >>"
+            )),
+            (4, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {g_res} >> >> /Contents {c1} 0 R >>"
+            )),
+            (5, format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << {g_res} >> >> /Contents {c2} 0 R >>"
+            )),
+        ];
+        for i in 0..p0 {
+            let n = p0_0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /A{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for i in 0..g {
+            let n = g0 + i;
+            bodies.push((
+                n,
+                format!(
+                    "<< /Type /Font /Subtype /Type1 /BaseFont /G{} /Mark {n} >>",
+                    i + 1
+                ),
+            ));
+        }
+        for (cnum, label) in [(c0, "Page0"), (c1, "Page1"), (c2, "Page2")] {
+            let stream = format!("BT /A1 12 Tf 72 720 Td ({label}) Tj ET");
+            bodies.push((
+                cnum,
+                format!(
+                    "<< /Length {} >>\nstream\n{stream}\nendstream",
+                    stream.len()
+                ),
+            ));
+        }
+        assemble_classic_pdf(bodies, 6, c2)
+    }
+
+    #[test]
+    fn linearized_membership_even_splits_then_erases_page_dicts_and_root() {
+        // gen_mixed_shared 60 70: 135 eligible => 2 streams (68 + 67); erase
+        // Catalog + Page0 + Page1 (all in stream 0) => 65 + 67 members.
+        let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        assert_eq!(
+            containers.len(),
+            2,
+            "135 eligible => 2 even-split containers"
+        );
+        assert_eq!(
+            containers[0].len(),
+            65,
+            "stream 0 loses Catalog+Page0+Page1"
+        );
+        assert_eq!(containers[1].len(), 67, "stream 1 untouched by the erasure");
+        // No page dict or root survives in any container.
+        let root = pdf.root_ref().unwrap();
+        let pages: BTreeSet<ObjectRef> = crate::pages::page_refs(&mut pdf)
+            .unwrap()
+            .into_iter()
+            .collect();
+        for c in &containers {
+            for m in c {
+                assert!(*m != root && !pages.contains(m), "{m:?} must be erased");
+            }
+        }
+    }
+
+    #[test]
+    fn linearized_routes_mixed_shared_first_page_then_other_page_private() {
+        // qpdf measured: stream 0 (shared fonts + Pages + Info) => part6;
+        // stream 1 (page-1-only fonts) => part7.
+        let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::FirstPage, ContainerPart::OtherPagePrivate]
+        );
+    }
+
+    #[test]
+    fn linearized_routes_three_page_shared_first_page_then_other_page_shared() {
+        // qpdf measured: stream 0 (page-0-private fonts + Pages + Info) => part6;
+        // stream 1 (fonts shared by pages 1 & 2, reach {1,2}) => part8.
+        let mut pdf = Pdf::open(Cursor::new(three_page_shared_pdf_bytes(2, 120))).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::FirstPage, ContainerPart::OtherPageShared]
+        );
+    }
+
+    #[test]
+    fn linearized_routes_trailer_only_container_to_rest() {
+        // A container whose members reach no page (here /Info, which is
+        // trailer-only and not in any page closure) is qpdf part 9 — lc_other.
+        // This does not arise from the even split on a font corpus (/Info is
+        // DFS-early and co-located with first-page objects), but the routing is
+        // exercised directly here.
+        let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
+        let info_ref = pdf.trailer().get_ref("Info").unwrap();
+        let synthetic = vec![vec![info_ref]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(routes, vec![ContainerPart::Rest]);
     }
 }

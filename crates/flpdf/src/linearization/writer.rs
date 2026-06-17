@@ -139,19 +139,22 @@ impl ObjStmLayout {
         let config = planner_config_from_options(options);
         let batch_plan = plan.objstm_batches(pdf, &config)?;
 
-        // Writer-level invariant (qpdf linearization rule, not encoded by the
-        // 5.8.1 planner): per-page *private* objects must remain plain
-        // indirects — qpdf rejects a linearized file whose page dictionaries
-        // are compressed.  Drop any `part4_other_pages_private` member here.
-        let other_pages_private: std::collections::BTreeSet<ObjectRef> =
-            plan.part4_other_pages_private.iter().copied().collect();
+        // Writer-level invariant (qpdf linearization rule): a page DICTIONARY may
+        // never be compressed — the linearization layout addresses pages by file
+        // offset. qpdf compresses page-*private* non-dictionary objects (fonts,
+        // etc.) normally, so only the page dictionaries themselves are excluded.
+        // The Generate membership already erases them (QPDFWriter.cc:2141), so
+        // this is a no-op there; it guards a Preserve source whose ObjStm somehow
+        // carried a page dict.
+        let page_dicts: std::collections::BTreeSet<ObjectRef> =
+            crate::pages::page_refs(pdf)?.into_iter().collect();
         let filter_batches = |batches: Vec<Vec<ObjectRef>>| -> Vec<Vec<ObjectRef>> {
             batches
                 .into_iter()
                 .filter_map(|batch| {
                     let kept: Vec<ObjectRef> = batch
                         .into_iter()
-                        .filter(|r| !other_pages_private.contains(r))
+                        .filter(|r| !page_dicts.contains(r))
                         .collect();
                     if kept.is_empty() {
                         None
@@ -942,22 +945,21 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 ///
 /// A linearized file repeats `/ID` across the first-page xref-stream dict and
 /// the main xref-stream dict; a file identifier is file-scoped, so both must
-/// carry the *same* value. The identifier is computed once from a single MD5
-/// over `bytes` itself (the placeholder is all-zero, so this digest depends only
-/// on the input and is stable across runs). Because the replacement is the same
-/// width as the placeholder, no byte offset shifts and the digest is never
-/// recomputed (the operation is acyclic). qpdf's pass-1 layout for xref-stream
-/// output differs from this final buffer (it uses xref streams, a different
-/// reconstruction out of scope here), so byte-parity with qpdf's `/ID` is not
-/// pursued on this path; the self-stable whole-final-buffer digest is kept.
+/// carry the *same* value. This function does **not** compute the identifier:
+/// `id0`/`id1` are precomputed by [`write_linearized`] from a digest over a
+/// reconstruction of qpdf's first write pass (the `det_id` computation; the
+/// pass-1 buffer is built by [`build_pass1_part1`] with qpdf's `writePad`
+/// length-stabilisation). That reconstruction is what reproduces qpdf's
+/// deterministic `/ID` byte-for-byte. Here we only overwrite the all-zero
+/// placeholders the final pass wrote at the xref-stream dict sites. Because the
+/// replacement is the same width as the placeholder, no byte offset shifts.
 ///
 /// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
 /// spans of the sections that actually emit a `/ID` (collected by the writer as
 /// it lays them down). Scanning the whole buffer would corrupt the output if a
 /// content stream, string, or metadata object happened to contain the same
 /// fixed-width placeholder byte sequence; restricting the search to the known
-/// `/ID` sections makes that misfire impossible. The digest still covers the
-/// whole buffer, so the identifier remains a content fingerprint.
+/// `/ID` sections makes that misfire impossible.
 ///
 /// # Panics
 ///
@@ -1671,38 +1673,61 @@ fn do_write_pass<R: Read + Seek>(
     // is not written twice.  ObjStm members are skipped and emitted via their
     // Part-4 container below.  The ObjStm path retains the writer-emission
     // order of `part4_objects()` (its split-xref tail relocation depends on it).
-    let mut part4_refs = plan.part4_objects();
-    if objstm_layout.is_empty() {
-        part4_refs.sort_by_key(|r| {
-            renumber
-                .new_for_original(*r)
-                .map(|nr| nr.number)
-                .unwrap_or(u32::MAX)
-        });
+    // Emit the second-half (Annex F Part 5) objects in NEW-NUMBER order, with
+    // each Part-4 ObjStm container interleaved at its object-number position
+    // among the plain objects — qpdf numbers the second-half uncompressed objects
+    // (plain + containers) in part order and writes them in that same order, so a
+    // part7 container sits in its owning page's group, NOT after every plain
+    // object. (mixed/threepage have a single second-half container that is the
+    // last second-half object, so this is identical to the old plain-then-
+    // containers emission; disc's part7 container falls in the middle.) Members
+    // are written inside their container; the early-written catalog is skipped.
+    enum Part4Emit<'a> {
+        Plain(ObjectRef),
+        Container(&'a ObjStmContainer),
     }
-    for original_ref in &part4_refs {
-        if objstm_layout.member_to_container.contains_key(original_ref) {
+    let mut part4_emits: Vec<(u32, Part4Emit)> = Vec::new();
+    for original_ref in plan.part4_objects() {
+        if objstm_layout
+            .member_to_container
+            .contains_key(&original_ref)
+        {
             continue;
         }
-        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
+        if catalog_emitted_early && plan.root_ref == Some(original_ref) {
             continue;
         }
-        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
+        let Some(new_ref) = renumber.new_for_original(original_ref) else {
+            // cov:ignore-start: every part4 plain object is in the RenumberMap by
+            // construction (the plan and renumber derive from the same part vectors);
+            // this guards a planner/renumber inconsistency that cannot occur here.
             return Err(crate::Error::Unsupported(format!(
-                "part4 object {} has no renumber entry",
-                original_ref
+                "part4 object {original_ref} has no renumber entry"
             )));
+            // cov:ignore-end
         };
-        let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
-        xref_offsets.insert(new_ref.number, offset);
+        part4_emits.push((new_ref.number, Part4Emit::Plain(original_ref)));
     }
-
-    // Part-4 ObjStm containers (after /E, in the remaining body).
     for container in &objstm_layout.part4 {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
-        xref_offsets.insert(container.container_new_num, offset);
+        part4_emits.push((container.container_new_num, Part4Emit::Container(container)));
+    }
+    part4_emits.sort_by_key(|(number, _)| *number);
+    for (_, emit) in &part4_emits {
+        match emit {
+            Part4Emit::Plain(original_ref) => {
+                let new_ref = renumber
+                    .new_for_original(*original_ref)
+                    .expect("part4 plain object renumber entry checked above");
+                let object = pdf.resolve_borrowed(*original_ref)?;
+                let renumbered = renumber_object(object, 0, renumber)?;
+                let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+                xref_offsets.insert(new_ref.number, offset);
+            }
+            Part4Emit::Container(container) => {
+                let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
+                xref_offsets.insert(container.container_new_num, offset);
+            }
+        }
     }
 
     // Part 6: main cross-reference + trailer.
@@ -1947,10 +1972,100 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// object lacks a probed byte length, or the hint-stream compressed length
 /// fails to converge within the iteration budget.
 ///
-/// Propagates any error from resolving source objects via
-/// [`Pdf::resolve_borrowed`] (e.g. [`crate::Error::Io`] or
-/// [`crate::Error::Parse`]) and from the underlying ObjStm-batch planning,
-/// hint-stream encoding, and xref-stream filtering steps.
+/// For each second-half ObjStm batch, the plain object after which its container
+/// must be emitted so the container lands at its qpdf part position.
+///
+/// qpdf orders the second half as `part7 (page by page) → part8 → part9`, with
+/// each ObjStm container at the END of its part-group (the container's synthetic
+/// object number is the group's highest, so it sorts last in qpdf's ObjGen-keyed
+/// part set). The anchor is the LAST second-half plain object whose part-group
+/// is at or before the container's group; the renumber inserts the container
+/// right after it. Returns `None` for a batch with no such preceding plain object
+/// (the renumber then appends it after all plain objects — the same result when
+/// the container's group is the last one).
+fn second_half_container_anchors(
+    plan: &LinearizationPlan,
+    part4_batches: &[Vec<ObjectRef>],
+) -> Vec<Option<ObjectRef>> {
+    use std::collections::BTreeSet;
+
+    let member_set: BTreeSet<ObjectRef> = part4_batches.iter().flatten().copied().collect();
+
+    // Second-half plain (non-member) objects in qpdf part order, each tagged with
+    // a group rank: part7 page i → (0, i); part8 → (1, 0); part9 → (2, 0).
+    let mut plain_ranked: Vec<(ObjectRef, (u8, usize))> = Vec::new();
+    for (i, privates) in plan.per_page_private_objects.iter().enumerate().skip(1) {
+        for &r in privates {
+            if !member_set.contains(&r) {
+                plain_ranked.push((r, (0, i)));
+            }
+        }
+    }
+    for &r in &plan.part4_other_pages_shared {
+        if !member_set.contains(&r) {
+            plain_ranked.push((r, (1, 0)));
+        }
+    }
+    for &r in &plan.part4_rest {
+        if !member_set.contains(&r) {
+            plain_ranked.push((r, (2, 0)));
+        }
+    }
+
+    let page_private_sets: Vec<BTreeSet<ObjectRef>> = plan
+        .per_page_private_objects
+        .iter()
+        .map(|v| v.iter().copied().collect())
+        .collect();
+    let shared_set: BTreeSet<ObjectRef> = plan.part4_other_pages_shared.iter().copied().collect();
+    let rest_set: BTreeSet<ObjectRef> = plan.part4_rest.iter().copied().collect();
+
+    part4_batches
+        .iter()
+        .map(|batch| {
+            if batch.is_empty() {
+                return None; // cov:ignore: resolve_batches drops empty batches before this point
+            }
+            // The container's part is the UNION of its members' page ownership —
+            // the even split can co-locate one page's privates with another's in
+            // a single container, which qpdf then routes to part8 (shared by 2+
+            // pages). So inspect EVERY member, not just the first: any member in
+            // the reach-≥2 shared set, or members spanning two different pages'
+            // private sets, makes the whole container part8.
+            let mut pages: BTreeSet<usize> = BTreeSet::new();
+            let mut shared = false;
+            let mut rest = false;
+            for &m in batch {
+                if shared_set.contains(&m) {
+                    shared = true;
+                } else if let Some(i) =
+                    (1..page_private_sets.len()).find(|&i| page_private_sets[i].contains(&m))
+                {
+                    pages.insert(i);
+                } else if rest_set.contains(&m) {
+                    rest = true;
+                }
+            }
+            let batch_rank: (u8, usize) = if shared || pages.len() >= 2 {
+                (1, 0) // part8 (other-page-shared)
+            } else if let Some(&i) = pages.iter().next() {
+                (0, i) // part7 (private to one other page)
+            } else if rest {
+                (2, 0) // part9 (rest)
+            } else {
+                return None; // cov:ignore: every Part-4 batch member is page-private, shared, or rest
+            };
+            // `plain_ranked` is already in ascending rank order, so the last entry
+            // with rank ≤ batch_rank is the container's group's last plain object
+            // (or the previous non-empty group's, when this group has no plain).
+            plain_ranked
+                .iter()
+                .rfind(|(_, rank)| *rank <= batch_rank)
+                .map(|(r, _)| *r)
+        })
+        .collect()
+}
+
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -2008,13 +2123,21 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
     let mut local_renumber = renumber.clone();
+    // Per Part-4 batch, the second-half plain object after which its container is
+    // emitted (its part-group's last plain object) so each second-half container
+    // lands at its qpdf part position: a part7 container at the END of its owning
+    // page's group, a part8 container after the last part8 plain object, etc.
+    // `None` (no preceding plain) appends after all plain — equivalent when the
+    // container's group is the last one (the single-second-half-container case).
+    let second_half_anchors =
+        second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
     // Part-3 batches are numbered last within the FIRST half (qpdf packs the
-    // first-page shared dicts + /Pages tree + /Info there); Part-4 batches last
-    // within the SECOND half.  Passing them separately lets the renumber place
-    // each container + members in the correct half.
+    // first-page shared dicts + /Pages tree + /Info there); Part-4 batches are
+    // interleaved among the second-half objects at their part position.
     let relocation = local_renumber.place_objstm_members_per_half(
         &resolved_batch_plan.part3_batches,
         &resolved_batch_plan.part4_batches,
+        &second_half_anchors,
     );
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;
@@ -2054,6 +2177,33 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     let objstm_layout =
         ObjStmLayout::build_from_batches(&resolved_batch_plan, &container_numbers, renumber)?;
+
+    // Map each ObjStm container's new object number to its even-split allocation
+    // rank (qpdf numbers the container objects' pre-renumber identities in
+    // even-split order via `makeIndirectObject`). The page-offset hint table uses
+    // this to order each page's shared identifiers by pre-renumber object number
+    // (see `PageOffsetHintTable::from_plan`). Re-deriving the even-split here is
+    // deterministic and cheap relative to the convergence loop below.
+    let container_even_split_rank: std::collections::BTreeMap<u32, u32> = {
+        let membership = crate::linearization::plan::objstm_membership_linearized(pdf)?;
+        let mut rank = std::collections::BTreeMap::new();
+        for (split_index, members) in membership.iter().enumerate() {
+            // `objstm_membership_linearized` drops empty containers, so `first()`
+            // is always present.
+            let first = *members
+                .first()
+                .expect("objstm_membership_linearized never yields an empty container");
+            // It recomputes the even split from the source unconditionally, so it
+            // reports containers even on the Preserve path where no ObjStm is
+            // generated. Only rank containers the Generate layout actually
+            // materialized (members present in `member_to_container`); the
+            // Preserve path finds none and skips.
+            if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(&first) {
+                rank.insert(container_num, split_index as u32);
+            }
+        }
+        rank
+    };
 
     // Highest object number actually used in the output.  After relocation
     // the renumber map already counts every plain object, every ObjStm
@@ -2099,8 +2249,12 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Build initial placeholder hint tables (all lengths = 0).
     // ------------------------------------------------------------------
-    let po_table_initial =
-        PageOffsetHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+    let po_table_initial = PageOffsetHintTable::from_plan(
+        plan,
+        renumber,
+        &objstm_layout.member_to_container,
+        &container_even_split_rank,
+    );
     let so_table_initial =
         SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
     let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial)?;
@@ -2292,24 +2446,54 @@ pub fn write_linearized<R: Read + Seek>(
             )));
         }
 
+        // Containers a non-first page must not add to its byte length: only a
+        // part7 container owned entirely by this one page is a section object.
+        // A page-private object that the even split placed in the first-page
+        // (part6) container or in a part8 (multi-page-shared) container is
+        // physically outside this page's section, so its container's bytes belong
+        // elsewhere. Same classification as the per-page object-count fold.
+        let non_page_owned = crate::linearization::hint_page::non_page_owned_containers(
+            plan,
+            &objstm_layout.member_to_container,
+        );
+        let plain_byte_len = |orig: &ObjectRef| -> u64 {
+            renumber
+                .new_for_original(*orig)
+                .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
+                .unwrap_or(0) as u64
+        };
         let per_page_byte_lengths: Vec<u64> = plan
             .per_page_private_objects
             .iter()
             .enumerate()
             .map(|(page_idx, privates)| {
-                let private_len: u64 = privates
-                    .iter()
-                    .map(|orig| {
-                        renumber
-                            .new_for_original(*orig)
-                            .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
-                            .unwrap_or(0) as u64
-                    })
-                    .sum();
                 if page_idx == 0 {
-                    private_len + part3_byte_len
+                    // Page 0: Part 2 (always plain) + Part 3 (plain + containers).
+                    let part2_len: u64 = privates.iter().map(plain_byte_len).sum();
+                    part2_len + part3_byte_len
                 } else {
-                    private_len
+                    // Pages 1..N: a private compressed into this page's own part7
+                    // ObjStm has no standalone bytes — its physical contribution is
+                    // the container object, counted ONCE. Containers not owned by
+                    // this single page (first-page part6, or multi-page part8) are
+                    // excluded; their bytes live in another section.
+                    let mut len = 0u64;
+                    let mut containers: std::collections::BTreeSet<u32> =
+                        std::collections::BTreeSet::new();
+                    for orig in privates {
+                        match objstm_layout.member_to_container.get(orig) {
+                            Some(&(container_num, _)) => {
+                                if !non_page_owned.contains(&container_num) {
+                                    containers.insert(container_num);
+                                }
+                            }
+                            None => len += plain_byte_len(orig),
+                        }
+                    }
+                    len + containers
+                        .iter()
+                        .map(|c| byte_lengths.get(c).copied().unwrap_or(0) as u64)
+                        .sum::<u64>()
                 }
             })
             .collect();
@@ -2317,8 +2501,12 @@ pub fn write_linearized<R: Read + Seek>(
         // ------------------------------------------------------------------
         // Patch hint tables.
         // ------------------------------------------------------------------
-        let mut po_table =
-            PageOffsetHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+        let mut po_table = PageOffsetHintTable::from_plan(
+            plan,
+            renumber,
+            &objstm_layout.member_to_container,
+            &container_even_split_rank,
+        );
         let mut so_table =
             SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
 
@@ -2464,38 +2652,31 @@ pub fn write_linearized<R: Read + Seek>(
             // This is only meaningful when nshared_total > nshared_first_page
             // (i.e., there are Part-8 objects).  When part4_other_pages_shared
             // is empty the location value is ignored (qpdf Implementation Note 131).
-            if !plan.part4_other_pages_shared.is_empty() {
-                let first_part8_orig = plan.part4_other_pages_shared[0];
-                // When the first Part-8 shared object is packed into an
-                // ObjStm it has no standalone offset; its physical location
-                // is the container object that holds it (qpdf's
-                // adjusted_offset() math works the same on the container's
-                // offset — readers seek to the container, then the ObjStm
-                // /First + pair table locates the member).
-                let first_part8_lookup_num = if let Some(&(container_num, _idx)) =
-                    objstm_layout.member_to_container.get(&first_part8_orig)
-                {
-                    container_num
-                } else {
-                    renumber
-                        .new_for_original(first_part8_orig)
-                        .ok_or_else(|| {
-                            crate::Error::Unsupported(format!(
-                                "first Part-8 shared object {} has no renumber entry",
-                                first_part8_orig
-                            ))
-                        })?
-                        .number
-                };
+            // `from_plan` already set `first_object_number` to the FIRST
+            // SECOND-HALF (Part-8) shared entry — the container number when that
+            // entry is an ObjStm container, or the object's own number when it is
+            // plain — and crucially EXCLUDES part4-shared objects that the global
+            // even split placed in a first-page (part6) container (those are
+            // before /E, not Part-8). It is 0 when there are no Part-8 entries
+            // (location is then ignored per Implementation Note 131). Look up that
+            // object's probe offset for the `location` field; the object number
+            // itself is already correct, so it is not overwritten here.
+            let first_part8_lookup_num = so_table.header.first_object_number;
+            if first_part8_lookup_num != 0 {
                 let first_part8_off = xref_offsets
                     .get(&first_part8_lookup_num)
                     .copied()
+                    // cov:ignore-start: the first Part-8 entry (a container or a
+                    // plain Part-8 object) is always probed in the same pass that
+                    // fills `xref_offsets`, so this lookup never misses for a
+                    // well-formed plan.
                     .ok_or_else(|| {
                         crate::Error::Unsupported(format!(
-                            "first Part-8 shared object (lookup #{}) has no probed offset",
-                            first_part8_lookup_num
+                            "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
+                             has no probed offset"
                         ))
                     })?;
+                // cov:ignore-end
                 // Subtract hint stream total length so that qpdf's
                 // adjusted_offset() reconstructs the correct file offset.
                 so_table.header.location = first_part8_off
@@ -2507,19 +2688,6 @@ pub fn write_linearized<R: Read + Seek>(
                              ({hint_stream_obj_total_len}); cannot compute shared-hint location"
                         ))
                     })? as u64;
-
-                // first_object_number (item 1): object number of the first Part-8
-                // shared object.  When that object is packed into an ObjStm we use
-                // the *container's* new object number (already resolved above as
-                // `first_part8_lookup_num`), because the xref points readers to the
-                // container — not to a standalone object.
-                //
-                // `from_plan` computes this from `renumber.new_for_original`, which
-                // returns the member's own renumber slot — incorrect when the member
-                // lives inside an ObjStm container.  We patch it here alongside the
-                // `location` field so both fields agree on which object number to
-                // announce as the first Part-8 entry.
-                so_table.header.first_object_number = first_part8_lookup_num;
             }
 
             // Per-object length_minus_least.  group_offset is no longer a

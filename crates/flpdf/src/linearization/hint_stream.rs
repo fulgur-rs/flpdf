@@ -753,7 +753,12 @@ mod tests {
     fn single_page_encode_does_not_panic() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let _ = encode_hint_stream(&po, &so).expect("encode"); // must not panic
     }
@@ -762,7 +767,12 @@ mod tests {
     fn single_page_shared_section_offset_is_positive() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(
@@ -775,7 +785,12 @@ mod tests {
     fn single_page_compressed_starts_with_zlib_header() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(
@@ -801,7 +816,12 @@ mod tests {
     fn single_page_shared_section_within_uncompressed() {
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(
@@ -818,7 +838,12 @@ mod tests {
     fn two_page_encode_does_not_panic() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let _ = encode_hint_stream(&po, &so).expect("encode");
     }
@@ -827,7 +852,12 @@ mod tests {
     fn two_page_shared_section_offset_is_positive() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(result.shared_section_offset_in_uncompressed > 0);
@@ -837,7 +867,12 @@ mod tests {
     fn two_page_compressed_starts_with_zlib_header() {
         let plan = two_page_plan_with_shared();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
         assert!(result.compressed.len() >= 2);
@@ -848,13 +883,23 @@ mod tests {
     fn two_page_uncompressed_larger_than_single_page() {
         let single_plan = single_page_plan();
         let renumber_s = RenumberMap::from_plan(&single_plan);
-        let po_s = PageOffsetHintTable::from_plan(&single_plan, &renumber_s, &Default::default());
+        let po_s = PageOffsetHintTable::from_plan(
+            &single_plan,
+            &renumber_s,
+            &Default::default(),
+            &Default::default(),
+        );
         let so_s = SharedObjectHintTable::from_plan(&single_plan, &renumber_s, &Default::default());
         let single_result = encode_hint_stream(&po_s, &so_s).expect("encode");
 
         let two_plan = two_page_plan_with_shared();
         let renumber_t = RenumberMap::from_plan(&two_plan);
-        let po_t = PageOffsetHintTable::from_plan(&two_plan, &renumber_t, &Default::default());
+        let po_t = PageOffsetHintTable::from_plan(
+            &two_plan,
+            &renumber_t,
+            &Default::default(),
+            &Default::default(),
+        );
         let so_t = SharedObjectHintTable::from_plan(&two_plan, &renumber_t, &Default::default());
         let two_result = encode_hint_stream(&po_t, &so_t).expect("encode");
 
@@ -872,7 +917,12 @@ mod tests {
     fn no_shared_encode_succeeds() {
         let plan = single_page_plan(); // has no shared objects
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
         // Even with no shared objects the shared section header is emitted,
@@ -901,7 +951,12 @@ mod tests {
         //   → shared section starts at byte 36
         let plan = single_page_plan();
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
 
@@ -927,7 +982,12 @@ mod tests {
         //   36 (page offset header) + 24 (shared object header) = 60 bytes.
         let plan = single_page_plan(); // no shared objects
         let renumber = RenumberMap::from_plan(&plan);
-        let po = PageOffsetHintTable::from_plan(&plan, &renumber, &Default::default());
+        let po = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
         let result = encode_hint_stream(&po, &so).expect("encode");
 

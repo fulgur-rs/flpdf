@@ -150,3 +150,90 @@ fn two_page_generate_packs_first_half_container_before_e() {
         "the first-half ObjStm container (marker at {marker}) must be before /E ({e_off})"
     );
 }
+
+/// A `>cap` fixture that produces BOTH a first-half (part6) and a second-half
+/// (part7) ObjStm container. Exercises the second-half container path: the
+/// page-private-font compression, the per-page object-count fold, and the
+/// per-page byte-length fold (a page-1 private object compressed into the part7
+/// container contributes the container's bytes, not its own). Runs on every
+/// build (no qpdf-zlib-compat needed — only structure is asserted).
+#[test]
+fn mixed_generate_emits_part6_and_part7_containers_and_round_trips() {
+    let bytes = linearize_generate("objstm-lin-mixed-60-70.pdf");
+
+    // Two ObjStm containers: one before /E (part6, first-page shared) and one
+    // after /E (part7, page-1 private fonts).
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 2,
+        "mixed generate must emit two ObjStm containers (part6 + part7), found {n_objstm}"
+    );
+    let e_off = parse_e_offset(&bytes);
+    let first_marker = first_objstm_marker_offset(&bytes).expect("ObjStm marker present");
+    assert!(
+        first_marker < e_off,
+        "the first-half (part6) ObjStm container (marker at {first_marker}) must be before /E ({e_off})"
+    );
+
+    // Round-trip: every object resolves, including both containers' compressed
+    // members (the part7 container's members are page-1 private fonts).
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A fixture whose fonts are shared by pages 1 & 2 (not page 0), with the first
+/// chunk even-split into the FIRST-PAGE (part6) container and the rest into a
+/// part8 (other-page-shared) container. Exercises the shared-object hint table's
+/// Part-8 split — including the branch that skips a part4-shared object folded
+/// into a first-page container. Structure-only (no qpdf-zlib-compat).
+#[test]
+fn threepage_shared_generate_emits_part6_and_part8_containers_and_round_trips() {
+    let bytes = linearize_generate("objstm-lin-threepage-2-120.pdf");
+
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 2,
+        "threepage-shared generate must emit two ObjStm containers (part6 + part8), found {n_objstm}"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A fixture with a PLAIN (uncompressed, stream) part8 object — a Form XObject
+/// shared by pages 1 & 2 — alongside a part7 container. Exercises the
+/// shared-object hint table's plain-Part-8 branch (`first_object_number` taken
+/// from a non-compressed shared object). Structure-only round-trip; this fixture
+/// is not yet byte-identical to qpdf (it needs part-ordered second-half
+/// containers), so no golden comparison is made here.
+#[test]
+fn disc_part7_part8_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-disc-2-250-2.pdf");
+
+    // A part7 container (page-1 private fonts) plus a part8 container (page-2
+    // private fonts even-split with page-1's tail) — at least two ObjStm
+    // containers, and the shared Form XObject stays a plain stream.
+    let n_objstm = count_objstm_markers(&bytes);
+    assert!(
+        n_objstm >= 2,
+        "disc generate must emit at least two ObjStm containers, found {n_objstm}"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}

@@ -152,3 +152,76 @@ fn three_page_objstm_byte_identical_to_qpdf() {
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
 }
+
+// ---- Phase-2 (flpdf-g6hb.2): >cap global even-split + part routing ----------
+//
+// sharedfonts-100: 104 eligible first-page-shared dicts → 2 containers (50+51),
+// BOTH in part6 (first half). Exercises the global even-split membership fix
+// without second-half container numbering (finding-4): no part4 containers, so
+// the existing per-half renumber suffices.
+#[test]
+fn sharedfonts100_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-sharedfonts-100.pdf",
+        "objstm-lin-sharedfonts-100",
+    );
+}
+
+#[test]
+fn sharedfonts100_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-sharedfonts-100.pdf",
+        "objstm-lin-sharedfonts-100",
+    );
+}
+
+// mixed-60-70: a part7 (other-page-private) ObjStm container. Exercises the
+// second-half container numbering (finding-4), the page-private-font
+// compression, and the per-page object-count / page-length container folds.
+// Fully byte-identical to qpdf (structural + strict).
+#[test]
+fn mixed_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("objstm-lin-mixed-60-70.pdf", "objstm-lin-mixed-60-70");
+}
+
+#[test]
+fn mixed_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-mixed-60-70.pdf", "objstm-lin-mixed-60-70");
+}
+
+// threepage-2-120: a part8 (other-page-shared) ObjStm container holding fonts
+// shared by pages 1 & 2 (not page 0). Exercises the shared-object hint table's
+// first-page vs Part-8 split when a part4-shared object even-splits into the
+// first-page container. Fully byte-identical (structural + strict).
+#[test]
+fn threepage_shared_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-threepage-2-120.pdf",
+        "objstm-lin-threepage-2-120",
+    );
+}
+
+#[test]
+fn threepage_shared_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-threepage-2-120.pdf",
+        "objstm-lin-threepage-2-120",
+    );
+}
+
+// disc-2-250-2: a pure part7 ObjStm container coexisting with a part8 plain Form
+// XObject AND a part8 container the even split filled with two pages' private
+// fonts. Exercises the deepest second-half machinery: part-ordered container
+// emission (the part7 container interleaved in its page's group), the
+// shared-object hint table including a part8 container of page-private members,
+// and per-page shared identifiers ordered by pre-renumber object number. Fully
+// byte-identical to qpdf (structural + strict).
+#[test]
+fn disc_part7_part8_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
+}
+
+#[test]
+fn disc_part7_part8_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
+}
