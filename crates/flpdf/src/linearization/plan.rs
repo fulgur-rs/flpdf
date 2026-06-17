@@ -1853,6 +1853,15 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     containers: &[Vec<ObjectRef>],
 ) -> crate::Result<Vec<ContainerPart>> {
+    // in_outlines takes precedence over in_open_document and in_first_page
+    // (QPDF_linearization.cc:1118-1122).
+    let outline_set = outlines_set(pdf)?;
+    let outlines_first_page = if outline_set.is_empty() {
+        false
+    } else {
+        outlines_in_first_page_predicate(pdf)?
+    };
+
     let open_doc_set = open_document_set(pdf)?;
 
     let page_refs = crate::pages::page_refs(pdf)?;
@@ -1881,6 +1890,14 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     Ok(containers
         .iter()
         .map(|members| {
+            // in_outlines is checked first (QPDF_linearization.cc:1118-1122).
+            if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
+                return if outlines_first_page {
+                    ContainerPart::FirstPage
+                } else {
+                    ContainerPart::Rest
+                };
+            }
             // in_open_document takes precedence over every page category.
             if members.iter().any(|m| open_doc_set.contains(m)) {
                 return ContainerPart::OpenDocument;
@@ -4432,6 +4449,36 @@ mod tests {
         let synthetic = vec![vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)]];
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
         assert_eq!(routes, vec![ContainerPart::OpenDocument]);
+    }
+
+    #[test]
+    fn route_objstm_containers_outlines_first_page_routes_to_first_page() {
+        // Outline container routes to FirstPage when /PageMode /UseOutlines is set.
+        // Object 5 = outline dict, object 6 = outline item in outlines_pdf_bytes.
+        let mut pdf =
+            Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(b"UseOutlines"))).unwrap();
+        let outline_ref = ObjectRef::new(5, 0); // outline dict
+        let synthetic = vec![vec![outline_ref]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::FirstPage],
+            "outline container must route to FirstPage when /PageMode /UseOutlines"
+        );
+    }
+
+    #[test]
+    fn route_objstm_containers_outlines_no_use_outlines_routes_to_rest() {
+        // Without /PageMode /UseOutlines, outline containers stay in Rest (part9).
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes())).unwrap();
+        let outline_ref = ObjectRef::new(5, 0); // outline dict
+        let synthetic = vec![vec![outline_ref]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::Rest],
+            "outline container must route to Rest when no /PageMode /UseOutlines"
+        );
     }
 
     /// A `/Root` that resolves to a NON-dictionary (a malformed catalog) yields
