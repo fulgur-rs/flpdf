@@ -1451,6 +1451,60 @@ fn compute_outline_hint_info<R: Read + Seek>(
     }))
 }
 
+/// Build the per-pass Outlines Hint Table (qpdf's `calculateHOutline`).
+///
+/// `first_object_offset` is the first outline unit's probe offset MINUS the hint
+/// stream object length — the same `adjusted_offset` convention as the Shared
+/// Object table `location` (qpdf adds `/H[1]` back for offsets at or after the
+/// hint stream). `group_length` is the summed byte length of the `nobjects`
+/// consecutive output units starting at `first_object` (qpdf's
+/// `outputLengthNextN`).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if the first outline unit has no probed
+/// offset in `xref_offsets`, or if that offset is smaller than
+/// `hint_stream_obj_total_len` (either indicates an inconsistent layout, never
+/// produced for a well-formed plan).
+fn build_outline_hint_table(
+    info: &OutlineHintInfo,
+    xref_offsets: &BTreeMap<u32, usize>,
+    byte_lengths: &BTreeMap<u32, usize>,
+    hint_stream_obj_total_len: usize,
+) -> Result<OutlineHintTable> {
+    let first_off = xref_offsets
+        .get(&info.first_object)
+        .copied()
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "outline hint: first outline unit (#{}) has no probed offset",
+                info.first_object
+            ))
+        })?;
+    let first_object_offset = first_off
+        .checked_sub(hint_stream_obj_total_len)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "outline hint: first unit offset ({first_off}) is less than the hint \
+             stream length ({hint_stream_obj_total_len})"
+            ))
+        })? as u32;
+    // `u64` range bound prevents a `u32` overflow panic on a pathological
+    // (>4-billion-object) layout; for any realistic document the values fit in
+    // `u32`, so `n as u32` and the sum are byte-identical to the direct
+    // computation.
+    let group_length: u64 = (info.first_object as u64
+        ..info.first_object as u64 + info.nobjects as u64)
+        .map(|n| byte_lengths.get(&(n as u32)).copied().unwrap_or(0) as u64)
+        .sum();
+    Ok(OutlineHintTable {
+        first_object: info.first_object,
+        first_object_offset,
+        nobjects: info.nobjects,
+        group_length: group_length as u32,
+    })
+}
+
 /// Build the pass-1 (digest) variant of an already-built [`Part1Bytes`].
 ///
 /// qpdf's first write pass emits the linearization parameter dict **empty**
@@ -2853,56 +2907,17 @@ pub fn write_linearized<R: Read + Seek>(
         }
 
         // Patch the Outlines Hint Table (qpdf calculateHOutline): fill the
-        // per-pass offset/length for the first outline unit. `first_object_offset`
-        // is the unit's probe offset MINUS the hint stream object length — the
-        // same `adjusted_offset` convention as the Shared Object table `location`
-        // (qpdf adds /H[1] back for offsets at or after the hint stream).
-        // `group_length` is the byte length of the `nobjects` consecutive output
-        // units (qpdf's outputLengthNextN).
+        // per-pass offset/length for the first outline unit (see
+        // `build_outline_hint_table`).
         let outline_table = outline_info
             .as_ref()
-            .map(|info| -> Result<OutlineHintTable> {
-                let first_off = xref_offsets
-                    .get(&info.first_object)
-                    .copied()
-                    // cov:ignore-start: the first outline unit is an ObjStm
-                    // container (or plain object) always emitted and probed in the
-                    // same pass that fills `xref_offsets`, so the lookup never
-                    // misses for a well-formed plan; this guards a layout bug.
-                    .ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "outline hint: first outline unit (#{}) has no probed offset",
-                            info.first_object
-                        ))
-                    })?;
-                // cov:ignore-end
-                let first_object_offset = first_off
-                    .checked_sub(hint_stream_obj_total_len)
-                    // cov:ignore-start: the outline objects live in the second
-                    // half (after the hint stream), so the unit offset always
-                    // exceeds the hint stream length; the subtraction never
-                    // underflows for a valid layout.
-                    .ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "outline hint: first unit offset ({first_off}) is less than the hint \
-                             stream length ({hint_stream_obj_total_len})"
-                        ))
-                    })? as u32;
-                // cov:ignore-end
-                // `u64` range bound prevents a `u32` overflow panic on a
-                // pathological (>4-billion-object) layout; for any realistic
-                // document the values fit in `u32`, so `n as u32` and the sum
-                // are byte-identical to the direct computation.
-                let group_length: u64 = (info.first_object as u64
-                    ..info.first_object as u64 + info.nobjects as u64)
-                    .map(|n| byte_lengths.get(&(n as u32)).copied().unwrap_or(0) as u64)
-                    .sum();
-                Ok(OutlineHintTable {
-                    first_object: info.first_object,
-                    first_object_offset,
-                    nobjects: info.nobjects,
-                    group_length: group_length as u32,
-                })
+            .map(|info| {
+                build_outline_hint_table(
+                    info,
+                    &xref_offsets,
+                    &byte_lengths,
+                    hint_stream_obj_total_len,
+                )
             })
             .transpose()?;
 
@@ -4615,5 +4630,75 @@ mod tests {
         expected.extend_from_slice(&payload);
         expected.extend_from_slice(b"\nendstream\nendobj\n");
         assert_eq!(bytes, expected, "hint-stream object framing + key order");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_outline_hint_table (qpdf calculateHOutline)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_outline_hint_table_uses_adjusted_offset_and_consecutive_lengths() {
+        // first_object = 3, nobjects = 2 → group_length sums units 3 and 4.
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 2,
+        };
+        let xref_offsets = BTreeMap::from([(3u32, 500usize), (4u32, 560usize)]);
+        let byte_lengths = BTreeMap::from([(3u32, 60usize), (4u32, 70usize), (5u32, 999usize)]);
+        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths, 144).unwrap();
+        assert_eq!(table.first_object, 3);
+        // adjusted_offset convention: probe offset MINUS hint stream length.
+        assert_eq!(table.first_object_offset, 500 - 144);
+        assert_eq!(table.nobjects, 2);
+        // outputLengthNextN: units 3 and 4 only (unit 5 excluded by nobjects).
+        assert_eq!(table.group_length, 60 + 70);
+    }
+
+    #[test]
+    fn build_outline_hint_table_errors_when_first_unit_has_no_probed_offset() {
+        let info = OutlineHintInfo {
+            first_object: 7,
+            nobjects: 1,
+        };
+        // `first_object` absent from xref_offsets → layout guard fires.
+        let err =
+            build_outline_hint_table(&info, &BTreeMap::new(), &BTreeMap::new(), 144).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("no probed offset")),
+            "expected 'no probed offset' Unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_outline_hint_table_errors_when_offset_below_hint_stream_length() {
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 1,
+        };
+        // Offset (100) < hint stream length (144) → adjusted_offset underflow guard.
+        let xref_offsets = BTreeMap::from([(3u32, 100usize)]);
+        let err =
+            build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new(), 144).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("less than the hint")),
+            "expected 'less than the hint stream length' Unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_outline_hint_table_missing_byte_length_counts_as_zero() {
+        // A unit in [first_object, first_object+nobjects) absent from byte_lengths
+        // contributes 0 (the `unwrap_or(0)` path) — exercised without the qpdf
+        // golden so default-feature coverage hits it.
+        let info = OutlineHintInfo {
+            first_object: 10,
+            nobjects: 3,
+        };
+        let xref_offsets = BTreeMap::from([(10u32, 1000usize)]);
+        let byte_lengths = BTreeMap::from([(10u32, 40usize), (12u32, 5usize)]); // 11 missing
+        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths, 200).unwrap();
+        assert_eq!(table.first_object_offset, 1000 - 200);
+        // 40 (unit 10) + 0 (unit 11 missing → unwrap_or(0)) + 5 (unit 12).
+        assert_eq!(table.group_length, 45);
     }
 }
