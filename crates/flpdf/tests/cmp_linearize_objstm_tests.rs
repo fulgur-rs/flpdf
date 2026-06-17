@@ -286,3 +286,24 @@ fn outlines_objstm_structurally_byte_identical_to_qpdf() {
 fn outlines_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-outlines-80-80.pdf", "objstm-lin-outlines-80-80");
 }
+
+// useoutlines-80-80 (flpdf-vvjr.1): /PageMode /UseOutlines causes outline
+// objects (dict + 80 items) to route to part6 (first-page section) instead of
+// part9. Their ObjStm container folds into page-0 nobjects (qpdf: 4, was 3).
+// Two pages share fonts so a first-page (part6) container coexists.
+// Regression: objstm-lin-outlines-80-80 (no /PageMode) must stay byte-identical.
+#[test]
+fn useoutlines_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-useoutlines-80-80.pdf",
+        "objstm-lin-useoutlines-80-80",
+    );
+}
+
+#[test]
+fn useoutlines_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-useoutlines-80-80.pdf",
+        "objstm-lin-useoutlines-80-80",
+    );
+}

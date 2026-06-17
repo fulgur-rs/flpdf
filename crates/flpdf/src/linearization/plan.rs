@@ -774,12 +774,11 @@ impl LinearizationPlan {
         // Outline objects routed to the first-page section when
         // /PageMode /UseOutlines is set (QPDF_linearization.cc:1031-1043).
         // Must be built before shared_hints so they can be included in it.
-        let outline_first_page_members: Vec<ObjectRef> =
-            if outlines_in_first_page_predicate(pdf)? {
-                outlines_set(pdf)?.into_iter().collect()
-            } else {
-                Vec::new()
-            };
+        let outline_first_page_members: Vec<ObjectRef> = if outlines_in_first_page_predicate(pdf)? {
+            outlines_set(pdf)?.into_iter().collect()
+        } else {
+            Vec::new()
+        };
 
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
             object_ref: obj_ref,
@@ -799,12 +798,13 @@ impl LinearizationPlan {
         });
         // Outline objects are in the first-page section (physically owned by
         // page 0), so page 0 is not listed in referencing_pages.
-        let outline_entries = outline_first_page_members
-            .iter()
-            .map(|&obj_ref| SharedObjectHintEntry {
-                object_ref: obj_ref,
-                referencing_pages: vec![],
-            });
+        let outline_entries =
+            outline_first_page_members
+                .iter()
+                .map(|&obj_ref| SharedObjectHintEntry {
+                    object_ref: obj_ref,
+                    referencing_pages: vec![],
+                });
         // Part-4 shared objects: referenced by ≥ 2 pages but NOT in the
         // first-page closure.  These live after /E (not physically owned
         // by any page via layout), so ALL referencing pages are listed.
@@ -4439,8 +4439,10 @@ mod tests {
 
     #[test]
     fn outlines_in_first_page_predicate_true_when_use_outlines_and_outlines_present() {
-        let mut pdf =
-            Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(b"UseOutlines"))).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
+            b"UseOutlines",
+        )))
+        .unwrap();
         assert!(
             outlines_in_first_page_predicate(&mut pdf).unwrap(),
             "/PageMode /UseOutlines + /Outlines => predicate must be true"
@@ -4458,8 +4460,10 @@ mod tests {
 
     #[test]
     fn outlines_in_first_page_predicate_false_when_page_mode_not_use_outlines() {
-        let mut pdf =
-            Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(b"FullScreen"))).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
+            b"FullScreen",
+        )))
+        .unwrap();
         assert!(
             !outlines_in_first_page_predicate(&mut pdf).unwrap(),
             "/PageMode /FullScreen (not UseOutlines) => predicate must be false"
@@ -4493,8 +4497,10 @@ mod tests {
     fn route_objstm_containers_outlines_first_page_routes_to_first_page() {
         // Outline container routes to FirstPage when /PageMode /UseOutlines is set.
         // Object 5 = outline dict, object 6 = outline item in outlines_pdf_bytes.
-        let mut pdf =
-            Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(b"UseOutlines"))).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
+            b"UseOutlines",
+        )))
+        .unwrap();
         let outline_ref = ObjectRef::new(5, 0); // outline dict
         let synthetic = vec![vec![outline_ref]];
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();

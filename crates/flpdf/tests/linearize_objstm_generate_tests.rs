@@ -398,3 +398,48 @@ fn objstm_bearing_input_drops_source_structural_containers() {
             .unwrap_or_else(|e| panic!("object {r} did not resolve after drop: {e}"));
     }
 }
+
+// flpdf-vvjr.1: /PageMode /UseOutlines causes outline containers to route to
+// FirstPage (part6). Exercises route_objstm_containers FirstPage arm and
+// page-0 nobjects fold without qpdf-zlib-compat. Byte-parity is gated on
+// qpdf-zlib-compat in cmp_linearize_objstm_tests.rs.
+#[test]
+fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
+    let bytes = linearize_generate("objstm-lin-useoutlines-80-80.pdf");
+
+    // The output must parse as a valid linearized PDF.
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // The hint-stream dict must carry /O (outline objects present in part6).
+    let hint_dict_start = bytes
+        .windows(b"/Filter /FlateDecode /S ".len())
+        .position(|w| w == b"/Filter /FlateDecode /S ")
+        .expect("hint stream dict present");
+    let dict_end = hint_dict_start
+        + bytes[hint_dict_start..]
+            .windows(2)
+            .position(|w| w == b">>")
+            .expect("hint dict close");
+    let hint_dict = &bytes[hint_dict_start..dict_end];
+    assert!(
+        hint_dict.windows(4).any(|w| w == b" /O "),
+        "hint stream dict must carry /O key when /PageMode /UseOutlines: {:?}",
+        String::from_utf8_lossy(hint_dict)
+    );
+
+    // The linearization data must show page-0 nobjects = 4: the page object
+    // (part2), its content stream (part2), the first-page shared-dicts
+    // container (part3), and the outline container (now in part6 = page-0 section).
+    let dump = flpdf::linearization::show_linearization_bytes(&bytes, "useoutlines.pdf")
+        .expect("show-linearization decode");
+    assert!(
+        dump.contains("nobjects: 4"),
+        "page-0 nobjects must be 4 when outlines route to first-page section:\n{dump}"
+    );
+}
