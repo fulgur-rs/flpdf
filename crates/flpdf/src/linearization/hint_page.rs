@@ -257,10 +257,12 @@ fn page0_object_count_with_objstm(
     member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
 ) -> u32 {
     // Page 0's section is Part 2 (always plain) followed by Part 3 (plain or
-    // folded into a first-half container).
+    // folded into a first-half container). No container is excluded — page 0
+    // owns its first-page (part6) containers.
     objstm_folded_count(
         plan.part2_objects.iter().chain(&plan.part3_objects),
         member_to_container,
+        &std::collections::BTreeSet::new(),
     )
 }
 
@@ -269,9 +271,16 @@ fn page0_object_count_with_objstm(
 /// counts once, and each *distinct* container counts once (its members are not
 /// counted individually). Mirrors qpdf, where a page's section holds the
 /// container object — not the members inside it.
+///
+/// `exclude` lists container numbers that belong to a *different* section: a
+/// page's private object can land (via the global even split) in a first-page
+/// (part6) container, which is physically in page 0's section, not this page's.
+/// Such a member is counted only via page 0's container, so it must add nothing
+/// here.
 fn objstm_folded_count<'a>(
     objects: impl Iterator<Item = &'a ObjectRef>,
     member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+    exclude: &std::collections::BTreeSet<u32>,
 ) -> u32 {
     use std::collections::BTreeSet;
 
@@ -280,7 +289,9 @@ fn objstm_folded_count<'a>(
     for r in objects {
         match member_to_container.get(r) {
             Some(&(container_num, _)) => {
-                containers.insert(container_num);
+                if !exclude.contains(&container_num) {
+                    containers.insert(container_num);
+                }
             }
             None => plain += 1,
         }
@@ -363,9 +374,24 @@ impl PageOffsetHintTable {
             // members — so its object_count must count the container once, exactly
             // like page 0. Without this a page with a part7 container reports its
             // members individually, inflating `bits_object_count_delta`.
+            //
+            // Containers in page 0's first-page section (part6) are excluded: a
+            // page-private object can land in a first-page container via the
+            // global even split, but it is then physically in page 0's section,
+            // so it must not add a container to this page's count.
+            let first_page_containers: std::collections::BTreeSet<u32> = plan
+                .part2_objects
+                .iter()
+                .chain(&plan.part3_objects)
+                .filter_map(|r| member_to_container.get(r).map(|&(c, _)| c))
+                .collect();
             for (i, count) in object_counts.iter_mut().enumerate().skip(1) {
                 if let Some(privates) = plan.per_page_private_objects.get(i) {
-                    *count = objstm_folded_count(privates.iter(), member_to_container);
+                    *count = objstm_folded_count(
+                        privates.iter(),
+                        member_to_container,
+                        &first_page_containers,
+                    );
                 }
             }
         }
