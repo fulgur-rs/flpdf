@@ -1674,38 +1674,57 @@ fn do_write_pass<R: Read + Seek>(
     // is not written twice.  ObjStm members are skipped and emitted via their
     // Part-4 container below.  The ObjStm path retains the writer-emission
     // order of `part4_objects()` (its split-xref tail relocation depends on it).
-    let mut part4_refs = plan.part4_objects();
-    if objstm_layout.is_empty() {
-        part4_refs.sort_by_key(|r| {
-            renumber
-                .new_for_original(*r)
-                .map(|nr| nr.number)
-                .unwrap_or(u32::MAX)
-        });
+    // Emit the second-half (Annex F Part 5) objects in NEW-NUMBER order, with
+    // each Part-4 ObjStm container interleaved at its object-number position
+    // among the plain objects — qpdf numbers the second-half uncompressed objects
+    // (plain + containers) in part order and writes them in that same order, so a
+    // part7 container sits in its owning page's group, NOT after every plain
+    // object. (mixed/threepage have a single second-half container that is the
+    // last second-half object, so this is identical to the old plain-then-
+    // containers emission; disc's part7 container falls in the middle.) Members
+    // are written inside their container; the early-written catalog is skipped.
+    enum Part4Emit<'a> {
+        Plain(ObjectRef),
+        Container(&'a ObjStmContainer),
     }
-    for original_ref in &part4_refs {
-        if objstm_layout.member_to_container.contains_key(original_ref) {
+    let mut part4_emits: Vec<(u32, Part4Emit)> = Vec::new();
+    for original_ref in plan.part4_objects() {
+        if objstm_layout
+            .member_to_container
+            .contains_key(&original_ref)
+        {
             continue;
         }
-        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
+        if catalog_emitted_early && plan.root_ref == Some(original_ref) {
             continue;
         }
-        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
+        let Some(new_ref) = renumber.new_for_original(original_ref) else {
             return Err(crate::Error::Unsupported(format!(
-                "part4 object {} has no renumber entry",
-                original_ref
+                "part4 object {original_ref} has no renumber entry"
             )));
         };
-        let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
-        xref_offsets.insert(new_ref.number, offset);
+        part4_emits.push((new_ref.number, Part4Emit::Plain(original_ref)));
     }
-
-    // Part-4 ObjStm containers (after /E, in the remaining body).
     for container in &objstm_layout.part4 {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
-        xref_offsets.insert(container.container_new_num, offset);
+        part4_emits.push((container.container_new_num, Part4Emit::Container(container)));
+    }
+    part4_emits.sort_by_key(|(number, _)| *number);
+    for (_, emit) in &part4_emits {
+        match emit {
+            Part4Emit::Plain(original_ref) => {
+                let new_ref = renumber
+                    .new_for_original(*original_ref)
+                    .expect("part4 plain object renumber entry checked above");
+                let object = pdf.resolve_borrowed(*original_ref)?;
+                let renumbered = renumber_object(object, 0, renumber)?;
+                let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+                xref_offsets.insert(new_ref.number, offset);
+            }
+            Part4Emit::Container(container) => {
+                let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
+                xref_offsets.insert(container.container_new_num, offset);
+            }
+        }
     }
 
     // Part 6: main cross-reference + trailer.
