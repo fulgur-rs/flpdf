@@ -267,73 +267,67 @@ impl SharedObjectHintTable {
         //
         // Fail fast on plan/renumber inconsistency for the part8 case.
         // ------------------------------------------------------------------
-        let first_object_number: u32 = if plan.part4_other_pages_shared.is_empty() {
-            // No Part-8 shared objects: value is meaningless per Note 131.
-            // Emit 0 (qpdf also emits 0 in this path per line 1400-1403 of
-            // QPDF_linearization.cc: first_shared_obj is only set when
-            // part8 is non-empty).
-            0
-        } else {
-            let first_part8 = plan.part4_other_pages_shared[0];
-            renumber
-                .new_for_original(first_part8)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "first Part-8 shared object {:?} not found in RenumberMap \
-                         (plan/renumber inconsistency)",
-                        first_part8
-                    )
-                })
-                .number
-        };
+        // Step 2: count the Part-8 (after-/E) shared entries and find the first
+        // one, then derive `first_page_entries = shared_count − part8_entries`.
+        //
+        // `shared_hints` (folded) is laid out as
+        //   [Part-2] + [Part-3] + [Part-4 other-page-shared]
+        // and the Part-2 / Part-3 entries are physically in the first-page
+        // section (before /E). The subtlety with the GLOBAL even split: a
+        // `part4_other_pages_shared` object can land in a FIRST-PAGE (part6)
+        // ObjStm container — it is then physically before /E and folds into the
+        // first-page container, NOT a Part-8 entry. Only objects in a SECOND-HALF
+        // container (or plain Part-8 objects) are after /E. So we exclude
+        // first-page containers (the same set the per-page hint folds exclude)
+        // when counting Part-8 entries, and `first_object_number` (Annex F.4.1
+        // item 1 — the first object of the Part-8 section) is the FIRST such
+        // second-half entry, NOT `part4_other_pages_shared[0]` (which may fold
+        // into the part6 container).
+        let first_page_container_nums: std::collections::BTreeSet<u32> = plan
+            .part2_objects
+            .iter()
+            .chain(&plan.part3_objects)
+            .filter_map(|r| member_to_container.get(r).map(|&(c, _)| c))
+            .collect();
 
-        // ------------------------------------------------------------------
-        // Step 2: count shared objects that are physically in the first-page
-        // section (before /E).
-        //
-        // `shared_hints` is laid out as:
-        //   [part2 entries] + [part3 entries] + [part4_other_pages_shared entries]
-        //
-        // Only the part2 + part3 entries are physically in the first-page
-        // section (before /E).  The part4_other_pages_shared entries live
-        // after /E, so `first_page_entries` must NOT include them.
-        //
-        // Setting `first_page_entries = shared_count` (the old value) when
-        // there are part4 shared objects would tell qpdf that ALL shared
-        // objects are in the first-page section, contradicting the actual
-        // file layout and causing "in computed list but not hint table"
-        // warnings for those objects.
-        //
-        // `first_page_entries` = the folded shared entries physically in the
-        // first-page section (Part-2 + Part-3, with packed Part-3 members folded
-        // into their first-half container).  The remainder
-        // (section_entries - first_page_entries) are the Part-8 (after-/E)
-        // shared objects, counted in the SAME folded form as `shared_count`:
-        // `part4_other_pages_shared` members packed into a second-half ObjStm
-        // container fold to one shared entry per container (see
-        // [`LinearizationPlan::canonical_shared_hints`]), so subtracting the
-        // unfolded `part4_other_pages_shared.len()` would over-count the Part-8
-        // region and undercount `first_page_entries`.  Mirror the fold here so
-        // the count stays consistent with the folded list regardless of ObjStm
-        // packing.
-        // ------------------------------------------------------------------
-        let part8_entries = {
-            let mut seen_containers = std::collections::BTreeSet::new();
-            let mut count = 0u32;
-            for r in &plan.part4_other_pages_shared {
-                match member_to_container.get(r) {
+        let mut seen_containers = std::collections::BTreeSet::new();
+        let mut part8_entries = 0u32;
+        let mut first_object_number: u32 = 0;
+        for r in &plan.part4_other_pages_shared {
+            match member_to_container.get(r) {
+                Some(&(container_num, _)) => {
+                    // Members folded into a FIRST-PAGE container are before /E,
+                    // not Part-8 — skip them entirely.
+                    if first_page_container_nums.contains(&container_num) {
+                        continue;
+                    }
                     // One folded entry per distinct second-half container.
-                    Some(&(container_num, _)) => {
-                        if seen_containers.insert(container_num) {
-                            count += 1;
+                    if seen_containers.insert(container_num) {
+                        part8_entries += 1;
+                        if first_object_number == 0 {
+                            first_object_number = container_num;
                         }
                     }
+                }
+                None => {
                     // Plain (uncompressed) Part-8 object: its own entry.
-                    None => count += 1,
+                    part8_entries += 1;
+                    if first_object_number == 0 {
+                        first_object_number = renumber
+                            .new_for_original(*r)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Part-8 shared object {r:?} not found in RenumberMap \
+                                     (plan/renumber inconsistency)"
+                                )
+                            })
+                            .number;
+                    }
                 }
             }
-            count
-        };
+        }
+        // No Part-8 shared objects: `first_object_number` stays 0 (meaningless
+        // per Implementation Note 131; qpdf emits 0 too).
         let first_page_entries = shared_count.saturating_sub(part8_entries);
 
         // ------------------------------------------------------------------

@@ -2495,36 +2495,24 @@ pub fn write_linearized<R: Read + Seek>(
             // This is only meaningful when nshared_total > nshared_first_page
             // (i.e., there are Part-8 objects).  When part4_other_pages_shared
             // is empty the location value is ignored (qpdf Implementation Note 131).
-            if !plan.part4_other_pages_shared.is_empty() {
-                let first_part8_orig = plan.part4_other_pages_shared[0];
-                // When the first Part-8 shared object is packed into an
-                // ObjStm it has no standalone offset; its physical location
-                // is the container object that holds it (qpdf's
-                // adjusted_offset() math works the same on the container's
-                // offset — readers seek to the container, then the ObjStm
-                // /First + pair table locates the member).
-                let first_part8_lookup_num = if let Some(&(container_num, _idx)) =
-                    objstm_layout.member_to_container.get(&first_part8_orig)
-                {
-                    container_num
-                } else {
-                    renumber
-                        .new_for_original(first_part8_orig)
-                        .ok_or_else(|| {
-                            crate::Error::Unsupported(format!(
-                                "first Part-8 shared object {} has no renumber entry",
-                                first_part8_orig
-                            ))
-                        })?
-                        .number
-                };
+            // `from_plan` already set `first_object_number` to the FIRST
+            // SECOND-HALF (Part-8) shared entry — the container number when that
+            // entry is an ObjStm container, or the object's own number when it is
+            // plain — and crucially EXCLUDES part4-shared objects that the global
+            // even split placed in a first-page (part6) container (those are
+            // before /E, not Part-8). It is 0 when there are no Part-8 entries
+            // (location is then ignored per Implementation Note 131). Look up that
+            // object's probe offset for the `location` field; the object number
+            // itself is already correct, so it is not overwritten here.
+            let first_part8_lookup_num = so_table.header.first_object_number;
+            if first_part8_lookup_num != 0 {
                 let first_part8_off = xref_offsets
                     .get(&first_part8_lookup_num)
                     .copied()
                     .ok_or_else(|| {
                         crate::Error::Unsupported(format!(
-                            "first Part-8 shared object (lookup #{}) has no probed offset",
-                            first_part8_lookup_num
+                            "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
+                             has no probed offset"
                         ))
                     })?;
                 // Subtract hint stream total length so that qpdf's
@@ -2538,19 +2526,6 @@ pub fn write_linearized<R: Read + Seek>(
                              ({hint_stream_obj_total_len}); cannot compute shared-hint location"
                         ))
                     })? as u64;
-
-                // first_object_number (item 1): object number of the first Part-8
-                // shared object.  When that object is packed into an ObjStm we use
-                // the *container's* new object number (already resolved above as
-                // `first_part8_lookup_num`), because the xref points readers to the
-                // container — not to a standalone object.
-                //
-                // `from_plan` computes this from `renumber.new_for_original`, which
-                // returns the member's own renumber slot — incorrect when the member
-                // lives inside an ObjStm container.  We patch it here alongside the
-                // `location` field so both fields agree on which object number to
-                // announce as the first Part-8 entry.
-                so_table.header.first_object_number = first_part8_lookup_num;
             }
 
             // Per-object length_minus_least.  group_offset is no longer a

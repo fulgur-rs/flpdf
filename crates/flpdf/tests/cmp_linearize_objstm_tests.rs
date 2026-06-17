@@ -189,14 +189,11 @@ fn mixed_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-mixed-60-70.pdf", "objstm-lin-mixed-60-70");
 }
 
-// threepage-2-120 (part8 other-page-shared container) and disc-2-250-2 (a part7
-// container coexisting with a part8 plain Form XObject) are not yet
-// byte-identical: threepage's residual is the shared-object hint table for a
-// part8 container; disc additionally needs second-half containers ordered by
-// PART (part7→part8→part9) rather than even-split order (they pass the part-order
-// check only coincidentally today). Tracked in the Phase-2 design doc.
+// threepage-2-120: a part8 (other-page-shared) ObjStm container holding fonts
+// shared by pages 1 & 2 (not page 0). Exercises the shared-object hint table's
+// first-page vs Part-8 split when a part4-shared object even-splits into the
+// first-page container. Fully byte-identical (structural + strict).
 #[test]
-#[ignore = "part8 shared-object hint table (threepage); part-ordered second-half containers (disc)"]
 fn threepage_shared_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural(
         "objstm-lin-threepage-2-120.pdf",
@@ -205,7 +202,21 @@ fn threepage_shared_objstm_structurally_byte_identical_to_qpdf() {
 }
 
 #[test]
-#[ignore = "finding-4: second-half container numbering (Stage B)"]
+fn threepage_shared_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-threepage-2-120.pdf",
+        "objstm-lin-threepage-2-120",
+    );
+}
+
+// disc-2-250-2: a pure part7 container coexisting with a part8 plain Form
+// XObject. Not yet byte-identical — qpdf orders the second-half ObjStm
+// containers by PART (part7→part8→part9), interleaved among the second-half
+// uncompressed objects, but flpdf currently emits them in even-split order
+// before the xref (they coincide only when even-split order == part order).
+// Tracked in the Phase-2 design doc.
+#[test]
+#[ignore = "disc: part-ordered second-half containers (Phase-2 follow-up)"]
 fn disc_part7_part8_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
 }
