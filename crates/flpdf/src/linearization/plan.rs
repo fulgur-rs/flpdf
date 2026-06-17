@@ -430,6 +430,16 @@ pub struct LinearizationPlan {
     /// and to populate the Page Offset Hint Table's `page_length_minus_least`
     /// and `least_page_length` fields.
     pub per_page_private_objects: Vec<Vec<ObjectRef>>,
+
+    /// Full object → referencing-page inverse map: `all_referenced_pages[r]` is
+    /// the set of 0-based page indices whose closure reaches `r`.
+    ///
+    /// Used to compute a shared ObjStm container's referencing pages from its
+    /// FULL membership — the global even split can place a page's *private*
+    /// object inside a container in another section (the first-page part6
+    /// container or a part8 shared container), and the page then references that
+    /// container as a shared object. Keyed by original ref.
+    pub all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>>,
 }
 
 impl LinearizationPlan {
@@ -781,6 +791,7 @@ impl LinearizationPlan {
             page_hints,
             shared_hints,
             per_page_private_objects,
+            all_referenced_pages,
         })
     }
 
@@ -920,6 +931,43 @@ impl LinearizationPlan {
             }
         });
 
+        // Recompute each entry's referencing pages from its FULL membership via
+        // `all_referenced_pages` (excluding page 0, which owns the first-page
+        // section and lists no shared identifiers). The fold above unions only
+        // the `shared_hints` inputs (part2/part3/part4_shared); the global even
+        // split can also place a page's PRIVATE object inside a shared container
+        // (the first-page part6 container, or a part8 container co-locating two
+        // pages' privates), and the page then references that container through
+        // the private object — a reference the input entries do not record. This
+        // is a no-op for documents whose containers hold only shared_hints
+        // objects (the union is identical).
+        if !self.all_referenced_pages.is_empty() {
+            let mut container_members: BTreeMap<u32, Vec<ObjectRef>> = BTreeMap::new();
+            for (&member, &(cnum, _)) in member_to_container {
+                container_members.entry(cnum).or_default().push(member);
+            }
+            let pages_excluding_first = |refs: &mut dyn Iterator<Item = ObjectRef>| -> Vec<u32> {
+                let mut pages: BTreeSet<u32> = BTreeSet::new();
+                for r in refs {
+                    if let Some(ps) = self.all_referenced_pages.get(&r) {
+                        pages.extend(ps.iter().copied().filter(|&p| p != 0));
+                    }
+                }
+                pages.into_iter().collect()
+            };
+            for entry in &mut out {
+                entry.referencing_pages = if entry.object_ref.generation == u16::MAX {
+                    let members = container_members
+                        .get(&entry.object_ref.number)
+                        .cloned()
+                        .unwrap_or_default();
+                    pages_excluding_first(&mut members.into_iter())
+                } else {
+                    pages_excluding_first(&mut std::iter::once(entry.object_ref))
+                };
+            }
+        }
+
         out
     }
 
@@ -981,6 +1029,7 @@ impl Default for LinearizationPlan {
             page_hints: Vec::new(),
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
+            all_referenced_pages: BTreeMap::new(),
         }
     }
 }
