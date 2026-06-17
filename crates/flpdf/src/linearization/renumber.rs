@@ -423,6 +423,7 @@ impl RenumberMap {
         &mut self,
         first_half_batches: &[Vec<ObjectRef>],
         second_half_batches: &[Vec<ObjectRef>],
+        second_half_anchors: &[Option<ObjectRef>],
     ) -> ObjStmRelocation {
         // Fast path: nothing to place — leave the map byte-identical.
         let no_first = first_half_batches.iter().all(|b| b.is_empty());
@@ -513,25 +514,51 @@ impl RenumberMap {
         new_by_new_number.push(SENTINEL); // slot 0
 
         // --- Second half ---
-        // (1) second-half non-members (type-1).
+        // (1)+(2) second-half non-members (type-1) with each ObjStm container
+        //     INTERLEAVED at its part-group end (type-1). qpdf numbers the
+        //     second-half containers AMONG the uncompressed objects — before the
+        //     main xref (QPDFWriter.cc:2578-2592 counts containers in
+        //     `second_half_uncompressed`) — AND at their part position: a part7
+        //     container sits at the END of its owning page's group (its synthetic
+        //     ObjGen is the group's highest), so it follows that page's plain
+        //     objects but precedes the next page. `second_half_anchors[bi]` is the
+        //     plain object after which container `bi` is emitted (the group's last
+        //     plain object); `None` means "append after all plain" (the caller's
+        //     default — and the result is identical to interleaving when the
+        //     container's group is the last one).
+        let mut second_half_container_slot: Vec<Option<u32>> =
+            vec![None; second_half_batches.len()];
+        let mut emit_container = |bi: usize, table: &mut Vec<ObjectRef>| {
+            if second_half_batches[bi].is_empty() || second_half_container_slot[bi].is_some() {
+                return;
+            }
+            let container_num = table.len() as u32;
+            table.push(SENTINEL); // container: a plain indirect, no original
+            second_half_container_slot[bi] = Some(container_num);
+        };
         for &original in &second_half_plain {
             new_by_new_number.push(original);
+            for bi in 0..second_half_batches.len() {
+                if second_half_anchors.get(bi).copied().flatten() == Some(original) {
+                    emit_container(bi, &mut new_by_new_number);
+                }
+            }
         }
-        // (2) Part-4 ObjStm containers, batch-ordered (type-1). qpdf numbers the
-        //     second-half ObjStm containers AMONG the uncompressed objects —
-        //     BEFORE the main xref stream — because a container is itself a
-        //     plain (type-1) object with a real file offset
-        //     (QPDFWriter.cc:2578-2592: `second_half_uncompressed` counts the
-        //     containers, and the xref is numbered after them). Emitting them
-        //     before the xref is what makes a second-half container's object
-        //     number match qpdf (finding-4 in the Phase-2 design doc).
-        for batch in second_half_batches {
+        // Containers with no anchor (or whose anchor was not found) go after all
+        // plain objects, in batch order — the original "compressed last" behaviour.
+        for bi in 0..second_half_batches.len() {
+            emit_container(bi, &mut new_by_new_number);
+        }
+        // Record container numbers in batch order (the writer maps batch ->
+        // container by position).
+        for (bi, batch) in second_half_batches.iter().enumerate() {
             if batch.is_empty() {
                 continue;
             }
-            let container_num = new_by_new_number.len() as u32;
-            new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
-            second_half_container_numbers.push(container_num);
+            second_half_container_numbers.push(
+                second_half_container_slot[bi]
+                    .expect("every non-empty second-half batch is assigned a container slot"),
+            );
         }
         // (3) main (second-half) xref stream slot (type-1) — after every
         //     uncompressed object (plain + containers), before the members.
@@ -1101,7 +1128,7 @@ mod tests {
             vec![ObjectRef::new(5, 0)],
             vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
         ];
-        let relocation = rn.place_objstm_members_per_half(&[], &second_half_batches);
+        let relocation = rn.place_objstm_members_per_half(&[], &second_half_batches, &[]);
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -1184,7 +1211,7 @@ mod tests {
 
         // One Part-3 (first-half) batch: 5 0 R + 8 0 R (both part3_objects).
         let first_half_batches = vec![vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)]];
-        let relocation = rn.place_objstm_members_per_half(&first_half_batches, &[]);
+        let relocation = rn.place_objstm_members_per_half(&first_half_batches, &[], &[]);
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -1248,7 +1275,7 @@ mod tests {
         let first_half_batches = vec![vec![], vec![ObjectRef::new(5, 0)]];
         let second_half_batches = vec![vec![], vec![ObjectRef::new(4, 0)]];
         let relocation =
-            rn.place_objstm_members_per_half(&first_half_batches, &second_half_batches);
+            rn.place_objstm_members_per_half(&first_half_batches, &second_half_batches, &[]);
 
         // Empty batches contribute no container numbers: one first-half + one
         // second-half = exactly two containers.

@@ -266,6 +266,50 @@ fn page0_object_count_with_objstm(
     )
 }
 
+/// Container numbers that a NON-first page must not count toward its page-offset
+/// object count (or page byte length): only a container owned entirely by one
+/// non-first page (a part7 container) is a section object of that page. A
+/// container is excluded when it touches no non-first page, more than one
+/// non-first page (part8 — the even split can co-locate two pages' privates), or
+/// any non-page member (a first-page part2/part3 object, a part8-shared, or a
+/// part9 object). Page 0 is handled separately (it owns its first-page
+/// containers) and is not consulted here.
+pub(crate) fn non_page_owned_containers(
+    plan: &LinearizationPlan,
+    member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+) -> std::collections::BTreeSet<u32> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let page_private_sets: Vec<BTreeSet<ObjectRef>> = plan
+        .per_page_private_objects
+        .iter()
+        .map(|v| v.iter().copied().collect())
+        .collect();
+
+    let mut container_pages: BTreeMap<u32, BTreeSet<usize>> = BTreeMap::new();
+    let mut has_nonpage_member: BTreeSet<u32> = BTreeSet::new();
+    let mut all_containers: BTreeSet<u32> = BTreeSet::new();
+    for (member, &(cnum, _)) in member_to_container {
+        all_containers.insert(cnum);
+        match (1..page_private_sets.len()).find(|&i| page_private_sets[i].contains(member)) {
+            Some(i) => {
+                container_pages.entry(cnum).or_default().insert(i);
+            }
+            None => {
+                has_nonpage_member.insert(cnum);
+            }
+        }
+    }
+
+    all_containers
+        .into_iter()
+        .filter(|c| {
+            let single_page = container_pages.get(c).is_some_and(|s| s.len() == 1);
+            !single_page || has_nonpage_member.contains(c)
+        })
+        .collect()
+}
+
 /// Count the objects a page contributes to its linearization section when its
 /// compressed members are folded into ObjStm containers: each plain indirect
 /// counts once, and each *distinct* container counts once (its members are not
@@ -375,23 +419,18 @@ impl PageOffsetHintTable {
             // like page 0. Without this a page with a part7 container reports its
             // members individually, inflating `bits_object_count_delta`.
             //
-            // Containers in page 0's first-page section (part6) are excluded: a
-            // page-private object can land in a first-page container via the
-            // global even split, but it is then physically in page 0's section,
-            // so it must not add a container to this page's count.
-            let first_page_containers: std::collections::BTreeSet<u32> = plan
-                .part2_objects
-                .iter()
-                .chain(&plan.part3_objects)
-                .filter_map(|r| member_to_container.get(r).map(|&(c, _)| c))
-                .collect();
+            // A non-first page may count only a container that is ENTIRELY its
+            // own private section object (a part7 container). The global even
+            // split can place a page's private object in the first-page (part6)
+            // container — physically page 0's — or co-locate two pages' privates
+            // in one container that qpdf then routes to part8 (shared). Neither
+            // belongs to this page's section, so exclude every container that is
+            // not owned by a single non-first page.
+            let non_page_owned = non_page_owned_containers(plan, member_to_container);
             for (i, count) in object_counts.iter_mut().enumerate().skip(1) {
                 if let Some(privates) = plan.per_page_private_objects.get(i) {
-                    *count = objstm_folded_count(
-                        privates.iter(),
-                        member_to_container,
-                        &first_page_containers,
-                    );
+                    *count =
+                        objstm_folded_count(privates.iter(), member_to_container, &non_page_owned);
                 }
             }
         }
