@@ -326,8 +326,18 @@ impl Part1Bytes {
         // (qpdf byte format) and grows this pad to absorb the saved bytes
         // — total Part 1 byte length stays constant so downstream offsets
         // never shift.
+        //
+        // qpdf lands the first-page xref at a FIXED offset regardless of the
+        // param-dict object number's digit count: it absorbs the extra
+        // `{n} 0 obj\n` digits into this pad so the param-dict OBJECT's total
+        // span stays constant. `PARAM_DICT_TRAILING_PAD` is tuned for a
+        // single-digit object number; when the param dict is numbered with more
+        // digits (e.g. obj 72 in a file with >70 second-half objects), shorten
+        // the pad by `digits − 1` so the xref still lands where qpdf places it.
         // ------------------------------------------------------------------
-        let dict_writable_end = bytes.len() + PARAM_DICT_TRAILING_PAD;
+        let obj_number_digits = param_dict_obj_number.to_string().len();
+        let trailing_pad = PARAM_DICT_TRAILING_PAD - (obj_number_digits - 1);
+        let dict_writable_end = bytes.len() + trailing_pad;
         bytes.resize(dict_writable_end, b' ');
 
         let placeholders = Part1Placeholders {

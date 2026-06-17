@@ -256,24 +256,36 @@ fn page0_object_count_with_objstm(
     plan: &LinearizationPlan,
     member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
 ) -> u32 {
+    // Page 0's section is Part 2 (always plain) followed by Part 3 (plain or
+    // folded into a first-half container).
+    objstm_folded_count(
+        plan.part2_objects.iter().chain(&plan.part3_objects),
+        member_to_container,
+    )
+}
+
+/// Count the objects a page contributes to its linearization section when its
+/// compressed members are folded into ObjStm containers: each plain indirect
+/// counts once, and each *distinct* container counts once (its members are not
+/// counted individually). Mirrors qpdf, where a page's section holds the
+/// container object — not the members inside it.
+fn objstm_folded_count<'a>(
+    objects: impl Iterator<Item = &'a ObjectRef>,
+    member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+) -> u32 {
     use std::collections::BTreeSet;
 
-    // Part-2 objects are always plain indirects in the first-page section.
-    let part2 = plan.part2_objects.len() as u32;
-
-    // Part-3 objects either stay plain or are folded into a container.
-    let mut part3_plain = 0u32;
-    let mut first_page_containers: BTreeSet<u32> = BTreeSet::new();
-    for r in &plan.part3_objects {
+    let mut plain = 0u32;
+    let mut containers: BTreeSet<u32> = BTreeSet::new();
+    for r in objects {
         match member_to_container.get(r) {
             Some(&(container_num, _)) => {
-                first_page_containers.insert(container_num);
+                containers.insert(container_num);
             }
-            None => part3_plain += 1,
+            None => plain += 1,
         }
     }
-
-    part2 + part3_plain + first_page_containers.len() as u32
+    plain + containers.len() as u32
 }
 
 impl PageOffsetHintTable {
@@ -345,6 +357,17 @@ impl PageOffsetHintTable {
         let mut object_counts: Vec<u32> = plan.page_hints.iter().map(|h| h.object_count).collect();
         if !member_to_container.is_empty() {
             object_counts[0] = page0_object_count_with_objstm(plan, member_to_container);
+            // Pages 1..N: fold each page's private objects into their containers
+            // too. A page whose private resources are compressed into a part7
+            // ObjStm holds the container (one object) in its section, not the
+            // members — so its object_count must count the container once, exactly
+            // like page 0. Without this a page with a part7 container reports its
+            // members individually, inflating `bits_object_count_delta`.
+            for (i, count) in object_counts.iter_mut().enumerate().skip(1) {
+                if let Some(privates) = plan.per_page_private_objects.get(i) {
+                    *count = objstm_folded_count(privates.iter(), member_to_container);
+                }
+            }
         }
 
         let least_object_count = object_counts.iter().copied().min().unwrap_or(0);
