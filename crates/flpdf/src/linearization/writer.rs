@@ -106,6 +106,10 @@ struct ObjStmContainer {
 /// surrounding byte offsets shift), which keeps the convergence loop bounded.
 #[derive(Debug, Clone, Default)]
 struct ObjStmLayout {
+    /// Containers emitted in the open-document region (qpdf part4) — physically
+    /// right after the Catalog and before the primary hint stream, so they are
+    /// the first compressed objects of the first half.
+    open_document: Vec<ObjStmContainer>,
     /// Containers emitted inside the first-page section (Annex F Part 3,
     /// before `/E`).
     part3: Vec<ObjStmContainer>,
@@ -121,7 +125,7 @@ impl ObjStmLayout {
     /// `true` when no ObjStm containers are scheduled — the writer then keeps
     /// its classic-xref-table path verbatim (no regression).
     fn is_empty(&self) -> bool {
-        self.part3.is_empty() && self.part4.is_empty()
+        self.open_document.is_empty() && self.part3.is_empty() && self.part4.is_empty()
     }
 
     /// Resolve the Part-tagged, writer-filtered ObjStm batch plan.
@@ -165,6 +169,7 @@ impl ObjStmLayout {
                 .collect()
         };
         Ok(crate::linearization::plan::ObjStmBatchPlan {
+            open_document_batches: filter_batches(batch_plan.open_document_batches),
             part3_batches: filter_batches(batch_plan.part3_batches),
             part4_batches: filter_batches(batch_plan.part4_batches),
         })
@@ -174,17 +179,19 @@ impl ObjStmLayout {
     /// member + container through the **placed** `renumber` map.
     ///
     /// `container_numbers` are the per-batch container object numbers returned
-    /// by [`RenumberMap::place_objstm_members_per_half`] (Part-3 batches first,
-    /// then Part-4), so the layout never re-derives numbers independently.
-    /// Every
-    /// member ref is mapped through `renumber`; a missing entry is a planner /
-    /// renumber inconsistency and is surfaced loudly.
+    /// by [`RenumberMap::place_objstm_members_per_half`] (open-document batches
+    /// first, then Part-3, then Part-4), so the layout never re-derives numbers
+    /// independently. Every member ref is mapped through `renumber`; a missing
+    /// entry is a planner / renumber inconsistency and is surfaced loudly.
     fn build_from_batches(
         batch_plan: &crate::linearization::plan::ObjStmBatchPlan,
         container_numbers: &[u32],
         renumber: &RenumberMap,
     ) -> Result<Self> {
-        if batch_plan.part3_batches.is_empty() && batch_plan.part4_batches.is_empty() {
+        if batch_plan.open_document_batches.is_empty()
+            && batch_plan.part3_batches.is_empty()
+            && batch_plan.part4_batches.is_empty()
+        {
             return Ok(Self::default());
         }
 
@@ -227,8 +234,17 @@ impl ObjStmLayout {
 
         let container_numbers_vec: Vec<u32> = container_numbers.to_vec();
         let mut container_iter = container_numbers_vec.into_iter();
+        let mut open_document = Vec::new();
         let mut part3 = Vec::new();
         let mut part4 = Vec::new();
+        // Consumption order MUST match `place_objstm_members_per_half`'s
+        // `container_numbers` order: open-document, then Part-3, then Part-4.
+        take(
+            &batch_plan.open_document_batches,
+            &mut open_document,
+            &mut member_to_container,
+            &mut container_iter,
+        )?;
         take(
             &batch_plan.part3_batches,
             &mut part3,
@@ -244,6 +260,7 @@ impl ObjStmLayout {
         let _ = container_iter;
 
         Ok(Self {
+            open_document,
             part3,
             part4,
             member_to_container,
@@ -1449,7 +1466,12 @@ fn do_write_pass<R: Read + Seek>(
     // entries.  Built once: the first-page xref stream (emitted just below,
     // before /E) and the main xref stream (emitted at EOF) both consume it.
     let mut member_new: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
-    for container in objstm_layout.part3.iter().chain(&objstm_layout.part4) {
+    for container in objstm_layout
+        .open_document
+        .iter()
+        .chain(&objstm_layout.part3)
+        .chain(&objstm_layout.part4)
+    {
         for (idx, &(_orig, new_ref)) in container.members.iter().enumerate() {
             member_new.insert(new_ref.number, (container.container_new_num, idx as u32));
         }
@@ -1570,6 +1592,18 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
+    }
+
+    // Open-document ObjStm containers (qpdf part4).  qpdf places the
+    // open-document objects (`/OpenAction`, `/AcroForm`, … subtrees) in part4,
+    // physically right after the Catalog and BEFORE the primary hint stream —
+    // their object numbers (`part4_first_obj …`) sit between the catalog and the
+    // hint id (QPDFWriter.cc:2606-2612).  The container itself is a plain
+    // indirect object; its compressed members are emitted nowhere else (skipped
+    // in every plain loop via `member_to_container`).
+    for container in &objstm_layout.open_document {
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
+        xref_offsets.insert(container.container_new_num, offset);
     }
 
     // Hint stream object.
@@ -2131,10 +2165,13 @@ pub fn write_linearized<R: Read + Seek>(
     // container's group is the last one (the single-second-half-container case).
     let second_half_anchors =
         second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
-    // Part-3 batches are numbered last within the FIRST half (qpdf packs the
-    // first-page shared dicts + /Pages tree + /Info there); Part-4 batches are
-    // interleaved among the second-half objects at their part position.
+    // Open-document batches are numbered FIRST in the first half (right after
+    // the catalog, before the hint); Part-3 batches are numbered last within
+    // the first half (qpdf packs the first-page shared dicts + /Pages tree +
+    // /Info there); Part-4 batches are interleaved among the second-half
+    // objects at their part position.
     let relocation = local_renumber.place_objstm_members_per_half(
+        &resolved_batch_plan.open_document_batches,
         &resolved_batch_plan.part3_batches,
         &resolved_batch_plan.part4_batches,
         &second_half_anchors,
@@ -2144,9 +2181,10 @@ pub fn write_linearized<R: Read + Seek>(
 
     // Floor the header to 1.5 only when the output actually carries an ObjStm
     // container (qpdf raises the minimum on real emission, not on mode). When
-    // both batch lists are empty the placement early-returned and no container
+    // all batch lists are empty the placement early-returned and no container
     // is written, so the non-ObjStm linearized goldens stay at the 1.2 floor.
-    let emits_object_streams = !resolved_batch_plan.part3_batches.is_empty()
+    let emits_object_streams = !resolved_batch_plan.open_document_batches.is_empty()
+        || !resolved_batch_plan.part3_batches.is_empty()
         || !resolved_batch_plan.part4_batches.is_empty();
     let eff_version = effective_pdf_version(pdf.version(), options, true, emits_object_streams);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);

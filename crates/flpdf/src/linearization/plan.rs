@@ -1123,17 +1123,24 @@ impl Default for LinearizationPlan {
 ///
 /// # Part constraints
 ///
+/// * `open_document_batches` — containers qpdf categorizes `in_open_document`
+///   (qpdf part4: the open-document objects placed FIRST in the first half,
+///   right after the Catalog and before the first-page section). A container
+///   lands here when any member is in [`open_document_set`].
 /// * `part3_batches` — containers that belong in the first-page section
-///   (ISO 32000-1 Annex F Part 3: shared/catalog objects).
-/// * `part4_batches` — containers that belong after `/E` (Part 4: remaining
-///   document objects from `part4_other_pages_private`, `part4_other_pages_shared`,
-///   and `part4_rest`).
+///   (ISO 32000-1 Annex F Part 3 = qpdf part6: shared/catalog objects).
+/// * `part4_batches` — containers that belong after `/E` (Part 4 = qpdf
+///   part7/8/9: remaining document objects from `part4_other_pages_private`,
+///   `part4_other_pages_shared`, and `part4_rest`).
 ///
-/// ObjStm containers can never span the Part-3 / Part-4 boundary.
-/// `part2_objects` (first-page closure exclusives) are **never** placed in
-/// either batch list — they stay as plain indirect objects.
+/// ObjStm containers can never span a part boundary. `part2_objects`
+/// (first-page closure exclusives) are **never** placed in any batch list —
+/// they stay as plain indirect objects.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObjStmBatchPlan {
+    /// ObjStm batches for qpdf part4 (open-document objects). Numbered and
+    /// emitted in the first half, before the first-page section.
+    pub open_document_batches: Vec<Vec<ObjectRef>>,
     /// ObjStm batches for Part 3 (shared/catalog) objects.
     pub part3_batches: Vec<Vec<ObjectRef>>,
     /// ObjStm batches for Part 4 (rest-of-document) objects.
@@ -1375,11 +1382,13 @@ impl LinearizationPlan {
         let containers = objstm_membership_linearized(pdf)?;
         let routes = route_objstm_containers(pdf, &containers)?;
 
+        let mut open_document_batches: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
             members.sort_unstable_by_key(|r| r.number);
             match route {
+                ContainerPart::OpenDocument => open_document_batches.push(members),
                 ContainerPart::FirstPage => part3_batches.push(members),
                 ContainerPart::OtherPagePrivate
                 | ContainerPart::OtherPageShared
@@ -1388,6 +1397,7 @@ impl LinearizationPlan {
         }
 
         Ok(ObjStmBatchPlan {
+            open_document_batches,
             part3_batches,
             part4_batches,
         })
@@ -1519,6 +1529,11 @@ impl LinearizationPlan {
         }
 
         Ok(ObjStmBatchPlan {
+            // Preserve mode does not model the open-document category (no such
+            // fixture in the supported corpus); it reconstructs the source
+            // grouping verbatim. Generate mode (`objstm_batches_generate`)
+            // routes open-document containers.
+            open_document_batches: Vec::new(),
             part3_batches,
             part4_batches,
         })
@@ -1539,14 +1554,21 @@ impl LinearizationPlan {
 // ---------------------------------------------------------------------------
 
 /// Linearization part a generate-mode ObjStm container is routed to, by the
-/// union of its members' page users.
+/// union of its members' object users.
 ///
-/// `FirstPage` is qpdf part 6 (first-page section), `OtherPagePrivate` part 7,
-/// `OtherPageShared` part 8, and `Rest` part 9. The open-document / outline /
-/// thumbnail categories qpdf checks *before* `in_first_page` are not modeled
-/// (see [`route_objstm_containers`]).
+/// `OpenDocument` is qpdf part 4 (open-document objects, first half), `FirstPage`
+/// part 6 (first-page section), `OtherPagePrivate` part 7, `OtherPageShared`
+/// part 8, and `Rest` part 9. qpdf checks `in_open_document` *before*
+/// `in_first_page`, so [`route_objstm_containers`] tests it first. The outline
+/// and thumbnail categories qpdf also checks before `in_first_page` are not yet
+/// modeled (see [`route_objstm_containers`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContainerPart {
+    /// qpdf part 4 — the container holds at least one open-document object
+    /// (reachable from the catalog's `/OpenAction`, `/AcroForm`,
+    /// `/ViewerPreferences`, `/PageMode`, `/Threads`, or the trailer's
+    /// `/Encrypt`). Takes precedence over every page category.
+    OpenDocument,
     /// qpdf part 6 — the container holds at least one first-page object.
     FirstPage,
     /// qpdf part 7 — the container's members are private to exactly one
@@ -1603,37 +1625,115 @@ pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
         .collect())
 }
 
+/// Compute the set of objects qpdf categorizes `in_open_document`.
+///
+/// Mirrors qpdf's `optimize()` open-document object users
+/// (QPDF_optimization.cc:91-110) followed by the `open_document_keys` test in
+/// `calculateLinearizationData` (QPDF_linearization.cc:1045-1097): every
+/// indirect object reachable from the document catalog's `/ViewerPreferences`,
+/// `/PageMode`, `/Threads`, `/OpenAction`, or `/AcroForm` entries, or from the
+/// trailer's `/Encrypt` entry.
+///
+/// The traversal mirrors `updateObjectMapsInternal`
+/// (QPDF_optimization.cc:271-337): it records every indirect object it reaches
+/// but STOPS at a `/Page` leaf (a page boundary), so an `/OpenAction` destination
+/// like `[page /Fit]` drops the page and keeps only the non-page objects. A
+/// single shared `visited` set is sufficient because the result is the union
+/// over all keys.
+///
+/// qpdf categorizes `in_open_document` with HIGHER precedence than
+/// `in_first_page`, so [`route_objstm_containers`] tests this set before the
+/// page categories.
+///
+/// # Errors
+///
+/// Propagates reader errors from resolving the catalog, the trailer values, or
+/// any reached object.
+fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
+    // Seed refs: the indirect refs inside each open-document key's value. A
+    // direct value (e.g. an inline /OpenAction action dict) contributes only the
+    // indirect refs it contains; qpdf records indirect objects, not inline ones.
+    let mut seeds: Vec<ObjectRef> = Vec::new();
+    if let Some(enc) = pdf.trailer().get("Encrypt") {
+        collect_direct_refs(enc, 0, &mut seeds)?;
+    }
+    if let Some(root) = pdf.root_ref() {
+        if let Object::Dictionary(catalog) = pdf.resolve_borrowed(root)? {
+            for key in [
+                b"ViewerPreferences".as_slice(),
+                b"PageMode",
+                b"Threads",
+                b"OpenAction",
+                b"AcroForm",
+            ] {
+                if let Some(v) = catalog.get(key) {
+                    collect_direct_refs(v, 0, &mut seeds)?;
+                }
+            }
+        }
+    }
+
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut queue: VecDeque<ObjectRef> = seeds.into_iter().collect();
+    while let Some(r) = queue.pop_front() {
+        if !visited.insert(r) {
+            continue;
+        }
+        let obj = pdf.resolve_borrowed(r)?;
+        // Page boundary: qpdf neither records nor descends a non-top `/Page`
+        // leaf reached while tracing a document-level key.
+        if matches!(obj, Object::Dictionary(d)
+            if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page"))
+        {
+            continue;
+        }
+        let mut children = Vec::new();
+        collect_direct_refs(obj, 0, &mut children)?;
+        out.insert(r);
+        for cr in children {
+            if !visited.contains(&cr) {
+                queue.push_back(cr);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Route each ObjStm container to a linearization part by the union of its
-/// members' page users.
+/// members' object users.
 ///
 /// Mirrors qpdf's `filterCompressedObjects` (the container inherits the union of
-/// every member's obj_users) followed by the `lc_*` categorization: a container
-/// holding any first-page object is part 6 ([`ContainerPart::FirstPage`]);
-/// otherwise it is part 7 / part 8 / part 9 by the number of *distinct non-first*
-/// pages its members reach (one → [`ContainerPart::OtherPagePrivate`], two or
-/// more → [`ContainerPart::OtherPageShared`], none →
-/// [`ContainerPart::Rest`]).
+/// every member's obj_users) followed by the `lc_*` categorization. In qpdf's
+/// precedence order: a container holding any [`open_document_set`] object is
+/// part 4 ([`ContainerPart::OpenDocument`]); otherwise a container holding any
+/// first-page object is part 6 ([`ContainerPart::FirstPage`]); otherwise it is
+/// part 7 / part 8 / part 9 by the number of *distinct non-first* pages its
+/// members reach (one → [`ContainerPart::OtherPagePrivate`], two or more →
+/// [`ContainerPart::OtherPageShared`], none → [`ContainerPart::Rest`]).
 ///
 /// The page-user signals (first-page closure and the per-object referencing-page
 /// map) are recomputed exactly as [`LinearizationPlan::from_pdf`] derives them.
 ///
 /// # Deviation
 ///
-/// qpdf checks `in_open_document` (/OpenAction, /AcroForm, /ViewerPreferences,
-/// /PageMode, /Threads), `in_outlines`, and the thumbnail categories *before*
-/// `in_first_page`, so such a member would route its whole container to part 4 /
-/// part 9. That is not modeled here: those objects do not occur in the supported
-/// corpus, and the always-first-page objects (/Info, /Catalog, the /Pages tree)
-/// are DFS-early and therefore always land in the first container, which is
-/// first-page regardless. See `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`.
+/// qpdf checks `in_outlines` and the thumbnail categories *before*
+/// `in_first_page` too; those are not modeled here (they do not occur in the
+/// supported corpus). When multiple open-document containers exist qpdf orders
+/// them by ascending object number (`std::set<QPDFObjGen>`); this routing keeps
+/// even-split order, which is identical for the single-container case. See
+/// `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`.
 ///
 /// # Errors
 ///
-/// Propagates reader errors from the page-tree walk or the per-page closures.
+/// Propagates reader errors from the page-tree walk, the per-page closures, or
+/// the open-document traversal.
 pub(crate) fn route_objstm_containers<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     containers: &[Vec<ObjectRef>],
 ) -> crate::Result<Vec<ContainerPart>> {
+    let open_doc_set = open_document_set(pdf)?;
+
     let page_refs = crate::pages::page_refs(pdf)?;
 
     let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
@@ -1660,6 +1760,10 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     Ok(containers
         .iter()
         .map(|members| {
+            // in_open_document takes precedence over every page category.
+            if members.iter().any(|m| open_doc_set.contains(m)) {
+                return ContainerPart::OpenDocument;
+            }
             if members.iter().any(|m| first_page_set.contains(m)) {
                 return ContainerPart::FirstPage;
             }

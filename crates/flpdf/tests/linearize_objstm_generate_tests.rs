@@ -55,6 +55,22 @@ fn parse_e_offset(bytes: &[u8]) -> usize {
     val
 }
 
+/// Parse an integer-valued key (e.g. `/O `, `/E `) from the linearization
+/// parameter dictionary in the leading bytes of a linearized file.
+fn parse_param_int(bytes: &[u8], key: &[u8]) -> usize {
+    let pos = bytes
+        .windows(key.len())
+        .position(|w| w == key)
+        .unwrap_or_else(|| panic!("param dict {} key present", String::from_utf8_lossy(key)));
+    let mut i = pos + key.len();
+    let mut val = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val * 10 + (bytes[i] - b'0') as usize;
+        i += 1;
+    }
+    val
+}
+
 /// Count `/Type /ObjStm` container markers in the file body.
 fn count_objstm_markers(bytes: &[u8]) -> usize {
     let needle = b"/Type /ObjStm";
@@ -201,6 +217,58 @@ fn threepage_shared_generate_emits_part6_and_part8_containers_and_round_trips() 
         "threepage-shared generate must emit two ObjStm containers (part6 + part8), found {n_objstm}"
     );
 
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A fixture whose catalog `/OpenAction` reaches an action dict + 80 "od-only"
+/// font dicts that no page references. qpdf categorizes them `in_open_document`
+/// (lc_open_document → part4, the FIRST half right after the Catalog and before
+/// the first page), so they even-split into an open-document container numbered
+/// ahead of the first-page section. The first page therefore keeps a LOW object
+/// number (`/O`), while a part6 (first-page-shared) container holds the page
+/// fonts. Pins the open-document routing + first-half part4-before-part6
+/// numbering (deflate-independent — object numbers do not depend on the
+/// compression backend, so this runs without qpdf-zlib-compat).
+#[test]
+fn openaction_generate_routes_open_document_container_to_first_half() {
+    let bytes = linearize_generate("objstm-lin-openaction-80-80.pdf");
+
+    // Two ObjStm containers: the open-document container (part4) and the
+    // first-page-shared container (part6). Both are first-half (before /E).
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 2,
+        "openaction generate must emit two ObjStm containers (open-document + \
+         first-page), found {n_objstm}"
+    );
+    let e_off = parse_e_offset(&bytes);
+    let first_marker = first_objstm_marker_offset(&bytes).expect("ObjStm marker present");
+    assert!(
+        first_marker < e_off,
+        "the open-document ObjStm container (marker at {first_marker}) must be in \
+         the first half, before /E ({e_off})"
+    );
+
+    // /O (first_page_object): the open-document objects are numbered in part4
+    // (first half, before the first page), so the first page object keeps qpdf's
+    // low number 9 — NOT the high number it had when the OpenAction subtree was
+    // mis-routed into the second half.
+    let first_page_object = parse_param_int(&bytes, b"/O ");
+    assert_eq!(
+        first_page_object, 9,
+        "first page object number (/O) must be 9 (open-document objects numbered \
+         in part4 ahead of the first page); got {first_page_object}"
+    );
+
+    // Round-trip: every object resolves, including both containers' compressed
+    // members (the open-document container's 82 members + the first-page
+    // container's 80 shared fonts).
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
