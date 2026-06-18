@@ -444,3 +444,33 @@ fn outlines_multi_container_hint_table_matches_qpdf() {
     let nobjects = u32::from_be_bytes(flpdf_table[8..12].try_into().unwrap());
     assert!(nobjects >= 2, "nobjects={nobjects}: not multi-container");
 }
+
+// outlines-shared-page-80-80 (flpdf-vvjr.4 scenario A): outline∩page object
+// overlap — outline items reference page objects, which are already assigned to
+// part-4/6/7. Verifies that the shared-page objects are not double-counted and
+// are placed in the correct linearization part.
+#[test]
+fn outlines_shared_page_objstm_structurally_identical_to_qpdf() {
+    assert_structural("objstm-lin-outlines-shared-page-80-80.pdf", "objstm-lin-outlines-shared-page-80-80");
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn outlines_shared_page_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-outlines-shared-page-80-80.pdf", "objstm-lin-outlines-shared-page-80-80");
+}
+
+// outlines-coloc-200-20 (flpdf-vvjr.4 scenario B): ObjStm co-location — outline
+// items and page content share the same ObjStm containers (K=20 items spread
+// over fewer containers alongside page objects). Verifies correct part assignment
+// when outline objects co-locate with page objects in the same ObjStm.
+#[test]
+fn outlines_coloc_objstm_structurally_identical_to_qpdf() {
+    assert_structural("objstm-lin-outlines-coloc-200-20.pdf", "objstm-lin-outlines-coloc-200-20");
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn outlines_coloc_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-outlines-coloc-200-20.pdf", "objstm-lin-outlines-coloc-200-20");
+}
