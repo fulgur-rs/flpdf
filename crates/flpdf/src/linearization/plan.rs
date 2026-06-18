@@ -774,11 +774,12 @@ impl LinearizationPlan {
         // Outline objects routed to the first-page section when
         // /PageMode /UseOutlines is set (QPDF_linearization.cc:1031-1043).
         // Must be built before shared_hints so they can be included in it.
-        let outline_first_page_members: BTreeSet<ObjectRef> = if outlines_in_first_page_predicate(pdf)? {
-            outlines_set(pdf)?
-        } else {
-            BTreeSet::new()
-        };
+        let outline_first_page_members: BTreeSet<ObjectRef> =
+            if outlines_in_first_page_predicate(pdf)? {
+                outlines_set(pdf)?
+            } else {
+                BTreeSet::new()
+            };
 
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
             object_ref: obj_ref,
