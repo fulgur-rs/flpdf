@@ -1154,7 +1154,7 @@ mod tests {
         let container_num = 99u32;
         let plan = LinearizationPlan {
             part2_objects: vec![ObjectRef::new(5, 0)],
-            outline_first_page_members: vec![outline_ref],
+            outline_first_page_members: std::collections::BTreeSet::from([outline_ref]),
             ..Default::default()
         };
         // outline_ref lives in container 99.

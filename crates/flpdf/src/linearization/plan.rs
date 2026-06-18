@@ -448,7 +448,7 @@ pub struct LinearizationPlan {
     /// container in the page-0 object count (qpdf counts all part6 objects in
     /// `entries.at(0).nobjects`, including outlines placed there when
     /// `outlines_in_first_page` is set).
-    pub(crate) outline_first_page_members: Vec<ObjectRef>,
+    pub(crate) outline_first_page_members: BTreeSet<ObjectRef>,
 }
 
 impl LinearizationPlan {
@@ -774,10 +774,10 @@ impl LinearizationPlan {
         // Outline objects routed to the first-page section when
         // /PageMode /UseOutlines is set (QPDF_linearization.cc:1031-1043).
         // Must be built before shared_hints so they can be included in it.
-        let outline_first_page_members: Vec<ObjectRef> = if outlines_in_first_page_predicate(pdf)? {
-            outlines_set(pdf)?.into_iter().collect()
+        let outline_first_page_members: BTreeSet<ObjectRef> = if outlines_in_first_page_predicate(pdf)? {
+            outlines_set(pdf)?
         } else {
-            Vec::new()
+            BTreeSet::new()
         };
 
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
@@ -1158,7 +1158,7 @@ impl Default for LinearizationPlan {
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
             all_referenced_pages: BTreeMap::new(),
-            outline_first_page_members: Vec::new(),
+            outline_first_page_members: BTreeSet::new(),
         }
     }
 }
@@ -1436,10 +1436,7 @@ impl LinearizationPlan {
         let containers = objstm_membership_linearized(pdf)?;
         let routes = route_objstm_containers(pdf, &containers)?;
 
-        // Build a set from outline_first_page_members for O(log n) membership
-        // checks when separating outline-routed containers from regular ones.
-        let outline_set: BTreeSet<ObjectRef> =
-            self.outline_first_page_members.iter().copied().collect();
+        let outline_set = &self.outline_first_page_members;
 
         let mut open_document_batches: Vec<Vec<ObjectRef>> = Vec::new();
         // Separate first-page containers into regular (fonts/shared) and
