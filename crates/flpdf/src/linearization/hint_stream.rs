@@ -812,8 +812,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let _ = encode_hint_stream(&po, &so, None).expect("encode"); // must not panic
     }
 
@@ -826,8 +832,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
         assert!(
             result.shared_section_offset_in_uncompressed > 0,
@@ -844,8 +856,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
         assert!(
             result.compressed.len() >= 2,
@@ -875,8 +893,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
         assert!(
             result.shared_section_offset_in_uncompressed <= result.uncompressed.len(),
@@ -897,8 +921,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let _ = encode_hint_stream(&po, &so, None).expect("encode");
     }
 
@@ -911,8 +941,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
         assert!(result.shared_section_offset_in_uncompressed > 0);
     }
@@ -926,8 +962,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
         assert!(result.compressed.len() >= 2);
         assert_eq!(result.compressed[0], 0x78);
@@ -942,8 +984,14 @@ mod tests {
             &renumber_s,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so_s = SharedObjectHintTable::from_plan(&single_plan, &renumber_s, &Default::default());
+        let so_s = SharedObjectHintTable::from_plan(
+            &single_plan,
+            &renumber_s,
+            &Default::default(),
+            &Default::default(),
+        );
         let single_result = encode_hint_stream(&po_s, &so_s, None).expect("encode");
 
         let two_plan = two_page_plan_with_shared();
@@ -953,8 +1001,14 @@ mod tests {
             &renumber_t,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so_t = SharedObjectHintTable::from_plan(&two_plan, &renumber_t, &Default::default());
+        let so_t = SharedObjectHintTable::from_plan(
+            &two_plan,
+            &renumber_t,
+            &Default::default(),
+            &Default::default(),
+        );
         let two_result = encode_hint_stream(&po_t, &so_t, None).expect("encode");
 
         assert!(
@@ -976,8 +1030,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
         // Even with no shared objects the shared section header is emitted,
         // so shared_section_offset_in_uncompressed must be > 0.
@@ -1010,8 +1070,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
 
         assert_eq!(
@@ -1041,8 +1107,14 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
-        let so = SharedObjectHintTable::from_plan(&plan, &renumber, &Default::default());
+        let so = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         let result = encode_hint_stream(&po, &so, None).expect("encode");
 
         assert_eq!(

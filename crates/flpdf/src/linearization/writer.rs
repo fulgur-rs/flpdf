@@ -2502,14 +2502,24 @@ pub fn write_linearized<R: Read + Seek>(
     // ------------------------------------------------------------------
     // Build initial placeholder hint tables (all lengths = 0).
     // ------------------------------------------------------------------
+    let second_half_container_nums: std::collections::BTreeSet<u32> = objstm_layout
+        .part4
+        .iter()
+        .map(|c| c.container_new_num)
+        .collect();
     let po_table_initial = PageOffsetHintTable::from_plan(
         plan,
         renumber,
         &objstm_layout.member_to_container,
         &container_even_split_rank,
+        &second_half_container_nums,
     );
-    let so_table_initial =
-        SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+    let so_table_initial = SharedObjectHintTable::from_plan(
+        plan,
+        renumber,
+        &objstm_layout.member_to_container,
+        &second_half_container_nums,
+    );
     // Outlines Hint Table inputs (qpdf in_outlines / calculateHOutline). Loop-
     // invariant; `None` when the document has no outlines, in which case no `/O`
     // key or outline table is emitted (byte-identical to the no-outline path).
@@ -2789,9 +2799,14 @@ pub fn write_linearized<R: Read + Seek>(
             renumber,
             &objstm_layout.member_to_container,
             &container_even_split_rank,
+            &second_half_container_nums,
         );
-        let mut so_table =
-            SharedObjectHintTable::from_plan(plan, renumber, &objstm_layout.member_to_container);
+        let mut so_table = SharedObjectHintTable::from_plan(
+            plan,
+            renumber,
+            &objstm_layout.member_to_container,
+            &second_half_container_nums,
+        );
 
         // location_of_first_page = byte offset of the hint stream object itself.
         //
@@ -2861,8 +2876,11 @@ pub fn write_linearized<R: Read + Seek>(
             // real original ref whose number happens to coincide with a
             // container's new number can never be mistaken for a container (and
             // vice versa).
-            let folded_shared =
-                plan.canonical_shared_hints(&objstm_layout.member_to_container, renumber);
+            let folded_shared = plan.canonical_shared_hints(
+                &objstm_layout.member_to_container,
+                renumber,
+                &second_half_container_nums,
+            );
             let shared_section_lens: Vec<u64> =
                 folded_shared
                     .iter()

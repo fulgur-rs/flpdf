@@ -315,12 +315,11 @@ fn useoutlines_objstm_byte_identical_to_qpdf() {
 // consecutiveness in the multi-container case: nobjects=3, group_length covers
 // all three consecutive containers.
 //
-// Full-byte tests are #[ignore]d: nshared_total miscount (flpdf-fmlf) causes
-// flpdf to include the Part-9 outlines container in the Shared Object Hint Table
-// (nshared=3 vs qpdf's 2), producing different hint stream sizes.
-// The Outlines Hint Table itself is correct — see hint_table test below.
+// Previously #[ignore]d (flpdf-fmlf): second-half ObjStm containers were
+// incorrectly included in the first-page section of the Shared Object Hint
+// Table (nshared=3 vs qpdf's 2). Fixed by canonical_shared_hints skipping
+// containers in second_half_container_nums when input_idx < first_page_input.
 #[test]
-#[ignore = "blocked by flpdf-fmlf: nshared_total miscount in Shared Object Hint Table"]
 fn outlines_multi_container_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural(
         "objstm-lin-outlines-80-200.pdf",
@@ -329,7 +328,6 @@ fn outlines_multi_container_objstm_structurally_byte_identical_to_qpdf() {
 }
 
 #[test]
-#[ignore = "blocked by flpdf-fmlf: nshared_total miscount in Shared Object Hint Table"]
 fn outlines_multi_container_objstm_byte_identical_to_qpdf() {
     assert_strict(
         "objstm-lin-outlines-80-200.pdf",
@@ -451,13 +449,19 @@ fn outlines_multi_container_hint_table_matches_qpdf() {
 // are placed in the correct linearization part.
 #[test]
 fn outlines_shared_page_objstm_structurally_identical_to_qpdf() {
-    assert_structural("objstm-lin-outlines-shared-page-80-80.pdf", "objstm-lin-outlines-shared-page-80-80");
+    assert_structural(
+        "objstm-lin-outlines-shared-page-80-80.pdf",
+        "objstm-lin-outlines-shared-page-80-80",
+    );
 }
 
 #[cfg(feature = "qpdf-zlib-compat")]
 #[test]
 fn outlines_shared_page_objstm_byte_identical_to_qpdf() {
-    assert_strict("objstm-lin-outlines-shared-page-80-80.pdf", "objstm-lin-outlines-shared-page-80-80");
+    assert_strict(
+        "objstm-lin-outlines-shared-page-80-80.pdf",
+        "objstm-lin-outlines-shared-page-80-80",
+    );
 }
 
 // outlines-coloc-200-20 (flpdf-vvjr.4 scenario B): ObjStm co-location — outline
@@ -466,11 +470,17 @@ fn outlines_shared_page_objstm_byte_identical_to_qpdf() {
 // when outline objects co-locate with page objects in the same ObjStm.
 #[test]
 fn outlines_coloc_objstm_structurally_identical_to_qpdf() {
-    assert_structural("objstm-lin-outlines-coloc-200-20.pdf", "objstm-lin-outlines-coloc-200-20");
+    assert_structural(
+        "objstm-lin-outlines-coloc-200-20.pdf",
+        "objstm-lin-outlines-coloc-200-20",
+    );
 }
 
 #[cfg(feature = "qpdf-zlib-compat")]
 #[test]
 fn outlines_coloc_objstm_byte_identical_to_qpdf() {
-    assert_strict("objstm-lin-outlines-coloc-200-20.pdf", "objstm-lin-outlines-coloc-200-20");
+    assert_strict(
+        "objstm-lin-outlines-coloc-200-20.pdf",
+        "objstm-lin-outlines-coloc-200-20",
+    );
 }
