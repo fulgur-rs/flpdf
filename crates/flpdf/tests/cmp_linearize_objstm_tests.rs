@@ -356,7 +356,7 @@ fn parse_outline_hint_table(pdf: &[u8]) -> [u8; 16] {
     // skip optional whitespace between '[' and the first digit
     let ws = after_h_raw
         .iter()
-        .take_while(|&&b| b == b' ' || b == b'\t')
+        .take_while(|&&b| b.is_ascii_whitespace())
         .count();
     let after_h = &after_h_raw[ws..];
     let n_len = after_h.iter().take_while(|&&b| b.is_ascii_digit()).count();

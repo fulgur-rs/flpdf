@@ -13,18 +13,18 @@
 ## Task 1: fixture PDF を生成して tests/fixtures/compat/ に配置
 
 **Files:**
-- Create: `tests/fixtures/compat/objstm-lin-outlines-200-80.pdf`
+- Create: `tests/fixtures/compat/objstm-lin-outlines-80-200.pdf`
 
 **Step 1: fixture を生成**
 
 ```bash
-python3 docs/plans/tools/gen_outlines_gap.py 200 80 > tests/fixtures/compat/objstm-lin-outlines-200-80.pdf
+python3 docs/plans/tools/gen_outlines_gap.py 80 200 > tests/fixtures/compat/objstm-lin-outlines-80-200.pdf
 ```
 
 **Step 2: qpdf で構文チェック**
 
 ```bash
-qpdf --check tests/fixtures/compat/objstm-lin-outlines-200-80.pdf
+qpdf --check tests/fixtures/compat/objstm-lin-outlines-80-200.pdf
 ```
 
 期待値: "No syntax or stream encoding errors found"
@@ -34,26 +34,26 @@ qpdf --check tests/fixtures/compat/objstm-lin-outlines-200-80.pdf
 ## Task 2: qpdf golden を生成して tests/golden/references/ に配置
 
 **Files:**
-- Create: `tests/golden/references/objstm-lin-outlines-200-80/linearize-objstm.pdf`
+- Create: `tests/golden/references/objstm-lin-outlines-80-200/linearize-objstm.pdf`
 
 **Step 1: ディレクトリ作成**
 
 ```bash
-mkdir -p tests/golden/references/objstm-lin-outlines-200-80
+mkdir -p tests/golden/references/objstm-lin-outlines-80-200
 ```
 
 **Step 2: ObjStm linearize golden 生成**
 
 ```bash
 qpdf --linearize --object-streams=generate --deterministic-id \
-  tests/fixtures/compat/objstm-lin-outlines-200-80.pdf \
-  tests/golden/references/objstm-lin-outlines-200-80/linearize-objstm.pdf
+  tests/fixtures/compat/objstm-lin-outlines-80-200.pdf \
+  tests/golden/references/objstm-lin-outlines-80-200/linearize-objstm.pdf
 ```
 
 **Step 3: linearization check**
 
 ```bash
-qpdf --check-linearization tests/golden/references/objstm-lin-outlines-200-80/linearize-objstm.pdf
+qpdf --check-linearization tests/golden/references/objstm-lin-outlines-80-200/linearize-objstm.pdf
 ```
 
 期待値: "no linearization errors"
@@ -62,7 +62,7 @@ qpdf --check-linearization tests/golden/references/objstm-lin-outlines-200-80/li
 
 ```bash
 python3 - << 'EOF'
-with open("tests/golden/references/objstm-lin-outlines-200-80/linearize-objstm.pdf", "rb") as f:
+with open("tests/golden/references/objstm-lin-outlines-80-200/linearize-objstm.pdf", "rb") as f:
     data = f.read()
 idx = data[:2000].find(b"/O ")
 assert idx >= 0, "/O key not found in linearization dict"
@@ -88,7 +88,7 @@ grep -n "outlines-80-80\|G6HB2_FIX\|useoutlines-80-80" tests/golden/regenerate.s
 `tests/golden/regenerate.sh` の `G6HB2_FIX` 連想配列に以下を追加:
 
 ```bash
-    [objstm-lin-outlines-200-80]="gen_outlines_gap.py 200 80"
+    [objstm-lin-outlines-80-200]="gen_outlines_gap.py 80 200"
 ```
 
 既存の `[objstm-lin-outlines-80-80]="gen_outlines_gap.py 80 80"` 行の直後に挿入。
@@ -104,13 +104,13 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
             objstm-lin-useoutlines-80-80; do
 ```
 
-`objstm-lin-useoutlines-80-80` の後に `objstm-lin-outlines-200-80` を追加:
+`objstm-lin-useoutlines-80-80` の後に `objstm-lin-outlines-80-200` を追加:
 
 ```bash
 for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
             objstm-lin-threepage-2-120 objstm-lin-disc-2-250-2 \
             objstm-lin-openaction-80-80 objstm-lin-outlines-80-80 \
-            objstm-lin-useoutlines-80-80 objstm-lin-outlines-200-80; do
+            objstm-lin-useoutlines-80-80 objstm-lin-outlines-80-200; do
 ```
 
 **Step 4: 変更を確認**
@@ -144,12 +144,12 @@ grep -n -A5 "outlines_objstm\|outlines-80-80" crates/flpdf/tests/cmp_linearize_o
 // container case: first_object..first_object+nobjects-1 covers all three.
 #[test]
 fn outlines_multi_container_objstm_structurally_byte_identical_to_qpdf() {
-    assert_structural("objstm-lin-outlines-200-80.pdf", "objstm-lin-outlines-200-80");
+    assert_structural("objstm-lin-outlines-80-200.pdf", "objstm-lin-outlines-80-200");
 }
 
 #[test]
 fn outlines_multi_container_objstm_byte_identical_to_qpdf() {
-    assert_strict("objstm-lin-outlines-200-80.pdf", "objstm-lin-outlines-200-80");
+    assert_strict("objstm-lin-outlines-80-200.pdf", "objstm-lin-outlines-80-200");
 }
 ```
 
@@ -211,13 +211,13 @@ echo "Coverage gate: no src/ code changed, skip"
 **Step 2: git add して commit**
 
 ```bash
-git add tests/fixtures/compat/objstm-lin-outlines-200-80.pdf \
-        tests/golden/references/objstm-lin-outlines-200-80/ \
+git add tests/fixtures/compat/objstm-lin-outlines-80-200.pdf \
+        tests/golden/references/objstm-lin-outlines-80-200/ \
         tests/golden/regenerate.sh \
         crates/flpdf/tests/cmp_linearize_objstm_tests.rs
 git commit -m "test(flpdf-vvjr.3): verify multi-container outline group_length with K=200 fixture
 
-Add objstm-lin-outlines-200-80 fixture (281 eligible objects → 3 ObjStm
+Add objstm-lin-outlines-80-200 fixture (281 eligible objects → 3 ObjStm
 containers via even split). All three route to ContainerPart::Rest and are
 numbered consecutively, confirming group_length summation is correct in the
 multi-container case. byte-identical to qpdf 11.9.0."
