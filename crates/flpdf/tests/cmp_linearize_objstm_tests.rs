@@ -307,3 +307,140 @@ fn useoutlines_objstm_byte_identical_to_qpdf() {
         "objstm-lin-useoutlines-80-80",
     );
 }
+
+// outlines-80-200 (flpdf-vvjr.3): outline tree with S=80 shared fonts and K=200
+// items spans 3 ObjStm containers (281 eligible objects, even split:
+// ceil(281/100)=3, containers of ~94 each). All three containers route to
+// ContainerPart::Rest (outline priority applies). Verifies group_length
+// consecutiveness in the multi-container case: nobjects=3, group_length covers
+// all three consecutive containers.
+//
+// Full-byte tests are #[ignore]d: nshared_total miscount (flpdf-fmlf) causes
+// flpdf to include the Part-9 outlines container in the Shared Object Hint Table
+// (nshared=3 vs qpdf's 2), producing different hint stream sizes.
+// The Outlines Hint Table itself is correct — see hint_table test below.
+#[test]
+#[ignore = "blocked by flpdf-fmlf: nshared_total miscount in Shared Object Hint Table"]
+fn outlines_multi_container_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-outlines-80-200.pdf",
+        "objstm-lin-outlines-80-200",
+    );
+}
+
+#[test]
+#[ignore = "blocked by flpdf-fmlf: nshared_total miscount in Shared Object Hint Table"]
+fn outlines_multi_container_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-outlines-80-200.pdf",
+        "objstm-lin-outlines-80-200",
+    );
+}
+
+/// Parse the 16-byte Outlines Hint Table from a linearized PDF's hint stream.
+///
+/// Uses `/H [<hint_offset> ...]` from the linearization parameter dict to locate
+/// the hint stream object, reads its `/O` key (byte offset into the decompressed
+/// stream where the Outlines table starts), decompresses with ZlibDecoder, and
+/// returns the 16 raw bytes (4 × u32 MSB-first: first_object, first_obj_offset,
+/// nobjects, group_length).
+fn parse_outline_hint_table(pdf: &[u8]) -> [u8; 16] {
+    use std::io::Read;
+
+    // Locate hint stream object via /H [<offset> ...] in the linearization dict
+    let h_pos = pdf
+        .windows(4)
+        .position(|w| w == b"/H [")
+        .expect("no /H key in linearization dict");
+    let after_h_raw = &pdf[h_pos + 4..];
+    // skip optional whitespace between '[' and the first digit
+    let ws = after_h_raw
+        .iter()
+        .take_while(|&&b| b.is_ascii_whitespace())
+        .count();
+    let after_h = &after_h_raw[ws..];
+    let n_len = after_h.iter().take_while(|&&b| b.is_ascii_digit()).count();
+    let hint_offset: usize = std::str::from_utf8(&after_h[..n_len])
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let hint_area = &pdf[hint_offset..];
+
+    // Extract /O value from the hint stream dict
+    let o_rel = hint_area
+        .windows(3)
+        .position(|w| w == b"/O ")
+        .expect("no /O key in hint stream dict");
+    let after_o = &hint_area[o_rel + 3..];
+    let n_len = after_o.iter().take_while(|&&b| b.is_ascii_digit()).count();
+    let o_off: usize = std::str::from_utf8(&after_o[..n_len])
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Locate "stream\n" inside the hint object
+    let stream_rel = hint_area
+        .windows(7)
+        .position(|w| w == b"stream\n")
+        .expect("no stream marker in hint object");
+    let data_start = stream_rel + 7;
+
+    // Locate "\nendstream"
+    let end_rel = hint_area[data_start..]
+        .windows(10)
+        .position(|w| w == b"\nendstream")
+        .expect("no endstream in hint object");
+    let compressed = &hint_area[data_start..data_start + end_rel];
+
+    // PDF FlateDecode = zlib (RFC 1950)
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .expect("failed to decompress hint stream");
+
+    assert!(
+        decompressed.len() >= o_off + 16,
+        "decompressed hint stream ({} bytes) too short for /O offset {}",
+        decompressed.len(),
+        o_off
+    );
+
+    let mut table = [0u8; 16];
+    table.copy_from_slice(&decompressed[o_off..o_off + 16]);
+    table
+}
+
+// Outlines Hint Table targeted assertion: verifies the 16-byte table at /O offset
+// matches qpdf's golden exactly (first_object, first_obj_offset, nobjects=3,
+// group_length). This passes despite flpdf-fmlf because the Outlines Hint Table
+// computation is correct; only the Shared Object table is wrong.
+#[test]
+fn outlines_multi_container_hint_table_matches_qpdf() {
+    let flpdf_bytes = flpdf_linearized_objstm("objstm-lin-outlines-80-200.pdf");
+    let golden_bytes = golden("objstm-lin-outlines-80-200");
+
+    let flpdf_table = parse_outline_hint_table(&flpdf_bytes);
+    let golden_table = parse_outline_hint_table(&golden_bytes);
+
+    assert_eq!(
+        flpdf_table,
+        golden_table,
+        "Outlines Hint Table mismatch: flpdf vs qpdf golden\n\
+         flpdf  first_object={} first_obj_off={} nobjects={} group_length={}\n\
+         golden first_object={} first_obj_off={} nobjects={} group_length={}",
+        u32::from_be_bytes(flpdf_table[0..4].try_into().unwrap()),
+        u32::from_be_bytes(flpdf_table[4..8].try_into().unwrap()),
+        u32::from_be_bytes(flpdf_table[8..12].try_into().unwrap()),
+        u32::from_be_bytes(flpdf_table[12..16].try_into().unwrap()),
+        u32::from_be_bytes(golden_table[0..4].try_into().unwrap()),
+        u32::from_be_bytes(golden_table[4..8].try_into().unwrap()),
+        u32::from_be_bytes(golden_table[8..12].try_into().unwrap()),
+        u32::from_be_bytes(golden_table[12..16].try_into().unwrap()),
+    );
+
+    // Verify multi-container: nobjects must be >= 2
+    let nobjects = u32::from_be_bytes(flpdf_table[8..12].try_into().unwrap());
+    assert!(nobjects >= 2, "nobjects={nobjects}: not multi-container");
+}
