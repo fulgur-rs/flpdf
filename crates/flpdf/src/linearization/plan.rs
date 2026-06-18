@@ -449,6 +449,22 @@ pub struct LinearizationPlan {
     /// `entries.at(0).nobjects`, including outlines placed there when
     /// `outlines_in_first_page` is set).
     pub(crate) outline_first_page_members: BTreeSet<ObjectRef>,
+
+    /// Outline objects for the classic (non-ObjStm) linearize path when
+    /// `/PageMode` is NOT `/UseOutlines`.  Extracted from `part4_rest` and
+    /// assigned consecutive second-half object numbers (between `pages_tree`
+    /// and `info/param_dict` in the renumber map), then emitted after /E.
+    /// Matches qpdf's `lc_outlines` (part9) placement.  Empty when
+    /// `UseOutlines` is active or when there are no outlines.
+    pub(crate) part9_outline_objects: Vec<ObjectRef>,
+
+    /// Outline objects for the classic (non-ObjStm) linearize path when
+    /// `/PageMode /UseOutlines` is set.  Extracted from `part4_rest` and
+    /// given first-half numbers (after Part 3 in the renumber map), then
+    /// emitted **before** /E (between Part 3 and the /E boundary).  Matches
+    /// qpdf's `lc_outlines` (part6) placement.  Empty when `UseOutlines` is
+    /// not set or when there are no outlines.
+    pub(crate) part6_outline_objects: Vec<ObjectRef>,
 }
 
 impl LinearizationPlan {
@@ -597,6 +613,11 @@ impl LinearizationPlan {
                 part2_objects.push(*obj_ref);
             }
         }
+        // qpdf packs first-half shared objects in ascending source object number
+        // order (observed against qpdf 11.9.0: ObjStm member ordering matches
+        // source number order, not the BFS discovery order which follows dict key
+        // alphabetical order). Mirror the same sort used in `fold_pages_tree_into_first_half`.
+        part3_objects.sort_unstable_by_key(|r| r.number);
 
         // ----------------------------------------------------------------
         // Step 6: build Part 4 by removing Part 2 and Part 3 objects.
@@ -774,12 +795,49 @@ impl LinearizationPlan {
         // Outline objects routed to the first-page section when
         // /PageMode /UseOutlines is set (QPDF_linearization.cc:1031-1043).
         // Must be built before shared_hints so they can be included in it.
-        let outline_first_page_members: BTreeSet<ObjectRef> =
-            if outlines_in_first_page_predicate(pdf)? {
-                outlines_set(pdf)?
+        //
+        // For the classic (non-ObjStm) linearize path, outlines in part4_rest
+        // need to be extracted into dedicated fields so the renumber map can
+        // assign them the correct half:
+        //   part6_outline_objects — UseOutlines: first-half numbers, emitted before /E
+        //   part9_outline_objects — !UseOutlines: second-half numbers, emitted after /E
+        let outlines_in_first_page = outlines_in_first_page_predicate(pdf)?;
+        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+
+        let (part6_outline_objects, part9_outline_objects): (Vec<ObjectRef>, Vec<ObjectRef>) =
+            if outlines_in_first_page {
+                let part6: Vec<ObjectRef> = part4_rest
+                    .iter()
+                    .filter(|r| all_outline_refs.contains(r))
+                    .copied()
+                    .collect();
+                (part6, vec![])
             } else {
-                BTreeSet::new()
+                let part9: Vec<ObjectRef> = part4_rest
+                    .iter()
+                    .filter(|r| all_outline_refs.contains(r))
+                    .copied()
+                    .collect();
+                (vec![], part9)
             };
+        // Remove extracted outlines from part4_rest to avoid double assignment.
+        let outline_extract_set: BTreeSet<ObjectRef> = part6_outline_objects
+            .iter()
+            .chain(&part9_outline_objects)
+            .copied()
+            .collect();
+        part4_rest.retain(|r| !outline_extract_set.contains(r));
+
+        // For UseOutlines: outlines are emitted before /E and count toward page 0.
+        if outlines_in_first_page && !page_hints.is_empty() {
+            page_hints[0].object_count += part6_outline_objects.len() as u32;
+        }
+
+        let outline_first_page_members: BTreeSet<ObjectRef> = if outlines_in_first_page {
+            all_outline_refs
+        } else {
+            BTreeSet::new()
+        };
 
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
             object_ref: obj_ref,
@@ -841,6 +899,8 @@ impl LinearizationPlan {
             per_page_private_objects,
             all_referenced_pages,
             outline_first_page_members,
+            part9_outline_objects,
+            part6_outline_objects,
         })
     }
 
@@ -859,6 +919,7 @@ impl LinearizationPlan {
         self.part4_other_pages_private
             .iter()
             .chain(&self.part4_other_pages_shared)
+            .chain(&self.part9_outline_objects)
             .chain(&self.part4_rest)
             .copied()
             .collect()
@@ -1127,6 +1188,8 @@ impl LinearizationPlan {
             .chain(&self.part3_objects)
             .chain(&self.part4_other_pages_private)
             .chain(&self.part4_other_pages_shared)
+            .chain(&self.part6_outline_objects)
+            .chain(&self.part9_outline_objects)
             .chain(&self.part4_rest)
         {
             if !seen.insert(*r) {
@@ -1160,6 +1223,8 @@ impl Default for LinearizationPlan {
             per_page_private_objects: Vec::new(),
             all_referenced_pages: BTreeMap::new(),
             outline_first_page_members: BTreeSet::new(),
+            part9_outline_objects: Vec::new(),
+            part6_outline_objects: Vec::new(),
         }
     }
 }

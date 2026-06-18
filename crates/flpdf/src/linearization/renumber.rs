@@ -176,6 +176,8 @@ impl RenumberMap {
             + plan.part3_objects.len()
             + plan.part4_other_pages_private.len()
             + plan.part4_other_pages_shared.len()
+            + plan.part6_outline_objects.len()
+            + plan.part9_outline_objects.len()
             + plan.part4_rest.len();
         let capacity = total_parts + 3; // slots 0, param dict, hint stream
 
@@ -216,6 +218,7 @@ impl RenumberMap {
         //  slot N+1..  part8 (other pages' shared) in plan order
         //  slot ..     pages_tree (if in part4_rest)
         //  slot ..     info (if in part4_rest)
+        //  slot ..     part9 outline objects (classic, !UseOutlines) — qpdf lc_outlines
         //  slot ..     <param dict reserved>
         //  slot ..     root_ref / Catalog (if in part4_rest)
         //  slot ..     <hint stream reserved>
@@ -223,6 +226,7 @@ impl RenumberMap {
         // First-half follows:
         //  slot ..     Part 2 in plan order
         //  slot ..     Part 3 in plan order
+        //  slot ..     part6 outline objects (classic, UseOutlines) — qpdf lc_outlines
         //  slot ..     part4_rest remaining (pages_tree/info/root already promoted)
 
         // 1. part7 (other pages' private) in plan order.
@@ -238,6 +242,13 @@ impl RenumberMap {
         // 3. pages_tree, 4. info — the two "part9 head" promotions from part4_rest.
         promote(plan.pages_tree_ref, &mut by_new_number, &mut by_original);
         promote(plan.info_ref, &mut by_new_number, &mut by_original);
+
+        // 3b. part9 outline objects (classic, !UseOutlines).
+        // qpdf places lc_outlines between info and the param dict in the
+        // second-half renumber pass, giving them consecutive second-half numbers.
+        for &original in &plan.part9_outline_objects {
+            push_real(original, &mut by_new_number, &mut by_original);
+        }
 
         // 5. Param dict (reserved).
         let param_dict_slot = by_new_number.len() as u32;
@@ -257,6 +268,13 @@ impl RenumberMap {
 
         // 9. Part 3 in plan order.
         for &original in &plan.part3_objects {
+            push_real(original, &mut by_new_number, &mut by_original);
+        }
+
+        // 9b. part6 outline objects (classic, UseOutlines).
+        // These go into the first-half section before /E, between Part 3 and
+        // the remaining part4_rest, matching qpdf's lc_outlines (part6) order.
+        for &original in &plan.part6_outline_objects {
             push_real(original, &mut by_new_number, &mut by_original);
         }
 

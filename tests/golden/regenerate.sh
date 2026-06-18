@@ -391,6 +391,18 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
     echo "$stem/linearize-objstm.pdf"
 done
 
+# Classic (non-ObjStm) linearize goldens for outline section routing (flpdf-vvjr.2).
+# outlines-80-80: outlines route to part9 (second-half, !UseOutlines).
+# useoutlines-80-80: outlines route to part6 (first-page section, UseOutlines).
+# Pinned to linearize-classic.pdf to coexist with the ObjStm golden in the same dir.
+for stem in objstm-lin-outlines-80-80 objstm-lin-useoutlines-80-80; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-classic.pdf"
+    qpdf --check "$REF/$stem/linearize-classic.pdf" >/dev/null
+    echo "$stem/linearize-classic.pdf"
+done
+
 echo ""
 echo "=== All references generated ==="
 
