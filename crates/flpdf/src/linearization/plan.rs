@@ -442,13 +442,16 @@ pub struct LinearizationPlan {
     pub all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>>,
 
     /// Outline objects routed to the first-page section (part6) when the catalog
-    /// specifies `/PageMode /UseOutlines`. Empty when the predicate is false.
+    /// specifies `/PageMode /UseOutlines`, in emitted order (root first, then items
+    /// in traversal order). Empty when the predicate is false.
     ///
+    /// Ordered to match qpdf's `lc_outlines` traversal order so that `shared_hints`
+    /// entries are in the same sequence as physically emitted objects.
     /// Used by `page0_object_count_with_objstm` to include the outline ObjStm
     /// container in the page-0 object count (qpdf counts all part6 objects in
     /// `entries.at(0).nobjects`, including outlines placed there when
     /// `outlines_in_first_page` is set).
-    pub(crate) outline_first_page_members: BTreeSet<ObjectRef>,
+    pub(crate) outline_first_page_members: Vec<ObjectRef>,
 
     /// Outline objects for the classic (non-ObjStm) linearize path when
     /// `/PageMode` is NOT `/UseOutlines`.  Extracted from `part4_rest` and
@@ -847,10 +850,14 @@ impl LinearizationPlan {
             page_hints[0].object_count += part6_outline_objects.len() as u32;
         }
 
-        let outline_first_page_members: BTreeSet<ObjectRef> = if outlines_in_first_page {
-            all_outline_refs
+        // Use part6_outline_objects (already root-first, only objects actually
+        // extracted from part4_rest) so that shared_hints iteration order matches
+        // the physical emitted order and objects also reachable from a page closure
+        // are not double-counted in shared_hints.
+        let outline_first_page_members: Vec<ObjectRef> = if outlines_in_first_page {
+            part6_outline_objects.clone()
         } else {
-            BTreeSet::new()
+            vec![]
         };
 
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
@@ -1236,7 +1243,7 @@ impl Default for LinearizationPlan {
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
             all_referenced_pages: BTreeMap::new(),
-            outline_first_page_members: BTreeSet::new(),
+            outline_first_page_members: Vec::new(),
             part9_outline_objects: Vec::new(),
             part6_outline_objects: Vec::new(),
         }
