@@ -2751,7 +2751,7 @@ pub fn write_linearized<R: Read + Seek>(
                         .part6_outline_objects
                         .iter()
                         .filter(|orig| !objstm_layout.member_to_container.contains_key(*orig))
-                        .map(|orig| plain_byte_len(orig))
+                        .map(plain_byte_len)
                         .sum();
                     part2_len + part3_byte_len + part6_plain_len
                 } else {
