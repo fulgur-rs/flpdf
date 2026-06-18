@@ -807,12 +807,11 @@ impl LinearizationPlan {
         // renumber map assigns it the lowest new unit among outline objects,
         // matching qpdf's lc_outlines traversal-from-root order (used by
         // compute_outline_hint_info's first_object).
-        let outline_root_ref: Option<ObjectRef> = pdf.root_ref().and_then(|r| {
-            match pdf.resolve_borrowed(r) {
+        let outline_root_ref: Option<ObjectRef> =
+            pdf.root_ref().and_then(|r| match pdf.resolve_borrowed(r) {
                 Ok(Object::Dictionary(d)) => d.get_ref("Outlines"),
                 _ => None,
-            }
-        });
+            });
 
         let extract_outlines = |src: &[ObjectRef]| -> Vec<ObjectRef> {
             let mut v: Vec<ObjectRef> = src
