@@ -70,10 +70,10 @@ fn useoutlines_classic_routes_outlines_to_first_page_and_round_trips() {
     }
 
     // The hint-stream dict must carry /O (outline objects present in part6).
-    let hint_dict_start = find(&bytes, b"/Filter /FlateDecode /S ")
-        .expect("hint stream dict present");
-    let dict_end = hint_dict_start
-        + find(&bytes[hint_dict_start..], b">>").expect("hint dict close");
+    let hint_dict_start =
+        find(&bytes, b"/Filter /FlateDecode /S ").expect("hint stream dict present");
+    let dict_end =
+        hint_dict_start + find(&bytes[hint_dict_start..], b">>").expect("hint dict close");
     let hint_dict = &bytes[hint_dict_start..dict_end];
     assert!(
         hint_dict.windows(4).any(|w| w == b" /O "),

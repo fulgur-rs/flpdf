@@ -1896,10 +1896,12 @@ fn do_write_pass<R: Read + Seek>(
             continue; // cov:ignore: ObjStm path handles via containers above
         }
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
+            // cov:ignore-start: planner/renumber inconsistency — impossible by construction
             return Err(crate::Error::Unsupported(format!(
                 "part6 outline object {} has no renumber entry",
                 original_ref
-            ))); // cov:ignore: planner/renumber inconsistency — impossible by construction
+            )));
+            // cov:ignore-end
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
         let renumbered = renumber_object(object, 0, renumber)?;
