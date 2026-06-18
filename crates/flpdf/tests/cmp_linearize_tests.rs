@@ -65,6 +65,14 @@ fn golden(fixture_stem: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
 }
 
+fn golden_classic(fixture_stem: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(fixture_stem)
+        .join("linearize-classic.pdf");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
 /// Report the first differing byte offset for a readable failure message.
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     if a == b {
@@ -86,6 +94,40 @@ fn assert_linearize_byte_identical(fixture: &str, stem: &str) {
         let lo = off.saturating_sub(16);
         panic!(
             "{fixture}: not byte-identical to qpdf --linearize --deterministic-id golden \
+             (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
+fn assert_classic_byte_identical(fixture: &str, stem: &str) {
+    let actual = flpdf_linearized(fixture);
+    let expected = golden_classic(stem);
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "{fixture}: not byte-identical to qpdf --linearize --deterministic-id golden \
+             (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
+fn assert_classic_structurally_byte_identical(fixture: &str, stem: &str) {
+    let actual = mask_id1(&flpdf_linearized(fixture));
+    let expected = mask_id1(&golden_classic(stem));
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "{fixture}: structural layout diverged from qpdf classic golden (ignoring /ID[1]) \
              (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
              flpdf : {:?}\ngolden: {:?}",
             actual.len(),
@@ -304,5 +346,46 @@ fn one_page_linearized_content_stream_equals_plain_and_qpdf_golden() {
         (&lin_dict, &lin_payload),
         (&qpdf_dict, &qpdf_payload),
         "linearized content stream must equal qpdf golden obj9"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Classic (non-ObjStm) linearize: outline object section routing (flpdf-vvjr.2).
+//
+// outlines-80-80 (!UseOutlines): catalog /Outlines -> outline dict + 80 items.
+// qpdf routes these to part9 (second-half, after /E). Regression: the
+// useoutlines case (below) must also stay byte-identical.
+//
+// useoutlines-80-80 (UseOutlines): /PageMode /UseOutlines causes outline
+// objects (dict + 80 items) to route to part6 (first-page section, before /E).
+// Their plain bytes count toward page-0 length in the page hint table header.
+// --------------------------------------------------------------------------
+
+#[test]
+fn outlines_classic_structurally_byte_identical_to_qpdf() {
+    assert_classic_structurally_byte_identical(
+        "objstm-lin-outlines-80-80.pdf",
+        "objstm-lin-outlines-80-80",
+    );
+}
+
+#[test]
+fn outlines_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical("objstm-lin-outlines-80-80.pdf", "objstm-lin-outlines-80-80");
+}
+
+#[test]
+fn useoutlines_classic_structurally_byte_identical_to_qpdf() {
+    assert_classic_structurally_byte_identical(
+        "objstm-lin-useoutlines-80-80.pdf",
+        "objstm-lin-useoutlines-80-80",
+    );
+}
+
+#[test]
+fn useoutlines_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-useoutlines-80-80.pdf",
+        "objstm-lin-useoutlines-80-80",
     );
 }

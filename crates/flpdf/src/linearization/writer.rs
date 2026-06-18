@@ -1473,7 +1473,7 @@ fn compute_outline_hint_info<R: Read + Seek>(
     let unit_of = |r: ObjectRef| -> Option<u32> {
         match objstm_layout.member_to_container.get(&r) {
             Some(&(container_num, _)) => Some(container_num),
-            None => renumber.new_for_original(r).map(|nr| nr.number), // cov:ignore: plain (uncompressed) outline — deferred
+            None => renumber.new_for_original(r).map(|nr| nr.number),
         }
     };
     let units: std::collections::BTreeSet<u32> =
@@ -1886,8 +1886,31 @@ fn do_write_pass<R: Read + Seek>(
         xref_offsets.insert(container.container_new_num, offset);
     }
 
-    // /E: end of first-page section, AFTER Part-2, Part-3 and the Part-3
-    // ObjStm containers.
+    // Part 6 outline objects (classic path, UseOutlines): first-page outlines
+    // emitted before /E.  When /PageMode /UseOutlines is set, outline objects
+    // belong to the first-page section (Annex F §F.3.4).  On the ObjStm path
+    // these are already in a Part-3 ObjStm container emitted above; skip any
+    // that are ObjStm members to avoid writing them twice.
+    for original_ref in &plan.part6_outline_objects {
+        if objstm_layout.member_to_container.contains_key(original_ref) {
+            continue; // cov:ignore: ObjStm path handles via containers above
+        }
+        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
+            // cov:ignore-start: planner/renumber inconsistency — impossible by construction
+            return Err(crate::Error::Unsupported(format!(
+                "part6 outline object {} has no renumber entry",
+                original_ref
+            )));
+            // cov:ignore-end
+        };
+        let object = pdf.resolve_borrowed(*original_ref)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        xref_offsets.insert(new_ref.number, offset);
+    }
+
+    // /E: end of first-page section, AFTER Part-2, Part-3, the Part-3
+    // ObjStm containers, and Part-6 outline objects (when UseOutlines).
     let end_of_first_page_offset = bytes.len();
 
     // Part 5 (Annex F): remaining body.  qpdf emits the objects that follow
@@ -2719,9 +2742,18 @@ pub fn write_linearized<R: Read + Seek>(
             .enumerate()
             .map(|(page_idx, privates)| {
                 if page_idx == 0 {
-                    // Page 0: Part 2 (always plain) + Part 3 (plain + containers).
+                    // Page 0: Part 2 (always plain) + Part 3 (plain + containers)
+                    // + Part 6 outline plain objects (UseOutlines, classic path).
+                    // ObjStm outline members are already counted inside Part-3
+                    // containers (part3_container_len), so only plain ones are added.
                     let part2_len: u64 = privates.iter().map(plain_byte_len).sum();
-                    part2_len + part3_byte_len
+                    let part6_plain_len: u64 = plan
+                        .part6_outline_objects
+                        .iter()
+                        .filter(|orig| !objstm_layout.member_to_container.contains_key(*orig))
+                        .map(plain_byte_len)
+                        .sum();
+                    part2_len + part3_byte_len + part6_plain_len
                 } else {
                     // Pages 1..N: a private compressed into this page's own part7
                     // ObjStm has no standalone bytes — its physical contribution is
