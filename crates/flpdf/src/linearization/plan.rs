@@ -803,22 +803,37 @@ impl LinearizationPlan {
         //   part9_outline_objects — !UseOutlines: second-half numbers, emitted after /E
         let outlines_in_first_page = outlines_in_first_page_predicate(pdf)?;
         let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+        // Outline root reference: placed first in the extracted vectors so the
+        // renumber map assigns it the lowest new unit among outline objects,
+        // matching qpdf's lc_outlines traversal-from-root order (used by
+        // compute_outline_hint_info's first_object).
+        let outline_root_ref: Option<ObjectRef> = pdf.root_ref().and_then(|r| {
+            match pdf.resolve_borrowed(r) {
+                Ok(Object::Dictionary(d)) => d.get_ref("Outlines"),
+                _ => None,
+            }
+        });
+
+        let extract_outlines = |src: &[ObjectRef]| -> Vec<ObjectRef> {
+            let mut v: Vec<ObjectRef> = src
+                .iter()
+                .filter(|r| all_outline_refs.contains(r))
+                .copied()
+                .collect();
+            // Rotate root to front so it receives the lowest consecutive new number.
+            if let Some(root) = outline_root_ref {
+                if let Some(pos) = v.iter().position(|&r| r == root) {
+                    v[..=pos].rotate_right(1);
+                }
+            }
+            v
+        };
 
         let (part6_outline_objects, part9_outline_objects): (Vec<ObjectRef>, Vec<ObjectRef>) =
             if outlines_in_first_page {
-                let part6: Vec<ObjectRef> = part4_rest
-                    .iter()
-                    .filter(|r| all_outline_refs.contains(r))
-                    .copied()
-                    .collect();
-                (part6, vec![])
+                (extract_outlines(&part4_rest), vec![])
             } else {
-                let part9: Vec<ObjectRef> = part4_rest
-                    .iter()
-                    .filter(|r| all_outline_refs.contains(r))
-                    .copied()
-                    .collect();
-                (vec![], part9)
+                (vec![], extract_outlines(&part4_rest))
             };
         // Remove extracted outlines from part4_rest to avoid double assignment.
         let outline_extract_set: BTreeSet<ObjectRef> = part6_outline_objects
@@ -1563,16 +1578,27 @@ impl LinearizationPlan {
         }
 
         let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
-        let part3_set: BTreeSet<ObjectRef> = self.part3_objects.iter().copied().collect();
+        // part6_outline_objects are first-half objects (like Part-3 members) when
+        // UseOutlines is set; include them so ObjStm-compressed outline objects are
+        // batched into first-half containers rather than silently dropped to plain.
+        let part3_set: BTreeSet<ObjectRef> = self
+            .part3_objects
+            .iter()
+            .chain(&self.part6_outline_objects)
+            .copied()
+            .collect();
         // Only objects actually in the linearization plan's Part-4 set have a
         // RenumberMap entry. A source ObjStm may carry eligible-but-unplanned
         // objects (unreachable / trailer-only); batching those would make
         // ObjStmLayout::build fail with "has no renumber entry". Skip them.
+        // part9_outline_objects are second-half objects; include them for the same
+        // reason as part6 above.
         let part4_set: BTreeSet<ObjectRef> = self
             .part4_other_pages_private
             .iter()
             .chain(&self.part4_other_pages_shared)
             .chain(&self.part4_rest)
+            .chain(&self.part9_outline_objects)
             .copied()
             .collect();
 
@@ -1594,7 +1620,13 @@ impl LinearizationPlan {
             .collect();
         let shared_set: BTreeSet<ObjectRef> =
             self.part4_other_pages_shared.iter().copied().collect();
-        let rest_set: BTreeSet<ObjectRef> = self.part4_rest.iter().copied().collect();
+        // part9_outline_objects are "rest" objects: not page-private or shared.
+        let rest_set: BTreeSet<ObjectRef> = self
+            .part4_rest
+            .iter()
+            .chain(&self.part9_outline_objects)
+            .copied()
+            .collect();
         let owner_of = |r: &ObjectRef| -> Option<Owner> {
             for (i, s) in page_private_sets.iter().enumerate() {
                 if s.contains(r) {
