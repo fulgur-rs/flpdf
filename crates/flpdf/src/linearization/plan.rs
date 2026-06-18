@@ -440,6 +440,15 @@ pub struct LinearizationPlan {
     /// container or a part8 shared container), and the page then references that
     /// container as a shared object. Keyed by original ref.
     pub all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>>,
+
+    /// Outline objects routed to the first-page section (part6) when the catalog
+    /// specifies `/PageMode /UseOutlines`. Empty when the predicate is false.
+    ///
+    /// Used by `page0_object_count_with_objstm` to include the outline ObjStm
+    /// container in the page-0 object count (qpdf counts all part6 objects in
+    /// `entries.at(0).nobjects`, including outlines placed there when
+    /// `outlines_in_first_page` is set).
+    pub(crate) outline_first_page_members: BTreeSet<ObjectRef>,
 }
 
 impl LinearizationPlan {
@@ -750,14 +759,28 @@ impl LinearizationPlan {
         // shared_hints is always non-empty whenever part2_objects is non-empty.
         //
         // Layout of shared_hints (in file order):
-        //   [part2 entries]  - first-page section private objects (page 0 owns
-        //                      them by physical position; referencing_pages = [])
-        //   [part3 entries]  - first-page section shared objects (also owned by
-        //                      page 0 physically; referencing_pages lists pages
-        //                      1..N that also use them, NOT page 0)
-        //   [part4_shared]   - Part-4 shared objects (after /E; owned by no
-        //                      page via physical position; referencing_pages lists
-        //                      ALL pages that reference them)
+        //   [part2 entries]   - first-page section private objects (page 0 owns
+        //                       them by physical position; referencing_pages = [])
+        //   [part3 entries]   - first-page section shared objects (also owned by
+        //                       page 0 physically; referencing_pages lists pages
+        //                       1..N that also use them, NOT page 0)
+        //   [outline entries] - outline objects routed to the first-page section
+        //                       when /PageMode /UseOutlines is set; physically
+        //                       owned by page 0 via layout (referencing_pages = [])
+        //   [part4_shared]    - Part-4 shared objects (after /E; owned by no
+        //                       page via physical position; referencing_pages lists
+        //                       ALL pages that reference them)
+
+        // Outline objects routed to the first-page section when
+        // /PageMode /UseOutlines is set (QPDF_linearization.cc:1031-1043).
+        // Must be built before shared_hints so they can be included in it.
+        let outline_first_page_members: BTreeSet<ObjectRef> =
+            if outlines_in_first_page_predicate(pdf)? {
+                outlines_set(pdf)?
+            } else {
+                BTreeSet::new()
+            };
+
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
             object_ref: obj_ref,
             referencing_pages: vec![],
@@ -774,6 +797,15 @@ impl LinearizationPlan {
                 referencing_pages: pages,
             }
         });
+        // Outline objects are in the first-page section (physically owned by
+        // page 0), so page 0 is not listed in referencing_pages.
+        let outline_entries =
+            outline_first_page_members
+                .iter()
+                .map(|&obj_ref| SharedObjectHintEntry {
+                    object_ref: obj_ref,
+                    referencing_pages: vec![],
+                });
         // Part-4 shared objects: referenced by ≥ 2 pages but NOT in the
         // first-page closure.  These live after /E (not physically owned
         // by any page via layout), so ALL referencing pages are listed.
@@ -789,6 +821,7 @@ impl LinearizationPlan {
         });
         let shared_hints: Vec<SharedObjectHintEntry> = part2_entries
             .chain(part3_entries)
+            .chain(outline_entries)
             .chain(part4_shared_entries)
             .collect();
 
@@ -807,6 +840,7 @@ impl LinearizationPlan {
             shared_hints,
             per_page_private_objects,
             all_referenced_pages,
+            outline_first_page_members,
         })
     }
 
@@ -933,13 +967,16 @@ impl LinearizationPlan {
         }
 
         // The first-page section of `shared_hints` is the leading part2 ++ part3
-        // entries; trailing entries are Part-8 (`part4_other_pages_shared`, after /E).
+        // ++ outline entries; trailing entries are Part-8 (`part4_other_pages_shared`,
+        // after /E).
         // Invariant: this split is only correct because `Self::new` builds
         // `shared_hints` as exactly `part2_entries ++ part3_entries ++
-        // part4_shared_entries` (one entry per object, no filter). Keep the two
-        // in lockstep — reordering the construction there silently breaks this
-        // boundary.
-        let first_page_input = self.part2_objects.len() + self.part3_objects.len();
+        // outline_entries ++ part4_shared_entries` (one entry per object, no filter).
+        // Keep the two in lockstep — reordering the construction there silently
+        // breaks this boundary.
+        let first_page_input = self.part2_objects.len()
+            + self.part3_objects.len()
+            + self.outline_first_page_members.len();
 
         // Position (index into the output list) at which each container was
         // first emitted, so later members of the same container fold into it.
@@ -1122,6 +1159,7 @@ impl Default for LinearizationPlan {
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
             all_referenced_pages: BTreeMap::new(),
+            outline_first_page_members: BTreeSet::new(),
         }
     }
 }
@@ -1399,19 +1437,37 @@ impl LinearizationPlan {
         let containers = objstm_membership_linearized(pdf)?;
         let routes = route_objstm_containers(pdf, &containers)?;
 
+        let outline_set = &self.outline_first_page_members;
+
         let mut open_document_batches: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
+        // Separate first-page containers into regular (fonts/shared) and
+        // outline-routed.  qpdf places outline containers AFTER the regular
+        // first-page containers in the first half, so regular go first and
+        // outline containers are appended last (QPDF_linearization.cc:1031-1043).
+        let mut part3_regular: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part3_outlines: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
             members.sort_unstable_by_key(|r| r.number);
             match route {
                 ContainerPart::OpenDocument => open_document_batches.push(members),
-                ContainerPart::FirstPage => part3_batches.push(members),
+                ContainerPart::FirstPage => {
+                    if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
+                        part3_outlines.push(members);
+                    } else {
+                        part3_regular.push(members);
+                    }
+                }
                 ContainerPart::OtherPagePrivate
                 | ContainerPart::OtherPageShared
                 | ContainerPart::Rest => part4_batches.push(members),
             }
         }
+
+        // Regular first-page containers numbered before outline containers so
+        // that outline ObjStms get higher golden object numbers (matching qpdf).
+        let mut part3_batches = part3_regular;
+        part3_batches.extend(part3_outlines);
 
         Ok(ObjStmBatchPlan {
             open_document_batches,
@@ -1774,16 +1830,47 @@ pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BT
     closure_from_seeds(pdf, seeds)
 }
 
+/// Returns `true` when the catalog specifies `/PageMode /UseOutlines` AND has
+/// an `/Outlines` entry (QPDF_linearization.cc:1031-1043).
+///
+/// When `true`, outline objects are routed to the first-page section (part6)
+/// rather than part9 by [`route_objstm_containers`].
+fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<bool> {
+    let Some(root) = pdf.root_ref() else {
+        return Ok(false); // cov:ignore: root_ref None ⇒ from_pdf fails earlier via catalog()?
+    };
+    let Object::Dictionary(cat) = pdf.resolve(root)? else {
+        return Ok(false); // cov:ignore: non-dictionary catalog unreachable on valid linearizable PDF
+    };
+    if cat.get("Outlines").is_none() {
+        return Ok(false);
+    }
+    match cat.get("PageMode") {
+        Some(Object::Name(n)) => Ok(n == b"UseOutlines"),
+        // cov:ignore-start: /PageMode as indirect reference; structurally identical to
+        // the direct-name arm; exercising requires a dedicated fixture with indirect PageMode
+        Some(Object::Reference(r)) => {
+            let r = *r;
+            Ok(matches!(pdf.resolve(r)?, Object::Name(n) if n == b"UseOutlines"))
+        }
+        // cov:ignore-end
+        _ => Ok(false),
+    }
+}
+
 /// Route each ObjStm container to a linearization part by the union of its
 /// members' object users.
 ///
 /// Mirrors qpdf's `filterCompressedObjects` (the container inherits the union of
 /// every member's obj_users) followed by the `lc_*` categorization. In qpdf's
-/// precedence order: a container holding any [`open_document_set`] object is
-/// part 4 ([`ContainerPart::OpenDocument`]); otherwise a container holding any
-/// first-page object is part 6 ([`ContainerPart::FirstPage`]); otherwise it is
-/// part 7 / part 8 / part 9 by the number of *distinct non-first* pages its
-/// members reach (one → [`ContainerPart::OtherPagePrivate`], two or more →
+/// precedence order: a container holding any outline object is part 6
+/// ([`ContainerPart::FirstPage`]) when `/PageMode /UseOutlines` is set, or
+/// part 9 ([`ContainerPart::Rest`]) otherwise; a container holding any
+/// [`open_document_set`] object is part 4 ([`ContainerPart::OpenDocument`]);
+/// otherwise a container holding any first-page object is part 6
+/// ([`ContainerPart::FirstPage`]); otherwise it is part 7 / part 8 / part 9 by
+/// the number of *distinct non-first* pages its members reach (one →
+/// [`ContainerPart::OtherPagePrivate`], two or more →
 /// [`ContainerPart::OtherPageShared`], none → [`ContainerPart::Rest`]).
 ///
 /// The page-user signals (first-page closure and the per-object referencing-page
@@ -1791,11 +1878,10 @@ pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BT
 ///
 /// # Deviation
 ///
-/// qpdf checks `in_outlines` and the thumbnail categories *before*
-/// `in_first_page` too; those are not modeled here (they do not occur in the
-/// supported corpus). When multiple open-document containers exist qpdf orders
-/// them by ascending object number (`std::set<QPDFObjGen>`); this routing keeps
-/// even-split order, which is identical for the single-container case. See
+/// When multiple open-document containers exist qpdf orders them by ascending
+/// object number (`std::set<QPDFObjGen>`); this routing keeps even-split order,
+/// which is identical for the single-container case. Thumbnail categories are
+/// not yet modeled. See
 /// `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`.
 ///
 /// # Errors
@@ -1806,6 +1892,15 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     containers: &[Vec<ObjectRef>],
 ) -> crate::Result<Vec<ContainerPart>> {
+    // in_outlines takes precedence over in_open_document and in_first_page
+    // (QPDF_linearization.cc:1118-1122).
+    let outline_set = outlines_set(pdf)?;
+    let outlines_first_page = if outline_set.is_empty() {
+        false
+    } else {
+        outlines_in_first_page_predicate(pdf)?
+    };
+
     let open_doc_set = open_document_set(pdf)?;
 
     let page_refs = crate::pages::page_refs(pdf)?;
@@ -1834,6 +1929,14 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     Ok(containers
         .iter()
         .map(|members| {
+            // in_outlines is checked first (QPDF_linearization.cc:1118-1122).
+            if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
+                return if outlines_first_page {
+                    ContainerPart::FirstPage
+                } else {
+                    ContainerPart::Rest
+                };
+            }
             // in_open_document takes precedence over every page category.
             if members.iter().any(|m| open_doc_set.contains(m)) {
                 return ContainerPart::OpenDocument;
@@ -4292,6 +4395,92 @@ mod tests {
         assert!(outlines_set(&mut pdf).unwrap().is_empty());
     }
 
+    // Builds a variant of outlines_pdf_bytes() with /PageMode injected into
+    // the catalog. Rebuilds the xref table so offsets remain valid.
+    fn outlines_pdf_bytes_with_page_mode(mode: &[u8]) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offs = [0u64; 7];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &[u8]| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        let catalog = format!(
+            "<< /Type /Catalog /PageMode /{} /Outlines 5 0 R /Pages 2 0 R >>",
+            std::str::from_utf8(mode).unwrap()
+        );
+        push(&mut pdf, 1, catalog.as_bytes());
+        push(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+        push(&mut pdf, 4, b"<< /Unused true >>");
+        push(
+            &mut pdf,
+            5,
+            b"<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>",
+        );
+        push(&mut pdf, 6, b"<< /Title (Item) /Parent 5 0 R >>");
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 7\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn outlines_in_first_page_predicate_true_when_use_outlines_and_outlines_present() {
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
+            b"UseOutlines",
+        )))
+        .unwrap();
+        assert!(
+            outlines_in_first_page_predicate(&mut pdf).unwrap(),
+            "/PageMode /UseOutlines + /Outlines => predicate must be true"
+        );
+    }
+
+    #[test]
+    fn outlines_in_first_page_predicate_false_without_page_mode() {
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes())).unwrap();
+        assert!(
+            !outlines_in_first_page_predicate(&mut pdf).unwrap(),
+            "/Outlines with no /PageMode => predicate must be false"
+        );
+    }
+
+    #[test]
+    fn outlines_in_first_page_predicate_false_when_page_mode_not_use_outlines() {
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
+            b"FullScreen",
+        )))
+        .unwrap();
+        assert!(
+            !outlines_in_first_page_predicate(&mut pdf).unwrap(),
+            "/PageMode /FullScreen (not UseOutlines) => predicate must be false"
+        );
+    }
+
+    #[test]
+    fn outlines_in_first_page_predicate_false_when_no_outlines() {
+        // two_page_shared_font_bytes has no /Outlines in the catalog.
+        let mut pdf = Pdf::open(Cursor::new(two_page_shared_font_bytes())).unwrap();
+        assert!(
+            !outlines_in_first_page_predicate(&mut pdf).unwrap(),
+            "catalog without /Outlines => predicate must be false"
+        );
+    }
+
     #[test]
     fn linearized_routes_open_document_container_before_page_categories() {
         // A container holding an open-document member routes to part 4
@@ -4303,6 +4492,38 @@ mod tests {
         let synthetic = vec![vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)]];
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
         assert_eq!(routes, vec![ContainerPart::OpenDocument]);
+    }
+
+    #[test]
+    fn route_objstm_containers_outlines_first_page_routes_to_first_page() {
+        // Outline container routes to FirstPage when /PageMode /UseOutlines is set.
+        // Object 5 = outline dict, object 6 = outline item in outlines_pdf_bytes.
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
+            b"UseOutlines",
+        )))
+        .unwrap();
+        let outline_ref = ObjectRef::new(5, 0); // outline dict
+        let synthetic = vec![vec![outline_ref]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::FirstPage],
+            "outline container must route to FirstPage when /PageMode /UseOutlines"
+        );
+    }
+
+    #[test]
+    fn route_objstm_containers_outlines_no_use_outlines_routes_to_rest() {
+        // Without /PageMode /UseOutlines, outline containers stay in Rest (part9).
+        let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes())).unwrap();
+        let outline_ref = ObjectRef::new(5, 0); // outline dict
+        let synthetic = vec![vec![outline_ref]];
+        let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::Rest],
+            "outline container must route to Rest when no /PageMode /UseOutlines"
+        );
     }
 
     /// A `/Root` that resolves to a NON-dictionary (a malformed catalog) yields

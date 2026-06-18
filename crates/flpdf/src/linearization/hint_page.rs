@@ -257,10 +257,15 @@ fn page0_object_count_with_objstm(
     member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
 ) -> u32 {
     // Page 0's section is Part 2 (always plain) followed by Part 3 (plain or
-    // folded into a first-half container). No container is excluded — page 0
-    // owns its first-page (part6) containers.
+    // folded into a first-half container), plus any outline objects routed to
+    // the first-page section when /PageMode /UseOutlines is set. qpdf counts
+    // all part6 objects in entries.at(0).nobjects
+    // (QPDF_linearization.cc:1222).
     objstm_folded_count(
-        plan.part2_objects.iter().chain(&plan.part3_objects),
+        plan.part2_objects
+            .iter()
+            .chain(&plan.part3_objects)
+            .chain(&plan.outline_first_page_members),
         member_to_container,
         &std::collections::BTreeSet::new(),
     )
@@ -1139,5 +1144,29 @@ mod tests {
 
         // |part2| (2) + |part3 plain| (1: plain_part3) + |containers| (1) = 4.
         assert_eq!(page0_object_count_with_objstm(&plan, &m2c), 4);
+    }
+
+    /// When outline objects are routed to the first-page section (UseOutlines),
+    /// page0_object_count must include the outline ObjStm container once.
+    #[test]
+    fn page0_count_includes_outline_container_when_first_page() {
+        let outline_ref = ObjectRef::new(10, 0);
+        let container_num = 99u32;
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(5, 0)],
+            outline_first_page_members: std::collections::BTreeSet::from([outline_ref]),
+            ..Default::default()
+        };
+        // outline_ref lives in container 99.
+        let mut m2c: std::collections::BTreeMap<ObjectRef, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        m2c.insert(outline_ref, (container_num, 0));
+
+        // |part2| (1 plain) + |outline container| (1) = 2.
+        assert_eq!(
+            page0_object_count_with_objstm(&plan, &m2c),
+            2,
+            "outline container must be counted when outline_first_page_members is non-empty"
+        );
     }
 }
