@@ -12,12 +12,14 @@
 //! | M+1..N      | part8: other pages' shared objects (qpdf part8). |
 //! | N+1         | Pages tree (qpdf part9 head). Skipped if absent. |
 //! | N+2         | Info dict (qpdf `lc_other`). Skipped if absent. |
+//! | N+3..O      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
+//! | O+1..P      | Remaining `part4_rest` objects (e.g. `lc_thumbnail`). Skipped if absent. |
 //! | param       | **Reserved** — linearization parameter dictionary (Part 1). |
 //! | catalog     | Catalog (qpdf `lc_root`). Skipped if absent. |
 //! | hint        | **Reserved** — primary hint stream. |
 //! | next..a     | Part 2 — first-page objects (plan order). |
 //! | a+1..b      | Part 3 — shared objects (plan order). |
-//! | b+1..end    | part4_rest remaining — everything not promoted (plan order). |
+//! | b+1..end    | Part 6 — outline objects (qpdf `lc_outlines`, `UseOutlines`). Skipped if absent. |
 //!
 //! The `param` and `hint` slots are *dynamic*: when an upstream object is
 //! absent from the plan its slot is simply not consumed, so emitted object
