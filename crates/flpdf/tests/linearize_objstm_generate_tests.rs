@@ -332,6 +332,71 @@ fn outlines_generate_emits_outline_hint_table_and_o_key() {
     }
 }
 
+/// A fixture with TWO open-document ObjStm containers (flpdf-699x).
+///
+/// The catalog `/OpenAction` action dict carries `/HighRef` (50 high-numbered OD
+/// fonts, 100..149) BEFORE `/LowRef` (50 low-numbered OD fonts, 6..55) because
+/// H < L lexically in DFS.  The 107 eligible objects split into two containers:
+///   C0: [action(5), 100..149 (50), 6..8 (3)] — N=54, all OD, min=5
+///   C1: [9..55 (47), pages(2), 56..60 (5)] — N=53, has OD, min=2
+///
+/// qpdf emits C0 before C1 (ObjGen / even-split order), NOT ascending-min-member
+/// order.  This verifies that flpdf's DFS order for open_document_batches is
+/// correct: if it erroneously sorted by ascending min-member it would place C1
+/// (min=2) before C0 (min=5), diverging from qpdf.
+#[test]
+fn openaction_multi_od_generates_two_od_containers_in_dfs_order() {
+    let bytes = linearize_generate("objstm-lin-openaction-multi-od.pdf");
+
+    // Two ObjStm containers: both open-document (part4), both in the first half.
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 2,
+        "openaction-multi-od must emit exactly two ObjStm containers (both OD), \
+         found {n_objstm}"
+    );
+    let e_off = parse_e_offset(&bytes);
+    let first_marker = first_objstm_marker_offset(&bytes).expect("ObjStm marker present");
+    assert!(
+        first_marker < e_off,
+        "the first OD ObjStm container (marker at {first_marker}) must be in the first \
+         half, before /E ({e_off})"
+    );
+
+    // The two OD containers are both in the first half; verify the second one
+    // also appears before /E.
+    let second_marker_offset = bytes[first_marker + 1..]
+        .windows(b"\nobj\n".len())
+        .position(|w| w == b"\nobj\n")
+        .map(|p| first_marker + 1 + p);
+    if let Some(second) = second_marker_offset {
+        assert!(
+            second < e_off,
+            "the second OD ObjStm container (approx byte {second}) must also be in the \
+             first half, before /E ({e_off})"
+        );
+    }
+
+    // /O (first_page_object) = 10: open-document objects occupy 2 containers
+    // (part4) before the first page, which therefore receives object number 10.
+    let first_page_object = parse_param_int(&bytes, b"/O ");
+    assert_eq!(
+        first_page_object, 10,
+        "first page object (/O) must be 10 with two OD containers in the first half; \
+         got {first_page_object}"
+    );
+
+    // Round-trip: all objects (including both OD containers' compressed members)
+    // must resolve in the back-patched output.
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
 /// A fixture with a PLAIN (uncompressed, stream) part8 object — a Form XObject
 /// shared by pages 1 & 2 — alongside a part7 container. Exercises the
 /// shared-object hint table's plain-Part-8 branch (`first_object_number` taken
