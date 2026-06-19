@@ -506,3 +506,28 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
         "objstm-lin-outlines-coloc-200-20",
     );
 }
+
+// acroform-widget-ap-stream-page0 (PR #393 Fix 1 + Fix 3): AcroForm widget with
+// an /AP /N Form XObject appearance stream (Object::Stream → ineligible for
+// ObjStm packing). The Form XObject is in open_document_set (via
+// Catalog → /AcroForm → widget → /AP) but cannot be an ObjStm member.
+// qpdf emits it as a plain indirect object between the Catalog and the OD ObjStm
+// containers (pre-/O region). flpdf routes it to `part4_open_document_plain` and
+// emits it similarly. Exercises the eligibility check in from_pdf Step 6b and the
+// pre-/O plain emission loop in writer.rs.
+#[test]
+fn acroform_widget_ap_stream_page0_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        "objstm-lin-acroform-widget-ap-stream-page0",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn acroform_widget_ap_stream_page0_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        "objstm-lin-acroform-widget-ap-stream-page0",
+    );
+}

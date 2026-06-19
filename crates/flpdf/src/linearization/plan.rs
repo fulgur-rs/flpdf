@@ -468,6 +468,17 @@ pub struct LinearizationPlan {
     /// qpdf's `lc_outlines` (part6) placement.  Empty when `UseOutlines` is
     /// not set or when there are no outlines.
     pub(crate) part6_outline_objects: Vec<ObjectRef>,
+
+    /// Ineligible open-document objects emitted as plain objects in the pre-/O
+    /// region (between the Catalog and the open-document ObjStm containers).
+    ///
+    /// These are objects that are in the open-document set but cannot be packed
+    /// into an ObjStm (e.g. stream objects such as `/AP /N` appearance streams).
+    /// qpdf emits them as plain indirect objects before the hint stream, between
+    /// the Catalog and the OD ObjStm containers.
+    ///
+    /// Empty when `use_generate_objstm` is false.
+    pub part4_open_document_plain: Vec<ObjectRef>,
 }
 
 impl LinearizationPlan {
@@ -547,10 +558,12 @@ impl LinearizationPlan {
         // In non-generate mode the peeling never runs, so we skip the catalog
         // traversal entirely to avoid failing on broken catalog references that
         // non-generate linearization would otherwise tolerate.
-        let open_document_set = if use_generate_objstm {
-            open_document_set(pdf)?
+        let (open_document_set, elig_ctx) = if use_generate_objstm {
+            let od_set = open_document_set(pdf)?;
+            let ctx = eligibility_context(pdf)?;
+            (od_set, Some(ctx))
         } else {
-            BTreeSet::new()
+            (BTreeSet::new(), None)
         };
 
         // ----------------------------------------------------------------
@@ -770,6 +783,7 @@ impl LinearizationPlan {
         let mut part4_other_pages_private: Vec<ObjectRef> = Vec::new();
         let mut part4_other_pages_shared: Vec<ObjectRef> = Vec::new();
         let mut part4_rest: Vec<ObjectRef> = Vec::new();
+        let mut part4_open_document_plain: Vec<ObjectRef> = Vec::new();
         // Track which objects are already in part7 (private) to build in page order.
         let mut placed_private: BTreeSet<ObjectRef> = BTreeSet::new();
 
@@ -790,34 +804,60 @@ impl LinearizationPlan {
                 continue;
             }
             let reach = page_reach.get(&r).copied().unwrap_or(0);
-            // In generate mode, OD+first-page objects were peeled from Part 2/3
-            // by Step 5 and now reside in Part 4, so they must NOT be treated as
-            // first-page objects here (they should flow to part9). In non-generate
-            // mode, OD+first-page objects remain in Part 2/3 (moved) and are
-            // never present in part4_provisional; the `use_generate_objstm` guard
-            // keeps the defensive skip consistent with the Step 5 gate.
+            // In generate mode, eligible OD+first-page objects were peeled from
+            // Part 2/3 by Step 5. They flow to part4_rest (for ObjStm packing) or
+            // part4_open_document_plain (for pre-/O plain emission) depending on
+            // ObjStm eligibility. In non-generate mode, OD+first-page objects
+            // remain in Part 2/3 (moved) and are never present in
+            // part4_provisional; the `use_generate_objstm` guard keeps the
+            // defensive skip consistent with the Step 5 gate.
             let in_first_page = first_page_set.contains(&r)
                 && !(use_generate_objstm && open_document_set.contains(&r));
             if in_first_page {
                 // Should have been in Part 2 or Part 3 — skip (defensive).
                 continue;
             }
-            // open_document objects must not go into part8 even if page_reach >= 2:
-            // their ObjStm container is placed before /O (first half), not in the
-            // second half after /E where part8 lives.  Route them to part9 instead.
+            // In generate mode, route open-document objects by ObjStm eligibility:
+            //   eligible   → part4_rest (the ObjStm batch planner will pack them)
+            //   ineligible → part4_open_document_plain (emitted pre-/O as plain
+            //                objects, between the Catalog and the OD containers).
+            //
+            // qpdf emits ineligible OD objects (e.g. /AP /N appearance streams,
+            // which are Object::Stream and therefore cannot be ObjStm members) as
+            // plain indirect objects in the pre-/O region, NOT in [/O,/E) and NOT
+            // after /E.  Oracle: qpdf --linearize --object-streams=generate on a
+            // page-0 widget with /AP /N places the Form XObject at a lower object
+            // number than the OD ObjStm, physically before the hint stream.
+            if use_generate_objstm && open_document_set.contains(&r) {
+                let ctx = elig_ctx
+                    .as_ref()
+                    .expect("elig_ctx is Some when use_generate_objstm");
+                let obj = pdf.resolve_borrowed(r)?;
+                if is_eligible_for_objstm(r, obj, ctx) {
+                    part4_rest.push(r);
+                } else {
+                    part4_open_document_plain.push(r);
+                }
+                continue;
+            }
+            // open_document objects in generate mode are caught above.  For
+            // non-generate mode, or for non-OD objects: use reach to partition.
             if reach >= 2 && !open_document_set.contains(&r) {
                 part4_other_pages_shared.push(r);
             } else {
                 // reach == 0 or reach == 1 but not private (shouldn't happen
                 // since per_page_private_objects captures all reach-1 non-first
-                // objects), or open_document object with reach >= 2.
-                // Everything else goes to part9.
+                // objects), or open_document object with reach >= 2 in non-generate
+                // mode.  Everything else goes to part9.
                 part4_rest.push(r);
             }
         }
 
         debug_assert_eq!(
-            part4_other_pages_private.len() + part4_other_pages_shared.len() + part4_rest.len(),
+            part4_other_pages_private.len()
+                + part4_other_pages_shared.len()
+                + part4_rest.len()
+                + part4_open_document_plain.len(),
             part4_provisional.len(),
             "Part-4 sub-partition must preserve membership"
         );
@@ -960,6 +1000,7 @@ impl LinearizationPlan {
             part4_other_pages_private,
             part4_other_pages_shared,
             part4_rest,
+            part4_open_document_plain,
             total_object_count,
             root_ref,
             pages_tree_ref,
@@ -1124,12 +1165,18 @@ impl LinearizationPlan {
             }
             match member_to_container.get(&entry.object_ref) {
                 Some(&(container_num, _idx)) => {
-                    // Within the first-page section: skip second-half (outline-routed) ObjStm
-                    // containers and open-document containers (placed before /O, not in [/O,/E)).
-                    // qpdf does not list either in the Shared Object Hint Table.
+                    // Open-document containers live in the pre-/O region (before
+                    // the first-page section and before /E), so qpdf excludes
+                    // them from the SOHT unconditionally — regardless of whether
+                    // the triggering entry is in the first-page section or in the
+                    // Part-8 section.
+                    if open_document_container_nums.contains(&container_num) {
+                        continue;
+                    }
+                    // Within the first-page section: skip second-half
+                    // (outline-routed) ObjStm containers placed after /E.
                     if input_idx < first_page_input
-                        && (second_half_container_nums.contains(&container_num)
-                            || open_document_container_nums.contains(&container_num))
+                        && second_half_container_nums.contains(&container_num)
                     {
                         continue;
                     }
@@ -1272,6 +1319,7 @@ impl LinearizationPlan {
             .chain(&self.part6_outline_objects)
             .chain(&self.part9_outline_objects)
             .chain(&self.part4_rest)
+            .chain(&self.part4_open_document_plain)
         {
             if !seen.insert(*r) {
                 return false;
@@ -1295,6 +1343,7 @@ impl Default for LinearizationPlan {
             part4_other_pages_private: Vec::new(),
             part4_other_pages_shared: Vec::new(),
             part4_rest: Vec::new(),
+            part4_open_document_plain: Vec::new(),
             total_object_count: 0,
             root_ref: None,
             pages_tree_ref: None,

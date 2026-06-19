@@ -519,6 +519,102 @@ fn acroform_widget_page0_peeled_from_first_page_section() {
     );
 }
 
+/// Ineligible OD objects (streams) are routed to `part4_open_document_plain` and
+/// written as plain indirect objects in the pre-/O region, NOT packed into an ObjStm.
+///
+/// Fixture layout (obj 8 = `/AP /N` Form XObject appearance stream):
+///   obj 1: Catalog  (eligible OD — dict)
+///   obj 5: AcroForm (eligible OD — dict)
+///   obj 6: Widget   (eligible OD — dict)
+///   obj 7: AP dict  (eligible OD — dict)
+///   obj 8: Form XObject (ineligible OD — stream)
+///
+/// After `from_pdf`, obj 8 must be in `part4_open_document_plain` and the eligible
+/// dicts in `part4_rest` (to be packed into an OD ObjStm).  Writing must succeed
+/// and the plain Form XObject must appear in the output bytes before the ObjStm.
+#[test]
+fn ineligible_od_stream_routes_to_part4_open_document_plain() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-ap-stream-page0.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    // Only obj 8 (the Form XObject stream) must be in part4_open_document_plain.
+    let ap_stream = ObjectRef {
+        number: 8,
+        generation: 0,
+    };
+    assert_eq!(
+        plan.part4_open_document_plain,
+        vec![ap_stream],
+        "only the ineligible AP stream (obj 8) must be in part4_open_document_plain"
+    );
+
+    // The eligible OD dicts (5=AcroForm, 6=Widget, 7=AP dict) must NOT be in
+    // part4_open_document_plain; they should appear in part4_objects() (via part4_rest).
+    let plain_set: BTreeSet<_> = plan.part4_open_document_plain.iter().copied().collect();
+    for n in [5u32, 6, 7] {
+        let r = ObjectRef {
+            number: n,
+            generation: 0,
+        };
+        assert!(
+            !plain_set.contains(&r),
+            "eligible OD dict obj {n} must NOT be in part4_open_document_plain"
+        );
+    }
+
+    // Exercise the writer path: write_linearized must succeed and the output
+    // must contain the plain Form XObject before the OD ObjStm container.
+    let renumber = RenumberMap::from_plan(&plan);
+    let f2 = std::fs::File::open(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join("objstm-lin-acroform-widget-ap-stream-page0.pdf"),
+    )
+    .unwrap();
+    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
+    let mut opts = WriteOptions::default();
+    opts.object_streams = ObjectStreamMode::Generate;
+    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
+    doc.back_patch().unwrap();
+
+    // The new number assigned to the Form XObject is immediately after the Catalog
+    // in the renumber map.  Verify it appears as a plain "N 0 obj" before any ObjStm.
+    let new_ref = renumber
+        .new_for_original(ap_stream)
+        .expect("AP stream must have a new number");
+    let plain_marker = format!("{} 0 obj", new_ref.number).into_bytes();
+    let bytes = &doc.bytes;
+    let plain_pos = bytes
+        .windows(plain_marker.len())
+        .position(|w| w == plain_marker.as_slice())
+        .unwrap_or_else(|| {
+            panic!(
+                "plain marker '{} 0 obj' not found in output",
+                new_ref.number
+            )
+        });
+
+    // ObjStm appears in the output; find it after the Catalog section.
+    let objstm_marker = b" /Type /ObjStm";
+    let objstm_pos = bytes
+        .windows(objstm_marker.len())
+        .position(|w| w == objstm_marker)
+        .expect("/Type /ObjStm must appear in output");
+
+    assert!(
+        plain_pos < objstm_pos,
+        "plain Form XObject (byte {plain_pos}) must precede the OD ObjStm (byte {objstm_pos})"
+    );
+}
+
 /// Regression test: in non-generate mode the OD peeling must NOT apply.
 ///
 /// Oracle: `qpdf --linearize --object-streams=disable` on the AcroForm fixture

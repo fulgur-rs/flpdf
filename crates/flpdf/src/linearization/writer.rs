@@ -1785,6 +1785,29 @@ fn do_write_pass<R: Read + Seek>(
         catalog_emitted_early = true;
     }
 
+    // Ineligible open-document plain objects (generate mode only).
+    // Stream objects such as /AP /N appearance streams cannot be packed into
+    // an ObjStm.  qpdf emits them as plain indirect objects in the pre-/O
+    // region, between the Catalog and the OD ObjStm containers, giving them
+    // object numbers immediately after the Catalog and before the OD containers.
+    // Oracle: qpdf --linearize --object-streams=generate on a page-0 widget
+    // with /AP /N places the Form XObject before the OD ObjStm at a lower
+    // object number (e.g. obj 7 before obj 8 ObjStm).
+    for original_ref in &plan.part4_open_document_plain {
+        // cov:ignore-start: unreachable invariant — renumber.rs step-6b inserts
+        // every part4_open_document_plain ref, so new_for_original is always Some.
+        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
+            return Err(crate::Error::Unsupported(
+                "part4_open_document_plain ref missing from renumber map".into(),
+            ));
+        };
+        // cov:ignore-end
+        let object = pdf.resolve_borrowed(*original_ref)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        xref_offsets.insert(new_ref.number, offset);
+    }
+
     // Open-document ObjStm containers (qpdf part4).  qpdf places the
     // open-document objects (`/OpenAction`, `/AcroForm`, … subtrees) in part4,
     // physically right after the Catalog and BEFORE the primary hint stream —
