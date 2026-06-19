@@ -547,11 +547,16 @@ fn acroform_widget_stays_in_first_page_section_in_disable_mode() {
         .collect();
 
     let part2_set: BTreeSet<_> = plan.part2_objects.iter().copied().collect();
+    let part4_set: BTreeSet<_> = plan.part4_objects().into_iter().collect();
 
     for r in &widget_refs {
         assert!(
             part2_set.contains(r),
             "widget {r} must be in part2 in disable mode (no OD peeling)"
+        );
+        assert!(
+            !part4_set.contains(r),
+            "widget {r} must NOT be in part4 in disable mode (disjoint partition)"
         );
     }
 

@@ -782,11 +782,14 @@ impl LinearizationPlan {
                 continue;
             }
             let reach = page_reach.get(&r).copied().unwrap_or(0);
-            // Objects in first_page_set that are also in open_document_set were
-            // deliberately excluded from Part 2/3 (in_open_document > in_first_page)
-            // and now reside in Part 4. Do not skip them here — they flow through
-            // the part7/8/9 buckets just like pure open-document objects.
-            let in_first_page = first_page_set.contains(&r) && !open_document_set.contains(&r);
+            // In generate mode, OD+first-page objects were peeled from Part 2/3
+            // by Step 5 and now reside in Part 4, so they must NOT be treated as
+            // first-page objects here (they should flow to part9). In non-generate
+            // mode, OD+first-page objects remain in Part 2/3 (moved) and are
+            // never present in part4_provisional; the `use_generate_objstm` guard
+            // keeps the defensive skip consistent with the Step 5 gate.
+            let in_first_page = first_page_set.contains(&r)
+                && !(use_generate_objstm && open_document_set.contains(&r));
             if in_first_page {
                 // Should have been in Part 2 or Part 3 — skip (defensive).
                 continue;
