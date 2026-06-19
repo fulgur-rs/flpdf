@@ -270,13 +270,22 @@ pub(crate) fn calculate_xref_stream_padding(xref_bytes: usize) -> usize {
 /// in the first 4 GB (`max_offset = 1 << 25` ⇒ 4 bytes) so the reserved region
 /// is an upper bound on the second pass; field 3 sizes the object-stream index.
 /// Mirrors `QPDFWriter::writeXRefStream`'s pass-1 field sizing.
+///
+/// When `max_ostream_index == 0` (no ObjStm members or only single-member
+/// containers where the index is always 0), field 3 is 0 — matching qpdf's
+/// behaviour of omitting the generation/index column when all values are 0.
 pub(crate) fn first_pass_widths(
     max_id: u32,
     max_ostream_index: u64,
     hint_length: u64,
 ) -> XrefWidths {
     let f1 = bytes_needed((1u64 << 25) + hint_length).max(bytes_needed(u64::from(max_id)));
-    [1, f1, bytes_needed(max_ostream_index)]
+    let f3 = if max_ostream_index > 0 {
+        bytes_needed(max_ostream_index)
+    } else {
+        0
+    };
+    [1, f1, f3]
 }
 
 /// PNG-Up-predicted (uncompressed) payload length for `n_entries` rows: each row
@@ -306,6 +315,10 @@ pub(crate) fn first_pass_region_len(
 /// hint_length` (or the largest object number), field 3 the global maximum
 /// object-stream member index. `hint_length` is 0 for the main (second-half)
 /// stream and `/H[1]` for the first-page stream (mirrors `writeXRefStream`).
+///
+/// When `max_ostream_index == 0` (no ObjStm members, or only single-member
+/// containers where every index is 0), field 3 is 0 — matching qpdf's
+/// behaviour of omitting the generation/index column when all values are 0.
 pub(crate) fn second_pass_widths(
     max_offset: u64,
     hint_length: u64,
@@ -313,7 +326,12 @@ pub(crate) fn second_pass_widths(
     max_ostream_index: u64,
 ) -> XrefWidths {
     let f1 = bytes_needed(max_offset + hint_length).max(bytes_needed(u64::from(max_id)));
-    [1, f1, bytes_needed(max_ostream_index)]
+    let f3 = if max_ostream_index > 0 {
+        bytes_needed(max_ostream_index)
+    } else {
+        0
+    };
+    [1, f1, f3]
 }
 
 /// Build the cross-reference stream entries for object numbers
@@ -476,7 +494,9 @@ mod tests {
     fn first_pass_widths_force_wide_field2() {
         // 1<<25 dominates field 2 (4 bytes); field 3 sizes the objstm index.
         assert_eq!(first_pass_widths(16, 3, 130), [1, 4, 1]);
-        assert_eq!(first_pass_widths(16, 0, 0), [1, 4, 1]);
+        // When max_ostream_index is 0 there are no ObjStm members, so W[2] = 0
+        // (matching qpdf which omits f3 when no compressed entries exist).
+        assert_eq!(first_pass_widths(16, 0, 0), [1, 4, 0]);
     }
 
     /// The first-pass region size pins where the object after the first-half

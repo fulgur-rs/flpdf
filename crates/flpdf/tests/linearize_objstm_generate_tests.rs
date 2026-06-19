@@ -649,22 +649,25 @@ fn ineligible_od_stream_routes_to_part4_open_document_plain() {
     let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
     doc.back_patch().unwrap();
 
-    // The new number assigned to the Form XObject is immediately after the Catalog
-    // in the renumber map.  Verify it appears as a plain "N 0 obj" before any ObjStm.
-    let new_ref = renumber
+    // Verify the plain Form XObject stream appears before any ObjStm in the
+    // output.  The Form XObject (ap_stream = obj 8 original) is written as a
+    // plain (uncompressed) object; its stream dictionary contains /Subtype /Form.
+    // ObjStm content is DEFLATE-compressed, so /Subtype /Form in raw bytes can
+    // only be the plain form xobject.  We look for this marker rather than the
+    // "N 0 obj" header because write_linearized re-numbers objects internally
+    // via place_objstm_members_per_half, and the resulting new number differs
+    // from what RenumberMap::from_plan assigned.
+    let _ = renumber
         .new_for_original(ap_stream)
         .expect("AP stream must have a new number");
-    let plain_marker = format!("{} 0 obj", new_ref.number).into_bytes();
+    let plain_marker = b"/Subtype /Form";
     let bytes = &doc.bytes;
     let plain_pos = bytes
         .windows(plain_marker.len())
         .position(|w| w == plain_marker.as_slice())
-        .unwrap_or_else(|| {
-            panic!(
-                "plain marker '{} 0 obj' not found in output",
-                new_ref.number
-            )
-        });
+        .expect(
+            "/Subtype /Form not found in output — Form XObject must be written as a plain object",
+        );
 
     // ObjStm appears in the output; find it after the Catalog section.
     let objstm_marker = b" /Type /ObjStm";
@@ -675,8 +678,89 @@ fn ineligible_od_stream_routes_to_part4_open_document_plain() {
 
     assert!(
         plain_pos < objstm_pos,
-        "plain Form XObject (byte {plain_pos}) must precede the OD ObjStm (byte {objstm_pos})"
+        "plain Form XObject (/Subtype /Form at byte {plain_pos}) must precede the OD ObjStm (byte {objstm_pos})"
     );
+}
+
+/// A fixture with /Thumb thumbnail entries on other pages: one page has a private
+/// thumbnail (only one page's /Thumb reaches it) and two pages share a thumbnail
+/// (same object pointed to by two /Thumb entries). qpdf assigns thumbnail objects
+/// the separate ou_thumb user and does NOT include them in page closures, so they
+/// land in part9 (part4_rest) with page_reach 0. Verify that compute_closure
+/// skips /Thumb and the plan matches the oracle hint table (nobjects=2 per page).
+#[test]
+fn thumbnail_private_shared_routes_thumbs_to_part9() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-thumbnail-private-shared.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    // Source objects 11=thumb_priv, 12=thumb_shared. With /Thumb skipping these
+    // have page_reach 0 and must land in part4_rest (never part7 or part8).
+    let thumb_priv = ObjectRef {
+        number: 11,
+        generation: 0,
+    };
+    let thumb_shared = ObjectRef {
+        number: 12,
+        generation: 0,
+    };
+
+    let part7_set: BTreeSet<_> = plan.part4_other_pages_private.iter().copied().collect();
+    let part8_set: BTreeSet<_> = plan.part4_other_pages_shared.iter().copied().collect();
+    let part9_set: BTreeSet<_> = plan.part4_rest.iter().copied().collect();
+
+    assert!(
+        !part7_set.contains(&thumb_priv),
+        "thumb_priv (obj 11) must NOT be in part7 (other-page-private)"
+    );
+    assert!(
+        !part7_set.contains(&thumb_shared),
+        "thumb_shared (obj 12) must NOT be in part7"
+    );
+    assert!(
+        !part8_set.contains(&thumb_priv),
+        "thumb_priv (obj 11) must NOT be in part8 (other-page-shared)"
+    );
+    assert!(
+        !part8_set.contains(&thumb_shared),
+        "thumb_shared (obj 12) must NOT be in part8"
+    );
+    assert!(
+        part9_set.contains(&thumb_priv),
+        "thumb_priv (obj 11) must be in part9 (part4_rest) — qpdf ou_thumb excludes it from page closures"
+    );
+    assert!(
+        part9_set.contains(&thumb_shared),
+        "thumb_shared (obj 12) must be in part9 (part4_rest)"
+    );
+
+    // Each non-first page has exactly 2 private objects (page dict + content),
+    // matching the oracle's hint table "nobjects: 2" for pages 1-3.
+    // Without /Thumb skipping, page 1 would have 3 objects (including thumb_priv).
+    for (i, privates) in plan.per_page_private_objects.iter().enumerate().skip(1) {
+        assert_eq!(
+            privates.len(),
+            2,
+            "page {i} must have 2 private objects (page dict + content, no thumbnail); got {}",
+            privates.len()
+        );
+    }
+
+    // Round-trip: every object resolves including the thumbnail image streams.
+    let bytes = linearize_generate("objstm-lin-thumbnail-private-shared.pdf");
+    let mut pdf_rt = Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in pdf_rt.object_refs() {
+        pdf_rt
+            .resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
 }
 
 /// Regression test: in non-generate mode the OD peeling must NOT apply.

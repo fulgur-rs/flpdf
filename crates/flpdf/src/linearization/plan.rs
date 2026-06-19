@@ -244,6 +244,14 @@ fn compute_closure<R: Read + Seek>(
                         // Pages → sibling pages — never follow.
                         continue;
                     }
+                    if k == b"Thumb" {
+                        // qpdf gives thumbnail objects the separate ou_thumb
+                        // user (not a page user), so page closures never
+                        // include /Thumb targets. Skipping here ensures
+                        // thumbnail objects land in part4_rest (part 9)
+                        // rather than the per-page private/shared sections.
+                        continue;
+                    }
                     if k == b"Parent" {
                         // Walk the /Parent chain up to the root Pages node so
                         // inherited /Resources, /MediaBox, /Rotate, etc. from
@@ -2116,8 +2124,10 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// same DFS / even-split order that this function preserves.  The ordering is
 /// therefore byte-identical to qpdf for ≥2 open-document containers; verified
 /// with `objstm-lin-openaction-multi-od` (two OD containers whose min-member
-/// numbers are non-ascending in DFS order).  Thumbnail categories are not yet
-/// modeled.
+/// numbers are non-ascending in DFS order).  Thumbnail categories are handled
+/// implicitly: `compute_closure` skips `/Thumb`, so thumbnail objects have
+/// page_reach 0 and any container holding only thumbnail members already maps
+/// to [`ContainerPart::Rest`] via the `other_pages.len() == 0` branch.
 ///
 /// # Errors
 ///

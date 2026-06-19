@@ -58,7 +58,7 @@
 //! This module returns `LinearizedOffsets` containing all information required
 //! for that step.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
@@ -2259,8 +2259,6 @@ fn second_half_container_anchors(
     plan: &LinearizationPlan,
     part4_batches: &[Vec<ObjectRef>],
 ) -> Vec<Option<ObjectRef>> {
-    use std::collections::BTreeSet;
-
     let member_set: BTreeSet<ObjectRef> = part4_batches.iter().flatten().copied().collect();
 
     // Second-half plain (non-member) objects in qpdf part order, each tagged with
@@ -2403,6 +2401,22 @@ pub fn write_linearized<R: Read + Seek>(
     // container's group is the last one (the single-second-half-container case).
     let second_half_anchors =
         second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
+    // Part-4 non-member part4_rest objects (e.g. lc_thumbnail streams) must be
+    // placed AFTER the second-half ObjStm containers in the file, not before.
+    // Compute the set of such objects so place_objstm_members_per_half can
+    // emit them in a post-container pass.
+    let part4_member_set: BTreeSet<ObjectRef> = resolved_batch_plan
+        .part4_batches
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    let second_half_post_plain: BTreeSet<ObjectRef> = plan
+        .part4_rest
+        .iter()
+        .copied()
+        .filter(|r| !part4_member_set.contains(r))
+        .collect();
     // Open-document batches are numbered FIRST in the first half (right after
     // the catalog, before the hint); Part-3 batches are numbered last within
     // the first half (qpdf packs the first-page shared dicts + /Pages tree +
@@ -2413,6 +2427,7 @@ pub fn write_linearized<R: Read + Seek>(
         &resolved_batch_plan.part3_batches,
         &resolved_batch_plan.part4_batches,
         &second_half_anchors,
+        &second_half_post_plain,
     );
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;
