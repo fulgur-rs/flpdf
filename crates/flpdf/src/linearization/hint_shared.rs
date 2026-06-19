@@ -285,7 +285,15 @@ impl SharedObjectHintTable {
         // lists even though no individual member is `part4_other_pages_shared`.
         // So the Part-8 count is the part8 containers plus the plain (no-container)
         // `part4_other_pages_shared` objects.
-        let part8_containers = plan.part8_container_nums(member_to_container);
+        // Open-document containers are excluded here for the same reason
+        // `canonical_shared_hints` excludes them: they live in the pre-/O
+        // region (before /E), so they do not appear in the Part-8 SOHT section
+        // and must not count toward `part8_entries`.
+        let part8_containers: std::collections::BTreeSet<u32> = plan
+            .part8_container_nums(member_to_container)
+            .into_iter()
+            .filter(|cnum| !open_document_container_nums.contains(cnum))
+            .collect();
         let part8_plain = plan
             .part4_other_pages_shared
             .iter()
@@ -1131,6 +1139,74 @@ mod tests {
         assert_eq!(
             table.header.first_object_number, simulated_container_num,
             "post-patch: first_object_number must equal the ObjStm container number"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // OD container filter: must not count OD ObjStm as Part-8 entry
+    // -----------------------------------------------------------------------
+
+    /// Plan where a Part-3 font is in a first-half ObjStm (fh_cnum) and an OD
+    /// widget is in a separate OD ObjStm (od_cnum).  The widget spans pages 1
+    /// and 2, so `part8_container_nums` includes od_cnum via the
+    /// `container_pages.len() >= 2` path.  The OD container must be filtered
+    /// out of `part8_entries` so `first_page_entries` is not undercounted.
+    #[test]
+    fn od_container_spanning_two_later_pages_not_counted_as_part8_entry() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let font = ObjectRef::new(7, 0);
+        let widget = ObjectRef::new(6, 0);
+        let fh_cnum: u32 = 20; // first-half ObjStm container
+        let od_cnum: u32 = 21; // OD ObjStm container
+
+        let mut all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
+        // Widget reaches pages 1 and 2 (not page 0), which makes od_cnum
+        // eligible for part8_container_nums via container_pages.len() >= 2.
+        all_referenced_pages.insert(widget, BTreeSet::from([1u32, 2]));
+
+        let plan = LinearizationPlan {
+            part3_objects: vec![font],
+            all_referenced_pages,
+            shared_hints: vec![SharedObjectHintEntry {
+                object_ref: font,
+                referencing_pages: vec![0, 1, 2],
+            }],
+            ..Default::default()
+        };
+
+        let renumber = RenumberMap::from_plan(&plan);
+
+        // Font packed in first-half ObjStm; widget packed in OD ObjStm.
+        let member_to_container: BTreeMap<ObjectRef, (u32, u32)> =
+            [(font, (fh_cnum, 0)), (widget, (od_cnum, 0))]
+                .into_iter()
+                .collect();
+
+        // od_cnum is the open-document container.
+        let open_document_container_nums: BTreeSet<u32> = BTreeSet::from([od_cnum]);
+
+        let table = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &member_to_container,
+            &Default::default(), // second_half_container_nums
+            &open_document_container_nums,
+        );
+
+        // canonical_shared_hints emits one entry (fh_cnum for font); od_cnum
+        // is filtered by open_document_container_nums.  No Part-8 section.
+        assert_eq!(
+            table.header.section_entries, 1,
+            "one shared entry: font folded into first-half container"
+        );
+        assert_eq!(
+            table.header.first_page_entries, 1,
+            "OD container must NOT inflate part8_entries: all 1 entries are first-page"
+        );
+        assert_eq!(
+            table.header.first_object_number, 0,
+            "no Part-8 shared objects → first_object_number must be 0 (Note 131)"
         );
     }
 }
