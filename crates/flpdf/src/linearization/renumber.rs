@@ -178,7 +178,8 @@ impl RenumberMap {
             + plan.part4_other_pages_shared.len()
             + plan.part6_outline_objects.len()
             + plan.part9_outline_objects.len()
-            + plan.part4_rest.len();
+            + plan.part4_rest.len()
+            + plan.part4_open_document_plain.len();
         let capacity = total_parts + 3; // slots 0, param dict, hint stream
 
         let mut by_new_number: Vec<ObjectRef> = Vec::with_capacity(capacity);
@@ -256,6 +257,16 @@ impl RenumberMap {
 
         // 6. Catalog (promoted from part4_rest).
         promote(plan.root_ref, &mut by_new_number, &mut by_original);
+
+        // 6b. Ineligible open-document plain objects (generate mode only).
+        // These objects are in the open-document set but cannot be packed into
+        // an ObjStm (e.g. stream objects such as /AP /N appearance streams).
+        // qpdf emits them as plain indirect objects between the Catalog and the
+        // OD ObjStm containers, so they occupy object numbers immediately after
+        // the Catalog and before the hint stream sentinel.
+        for &original in &plan.part4_open_document_plain {
+            push_real(original, &mut by_new_number, &mut by_original);
+        }
 
         // 7. Hint stream (reserved).
         let hint_stream_slot = by_new_number.len() as u32;

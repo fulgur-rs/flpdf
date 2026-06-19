@@ -29,7 +29,7 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
@@ -270,6 +270,28 @@ fn openaction_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// acroform-widget-page0-5-10 (flpdf-sjgv): AcroForm widgets in both
+// /AcroForm /Fields (in_open_document) and page 0 /Annots (in_first_page).
+// qpdf's in_open_document > in_first_page precedence means widgets go to the
+// open-document section (part4, first half, before /O). Without the fix,
+// from_pdf Step 5 places them in part2, inflating page_hints[0].object_count
+// and diverging hint tables. Exercises the from_pdf open_document_set peeling.
+#[test]
+fn acroform_widget_page0_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-page0-5-10.pdf",
+        "objstm-lin-acroform-widget-page0-5-10",
+    );
+}
+
+#[test]
+fn acroform_widget_page0_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-page0-5-10.pdf",
+        "objstm-lin-acroform-widget-page0-5-10",
+    );
+}
+
 // outlines-80-80 (flpdf-rm09, Stage B — in_outlines, part9): the catalog's
 // /Outlines subtree (an outline dict + 80 items reachable ONLY from /Outlines)
 // is qpdf's in_outlines category. With no /PageMode /UseOutlines, qpdf places it
@@ -482,5 +504,78 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
     assert_strict(
         "objstm-lin-outlines-coloc-200-20.pdf",
         "objstm-lin-outlines-coloc-200-20",
+    );
+}
+
+// acroform-widget-ap-stream-page0 (PR #393 Fix 1 + Fix 3): AcroForm widget with
+// an /AP /N Form XObject appearance stream (Object::Stream → ineligible for
+// ObjStm packing). The Form XObject is in open_document_set (via
+// Catalog → /AcroForm → widget → /AP) but cannot be an ObjStm member.
+// qpdf emits it as a plain indirect object between the Catalog and the OD ObjStm
+// containers (pre-/O region). flpdf routes it to `part4_open_document_plain` and
+// emits it similarly. Exercises the eligibility check in from_pdf Step 6b and the
+// pre-/O plain emission loop in writer.rs.
+#[test]
+fn acroform_widget_ap_stream_page0_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        "objstm-lin-acroform-widget-ap-stream-page0",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn acroform_widget_ap_stream_page0_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        "objstm-lin-acroform-widget-ap-stream-page0",
+    );
+}
+
+// acroform-widget-page1-only (PR #393 Fix 4 — r3443001374): AcroForm widget
+// exclusive to page 1 (not on page 0). Widget has page_reach==1 and is in
+// open_document_set. Without the fix, the per_page_private_objects filter
+// includes the widget (inflating page_hints[1].object_count) and the part7
+// pre-pass places it in part4_other_pages_private, bypassing OD routing.
+// With the fix, the widget flows to part4_rest (OD section) and
+// page_hints[1].object_count==2 (page dict + contents only).
+#[test]
+fn acroform_widget_page1_only_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-page1-only.pdf",
+        "objstm-lin-acroform-widget-page1-only",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn acroform_widget_page1_only_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-page1-only.pdf",
+        "objstm-lin-acroform-widget-page1-only",
+    );
+}
+
+// acroform-widget-page1-page2 (PR #393 Fix 5 — r3443001371): AcroForm widget
+// shared by pages 1 AND 2 (page_reach==2, in open_document_set). OD routing
+// sends the widget to part4_rest. Its OD ObjStm container spans pages {1,2}
+// in all_referenced_pages, satisfying part8_container_nums' container_pages
+// criterion. Without the fix, canonical_shared_hints appends the OD container
+// as a spurious Part-8 SOHT entry (nshared_total > oracle). With the fix the
+// open_document_container_nums filter skips it and nshared_total==2.
+#[test]
+fn acroform_widget_page1_page2_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-page1-page2.pdf",
+        "objstm-lin-acroform-widget-page1-page2",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn acroform_widget_page1_page2_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-page1-page2.pdf",
+        "objstm-lin-acroform-widget-page1-page2",
     );
 }

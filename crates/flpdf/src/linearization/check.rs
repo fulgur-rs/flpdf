@@ -757,7 +757,7 @@ mod tests {
     fn build_linearized_bytes() -> Vec<u8> {
         let raw = tiny_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(raw.clone())).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = Pdf::open(Cursor::new(raw)).unwrap();
         let mut doc =

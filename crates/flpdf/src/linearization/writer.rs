@@ -1785,6 +1785,29 @@ fn do_write_pass<R: Read + Seek>(
         catalog_emitted_early = true;
     }
 
+    // Ineligible open-document plain objects (generate mode only).
+    // Stream objects such as /AP /N appearance streams cannot be packed into
+    // an ObjStm.  qpdf emits them as plain indirect objects in the pre-/O
+    // region, between the Catalog and the OD ObjStm containers, giving them
+    // object numbers immediately after the Catalog and before the OD containers.
+    // Oracle: qpdf --linearize --object-streams=generate on a page-0 widget
+    // with /AP /N places the Form XObject before the OD ObjStm at a lower
+    // object number (e.g. obj 7 before obj 8 ObjStm).
+    for original_ref in &plan.part4_open_document_plain {
+        // cov:ignore-start: unreachable invariant — renumber.rs step-6b inserts
+        // every part4_open_document_plain ref, so new_for_original is always Some.
+        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
+            return Err(crate::Error::Unsupported(
+                "part4_open_document_plain ref missing from renumber map".into(),
+            ));
+        };
+        // cov:ignore-end
+        let object = pdf.resolve_borrowed(*original_ref)?;
+        let renumbered = renumber_object(object, 0, renumber)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        xref_offsets.insert(new_ref.number, offset);
+    }
+
     // Open-document ObjStm containers (qpdf part4).  qpdf places the
     // open-document objects (`/OpenAction`, `/AcroForm`, … subtrees) in part4,
     // physically right after the Catalog and BEFORE the primary hint stream —
@@ -2507,18 +2530,25 @@ pub fn write_linearized<R: Read + Seek>(
         .iter()
         .map(|c| c.container_new_num)
         .collect();
+    let open_document_container_nums: std::collections::BTreeSet<u32> = objstm_layout
+        .open_document
+        .iter()
+        .map(|c| c.container_new_num)
+        .collect();
     let po_table_initial = PageOffsetHintTable::from_plan(
         plan,
         renumber,
         &objstm_layout.member_to_container,
         &container_even_split_rank,
         &second_half_container_nums,
+        &open_document_container_nums,
     );
     let so_table_initial = SharedObjectHintTable::from_plan(
         plan,
         renumber,
         &objstm_layout.member_to_container,
         &second_half_container_nums,
+        &open_document_container_nums,
     );
     // Outlines Hint Table inputs (qpdf in_outlines / calculateHOutline). Loop-
     // invariant; `None` when the document has no outlines, in which case no `/O`
@@ -2800,12 +2830,14 @@ pub fn write_linearized<R: Read + Seek>(
             &objstm_layout.member_to_container,
             &container_even_split_rank,
             &second_half_container_nums,
+            &open_document_container_nums,
         );
         let mut so_table = SharedObjectHintTable::from_plan(
             plan,
             renumber,
             &objstm_layout.member_to_container,
             &second_half_container_nums,
+            &open_document_container_nums,
         );
 
         // location_of_first_page = byte offset of the hint stream object itself.
@@ -2880,6 +2912,7 @@ pub fn write_linearized<R: Read + Seek>(
                 &objstm_layout.member_to_container,
                 renumber,
                 &second_half_container_nums,
+                &open_document_container_nums,
             );
             let shared_section_lens: Vec<u64> =
                 folded_shared
@@ -3253,7 +3286,7 @@ mod tests {
 
     fn build_linearized() -> LinearizedDocument {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
@@ -3330,7 +3363,7 @@ mod tests {
     #[test]
     fn hint_stream_offset_after_part1() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let part1_len = Part1Bytes::build(&plan, &renumber, "1.4").byte_length();
 
@@ -3696,7 +3729,7 @@ mod tests {
     fn catalog_reachable_from_first_page_emitted_once() {
         let mut pdf =
             Pdf::open(Cursor::new(catalog_backref_pdf_bytes())).expect("backref PDF must parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         // Precondition: the `/X` back-reference puts the catalog (obj 1) into the
         // single page's PRIVATE first-page set (part2) — the case the part2 loop
         // skip guards against double-emitting.
@@ -3782,7 +3815,7 @@ mod tests {
     fn shared_catalog_in_part3_emitted_once() {
         let mut pdf = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
             .expect("two-page backref PDF must parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         // Precondition: a catalog reachable from BOTH pages is shared, so it
         // lands in part3 (first-page shared) — exercising the part3 loop skip.
         assert!(
@@ -3825,8 +3858,9 @@ mod tests {
         source_bytes: &[u8],
         object_streams: crate::writer::ObjectStreamMode,
     ) -> Vec<u8> {
+        let use_generate = object_streams == crate::writer::ObjectStreamMode::Generate;
         let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriteOptions {
             deterministic_id: true,
@@ -4390,7 +4424,7 @@ mod tests {
     #[test]
     fn first_page_object_new_num_equals_renumber_of_page_ref() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
         let expected_num = renumber
@@ -4455,7 +4489,7 @@ mod tests {
         // The deep object contains no Reference, so the RenumberMap is never
         // consulted — the inline-depth guard must fire before the Null leaf.
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
         let err = renumber_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber);
@@ -4465,7 +4499,7 @@ mod tests {
     #[test]
     fn renumber_object_accepts_nesting_up_to_the_limit() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
         // The catalog (1 0 R) is in the plan, so it has a renumber entry.
@@ -4503,7 +4537,7 @@ mod tests {
     /// non-deterministic `/ID` policy (e.g. `--static-id`).
     fn linearize_with(source_bytes: &[u8], configure: impl FnOnce(&mut WriteOptions)) -> Vec<u8> {
         let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut opts = WriteOptions::default();
         configure(&mut opts);
@@ -4631,7 +4665,7 @@ mod tests {
     #[test]
     fn deterministic_id_linearized_rejects_encrypt() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriteOptions {
             deterministic_id: true,
@@ -4656,7 +4690,7 @@ mod tests {
     #[test]
     fn deterministic_id_linearized_rejects_static_id() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriteOptions {
             deterministic_id: true,
@@ -4677,7 +4711,7 @@ mod tests {
     #[test]
     fn deterministic_id_linearized_rejects_copy_encryption() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriteOptions {
             deterministic_id: true,
@@ -4703,7 +4737,7 @@ mod tests {
     #[test]
     fn deterministic_id_linearized_without_encryption_succeeds() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriteOptions {
             deterministic_id: true,

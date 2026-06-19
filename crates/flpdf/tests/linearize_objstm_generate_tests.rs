@@ -23,7 +23,7 @@ fn linearize_generate(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
@@ -442,4 +442,326 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
         dump.contains("nobjects: 4"),
         "page-0 nobjects must be 4 when outlines route to first-page section:\n{dump}"
     );
+}
+
+/// A fixture whose AcroForm widgets appear in BOTH /AcroForm /Fields (open-document)
+/// AND page 0 /Annots (first-page closure). qpdf's in_open_document > in_first_page
+/// precedence means widgets must NOT be in part2/part3 (first-page section) — they
+/// should be left in Part 4 so route_objstm_containers puts their ObjStm container
+/// in the OpenDocument slot (first half, before /O). Pins the from_pdf Step 5 fix
+/// (flpdf-sjgv): before the fix, widgets land in part2 and inflate
+/// page_hints[0].object_count beyond what qpdf computes.
+///
+/// Fixture layout (W=5, S=10):
+///   obj 1: Catalog (/AcroForm 5, /Pages 2)
+///   obj 2: Pages
+///   obj 3: Page0 (/Annots [6..10], /Resources inline /Font -> 11..20, /Contents 21)
+///   obj 4: Page1 (/Resources inline /Font -> 11..20, /Contents 22)
+///   obj 5: AcroForm (/Fields [6..10])
+///   obj 6-10: Widget annotations (in both /AcroForm /Fields AND page0 /Annots)
+///   obj 11-20: Shared fonts (page0 and page1 both reference them → Part 3)
+///   obj 21: Content stream for page0
+///   obj 22: Content stream for page1
+#[test]
+fn acroform_widget_page0_peeled_from_first_page_section() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-page0-5-10.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    // Widgets: objects 6..=10 (W=5). They are in open_document_set (via /AcroForm
+    // /Fields) AND first_page_closure (via page0 /Annots). qpdf's in_open_document
+    // precedence means they must be ABSENT from part2 and part3.
+    let widget_refs: Vec<ObjectRef> = (6u32..=10)
+        .map(|n| ObjectRef {
+            number: n,
+            generation: 0,
+        })
+        .collect();
+
+    let part2_set: BTreeSet<_> = plan.part2_objects.iter().copied().collect();
+    let part3_set: BTreeSet<_> = plan.part3_objects.iter().copied().collect();
+
+    for r in &widget_refs {
+        assert!(
+            !part2_set.contains(r),
+            "widget {r} must not be in part2 (in_open_document > in_first_page)"
+        );
+        assert!(
+            !part3_set.contains(r),
+            "widget {r} must not be in part3 (in_open_document > in_first_page)"
+        );
+    }
+
+    // Widgets must end up in Part 4 (awaiting OpenDocument container routing).
+    let part4: BTreeSet<_> = plan.part4_objects().into_iter().collect();
+    for r in &widget_refs {
+        assert!(
+            part4.contains(r),
+            "widget {r} must be in part4 (left for route_objstm_containers OpenDocument routing)"
+        );
+    }
+
+    // page_hints[0].object_count must reflect only the true first-page section:
+    //   part2 = {page0(3), c0(21)} = 2 objects
+    //   part3 = {shared fonts 11..=20} = 10 objects
+    //   total = 12
+    // Without the fix widgets(5) are in part2, giving 7+10 = 17.
+    assert_eq!(
+        plan.page_hints[0].object_count, 12,
+        "page 0 object_count must be 12 (page + content + 10 shared fonts, widgets peeled)"
+    );
+}
+
+/// Ineligible OD objects (streams) are routed to `part4_open_document_plain` and
+/// written as plain indirect objects in the pre-/O region, NOT packed into an ObjStm.
+///
+/// Fixture layout (obj 8 = `/AP /N` Form XObject appearance stream):
+///   obj 1: Catalog  (eligible OD — dict)
+///   obj 5: AcroForm (eligible OD — dict)
+///   obj 6: Widget   (eligible OD — dict)
+///   obj 7: AP dict  (eligible OD — dict)
+///   obj 8: Form XObject (ineligible OD — stream)
+///
+/// After `from_pdf`, obj 8 must be in `part4_open_document_plain` and the eligible
+/// dicts in `part4_rest` (to be packed into an OD ObjStm).  Writing must succeed
+/// and the plain Form XObject must appear in the output bytes before the ObjStm.
+#[test]
+fn ineligible_od_stream_routes_to_part4_open_document_plain() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-ap-stream-page0.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    // Only obj 8 (the Form XObject stream) must be in part4_open_document_plain.
+    let ap_stream = ObjectRef {
+        number: 8,
+        generation: 0,
+    };
+    assert_eq!(
+        plan.part4_open_document_plain,
+        vec![ap_stream],
+        "only the ineligible AP stream (obj 8) must be in part4_open_document_plain"
+    );
+
+    // The eligible OD dicts (5=AcroForm, 6=Widget, 7=AP dict) must NOT be in
+    // part4_open_document_plain; they should appear in part4_objects() (via part4_rest).
+    let plain_set: BTreeSet<_> = plan.part4_open_document_plain.iter().copied().collect();
+    for n in [5u32, 6, 7] {
+        let r = ObjectRef {
+            number: n,
+            generation: 0,
+        };
+        assert!(
+            !plain_set.contains(&r),
+            "eligible OD dict obj {n} must NOT be in part4_open_document_plain"
+        );
+    }
+
+    // Exercise the writer path: write_linearized must succeed and the output
+    // must contain the plain Form XObject before the OD ObjStm container.
+    let renumber = RenumberMap::from_plan(&plan);
+    let f2 = std::fs::File::open(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join("objstm-lin-acroform-widget-ap-stream-page0.pdf"),
+    )
+    .unwrap();
+    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
+    let mut opts = WriteOptions::default();
+    opts.object_streams = ObjectStreamMode::Generate;
+    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
+    doc.back_patch().unwrap();
+
+    // The new number assigned to the Form XObject is immediately after the Catalog
+    // in the renumber map.  Verify it appears as a plain "N 0 obj" before any ObjStm.
+    let new_ref = renumber
+        .new_for_original(ap_stream)
+        .expect("AP stream must have a new number");
+    let plain_marker = format!("{} 0 obj", new_ref.number).into_bytes();
+    let bytes = &doc.bytes;
+    let plain_pos = bytes
+        .windows(plain_marker.len())
+        .position(|w| w == plain_marker.as_slice())
+        .unwrap_or_else(|| {
+            panic!(
+                "plain marker '{} 0 obj' not found in output",
+                new_ref.number
+            )
+        });
+
+    // ObjStm appears in the output; find it after the Catalog section.
+    let objstm_marker = b" /Type /ObjStm";
+    let objstm_pos = bytes
+        .windows(objstm_marker.len())
+        .position(|w| w == objstm_marker)
+        .expect("/Type /ObjStm must appear in output");
+
+    assert!(
+        plain_pos < objstm_pos,
+        "plain Form XObject (byte {plain_pos}) must precede the OD ObjStm (byte {objstm_pos})"
+    );
+}
+
+/// Regression test: in non-generate mode the OD peeling must NOT apply.
+///
+/// Oracle: `qpdf --linearize --object-streams=disable` on the AcroForm fixture
+/// shows Page 0 with nobjects=12 and nshared=0, meaning all first-page-closure
+/// objects (including the 5 widgets) stay in the first-page section.  When
+/// `use_generate_objstm=false`, Part 2 must contain the widgets and
+/// `page_hints[0].object_count` must equal 17 (7 Part-2 + 10 Part-3 fonts).
+#[test]
+fn acroform_widget_stays_in_first_page_section_in_disable_mode() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-page0-5-10.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = flpdf::Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+
+    let widget_refs: Vec<ObjectRef> = (6u32..=10)
+        .map(|n| ObjectRef {
+            number: n,
+            generation: 0,
+        })
+        .collect();
+
+    let part2_set: BTreeSet<_> = plan.part2_objects.iter().copied().collect();
+    let part4_set: BTreeSet<_> = plan.part4_objects().into_iter().collect();
+
+    for r in &widget_refs {
+        assert!(
+            part2_set.contains(r),
+            "widget {r} must be in part2 in disable mode (no OD peeling)"
+        );
+        assert!(
+            !part4_set.contains(r),
+            "widget {r} must NOT be in part4 in disable mode (disjoint partition)"
+        );
+    }
+
+    // page0 dict(3) + content0(21) + widgets(6-10, =5) = 7 Part-2 objects,
+    // plus shared fonts 11-20 (=10) in Part-3 → total 17.
+    assert_eq!(
+        plan.page_hints[0].object_count, 17,
+        "page 0 object_count must be 17 in disable mode (widgets not peeled)"
+    );
+}
+
+/// OD routing for a widget exclusive to page 1 (r3443001374).
+///
+/// Fixture: 2-page PDF, AcroForm widget (obj 6) in page 1 /Annots ONLY — not
+/// on page 0.  Widget has page_reach==1 (page 1) and is in open_document_set.
+///
+/// Oracle: qpdf places the widget in the pre-/O OD section, NOT in the
+/// second-half page-1 group.  Page 1 has nobjects==2 (page dict + contents).
+///
+/// Bug path without the fix:
+///   per_page_private_objects[1] includes widget (reach=1, not filtered by OD)
+///   → page_hints[1].object_count over-counts (would be 3 instead of 2)
+///   → part7 pre-pass puts widget in part4_other_pages_private
+///   → OD routing in the part8/part9 loop is bypassed for widget.
+///
+/// With the fix (open_document_set exclusion in per_page_private_objects filter):
+///   widget is absent from per_page_private_objects[1]
+///   → page_hints[1].object_count == 2 ✓
+///   → part7 pre-pass never sees widget
+///   → widget reaches OD routing → lands in part4_rest ✓
+#[test]
+fn acroform_widget_page1_only_routes_to_od_not_part7() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-page1-only.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = flpdf::Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    let widget = ObjectRef {
+        number: 6,
+        generation: 0,
+    };
+
+    // Widget must NOT be in part7 (other-pages-private).
+    let private_set: BTreeSet<_> = plan.part4_other_pages_private.iter().copied().collect();
+    assert!(
+        !private_set.contains(&widget),
+        "widget (obj 6) must NOT be in part4_other_pages_private after the OD filter fix"
+    );
+
+    // Widget must be in part4_objects() (via OD routing → part4_rest).
+    let part4_set: BTreeSet<_> = plan.part4_objects().into_iter().collect();
+    assert!(
+        part4_set.contains(&widget),
+        "widget (obj 6) must appear in part4_objects() after OD routing to part4_rest"
+    );
+
+    // page_hints[1].object_count must be 2, not 3.
+    // Oracle: qpdf --show-linearization on the qpdf-processed fixture reports
+    // Page 1: nobjects=2 (page dict + contents stream; widget is in pre-/O OD section).
+    assert_eq!(
+        plan.page_hints[1].object_count, 2,
+        "page 1 object_count must be 2 (page dict + contents); widget in OD section not counted"
+    );
+}
+
+/// OD ObjStm container NOT added as Part-8 SOHT entry when its members span
+/// multiple later pages (r3443001371).
+///
+/// Fixture: 3-page PDF, AcroForm widget (obj 6) in BOTH page 1 AND page 2
+/// /Annots.  Widget has page_reach==2 and is in open_document_set.  OD routing
+/// sends it to part4_rest.  Its container's all_referenced_pages spans {1, 2},
+/// which satisfies part8_container_nums' `container_pages.len()>=2` criterion.
+///
+/// Bug path without the fix:
+///   canonical_shared_hints line 1242 appends the OD container as a Part-8 SOHT
+///   entry → nshared_total > nshared_first_page (diverges from oracle).
+///
+/// With the fix (open_document_container_nums filter in the Part-8 append loop):
+///   OD container is skipped → nshared_total == nshared_first_page == 2 ✓
+#[test]
+fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
+    let bytes = linearize_generate("objstm-lin-acroform-widget-page1-page2.pdf");
+
+    // Decode the linearization dump and verify nshared_total matches oracle.
+    let dump = flpdf::linearization::show_linearization_bytes(&bytes, "widget-page1-page2")
+        .expect("show-linearization decode");
+
+    // Oracle: nshared_first_page=2, nshared_total=2 (no Part-8 OD container entry).
+    assert!(
+        dump.contains("nshared_first_page: 2"),
+        "SOHT must have 2 first-page entries:\n{dump}"
+    );
+    assert!(
+        dump.contains("nshared_total: 2"),
+        "SOHT nshared_total must be 2 (no spurious Part-8 OD container entry):\n{dump}"
+    );
+
+    // Round-trip sanity.
+    let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
 }

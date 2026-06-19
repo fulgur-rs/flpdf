@@ -813,10 +813,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -833,10 +835,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -857,10 +861,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -894,10 +900,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -922,10 +930,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -942,10 +952,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -963,10 +975,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -985,10 +999,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so_s = SharedObjectHintTable::from_plan(
             &single_plan,
             &renumber_s,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1002,10 +1018,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so_t = SharedObjectHintTable::from_plan(
             &two_plan,
             &renumber_t,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1031,10 +1049,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1071,10 +1091,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1108,10 +1130,12 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         let so = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );

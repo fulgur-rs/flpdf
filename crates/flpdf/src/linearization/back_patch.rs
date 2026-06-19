@@ -375,7 +375,7 @@ mod tests {
     /// Build a fully linearized document (without back-patching).
     fn build_linearized() -> LinearizedDocument {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())

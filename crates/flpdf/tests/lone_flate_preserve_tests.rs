@@ -75,7 +75,7 @@ fn linearized_preserves_lone_flate_verbatim() {
         std::fs::File::open(fixture_path()).unwrap(),
     ))
     .unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
     let mut pdf2 = Pdf::open(std::io::BufReader::new(
         std::fs::File::open(fixture_path()).unwrap(),
