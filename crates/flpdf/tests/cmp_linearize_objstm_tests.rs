@@ -531,3 +531,51 @@ fn acroform_widget_ap_stream_page0_objstm_byte_identical_to_qpdf() {
         "objstm-lin-acroform-widget-ap-stream-page0",
     );
 }
+
+// acroform-widget-page1-only (PR #393 Fix 4 — r3443001374): AcroForm widget
+// exclusive to page 1 (not on page 0). Widget has page_reach==1 and is in
+// open_document_set. Without the fix, the per_page_private_objects filter
+// includes the widget (inflating page_hints[1].object_count) and the part7
+// pre-pass places it in part4_other_pages_private, bypassing OD routing.
+// With the fix, the widget flows to part4_rest (OD section) and
+// page_hints[1].object_count==2 (page dict + contents only).
+#[test]
+fn acroform_widget_page1_only_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-page1-only.pdf",
+        "objstm-lin-acroform-widget-page1-only",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn acroform_widget_page1_only_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-page1-only.pdf",
+        "objstm-lin-acroform-widget-page1-only",
+    );
+}
+
+// acroform-widget-page1-page2 (PR #393 Fix 5 — r3443001371): AcroForm widget
+// shared by pages 1 AND 2 (page_reach==2, in open_document_set). OD routing
+// sends the widget to part4_rest. Its OD ObjStm container spans pages {1,2}
+// in all_referenced_pages, satisfying part8_container_nums' container_pages
+// criterion. Without the fix, canonical_shared_hints appends the OD container
+// as a spurious Part-8 SOHT entry (nshared_total > oracle). With the fix the
+// open_document_container_nums filter skips it and nshared_total==2.
+#[test]
+fn acroform_widget_page1_page2_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-page1-page2.pdf",
+        "objstm-lin-acroform-widget-page1-page2",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn acroform_widget_page1_page2_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-page1-page2.pdf",
+        "objstm-lin-acroform-widget-page1-page2",
+    );
+}

@@ -747,6 +747,18 @@ impl LinearizationPlan {
                 .filter(|r| {
                     !part2_set.contains(r)
                         && !part3_set.contains(r)
+                        // In generate mode, open-document objects (AcroForm
+                        // widgets, etc.) that happen to be exclusive to one
+                        // later page must NOT be counted as page-private: qpdf
+                        // routes them to the pre-/O open-document section
+                        // (not the per-page section), so they are absent from
+                        // the second-half page objects and should not inflate
+                        // page_hints[page_idx].object_count.  Excluding them
+                        // here also keeps them out of per_page_private_objects,
+                        // so the part7 pre-pass below never captures them and
+                        // they remain available for OD routing in the
+                        // part8/part9 loop.
+                        && !(use_generate_objstm && open_document_set.contains(r))
                         && page_reach.get(r).copied() == Some(1)
                 })
                 .collect();
@@ -1240,7 +1252,12 @@ impl LinearizationPlan {
         // Part-8 section by physical object number, matching qpdf's ObjGen-keyed
         // `lc_other_page_shared`.
         for cnum in self.part8_container_nums(member_to_container) {
-            if !container_pos.contains_key(&cnum) {
+            // Open-document containers live in the pre-/O region (before the
+            // first-page section), so qpdf excludes them from the SOHT even
+            // when their members span multiple later pages (which would
+            // otherwise qualify them as Part-8 shared containers via the
+            // `container_pages.len() >= 2` criterion in `part8_container_nums`).
+            if !container_pos.contains_key(&cnum) && !open_document_container_nums.contains(&cnum) {
                 out.push(SharedObjectHintEntry {
                     object_ref: ObjectRef::new(cnum, u16::MAX),
                     referencing_pages: Vec::new(), // recomputed below
