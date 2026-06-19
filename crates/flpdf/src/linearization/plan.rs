@@ -2110,11 +2110,14 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 ///
 /// # Deviation
 ///
-/// When multiple open-document containers exist qpdf orders them by ascending
-/// object number (`std::set<QPDFObjGen>`); this routing keeps even-split order,
-/// which is identical for the single-container case. Thumbnail categories are
-/// not yet modeled. See
-/// `docs/plans/2026-06-17-objstm-generate-linearized-phase2.md`.
+/// **Multiple open-document containers (verified, flpdf-699x):** qpdf assigns
+/// container `ObjGen`s sequentially in even-split order, so its
+/// `std::set<QPDFObjGen>` (used for `lc_open_document`) iterates them in the
+/// same DFS / even-split order that this function preserves.  The ordering is
+/// therefore byte-identical to qpdf for ≥2 open-document containers; verified
+/// with `objstm-lin-openaction-multi-od` (two OD containers whose min-member
+/// numbers are non-ascending in DFS order).  Thumbnail categories are not yet
+/// modeled.
 ///
 /// # Errors
 ///

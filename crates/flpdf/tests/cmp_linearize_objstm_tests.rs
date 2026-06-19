@@ -270,6 +270,29 @@ fn openaction_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// openaction-multi-od (flpdf-699x): TWO open-document ObjStm containers.
+// The fixture arranges high-numbered OD objects (100..149) to be visited FIRST
+// in DFS (/HighRef < /LowRef lexically), so even-split C0 has min-member 5
+// (action) while C1 has min-member 2 (pages).  Discriminates between "DFS
+// order" (correct) and "sort by ascending min-member" hypotheses: qpdf emits
+// C0 before C1 (even-split/ObjGen order), so the physical byte order in the
+// golden matches DFS order, not ascending-min order.
+#[test]
+fn openaction_multi_od_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-openaction-multi-od.pdf",
+        "objstm-lin-openaction-multi-od",
+    );
+}
+
+#[test]
+fn openaction_multi_od_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-openaction-multi-od.pdf",
+        "objstm-lin-openaction-multi-od",
+    );
+}
+
 // acroform-widget-page0-5-10 (flpdf-sjgv): AcroForm widgets in both
 // /AcroForm /Fields (in_open_document) and page 0 /Annots (in_first_page).
 // qpdf's in_open_document > in_first_page precedence means widgets go to the
