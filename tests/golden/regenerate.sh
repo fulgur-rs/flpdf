@@ -227,6 +227,8 @@ declare -A G6HB2_FIX=(
     [objstm-lin-outlines-80-80]="gen_outlines_gap.py 80 80"
     [objstm-lin-outlines-80-200]="gen_outlines_gap.py 80 200"
     [objstm-lin-useoutlines-80-80]="gen_outlines_gap.py 80 80 --use-outlines"
+    [objstm-lin-outlines-shared-page-80-80]="gen_outlines_shared_page.py 80 80"
+    [objstm-lin-outlines-coloc-200-20]="gen_outlines_gap.py 200 20"
 )
 for stem in "${!G6HB2_FIX[@]}"; do
     if [[ ! -f "$FIX/$stem.pdf" ]]; then
@@ -384,7 +386,8 @@ echo "shared-stream-objstm/linearize-objstm.pdf"
 for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
             objstm-lin-threepage-2-120 objstm-lin-disc-2-250-2 \
             objstm-lin-openaction-80-80 objstm-lin-outlines-80-80 \
-            objstm-lin-outlines-80-200 objstm-lin-useoutlines-80-80; do
+            objstm-lin-outlines-80-200 objstm-lin-useoutlines-80-80 \
+            objstm-lin-outlines-shared-page-80-80 objstm-lin-outlines-coloc-200-20; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"

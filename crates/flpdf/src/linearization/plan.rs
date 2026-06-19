@@ -1041,6 +1041,7 @@ impl LinearizationPlan {
         &self,
         member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
         renumber: &RenumberMap,
+        second_half_container_nums: &BTreeSet<u32>,
     ) -> Vec<SharedObjectHintEntry> {
         if member_to_container.is_empty() {
             return self.shared_hints.clone();
@@ -1071,6 +1072,13 @@ impl LinearizationPlan {
             }
             match member_to_container.get(&entry.object_ref) {
                 Some(&(container_num, _idx)) => {
+                    // Within the first-page section: skip second-half (outline-routed) ObjStm
+                    // containers. qpdf does not list them in the Shared Object Hint Table.
+                    if input_idx < first_page_input
+                        && second_half_container_nums.contains(&container_num)
+                    {
+                        continue;
+                    }
                     if let Some(&pos) = container_pos.get(&container_num) {
                         // Fold into the already-emitted container entry: union
                         // the referencing pages (dedup, keep ascending order).
@@ -4022,7 +4030,7 @@ mod tests {
         // and the container is numbered 12, so the post-sort order is
         // [page, content, container].
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&m2c, &renumber);
+        let folded = plan.canonical_shared_hints(&m2c, &renumber, &Default::default());
         // page, content, and ONE container entry = 3 entries (members folded).
         assert_eq!(
             folded.len(),
@@ -4058,7 +4066,7 @@ mod tests {
         };
         // The empty-map branch returns before using `renumber`, so any map works.
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&BTreeMap::new(), &renumber);
+        let folded = plan.canonical_shared_hints(&BTreeMap::new(), &renumber, &Default::default());
         assert_eq!(folded, plan.shared_hints);
     }
 
@@ -4115,7 +4123,7 @@ mod tests {
         m2c.insert(font_dict, (11, 0));
 
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&m2c, &renumber);
+        let folded = plan.canonical_shared_hints(&m2c, &renumber, &Default::default());
 
         // 3 plain first-page entries (page, content, image) + 1 folded
         // container + 1 Part-8 entry = 5 (only font_dict folded away).
@@ -4128,6 +4136,65 @@ mod tests {
         assert_eq!(folded[3].object_ref, ObjectRef::new(11, u16::MAX));
         // Part-8 entry stays last (not pulled into the first-page sort).
         assert_eq!(folded[4].object_ref, other_shared);
+    }
+
+    /// A second-half (outline-routed, Part-4) ObjStm container that appears in
+    /// the first-page section of `shared_hints` must be skipped entirely when
+    /// `second_half_container_nums` contains its number.  qpdf does not emit
+    /// these containers in the Shared Object Hint Table's first-page section.
+    #[test]
+    fn canonical_shared_hints_skips_second_half_container_in_first_page_section() {
+        let page = ObjectRef::new(3, 0);
+        let content = ObjectRef::new(9, 0);
+        let font_dict = ObjectRef::new(1, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page, content],
+            part3_objects: vec![font_dict],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: content,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: font_dict,
+                    referencing_pages: vec![1],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // font_dict lives in container 20, which is a second-half (Part-4) container.
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(font_dict, (20, 0));
+
+        // Mark container 20 as second-half so it should be skipped.
+        let mut second_half: BTreeSet<u32> = BTreeSet::new();
+        second_half.insert(20);
+
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded = plan.canonical_shared_hints(&m2c, &renumber, &second_half);
+
+        // The second-half container entry must be absent from the result.
+        // Only the two plain first-page entries (page, content) survive;
+        // font_dict's container is skipped entirely (not folded, not emitted).
+        assert_eq!(
+            folded.len(),
+            2,
+            "second-half container must be excluded from first-page section"
+        );
+        assert_eq!(folded[0].object_ref, page);
+        assert_eq!(folded[1].object_ref, content);
+        // Confirm the second-half container sentinel is absent.
+        assert!(
+            folded
+                .iter()
+                .all(|e| e.object_ref != ObjectRef::new(20, u16::MAX)),
+            "container 20 sentinel must not appear"
+        );
     }
 
     // -- Linearized generate-mode membership + container part routing --------

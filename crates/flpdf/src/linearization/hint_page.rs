@@ -255,6 +255,7 @@ pub struct PageOffsetHintTable {
 fn page0_object_count_with_objstm(
     plan: &LinearizationPlan,
     member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+    second_half_container_nums: &std::collections::BTreeSet<u32>,
 ) -> u32 {
     // Page 0's section is Part 2 (always plain) followed by Part 3 (plain or
     // folded into a first-half container), plus any outline objects routed to
@@ -267,7 +268,7 @@ fn page0_object_count_with_objstm(
             .chain(&plan.part3_objects)
             .chain(&plan.outline_first_page_members),
         member_to_container,
-        &std::collections::BTreeSet::new(),
+        second_half_container_nums,
     )
 }
 
@@ -385,6 +386,7 @@ impl PageOffsetHintTable {
         renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
         container_even_split_rank: &std::collections::BTreeMap<u32, u32>,
+        second_half_container_nums: &std::collections::BTreeSet<u32>,
     ) -> Self {
         assert!(
             !plan.page_hints.is_empty(),
@@ -404,7 +406,8 @@ impl PageOffsetHintTable {
         // that references a compressed first-page shared object points at the
         // container's index, and page 0's object_count counts the container —
         // not its members.  With no ObjStm packing this is `plan.shared_hints`.
-        let shared_hints = plan.canonical_shared_hints(member_to_container, renumber);
+        let shared_hints =
+            plan.canonical_shared_hints(member_to_container, renumber, second_half_container_nums);
 
         // ------------------------------------------------------------------
         // Step 1: collect object counts per page from the plan.
@@ -417,7 +420,11 @@ impl PageOffsetHintTable {
         // ------------------------------------------------------------------
         let mut object_counts: Vec<u32> = plan.page_hints.iter().map(|h| h.object_count).collect();
         if !member_to_container.is_empty() {
-            object_counts[0] = page0_object_count_with_objstm(plan, member_to_container);
+            object_counts[0] = page0_object_count_with_objstm(
+                plan,
+                member_to_container,
+                second_half_container_nums,
+            );
             // Pages 1..N: fold each page's private objects into their containers
             // too. A page whose private resources are compressed into a part7
             // ObjStm holds the container (one object) in its section, not the
@@ -743,6 +750,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -759,6 +767,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -778,6 +787,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(table.header.least_object_count, 3);
@@ -792,6 +802,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(table.entries[0].object_count_minus_least, 0);
@@ -804,6 +815,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -826,6 +838,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -841,6 +854,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -863,6 +877,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(table.entries.len(), 2, "two-page plan must have 2 entries");
@@ -875,6 +890,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -892,6 +908,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         // delta = 5 - 4 = 1 → bits_needed(1) = 1
@@ -905,6 +922,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -922,6 +940,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -943,6 +962,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         // greatest shared count = 2 → bits_needed(2) = 2
@@ -956,6 +976,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -974,6 +995,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1005,6 +1027,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         for entry in &table.entries {
@@ -1021,6 +1044,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1043,6 +1067,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(table.header.denominator, 4);
@@ -1055,6 +1080,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1093,6 +1119,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
         assert_eq!(table.header.bits_shared_object_id, 0);
     }
@@ -1109,6 +1136,7 @@ mod tests {
         let table = PageOffsetHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1143,7 +1171,10 @@ mod tests {
         m2c.insert(packed_b, (12, 1));
 
         // |part2| (2) + |part3 plain| (1: plain_part3) + |containers| (1) = 4.
-        assert_eq!(page0_object_count_with_objstm(&plan, &m2c), 4);
+        assert_eq!(
+            page0_object_count_with_objstm(&plan, &m2c, &Default::default()),
+            4
+        );
     }
 
     /// When outline objects are routed to the first-page section (UseOutlines),
@@ -1164,7 +1195,7 @@ mod tests {
 
         // |part2| (1 plain) + |outline container| (1) = 2.
         assert_eq!(
-            page0_object_count_with_objstm(&plan, &m2c),
+            page0_object_count_with_objstm(&plan, &m2c, &Default::default()),
             2,
             "outline container must be counted when outline_first_page_members is non-empty"
         );
