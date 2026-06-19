@@ -543,7 +543,15 @@ impl LinearizationPlan {
         // even if they are also in the first-page closure. Computing this set
         // here ensures Step 5 can exclude them from part2/part3 without
         // requiring the hint builders or container router to compensate.
-        let open_document_set = open_document_set(pdf)?;
+        //
+        // In non-generate mode the peeling never runs, so we skip the catalog
+        // traversal entirely to avoid failing on broken catalog references that
+        // non-generate linearization would otherwise tolerate.
+        let open_document_set = if use_generate_objstm {
+            open_document_set(pdf)?
+        } else {
+            BTreeSet::new()
+        };
 
         // ----------------------------------------------------------------
         // Step 2: collect page references.
