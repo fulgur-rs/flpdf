@@ -443,3 +443,78 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
         "page-0 nobjects must be 4 when outlines route to first-page section:\n{dump}"
     );
 }
+
+/// A fixture whose AcroForm widgets appear in BOTH /AcroForm /Fields (open-document)
+/// AND page 0 /Annots (first-page closure). qpdf's in_open_document > in_first_page
+/// precedence means widgets must NOT be in part2/part3 (first-page section) — they
+/// should be left in Part 4 so route_objstm_containers puts their ObjStm container
+/// in the OpenDocument slot (first half, before /O). Pins the from_pdf Step 5 fix
+/// (flpdf-sjgv): before the fix, widgets land in part2 and inflate
+/// page_hints[0].object_count beyond what qpdf computes.
+///
+/// Fixture layout (W=5, S=10):
+///   obj 1: Catalog (/AcroForm 5, /Pages 2)
+///   obj 2: Pages
+///   obj 3: Page0 (/Annots [6..10], /Resources inline /Font -> 11..20, /Contents 21)
+///   obj 4: Page1 (/Resources inline /Font -> 11..20, /Contents 22)
+///   obj 5: AcroForm (/Fields [6..10])
+///   obj 6-10: Widget annotations (in both /AcroForm /Fields AND page0 /Annots)
+///   obj 11-20: Shared fonts (page0 and page1 both reference them → Part 3)
+///   obj 21: Content stream for page0
+///   obj 22: Content stream for page1
+#[test]
+fn acroform_widget_page0_peeled_from_first_page_section() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-page0-5-10.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+
+    // Widgets: objects 6..=10 (W=5). They are in open_document_set (via /AcroForm
+    // /Fields) AND first_page_closure (via page0 /Annots). qpdf's in_open_document
+    // precedence means they must be ABSENT from part2 and part3.
+    let widget_refs: Vec<ObjectRef> = (6u32..=10)
+        .map(|n| ObjectRef {
+            number: n,
+            generation: 0,
+        })
+        .collect();
+
+    let part2_set: BTreeSet<_> = plan.part2_objects.iter().copied().collect();
+    let part3_set: BTreeSet<_> = plan.part3_objects.iter().copied().collect();
+
+    for r in &widget_refs {
+        assert!(
+            !part2_set.contains(r),
+            "widget {r} must not be in part2 (in_open_document > in_first_page)"
+        );
+        assert!(
+            !part3_set.contains(r),
+            "widget {r} must not be in part3 (in_open_document > in_first_page)"
+        );
+    }
+
+    // Widgets must end up in Part 4 (awaiting OpenDocument container routing).
+    let part4: BTreeSet<_> = plan.part4_objects().into_iter().collect();
+    for r in &widget_refs {
+        assert!(
+            part4.contains(r),
+            "widget {r} must be in part4 (left for route_objstm_containers OpenDocument routing)"
+        );
+    }
+
+    // page_hints[0].object_count must reflect only the true first-page section:
+    //   part2 = {page0(3), c0(21)} = 2 objects
+    //   part3 = {shared fonts 11..=20} = 10 objects
+    //   total = 12
+    // Without the fix widgets(5) are in part2, giving 7+10 = 17.
+    assert_eq!(
+        plan.page_hints[0].object_count, 12,
+        "page 0 object_count must be 12 (page + content + 10 shared fonts, widgets peeled)"
+    );
+}

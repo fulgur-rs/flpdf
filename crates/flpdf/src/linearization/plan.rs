@@ -531,6 +531,18 @@ impl LinearizationPlan {
             });
 
         // ----------------------------------------------------------------
+        // Step 1b: compute open-document set for qpdf precedence.
+        // ----------------------------------------------------------------
+        // qpdf's in_open_document category takes precedence over in_first_page:
+        // objects reachable from catalog open-document keys (/OpenAction,
+        // /AcroForm, /ViewerPreferences, /PageMode, /Threads, /Encrypt) are
+        // placed in the open-document section (part4, first half, before /O),
+        // even if they are also in the first-page closure. Computing this set
+        // here ensures Step 5 can exclude them from part2/part3 without
+        // requiring the hint builders or container router to compensate.
+        let open_document_set = open_document_set(pdf)?;
+
+        // ----------------------------------------------------------------
         // Step 2: collect page references.
         // Propagate page-tree errors so a malformed /Pages does not silently
         // produce an empty page_hints (which would corrupt downstream hint tables).
@@ -608,6 +620,15 @@ impl LinearizationPlan {
         let mut part3_objects: Vec<ObjectRef> = Vec::new();
 
         for obj_ref in &first_page_closure {
+            // qpdf: in_open_document > in_first_page. Objects reachable from
+            // catalog open-document keys (/AcroForm, /OpenAction, etc.) are
+            // placed in the open-document section (part4, first half) even if
+            // they also appear in the first-page closure. Leave them in Part 4
+            // so route_objstm_containers can assign their ObjStm container to
+            // ContainerPart::OpenDocument.
+            if open_document_set.contains(obj_ref) {
+                continue;
+            }
             if Some(*obj_ref) == first_page_ref {
                 part2_objects.push(*obj_ref);
             } else if shared_page_indices.contains_key(obj_ref) {
@@ -750,7 +771,11 @@ impl LinearizationPlan {
                 continue;
             }
             let reach = page_reach.get(&r).copied().unwrap_or(0);
-            let in_first_page = first_page_set.contains(&r);
+            // Objects in first_page_set that are also in open_document_set were
+            // deliberately excluded from Part 2/3 (in_open_document > in_first_page)
+            // and now reside in Part 4. Do not skip them here — they flow through
+            // the part7/8/9 buckets just like pure open-document objects.
+            let in_first_page = first_page_set.contains(&r) && !open_document_set.contains(&r);
             if in_first_page {
                 // Should have been in Part 2 or Part 3 — skip (defensive).
                 continue;
@@ -1042,6 +1067,7 @@ impl LinearizationPlan {
         member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
         renumber: &RenumberMap,
         second_half_container_nums: &BTreeSet<u32>,
+        open_document_container_nums: &BTreeSet<u32>,
     ) -> Vec<SharedObjectHintEntry> {
         if member_to_container.is_empty() {
             return self.shared_hints.clone();
@@ -1073,9 +1099,11 @@ impl LinearizationPlan {
             match member_to_container.get(&entry.object_ref) {
                 Some(&(container_num, _idx)) => {
                     // Within the first-page section: skip second-half (outline-routed) ObjStm
-                    // containers. qpdf does not list them in the Shared Object Hint Table.
+                    // containers and open-document containers (placed before /O, not in [/O,/E)).
+                    // qpdf does not list either in the Shared Object Hint Table.
                     if input_idx < first_page_input
-                        && second_half_container_nums.contains(&container_num)
+                        && (second_half_container_nums.contains(&container_num)
+                            || open_document_container_nums.contains(&container_num))
                     {
                         continue;
                     }
@@ -4030,7 +4058,8 @@ mod tests {
         // and the container is numbered 12, so the post-sort order is
         // [page, content, container].
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&m2c, &renumber, &Default::default());
+        let folded =
+            plan.canonical_shared_hints(&m2c, &renumber, &Default::default(), &Default::default());
         // page, content, and ONE container entry = 3 entries (members folded).
         assert_eq!(
             folded.len(),
@@ -4066,7 +4095,12 @@ mod tests {
         };
         // The empty-map branch returns before using `renumber`, so any map works.
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&BTreeMap::new(), &renumber, &Default::default());
+        let folded = plan.canonical_shared_hints(
+            &BTreeMap::new(),
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(folded, plan.shared_hints);
     }
 
@@ -4123,7 +4157,8 @@ mod tests {
         m2c.insert(font_dict, (11, 0));
 
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&m2c, &renumber, &Default::default());
+        let folded =
+            plan.canonical_shared_hints(&m2c, &renumber, &Default::default(), &Default::default());
 
         // 3 plain first-page entries (page, content, image) + 1 folded
         // container + 1 Part-8 entry = 5 (only font_dict folded away).
@@ -4176,7 +4211,8 @@ mod tests {
         second_half.insert(20);
 
         let renumber = RenumberMap::from_plan(&plan);
-        let folded = plan.canonical_shared_hints(&m2c, &renumber, &second_half);
+        let folded =
+            plan.canonical_shared_hints(&m2c, &renumber, &second_half, &Default::default());
 
         // The second-half container entry must be absent from the result.
         // Only the two plain first-page entries (page, content) survive;
@@ -4194,6 +4230,66 @@ mod tests {
                 .iter()
                 .all(|e| e.object_ref != ObjectRef::new(20, u16::MAX)),
             "container 20 sentinel must not appear"
+        );
+    }
+
+    /// An open-document (before /O) ObjStm container that appears in the
+    /// first-page section of `shared_hints` must be skipped entirely when
+    /// `open_document_container_nums` contains its number.  Objects placed before
+    /// /O are not part of the first-page [/O,/E) section and must not appear in
+    /// the Shared Object Hint Table's first-page entries.
+    #[test]
+    fn canonical_shared_hints_skips_open_document_container_in_first_page_section() {
+        let page = ObjectRef::new(3, 0);
+        let content = ObjectRef::new(9, 0);
+        let font_dict = ObjectRef::new(1, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page, content],
+            part3_objects: vec![font_dict],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: content,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: font_dict,
+                    referencing_pages: vec![1],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // font_dict lives in container 30, which is an open-document (before /O) container.
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(font_dict, (30, 0));
+
+        // Mark container 30 as open-document so it should be skipped.
+        let mut open_doc: BTreeSet<u32> = BTreeSet::new();
+        open_doc.insert(30);
+
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded = plan.canonical_shared_hints(&m2c, &renumber, &Default::default(), &open_doc);
+
+        // The open-document container entry must be absent from the result.
+        // Only the two plain first-page entries (page, content) survive;
+        // font_dict's container is skipped entirely (not folded, not emitted).
+        assert_eq!(
+            folded.len(),
+            2,
+            "open-document container must be excluded from first-page section"
+        );
+        assert_eq!(folded[0].object_ref, page);
+        assert_eq!(folded[1].object_ref, content);
+        // Confirm the open-document container sentinel is absent.
+        assert!(
+            folded
+                .iter()
+                .all(|e| e.object_ref != ObjectRef::new(30, u16::MAX)),
+            "container 30 sentinel must not appear"
         );
     }
 

@@ -270,6 +270,28 @@ fn openaction_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// acroform-widget-page0-5-10 (flpdf-sjgv): AcroForm widgets in both
+// /AcroForm /Fields (in_open_document) and page 0 /Annots (in_first_page).
+// qpdf's in_open_document > in_first_page precedence means widgets go to the
+// open-document section (part4, first half, before /O). Without the fix,
+// from_pdf Step 5 places them in part2, inflating page_hints[0].object_count
+// and diverging hint tables. Exercises the from_pdf open_document_set peeling.
+#[test]
+fn acroform_widget_page0_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-acroform-widget-page0-5-10.pdf",
+        "objstm-lin-acroform-widget-page0-5-10",
+    );
+}
+
+#[test]
+fn acroform_widget_page0_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-acroform-widget-page0-5-10.pdf",
+        "objstm-lin-acroform-widget-page0-5-10",
+    );
+}
+
 // outlines-80-80 (flpdf-rm09, Stage B — in_outlines, part9): the catalog's
 // /Outlines subtree (an outline dict + 80 items reachable ONLY from /Outlines)
 // is qpdf's in_outlines category. With no /PageMode /UseOutlines, qpdf places it

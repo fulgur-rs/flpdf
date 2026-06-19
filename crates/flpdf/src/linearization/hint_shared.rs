@@ -215,12 +215,17 @@ impl SharedObjectHintTable {
         renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
         second_half_container_nums: &std::collections::BTreeSet<u32>,
+        open_document_container_nums: &std::collections::BTreeSet<u32>,
     ) -> Self {
         // Fold first-page ObjStm members into their container (one shared entry
         // per container) so the table matches qpdf's positional shared list.
         // With no ObjStm packing this equals `plan.shared_hints`.
-        let shared_hints =
-            plan.canonical_shared_hints(member_to_container, renumber, second_half_container_nums);
+        let shared_hints = plan.canonical_shared_hints(
+            member_to_container,
+            renumber,
+            second_half_container_nums,
+            open_document_container_nums,
+        );
         let shared_count = shared_hints.len() as u32;
 
         // ------------------------------------------------------------------
@@ -538,6 +543,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert!(
@@ -557,6 +563,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -583,6 +590,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -598,6 +606,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -618,6 +627,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -642,6 +652,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         // One object per group (we never group multiple shared objects
@@ -657,6 +668,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -684,6 +696,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -700,6 +713,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -720,6 +734,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -746,6 +761,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -761,6 +777,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -781,6 +798,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -804,6 +822,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         // 1-object-per-group model — see two_page_bits_group_object_count.
@@ -817,6 +836,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -838,6 +858,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -920,6 +941,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         // first_page_entries = |part2| + |part3| = 1 + 1 = 2
@@ -948,6 +970,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -984,6 +1007,7 @@ mod tests {
             &renumber,
             &member_to_container,
             &Default::default(),
+            &Default::default(),
         );
 
         assert_eq!(
@@ -1005,6 +1029,7 @@ mod tests {
         let table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -1054,6 +1079,7 @@ mod tests {
             &renumber,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         );
 
         // from_plan: member's renumber slot (before writer patch)
@@ -1080,6 +1106,7 @@ mod tests {
         let mut table = SharedObjectHintTable::from_plan(
             &plan,
             &renumber,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
