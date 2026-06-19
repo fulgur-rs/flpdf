@@ -494,7 +494,10 @@ impl LinearizationPlan {
     /// each page's reachability closure (via [`Pdf::resolve`] /
     /// [`Pdf::resolve_borrowed`]) — typically an [`crate::Error::Io`] or
     /// [`crate::Error::Parse`] on a truncated or malformed object.
-    pub fn from_pdf<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Self> {
+    pub fn from_pdf<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        use_generate_objstm: bool,
+    ) -> crate::Result<Self> {
         // ----------------------------------------------------------------
         // Step 1: collect all known object refs (Part 4 initial state).
         // The free-list head at object 0 is excluded per ISO 32000-1 §7.5.4.
@@ -620,18 +623,21 @@ impl LinearizationPlan {
         let mut part3_objects: Vec<ObjectRef> = Vec::new();
 
         for obj_ref in &first_page_closure {
-            // qpdf: in_open_document > in_first_page. Objects reachable from
-            // catalog open-document keys (/AcroForm, /OpenAction, etc.) are
-            // placed in the open-document section (part4, first half) even if
-            // they also appear in the first-page closure. Leave them in Part 4
-            // so route_objstm_containers can assign their ObjStm container to
-            // ContainerPart::OpenDocument.
+            // qpdf: in_open_document > in_first_page in ObjStm-generate mode.
+            // Objects reachable from catalog open-document keys (/AcroForm,
+            // /OpenAction, etc.) are placed in the open-document section (Part 4,
+            // first half) even if they also appear in the first-page closure.
+            // Leaving them in Part 4 lets route_objstm_containers assign their
+            // ObjStm container to ContainerPart::OpenDocument.
             //
-            // This peeling is only correct when ObjectStreamMode::Generate is
-            // active. In Disable mode these objects would remain as plain
-            // objects in the first-page section (Part 2/3); the mismatch is
-            // tracked as a follow-up issue for non-generate linearization.
-            if open_document_set.contains(obj_ref) {
+            // In Disable/Preserve mode qpdf keeps these objects as plain Part
+            // 2/3 first-page objects. Oracle: `qpdf --linearize
+            // --object-streams=disable` on an AcroForm fixture shows Page 0
+            // with 12 objects and nshared=0 (all in first-page section), vs.
+            // 2 objects in generate mode (widgets peeled into ObjStm
+            // containers). The peeling is therefore gated on
+            // `use_generate_objstm`.
+            if use_generate_objstm && open_document_set.contains(obj_ref) {
                 continue;
             }
             if Some(*obj_ref) == first_page_ref {
@@ -2346,7 +2352,8 @@ mod tests {
     #[test]
     fn from_pdf_does_not_panic() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan construction must succeed");
+        let plan =
+            LinearizationPlan::from_pdf(&mut pdf, false).expect("plan construction must succeed");
         assert!(plan.total_object_count > 0);
     }
 
@@ -2356,7 +2363,7 @@ mod tests {
     #[test]
     fn plan_fields_accessible() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // root_ref should be Some(1 0 R)
         assert_eq!(plan.root_ref, Some(ObjectRef::new(1, 0)));
@@ -2374,7 +2381,7 @@ mod tests {
     #[test]
     fn single_page_part2_non_empty_part3_empty() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Part 2 must contain the page dict (object 3) and the Pages node
         // (reached via /Parent).
@@ -2426,7 +2433,7 @@ mod tests {
     #[test]
     fn part4_contains_only_remaining_objects() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // No object should appear in both Part 4 and Part 2/3.
         let part4_set: BTreeSet<_> = plan.part4_objects().into_iter().collect();
@@ -2450,7 +2457,7 @@ mod tests {
     #[test]
     fn parts_are_disjoint_after_closure() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
         assert!(
             plan.parts_are_disjoint(),
             "object refs must appear in at most one part"
@@ -2464,7 +2471,7 @@ mod tests {
     #[test]
     fn two_page_shared_font_partitioned_correctly() {
         let mut pdf = open_two_page_shared_font();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Resources (5 0 R) and Font (8 0 R) are shared → Part 3.
         let shared_ref_resources = ObjectRef::new(5, 0);
@@ -2508,7 +2515,7 @@ mod tests {
     #[test]
     fn shared_hints_reference_correct_pages() {
         let mut pdf = open_two_page_shared_font();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let part2_len = plan.part2_objects.len();
 
@@ -2542,8 +2549,8 @@ mod tests {
     #[test]
     fn cycle_does_not_loop_forever() {
         let mut pdf = open_cycle_pdf();
-        let plan =
-            LinearizationPlan::from_pdf(&mut pdf).expect("cycle PDF must not cause infinite loop");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false)
+            .expect("cycle PDF must not cause infinite loop");
 
         // Basic sanity: we got a plan with objects in Part 2.
         assert!(!plan.part2_objects.is_empty(), "Part 2 must be non-empty");
@@ -2633,7 +2640,7 @@ mod tests {
     fn resources_subtree_dedups_duplicate_ref() {
         let mut pdf = Pdf::open(Cursor::new(resources_duplicate_ref_pdf_bytes()))
             .expect("duplicate-ref PDF must parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         // The doubly-referenced resource object appears exactly once across all
         // parts (the visited-set dedup prevents a duplicate).
         assert!(plan.parts_are_disjoint());
@@ -2653,7 +2660,7 @@ mod tests {
     fn resources_subtree_stops_at_page_tree_crosslink() {
         let mut pdf = Pdf::open(Cursor::new(resources_crosslink_page_tree_pdf_bytes()))
             .expect("crosslink PDF must parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).expect("plan");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         // The walk reaches the /Pages node via the bad /Resources link but does
         // not descend into it (no sibling-page content pulled in); the plan is
         // still well-formed and disjoint.
@@ -2685,7 +2692,7 @@ mod tests {
     #[test]
     fn page1_hint_object_count_matches_part2_plus_part3() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         assert_eq!(
             plan.page_hints[0].object_count,
@@ -2700,7 +2707,7 @@ mod tests {
     #[test]
     fn hint_table_inputs_well_formed_empty() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Each PageHintEntry must reference a non-zero object number.
         for entry in &plan.page_hints {
@@ -2798,7 +2805,7 @@ mod tests {
     fn multilevel_pages_inherited_resources_join_page_closure() {
         let bytes = two_level_pages_inherited_resources_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("multi-level Pages PDF should parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let resources_ref = ObjectRef::new(6, 0);
         let font_ref = ObjectRef::new(7, 0);
@@ -2891,7 +2898,7 @@ mod tests {
     fn from_pdf_propagates_parent_chain_resolve_error() {
         let bytes = page_parent_resolve_error_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture xref/trailer must parse");
-        let result = LinearizationPlan::from_pdf(&mut pdf);
+        let result = LinearizationPlan::from_pdf(&mut pdf, false);
         assert!(
             result.is_err(),
             "from_pdf must propagate a /Parent-chain resolve error, got Ok"
@@ -2975,7 +2982,7 @@ mod tests {
     fn from_pdf_follows_reference_chain_parent() {
         let bytes = reference_chain_parent_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture must parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Single-page document: the page's whole closure is Part 2.
         let resources_ref = ObjectRef::new(6, 0);
@@ -3088,7 +3095,7 @@ mod tests {
     fn non_first_page_shared_objects_in_shared_hints() {
         let bytes = three_page_shared_content_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("three-page PDF should parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // The shared content stream (8 0 R) is referenced by pages 2 and 3
         // (0-based: pages 1 and 2) but NOT page 1 (0-based: page 0).
@@ -3170,7 +3177,7 @@ mod tests {
     fn objstm_batches_disable_yields_empty_plan() {
         let bytes = three_page_shared_content_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &disable_config()).unwrap();
         assert!(
@@ -3201,7 +3208,7 @@ mod tests {
         //   9 0 R (Font dict) → eligible (in part3)
         let bytes = three_page_shared_content_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
 
@@ -3269,7 +3276,7 @@ mod tests {
     fn objstm_batches_generate_never_places_part2_in_batches() {
         let bytes = three_page_shared_content_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
 
@@ -3298,7 +3305,7 @@ mod tests {
     fn objstm_batches_two_page_generate_part2_not_in_batches() {
         let bytes = two_page_shared_font_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
 
@@ -3330,7 +3337,7 @@ mod tests {
         //   8 0 R font (part3)             → eligible plain dict
         let bytes = two_page_shared_font_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
 
@@ -3366,7 +3373,7 @@ mod tests {
         // No source ObjStms → Preserve must yield empty batches.
         let bytes = two_page_shared_font_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &preserve_config()).unwrap();
         assert!(
@@ -3559,7 +3566,7 @@ mod tests {
     fn objstm_batches_preserve_source_objstm_grouping_and_part_split() {
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Verify the partition is what the fixture was designed to produce.
         // Part 2 must contain page 1 dict (3 0 R).
@@ -3716,7 +3723,7 @@ mod tests {
         // member.
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let cap1_config = PlannerConfig {
             mode: crate::writer::object_streams::ObjectStreamMode::Preserve,
@@ -3845,7 +3852,7 @@ mod tests {
     fn objstm_batches_preserve_cap_actually_splits_same_source_same_part() {
         let bytes = objstm_two_part4_members_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture should parse");
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let m10 = ObjectRef::new(10, 0);
         let m11 = ObjectRef::new(11, 0);
@@ -3917,7 +3924,7 @@ mod tests {
         //                       Part4 = page 2 dict (4 0 R) + content stream (7 0 R ineligible)
         let bytes = two_page_shared_font_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
 
@@ -3979,7 +3986,7 @@ mod tests {
     #[test]
     fn objstm_batches_generate_keeps_catalog_standalone_single_page() {
         let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Single page → no first-page SHARED objects → no first-half batch.
         let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();

@@ -23,7 +23,7 @@ fn linearize_generate(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
@@ -473,7 +473,7 @@ fn acroform_widget_page0_peeled_from_first_page_section() {
 
     let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
 
     // Widgets: objects 6..=10 (W=5). They are in open_document_set (via /AcroForm
     // /Fields) AND first_page_closure (via page0 /Annots). qpdf's in_open_document
@@ -516,5 +516,49 @@ fn acroform_widget_page0_peeled_from_first_page_section() {
     assert_eq!(
         plan.page_hints[0].object_count, 12,
         "page 0 object_count must be 12 (page + content + 10 shared fonts, widgets peeled)"
+    );
+}
+
+/// Regression test: in non-generate mode the OD peeling must NOT apply.
+///
+/// Oracle: `qpdf --linearize --object-streams=disable` on the AcroForm fixture
+/// shows Page 0 with nobjects=12 and nshared=0, meaning all first-page-closure
+/// objects (including the 5 widgets) stay in the first-page section.  When
+/// `use_generate_objstm=false`, Part 2 must contain the widgets and
+/// `page_hints[0].object_count` must equal 17 (7 Part-2 + 10 Part-3 fonts).
+#[test]
+fn acroform_widget_stays_in_first_page_section_in_disable_mode() {
+    use flpdf::ObjectRef;
+    use std::collections::BTreeSet;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("objstm-lin-acroform-widget-page0-5-10.pdf");
+
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = flpdf::Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+
+    let widget_refs: Vec<ObjectRef> = (6u32..=10)
+        .map(|n| ObjectRef {
+            number: n,
+            generation: 0,
+        })
+        .collect();
+
+    let part2_set: BTreeSet<_> = plan.part2_objects.iter().copied().collect();
+
+    for r in &widget_refs {
+        assert!(
+            part2_set.contains(r),
+            "widget {r} must be in part2 in disable mode (no OD peeling)"
+        );
+    }
+
+    // page0 dict(3) + content0(21) + widgets(6-10, =5) = 7 Part-2 objects,
+    // plus shared fonts 11-20 (=10) in Part-3 → total 17.
+    assert_eq!(
+        plan.page_hints[0].object_count, 17,
+        "page 0 object_count must be 17 in disable mode (widgets not peeled)"
     );
 }

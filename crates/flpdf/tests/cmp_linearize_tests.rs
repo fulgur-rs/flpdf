@@ -34,7 +34,7 @@ fn flpdf_linearized(fixture: &str) -> Vec<u8> {
     // Build the plan + renumber map from one handle.
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     // Re-open so `write_linearized` can seek/read objects independently.
