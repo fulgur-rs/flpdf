@@ -745,21 +745,24 @@ impl LinearizationPlan {
             let private: Vec<ObjectRef> = closure
                 .into_iter()
                 .filter(|r| {
-                    !part2_set.contains(r)
-                        && !part3_set.contains(r)
-                        // In generate mode, open-document objects (AcroForm
-                        // widgets, etc.) that happen to be exclusive to one
-                        // later page must NOT be counted as page-private: qpdf
-                        // routes them to the pre-/O open-document section
-                        // (not the per-page section), so they are absent from
-                        // the second-half page objects and should not inflate
-                        // page_hints[page_idx].object_count.  Excluding them
-                        // here also keeps them out of per_page_private_objects,
-                        // so the part7 pre-pass below never captures them and
-                        // they remain available for OD routing in the
-                        // part8/part9 loop.
-                        && !(use_generate_objstm && open_document_set.contains(r))
-                        && page_reach.get(r).copied() == Some(1)
+                    if part2_set.contains(r) || part3_set.contains(r) {
+                        return false;
+                    }
+                    // In generate mode, open-document objects (AcroForm
+                    // widgets, etc.) that happen to be exclusive to one
+                    // later page must NOT be counted as page-private: qpdf
+                    // routes them to the pre-/O open-document section
+                    // (not the per-page section), so they are absent from
+                    // the second-half page objects and should not inflate
+                    // page_hints[page_idx].object_count.  Excluding them
+                    // here also keeps them out of per_page_private_objects,
+                    // so the part7 pre-pass below never captures them and
+                    // they remain available for OD routing in the
+                    // part8/part9 loop.
+                    if use_generate_objstm && open_document_set.contains(r) {
+                        return false;
+                    }
+                    page_reach.get(r).copied() == Some(1)
                 })
                 .collect();
             if page_idx < page_hints.len() {
