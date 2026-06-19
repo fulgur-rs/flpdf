@@ -365,17 +365,16 @@ fn openaction_multi_od_generates_two_od_containers_in_dfs_order() {
 
     // The two OD containers are both in the first half; verify the second one
     // also appears before /E.
-    let second_marker_offset = bytes[first_marker + 1..]
-        .windows(b"\nobj\n".len())
-        .position(|w| w == b"\nobj\n")
-        .map(|p| first_marker + 1 + p);
-    if let Some(second) = second_marker_offset {
-        assert!(
-            second < e_off,
-            "the second OD ObjStm container (approx byte {second}) must also be in the \
-             first half, before /E ({e_off})"
-        );
-    }
+    let second = bytes[first_marker + 1..]
+        .windows(b"/Type /ObjStm".len())
+        .position(|w| w == b"/Type /ObjStm")
+        .map(|p| first_marker + 1 + p)
+        .expect("second OD ObjStm container present");
+    assert!(
+        second < e_off,
+        "the second OD ObjStm container (marker at {second}) must also be in the \
+         first half, before /E ({e_off})"
+    );
 
     // /O (first_page_object) = 10: open-document objects occupy 2 containers
     // (part4) before the first page, which therefore receives object number 10.
