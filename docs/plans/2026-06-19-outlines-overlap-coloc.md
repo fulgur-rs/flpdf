@@ -306,7 +306,8 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
 ```bash
 cd /home/ubuntu/flpdf/.worktrees/flpdf-vvjr4
 cargo test -p flpdf --test cmp_linearize_objstm_tests \
-    outlines_shared_page_objstm_structurally_identical_to_qpdf \
+    outlines_shared_page_objstm_structurally_identical_to_qpdf -- --nocapture 2>&1 | tail -30
+cargo test -p flpdf --test cmp_linearize_objstm_tests \
     outlines_coloc_objstm_structurally_identical_to_qpdf -- --nocapture 2>&1 | tail -30
 ```
 
@@ -318,7 +319,9 @@ If these FAIL: record the diff and investigate (likely a bug in `from_pdf` or co
 ```bash
 cargo test -p flpdf --test cmp_linearize_objstm_tests \
     --features qpdf-zlib-compat \
-    outlines_shared_page_objstm_byte_identical_to_qpdf \
+    outlines_shared_page_objstm_byte_identical_to_qpdf -- --nocapture 2>&1 | tail -30
+cargo test -p flpdf --test cmp_linearize_objstm_tests \
+    --features qpdf-zlib-compat \
     outlines_coloc_objstm_byte_identical_to_qpdf -- --nocapture 2>&1 | tail -30
 ```
 
@@ -486,9 +489,10 @@ Search for all callers: `canonical_shared_hints`. Pass the `outlines_set` (use `
 ```bash
 cargo test -p flpdf --test cmp_linearize_objstm_tests \
     outlines_coloc_objstm_structurally_identical_to_qpdf -- --nocapture 2>&1
-# Regression guards:
-cargo test -p flpdf --test cmp_linearize_objstm_tests \
-    outlines_objstm outlines_multi_container useoutlines_objstm -- --nocapture 2>&1
+# Regression guards (run each filter separately):
+cargo test -p flpdf --test cmp_linearize_objstm_tests outlines_objstm -- --nocapture 2>&1
+cargo test -p flpdf --test cmp_linearize_objstm_tests outlines_multi_container -- --nocapture 2>&1
+cargo test -p flpdf --test cmp_linearize_objstm_tests useoutlines_objstm -- --nocapture 2>&1
 ```
 
 ### Step 6: Commit
@@ -507,7 +511,9 @@ git commit -m "fix(vvjr.4-B): exclude outline-routed containers from Part-8 shar
 ```bash
 cargo test -p flpdf --test cmp_linearize_objstm_tests \
     --features qpdf-zlib-compat \
-    outlines_shared_page_objstm_byte_identical_to_qpdf \
+    outlines_shared_page_objstm_byte_identical_to_qpdf -- --nocapture 2>&1
+cargo test -p flpdf --test cmp_linearize_objstm_tests \
+    --features qpdf-zlib-compat \
     outlines_coloc_objstm_byte_identical_to_qpdf -- --nocapture 2>&1
 ```
 
@@ -574,7 +580,13 @@ git commit -m "ci(vvjr.4): wire outlines-shared-page-80-80 and outlines-coloc-20
 
 ## Task 8: Session completion
 
-### Step 1: Run full test suite
+### Step 1: Build check
+
+```bash
+cargo check --workspace 2>&1 | tail -10
+```
+
+### Step 2: Run full test suite
 
 ```bash
 cargo test --workspace -q 2>&1 | tail -20
@@ -582,7 +594,15 @@ cargo test --workspace -q 2>&1 | tail -20
 
 All tests pass.
 
-### Step 2: Run cargo fmt
+### Step 3: Run clippy
+
+```bash
+cargo clippy --workspace -- -D warnings 2>&1 | tail -20
+```
+
+No warnings.
+
+### Step 4: Run cargo fmt
 
 ```bash
 cargo fmt --check
@@ -591,13 +611,13 @@ cargo fmt
 git add -u && git commit -m "style: cargo fmt"
 ```
 
-### Step 3: Push
+### Step 5: Push
 
 ```bash
 git push -u origin flpdf-vvjr4
 ```
 
-### Step 4: Close the beads issue
+### Step 6: Close the beads issue
 
 After PR is created and merged: `bd close flpdf-vvjr.4`.
 

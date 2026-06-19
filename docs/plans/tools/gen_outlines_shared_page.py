@@ -15,6 +15,11 @@ S = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 80
 use_outlines = len(sys.argv) > 3 and sys.argv[3] == "--use-outlines"
 
+if S < 0:
+    raise SystemExit("S must be >= 0")
+if K <= 0:
+    raise SystemExit("K must be > 0")
+
 catalog, pages, page0, page1, outlines = 1, 2, 3, 4, 5
 o0 = 6
 item_nums = list(range(o0, o0 + K))
