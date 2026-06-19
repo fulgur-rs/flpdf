@@ -626,6 +626,11 @@ impl LinearizationPlan {
             // they also appear in the first-page closure. Leave them in Part 4
             // so route_objstm_containers can assign their ObjStm container to
             // ContainerPart::OpenDocument.
+            //
+            // This peeling is only correct when ObjectStreamMode::Generate is
+            // active. In Disable mode these objects would remain as plain
+            // objects in the first-page section (Part 2/3); the mismatch is
+            // tracked as a follow-up issue for non-generate linearization.
             if open_document_set.contains(obj_ref) {
                 continue;
             }
@@ -780,12 +785,16 @@ impl LinearizationPlan {
                 // Should have been in Part 2 or Part 3 — skip (defensive).
                 continue;
             }
-            if reach >= 2 {
+            // open_document objects must not go into part8 even if page_reach >= 2:
+            // their ObjStm container is placed before /O (first half), not in the
+            // second half after /E where part8 lives.  Route them to part9 instead.
+            if reach >= 2 && !open_document_set.contains(&r) {
                 part4_other_pages_shared.push(r);
             } else {
                 // reach == 0 or reach == 1 but not private (shouldn't happen
                 // since per_page_private_objects captures all reach-1 non-first
-                // objects).  Everything else goes to part9.
+                // objects), or open_document object with reach >= 2.
+                // Everything else goes to part9.
                 part4_rest.push(r);
             }
         }
