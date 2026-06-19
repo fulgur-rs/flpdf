@@ -29,7 +29,7 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
