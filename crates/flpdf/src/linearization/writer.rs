@@ -2415,7 +2415,11 @@ pub fn write_linearized<R: Read + Seek>(
         .part4_rest
         .iter()
         .copied()
-        .filter(|r| !part4_member_set.contains(r))
+        .filter(|r| {
+            !part4_member_set.contains(r)
+                && Some(*r) != plan.pages_tree_ref
+                && Some(*r) != plan.info_ref
+        })
         .collect();
     // Open-document batches are numbered FIRST in the first half (right after
     // the catalog, before the hint); Part-3 batches are numbered last within
