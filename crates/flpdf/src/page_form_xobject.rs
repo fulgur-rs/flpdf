@@ -1253,4 +1253,126 @@ mod tests {
         let err = xobject_object_closure(&mut pdf, xref);
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
+
+    // ---- inherited_rotate_attribute (edge arms) ----------------------------
+
+    #[test]
+    fn inherited_rotate_attribute_returns_absent_for_non_dict() {
+        let mut pdf = doc_with_non_dict_obj3();
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_resolves_indirect_reference() {
+        // /Rotate stored as an indirect reference to an integer.
+        let mut pdf = open(one_page_doc("/Rotate 6 0 R", "x", &[(6, "90")]));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 90)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_treats_null_as_absent_and_climbs() {
+        // Leaf /Rotate is null (equivalent to absent); the parent /Pages node has
+        // no /Rotate either, so the walk reports absent.
+        let mut pdf = open(one_page_doc("/Rotate null", "x", &[]));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_breaks_on_parent_cycle() {
+        // /Parent nodes point at each other; neither carries /Rotate.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 4 0 R >>"),
+                (4, "<< /Type /Pages /Parent 3 0 R >>"),
+            ],
+            1,
+        ));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_errors_on_parent_chain_too_deep() {
+        let total = DEFAULT_MAX_PAGE_TREE_DEPTH + 5;
+        let mut objs: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        ];
+        for n in 3..=(total as u32) {
+            objs.push((n, format!("<< /Type /Pages /Parent {} 0 R >>", n + 1)));
+        }
+        let borrowed: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
+        let mut pdf = open(build_pdf(&borrowed, 1));
+        let err = inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0));
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    // ---- leaf_user_unit (edge arms) ----------------------------------------
+
+    #[test]
+    fn leaf_user_unit_returns_absent_for_non_dict() {
+        let mut pdf = doc_with_non_dict_obj3();
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 1.0)
+        );
+    }
+
+    #[test]
+    fn leaf_user_unit_resolves_indirect_reference() {
+        let mut pdf = open(one_page_doc("/UserUnit 6 0 R", "x", &[(6, "3")]));
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 3.0)
+        );
+    }
+
+    #[test]
+    fn leaf_user_unit_treats_null_as_absent() {
+        let mut pdf = open(one_page_doc("/UserUnit null", "x", &[]));
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 1.0)
+        );
+    }
+
+    #[test]
+    fn leaf_user_unit_reads_real_value() {
+        let mut pdf = open(one_page_doc("/UserUnit 1.5", "x", &[]));
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 1.5)
+        );
+    }
+
+    // ---- transformation_matrix (invert scale==0 guard) ---------------------
+
+    #[test]
+    fn transformation_matrix_invert_zero_scale_is_identity() {
+        // A /UserUnit 0 destination would invert to a 1/0 scale; qpdf guards this
+        // by returning the identity.
+        let t = PageTransform {
+            rotate_present: false,
+            rotate: 0,
+            uu_present: true,
+            scale: 0.0,
+        };
+        assert_eq!(
+            transformation_matrix(&t, 612.0, 792.0, true),
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
+    }
 }
