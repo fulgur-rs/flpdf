@@ -123,6 +123,24 @@ fn overlay_with_from_range_succeeds() {
 }
 
 #[test]
+fn empty_from_differs_from_absent_from() {
+    // qpdf parity: an explicit empty `--from=` is an empty source set, so
+    // `--repeat` cycles from the first dest page (every dest page <- s2). This is
+    // observably different from an absent `--from` (p1<-s1, p2<-s2, then repeat),
+    // so the two invocations must NOT produce identical output.
+    let two = fixture("two-page.pdf");
+    let absent = run_overlay_ok("three-page.pdf", &["--overlay", &two, "--repeat=2", "--"]);
+    let empty = run_overlay_ok(
+        "three-page.pdf",
+        &["--overlay", &two, "--from=", "--repeat=2", "--"],
+    );
+    assert_ne!(
+        absent, empty,
+        "explicit empty --from= must be distinguished from an absent --from"
+    );
+}
+
+#[test]
 fn single_underlay_succeeds() {
     // A lone `--underlay` (no overlay) must stack the source beneath the page.
     let two = fixture("two-page.pdf");
