@@ -322,3 +322,16 @@ git add -A && git commit -m "test(linearization): cover preserve source-grouping
   unit test; do not `cov:ignore` a reachable behaviour.
 - **>100-member source container** (preserve should NOT cap-split, but flpdf's per-container
   `chunks(cap)` would): pre-existing, not introduced here. Defer.
+- **Part-8 container shared-identifier rank (Preserve)**: `container_shared_rank` is built only
+  from `objstm_layout.part3` (first-half) for Preserve. A Preserve input where a non-first page
+  references a Part-8 (other-page-shared) ObjStm container would fall through to
+  `unwrap_or(0)` in `shared_sort_key`, risking a mis-ordered identifier. Not a regression (the
+  prior `container_even_split_rank` was already wrong for reused source containers), not exercised
+  by this fixture (all 3 containers are first-half). Tracked under flpdf-oq7g (full preserve
+  byte-parity), same cluster as the mixed-container and plain+container-interleave gaps.
+- **Plain shared object + container interleave (Preserve)**: `shared_sort_key`'s `(0, source_num)`
+  vs `(1, rank)` split forces all plain shared objects before all containers. Correct for Generate
+  (containers are high-numbered `makeIndirectObject` ids) but for Preserve a plain shared object
+  could have a higher source number than a container; the split would mis-order them. No fixture
+  exercises it (qpdf-generated ObjStm inputs pack the shared dicts into containers). Tracked under
+  flpdf-oq7g.
