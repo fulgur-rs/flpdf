@@ -295,6 +295,12 @@ fi
 #                     from the root /Outlines key => qpdf in_outlines (lc_outlines,
 #                     part9 second half via pushOutlinesToPart, with the Outlines
 #                     hint table + hint dict /O), plus 80 first-page shared fonts.
+#  - outline-od-shared-stream: a /JS action stream reachable from BOTH /OpenAction
+#                     and an outline item's /A. qpdf orders in_outlines above
+#                     in_open_document (lc_outlines wins), and the stream is
+#                     ineligible for ObjStm, so qpdf emits it plain in part9 AFTER
+#                     the outline container. Discriminates step-6b OD/outline
+#                     precedence and the second-half post-container plain ordering.
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
@@ -308,6 +314,7 @@ declare -A G6HB2_FIX=(
     [objstm-lin-useoutlines-80-80]="gen_outlines_gap.py 80 80 --use-outlines"
     [objstm-lin-outlines-shared-page-80-80]="gen_outlines_shared_page.py 80 80"
     [objstm-lin-outlines-coloc-200-20]="gen_outlines_gap.py 200 20"
+    [objstm-lin-outline-od-shared-stream]="gen_outline_open_action_shared_stream.py"
     [objstm-lin-acroform-widget-page0-5-10]="gen_acroform_widget_page0.py 5 10"
     [objstm-lin-acroform-widget-ap-stream-page0]="gen_acroform_widget_ap_stream_page0.py"
     [objstm-lin-acroform-widget-page1-only]="gen_acroform_widget_page1_only.py"
@@ -496,6 +503,7 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-outlines-80-80 \
             objstm-lin-outlines-80-200 objstm-lin-useoutlines-80-80 \
             objstm-lin-outlines-shared-page-80-80 objstm-lin-outlines-coloc-200-20 \
+            objstm-lin-outline-od-shared-stream \
             objstm-lin-acroform-widget-page0-5-10 \
             objstm-lin-acroform-widget-ap-stream-page0 \
             objstm-lin-acroform-widget-page1-only \

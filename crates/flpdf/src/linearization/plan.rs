@@ -826,6 +826,13 @@ impl LinearizationPlan {
         //   - page_reach >= 2 → two or more other pages → part8
         //   - page_reach == 0 → no page closure → part9
         let provisional_set: BTreeSet<ObjectRef> = part4_provisional.iter().copied().collect();
+        // Objects qpdf categorizes `in_outlines`.  qpdf's canonical
+        // classification orders `in_outlines` ABOVE `in_open_document`
+        // (QPDF_linearization.cc:1368-1387: lc_outlines before lc_open_document),
+        // so an object reachable from BOTH an open-document key and `/Outlines`
+        // is an outline.  Computed here (reused below at the outline extraction)
+        // so the open-document routing can defer to it.
+        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
         let mut part4_other_pages_private: Vec<ObjectRef> = Vec::new();
         let mut part4_other_pages_shared: Vec<ObjectRef> = Vec::new();
         let mut part4_rest: Vec<ObjectRef> = Vec::new();
@@ -874,7 +881,18 @@ impl LinearizationPlan {
             // after /E.  Oracle: qpdf --linearize --object-streams=generate on a
             // page-0 widget with /AP /N places the Form XObject at a lower object
             // number than the OD ObjStm, physically before the hint stream.
-            if use_generate_objstm && open_document_set.contains(&r) {
+            //
+            // Exclude outline objects: qpdf orders `in_outlines` above
+            // `in_open_document`, so an OD object also reachable from `/Outlines`
+            // is an outline, not an open-document object.  Letting it fall through
+            // to `part4_rest` lets the outline extraction below lift it into the
+            // outline section (part6/part9), matching qpdf's precedence.  Without
+            // this, an ineligible OD+outline stream would land in
+            // `part4_open_document_plain` (pre-/O) instead.
+            if use_generate_objstm
+                && open_document_set.contains(&r)
+                && !all_outline_refs.contains(&r)
+            {
                 let ctx = elig_ctx
                     .as_ref()
                     .expect("elig_ctx is Some when use_generate_objstm");
@@ -942,7 +960,8 @@ impl LinearizationPlan {
         //   part6_outline_objects — UseOutlines: first-half numbers, emitted before /E
         //   part9_outline_objects — !UseOutlines: second-half numbers, emitted after /E
         let outlines_in_first_page = outlines_in_first_page_predicate(pdf)?;
-        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+        // `all_outline_refs` is computed once above (step 6b), before the
+        // open-document routing that defers to it.
         // Outline root reference: placed first in the extracted vectors so the
         // renumber map assigns it the lowest new unit among outline objects,
         // matching qpdf's lc_outlines traversal-from-root order (used by

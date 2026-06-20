@@ -2414,10 +2414,16 @@ pub fn write_linearized<R: Read + Seek>(
     // container's group is the last one (the single-second-half-container case).
     let second_half_anchors =
         second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
-    // Part-4 non-member part4_rest objects (e.g. lc_thumbnail streams) must be
-    // placed AFTER the second-half ObjStm containers in the file, not before.
-    // Compute the set of such objects so place_objstm_members_per_half can
-    // emit them in a post-container pass.
+    // Part-4 non-member objects (e.g. lc_thumbnail streams, and ineligible
+    // outline streams) must be placed AFTER the second-half ObjStm containers in
+    // the file, not before.  Compute the set of such objects so
+    // place_objstm_members_per_half can emit them in a post-container pass.
+    //
+    // `part9_outline_objects` is included alongside `part4_rest`: its eligible
+    // members ride in a second-half ObjStm batch (filtered out by
+    // `part4_member_set`), but an ineligible outline stream (an Object::Stream
+    // reachable from `/Outlines`, e.g. a shared /JS action stream) is emitted
+    // plain and qpdf numbers it AFTER the outline container, not before.
     let part4_member_set: BTreeSet<ObjectRef> = resolved_batch_plan
         .part4_batches
         .iter()
@@ -2427,6 +2433,7 @@ pub fn write_linearized<R: Read + Seek>(
     let second_half_post_plain: BTreeSet<ObjectRef> = plan
         .part4_rest
         .iter()
+        .chain(&plan.part9_outline_objects)
         .copied()
         .filter(|r| {
             !part4_member_set.contains(r)
