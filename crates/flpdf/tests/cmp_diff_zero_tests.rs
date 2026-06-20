@@ -105,3 +105,28 @@ fn lone_flate_l9_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
     // bytes verbatim (qpdf default), so re-encoding at level 6 would diverge.
     assert_cmp_diff_zero("lone-flate-l9.pdf", "lone-flate-l9");
 }
+
+#[test]
+fn od_indirect_length_plain_rewrite_drops_orphan_holder_byte_identical_to_qpdf() {
+    // The catalog's /OpenAction reaches a JavaScript stream (obj 6) with an
+    // INDIRECT /Length (7 0 R); the holder (obj 7) is reachable ONLY through
+    // that /Length edge. Once /Length is normalized to a direct integer the
+    // holder orphans, and qpdf garbage-collects it. The plain full-rewrite path
+    // must drop it too (flpdf-sqkq), shifting object numbers contiguously — not
+    // emit it as a trailing integer object.
+    assert_cmp_diff_zero(
+        "objstm-lin-od-indirect-length.pdf",
+        "objstm-lin-od-indirect-length",
+    );
+}
+
+#[test]
+fn od_indirect_length_flate_plain_rewrite_drops_orphan_holder_byte_identical_to_qpdf() {
+    // Same orphan structure, but the JS stream is a lone /FlateDecode (the
+    // writer's verbatim-preserve path): /Length is direct-ized to the
+    // compressed byte count when the holder is dropped.
+    assert_cmp_diff_zero(
+        "objstm-lin-od-indirect-length-flate.pdf",
+        "objstm-lin-od-indirect-length-flate",
+    );
+}

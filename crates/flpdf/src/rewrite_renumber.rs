@@ -23,7 +23,7 @@
 //! - Objects unreachable from the seed never receive a number (qpdf drops them
 //!   by default).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object::{Object, ObjectRef, MAX_INLINE_DEPTH};
@@ -87,7 +87,28 @@ impl CatalogFirstRenumber {
     /// Returns [`Error::Unsupported`] when the trailer has no `/Root` entry.
     /// Propagates [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] if an
     /// object fails to load during the walk.
+    // The production writer always goes through `build_excluding` (passing the
+    // orphaned-`/Length`-holder set); this no-exclusions wrapper is retained for
+    // the unit tests that assert the plain visitation order.
+    #[allow(dead_code)]
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Self> {
+        Self::build_excluding(pdf, &BTreeSet::new())
+    }
+
+    /// Like [`Self::build`], but objects in `excluded` are skipped: they receive
+    /// no new number, and the walk does not descend into them. This drops
+    /// orphaned indirect `/Length` holders (flpdf-sqkq) — reached only via a
+    /// stream's `/Length` edge, which the writer re-emits as a direct integer —
+    /// so the remaining objects renumber contiguously, matching qpdf's
+    /// reachability garbage collection.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::build`].
+    pub(crate) fn build_excluding<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        excluded: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<Self> {
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut order: Vec<ObjectRef> = Vec::new();
         let mut queue: VecDeque<ObjectRef> = VecDeque::new();
@@ -108,13 +129,13 @@ impl CatalogFirstRenumber {
         }
 
         for seed in seeds {
-            enqueue(seed, &mut old_to_new, &mut order, &mut queue);
+            enqueue(seed, excluded, &mut old_to_new, &mut order, &mut queue);
         }
 
         while let Some(cur) = queue.pop_front() {
             let obj = pdf.resolve_borrowed(cur)?;
             collect_refs(obj, 0, &mut |r| {
-                enqueue(r, &mut old_to_new, &mut order, &mut queue);
+                enqueue(r, excluded, &mut old_to_new, &mut order, &mut queue);
             })?;
         }
 
@@ -199,6 +220,25 @@ impl GenerateRenumber {
         pdf: &mut Pdf<R>,
         groups: &[Vec<ObjectRef>],
     ) -> crate::Result<Self> {
+        Self::build_excluding(pdf, groups, &BTreeSet::new())
+    }
+
+    /// Like [`Self::build`], but objects in `excluded` are skipped: they receive
+    /// no new number, and the walk does not descend into them. This drops
+    /// orphaned indirect `/Length` holders (flpdf-sqkq), so the remaining
+    /// objects renumber contiguously — matching qpdf's reachability garbage
+    /// collection. An excluded ref is never an object-stream member (members are
+    /// reached only via non-`/Length` edges in `compressible_objgens`, while an
+    /// orphan holder is reachable only via `/Length`), so no group is affected.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::build`].
+    pub(crate) fn build_excluding<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        groups: &[Vec<ObjectRef>],
+        excluded: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<Self> {
         // member -> group index, and per-group members sorted ascending-source.
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut groups_sorted: Vec<Vec<ObjectRef>> = Vec::with_capacity(groups.len());
@@ -241,6 +281,7 @@ impl GenerateRenumber {
         for seed in seeds {
             enqueue_gen(
                 seed,
+                excluded,
                 &member_to_group,
                 &groups_sorted,
                 &mut old_to_new,
@@ -255,6 +296,7 @@ impl GenerateRenumber {
             collect_refs(obj, 0, &mut |r| {
                 enqueue_gen(
                     r,
+                    excluded,
                     &member_to_group,
                     &groups_sorted,
                     &mut old_to_new,
@@ -280,6 +322,7 @@ impl GenerateRenumber {
 #[allow(dead_code, clippy::too_many_arguments)]
 fn enqueue_gen(
     r: ObjectRef,
+    excluded: &BTreeSet<ObjectRef>,
     member_to_group: &HashMap<ObjectRef, usize>,
     groups_sorted: &[Vec<ObjectRef>],
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
@@ -287,6 +330,9 @@ fn enqueue_gen(
     next: &mut u32,
     queue: &mut VecDeque<ObjectRef>,
 ) {
+    if excluded.contains(&r) {
+        return;
+    }
     if old_to_new.contains_key(&r) {
         return;
     }
@@ -314,13 +360,19 @@ fn enqueue_gen(
 }
 
 /// Assign `original` a new number on first encounter and enqueue it for the BFS
-/// walk. Repeated calls for the same reference are no-ops.
+/// walk. Repeated calls for the same reference are no-ops. References in
+/// `excluded` are skipped entirely (no number, not walked) — see
+/// [`CatalogFirstRenumber::build_excluding`].
 fn enqueue(
     original: ObjectRef,
+    excluded: &BTreeSet<ObjectRef>,
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
     order: &mut Vec<ObjectRef>,
     queue: &mut VecDeque<ObjectRef>,
 ) {
+    if excluded.contains(&original) {
+        return;
+    }
     if old_to_new.contains_key(&original) {
         return;
     }
@@ -419,6 +471,21 @@ fn rewrite<M: NewNumberLookup>(obj: &mut Object, depth: usize, map: &M) -> crate
             }
         }
         Object::Stream(stream) => {
+            // A dropped orphan `/Length` holder (flpdf-sqkq) leaves the stream's
+            // indirect `/Length` pointing at an object that received no new
+            // number. qpdf re-emits every stream's `/Length` as a direct integer
+            // anyway (here `reencode_stream_for_compress` overwrites this
+            // placeholder), so direct-ize the dangling `/Length` to the raw byte
+            // count instead of tripping the unmapped-ref error below — every
+            // OTHER unmapped reference still errors as a genuine dangling ref.
+            let drop_length = matches!(
+                stream.dict.get("Length"),
+                Some(Object::Reference(r)) if map.new_for_original(*r).is_none()
+            );
+            if drop_length {
+                let data_len = stream.data.len() as i64;
+                stream.dict.insert("Length", Object::Integer(data_len));
+            }
             for value in stream.dict.values_mut() {
                 rewrite(value, depth + 1, map)?;
             }
@@ -512,6 +579,84 @@ mod tests {
         for (new, old) in map.pairs() {
             assert_eq!(map.new_for_original(old), Some(new));
         }
+    }
+
+    #[test]
+    fn build_excluding_drops_orphan_length_holder_and_renumbers_contiguously() {
+        // OD fixture: the JS stream (obj 6) has an indirect /Length (7 0 R); the
+        // holder (obj 7) is reachable only via that /Length edge (flpdf-sqkq).
+        let bytes =
+            include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let excluded: BTreeSet<ObjectRef> = std::iter::once(ObjectRef::new(7, 0)).collect();
+        let map = CatalogFirstRenumber::build_excluding(&mut pdf, &excluded).expect("build");
+
+        // Six live objects remain (holder dropped), numbered contiguously 1..=6.
+        assert_eq!(map.len(), 6);
+        assert!(map.new_for_original(ObjectRef::new(7, 0)).is_none());
+        let mut news: Vec<u32> = map.pairs().map(|(new, _)| new.number).collect();
+        news.sort_unstable();
+        assert_eq!(news, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn generate_build_excluding_drops_orphan_length_holder() {
+        let bytes =
+            include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let excluded: BTreeSet<ObjectRef> = std::iter::once(ObjectRef::new(7, 0)).collect();
+        // Empty groups: every reachable object is numbered as a plain object, so
+        // this isolates the `enqueue_gen` exclusion path. The holder is dropped;
+        // the page's /Contents stream (obj 4) is still numbered.
+        let map = GenerateRenumber::build_excluding(&mut pdf, &[], &excluded).expect("build");
+        assert!(map.new_for_original(ObjectRef::new(7, 0)).is_none());
+        assert!(map.new_for_original(ObjectRef::new(4, 0)).is_some());
+        assert_eq!(map.pairs().count(), 6);
+    }
+
+    #[test]
+    fn renumber_refs_in_place_directizes_dropped_length_holder() {
+        // The /Length holder (40,0) is absent from the map (dropped as an
+        // orphan); the stream's other ref (10,0) is mapped.
+        let map = CatalogFirstRenumber {
+            old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
+            order: vec![ObjectRef::new(10, 0)],
+        };
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Length", Object::Reference(ObjectRef::new(40, 0)));
+        stream_dict.insert("S", Object::Reference(ObjectRef::new(10, 0)));
+        let mut obj = Object::Stream(Stream::new(stream_dict, b"hello".to_vec()));
+
+        renumber_refs_in_place(&mut obj, &map).expect("rewrite");
+
+        let strm = obj.as_stream().unwrap();
+        // The dangling /Length is direct-ized to the raw byte count (5), not
+        // errored; the genuinely-mapped /S is renumbered normally.
+        assert_eq!(strm.dict.get("Length"), Some(&Object::Integer(5)));
+        assert_eq!(
+            strm.dict.get("S"),
+            Some(&Object::Reference(ObjectRef::new(1, 0)))
+        );
+    }
+
+    #[test]
+    fn renumber_refs_in_place_renumbers_mapped_length_holder() {
+        // A /Length holder that IS in the map (not dropped) must be renumbered as
+        // an ordinary reference, never direct-ized.
+        let map = CatalogFirstRenumber {
+            old_to_new: HashMap::from([(ObjectRef::new(40, 0), ObjectRef::new(3, 0))]),
+            order: vec![ObjectRef::new(40, 0)],
+        };
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Length", Object::Reference(ObjectRef::new(40, 0)));
+        let mut obj = Object::Stream(Stream::new(stream_dict, b"x".to_vec()));
+
+        renumber_refs_in_place(&mut obj, &map).expect("rewrite");
+
+        assert_eq!(
+            obj.as_stream().unwrap().dict.get("Length"),
+            Some(&Object::Reference(ObjectRef::new(3, 0)))
+        );
     }
 
     #[test]

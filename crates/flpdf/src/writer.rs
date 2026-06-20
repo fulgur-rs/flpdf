@@ -2617,11 +2617,26 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         return Err(crate::Error::Missing("/Root"));
     };
 
+    // flpdf-sqkq: drop indirect `/Length` holders that orphan once each stream's
+    // `/Length` is normalized to a direct integer, matching qpdf's reachability
+    // GC. Gated on direct-ization: `effective_stream_policy` is `None` only in
+    // `--stream-data=preserve`, where flpdf keeps the indirect `/Length` and the
+    // holder stays live; qdf mode externalizes `/Length` into its own holder
+    // objects, so leave that lifecycle untouched. Normal PDFs have no such
+    // orphans, so the set is empty and renumbering is unaffected.
+    let orphan_length_holders = if effective_stream_policy(options).is_some() && !options.qdf {
+        object_streams::orphaned_indirect_length_holders(pdf)?
+    } else {
+        BTreeSet::new()
+    };
+
     // Catalog-first renumber (flpdf-9hc.32): assign output object numbers in
     // qpdf's `enqueueObjectsStandard` BFS order so that plain rewrite output is
-    // byte-identical to `qpdf --static-id`. `build` borrows `pdf` mutably (lazy
-    // load) and returns an owned map, releasing the borrow before the loop.
-    let renumber = crate::rewrite_renumber::CatalogFirstRenumber::build(pdf)?;
+    // byte-identical to `qpdf --static-id`. `build_excluding` borrows `pdf`
+    // mutably (lazy load) and returns an owned map, releasing the borrow before
+    // the loop.
+    use crate::rewrite_renumber::CatalogFirstRenumber;
+    let renumber = CatalogFirstRenumber::build_excluding(pdf, &orphan_length_holders)?;
     // The new /Root reference (always seeded first by the walk, so present).
     let new_root = renumber
         .new_for_original(root_ref)
@@ -3605,9 +3620,16 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let eligible = object_streams::compressible_objgens(pdf)?;
     // 2. generateObjectStreams even split => one group per container.
     let groups = object_streams::even_split_into_streams(&eligible);
+    // flpdf-sqkq: drop indirect `/Length` holders that orphan once each stream's
+    // `/Length` is direct-ized — qpdf garbage-collects them. Generate mode always
+    // writes a direct `/Length`, so this is unconditional (cf. the catalog-first
+    // path, which gates on `effective_stream_policy`). An orphan holder is never
+    // an ObjStm member (members are reached via non-`/Length` edges only), so the
+    // even split above is unaffected.
+    let orphan_length_holders = object_streams::orphaned_indirect_length_holders(pdf)?;
     // 3. enqueueObject walk with the object-stream branch => container-first
     //    numbering (members ascending-source within each container).
-    let renumber = GenerateRenumber::build(pdf, &groups)?;
+    let renumber = GenerateRenumber::build_excluding(pdf, &groups, &orphan_length_holders)?;
     let new_root = generate_invariant(
         renumber.new_for_original(root_ref),
         "/Root absent from renumber map",
