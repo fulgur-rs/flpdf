@@ -62,7 +62,11 @@ fn flpdf_linearized_objstm_preserve(fixture: &str) -> Vec<u8> {
         .join(fixture);
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+    // Match the production Preserve path: the CLI builds the plan with
+    // `use_generate_objstm = (mode == Generate)` (flpdf-cli/src/main.rs), so
+    // Preserve passes `false`. `true` would enable Generate-mode open-document
+    // peeling, which the Preserve writer must not do.
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
