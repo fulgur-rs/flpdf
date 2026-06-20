@@ -194,6 +194,34 @@ fn sharedfonts100_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// cap-boundary-199: 199 first-page-shared font dicts + the /Pages tree = 200
+// eligible first-page-shared members, an exact multiple of the 100 cap. This is
+// the precise boundary the reverted ihb.3 fix targeted: the earlier per-part
+// greedy chunker filled one 100-member container exactly, then re-chunked the
+// /Info + /Pages extras into a stranded tiny first-half container, making the
+// page-0 object count and the shared-object hint table disagree (qpdf
+// --check-linearization not clean). qpdf's generateObjectStreams instead splits
+// the 200 members EVENLY across 3 containers (66 + 68 + 66), all part6, so no
+// container is stranded and the two hint tables stay in lockstep. flpdf's global
+// even-split (objstm_batches_generate) reproduces this byte-for-byte; a
+// regression to greedy chunks(cap) would re-split as 100 + 100 (2 containers)
+// and is caught here (structural + strict).
+#[test]
+fn cap_boundary_199_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-cap-boundary-199.pdf",
+        "objstm-lin-cap-boundary-199",
+    );
+}
+
+#[test]
+fn cap_boundary_199_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-cap-boundary-199.pdf",
+        "objstm-lin-cap-boundary-199",
+    );
+}
+
 // mixed-60-70: a part7 (other-page-private) ObjStm container. Exercises the
 // second-half container numbering (finding-4), the page-private-font
 // compression, and the per-page object-count / page-length container folds.
