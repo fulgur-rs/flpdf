@@ -410,6 +410,15 @@ pub(crate) fn orphaned_indirect_length_holders<R: std::io::Read + std::io::Seek>
                 length_holders.insert(*len_ref);
             }
         }
+        // Source `/Type /ObjStm` and `/Type /XRef` containers are never emitted
+        // (the linearization planner drops them — see `all_refs` in plan.rs and
+        // [`crate::writer::is_source_structural_container`]), so a reference they
+        // make does not keep an object alive in the output. Skip them here,
+        // mirroring the planner's emitted-object universe, so a holder referenced
+        // only from a dropped container is still recognised as an orphan.
+        if crate::writer::is_source_structural_container(obj) {
+            continue;
+        }
         collect_non_length_refs(obj, 0, &mut live_non_length)?;
     }
 
@@ -1896,6 +1905,58 @@ mod tests {
             orphans.is_empty(),
             "a /Length holder referenced via a nested ref in a direct trailer value must be kept; \
              got {orphans:?}"
+        );
+    }
+
+    #[test]
+    fn orphaned_indirect_length_holders_ignores_refs_from_source_structural_containers() {
+        // obj 5's indirect /Length holder (obj 6) is referenced via a non-/Length
+        // edge ONLY from a source /Type /ObjStm container (obj 7 /Aux). The planner
+        // drops that container, so the reference must NOT keep the holder alive —
+        // obj 6 is still an orphan (Codex r3445857177).
+        let bodies: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 5 >>\nstream\nBT ET\nendstream"),
+            (
+                5,
+                b"<< /Length 6 0 R >>\nstream\napp.alert('hi');\nendstream",
+            ),
+            (6, b"16"),
+            // Source ObjStm container that references the holder via /Aux. It is a
+            // structural container, so the planner never emits it.
+            (
+                7,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 /Aux 6 0 R >>\nstream\n\nendstream",
+            ),
+        ];
+        let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let size = bodies.len() as u32 + 1;
+        let mut offsets = vec![0usize; size as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(out)).unwrap();
+        let orphans = orphaned_indirect_length_holders(&mut pdf).unwrap();
+        assert_eq!(
+            orphans,
+            std::iter::once(ref0(6)).collect(),
+            "a holder referenced only from a dropped source structural container must be an orphan"
         );
     }
 
