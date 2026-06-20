@@ -63,9 +63,10 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
 /// The page's `/Contents` entry may be absent (returns `Ok(Vec::new())`), a single
 /// `Stream` or `Reference → Stream`, or an `Array` of such references.  Every stream
 /// is decoded through its filter pipeline via [`crate::filters::decode_stream_data`]
-/// and the resulting byte slices are concatenated with a single ASCII space (`b' '`)
-/// between each part, which is safe as a token boundary for PDF content-stream
-/// tokenisers (matching the convention used by lopdf and qpdf).
+/// and the parts are coalesced the way qpdf's `pipeContentStreams` does: a single
+/// `\n` is inserted before a stream only when the previous decoded stream did not
+/// already end in a newline (an empty stream, whose last byte is treated as 0,
+/// still forces the separator). No trailing newline is appended.
 ///
 /// # Errors
 ///
@@ -134,13 +135,21 @@ pub fn page_content_bytes<R: Read + Seek>(
         return Ok(Vec::new());
     }
 
-    // Decode each stream and join with a single space separator.
+    // Decode each stream and coalesce exactly as qpdf's `pipeContentStreams`
+    // does (libqpdf/QPDFObjectHandle.cc): a '\n' is inserted before a stream only
+    // when the previous decoded stream did NOT already end in a newline. qpdf
+    // resets its `LastChar` accumulator (initialised to 0) per stream, so an
+    // empty stream — whose last byte is 0, not '\n' — still forces a separator.
+    // No trailing newline is appended after the final stream.
     let mut result: Vec<u8> = Vec::new();
-    for (i, stream) in streams.into_iter().enumerate() {
+    let mut need_newline = false;
+    for stream in streams {
         let decoded = decode_stream_data(&stream.dict, &stream.data)?;
-        if i > 0 {
-            result.push(b' ');
+        if need_newline {
+            result.push(b'\n');
         }
+        let last = decoded.last().copied().unwrap_or(0);
+        need_newline = last != b'\n';
         result.extend_from_slice(&decoded);
     }
     Ok(result)
@@ -960,11 +969,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: /Contents = Array of References → decoded and joined with space
+    // Test: /Contents = Array of References → joined the way qpdf's
+    // pipeContentStreams does: a '\n' is inserted between streams only when the
+    // previous decoded stream does not already end in a newline.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn page_content_bytes_concatenates_array_of_refs_with_space_separator() {
+    fn page_content_bytes_concatenates_array_of_refs_with_newline_separator() {
+        // Neither body ends in a newline, so qpdf inserts a single '\n' between them.
         let body1 = b"q 1 0 0 1 0 0 cm";
         let body2 = b"BT /F1 12 Tf (World) Tj ET";
         let stream_bytes1 = stream_object_bytes(4, body1);
@@ -977,7 +989,43 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let content = page_content_bytes(&mut pdf, page_ref).unwrap();
         let mut expected = body1.to_vec();
-        expected.push(b' ');
+        expected.push(b'\n');
+        expected.extend_from_slice(body2);
+        assert_eq!(content, expected);
+    }
+
+    #[test]
+    fn page_content_bytes_no_separator_when_prev_stream_ends_in_newline() {
+        // body1 already ends in '\n' → qpdf adds NO separator before body2.
+        let body1 = b"q 1 0 0 1 0 0 cm\n";
+        let body2 = b"BT /F1 12 Tf (World) Tj ET";
+        let stream_bytes1 = stream_object_bytes(4, body1);
+        let stream_bytes2 = stream_object_bytes(5, body2);
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[(4, stream_bytes1), (5, stream_bytes2)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let mut expected = body1.to_vec();
+        expected.extend_from_slice(body2);
+        assert_eq!(content, expected);
+    }
+
+    #[test]
+    fn page_content_bytes_empty_stream_forces_newline() {
+        // An empty first stream produces no bytes; qpdf's per-stream LastChar is
+        // initialised to 0 (not '\n'), so a '\n' is still inserted before body2.
+        let body2 = b"BT /F1 12 Tf (World) Tj ET";
+        let stream_bytes1 = stream_object_bytes(4, b"");
+        let stream_bytes2 = stream_object_bytes(5, body2);
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[(4, stream_bytes1), (5, stream_bytes2)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let mut expected = vec![b'\n'];
         expected.extend_from_slice(body2);
         assert_eq!(content, expected);
     }
@@ -1796,7 +1844,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let mut expected = body1.to_vec();
-        expected.push(b' ');
+        expected.push(b'\n');
         expected.extend_from_slice(body2);
         assert_eq!(content, expected);
     }
