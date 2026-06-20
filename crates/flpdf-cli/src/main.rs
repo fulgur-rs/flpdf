@@ -3584,9 +3584,11 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 /// source opens under the same gate as the primary input.
 ///
 /// Page-range defaults match qpdf: an **absent** `--from`/`--to` defaults to all
-/// source/destination pages, while an **explicit empty** `--from=` selects an
-/// empty source set (so `--repeat` cycles from the first destination page).
-/// `--repeat` is absent by default (`None`, i.e. no repetition).
+/// source/destination pages. An **explicit empty** range is distinct from an
+/// absent one: empty `--from=` selects an empty source set (so `--repeat` cycles
+/// from the first destination page), empty `--to=` selects an empty destination
+/// set (the overlay becomes a no-op), and empty `--repeat=` means no repetition
+/// (identical to an absent `--repeat`). `--repeat` is `None` by default.
 ///
 /// # Errors
 ///
@@ -3628,10 +3630,23 @@ fn build_overlay_specs(
             Some("") => PageRange::empty(),
             Some(r) => PageRange::parse(r)?,
         };
-        let to = PageRange::parse(spec.to.as_deref().unwrap_or(""))?;
-        let repeat = match &spec.repeat {
+        // Distinguish an absent `--to` (default: all destination pages) from an
+        // explicit empty `--to=` (empty destination set). qpdf treats the latter
+        // as selecting no destination pages, so the overlay is a no-op (observed:
+        // byte-identical to a plain rewrite of the destination).
+        let to = match spec.to.as_deref() {
+            None => PageRange::parse("")?,
+            Some("") => PageRange::empty(),
+            Some(r) => PageRange::parse(r)?,
+        };
+        // An explicit empty `--repeat=` means "no repeat", identical to an absent
+        // `--repeat` (qpdf-observed: byte-identical to the default overlay). Both
+        // map to `None`, the canonical no-repeat representation; mapping to
+        // `Some(PageRange::empty())` would resolve to the same empty set in
+        // `spec_page_sources`, so `None` is preferred.
+        let repeat = match spec.repeat.as_deref() {
+            None | Some("") => None,
             Some(r) => Some(PageRange::parse(r)?),
-            None => None,
         };
         built.push(flpdf::OverlaySpec {
             source,
@@ -5635,6 +5650,66 @@ mod tests {
 
         let explicit = build_overlay_specs(&spec(Some("2")), false, false).unwrap();
         assert_eq!(explicit[0].from.resolve(3).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn build_overlay_specs_distinguishes_absent_and_empty_to() {
+        // qpdf parity: an absent `--to` defaults to all destination pages, while
+        // an explicit empty `--to=` selects no destination pages (the overlay
+        // becomes a no-op). A non-empty `--to=` is honored verbatim.
+        let file = compat_fixture("three-page.pdf");
+        let spec = |to: Option<&str>| {
+            vec![OverlaySpec {
+                kind: OverlayKind::Overlay,
+                file: file.clone(),
+                password: None,
+                from: None,
+                to: to.map(str::to_string),
+                repeat: None,
+            }]
+        };
+
+        let absent = build_overlay_specs(&spec(None), false, false).unwrap();
+        assert_eq!(absent[0].to.resolve(3).unwrap(), vec![1, 2, 3]);
+
+        let empty = build_overlay_specs(&spec(Some("")), false, false).unwrap();
+        assert_eq!(empty[0].to.resolve(3).unwrap(), Vec::<u32>::new());
+
+        let explicit = build_overlay_specs(&spec(Some("2-3")), false, false).unwrap();
+        assert_eq!(explicit[0].to.resolve(3).unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn build_overlay_specs_distinguishes_absent_and_empty_repeat() {
+        // qpdf parity: an explicit empty `--repeat=` is "no repeat", identical to
+        // an absent `--repeat` (both map to `None`). A non-empty `--repeat=` is
+        // parsed into a source-page range.
+        let file = compat_fixture("three-page.pdf");
+        let spec = |repeat: Option<&str>| {
+            vec![OverlaySpec {
+                kind: OverlayKind::Overlay,
+                file: file.clone(),
+                password: None,
+                from: None,
+                to: None,
+                repeat: repeat.map(str::to_string),
+            }]
+        };
+
+        let absent = build_overlay_specs(&spec(None), false, false).unwrap();
+        assert!(absent[0].repeat.is_none(), "absent --repeat -> None");
+
+        let empty = build_overlay_specs(&spec(Some("")), false, false).unwrap();
+        assert!(
+            empty[0].repeat.is_none(),
+            "explicit empty --repeat= -> None (no repeat), same as absent"
+        );
+
+        let explicit = build_overlay_specs(&spec(Some("2")), false, false).unwrap();
+        assert_eq!(
+            explicit[0].repeat.as_ref().unwrap().resolve(3).unwrap(),
+            vec![2]
+        );
     }
 
     #[test]
