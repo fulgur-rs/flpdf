@@ -459,10 +459,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 /// Read the leaf page's `/UserUnit` (not inheritable). Returns `(present, value)`:
 /// `present` is whether the leaf carried a non-null `/UserUnit`; `value` is its
 /// numeric value (1.0 when present-but-not-a-number).
-fn leaf_user_unit<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<(bool, f64)> {
+fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<(bool, f64)> {
     let uu_val = {
         let page_obj = pdf.resolve_borrowed(page_ref)?;
         let Some(dict) = page_obj.as_dict() else {
