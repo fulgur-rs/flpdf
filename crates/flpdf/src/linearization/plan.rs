@@ -598,11 +598,17 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
-        let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
+        let mut first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
             compute_closure(pdf, first_page)?
         } else {
             Vec::new()
         };
+        // A page-reachable stream's orphaned indirect /Length holder (flpdf-2vfg)
+        // enters the closure because compute_closure follows the stream dict's
+        // /Length via collect_direct_refs. qpdf garbage-collects it, so drop it
+        // from every page closure too — the all_refs filter above only removes it
+        // from the Part-4 universe and would otherwise leak it into Part 2/3.
+        first_page_closure.retain(|r| !orphan_length_holders.contains(r));
         let first_page_set: BTreeSet<ObjectRef> = first_page_closure.iter().copied().collect();
 
         // ----------------------------------------------------------------
@@ -630,7 +636,11 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref)?;
+            let mut closure = compute_closure(pdf, page_ref)?;
+            // Drop orphaned indirect /Length holders from later-page closures too
+            // (see the first-page closure above) so a page-private stream's holder
+            // is not emitted as a part7/part8 object.
+            closure.retain(|r| !orphan_length_holders.contains(r));
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -4924,6 +4934,57 @@ mod tests {
             !out.windows(b"/Length 7 0 R".len())
                 .any(|w| w == b"/Length 7 0 R"),
             "the OD stream's /Length must be direct-ized, not left as an indirect ref"
+        );
+    }
+
+    /// Two-page PDF whose SECOND page's `/Contents` stream (obj 6) has an
+    /// indirect `/Length` (`7 0 R`); the holder (obj 7) is reachable only via
+    /// that page-2 closure edge. flpdf-2vfg / Codex review on PR #400.
+    fn page2_contents_indirect_length_pdf_bytes() -> Vec<u8> {
+        let bodies: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 2 /Kids [ 3 0 R 4 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << >> >>",
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << >> >>",
+            ),
+            (5, b"<< /Length 5 >>\nstream\nBT ET\nendstream"),
+            (6, b"<< /Length 7 0 R >>\nstream\nBT ET\nendstream"),
+            (7, b"5"),
+        ];
+        let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = bodies.len() as u32 + 1;
+        let mut offsets = vec![0usize; total as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    #[test]
+    fn generate_plan_drops_orphan_length_holder_reached_via_later_page_closure() {
+        // The holder (obj 7) is reached only through page 2's /Contents stream
+        // /Length. It must be dropped from the later-page closure too, not just
+        // the Part-4 universe — otherwise it lands in the per-page (part7) set.
+        let mut pdf = Pdf::open(Cursor::new(page2_contents_indirect_length_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+        assert!(
+            !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
+            "a page-reachable orphaned /Length holder must not be assigned to any part"
         );
     }
 }

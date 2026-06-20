@@ -315,6 +315,8 @@ declare -A G6HB2_FIX=(
     [objstm-lin-thumbnail-private-shared]="gen_thumbnail.py"
     [objstm-lin-od-indirect-length]="gen_od_indirect_length.py"
     [objstm-lin-od-indirect-length-flate]="gen_od_indirect_length.py --flate"
+    [objstm-lin-page-contents-indirect-length]="gen_page_contents_indirect_length.py"
+    [objstm-lin-page-contents-indirect-length-flate]="gen_page_contents_indirect_length.py --flate"
 )
 for stem in "${!G6HB2_FIX[@]}"; do
     if [[ ! -f "$FIX/$stem.pdf" ]]; then
@@ -499,7 +501,9 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-acroform-widget-page1-only \
             objstm-lin-acroform-widget-page1-page2 \
             objstm-lin-thumbnail-private-shared \
-            objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate; do
+            objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate \
+            objstm-lin-page-contents-indirect-length \
+            objstm-lin-page-contents-indirect-length-flate; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"

@@ -760,3 +760,43 @@ fn od_indirect_length_flate_objstm_byte_identical_to_qpdf() {
         "objstm-lin-od-indirect-length-flate",
     );
 }
+
+// page-contents-indirect-length (flpdf-2vfg, Codex review on PR #400): the PAGE
+// /Contents stream (not an open-document stream) carries an indirect /Length
+// whose holder is reachable only via that /Length edge. The holder enters the
+// first-page closure because compute_closure follows the stream dict's /Length,
+// so the Part-4 `all_refs` filter alone is not enough — the planner must drop it
+// from the page closures too. These pin flpdf byte-identical to qpdf, i.e. the
+// orphaned holder is dropped and not leaked into Part 2/3, for both an
+// uncompressed and a lone-/FlateDecode content stream.
+#[test]
+fn page_contents_indirect_length_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-page-contents-indirect-length.pdf",
+        "objstm-lin-page-contents-indirect-length",
+    );
+}
+
+#[test]
+fn page_contents_indirect_length_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-page-contents-indirect-length.pdf",
+        "objstm-lin-page-contents-indirect-length",
+    );
+}
+
+#[test]
+fn page_contents_indirect_length_flate_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-page-contents-indirect-length-flate.pdf",
+        "objstm-lin-page-contents-indirect-length-flate",
+    );
+}
+
+#[test]
+fn page_contents_indirect_length_flate_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-page-contents-indirect-length-flate.pdf",
+        "objstm-lin-page-contents-indirect-length-flate",
+    );
+}
