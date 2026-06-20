@@ -796,23 +796,31 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // layer; the golden recipes live in tests/golden/regenerate.sh. Goldens under
 // tests/golden/references/overlay/.
 //
-//   case                | kind     | source        | --from | --to  | --repeat
-//   --------------------|----------|---------------|--------|-------|---------
-//   one-page (.16.3)    | overlay  | one-page      | -      | -     | -
-//   two-page default    | overlay  | two-page      | -      | -     | -
-//   one-page repeat1    | overlay  | one-page      | -      | -     | 1
-//   two-page to=2-3     | overlay  | two-page      | -      | 2-3   | -
-//   two overlays (.16.5)| overlay×2| one + two     | -      | -     | -
-//   overlay+underlay    | over+und | one + two     | -      | -     | -
-//   two-page from=2     | overlay  | two-page      | 2      | -     | -
-//   underlay two-page   | underlay | two-page      | -      | -     | -
-//   rotated (.16.3 mtx) | overlay  | one-page-r90  | -      | -     | -
-//   one-page to=1-3 rpt1| overlay  | one-page      | -      | 1-3   | 1
+//   case                | kind     | dest          | source        | --from | --to  | --repeat
+//   --------------------|----------|---------------|---------------|--------|-------|---------
+//   one-page (.16.3)    | overlay  | three-page    | one-page      | -      | -     | -
+//   two-page default    | overlay  | three-page    | two-page      | -      | -     | -
+//   one-page repeat1    | overlay  | three-page    | one-page      | -      | -     | 1
+//   two-page to=2-3     | overlay  | three-page    | two-page      | -      | 2-3   | -
+//   two overlays (.16.5)| overlay×2| three-page    | one + two     | -      | -     | -
+//   overlay+underlay    | over+und | three-page    | one + two     | -      | -     | -
+//   two-page from=2     | overlay  | three-page    | two-page      | 2      | -     | -
+//   underlay two-page   | underlay | three-page    | two-page      | -      | -     | -
+//   rotated source mtx  | overlay  | three-page    | one-page-r90  | -      | -     | -
+//   one-page to=1-3 rpt1| overlay  | three-page    | one-page      | -      | 1-3   | 1
+//   multi-stream (.16.10)| overlay | three-page    | multi-stream  | -      | -     | -
+//   rotated dest (.16.10)| overlay | one-page-r90  | one-page      | -      | -     | -
+//   userunit (.16.10)   | overlay  | three-page    | userunit      | -      | -     | -
 //
-// The rotated row is the matrix-transformed placement check: the source page
-// carries /Rotate 90, so its imported Form XObject gets a non-identity /Matrix
-// and the placement `cm` is fitted to the matrix-transformed bbox (a whole-file
-// byte match proves both the /Matrix import and the cm fragment).
+// The rotated-source row is the matrix-transformed placement check: the source
+// page carries /Rotate 90, so its imported Form XObject gets a non-identity
+// /Matrix. The flpdf-9hc.16.10 rows widen the gate to the four byte-parity gaps
+// the narrow fixtures had masked: multi-stream exercises the conditional /Matrix
+// omission (no /Rotate) and qpdf's newline content coalescing; rotated dest
+// exercises the destination inverse transform folded into every placement cm;
+// userunit exercises the /UserUnit scale folded into the Form /Matrix. The
+// .16.10 source fixtures are pinned to PDF 1.3 (== the three-page dest) so the
+// orthogonal source version-floor limitation does not perturb the bytes.
 //
 // Explicit deferrals (NOT covered here, by design):
 //   - Encrypted-source --password byte-identity: deferred to flpdf-9hc.16.8
@@ -1087,6 +1095,74 @@ mod byte_gate {
         .unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-to-repeat.pdf");
+    }
+
+    #[test]
+    fn overlay_multi_stream_source_is_byte_identical() {
+        // dest=three-page, overlay source=multi-stream-one-page (no /Rotate, a
+        // two-element /Contents array whose first stream does not end in a
+        // newline). The imported Form XObject must OMIT /Matrix (no /Rotate or
+        // /UserUnit) and coalesce the two content streams with qpdf's newline rule
+        // (a single '\n' between them). A whole-file match proves the
+        // /Matrix-omission (gap 1) and newline coalescing (gap 2). The source is
+        // pinned to PDF 1.3 (== dest) so the orthogonal source version-floor
+        // limitation does not perturb the bytes.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("multi-stream-one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-multi-stream.pdf");
+    }
+
+    #[test]
+    fn overlay_onto_rotated_dest_is_byte_identical() {
+        // dest=one-page-r90 (a +90-rotated page), overlay source=one-page. The
+        // destination's inverse transform is folded into BOTH the /Fx0 placement
+        // (cm "0 1 -1 0 612 0") and the source placement
+        // ("0 0.77273 -0.77273 0 612 159.54545") — the nonzero b/c prove the dest
+        // inverse transform is applied (gap 3).
+        let mut dest = fixture("one-page-r90.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "r90-dest-overlay-one-page.pdf");
+    }
+
+    #[test]
+    fn overlay_userunit_source_is_byte_identical() {
+        // dest=three-page, overlay source=userunit-one-page (/UserUnit 2, no
+        // /Rotate, pinned to PDF 1.3 == dest). The imported Form XObject's /Matrix
+        // folds the unit scale in ([2 0 0 2 0 0]); a whole-file match proves the
+        // /UserUnit scale (gap 4).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("userunit-one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-userunit.pdf");
     }
 
     /// Build a default-range [`OverlaySpec`] over a fixture document.

@@ -178,6 +178,79 @@ else
     echo "Skipping one-page-r90.pdf (already exists)"
 fi
 
+# Overlay byte-parity widening fixtures (flpdf-9hc.16.10). qpdf's CLI cannot add
+# /UserUnit and there is no plain multi-stream-no-/Rotate corpus pinned to PDF
+# 1.3, so both are hand-built (correct xref offsets) then normalised through
+# `qpdf --force-version=1.3 --static-id` for a clean, deterministic, dest-version
+# (three-page is 1.3) fixture. Pinning to 1.3 keeps the orthogonal source
+# version-floor limitation out of the overlay byte-gate.
+if [[ ! -f "$FIX/userunit-one-page.pdf" ]]; then
+    echo "Generating userunit-one-page.pdf ..."
+    # Single page with /UserUnit 2 and no /Rotate -> getFormXObjectForPage folds
+    # the scale into the Form /Matrix ([2 0 0 2 0 0]).
+    python3 - "$FIX/userunit-one-page.pdf" <<'PY'
+import subprocess, sys, tempfile, os
+objs = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /UserUnit 2 "
+    b"/Resources << /ProcSet [/PDF] >> /Contents 4 0 R >>",
+]
+content = b"0.5 g 100 100 200 200 re f"
+objs.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content))
+out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out)); out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+xs = len(out); n = len(objs) + 1
+out += b"xref\n0 %d\n0000000000 65535 f \n" % n
+for o in offs: out += b"%010d 00000 n \n" % o
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xs)
+with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as t:
+    t.write(out); rough = t.name
+subprocess.run(["qpdf", "--static-id", "--force-version=1.3", "--warning-exit-0",
+                rough, sys.argv[1]], check=True)
+os.unlink(rough)
+PY
+else
+    echo "Skipping userunit-one-page.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/multi-stream-one-page.pdf" ]]; then
+    echo "Generating multi-stream-one-page.pdf ..."
+    # Two-element /Contents array, no /Rotate; the first stream does not end in a
+    # newline, so getFormXObjectForPage's pipeContentStreams inserts a single '\n'
+    # between the two streams.
+    python3 - "$FIX/multi-stream-one-page.pdf" <<'PY'
+import subprocess, sys, tempfile, os
+c1 = b"q 1 0 0 1 0 0 cm"
+c2 = b"0.5 g 100 100 200 200 re f"
+objs = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+    b"/Resources << /ProcSet [/PDF] >> /Contents [4 0 R 5 0 R] >>",
+    b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
+    b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2),
+]
+out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out)); out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+xs = len(out); n = len(objs) + 1
+out += b"xref\n0 %d\n0000000000 65535 f \n" % n
+for o in offs: out += b"%010d 00000 n \n" % o
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xs)
+with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as t:
+    t.write(out); rough = t.name
+subprocess.run(["qpdf", "--static-id", "--force-version=1.3", "--warning-exit-0",
+                rough, sys.argv[1]], check=True)
+os.unlink(rough)
+PY
+else
+    echo "Skipping multi-stream-one-page.pdf (already exists)"
+fi
+
 # No-stream multipage fixtures for NON-linearized --object-streams=generate
 # byte-parity (flpdf-g6hb.1). Every reachable object is an ObjStm-eligible dict
 # (no content streams), so the output body is just the ObjStm container(s) plus
@@ -526,6 +599,27 @@ qpdf --static-id --warning-exit-0 \
     "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" --to=1-3 --repeat=1 -- \
     "$REF/overlay/three-page-overlay-to-repeat.pdf"
 echo "overlay/three-page-overlay-to-repeat.pdf"
+
+# Byte-parity widening (flpdf-9hc.16.10):
+#  - multi-stream source: no /Rotate -> imported Form XObject OMITS /Matrix, and
+#    its two content streams coalesce with a single '\n' (gaps 1 + 2).
+#  - rotated dest: the dest inverse transform folds into BOTH the /Fx0 and source
+#    placement cm (gap 3).
+#  - /UserUnit source: the imported Form /Matrix folds the unit scale in (gap 4).
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/multi-stream-one-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-multi-stream.pdf"
+echo "overlay/three-page-overlay-multi-stream.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/one-page-r90.pdf" --overlay "$FIX/one-page.pdf" -- \
+    "$REF/overlay/r90-dest-overlay-one-page.pdf"
+echo "overlay/r90-dest-overlay-one-page.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/userunit-one-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-userunit.pdf"
+echo "overlay/three-page-overlay-userunit.pdf"
 
 
 echo ""
