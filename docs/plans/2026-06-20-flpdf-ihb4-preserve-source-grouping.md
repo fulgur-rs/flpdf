@@ -178,19 +178,27 @@ git commit -m "test(linearization): pin failing preserve >cap byte-parity (flpdf
 **Step 1: In the per-container classification loop, keep `pages_tree_ref`/`info_ref` as
 first-half members of their source container**
 
-Currently a member that is neither in `part3_set` nor `part4_set` falls into the
-"else: leave as plain indirect" arm. Add a branch BEFORE that else so that, when the member is
-`self.pages_tree_ref` or `self.info_ref` (and eligible — the loop already checked
-`is_eligible_for_objstm` and the part2/length exclusions), it is pushed into `p3_eligible`
-(the first-half bucket for THIS source container), matching qpdf keeping the source member in
-its container. Add a `//` comment citing qpdf `preserveObjectStreams` + the linearized
-page/catalog erase (QPDFWriter.cc:1939, 2141-2161). Keep DRY: compute the
-`pages_tree_ref`/`info_ref` match once.
+MEASURED PREMISE (instrumented on the bearing fixture): `pages_tree_ref` (obj3) is in
+`part4_rest`, so the current classification routes it to the Part-4 owner bucket
+(`owner_of` → `Owner::Rest` → `p4_by_owner`), NOT to a "plain indirect" arm. Before catalog-drop
+the part4 buckets are `[[2,3],[71]]` (Catalog+Pages share the Rest bucket; Page2 in a Page
+bucket). So the new branch must take PRECEDENCE over the `part3_set`/`part4_set` classification.
 
-Note: `pages_tree_ref`/`info_ref` live in `part4_rest` (renumber promotes them); batching them
-into part3 keeps a valid RenumberMap slot (Invariant 9 in the existing unit test checks
-`part3_set || part4_set`, which `part4_rest` satisfies). This is the same set/batch split the
-current `canonicalise_first_half_batch` fold already relies on — verified clean.
+In the member loop, AFTER the part2 / length-exclusion / `is_eligible_for_objstm` guards but
+BEFORE the `if part3_set.contains(..) { p3_eligible } else if part4_set.contains(..) {..}`
+classification, add: if `obj_ref` equals `self.pages_tree_ref` or `self.info_ref`, push it into
+`p3_eligible` (this source container's first-half bucket) and `continue`. This mirrors qpdf
+keeping the source member in its container (qpdf `preserveObjectStreams` copies the source
+assignment; the linearized erase only removes /Page dicts + /Catalog — QPDFWriter.cc:1939,
+2141-2161 — NOT the /Pages tree or /Info). Keep DRY: compute the `pages_tree_ref`/`info_ref`
+match once.
+
+Note on slot validity: `pages_tree_ref`/`info_ref` stay in `part4_rest` (renumber promotes them
+to first-half via `promote()`), so batching them into part3 keeps a valid RenumberMap slot — the
+existing unit-test Invariant 9 checks `part3_set || part4_set`, which `part4_rest` satisfies.
+This is exactly the set/batch split the current `canonicalise_first_half_batch` fold already
+relies on (it folds obj3 from part4 into a part3 batch), and that output is `check-linearization`
+clean — so routing earlier (and keeping source grouping) preserves the same slot invariant.
 
 **Step 2: Build and run the preserve unit tests**
 
@@ -214,26 +222,30 @@ git commit -m "fix(linearization): preserve routes /Pages+/Info to source contai
 - Modify: `crates/flpdf/src/linearization/plan.rs` (`canonicalise_first_half_batch` ~1539-1633;
   its call site/doc ~1442-1517)
 
-**Step 1: Remove the grouping-destroying re-chunk**
+**Step 1: Remove `canonicalise_first_half_batch` (its fold + re-chunk are now redundant AND
+non-qpdf-faithful)**
 
-`canonicalise_first_half_batch` currently: collects `first_half_extra` (/Info, /Pages-tree),
-excludes Catalog/Pages/Info from Part 4, then flattens `part3_batches`, appends the extras,
-sorts by number, and `members.chunks(cap)` → over-writes `part3_batches`. With (A) already
-placing /Pages+/Info in the correct source-container batch, this whole flatten+append+chunk
-step is both redundant and wrong (it greedily merges containers). Replace it so the per-source-
-container `part3_batches` grouping is preserved:
-- Keep the Part-4 exclusion of `/Catalog`/`/Pages`/`/Info` (Catalog drop already happens at the
-  call site; /Pages+/Info no longer reach Part 4 after (A), so this becomes a safety no-op —
-  retain or fold into a short guard, whichever keeps the code minimal and covered).
-- Delete the `first_half_extra` collection, the flatten, the `sort_unstable_by_key`, and the
-  `members.chunks(cap)` assignment.
+`canonicalise_first_half_batch` currently: collects `first_half_extra` (/Info, /Pages-tree NOT
+already in part3), excludes Catalog/Pages/Info from Part 4, then flattens `part3_batches`,
+appends the extras, sorts by number, and `members.chunks(cap)` → over-writes `part3_batches`.
 
-If, after (A), `canonicalise_first_half_batch` no longer does anything beyond the Part-4
-exclusion already covered at the call site, prefer **removing the function and its call**
-entirely (and updating the surrounding doc-comment at ~1442-1517 + the `cov:ignore` block at
-1503-1515 that guards its `?`). Decide by what leaves the smallest, fully-covered surface.
-Update the Preserve-arm doc comment (1484-1499) to state the source-grouping behaviour
-(no /Pages+/Info fold, no re-chunk) and cite qpdf preserveObjectStreams.
+After (A), `/Pages`+`/Info` are already in their source-container part3 batch, so
+`first_half_extra` is EMPTY and the Part-4 exclusion drops nothing new (Catalog is already
+dropped at the call site, ~1500-1502; /Pages+/Info are no longer in Part 4). The function is now
+fully redundant. Moreover the unconditional fold is non-qpdf-faithful: if `/Pages`/`/Info` were
+*plain* (not ObjStm members) in the source, qpdf preserve keeps them plain, but the old fold
+would force-compress them into a first-half ObjStm. (A) only routes them when they ARE source
+members, which is exactly qpdf's behaviour.
+
+Therefore **remove `canonicalise_first_half_batch` and its call site** (the
+`if !plan.part3_batches.is_empty() { self.canonicalise_first_half_batch(...) }` block and its
+`cov:ignore-start/-end` guard at ~1503-1516). Keep the Catalog Part-4 drop at ~1500-1502 (it is
+separate and still required — qpdf never compresses the Catalog). Update the Preserve-arm
+doc-comment (~1484-1499) and the `objstm_batches` rustdoc (~1442-1446) to describe the
+source-grouping behaviour (preserve keeps qpdf's source ObjStm grouping; /Pages+/Info ride along
+in their source container; no fold, no re-chunk; Catalog stays standalone) and cite qpdf
+`preserveObjectStreams` (QPDFWriter.cc:1939) + the linearized page/catalog erase (2141-2161).
+Remove now-dead helpers if `canonicalise_first_half_batch` was their only caller.
 
 **Step 2: Run the structural preserve byte test — verify it now PASSES**
 
