@@ -607,6 +607,14 @@ qpdf --static-id --warning-exit-0 \
     "$REF/overlay/three-page-overlay-two-page-from2.pdf"
 echo "overlay/three-page-overlay-two-page-from2.pdf"
 
+# Explicit empty --from= (distinct from an absent --from): qpdf treats it as an
+# empty source set, so --repeat cycles from the first dest page. Here from={},
+# repeat={2} -> every dest page receives source page 2 (NOT s1,s2 then exhausted).
+qpdf --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/two-page.pdf" --from= --repeat=2 -- \
+    "$REF/overlay/three-page-overlay-two-page-from-empty-repeat2.pdf"
+echo "overlay/three-page-overlay-two-page-from-empty-repeat2.pdf"
+
 qpdf --static-id --warning-exit-0 \
     "$FIX/three-page.pdf" --underlay "$FIX/two-page.pdf" -- \
     "$REF/overlay/three-page-underlay-two-page.pdf"

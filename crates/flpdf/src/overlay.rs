@@ -805,6 +805,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 //   two overlays (.16.5)| overlay×2| three-page    | one + two     | -      | -     | -
 //   overlay+underlay    | over+und | three-page    | one + two     | -      | -     | -
 //   two-page from=2     | overlay  | three-page    | two-page      | 2      | -     | -
+//   two-page from= rpt2 | overlay  | three-page    | two-page      | (empty)| -     | 2
 //   underlay two-page   | underlay | three-page    | two-page      | -      | -     | -
 //   rotated source mtx  | overlay  | three-page    | one-page-r90  | -      | -     | -
 //   one-page to=1-3 rpt1| overlay  | three-page    | one-page      | -      | 1-3   | 1
@@ -1033,6 +1034,31 @@ mod byte_gate {
         .unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-two-page-from2.pdf");
+    }
+
+    #[test]
+    fn overlay_two_page_from_empty_repeat2_is_byte_identical() {
+        // dest=three-page, overlay source=two-page, explicit empty --from= with
+        // --repeat=2: an empty `from` set means `--repeat` cycles from the first
+        // dest page, so every dest page receives source page 2. This pins the
+        // empty-from path that `PageRange::empty()` enables (distinct from an
+        // absent `--from`, which would map p1<-s1, p2<-s2, p3 untouched).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("two-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &PageRange::empty(),
+            &pr(""),
+            Some(&pr("2")),
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(
+            &actual,
+            "three-page-overlay-two-page-from-empty-repeat2.pdf",
+        );
     }
 
     #[test]

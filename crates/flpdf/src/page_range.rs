@@ -104,6 +104,19 @@ impl PageRange {
         })
     }
 
+    /// Construct a range that selects **no** pages.
+    ///
+    /// This is distinct from [`PageRange::parse`] of the empty string, which
+    /// returns the "all pages" sentinel. It corresponds to qpdf's
+    /// overlay/underlay semantics where an explicitly empty `--from=` selects an
+    /// empty source set, so [`resolve`](PageRange::resolve) returns an empty
+    /// vector for any page count.
+    pub fn empty() -> Self {
+        Self {
+            entries: Some(Vec::new()),
+        }
+    }
+
     /// Resolve the parsed expression against `page_count` (the number of pages
     /// in the document, ≥ 1).
     ///
@@ -566,6 +579,16 @@ mod tests {
     #[test]
     fn empty_resolves_to_all() {
         assert_eq!(resolve("", 5), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn empty_constructor_selects_no_pages() {
+        // `PageRange::empty()` is the empty source set (qpdf `--from=`), distinct
+        // from `parse("")` which is the "all pages" sentinel.
+        let none = PageRange::empty();
+        assert_eq!(none.entries, Some(Vec::new()));
+        assert_eq!(none.resolve(5).unwrap(), Vec::<u32>::new());
+        assert_ne!(none, PageRange::parse("").unwrap());
     }
 
     #[test]

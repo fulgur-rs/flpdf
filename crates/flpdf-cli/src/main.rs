@@ -3093,7 +3093,7 @@ fn run_rewrite(
         // here; the new objects only surface because full_rewrite was forced on
         // above.
         if !overlay_specs.is_empty() {
-            let mut built = build_overlay_specs(overlay_specs, repair)?;
+            let mut built = build_overlay_specs(overlay_specs, repair, password.allow_weak_crypto)?;
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 
@@ -3484,6 +3484,14 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
 /// Tokens such as `--password=…` that merely start with `--` do not terminate a
 /// group; only a token equal to `--` does.
 ///
+/// The scan is scoped to *rewrite-level* overlay flags: the sibling
+/// value-terminated segments (`--encrypt`, `--pages`, `--add-attachment`,
+/// `--copy-attachments-from`) are each consumed as a unit up to their own
+/// terminating `--`, so an `--overlay`/`--underlay` token appearing as one of
+/// their values is preserved verbatim rather than starting a spurious group
+/// (mirroring qpdf's left-to-right parser, which consumes each value-terminated
+/// option as a whole).
+///
 /// # Errors
 ///
 /// Returns an error if a group is not terminated by a `--` token, or if
@@ -3495,6 +3503,25 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
+        // A sibling value-terminated segment owns every token up to its own
+        // terminating `--`. Copy it verbatim into the residual (for clap) without
+        // scanning inside, so an `--overlay`/`--underlay` that is really a *value*
+        // of one of these flags is not mistaken for a new overlay group. An
+        // unterminated segment is copied to the end and left for clap to reject.
+        if matches!(
+            arg.as_str(),
+            "--encrypt" | "--pages" | "--add-attachment" | "--copy-attachments-from"
+        ) {
+            residual.push(arg);
+            for tok in iter.by_ref() {
+                let is_terminator = tok == "--";
+                residual.push(tok);
+                if is_terminator {
+                    break;
+                }
+            }
+            continue;
+        }
         // qpdf requires the overlay/underlay file as a separate token (the file
         // may be written `--file=FILE` INSIDE the group, but the flag itself is
         // not an `=`-valued option). qpdf rejects `--overlay=FILE` with "overlay
@@ -3552,9 +3579,14 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 /// opening each source PDF (with its per-segment `--password`).
 ///
 /// Source files are opened read-only; an authentication failure or unreadable
-/// file is surfaced as a CLI error. Default page-range semantics match qpdf:
-/// `--from`/`--to` default to all source/destination pages (an empty range
-/// string), and `--repeat` is absent by default (`None`, i.e. no repetition).
+/// file is surfaced as a CLI error. `allow_weak_crypto` is the top-level
+/// `--allow-weak-crypto` opt-in, threaded through so an RC4/R5-encrypted overlay
+/// source opens under the same gate as the primary input.
+///
+/// Page-range defaults match qpdf: an **absent** `--from`/`--to` defaults to all
+/// source/destination pages, while an **explicit empty** `--from=` selects an
+/// empty source set (so `--repeat` cycles from the first destination page).
+/// `--repeat` is absent by default (`None`, i.e. no repetition).
 ///
 /// # Errors
 ///
@@ -3565,6 +3597,7 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 fn build_overlay_specs(
     specs: &[OverlaySpec],
     repair: bool,
+    allow_weak_crypto: bool,
 ) -> CliResult<Vec<flpdf::OverlaySpec<BufReader<File>>>> {
     let mut built = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -3572,6 +3605,7 @@ fn build_overlay_specs(
         let file = File::open(&path).map_err(|error| error_with_file(&path, error.into()))?;
         let options = PdfOpenOptions {
             repair,
+            allow_weak_crypto,
             password: spec
                 .password
                 .as_ref()
@@ -3586,7 +3620,14 @@ fn build_overlay_specs(
             OverlayKind::Overlay => flpdf::OverlayKind::Overlay,
             OverlayKind::Underlay => flpdf::OverlayKind::Underlay,
         };
-        let from = PageRange::parse(spec.from.as_deref().unwrap_or(""))?;
+        // Distinguish an absent `--from` (default: all source pages) from an
+        // explicit empty `--from=` (empty source set). qpdf treats the latter as
+        // "no from pages", so `--repeat` cycles from the first destination page.
+        let from = match spec.from.as_deref() {
+            None => PageRange::parse("")?,
+            Some("") => PageRange::empty(),
+            Some(r) => PageRange::parse(r)?,
+        };
         let to = PageRange::parse(spec.to.as_deref().unwrap_or(""))?;
         let repeat = match &spec.repeat {
             Some(r) => Some(PageRange::parse(r)?),
@@ -5422,6 +5463,72 @@ mod tests {
         assert_eq!(specs[0].password.as_deref(), Some("--weird"));
     }
 
+    #[test]
+    fn extract_overlay_token_inside_encrypt_segment_is_not_a_group() {
+        // `--overlay` here is a *value* of the value-terminated --encrypt segment
+        // (a literal user password), not a new overlay group. It must survive in
+        // the residual for clap, and no spurious group is produced.
+        let argv = strs(&[
+            "flpdf",
+            "rewrite",
+            "--encrypt",
+            "--overlay",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
+        assert!(specs.is_empty(), "no overlay group, got: {specs:?}");
+        assert_eq!(residual, argv, "encrypt segment copied verbatim");
+    }
+
+    #[test]
+    fn extract_underlay_token_inside_pages_segment_is_not_a_group() {
+        // Same protection for the --pages segment (and --underlay).
+        let argv = strs(&["--pages", "a.pdf", "--underlay", "b.pdf", "--", "out.pdf"]);
+        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
+        assert!(specs.is_empty(), "got: {specs:?}");
+        assert_eq!(residual, argv);
+    }
+
+    #[test]
+    fn extract_real_overlay_after_encrypt_segment_still_extracted() {
+        // A genuine --overlay group AFTER the encrypt segment's own `--` is still
+        // recognised and stripped; the encrypt segment is preserved verbatim.
+        let argv = strs(&[
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file, "src.pdf");
+        assert_eq!(
+            residual,
+            strs(&["--encrypt", "u", "o", "128", "--", "in.pdf", "out.pdf"])
+        );
+    }
+
+    #[test]
+    fn extract_unterminated_sibling_segment_copied_to_end() {
+        // An unterminated --encrypt segment is copied verbatim (clap raises the
+        // error later); the inner --overlay must NOT be hijacked into a group.
+        let argv = strs(&["--encrypt", "u", "o", "128", "--overlay", "x"]);
+        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
+        assert!(specs.is_empty(), "got: {specs:?}");
+        assert_eq!(residual, argv);
+    }
+
     // --- build_overlay_specs --------------------------------------------
 
     fn compat_fixture(name: &str) -> String {
@@ -5445,7 +5552,7 @@ mod tests {
             to: Some("1-2".into()),
             repeat: Some("1".into()),
         }];
-        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false, false).unwrap();
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].kind, flpdf::OverlayKind::Underlay);
         // repeat is Some when the segment supplied --repeat.
@@ -5464,7 +5571,7 @@ mod tests {
             to: None,
             repeat: None,
         }];
-        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false, false).unwrap();
         assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
         assert!(
             built[0].repeat.is_none(),
@@ -5484,7 +5591,7 @@ mod tests {
         }];
         // `flpdf::OverlaySpec` is not Debug (it holds a `Pdf`), so match the Ok
         // arm explicitly instead of `unwrap_err()`.
-        let err = match build_overlay_specs(&cli_specs, false) {
+        let err = match build_overlay_specs(&cli_specs, false, false) {
             Ok(_) => panic!("expected error for a missing source file"),
             Err(e) => e.to_string(),
         };
@@ -5492,5 +5599,67 @@ mod tests {
             err.contains("source.pdf"),
             "error should name the unreadable file: {err}"
         );
+    }
+
+    fn encrypted_fixture(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted")
+            .join(name)
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
+    }
+
+    #[test]
+    fn build_overlay_specs_distinguishes_absent_and_empty_from() {
+        // qpdf parity: an absent `--from` defaults to all source pages, while an
+        // explicit empty `--from=` selects no source pages (so `--repeat` cycles
+        // from the first destination page).
+        let file = compat_fixture("three-page.pdf");
+        let spec = |from: Option<&str>| {
+            vec![OverlaySpec {
+                kind: OverlayKind::Overlay,
+                file: file.clone(),
+                password: None,
+                from: from.map(str::to_string),
+                to: None,
+                repeat: None,
+            }]
+        };
+
+        let absent = build_overlay_specs(&spec(None), false, false).unwrap();
+        assert_eq!(absent[0].from.resolve(3).unwrap(), vec![1, 2, 3]);
+
+        let empty = build_overlay_specs(&spec(Some("")), false, false).unwrap();
+        assert_eq!(empty[0].from.resolve(3).unwrap(), Vec::<u32>::new());
+
+        let explicit = build_overlay_specs(&spec(Some("2")), false, false).unwrap();
+        assert_eq!(explicit[0].from.resolve(3).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn build_overlay_specs_threads_allow_weak_crypto_to_source() {
+        // An RC4 (weak) overlay source, opened with the CORRECT password, is
+        // refused unless `--allow-weak-crypto` was passed — the same gate the
+        // primary input honors.
+        let rc4_spec = || {
+            vec![OverlaySpec {
+                kind: OverlayKind::Overlay,
+                file: encrypted_fixture("v2-rc4-128-r3.pdf"),
+                password: Some("user-v2".into()),
+                from: None,
+                to: None,
+                repeat: None,
+            }]
+        };
+
+        let denied = match build_overlay_specs(&rc4_spec(), false, false) {
+            Ok(_) => panic!("weak-crypto source must be refused without the opt-in"),
+            Err(e) => e.to_string(),
+        };
+        assert!(denied.contains("weak crypto"), "got: {denied}");
+
+        let allowed = build_overlay_specs(&rc4_spec(), false, true).unwrap();
+        assert_eq!(allowed.len(), 1);
     }
 }
