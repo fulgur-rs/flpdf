@@ -519,8 +519,9 @@ fn parse_outline_hint_table(pdf: &[u8]) -> [u8; 16] {
 
 // Outlines Hint Table targeted assertion: verifies the 16-byte table at /O offset
 // matches qpdf's golden exactly (first_object, first_obj_offset, nobjects=3,
-// group_length). This passes despite flpdf-fmlf because the Outlines Hint Table
-// computation is correct; only the Shared Object table is wrong.
+// group_length). Complements the full-byte strict test above with a focused check
+// on the Outlines Hint Table; the Shared Object table is now byte-identical too
+// (the second-half ObjStm container miscount was fixed — see the note above).
 #[test]
 fn outlines_multi_container_hint_table_matches_qpdf() {
     let flpdf_bytes = flpdf_linearized_objstm("objstm-lin-outlines-80-200.pdf");
