@@ -385,8 +385,9 @@ fn collect_non_length_refs(
 /// byte-identical.
 ///
 /// A holder that is ALSO referenced through any non-`/Length` edge — another
-/// object's contents, or a trailer key (`/Root`, `/Info`, `/Encrypt`) — is NOT
-/// returned: dropping it would dangle a live reference. The non-`/Length` scan is
+/// object's contents, or any trailer value (every trailer entry is scanned,
+/// including nested indirect references inside a direct dict/array value) — is
+/// NOT returned: dropping it would dangle a live reference. The non-`/Length` scan is
 /// a deliberate over-approximation of qpdf's transitive reachability (it does not
 /// recurse through which objects are themselves kept), so it only ever keeps MORE
 /// objects — the safe direction, since keeping an orphan costs a few bytes while
@@ -413,11 +414,12 @@ pub(crate) fn orphaned_indirect_length_holders<R: std::io::Read + std::io::Seek>
     }
 
     // Trailer references keep objects alive independently of any object body.
-    let trailer = pdf.trailer();
-    for key in ["Root", "Info", "Encrypt"] {
-        if let Some(r) = trailer.get_ref(key) {
-            live_non_length.insert(r);
-        }
+    // Scan every trailer value (not just /Root /Info /Encrypt as direct refs):
+    // the trailer is not an indirect object, so the loop above never visits it,
+    // and a trailer key given as a direct dict/array can still hold nested
+    // indirect references that must be treated as live.
+    for (_key, value) in pdf.trailer().iter() {
+        collect_non_length_refs(value, 0, &mut live_non_length)?;
     }
 
     Ok(length_holders
@@ -1845,6 +1847,55 @@ mod tests {
         assert!(
             orphans.is_empty(),
             "a /Length holder also referenced via a non-/Length edge must NOT be dropped; got {orphans:?}"
+        );
+    }
+
+    #[test]
+    fn orphaned_indirect_length_holders_keeps_holder_referenced_in_direct_trailer_value() {
+        // obj 5 is a stream with indirect /Length 6 0 R; the holder (obj 6) is
+        // referenced ONLY through a nested ref inside a DIRECT /Info trailer dict.
+        // The trailer is not an indirect object, so the holder is live only when
+        // the whole trailer is scanned (gemini r3445712118).
+        let bodies: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 5 >>\nstream\nBT ET\nendstream"),
+            (
+                5,
+                b"<< /Length 6 0 R >>\nstream\napp.alert('hi');\nendstream",
+            ),
+            (6, b"16"),
+        ];
+        let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let size = bodies.len() as u32 + 1;
+        let mut offsets = vec![0usize; size as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        // /Info is a DIRECT dict whose nested entry references the holder (obj 6).
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R /Info << /Held 6 0 R >> >>\n").as_bytes(),
+        );
+        out.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(out)).unwrap();
+        let orphans = orphaned_indirect_length_holders(&mut pdf).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "a /Length holder referenced via a nested ref in a direct trailer value must be kept; \
+             got {orphans:?}"
         );
     }
 
