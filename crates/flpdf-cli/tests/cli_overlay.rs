@@ -46,6 +46,25 @@ fn run_overlay_ok(dest: &str, overlay_args: &[&str]) -> Vec<u8> {
     std::fs::read(&out).expect("output file present after success")
 }
 
+/// Like [`run_overlay_ok`] but injects `--static-id` so two separate invocations
+/// produce byte-comparable output (the trailer /ID is otherwise randomized per
+/// run). `FLPDF_STATIC_ID_QUIET` suppresses the testing-only stderr warning.
+fn run_overlay_static_id(dest: &str, overlay_args: &[&str]) -> Vec<u8> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("overlay-out.pdf");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env("FLPDF_STATIC_ID_QUIET", "1");
+    cmd.arg("rewrite").arg("--static-id").arg(fixture(dest));
+    for a in overlay_args {
+        cmd.arg(a);
+    }
+    cmd.arg(&out);
+    cmd.assert().success();
+
+    std::fs::read(&out).expect("output file present after success")
+}
+
 #[test]
 fn overlay_succeeds_and_output_parses_with_same_page_count() {
     let one = fixture("one-page.pdf");
@@ -138,6 +157,51 @@ fn empty_from_differs_from_absent_from() {
         absent, empty,
         "explicit empty --from= must be distinguished from an absent --from"
     );
+}
+
+#[test]
+fn empty_to_is_a_noop_and_differs_from_absent_to() {
+    // qpdf parity: an explicit empty `--to=` is an empty destination set, so the
+    // overlay applies to no page (a no-op). The output must equal a plain rewrite
+    // of the destination (no source imported -> no `/Fx1` marker) and be
+    // observably different from an absent `--to` (which overlays every page).
+    // `--static-id` pins the trailer /ID so the two runs are byte-comparable.
+    let two = fixture("two-page.pdf");
+    let passthrough = run_overlay_static_id("three-page.pdf", &[]);
+    let empty_to = run_overlay_static_id("three-page.pdf", &["--overlay", &two, "--to=", "--"]);
+    let absent_to = run_overlay_static_id("three-page.pdf", &["--overlay", &two, "--"]);
+
+    assert_eq!(
+        empty_to, passthrough,
+        "empty --to= overlay must be a no-op (== plain rewrite of the dest)"
+    );
+    assert!(
+        !String::from_utf8_lossy(&empty_to).contains("/Fx1"),
+        "no-op overlay must not import the source as /Fx1"
+    );
+    assert_ne!(
+        empty_to, absent_to,
+        "explicit empty --to= must be distinguished from an absent --to"
+    );
+}
+
+#[test]
+fn empty_repeat_equals_absent_repeat_and_differs_from_a_set_repeat() {
+    // qpdf parity: an explicit empty `--repeat=` means no repetition, identical
+    // to an absent `--repeat`. Both must produce the same output, and both must
+    // differ from a non-empty `--repeat=1` (which cycles the source onto the
+    // surplus destination pages). `--static-id` pins the trailer /ID so the runs
+    // are byte-comparable.
+    let two = fixture("two-page.pdf");
+    let absent = run_overlay_static_id("three-page.pdf", &["--overlay", &two, "--"]);
+    let empty = run_overlay_static_id("three-page.pdf", &["--overlay", &two, "--repeat=", "--"]);
+    let set = run_overlay_static_id("three-page.pdf", &["--overlay", &two, "--repeat=1", "--"]);
+
+    assert_eq!(
+        empty, absent,
+        "empty --repeat= must behave as no repeat (== absent --repeat)"
+    );
+    assert_ne!(empty, set, "a non-empty --repeat=1 must still take effect");
 }
 
 #[test]
