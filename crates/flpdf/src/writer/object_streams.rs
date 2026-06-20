@@ -326,6 +326,106 @@ pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Se
     Ok(excluded)
 }
 
+/// Collect every indirect reference reachable from `obj`'s inline structure,
+/// EXCEPT a stream dictionary's `/Length` value.
+///
+/// Errors on inline nesting deeper than [`crate::object::MAX_INLINE_DEPTH`],
+/// matching the linearization planner's `collect_direct_refs` guard so a hostile
+/// deeply-nested PDF cannot overflow the stack (DoS hardening) — and so this scan
+/// never silently truncates, which would shrink the live set and risk dropping a
+/// referenced object.
+fn collect_non_length_refs(
+    obj: &Object,
+    depth: usize,
+    out: &mut BTreeSet<ObjectRef>,
+) -> crate::Result<()> {
+    if depth > crate::object::MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
+    }
+    match obj {
+        Object::Reference(r) => {
+            out.insert(*r);
+        }
+        Object::Array(items) => {
+            for v in items {
+                collect_non_length_refs(v, depth + 1, out)?;
+            }
+        }
+        Object::Dictionary(d) => {
+            for (_k, v) in d.iter() {
+                collect_non_length_refs(v, depth + 1, out)?;
+            }
+        }
+        Object::Stream(s) => {
+            // The data bytes are opaque; only the dict carries refs. Skip
+            // `/Length`: every stream is written with a direct `/Length`, so an
+            // indirect `/Length` edge is dead in the output.
+            for (k, v) in s.dict.iter() {
+                if k == b"Length" {
+                    continue;
+                }
+                collect_non_length_refs(v, depth + 1, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Collect indirect `/Length` holders that become unreferenced once every
+/// stream's `/Length` is normalized to a direct integer.
+///
+/// flpdf (like qpdf) writes every stream's `/Length` as a direct integer, so an
+/// indirect `/Length` reference is a dead edge in the output. A holder reachable
+/// ONLY through such a dead edge is an orphan; qpdf drops it via reachability
+/// garbage collection of unreferenced objects, so flpdf must drop it too to stay
+/// byte-identical.
+///
+/// A holder that is ALSO referenced through any non-`/Length` edge — another
+/// object's contents, or a trailer key (`/Root`, `/Info`, `/Encrypt`) — is NOT
+/// returned: dropping it would dangle a live reference. The non-`/Length` scan is
+/// a deliberate over-approximation of qpdf's transitive reachability (it does not
+/// recurse through which objects are themselves kept), so it only ever keeps MORE
+/// objects — the safe direction, since keeping an orphan costs a few bytes while
+/// dropping a referenced object corrupts the file.
+///
+/// # Errors
+///
+/// Propagates reader errors from resolving any object, and the inline-nesting
+/// guard from [`collect_non_length_refs`].
+pub(crate) fn orphaned_indirect_length_holders<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<BTreeSet<ObjectRef>> {
+    let mut length_holders: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut live_non_length: BTreeSet<ObjectRef> = BTreeSet::new();
+
+    for r in pdf.object_refs() {
+        let obj = pdf.resolve_borrowed(r)?;
+        if let Some(s) = obj.as_stream() {
+            if let Some(Object::Reference(len_ref)) = s.dict.get("Length") {
+                length_holders.insert(*len_ref);
+            }
+        }
+        collect_non_length_refs(obj, 0, &mut live_non_length)?;
+    }
+
+    // Trailer references keep objects alive independently of any object body.
+    let trailer = pdf.trailer();
+    for key in ["Root", "Info", "Encrypt"] {
+        if let Some(r) = trailer.get_ref(key) {
+            live_non_length.insert(r);
+        }
+    }
+
+    Ok(length_holders
+        .difference(&live_non_length)
+        .copied()
+        .collect())
+}
+
 /// Preserve mode: reconstruct source ObjStm grouping.
 fn plan_preserve<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
@@ -1690,6 +1790,77 @@ mod tests {
             config.mode,
             ObjectStreamMode::Generate,
             "qdf=false must not change the object_streams mode"
+        );
+    }
+
+    /// One-page document whose catalog `/OpenAction` references a JavaScript
+    /// action (obj 5) whose `/JS` stream (obj 6) carries an INDIRECT `/Length`
+    /// (`7 0 R`). The holder (obj 7) is reachable only via that `/Length` edge,
+    /// unless `extra_ref_to_holder` adds a second, non-`/Length` reference.
+    fn pdf_with_indirect_length_holder(extra_ref_to_holder: bool) -> Vec<u8> {
+        let action: Vec<u8> = if extra_ref_to_holder {
+            b"<< /Type /Action /S /JavaScript /JS 6 0 R /Aux 7 0 R >>".to_vec()
+        } else {
+            b"<< /Type /Action /S /JavaScript /JS 6 0 R >>".to_vec()
+        };
+        pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+            ),
+            (4, b"<< /Length 3 >>\nstream\nq Q\nendstream".to_vec()),
+            (5, action),
+            (
+                6,
+                b"<< /Length 7 0 R >>\nstream\napp.alert('hi');\nendstream".to_vec(),
+            ),
+            (7, b"16".to_vec()),
+        ])
+    }
+
+    #[test]
+    fn orphaned_indirect_length_holders_returns_holder_reached_only_via_length() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(pdf_with_indirect_length_holder(false)))
+                .unwrap();
+        let orphans = orphaned_indirect_length_holders(&mut pdf).unwrap();
+        assert_eq!(
+            orphans,
+            std::iter::once(ref0(7)).collect(),
+            "the /Length holder reachable only via the stream's /Length must be an orphan"
+        );
+    }
+
+    #[test]
+    fn orphaned_indirect_length_holders_keeps_holder_with_non_length_reference() {
+        let mut pdf =
+            crate::reader::Pdf::open(std::io::Cursor::new(pdf_with_indirect_length_holder(true)))
+                .unwrap();
+        let orphans = orphaned_indirect_length_holders(&mut pdf).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "a /Length holder also referenced via a non-/Length edge must NOT be dropped; got {orphans:?}"
+        );
+    }
+
+    #[test]
+    fn collect_non_length_refs_errors_on_excessive_nesting() {
+        // Bury a reference under MAX_INLINE_DEPTH + 2 nested arrays so the depth
+        // guard trips before it is reached (DoS hardening).
+        let mut obj = Object::Array(vec![Object::Reference(ref0(9))]);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 2) {
+            obj = Object::Array(vec![obj]);
+        }
+        let mut out = BTreeSet::new();
+        let err = collect_non_length_refs(&obj, 0, &mut out);
+        assert!(
+            matches!(err, Err(crate::Error::Unsupported(_))),
+            "deeply nested inline structure must error, not overflow the stack"
         );
     }
 }

@@ -444,7 +444,20 @@ fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Res
             // Renumber the dictionary; leave the stream data bytes alone.
             let mut new_dict = Dictionary::new();
             for (key, value) in stream.dict.iter() {
-                new_dict.insert(key, renumber_object(value, depth + 1, renumber)?);
+                // A stream's `/Length` is rewritten to a direct integer at
+                // emission time. When it is an indirect reference whose holder
+                // was dropped as an orphan (flpdf-2vfg —
+                // `orphaned_indirect_length_holders`), that holder has no
+                // renumber entry; substitute a direct length (the raw stored
+                // byte count) so the dangling reference never reaches output. A
+                // holder still present in the map is renumbered normally.
+                let dropped_length_holder = key == b"Length"
+                    && matches!(value, Object::Reference(r) if renumber.new_for_original(*r).is_none());
+                if dropped_length_holder {
+                    new_dict.insert(key, Object::Integer(stream.data.len() as i64));
+                } else {
+                    new_dict.insert(key, renumber_object(value, depth + 1, renumber)?);
+                }
             }
             Ok(Object::Stream(Stream::new(new_dict, stream.data.clone())))
         }
