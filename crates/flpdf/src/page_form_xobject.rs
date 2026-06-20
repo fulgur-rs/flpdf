@@ -19,8 +19,10 @@
 //! - `/Group` — present only when the page dictionary carries a `/Group`;
 //!   shallow-copied (an indirect reference is materialized one level into a
 //!   direct dictionary, matching qpdf's `shallowCopy`).
-//! - `/Matrix` — the transformation matrix from the page's `/Rotate`. Always
-//!   emitted; identity `[1 0 0 1 0 0]` for rotation 0.
+//! - `/Matrix` — the transformation matrix from the page's `/Rotate` and
+//!   `/UserUnit`. Emitted only when at least one of `/Rotate` (inherited) or
+//!   `/UserUnit` (leaf) is present; identity `[1 0 0 1 0 0]` for an explicit
+//!   rotation 0 with unit scale.
 //! - `/Resources` — the page's effective resources (inheritance resolved),
 //!   inserted as a direct dictionary with its inner references preserved.
 //! - `/Subtype` — `/Form`.
@@ -42,7 +44,6 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-use crate::page_object_helper::PageObjectHelper;
 use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -56,9 +57,10 @@ const MAX_XOBJECT_CLOSURE_DEPTH: usize = DEFAULT_MAX_PAGE_TREE_DEPTH;
 ///
 /// Mirrors `QPDFPageObjectHelper::getFormXObjectForPage` (qpdf 11.9.0): the new
 /// XObject's `/BBox` is the page's effective `/TrimBox` (copied verbatim),
-/// `/Matrix` encodes the page's `/Rotate`, `/Resources` are the page's
-/// inheritance-resolved resources, and the stream holds the page's decoded
-/// content. `/Group` is shallow-copied when present. `/FormType` is not added.
+/// `/Matrix` encodes the page's `/Rotate` and `/UserUnit` and is emitted only when
+/// at least one of them is present, `/Resources` are the page's inheritance-resolved
+/// resources, and the stream holds the page's decoded content. `/Group` is
+/// shallow-copied when present. `/FormType` is not added.
 ///
 /// # Errors
 ///
@@ -75,11 +77,11 @@ pub(crate) fn page_to_form_xobject<R: Read + Seek>(
     // copies getTrimBox(false)).
     let bbox = effective_box_array(pdf, page_ref)?;
 
-    // /Matrix from /Rotate (getMatrixForTransformations). Width/height come from
-    // the same TrimBox rectangle used for /BBox. Always emitted.
-    let rotate = PageObjectHelper::new(page_ref, pdf).rotate()?;
+    // /Matrix from /Rotate + /UserUnit (getMatrixForTransformations). qpdf emits
+    // /Matrix ONLY when /Rotate (inherited) or /UserUnit (leaf) is present; width
+    // and height come from the same TrimBox rectangle used for /BBox.
+    let transform = read_page_transform(pdf, page_ref)?;
     let (bbox_w, bbox_h) = rectangle_dimensions(&bbox);
-    let matrix = matrix_for_rotation(rotate, bbox_w, bbox_h);
 
     // /Resources = effective (inheritance-resolved) resources, inserted as a
     // direct dictionary with inner references kept (qpdf shallowCopy semantics).
@@ -96,7 +98,10 @@ pub(crate) fn page_to_form_xobject<R: Read + Seek>(
     dict.insert("Type", Object::Name(b"XObject".to_vec()));
     dict.insert("Subtype", Object::Name(b"Form".to_vec()));
     dict.insert("BBox", Object::Array(bbox));
-    dict.insert("Matrix", Object::Array(matrix));
+    if transform.rotate_present || transform.uu_present {
+        let matrix = transformation_matrix(&transform, bbox_w, bbox_h, false);
+        dict.insert("Matrix", Object::Array(matrix_objects(&matrix)));
+    }
     if let Some(res) = resources {
         dict.insert("Resources", Object::Dictionary(res));
     }
@@ -362,49 +367,166 @@ fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
     (urx - llx, ury - lly)
 }
 
-/// Build the `/Matrix` array for a page rotation, mirroring qpdf's
-/// `getMatrixForTransformations` (qpdf 11.9.0) with scale fixed at 1.0
-/// (`/UserUnit` is unsupported and absent from fixtures).
+/// A page's `/Rotate` and `/UserUnit` attributes as qpdf's
+/// `getMatrixForTransformations` reads them.
 ///
-/// With `scale = 1`:
-/// - rotate   0 → `[1 0 0 1 0 0]` (identity)
-/// - rotate  90 → `[0 -1 1 0 0 width]`
-/// - rotate 180 → `[-1 0 0 -1 width height]`
-/// - rotate 270 → `[0 1 -1 0 height 0]`
-///
-/// Matrix components are emitted as [`Object::Real`] to mirror qpdf's
-/// `QPDFObjectHandle::newReal`; whole values serialize without a decimal point.
-fn matrix_for_rotation(rotate: i32, width: f64, height: f64) -> Vec<Object> {
-    let scale = 1.0_f64;
-    let r = |x: f64| Object::Real(x);
-    // `rotate()` already normalizes to {0, 90, 180, 270}.
-    match rotate {
-        90 => vec![
-            r(0.0),
-            r(-scale),
-            r(scale),
-            r(0.0),
-            r(0.0),
-            r(width * scale),
-        ],
-        180 => vec![
-            r(-scale),
-            r(0.0),
-            r(0.0),
-            r(-scale),
-            r(width * scale),
-            r(height * scale),
-        ],
-        270 => vec![
-            r(0.0),
-            r(scale),
-            r(-scale),
-            r(0.0),
-            r(height * scale),
-            r(0.0),
-        ],
-        _ => vec![r(scale), r(0.0), r(0.0), r(scale), r(0.0), r(0.0)],
+/// qpdf decides whether to emit a Form XObject `/Matrix` from *presence*
+/// (`isNull`), and computes the matrix from *value*; the two are tracked
+/// separately so a present-but-malformed attribute still forces emission while
+/// contributing its qpdf default to the matrix.
+pub(crate) struct PageTransform {
+    /// `/Rotate` is present (non-null) somewhere in the inheritance chain.
+    pub rotate_present: bool,
+    /// Raw `/Rotate` integer; 0 when present-but-not-an-integer or absent
+    /// (qpdf uses `getIntValueAsInt()` and falls back to 0 for non-integers).
+    pub rotate: i32,
+    /// `/UserUnit` is present (non-null) on the leaf page.
+    pub uu_present: bool,
+    /// `/UserUnit` numeric value; 1.0 when present-but-not-a-number or absent.
+    pub scale: f64,
+}
+
+/// Read a page's `/Rotate` and `/UserUnit` the way qpdf's `getAttribute` does:
+/// `/Rotate` is inheritable (walk the `/Parent` chain), `/UserUnit` is leaf-only.
+pub(crate) fn read_page_transform<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<PageTransform> {
+    let (rotate_present, rotate) = inherited_rotate_attribute(pdf, page_ref)?;
+    let (uu_present, scale) = leaf_user_unit(pdf, page_ref)?;
+    Ok(PageTransform {
+        rotate_present,
+        rotate,
+        uu_present,
+        scale,
+    })
+}
+
+/// Walk the `/Parent` chain for the first non-null `/Rotate`, mirroring qpdf's
+/// inheritable `getAttribute("/Rotate", false)`. Returns `(present, raw_int)`:
+/// `present` is whether any node carried a non-null `/Rotate`; `raw_int` is its
+/// integer value (0 when present-but-not-an-integer). Cycle- and depth-guarded.
+fn inherited_rotate_attribute<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<(bool, i32)> {
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut current = page_ref;
+    let mut depth: usize = 0;
+
+    loop {
+        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {current}"
+            )));
+        }
+        if !seen.insert(current) {
+            return Ok((false, 0));
+        }
+
+        let (rotate_val, parent_val) = {
+            let node_obj = pdf.resolve_borrowed(current)?;
+            let Some(dict) = node_obj.as_dict() else {
+                return Ok((false, 0));
+            };
+            (dict.get("Rotate").cloned(), dict.get("Parent").cloned())
+        };
+
+        if let Some(val) = rotate_val {
+            // /Rotate may be stored as an indirect reference; resolve it first.
+            let resolved = match val {
+                Object::Reference(r) => pdf.resolve(r)?,
+                other => other,
+            };
+            match resolved {
+                // Per PDF §7.3.9 a null value is equivalent to absent: climb on.
+                Object::Null => {}
+                Object::Integer(n) => return Ok((true, n as i32)),
+                _ => return Ok((true, 0)),
+            }
+        }
+
+        match parent_val {
+            Some(Object::Reference(r)) => {
+                current = r;
+                depth += 1;
+            }
+            _ => return Ok((false, 0)),
+        }
     }
+}
+
+/// Read the leaf page's `/UserUnit` (not inheritable). Returns `(present, value)`:
+/// `present` is whether the leaf carried a non-null `/UserUnit`; `value` is its
+/// numeric value (1.0 when present-but-not-a-number).
+fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<(bool, f64)> {
+    let uu_val = {
+        let page_obj = pdf.resolve_borrowed(page_ref)?;
+        let Some(dict) = page_obj.as_dict() else {
+            return Ok((false, 1.0));
+        };
+        dict.get("UserUnit").cloned()
+    };
+    let Some(val) = uu_val else {
+        return Ok((false, 1.0));
+    };
+    let resolved = match val {
+        Object::Reference(r) => pdf.resolve(r)?,
+        other => other,
+    };
+    match resolved {
+        Object::Null => Ok((false, 1.0)),
+        Object::Integer(n) => Ok((true, n as f64)),
+        Object::Real(r) => Ok((true, r)),
+        _ => Ok((true, 1.0)),
+    }
+}
+
+/// Compute a page's transformation matrix `[a b c d e f]`, mirroring qpdf's
+/// `getMatrixForTransformations` (qpdf 11.9.0) exactly.
+///
+/// Returns the identity when neither `/Rotate` nor `/UserUnit` is present. With
+/// `scale` = `/UserUnit` (or 1.0) and `rotate` the raw integer:
+/// - rotate  90 → `[0 -scale scale 0 0 width*scale]`
+/// - rotate 180 → `[-scale 0 0 -scale width*scale height*scale]`
+/// - rotate 270 → `[0 scale -scale 0 height*scale 0]`
+/// - otherwise  → `[scale 0 0 scale 0 0]`
+///
+/// `invert` inverts the destination-page transform (used by overlay placement):
+/// `scale` becomes `1/scale` (identity when `scale == 0`) and `rotate` becomes
+/// `360 - rotate` before the switch.
+pub(crate) fn transformation_matrix(
+    t: &PageTransform,
+    width: f64,
+    height: f64,
+    invert: bool,
+) -> [f64; 6] {
+    const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    if !(t.rotate_present || t.uu_present) {
+        return IDENTITY;
+    }
+    let mut scale = t.scale;
+    let mut rotate = t.rotate;
+    if invert {
+        if scale == 0.0 {
+            return IDENTITY;
+        }
+        scale = 1.0 / scale;
+        rotate = 360 - rotate;
+    }
+    match rotate {
+        90 => [0.0, -scale, scale, 0.0, 0.0, width * scale],
+        180 => [-scale, 0.0, 0.0, -scale, width * scale, height * scale],
+        270 => [0.0, scale, -scale, 0.0, height * scale, 0.0],
+        _ => [scale, 0.0, 0.0, scale, 0.0, 0.0],
+    }
+}
+
+/// Convert a `[f64; 6]` matrix to a PDF array of [`Object::Real`], mirroring
+/// qpdf's `QPDFObjectHandle::newReal`; whole values serialize without a decimal
+/// point.
+fn matrix_objects(m: &[f64; 6]) -> Vec<Object> {
+    m.iter().map(|&x| Object::Real(x)).collect()
 }
 
 /// Read the page dictionary's `/Group` value with qpdf `shallowCopy` semantics:
@@ -604,11 +726,12 @@ mod tests {
         let stream = form_stream(&mut pdf, xref);
         let dict = &stream.dict;
 
-        // Exact key set: BBox, Matrix, Resources, Subtype, Type. NO FormType.
+        // Exact key set: BBox, Resources, Subtype, Type. NO FormType, and NO
+        // /Matrix because this page carries neither /Rotate nor /UserUnit (qpdf's
+        // getFormXObjectForPage omits /Matrix in that case).
         let keys: BTreeSet<Vec<u8>> = dict.iter().map(|(k, _)| k.to_vec()).collect();
         let expected: BTreeSet<Vec<u8>> = [
             b"BBox".to_vec(),
-            b"Matrix".to_vec(),
             b"Resources".to_vec(),
             b"Subtype".to_vec(),
             b"Type".to_vec(),
@@ -619,6 +742,10 @@ mod tests {
         assert!(
             dict.get("FormType").is_none(),
             "qpdf getFormXObjectForPage must NOT add /FormType"
+        );
+        assert!(
+            dict.get("Matrix").is_none(),
+            "qpdf omits /Matrix when neither /Rotate nor /UserUnit is present"
         );
 
         // /Subtype /Form, /Type /XObject.
@@ -634,10 +761,6 @@ mod tests {
         // /BBox == page TrimBox (== MediaBox via fallback) [0 0 612 792].
         let bbox = dict.get("BBox").unwrap().as_array().unwrap();
         assert_eq!(numbers(bbox), vec![0, 0, 612, 792]);
-
-        // /Matrix identity for rotation 0.
-        let matrix = dict.get("Matrix").unwrap().as_array().unwrap();
-        assert_eq!(numbers(matrix), vec![1, 0, 0, 1, 0, 0]);
 
         // /Resources present (carries the page's font, ref preserved).
         let res = dict.get("Resources").unwrap().as_dict().unwrap();
@@ -749,8 +872,9 @@ mod tests {
     #[test]
     fn page_to_form_xobject_handles_non_numeric_box_element() {
         // A rectangle with a non-numeric element: rectangle_dimensions treats it
-        // as 0.0 (the array is still copied verbatim into /BBox).
-        let mut pdf = open(one_page_doc("/TrimBox [0 0 /X 100]", "x", &[]));
+        // as 0.0 (the array is still copied verbatim into /BBox). /Rotate 0 keeps
+        // /Matrix present so the identity assertion is exercised.
+        let mut pdf = open(one_page_doc("/TrimBox [0 0 /X 100] /Rotate 0", "x", &[]));
         let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
@@ -785,6 +909,84 @@ mod tests {
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![0, 1, -1, 0, 792, 0]);
+    }
+
+    #[test]
+    fn page_to_form_xobject_explicit_rotate_0_emits_identity_matrix() {
+        // An explicit /Rotate 0 is *present* (non-null), so qpdf still emits
+        // /Matrix — the identity. (Absence of /Rotate omits it; this guards that
+        // the presence check, not the value, drives emission.)
+        let mut pdf = open(one_page_doc("/Rotate 0", "x", &[]));
+        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let stream = form_stream(&mut pdf, xref);
+        let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
+        assert_eq!(numbers(m), vec![1, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn page_to_form_xobject_inherited_rotate_emits_matrix() {
+        // The leaf page has no /Rotate; the ancestor /Pages node carries
+        // /Rotate 90. qpdf inherits /Rotate, so /Matrix is emitted for the
+        // inherited rotation. MediaBox 0 0 612 792 -> [0 -1 1 0 0 612].
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>";
+        let pages = "<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>";
+        let content = "<< /Length 1 >>\nstream\nx\nendstream";
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, pages),
+                (3, page),
+                (4, content),
+            ],
+            1,
+        ));
+        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let stream = form_stream(&mut pdf, xref);
+        let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
+        assert_eq!(numbers(m), vec![0, -1, 1, 0, 0, 612]);
+    }
+
+    #[test]
+    fn page_to_form_xobject_userunit_only_emits_scale_matrix() {
+        // /UserUnit 2 with no /Rotate: qpdf emits /Matrix with the scale folded in
+        // (rotate-0 default branch -> [scale 0 0 scale 0 0]).
+        let mut pdf = open(one_page_doc("/UserUnit 2", "x", &[]));
+        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let stream = form_stream(&mut pdf, xref);
+        let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
+        assert_eq!(numbers(m), vec![2, 0, 0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn page_to_form_xobject_userunit_and_rotate_90() {
+        // /UserUnit 2 /Rotate 90 on 612x792 -> [0 -2 2 0 0 width*scale=1224].
+        let mut pdf = open(one_page_doc("/UserUnit 2 /Rotate 90", "x", &[]));
+        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let stream = form_stream(&mut pdf, xref);
+        let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
+        assert_eq!(numbers(m), vec![0, -2, 2, 0, 0, 1224]);
+    }
+
+    #[test]
+    fn page_to_form_xobject_present_non_integer_rotate_emits_identity() {
+        // A present-but-non-integer /Rotate is non-null, so /Matrix is emitted;
+        // qpdf treats a non-integer rotation as 0 -> identity.
+        let mut pdf = open(one_page_doc("/Rotate /X", "x", &[]));
+        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let stream = form_stream(&mut pdf, xref);
+        let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
+        assert_eq!(numbers(m), vec![1, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn page_to_form_xobject_present_non_numeric_userunit_scale_one() {
+        // A present-but-non-numeric /UserUnit is non-null, so /Matrix is emitted;
+        // qpdf uses scale 1.0 when /UserUnit is not a number.
+        let mut pdf = open(one_page_doc("/UserUnit /X", "x", &[]));
+        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let stream = form_stream(&mut pdf, xref);
+        let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
+        assert_eq!(numbers(m), vec![1, 0, 0, 1, 0, 0]);
     }
 
     #[test]
@@ -1050,5 +1252,127 @@ mod tests {
         let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let err = xobject_object_closure(&mut pdf, xref);
         assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    // ---- inherited_rotate_attribute (edge arms) ----------------------------
+
+    #[test]
+    fn inherited_rotate_attribute_returns_absent_for_non_dict() {
+        let mut pdf = doc_with_non_dict_obj3();
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_resolves_indirect_reference() {
+        // /Rotate stored as an indirect reference to an integer.
+        let mut pdf = open(one_page_doc("/Rotate 6 0 R", "x", &[(6, "90")]));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 90)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_treats_null_as_absent_and_climbs() {
+        // Leaf /Rotate is null (equivalent to absent); the parent /Pages node has
+        // no /Rotate either, so the walk reports absent.
+        let mut pdf = open(one_page_doc("/Rotate null", "x", &[]));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_breaks_on_parent_cycle() {
+        // /Parent nodes point at each other; neither carries /Rotate.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 4 0 R >>"),
+                (4, "<< /Type /Pages /Parent 3 0 R >>"),
+            ],
+            1,
+        ));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_errors_on_parent_chain_too_deep() {
+        let total = DEFAULT_MAX_PAGE_TREE_DEPTH + 5;
+        let mut objs: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        ];
+        for n in 3..=(total as u32) {
+            objs.push((n, format!("<< /Type /Pages /Parent {} 0 R >>", n + 1)));
+        }
+        let borrowed: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
+        let mut pdf = open(build_pdf(&borrowed, 1));
+        let err = inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0));
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    // ---- leaf_user_unit (edge arms) ----------------------------------------
+
+    #[test]
+    fn leaf_user_unit_returns_absent_for_non_dict() {
+        let mut pdf = doc_with_non_dict_obj3();
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 1.0)
+        );
+    }
+
+    #[test]
+    fn leaf_user_unit_resolves_indirect_reference() {
+        let mut pdf = open(one_page_doc("/UserUnit 6 0 R", "x", &[(6, "3")]));
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 3.0)
+        );
+    }
+
+    #[test]
+    fn leaf_user_unit_treats_null_as_absent() {
+        let mut pdf = open(one_page_doc("/UserUnit null", "x", &[]));
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (false, 1.0)
+        );
+    }
+
+    #[test]
+    fn leaf_user_unit_reads_real_value() {
+        let mut pdf = open(one_page_doc("/UserUnit 1.5", "x", &[]));
+        assert_eq!(
+            leaf_user_unit(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 1.5)
+        );
+    }
+
+    // ---- transformation_matrix (invert scale==0 guard) ---------------------
+
+    #[test]
+    fn transformation_matrix_invert_zero_scale_is_identity() {
+        // A /UserUnit 0 destination would invert to a 1/0 scale; qpdf guards this
+        // by returning the identity.
+        let t = PageTransform {
+            rotate_present: false,
+            rotate: 0,
+            uu_present: true,
+            scale: 0.0,
+        };
+        assert_eq!(
+            transformation_matrix(&t, 612.0, 792.0, true),
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
     }
 }

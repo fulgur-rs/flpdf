@@ -26,7 +26,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::page_form_xobject::{import_pages_as_form_xobjects, page_to_form_xobject};
+use crate::page_form_xobject::{
+    import_pages_as_form_xobjects, page_to_form_xobject, read_page_transform, transformation_matrix,
+};
 use crate::page_object_helper::{PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
@@ -70,55 +72,147 @@ fn fmt_number(v: f64) -> String {
     trimmed.to_string()
 }
 
-/// Build a `placeFormXObject` content fragment placing the Form XObject named
-/// `name` (whose `/BBox` is `bbox`) into the rectangle `rect`, mirroring qpdf's
-/// `QPDFPageObjectHelper::placeFormXObject` +
-/// `getMatrixForFormXObjectPlacement` (allow_shrink=true, allow_expand=false).
-///
-/// The fragment is exactly `"q\n" + matrix + " cm\n/" + name + " Do\nQ\n"`,
-/// where `matrix` is the six space-separated components formatted by
-/// [`fmt_number`].
-fn place_form_xobject(bbox: [f64; 4], rect: [f64; 4], name: &str) -> String {
-    let [bllx, blly, burx, bury] = bbox;
-    let [rllx, rlly, rurx, rury] = rect;
+/// The identity transformation matrix `[1 0 0 1 0 0]`.
+const IDENTITY_MATRIX: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
-    let bbox_w = burx - bllx;
-    let bbox_h = bury - blly;
+/// Multiply two transformation matrices, mirroring qpdf's `QPDFMatrix::concat`
+/// (`this.concat(other)`) byte-for-byte so the floating-point result matches
+/// qpdf's exactly.
+fn qpdf_concat(this: [f64; 6], other: [f64; 6]) -> [f64; 6] {
+    let [a, b, c, d, e, f] = this;
+    let [oa, ob, oc, od, oe, of] = other;
+    [
+        a * oa + c * ob,
+        b * oa + d * ob,
+        a * oc + c * od,
+        b * oc + d * od,
+        a * oe + c * of + e,
+        b * oe + d * of + f,
+    ]
+}
+
+/// `this.scale(sx, sy)` — qpdf concatenates a scaling matrix on the right.
+fn qpdf_scale(this: [f64; 6], sx: f64, sy: f64) -> [f64; 6] {
+    qpdf_concat(this, [sx, 0.0, 0.0, sy, 0.0, 0.0])
+}
+
+/// `this.translate(tx, ty)` — qpdf concatenates a translation matrix on the right.
+fn qpdf_translate(this: [f64; 6], tx: f64, ty: f64) -> [f64; 6] {
+    qpdf_concat(this, [1.0, 0.0, 0.0, 1.0, tx, ty])
+}
+
+/// Round a matrix component the way qpdf's `QPDFMatrix::unparse` does before
+/// formatting: values in `(-0.00001, 0.00001)` collapse to `0.0`.
+fn fix_rounding(d: f64) -> f64 {
+    if d > -0.00001 && d < 0.00001 {
+        0.0
+    } else {
+        d
+    }
+}
+
+/// Serialize a transformation matrix the way qpdf's `QPDFMatrix::unparse` does:
+/// `fix_rounding` each of the six components, then format with [`fmt_number`]
+/// (qpdf's `QUtil::double_to_string(..., 5)`), space-separated.
+fn matrix_unparse(m: [f64; 6]) -> String {
+    let parts: Vec<String> = m.iter().map(|&x| fmt_number(fix_rounding(x))).collect();
+    parts.join(" ")
+}
+
+/// Compute the placement matrix that lands the Form XObject (`/BBox` `fo_bbox`,
+/// `/Matrix` `fo_matrix`) inside `rect`, mirroring qpdf's
+/// `getMatrixForFormXObjectPlacement` (qpdf 11.9.0) exactly.
+///
+/// `tmatrix` is the destination page's inverse transform
+/// (`getMatrixForTransformations(true)`, the identity when the dest page has no
+/// `/Rotate`/`/UserUnit`); it is always concatenated, matching qpdf's
+/// `invert_transformations=true` call sites. `allow_shrink`/`allow_expand` gate
+/// whether the scale-to-fit factor may drop below or rise above 1.0.
+///
+/// Returns `None` when the matrix-transformed `/BBox` is degenerate (zero width
+/// or height); the caller substitutes the identity, matching qpdf's `{}`.
+fn matrix_for_form_xobject_placement(
+    fo_bbox: [f64; 4],
+    fo_matrix: [f64; 6],
+    rect: [f64; 4],
+    tmatrix: [f64; 6],
+    allow_shrink: bool,
+    allow_expand: bool,
+) -> Option<[f64; 6]> {
+    // wmatrix = I.concat(tmatrix).concat(fmatrix). tmatrix is identity (a no-op)
+    // when the dest page has no transform; fmatrix is identity when the fo has no
+    // /Matrix — both still concatenated, matching qpdf.
+    let wmatrix = qpdf_concat(qpdf_concat(IDENTITY_MATRIX, tmatrix), fo_matrix);
+    let t = transform_bbox(fo_bbox, wmatrix);
+    let [t_llx, t_lly, t_urx, t_ury] = t;
+    if t_urx == t_llx || t_ury == t_lly {
+        return None;
+    }
+    let [rllx, rlly, rurx, rury] = rect;
     let rect_w = rurx - rllx;
     let rect_h = rury - rlly;
-
-    // Scale to fit: smaller of the x/y ratios. Guard against a zero-area /BBox
-    // (qpdf would divide by zero); fall back to scale 1 so output stays finite.
-    let scale = if bbox_w == 0.0 || bbox_h == 0.0 {
-        1.0
-    } else {
-        let xscale = rect_w / bbox_w;
-        let yscale = rect_h / bbox_h;
-        let mut scale = xscale.min(yscale);
-        // allow_expand defaults false: never scale up.
-        if scale > 1.0 {
+    let t_w = t_urx - t_llx;
+    let t_h = t_ury - t_lly;
+    let xscale = rect_w / t_w;
+    let yscale = rect_h / t_h;
+    let mut scale = if xscale < yscale { xscale } else { yscale };
+    if scale > 1.0 {
+        if !allow_expand {
             scale = 1.0;
         }
-        scale
-    };
+    } else if scale < 1.0 && !allow_shrink {
+        scale = 1.0;
+    }
 
-    // Centre the transformed /BBox in the rectangle. T = scale * bbox; the
-    // translation moves the transformed bbox centre onto the rect centre.
-    let t_cx = scale * (bllx + burx) / 2.0;
-    let t_cy = scale * (blly + bury) / 2.0;
-    let rect_cx = (rllx + rurx) / 2.0;
-    let rect_cy = (rlly + rury) / 2.0;
-    let tx = rect_cx - t_cx;
-    let ty = rect_cy - t_cy;
+    // Re-measure the scaled box to find the centring translation.
+    let wmatrix = qpdf_concat(
+        qpdf_concat(qpdf_scale(IDENTITY_MATRIX, scale, scale), tmatrix),
+        fo_matrix,
+    );
+    let t = transform_bbox(fo_bbox, wmatrix);
+    let [t_llx, t_lly, t_urx, t_ury] = t;
+    let t_cx = (t_llx + t_urx) / 2.0;
+    let t_cy = (t_lly + t_ury) / 2.0;
+    let r_cx = (rllx + rurx) / 2.0;
+    let r_cy = (rlly + rury) / 2.0;
+    let tx = r_cx - t_cx;
+    let ty = r_cy - t_cy;
 
-    format!(
-        "q\n{} 0 0 {} {} {} cm\n/{} Do\nQ\n",
-        fmt_number(scale),
-        fmt_number(scale),
-        fmt_number(tx),
-        fmt_number(ty),
-        name,
+    // cm = I.translate(tx, ty).scale(scale, scale).concat(tmatrix). The fmatrix is
+    // deliberately absent: the PDF interpreter applies the fo's /Matrix itself.
+    let cm = qpdf_concat(
+        qpdf_scale(qpdf_translate(IDENTITY_MATRIX, tx, ty), scale, scale),
+        tmatrix,
+    );
+    Some(cm)
+}
+
+/// Build a `placeFormXObject` content fragment placing the Form XObject named
+/// `name` into `rect`, mirroring qpdf's `QPDFPageObjectHelper::placeFormXObject`
+/// (qpdf 11.9.0). A degenerate placement matrix collapses to the identity, as in
+/// qpdf.
+///
+/// The fragment is exactly `"q\n" + cm + " cm\n/" + name + " Do\nQ\n"`, where `cm`
+/// is the six components formatted by [`matrix_unparse`].
+fn place_form_xobject(
+    fo_bbox: [f64; 4],
+    fo_matrix: [f64; 6],
+    rect: [f64; 4],
+    tmatrix: [f64; 6],
+    allow_shrink: bool,
+    allow_expand: bool,
+    name: &str,
+) -> String {
+    let cm = matrix_for_form_xobject_placement(
+        fo_bbox,
+        fo_matrix,
+        rect,
+        tmatrix,
+        allow_shrink,
+        allow_expand,
     )
+    .unwrap_or(IDENTITY_MATRIX);
+    format!("q\n{} cm\n/{} Do\nQ\n", matrix_unparse(cm), name)
 }
 
 /// Apply an ordered list of overlay/underlay `sources` to the destination page
@@ -159,6 +253,16 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let media_box = page_box_or_err(dest, dest_page_ref, BoxKind::Media)?;
     let trim_box = page_box_or_err(dest, dest_page_ref, BoxKind::Trim)?;
 
+    // The destination page's inverse transform, folded into every placement
+    // (qpdf's placeFormXObject is called with invert_transformations=true for both
+    // /Fx0 and the sources). Width/height come from the dest /TrimBox, matching
+    // qpdf's getMatrixForTransformations(true). Identity when the dest page has no
+    // /Rotate or /UserUnit, so a non-rotated page is unaffected.
+    let dest_transform = read_page_transform(dest, dest_page_ref)?;
+    let trim_w = trim_box.urx - trim_box.llx;
+    let trim_h = trim_box.ury - trim_box.lly;
+    let tmatrix = transformation_matrix(&dest_transform, trim_w, trim_h, true);
+
     // 1. Convert the destination page itself to Form XObject /Fx0.
     let fx0_ref = page_to_form_xobject(dest, dest_page_ref)?;
 
@@ -184,20 +288,30 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     }
 
     // 3. Build the new page /Contents in draw order: underlays -> /Fx0 ->
-    //    overlays. Underlays/overlays place into the page /TrimBox; /Fx0 places
-    //    into the page /MediaBox.
+    //    overlays. Underlays/overlays place into the page /TrimBox with
+    //    allow_shrink=true; /Fx0 places into the page /MediaBox with
+    //    allow_shrink=false (qpdf's doUnderOverlayForPage flag split). Every
+    //    placement folds in the dest inverse transform `tmatrix`.
+    let trim_rect = page_box_array(&trim_box);
+    let media_rect = page_box_array(&media_box);
     let mut content = String::new();
     for (name, xref) in &underlay_names {
-        let bbox = xobject_placement_box(dest, *xref)?;
-        content.push_str(&place_form_xobject(bbox, page_box_array(&trim_box), name));
+        let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
+        content.push_str(&place_form_xobject(
+            bbox, fmatrix, trim_rect, tmatrix, true, false, name,
+        ));
     }
     {
-        let bbox = xobject_placement_box(dest, fx0_ref)?;
-        content.push_str(&place_form_xobject(bbox, page_box_array(&media_box), "Fx0"));
+        let (bbox, fmatrix) = fo_bbox_and_matrix(dest, fx0_ref)?;
+        content.push_str(&place_form_xobject(
+            bbox, fmatrix, media_rect, tmatrix, false, false, "Fx0",
+        ));
     }
     for (name, xref) in &overlay_names {
-        let bbox = xobject_placement_box(dest, *xref)?;
-        content.push_str(&place_form_xobject(bbox, page_box_array(&trim_box), name));
+        let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
+        content.push_str(&place_form_xobject(
+            bbox, fmatrix, trim_rect, tmatrix, true, false, name,
+        ));
     }
 
     // 4. Allocate the new /Contents stream (uncompressed, no /Filter; the writer
@@ -594,19 +708,19 @@ fn transform_bbox(bbox: [f64; 4], m: [f64; 6]) -> [f64; 4] {
     [min_x, min_y, max_x, max_y]
 }
 
-/// Read the imported Form XObject's placement box: its `/BBox` transformed by the
-/// XObject's `/Matrix`, returned as the bounding rectangle `[llx lly urx ury]`.
+/// Read an imported Form XObject's raw `/BBox` (`[llx lly urx ury]`) and `/Matrix`
+/// (`[a b c d e f]`), the inputs qpdf's `getMatrixForFormXObjectPlacement`
+/// consumes.
 ///
-/// qpdf's `getMatrixForFormXObjectPlacement` fits the matrix-transformed `/BBox`
-/// (not the raw `/BBox`) into the destination rectangle, so a rotated page —
-/// whose `/Matrix` swaps width and height — is scaled and centred by its visual
-/// extent. Non-numeric `/BBox` elements coerce to `0.0` (matching qpdf); a
+/// The `/Matrix` is returned verbatim (not pre-applied to the `/BBox`): qpdf folds
+/// it into the placement computation alongside the destination page's inverse
+/// transform. Non-numeric `/BBox` elements coerce to `0.0` (matching qpdf); a
 /// `/BBox` shorter than four elements is an error; an absent or malformed
 /// `/Matrix` is treated as the identity.
-fn xobject_placement_box<R: Read + Seek>(
+fn fo_bbox_and_matrix<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
-) -> Result<[f64; 4]> {
+) -> Result<([f64; 4], [f64; 6])> {
     let obj = pdf.resolve(xobject_ref)?;
     let dict = match &obj {
         Object::Stream(s) => &s.dict,
@@ -617,6 +731,7 @@ fn xobject_placement_box<R: Read + Seek>(
             )));
         }
     };
+    let matrix = matrix_or_identity(dict);
     // /BBox may be stored as an indirect reference; resolve it before reading
     // (qpdf dereferences here, so a reference must not fall through as "no array").
     let bbox_entry = dict.get("BBox").ok_or_else(|| {
@@ -641,7 +756,7 @@ fn xobject_placement_box<R: Read + Seek>(
         as_f64(&arr[2]),
         as_f64(&arr[3]),
     ];
-    Ok(transform_bbox(bbox, matrix_or_identity(dict)))
+    Ok((bbox, matrix))
 }
 
 /// Resolve `page_ref` to an owned page `Dictionary`, erroring when it is not a
@@ -681,23 +796,31 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // layer; the golden recipes live in tests/golden/regenerate.sh. Goldens under
 // tests/golden/references/overlay/.
 //
-//   case                | kind     | source        | --from | --to  | --repeat
-//   --------------------|----------|---------------|--------|-------|---------
-//   one-page (.16.3)    | overlay  | one-page      | -      | -     | -
-//   two-page default    | overlay  | two-page      | -      | -     | -
-//   one-page repeat1    | overlay  | one-page      | -      | -     | 1
-//   two-page to=2-3     | overlay  | two-page      | -      | 2-3   | -
-//   two overlays (.16.5)| overlay×2| one + two     | -      | -     | -
-//   overlay+underlay    | over+und | one + two     | -      | -     | -
-//   two-page from=2     | overlay  | two-page      | 2      | -     | -
-//   underlay two-page   | underlay | two-page      | -      | -     | -
-//   rotated (.16.3 mtx) | overlay  | one-page-r90  | -      | -     | -
-//   one-page to=1-3 rpt1| overlay  | one-page      | -      | 1-3   | 1
+//   case                | kind     | dest          | source        | --from | --to  | --repeat
+//   --------------------|----------|---------------|---------------|--------|-------|---------
+//   one-page (.16.3)    | overlay  | three-page    | one-page      | -      | -     | -
+//   two-page default    | overlay  | three-page    | two-page      | -      | -     | -
+//   one-page repeat1    | overlay  | three-page    | one-page      | -      | -     | 1
+//   two-page to=2-3     | overlay  | three-page    | two-page      | -      | 2-3   | -
+//   two overlays (.16.5)| overlay×2| three-page    | one + two     | -      | -     | -
+//   overlay+underlay    | over+und | three-page    | one + two     | -      | -     | -
+//   two-page from=2     | overlay  | three-page    | two-page      | 2      | -     | -
+//   underlay two-page   | underlay | three-page    | two-page      | -      | -     | -
+//   rotated source mtx  | overlay  | three-page    | one-page-r90  | -      | -     | -
+//   one-page to=1-3 rpt1| overlay  | three-page    | one-page      | -      | 1-3   | 1
+//   multi-stream (.16.10)| overlay | three-page    | multi-stream  | -      | -     | -
+//   rotated dest (.16.10)| overlay | one-page-r90  | one-page      | -      | -     | -
+//   userunit (.16.10)   | overlay  | three-page    | userunit      | -      | -     | -
 //
-// The rotated row is the matrix-transformed placement check: the source page
-// carries /Rotate 90, so its imported Form XObject gets a non-identity /Matrix
-// and the placement `cm` is fitted to the matrix-transformed bbox (a whole-file
-// byte match proves both the /Matrix import and the cm fragment).
+// The rotated-source row is the matrix-transformed placement check: the source
+// page carries /Rotate 90, so its imported Form XObject gets a non-identity
+// /Matrix. The flpdf-9hc.16.10 rows widen the gate to the four byte-parity gaps
+// the narrow fixtures had masked: multi-stream exercises the conditional /Matrix
+// omission (no /Rotate) and qpdf's newline content coalescing; rotated dest
+// exercises the destination inverse transform folded into every placement cm;
+// userunit exercises the /UserUnit scale folded into the Form /Matrix. The
+// .16.10 source fixtures are pinned to PDF 1.3 (== the three-page dest) so the
+// orthogonal source version-floor limitation does not perturb the bytes.
 //
 // Explicit deferrals (NOT covered here, by design):
 //   - Encrypted-source --password byte-identity: deferred to flpdf-9hc.16.8
@@ -974,6 +1097,74 @@ mod byte_gate {
         assert_byte_identical(&actual, "three-page-overlay-to-repeat.pdf");
     }
 
+    #[test]
+    fn overlay_multi_stream_source_is_byte_identical() {
+        // dest=three-page, overlay source=multi-stream-one-page (no /Rotate, a
+        // two-element /Contents array whose first stream does not end in a
+        // newline). The imported Form XObject must OMIT /Matrix (no /Rotate or
+        // /UserUnit) and coalesce the two content streams with qpdf's newline rule
+        // (a single '\n' between them). A whole-file match proves the
+        // /Matrix-omission (gap 1) and newline coalescing (gap 2). The source is
+        // pinned to PDF 1.3 (== dest) so the orthogonal source version-floor
+        // limitation does not perturb the bytes.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("multi-stream-one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-multi-stream.pdf");
+    }
+
+    #[test]
+    fn overlay_onto_rotated_dest_is_byte_identical() {
+        // dest=one-page-r90 (a +90-rotated page), overlay source=one-page. The
+        // destination's inverse transform is folded into BOTH the /Fx0 placement
+        // (cm "0 1 -1 0 612 0") and the source placement
+        // ("0 0.77273 -0.77273 0 612 159.54545") — the nonzero b/c prove the dest
+        // inverse transform is applied (gap 3).
+        let mut dest = fixture("one-page-r90.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "r90-dest-overlay-one-page.pdf");
+    }
+
+    #[test]
+    fn overlay_userunit_source_is_byte_identical() {
+        // dest=three-page, overlay source=userunit-one-page (/UserUnit 2, no
+        // /Rotate, pinned to PDF 1.3 == dest). The imported Form XObject's /Matrix
+        // folds the unit scale in ([2 0 0 2 0 0]); a whole-file match proves the
+        // /UserUnit scale (gap 4).
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("userunit-one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-userunit.pdf");
+    }
+
     /// Build a default-range [`OverlaySpec`] over a fixture document.
     fn spec(name: &str, kind: OverlayKind) -> OverlaySpec<std::io::BufReader<std::fs::File>> {
         OverlaySpec {
@@ -1040,12 +1231,51 @@ mod tests {
         assert_eq!(fmt_number(-0.000001), "0");
     }
 
+    // ---- qpdf matrix primitives ------------------------------------------
+
+    #[test]
+    fn qpdf_concat_matches_qpdf_arithmetic() {
+        // this=[2 0 0 2 0 0] (scale 2) concat other=[1 0 0 1 5 7] (translate):
+        // ap=2; bp=0; cp=0; dp=2; ep=2*5+0*7+0=10; fp=0*5+2*7+0=14.
+        assert_eq!(
+            qpdf_concat(
+                [2.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 1.0, 5.0, 7.0]
+            ),
+            [2.0, 0.0, 0.0, 2.0, 10.0, 14.0]
+        );
+    }
+
+    #[test]
+    fn matrix_unparse_applies_fix_rounding_and_trims() {
+        // fix_rounding zeroes a sub-0.00001 component before formatting.
+        assert_eq!(
+            matrix_unparse([0.000_004, 1.0, 0.0, 1.0, 0.0, 0.0]),
+            "0 1 0 1 0 0"
+        );
+        assert_eq!(
+            matrix_unparse([0.772_73, 0.0, 0.0, 0.772_73, 0.0, 159.545_45]),
+            "0.77273 0 0 0.77273 0 159.54545"
+        );
+    }
+
     // ---- place_form_xobject ----------------------------------------------
+
+    /// The identity transformation matrix `[1 0 0 1 0 0]`.
+    const ID: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
     #[test]
     fn place_identity_when_same_size() {
-        // BBox == rect (612x792 at origin) -> identity, centred.
-        let frag = place_form_xobject([0.0, 0.0, 612.0, 792.0], [0.0, 0.0, 612.0, 792.0], "Fx0");
+        // BBox == rect (612x792 at origin), no fo/dest transform -> identity, centred.
+        let frag = place_form_xobject(
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            true,
+            false,
+            "Fx0",
+        );
         assert_eq!(frag, "q\n1 0 0 1 0 0 cm\n/Fx0 Do\nQ\n");
     }
 
@@ -1053,45 +1283,121 @@ mod tests {
     fn place_centers_smaller_bbox_without_scaling() {
         // 300x144 source into 612x792 dest: no scale-up; centred at
         // tx = 306 - 150 = 156, ty = 396 - 72 = 324.
-        let frag = place_form_xobject([0.0, 0.0, 300.0, 144.0], [0.0, 0.0, 612.0, 792.0], "Fx1");
+        let frag = place_form_xobject(
+            [0.0, 0.0, 300.0, 144.0],
+            ID,
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            true,
+            false,
+            "Fx1",
+        );
         assert_eq!(frag, "q\n1 0 0 1 156 324 cm\n/Fx1 Do\nQ\n");
     }
 
     #[test]
     fn place_shrinks_larger_bbox_to_fit() {
-        // 612x792 source into 300x144 dest: scale = min(300/612, 144/792)
-        // = min(0.490196, 0.181818) = 0.18182 (5dp). tx = 150 - 0.18182*306,
-        // ty = 72 - 0.18182*396 -> "94.36364" and "0".
-        let frag = place_form_xobject([0.0, 0.0, 612.0, 792.0], [0.0, 0.0, 300.0, 144.0], "Fx0");
+        // 612x792 source into 300x144 dest with allow_shrink: scale = min(300/612,
+        // 144/792) = 0.18182 (5dp). tx -> "94.36364", ty -> "0".
+        let frag = place_form_xobject(
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            [0.0, 0.0, 300.0, 144.0],
+            ID,
+            true,
+            false,
+            "Fx0",
+        );
         assert_eq!(frag, "q\n0.18182 0 0 0.18182 94.36364 0 cm\n/Fx0 Do\nQ\n");
+    }
+
+    #[test]
+    fn place_allow_shrink_false_clamps_scale_to_one() {
+        // Same oversize source, but allow_shrink=false (the /Fx0 flags): the
+        // would-be <1 scale is clamped to 1 and the bbox is centred unscaled.
+        // scale 1; t_cx=306, t_cy=396; r_cx=150, r_cy=72; tx=-156, ty=-324.
+        let frag = place_form_xobject(
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            [0.0, 0.0, 300.0, 144.0],
+            ID,
+            false,
+            false,
+            "Fx0",
+        );
+        assert_eq!(frag, "q\n1 0 0 1 -156 -324 cm\n/Fx0 Do\nQ\n");
     }
 
     #[test]
     fn place_fractional_center() {
         // 301x145 source into 612x792 dest: no scale; tx = 306 - 150.5 = 155.5,
         // ty = 396 - 72.5 = 323.5.
-        let frag = place_form_xobject([0.0, 0.0, 301.0, 145.0], [0.0, 0.0, 612.0, 792.0], "Fx2");
+        let frag = place_form_xobject(
+            [0.0, 0.0, 301.0, 145.0],
+            ID,
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            true,
+            false,
+            "Fx2",
+        );
         assert_eq!(frag, "q\n1 0 0 1 155.5 323.5 cm\n/Fx2 Do\nQ\n");
     }
 
     #[test]
-    fn place_handles_zero_area_bbox() {
-        // A degenerate /BBox (zero width) must not divide by zero: scale falls
-        // back to 1, centred on the rect.
-        let frag = place_form_xobject([0.0, 0.0, 0.0, 100.0], [0.0, 0.0, 200.0, 200.0], "Fx1");
-        // scale 1; t_cx = 0, t_cy = 50; rect centre (100,100): tx=100, ty=50.
-        assert_eq!(frag, "q\n1 0 0 1 100 50 cm\n/Fx1 Do\nQ\n");
+    fn place_handles_zero_area_bbox_as_identity() {
+        // A degenerate /BBox (zero width) gives qpdf a degenerate transformed
+        // rectangle, so getMatrixForFormXObjectPlacement returns the identity
+        // (NOT a centred scale-1 placement). Mirrors qpdf 11.9.0.
+        let frag = place_form_xobject(
+            [0.0, 0.0, 0.0, 100.0],
+            ID,
+            [0.0, 0.0, 200.0, 200.0],
+            ID,
+            true,
+            false,
+            "Fx1",
+        );
+        assert_eq!(frag, "q\n1 0 0 1 0 0 cm\n/Fx1 Do\nQ\n");
     }
 
     #[test]
     fn place_uses_nonzero_bbox_origin_center() {
         // /BBox origin is non-zero: centre uses (llx+urx)/2, (lly+ury)/2.
         // BBox [10 10 510 610] -> w=500 h=600 into rect [0 0 612 792].
-        // scale = min(612/500, 792/600) = min(1.224, 1.32) -> clamped to 1.
-        // t_cx = (10+510)/2 = 260, rect_cx = 306 -> tx = 46.
-        // t_cy = (10+610)/2 = 310, rect_cy = 396 -> ty = 86.
-        let frag = place_form_xobject([10.0, 10.0, 510.0, 610.0], [0.0, 0.0, 612.0, 792.0], "Fx0");
+        // scale = min(612/500, 792/600) -> clamped to 1; tx=46, ty=86.
+        let frag = place_form_xobject(
+            [10.0, 10.0, 510.0, 610.0],
+            ID,
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            true,
+            false,
+            "Fx0",
+        );
         assert_eq!(frag, "q\n1 0 0 1 46 86 cm\n/Fx0 Do\nQ\n");
+    }
+
+    #[test]
+    fn place_fx0_into_rotated_dest_uses_inverse_transform() {
+        // /Fx0 placement onto a +90-rotated 612x792 dest page. The dest inverse
+        // transform tmatrix = getMatrixForTransformations(true) = [0 1 -1 0 792 0];
+        // the page-as-XObject carries /Matrix [0 -1 1 0 0 612] and /BBox
+        // [0 0 612 792]; rect = MediaBox [0 0 612 792]; allow_shrink=false.
+        // The resulting cm un-rotates the page: [0 1 -1 0 612 0]. The nonzero b/c
+        // (impossible for the old axis-aligned placement) prove the dest inverse
+        // transform is folded in.
+        let tmatrix = [0.0, 1.0, -1.0, 0.0, 792.0, 0.0];
+        let frag = place_form_xobject(
+            [0.0, 0.0, 612.0, 792.0],
+            [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
+            [0.0, 0.0, 612.0, 792.0],
+            tmatrix,
+            false,
+            false,
+            "Fx0",
+        );
+        assert_eq!(frag, "q\n0 1 -1 0 612 0 cm\n/Fx0 Do\nQ\n");
     }
 
     // ---- apply_overlays_to_page ------------------------------------------
@@ -1398,12 +1704,12 @@ mod tests {
         );
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Stream(Stream::new(dict, Vec::new())));
-        let bbox = xobject_placement_box(&mut pdf, r).unwrap();
+        let (bbox, _matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
         assert_eq!(bbox, [0.0, 1.5, 300.0, 144.0]);
     }
 
     #[test]
-    fn xobject_bbox_rejects_missing_and_short_box() {
+    fn fo_bbox_rejects_missing_and_short_box() {
         let mut pdf = open(one_page_doc("x"));
         // Missing /BBox.
         let mut d1 = Dictionary::new();
@@ -1411,7 +1717,7 @@ mod tests {
         let r1 = next_object_ref(&pdf).unwrap();
         pdf.set_object(r1, Object::Stream(Stream::new(d1, Vec::new())));
         assert!(matches!(
-            xobject_placement_box(&mut pdf, r1),
+            fo_bbox_and_matrix(&mut pdf, r1),
             Err(Error::Unsupported(_))
         ));
 
@@ -1421,26 +1727,26 @@ mod tests {
         let r2 = next_object_ref(&pdf).unwrap();
         pdf.set_object(r2, Object::Stream(Stream::new(d2, Vec::new())));
         assert!(matches!(
-            xobject_placement_box(&mut pdf, r2),
+            fo_bbox_and_matrix(&mut pdf, r2),
             Err(Error::Unsupported(_))
         ));
     }
 
     #[test]
-    fn xobject_bbox_rejects_non_stream_non_dict() {
+    fn fo_bbox_rejects_non_stream_non_dict() {
         let mut pdf = open(one_page_doc("x"));
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Integer(42));
         assert!(matches!(
-            xobject_placement_box(&mut pdf, r),
+            fo_bbox_and_matrix(&mut pdf, r),
             Err(Error::Unsupported(_))
         ));
     }
 
     #[test]
-    fn xobject_bbox_reads_from_plain_dictionary() {
+    fn fo_bbox_reads_from_plain_dictionary() {
         // A Form XObject value that is a bare dictionary (not a stream) still
-        // yields its /BBox.
+        // yields its /BBox. With no /Matrix the matrix defaults to identity.
         let mut pdf = open(one_page_doc("x"));
         let mut d = Dictionary::new();
         d.insert(
@@ -1454,14 +1760,13 @@ mod tests {
         );
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
-        assert_eq!(
-            xobject_placement_box(&mut pdf, r).unwrap(),
-            [0.0, 0.0, 10.0, 20.0]
-        );
+        let (bbox, matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
+        assert_eq!(bbox, [0.0, 0.0, 10.0, 20.0]);
+        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn xobject_bbox_resolves_indirect_reference() {
+    fn fo_bbox_resolves_indirect_reference() {
         // /BBox stored as an indirect reference to the array object must be
         // dereferenced, not rejected as "no array".
         let mut pdf = open(one_page_doc("x"));
@@ -1479,10 +1784,8 @@ mod tests {
         d.insert("BBox", Object::Reference(bbox_ref));
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
-        assert_eq!(
-            xobject_placement_box(&mut pdf, r).unwrap(),
-            [0.0, 0.0, 10.0, 20.0]
-        );
+        let (bbox, _matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
+        assert_eq!(bbox, [0.0, 0.0, 10.0, 20.0]);
     }
 
     #[test]
@@ -1551,22 +1854,28 @@ mod tests {
 
     #[test]
     fn place_uses_matrix_transformed_bbox_for_rotated_form() {
-        // A +90-rotated 612x792 page (Form /Matrix [0 -1 1 0 0 612], /BBox
-        // [0 0 612 792]) presents a 792x612 visual box. Placed into a 612x792
-        // rect it shrinks to fit and centres exactly as qpdf 11.9.0 emits:
+        // A +90-rotated 612x792 source page (Form /Matrix [0 -1 1 0 0 612], /BBox
+        // [0 0 612 792]) presents a 792x612 visual box. With an identity dest
+        // transform it shrinks to fit a 612x792 rect exactly as qpdf 11.9.0 emits:
         //   0.77273 0 0 0.77273 0 159.54545
-        // (scale=min(612/792,792/612)=0.77273; tx=306-0.77273*396=0;
-        //  ty=396-0.77273*306=159.54545). Verified against qpdf --overlay output.
-        let transformed =
-            transform_bbox([0.0, 0.0, 612.0, 792.0], [0.0, -1.0, 1.0, 0.0, 0.0, 612.0]);
-        let frag = place_form_xobject(transformed, [0.0, 0.0, 612.0, 792.0], "Fx1");
+        // The fo /Matrix affects scale/translation but does NOT appear in the cm
+        // (the PDF interpreter applies it automatically), so b/c stay 0.
+        let frag = place_form_xobject(
+            [0.0, 0.0, 612.0, 792.0],
+            [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
+            [0.0, 0.0, 612.0, 792.0],
+            ID,
+            true,
+            false,
+            "Fx1",
+        );
         assert_eq!(frag, "q\n0.77273 0 0 0.77273 0 159.54545 cm\n/Fx1 Do\nQ\n");
     }
 
     #[test]
-    fn xobject_placement_box_applies_form_matrix() {
-        // A Form XObject carrying a +90 /Matrix reports its matrix-transformed
-        // (visual) bounding box, not the raw /BBox.
+    fn fo_bbox_and_matrix_reads_bbox_and_matrix() {
+        // A Form XObject dict's /BBox and /Matrix are read verbatim (the matrix is
+        // applied later inside the placement math, not pre-multiplied here).
         let mut pdf = open(one_page_doc("x"));
         let mut d = Dictionary::new();
         d.insert(
@@ -1591,10 +1900,9 @@ mod tests {
         );
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
-        assert_eq!(
-            xobject_placement_box(&mut pdf, r).unwrap(),
-            [0.0, 0.0, 792.0, 612.0]
-        );
+        let (bbox, matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
+        assert_eq!(bbox, [0.0, 0.0, 612.0, 792.0]);
+        assert_eq!(matrix, [0.0, -1.0, 1.0, 0.0, 0.0, 612.0]);
     }
 
     // ---- map_overlay_pages (pure) ----------------------------------------
