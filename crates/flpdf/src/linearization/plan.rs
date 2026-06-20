@@ -1436,14 +1436,16 @@ impl LinearizationPlan {
     /// | Mode | Result |
     /// |------|--------|
     /// | `Disable` | Both batch lists are empty (no ObjStms emitted). |
-    /// | `Generate` | Eligible Part-3 (first-page shared) objects are packed into `part3_batches`; eligible Part-4 objects are packed into `part4_batches` (then canonicalised, see Note). |
-    /// | `Preserve` | Existing source ObjStm membership is re-used for Part-4, but any member in `part2_objects` or ineligible per [`is_eligible_for_objstm`] is silently dropped. Members that span the Part-3/Part-4 boundary are split into separate batches per part. If the source document contained no ObjStms, both batch lists are **empty** — Preserve does **not** fall through to Generate; it mirrors the behaviour of the non-linearized `writer::object_streams::plan_preserve` and qpdf's `--object-streams=preserve` semantics (preserve means "keep what was there", not "invent new ObjStms"). |
+    /// | `Generate` | Eligible Part-3 (first-page shared) objects are packed into `part3_batches`; eligible Part-4 objects are packed into `part4_batches`. The membership is qpdf-canonical by construction (a global even split with the page dictionaries and `/Catalog` erased), so no post-packing reshape is applied. |
+    /// | `Preserve` | The source ObjStm grouping is reproduced verbatim: each source container's eligible members are routed to their linearization part (first half → `part3_batches`, second half → `part4_batches`), and the `/Pages` tree and `/Info` dictionary ride along in whatever source container held them. Members in `part2_objects` or ineligible per [`is_eligible_for_objstm`] are dropped, and the `/Catalog` is excluded (qpdf never compresses it). Members that span the Part-3/Part-4 boundary are split into separate batches per part. There is no fold and no re-chunk across containers. If the source document contained no ObjStms, both batch lists are **empty** — Preserve does **not** fall through to Generate; it mirrors the behaviour of the non-linearized `writer::object_streams::plan_preserve` and qpdf's `--object-streams=preserve` semantics (preserve means "keep what was there", not "invent new ObjStms"). |
     ///
-    /// **Note:** after the per-mode packing, the member set is canonicalised to
-    /// qpdf 11.9.0's linearized layout (see `canonicalise_first_half_batch`):
-    /// the `/Pages` tree and `/Info` dictionary are folded into the first-half
-    /// (Part-3) batch and `/Catalog` is kept standalone, so the resulting
-    /// container membership matches qpdf for both Generate and Preserve.
+    /// **Note:** the `/Pages` tree and `/Info` dictionary are not relocated.
+    /// qpdf's `preserveObjectStreams` copies the source object->stream
+    /// assignment and the linearized pass only erases the `/Page` dictionaries
+    /// and the `/Catalog` (QPDFWriter.cc:1939, 2141-2161); the `/Pages` tree and
+    /// `/Info` stay in their source container. Preserve mirrors that by routing
+    /// them into their source container's first-half batch, so the resulting
+    /// container membership matches qpdf.
     ///
     /// # Invariants
     ///
@@ -1471,48 +1473,24 @@ impl LinearizationPlan {
                 // `generateObjectStreams` directly: a GLOBAL even split over the
                 // compressible set, with the page dictionaries + root Catalog
                 // erased and `/Info` / the `/Pages` tree kept as ordinary
-                // members. That membership is already qpdf-canonical, so it does
-                // NOT go through `canonicalise_first_half_batch` /
-                // `drop_from_part4_batches` (those reshape the per-part greedy
-                // batches the Generate path no longer produces).
+                // members. That membership is already qpdf-canonical, so no
+                // post-packing reshape is applied.
                 self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions)?
             }
             ObjectStreamMode::Preserve => {
                 let mut plan =
                     self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)?;
 
-                // Canonicalise the first-half ObjStm member set to qpdf's
-                // linearized layout. qpdf packs the first page's shared resource
-                // dicts PLUS the `/Pages` tree and `/Info` into ONE first-half
-                // container and keeps the `/Catalog` standalone. flpdf's Preserve
-                // planner emits first-page shared objects as `part3_batches` and
-                // would otherwise route `/Pages`/`/Info`/`/Catalog` through
-                // `part4_batches`; fold `/Pages` + `/Info` into the first-half
-                // batch and drop `/Catalog`/`/Pages`/`/Info` from Part 4 so the
-                // membership matches qpdf. (The Generate path achieves the same
-                // layout structurally via the global even split, above.)
-                //
-                // The `/Catalog` is NEVER compressed by qpdf, so its Part-4
-                // exclusion is unconditional; the `/Pages` + `/Info` fold only
-                // applies when a first-half batch already exists (multi-page with
-                // first-page shared objects). A single-page / no-shared Preserve
-                // run leaves `/Pages` + `/Info` in the second half.
+                // qpdf's preserveObjectStreams copies the source object->stream
+                // assignment verbatim and the linearized pass only erases the
+                // /Page dicts and the /Catalog (QPDFWriter.cc:1939, 2141-2161).
+                // objstm_batches_preserve already reproduces that grouping: the
+                // /Pages tree and /Info ride along in their source container's
+                // first-half batch, and the /Page dicts are excluded. Only the
+                // /Catalog still needs dropping here — qpdf never compresses it,
+                // but a source ObjStm may have held it, so remove it from Part 4.
                 if let Some(catalog_ref) = self.root_ref {
                     Self::drop_from_part4_batches(&mut plan, &BTreeSet::from([catalog_ref]));
-                }
-                if !plan.part3_batches.is_empty() {
-                    // cov:ignore-start: the `?` error arm is unreachable in tests
-                    // — `canonicalise_first_half_batch` only propagates a
-                    // `pdf.resolve_borrowed` failure on /Info or the /Pages tree,
-                    // which does not occur for well-formed inputs.
-                    self.canonicalise_first_half_batch(
-                        pdf,
-                        &ctx,
-                        &length_exclusions,
-                        config.batch_size_cap.get(),
-                        &mut plan,
-                    )?;
-                    // cov:ignore-end
                 }
                 plan
             }
@@ -1534,102 +1512,6 @@ impl LinearizationPlan {
                 (!kept.is_empty()).then_some(kept)
             })
             .collect();
-    }
-
-    /// Fold the `/Pages` tree and `/Info` dictionary into the first-half
-    /// (Part-3) ObjStm batch(es) and exclude `/Catalog`, `/Pages`, and `/Info`
-    /// from the Part-4 batches, matching qpdf 11.9.0's linearized member set
-    /// ({first-page `/Font` dict, `/Font`, `/Info`, `/Pages` tree} in one
-    /// first-half container, `/Catalog` standalone).
-    ///
-    /// The combined first-half member set (existing Part-3 members, then
-    /// `/Info`, then the `/Pages` tree) is re-chunked into batches of at most
-    /// `cap` members, so the qpdf single-container layout holds for the default
-    /// cap (100) while a smaller cap still produces conforming containers.
-    ///
-    /// Refs that are not eligible per [`is_eligible_for_objstm`] (or absent)
-    /// are left as plain indirects; only eligible refs are moved.
-    fn canonicalise_first_half_batch<R: Read + Seek>(
-        &self,
-        pdf: &mut Pdf<R>,
-        ctx: &crate::writer::object_streams::EligibilityContext,
-        length_exclusions: &BTreeSet<ObjectRef>,
-        cap: usize,
-        plan: &mut ObjStmBatchPlan,
-    ) -> crate::Result<()> {
-        // Objects qpdf never compresses in a linearized file: the document
-        // Catalog stays a standalone indirect object.
-        let catalog_ref = self.root_ref;
-
-        // First-half shared dicts qpdf packs alongside the Part-3 font/resource
-        // dicts: the /Info dictionary and the /Pages tree.  Collect the eligible
-        // ones (skip free/length-exclusion/ineligible refs) in qpdf's order
-        // (Info before Pages-tree, matching the measured member set
-        // {Font dict, Font, Info, Pages-tree}).  Skip any already present in the
-        // existing Part-3 batches so the fold is idempotent.
-        let existing_part3: BTreeSet<ObjectRef> = plan
-            .part3_batches
-            .iter()
-            .flat_map(|b| b.iter().copied())
-            .collect();
-        let mut first_half_extra: Vec<ObjectRef> = Vec::new();
-        for candidate in [self.info_ref, self.pages_tree_ref].into_iter().flatten() {
-            // cov:ignore-start: idempotency / exclusion guard — /Info and the
-            // /Pages tree are never first-page SHARED objects (they are not in
-            // the planner's Part-3 set) and are not indirect-/Length stream
-            // targets, so neither predicate fires on real documents; the guard
-            // keeps the fold idempotent if a caller ever pre-seeds them.
-            if existing_part3.contains(&candidate) || length_exclusions.contains(&candidate) {
-                continue;
-            }
-            // cov:ignore-end
-            let obj = pdf.resolve_borrowed(candidate)?;
-            if is_eligible_for_objstm(candidate, obj, ctx) {
-                first_half_extra.push(candidate);
-            }
-        }
-
-        // Exclude /Catalog, /Pages, /Info from the Part-4 batches: /Catalog
-        // stays standalone, /Pages and /Info migrate into the first-half batch.
-        let excluded_from_part4: BTreeSet<ObjectRef> = catalog_ref
-            .into_iter()
-            .chain([self.info_ref, self.pages_tree_ref].into_iter().flatten())
-            .collect();
-        // Filter the excluded refs out of every Part-4 batch (dropping any batch
-        // that becomes empty).  When `excluded_from_part4` is empty this is a
-        // harmless no-op, so no guard is needed — avoiding an unreachable
-        // empty-set branch (a linearizable document always has a /Catalog).
-        Self::drop_from_part4_batches(plan, &excluded_from_part4);
-
-        // cov:ignore-start: defensive — this method is only invoked when
-        // `part3_batches` is non-empty (multi-page docs with first-page shared
-        // objects), and such docs always have an eligible /Pages tree (a plain
-        // dict) to fold, so `first_half_extra` is non-empty in practice; the
-        // early return guards the degenerate "no eligible /Info or /Pages" case.
-        if first_half_extra.is_empty() {
-            return Ok(());
-        }
-        // cov:ignore-end
-
-        // Flatten the existing Part-3 members, append the extras, then order the
-        // whole set by ascending source object number and re-chunk by the cap so
-        // no container exceeds the limit.  qpdf packs first-half ObjStm container
-        // members in ascending object number of the source document (measured
-        // against qpdf 11.9.0: a first-page shared /Pages tree with a lower
-        // source number than a shared font dict is packed before it), so the
-        // member set must be source-number sorted rather than left in
-        // Part-3-then-extras order.  qpdf's default cap (100) keeps everything in
-        // one first-half container.
-        let mut members: Vec<ObjectRef> = plan
-            .part3_batches
-            .iter()
-            .flat_map(|b| b.iter().copied())
-            .collect();
-        members.extend(first_half_extra);
-        members.sort_unstable_by_key(|r| r.number);
-        plan.part3_batches = members.chunks(cap).map(|chunk| chunk.to_vec()).collect();
-
-        Ok(())
     }
 
     /// Generate mode: reproduce qpdf's linearized `generateObjectStreams`.
@@ -1809,7 +1691,21 @@ impl LinearizationPlan {
                 if !is_eligible_for_objstm(obj_ref, obj, ctx) {
                     continue;
                 }
-                if part3_set.contains(&obj_ref) {
+                if Some(obj_ref) == self.pages_tree_ref || Some(obj_ref) == self.info_ref {
+                    // qpdf's preserveObjectStreams copies the source
+                    // object->stream assignment verbatim; the linearized pass
+                    // only erases the /Page dicts and the /Catalog from it
+                    // (QPDFWriter.cc:1939, 2141-2161). It never relocates the
+                    // /Pages tree or /Info, so they ride along in whatever
+                    // source ObjStm container they were in. The planner puts
+                    // both in part4_rest, so the owner gating below would route
+                    // them to a second-half bucket; route them into THIS
+                    // container's first-half (part3) bucket instead so the
+                    // source grouping survives. They carry a valid RenumberMap
+                    // slot via part4_rest (renumber promotes them to the first
+                    // half), so part3 batching is sound.
+                    p3_eligible.push(obj_ref);
+                } else if part3_set.contains(&obj_ref) {
                     p3_eligible.push(obj_ref);
                 } else if part4_set.contains(&obj_ref) {
                     // part4_set gates owner bucketing: only objects with a
@@ -3733,15 +3629,16 @@ mod tests {
             "Part-3 object 5 0 R must NOT be misrouted into part4_batches"
         );
 
-        // ── Invariant 4: /Pages tree is folded into the first-half batch ──────
-        // 2 0 R (Pages) is folded into part3_batches (the qpdf member set), so
-        // it must NOT remain in part4_batches.  4 0 R (Page 2) is a Part-4
-        // page-private dict and stays in part4_batches at the planner level
-        // (the writer drops it later via the page-private filter).
+        // ── Invariant 4: /Pages tree is routed to the first-half batch ────────
+        // 2 0 R (Pages) is a member of source ObjStm 7 and is routed into that
+        // container's first-half (part3) batch, so it must NOT remain in
+        // part4_batches.  4 0 R (Page 2) is a Part-4 page-private dict and stays
+        // in part4_batches at the planner level (the writer drops it later via
+        // the page-private filter).
         let pages_ref = ObjectRef::new(2, 0);
         assert!(
             all_part3_batched.contains(&pages_ref),
-            "the /Pages tree (2 0 R) must be folded into part3_batches"
+            "the /Pages tree (2 0 R) must be routed into part3_batches"
         );
         assert!(
             !all_part4_batched.contains(&pages_ref),
@@ -3809,11 +3706,11 @@ mod tests {
     /// exceed the cap are split into multiple batches per part.
     #[test]
     fn objstm_batches_preserve_cap_splits_large_groups() {
-        // qpdf 11.9.0 packs the first-page shared Resources dict (5 0 R) plus
-        // the /Pages tree (2 0 R) into the first-half ObjStm; ObjStm 8
-        // contributes Page 2 (4 0 R) to part4.  With cap=1 the combined
-        // first-half member set is re-chunked so each batch holds at most one
-        // member.
+        // Source ObjStm 7 holds the first-page shared Resources dict (5 0 R) and
+        // the /Pages tree (2 0 R), both routed to the first half; ObjStm 8
+        // contributes Page 2 (4 0 R) to part4.  With cap=1 each source
+        // container's first-half members are chunked so each batch holds at most
+        // one member.
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
@@ -3861,7 +3758,7 @@ mod tests {
         );
         assert!(
             all_batched.contains(&pages_ref),
-            "2 0 R (/Pages tree, folded into the first-half batch) must be batched even with cap=1"
+            "2 0 R (/Pages tree, routed to the first-half batch) must be batched even with cap=1"
         );
         assert!(
             all_batched.contains(&page2_ref),
@@ -4071,11 +3968,10 @@ mod tests {
     }
 
     /// Single-page Generate (no first-page shared objects, so `part3_batches` is
-    /// empty and `canonicalise_first_half_batch` never runs): the document
-    /// `/Catalog` must still be excluded from the Part-4 ObjStm batches, because
-    /// qpdf never compresses the Catalog.  Guards the unconditional Catalog
-    /// exclusion in `objstm_batches` against regressing back under the
-    /// `part3_batches`-non-empty gate.
+    /// empty): the document `/Catalog` must still be excluded from the Part-4
+    /// ObjStm batches, because qpdf never compresses the Catalog (the linearized
+    /// `generateObjectStreams` erases it from the compressible set).  Guards the
+    /// Catalog exclusion against regressing for the no-first-half-batch case.
     #[test]
     fn objstm_batches_generate_keeps_catalog_standalone_single_page() {
         let mut pdf = open_tiny_pdf();

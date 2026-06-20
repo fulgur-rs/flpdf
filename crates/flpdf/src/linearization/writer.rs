@@ -2479,25 +2479,45 @@ pub fn write_linearized<R: Read + Seek>(
     // this to order each page's shared identifiers by pre-renumber object number
     // (see `PageOffsetHintTable::from_plan`). Re-deriving the even-split here is
     // deterministic and cheap relative to the convergence loop below.
-    let container_even_split_rank: std::collections::BTreeMap<u32, u32> = {
-        let membership = crate::linearization::plan::objstm_membership_linearized(pdf)?;
-        let mut rank = std::collections::BTreeMap::new();
-        for (split_index, members) in membership.iter().enumerate() {
-            // `objstm_membership_linearized` drops empty containers, so `first()`
-            // is always present.
-            let first = *members
-                .first()
-                .expect("objstm_membership_linearized never yields an empty container");
-            // It recomputes the even split from the source unconditionally, so it
-            // reports containers even on the Preserve path where no ObjStm is
-            // generated. Only rank containers the Generate layout actually
-            // materialized (members present in `member_to_container`); the
-            // Preserve path finds none and skips.
-            if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(&first) {
-                rank.insert(container_num, split_index as u32);
+    // Rank each first-half ObjStm container by the order qpdf lists it in a
+    // page's shared-identifier table. qpdf builds that order from
+    // `obj_user_to_objects` (a `std::set<QPDFObjGen>` keyed by object number), so
+    // it is the ascending order of the referenced containers' object numbers at
+    // linearization time (QPDF_linearization.cc:1388-1402).
+    //
+    // - Generate: the containers are fresh `makeIndirectObject` objects numbered
+    //   in even-split order, so the rank is that even-split index.
+    // - Preserve: the containers reuse the source ObjStm objects and keep their
+    //   source numbers, so the order is ascending source-container number. That
+    //   is exactly the first-half (Part-3) layout order, since
+    //   `objstm_batches_preserve` emits `part3_batches` in ascending
+    //   source-container order. (The Generate even-split rank does NOT apply here:
+    //   `objstm_membership_linearized` recomputes the even split, which mis-orders
+    //   the reused source containers.)
+    let container_shared_rank: std::collections::BTreeMap<u32, u32> = match options.object_streams {
+        crate::writer::ObjectStreamMode::Preserve => objstm_layout
+            .part3
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.container_new_num, i as u32))
+            .collect(),
+        _ => {
+            let membership = crate::linearization::plan::objstm_membership_linearized(pdf)?;
+            let mut rank = std::collections::BTreeMap::new();
+            for (split_index, members) in membership.iter().enumerate() {
+                // `objstm_membership_linearized` drops empty containers, so
+                // `first()` is always present.
+                let first = *members
+                    .first()
+                    .expect("objstm_membership_linearized never yields an empty container");
+                // Only rank containers the Generate layout actually
+                // materialized (members present in `member_to_container`).
+                if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(&first) {
+                    rank.insert(container_num, split_index as u32);
+                }
             }
+            rank
         }
-        rank
     };
 
     // Highest object number actually used in the output.  After relocation
@@ -2558,7 +2578,7 @@ pub fn write_linearized<R: Read + Seek>(
         plan,
         renumber,
         &objstm_layout.member_to_container,
-        &container_even_split_rank,
+        &container_shared_rank,
         &second_half_container_nums,
         &open_document_container_nums,
     );
@@ -2847,7 +2867,7 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             &objstm_layout.member_to_container,
-            &container_even_split_rank,
+            &container_shared_rank,
             &second_half_container_nums,
             &open_document_container_nums,
         );
