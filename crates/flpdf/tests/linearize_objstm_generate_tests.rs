@@ -10,7 +10,7 @@
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
 use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{ObjectStreamMode, Pdf, WriteOptions};
+use flpdf::{filters, Object, ObjectStreamMode, Pdf, WriteOptions};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -328,6 +328,82 @@ fn outlines_generate_emits_outline_hint_table_and_o_key() {
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A /JS action stream shared by `/OpenAction` and an outline item's `/A`.
+///
+/// The shared stream is reachable from BOTH the catalog's `/OpenAction` subtree
+/// (qpdf `in_open_document`) AND its `/Outlines` subtree (qpdf `in_outlines`).
+/// qpdf's canonical classification orders `in_outlines` above `in_open_document`
+/// (lc_outlines before lc_open_document), so the shared object is an outline, not
+/// an open-document object.  Being an `Object::Stream` it is ineligible for ObjStm
+/// packing, so qpdf emits it plain in the SECOND half (after `/E`), AFTER the
+/// outline ObjStm container — never in the pre-`/O` open-document region.
+///
+/// Regression: before the step-6b precedence fix the stream landed in
+/// `part4_open_document_plain` (pre-`/O`, first half); before the writer's
+/// post-container ordering fix it was numbered before, and emitted before, the
+/// second-half container.
+#[test]
+fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-outline-od-shared-stream.pdf");
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    // in_outlines wins over in_open_document: the shared stream is an outline, so
+    // it must NOT be routed to the open-document pre-/O plain list.
+    assert!(
+        plan.part4_open_document_plain.is_empty(),
+        "the OD+outline stream must be classified as an outline, not open-document; \
+         part4_open_document_plain = {:?}",
+        plan.part4_open_document_plain
+    );
+
+    let bytes = linearize_generate("objstm-lin-outline-od-shared-stream.pdf");
+    let e_off = parse_e_offset(&bytes);
+
+    // Locate the shared /JS stream by its decoded content (deflate-independent),
+    // then find its physical object header offset.
+    let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
+    let mut js_number = None;
+    for r in rt.object_refs() {
+        if let Ok(Object::Stream(s)) = rt.resolve(r) {
+            if let Ok(decoded) = filters::decode_stream_data(&s.dict, &s.data) {
+                if decoded == b"app.alert('shared');" {
+                    js_number = Some(r.number);
+                }
+            }
+        }
+    }
+    let js_number = js_number.expect("the shared /JS stream must survive linearization");
+    let js_marker = format!("\n{js_number} 0 obj");
+    let js_off = bytes
+        .windows(js_marker.len())
+        .position(|w| w == js_marker.as_bytes())
+        .expect("shared /JS stream object header present");
+
+    // The second-half outline ObjStm container (holding the eligible outline
+    // dicts) precedes the ineligible stream; both are after /E.
+    let container_off = bytes[e_off..]
+        .windows(b"/Type /ObjStm".len())
+        .position(|w| w == b"/Type /ObjStm")
+        .map(|p| e_off + p)
+        .expect("second-half outline ObjStm container present");
+    assert!(
+        e_off < container_off && container_off < js_off,
+        "the ineligible outline stream (obj {js_number}, offset {js_off}) must follow \
+         the second-half ObjStm container (offset {container_off}), both after /E ({e_off})"
+    );
+
+    // Round-trip: every object (including the outline container's members) resolves.
+    let refs = rt.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        rt.resolve(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }

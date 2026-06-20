@@ -593,6 +593,30 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// outline-od-shared-stream: a /JS action stream reachable from BOTH the catalog's
+// /OpenAction subtree (in_open_document) AND an outline item's /A (in_outlines).
+// qpdf's canonical classification orders in_outlines ABOVE in_open_document
+// (QPDF_linearization.cc lc_outlines before lc_open_document), so the shared
+// object is an outline.  Being an Object::Stream it is ineligible for ObjStm, so
+// qpdf emits it plain in part9 (second half) AFTER the outline container — NOT in
+// the pre-/O open-document region.  Exercises from_pdf step-6b OD/outline
+// precedence and the writer's second-half post-container plain ordering.
+#[test]
+fn outline_od_shared_stream_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-outline-od-shared-stream.pdf",
+        "objstm-lin-outline-od-shared-stream",
+    );
+}
+
+#[test]
+fn outline_od_shared_stream_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-outline-od-shared-stream.pdf",
+        "objstm-lin-outline-od-shared-stream",
+    );
+}
+
 // acroform-widget-ap-stream-page0 (PR #393 Fix 1 + Fix 3): AcroForm widget with
 // an /AP /N Form XObject appearance stream (Object::Stream → ineligible for
 // ObjStm packing). The Form XObject is in open_document_set (via
