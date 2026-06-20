@@ -116,3 +116,26 @@ fn nostream_130rev_generate_is_byte_identical_to_qpdf() {
 fn three_page_generate_is_byte_identical_to_qpdf() {
     assert_cmp_diff_zero("three-page.pdf", "three-page");
 }
+
+// ── Step D: orphaned indirect /Length holder dropped (flpdf-sqkq) ─────────────
+// The catalog's /OpenAction reaches a JavaScript stream (obj 6) with an INDIRECT
+// /Length (7 0 R); the holder (obj 7) is reachable ONLY through that /Length
+// edge. Once /Length is normalized to a direct integer the holder orphans, and
+// qpdf garbage-collects it before renumbering. The generate path must drop it
+// from the renumber universe too, shifting numbers contiguously.
+#[test]
+fn od_indirect_length_generate_drops_orphan_holder_byte_identical_to_qpdf() {
+    assert_cmp_diff_zero(
+        "objstm-lin-od-indirect-length.pdf",
+        "objstm-lin-od-indirect-length",
+    );
+}
+
+#[test]
+fn od_indirect_length_flate_generate_drops_orphan_holder_byte_identical_to_qpdf() {
+    // Same orphan structure, but the JS stream is a lone /FlateDecode source.
+    assert_cmp_diff_zero(
+        "objstm-lin-od-indirect-length-flate.pdf",
+        "objstm-lin-od-indirect-length-flate",
+    );
+}

@@ -511,6 +511,21 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
     echo "$stem/linearize-objstm.pdf"
 done
 
+# Plain full-rewrite + non-linearized generate goldens for the orphaned-/Length-
+# holder drop (flpdf-sqkq). The OD fixtures' indirect /Length holder (obj 7) is
+# reachable only via the JS stream's /Length; once /Length is normalized to a
+# direct integer it orphans and qpdf garbage-collects it. Pinned byte-identical
+# by cmp_diff_zero_tests (static-id) and cmp_generate_objstm_tests (generate)
+# under qpdf-zlib-compat.
+for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate; do
+    qpdf --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/static-id.pdf"
+    echo "$stem/static-id.pdf"
+    qpdf --object-streams=generate --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/generate.pdf"
+    echo "$stem/generate.pdf"
+done
+
 # Linearized >cap preserve golden for the ObjStm-bearing fixture (flpdf-ihb.4).
 # Distinct filename (linearize-objstm-preserve.pdf) so it never collides with the
 # generate-mode linearize-objstm.pdf goldens. preserve keeps qpdf's source ObjStm
