@@ -251,6 +251,24 @@ for stem in "${!G6HB2_FIX[@]}"; do
     fi
 done
 
+# ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
+# gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
+# on it yields an empty plan. Re-encoding through --object-streams=generate produces
+# 3 source ObjStm containers (68/67/68 members) so the preserve path has real source
+# grouping to preserve at >cap. qpdf 11.9.0 does not support reading a PDF from stdin
+# ("reading from stdin is not supported"), so the generator output is staged to a
+# temp file rather than piped. --deterministic-id keeps the fixture byte-reproducible.
+if [[ ! -f "$FIX/objstm-lin-cap-boundary-199-bearing.pdf" ]]; then
+    echo "Generating objstm-lin-cap-boundary-199-bearing.pdf ..."
+    bearing_src="$(mktemp)"
+    python3 "$ROOT/docs/plans/tools/gen_shared_fonts.py" 199 > "$bearing_src"
+    qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+        "$bearing_src" "$FIX/objstm-lin-cap-boundary-199-bearing.pdf"
+    rm -f "$bearing_src"
+else
+    echo "Skipping objstm-lin-cap-boundary-199-bearing.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -412,6 +430,17 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
     qpdf --check "$REF/$stem/linearize-objstm.pdf" >/dev/null
     echo "$stem/linearize-objstm.pdf"
 done
+
+# Linearized >cap preserve golden for the ObjStm-bearing fixture (flpdf-ihb.4).
+# Distinct filename (linearize-objstm-preserve.pdf) so it never collides with the
+# generate-mode linearize-objstm.pdf goldens. preserve keeps qpdf's source ObjStm
+# grouping (68/67/68) minus the erased /Catalog + /Page dicts => 3 containers
+# 66/66/68 in the linearized output.
+mkdir -p "$REF/objstm-lin-cap-boundary-199-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-cap-boundary-199-bearing.pdf" \
+    "$REF/objstm-lin-cap-boundary-199-bearing/linearize-objstm-preserve.pdf"
+echo "objstm-lin-cap-boundary-199-bearing/linearize-objstm-preserve.pdf"
 
 # Classic (non-ObjStm) linearize goldens for outline section routing (flpdf-vvjr.2).
 # outlines-80-80: outlines route to part9 (second-half, !UseOutlines).
