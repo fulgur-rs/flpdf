@@ -206,6 +206,10 @@ fi
 # Linearized generate-mode >cap fixtures (flpdf-g6hb.2). Each forces a distinct
 # qpdf even-split + part-routing scenario:
 #  - sharedfonts-100: 104 first-page-shared dicts => 2 containers (50+51), both part6.
+#  - cap-boundary-199: 199 fonts + /Pages = 200 first-page-shared members (exact
+#                     multiple of the 100 cap) => even-split 3 containers
+#                     (66+68+66), all part6. The ihb.3 stranded-container
+#                     boundary: greedy chunks(cap) would mis-split as 100+100.
 #  - mixed-60-70:     first-page-shared + page-1-only => part6 + part7 containers.
 #  - threepage-2-120: fonts shared by pages 1&2 (not page 0) => part6 + part8.
 #  - disc-2-250-2:    pure part7 container + a part8 uncompressed Form XObject
@@ -220,6 +224,7 @@ fi
 #                     hint table + hint dict /O), plus 80 first-page shared fonts.
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
+    [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
     [objstm-lin-mixed-60-70]="gen_mixed_shared.py 60 70"
     [objstm-lin-threepage-2-120]="gen_three_page_shared.py 2 120"
     [objstm-lin-disc-2-250-2]="gen_part7_part8_discriminator.py 2 250 2"
@@ -389,7 +394,8 @@ echo "shared-stream-objstm/linearize-objstm.pdf"
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
 # above for each scenario. Compared structurally (and strictly where flpdf
 # reaches byte-identity) by cmp_linearize_objstm_tests under qpdf-zlib-compat.
-for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
+for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
+            objstm-lin-mixed-60-70 \
             objstm-lin-threepage-2-120 objstm-lin-disc-2-250-2 \
             objstm-lin-openaction-80-80 objstm-lin-openaction-multi-od \
             objstm-lin-outlines-80-80 \
