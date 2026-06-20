@@ -532,15 +532,14 @@ impl LinearizationPlan {
         // [`crate::writer::is_source_structural_container`]).
         // Drop indirect `/Length` holders that become orphaned once each stream's
         // `/Length` is normalized to a direct integer (qpdf garbage-collects them;
-        // see [`orphaned_indirect_length_holders`]). Gated on generate mode — the
-        // scope where every stream is verified to be written with a direct
-        // `/Length`, matching the open-document peel gate below (flpdf-2vfg). The
-        // plain full-rewrite path has the same divergence, tracked separately.
-        let orphan_length_holders = if use_generate_objstm {
-            orphaned_indirect_length_holders(pdf)?
-        } else {
-            BTreeSet::new()
-        };
+        // see [`orphaned_indirect_length_holders`]). Applies to EVERY linearization
+        // mode: the linearized writer always emits a direct `/Length` — re-encoded
+        // and lone-`/FlateDecode`-verbatim streams alike, and `renumber_object`
+        // substitutes a direct length for a dropped holder's dangling reference —
+        // so an indirect `/Length` edge is dead in the output regardless of the
+        // object-stream mode (flpdf-2vfg). The plain (non-linearized) full-rewrite
+        // path has the same divergence, tracked separately (flpdf-sqkq).
+        let orphan_length_holders = orphaned_indirect_length_holders(pdf)?;
         let object_refs = pdf.object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
@@ -4985,6 +4984,20 @@ mod tests {
         assert!(
             !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
             "a page-reachable orphaned /Length holder must not be assigned to any part"
+        );
+    }
+
+    #[test]
+    fn non_generate_plan_also_drops_orphan_indirect_length_holder() {
+        // The orphan-holder pruning is NOT gated on generate mode: the linearized
+        // writer emits a direct /Length in every object-stream mode, so qpdf GCs
+        // the holder for plain `--linearize` (preserve) and `--object-streams=
+        // disable` runs too. `use_generate_objstm = false` must still drop it.
+        let mut pdf = Pdf::open(Cursor::new(od_indirect_length_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        assert!(
+            !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
+            "orphaned /Length holder must be dropped in non-generate mode too"
         );
     }
 }
