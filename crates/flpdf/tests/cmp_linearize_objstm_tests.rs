@@ -602,3 +602,25 @@ fn acroform_widget_page1_page2_objstm_byte_identical_to_qpdf() {
         "objstm-lin-acroform-widget-page1-page2",
     );
 }
+
+// thumbnail-private-shared: a 4-page fixture where other pages carry /Thumb
+// entries: page 1 has a private thumbnail (ou_thumb, lc_thumbnail_private → part9)
+// and pages 2 & 3 share a thumbnail object (lc_thumbnail_shared → part9). Pins
+// the compute_closure /Thumb skip that routes thumbnail objects to part4_rest
+// rather than the per-page private/shared sections.
+#[test]
+fn thumbnail_private_shared_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-thumbnail-private-shared.pdf",
+        "objstm-lin-thumbnail-private-shared",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn thumbnail_private_shared_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-thumbnail-private-shared.pdf",
+        "objstm-lin-thumbnail-private-shared",
+    );
+}

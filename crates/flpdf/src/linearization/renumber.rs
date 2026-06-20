@@ -12,12 +12,14 @@
 //! | M+1..N      | part8: other pages' shared objects (qpdf part8). |
 //! | N+1         | Pages tree (qpdf part9 head). Skipped if absent. |
 //! | N+2         | Info dict (qpdf `lc_other`). Skipped if absent. |
+//! | N+3..O      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
+//! | O+1..P      | Remaining `part4_rest` objects (e.g. `lc_thumbnail`). Skipped if absent. |
 //! | param       | **Reserved** — linearization parameter dictionary (Part 1). |
 //! | catalog     | Catalog (qpdf `lc_root`). Skipped if absent. |
 //! | hint        | **Reserved** — primary hint stream. |
 //! | next..a     | Part 2 — first-page objects (plan order). |
 //! | a+1..b      | Part 3 — shared objects (plan order). |
-//! | b+1..end    | part4_rest remaining — everything not promoted (plan order). |
+//! | b+1..end    | Part 6 — outline objects (qpdf `lc_outlines`, `UseOutlines`). Skipped if absent. |
 //!
 //! The `param` and `hint` slots are *dynamic*: when an upstream object is
 //! absent from the plan its slot is simply not consumed, so emitted object
@@ -220,6 +222,7 @@ impl RenumberMap {
         //  slot ..     pages_tree (if in part4_rest)
         //  slot ..     info (if in part4_rest)
         //  slot ..     part9 outline objects (classic, !UseOutlines) — qpdf lc_outlines
+        //  slot ..     part4_rest remaining (e.g. lc_thumbnail_private/shared)
         //  slot ..     <param dict reserved>
         //  slot ..     root_ref / Catalog (if in part4_rest)
         //  slot ..     <hint stream reserved>
@@ -228,7 +231,6 @@ impl RenumberMap {
         //  slot ..     Part 2 in plan order
         //  slot ..     Part 3 in plan order
         //  slot ..     part6 outline objects (classic, UseOutlines) — qpdf lc_outlines
-        //  slot ..     part4_rest remaining (pages_tree/info/root already promoted)
 
         // 1. part7 (other pages' private) in plan order.
         for &original in &plan.part4_other_pages_private {
@@ -248,6 +250,20 @@ impl RenumberMap {
         // qpdf places lc_outlines between info and the param dict in the
         // second-half renumber pass, giving them consecutive second-half numbers.
         for &original in &plan.part9_outline_objects {
+            push_real(original, &mut by_new_number, &mut by_original);
+        }
+
+        // 3c. Remaining part4_rest objects (e.g. lc_thumbnail_private/shared) go to
+        // the second half, after the part9 head promotions and before the param dict.
+        // root_ref (catalog) is excluded — it is a first-half standalone object
+        // that gets its slot via the promote() call at step 6 below.
+        for &original in &plan.part4_rest {
+            if by_original.contains_key(&original) {
+                continue; // already placed: pages_tree, info, or outline objects
+            }
+            if plan.root_ref == Some(original) {
+                continue; // catalog stays first-half; promoted at step 6
+            }
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
@@ -284,16 +300,8 @@ impl RenumberMap {
 
         // 9b. part6 outline objects (classic, UseOutlines).
         // These go into the first-half section before /E, between Part 3 and
-        // the remaining part4_rest, matching qpdf's lc_outlines (part6) order.
+        // the hint stream, matching qpdf's lc_outlines (part6) order.
         for &original in &plan.part6_outline_objects {
-            push_real(original, &mut by_new_number, &mut by_original);
-        }
-
-        // 10. part4_rest remaining (skip refs already promoted above).
-        for &original in &plan.part4_rest {
-            if by_original.contains_key(&original) {
-                continue;
-            }
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
@@ -461,6 +469,7 @@ impl RenumberMap {
         first_half_batches: &[Vec<ObjectRef>],
         second_half_batches: &[Vec<ObjectRef>],
         second_half_anchors: &[Option<ObjectRef>],
+        second_half_post_plain: &BTreeSet<ObjectRef>,
     ) -> ObjStmRelocation {
         // Fast path: nothing to place — leave the map byte-identical.
         let no_open = open_document_batches.iter().all(|b| b.is_empty());
@@ -576,7 +585,15 @@ impl RenumberMap {
             table.push(SENTINEL); // container: a plain indirect, no original
             second_half_container_slot[bi] = Some(container_num);
         };
+        // lc_thumbnail objects (non-member part4_rest streams) must be emitted
+        // AFTER the ObjStm containers, matching qpdf's part9-tail placement.
+        // Partition second_half_plain into pre- and post-container groups.
+        let mut post_container_plain: Vec<ObjectRef> = Vec::new();
         for &original in &second_half_plain {
+            if second_half_post_plain.contains(&original) {
+                post_container_plain.push(original);
+                continue;
+            }
             new_by_new_number.push(original);
             for bi in 0..second_half_batches.len() {
                 if second_half_anchors.get(bi).copied().flatten() == Some(original) {
@@ -584,10 +601,14 @@ impl RenumberMap {
                 }
             }
         }
-        // Containers with no anchor (or whose anchor was not found) go after all
-        // plain objects, in batch order — the original "compressed last" behaviour.
+        // Containers with no anchor (or whose anchor is a post-container object)
+        // go after all pre-container plain objects, in batch order.
         for bi in 0..second_half_batches.len() {
             emit_container(bi, &mut new_by_new_number);
+        }
+        // Post-container plain (lc_thumbnail / part9 tail): after all containers.
+        for &original in &post_container_plain {
+            new_by_new_number.push(original);
         }
         // Record container numbers in batch order (the writer maps batch ->
         // container by position).
@@ -873,21 +894,22 @@ mod tests {
         // part7 (other pages' private): page-2 dict and content come first.
         assert_eq!(rn.new_for_original(ObjectRef::new(4, 0)).unwrap().number, 1);
         assert_eq!(rn.new_for_original(ObjectRef::new(7, 0)).unwrap().number, 2);
-        // No pages_tree / info to promote → param dict lands at slot 3.
-        assert_eq!(rn.param_dict_ref().number, 3);
-        // Catalog promoted from part4_rest to slot 4.
-        assert_eq!(rn.new_for_original(ObjectRef::new(1, 0)).unwrap().number, 4);
-        // Hint stream at slot 5.
-        assert_eq!(rn.hint_stream_slot(), 5);
-        // Part 2 starts at slot 6.
-        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 6);
-        assert_eq!(rn.new_for_original(ObjectRef::new(6, 0)).unwrap().number, 7);
+        // No pages_tree / info to promote.  step 3c places the remaining
+        // part4_rest non-root object (2 0 R) in the second half at slot 3.
+        assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 3);
+        // Param dict lands at slot 4 (shifted by step 3c).
+        assert_eq!(rn.param_dict_ref().number, 4);
+        // Catalog promoted from part4_rest to slot 5.
+        assert_eq!(rn.new_for_original(ObjectRef::new(1, 0)).unwrap().number, 5);
+        // Hint stream at slot 6.
+        assert_eq!(rn.hint_stream_slot(), 6);
+        // Part 2 starts at slot 7.
+        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 7);
+        assert_eq!(rn.new_for_original(ObjectRef::new(6, 0)).unwrap().number, 8);
         // Part 3 follows.
-        assert_eq!(rn.new_for_original(ObjectRef::new(5, 0)).unwrap().number, 8);
-        assert_eq!(rn.new_for_original(ObjectRef::new(8, 0)).unwrap().number, 9);
-        // part4_rest remainder (catalog already promoted, so only 2 0 R).
+        assert_eq!(rn.new_for_original(ObjectRef::new(5, 0)).unwrap().number, 9);
         assert_eq!(
-            rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number,
+            rn.new_for_original(ObjectRef::new(8, 0)).unwrap().number,
             10
         );
     }
@@ -1088,9 +1110,9 @@ mod tests {
         let h = rn.hint_stream_slot();
         // No plan original maps onto the hint stream slot.
         assert!(rn.original_for_new(ObjectRef::new(h, 0)).is_none());
-        // two_page_plan has 2 part7 objects before param dict, then catalog,
-        // then hint stream: slots 1, 2 = part7; 3 = param; 4 = catalog; 5 = hint.
-        assert_eq!(h, 5);
+        // two_page_plan: slots 1, 2 = part7; 3 = step3c (2 0 R from part4_rest);
+        // 4 = param; 5 = catalog; 6 = hint.
+        assert_eq!(h, 6);
     }
 
     // -----------------------------------------------------------------------
@@ -1126,13 +1148,14 @@ mod tests {
 
         assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 1);
         assert_eq!(rn.new_for_original(info_ref).unwrap().number, 2);
-        assert_eq!(rn.param_dict_ref().number, 3);
-        assert_eq!(rn.new_for_original(catalog_ref).unwrap().number, 4);
-        assert_eq!(rn.hint_stream_slot(), 5);
+        // step 3c places other_part4 (the only non-root/non-promoted part4_rest
+        // entry) in the second half at slot 3 (before the param dict).
+        assert_eq!(rn.new_for_original(other_part4).unwrap().number, 3);
+        assert_eq!(rn.param_dict_ref().number, 4);
+        assert_eq!(rn.new_for_original(catalog_ref).unwrap().number, 5);
+        assert_eq!(rn.hint_stream_slot(), 6);
         // Part 2 starts immediately after the hint stream slot.
-        assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 6);
-        // Remaining part4_rest follows Part 2 (catalog, pages, info already promoted).
-        assert_eq!(rn.new_for_original(other_part4).unwrap().number, 7);
+        assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 7);
     }
 
     /// When pages/info refs are absent, their slots collapse and the param
@@ -1163,14 +1186,15 @@ mod tests {
             ..Default::default()
         };
         let rn = RenumberMap::from_plan(&plan);
-        // Layout: param=1, hint=2 (nothing promoted, no catalog either),
-        // then Part 2 starts at slot 3.
-        assert_eq!(rn.param_dict_ref().number, 1);
-        assert_eq!(rn.hint_stream_slot(), 2);
-        assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 3);
-        assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 4);
-        // part4_rest lands last.
-        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 5);
+        // step 3c places 3 0 R (the only part4_rest entry; root_ref=None so no
+        // root skip) in the second half at slot 1, before the param dict.
+        assert_eq!(rn.new_for_original(ObjectRef::new(3, 0)).unwrap().number, 1);
+        // param dict shifts to slot 2; hint to slot 3.
+        assert_eq!(rn.param_dict_ref().number, 2);
+        assert_eq!(rn.hint_stream_slot(), 3);
+        // Part 2 follows: pages_ref (10 0 R) at slot 4, then 2 0 R at slot 5.
+        assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 4);
+        assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 5);
     }
 
     /// A duplicated ref inside `part4_rest` (and also in `part4_other_pages_private`)
@@ -1212,7 +1236,8 @@ mod tests {
             vec![ObjectRef::new(5, 0)],
             vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
         ];
-        let relocation = rn.place_objstm_members_per_half(&[], &[], &second_half_batches, &[]);
+        let relocation =
+            rn.place_objstm_members_per_half(&[], &[], &second_half_batches, &[], &BTreeSet::new());
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -1295,7 +1320,8 @@ mod tests {
 
         // One Part-3 (first-half) batch: 5 0 R + 8 0 R (both part3_objects).
         let first_half_batches = vec![vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)]];
-        let relocation = rn.place_objstm_members_per_half(&[], &first_half_batches, &[], &[]);
+        let relocation =
+            rn.place_objstm_members_per_half(&[], &first_half_batches, &[], &[], &BTreeSet::new());
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -1364,6 +1390,7 @@ mod tests {
             &first_half_batches,
             &second_half_batches,
             &[],
+            &BTreeSet::new(),
         );
 
         // Empty batches contribute no container numbers: one open-document + one

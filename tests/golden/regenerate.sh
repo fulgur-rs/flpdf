@@ -234,6 +234,7 @@ declare -A G6HB2_FIX=(
     [objstm-lin-acroform-widget-ap-stream-page0]="gen_acroform_widget_ap_stream_page0.py"
     [objstm-lin-acroform-widget-page1-only]="gen_acroform_widget_page1_only.py"
     [objstm-lin-acroform-widget-page1-page2]="gen_acroform_widget_page1_page2.py"
+    [objstm-lin-thumbnail-private-shared]="gen_thumbnail.py"
 )
 for stem in "${!G6HB2_FIX[@]}"; do
     if [[ ! -f "$FIX/$stem.pdf" ]]; then
@@ -397,7 +398,8 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-mixed-60-70 \
             objstm-lin-acroform-widget-page0-5-10 \
             objstm-lin-acroform-widget-ap-stream-page0 \
             objstm-lin-acroform-widget-page1-only \
-            objstm-lin-acroform-widget-page1-page2; do
+            objstm-lin-acroform-widget-page1-page2 \
+            objstm-lin-thumbnail-private-shared; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"
