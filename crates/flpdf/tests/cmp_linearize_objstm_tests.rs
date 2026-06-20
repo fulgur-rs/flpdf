@@ -53,6 +53,36 @@ fn golden(stem: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
 }
 
+/// Linearize `fixture` with `--object-streams=preserve` via the public API and
+/// return the complete back-patched bytes. Unlike `generate`, this keeps the
+/// source document's ObjStm membership (qpdf's `preserveObjectStreams`).
+fn flpdf_linearized_objstm_preserve(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+    let renumber = RenumberMap::from_plan(&plan);
+    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
+    let mut opts = WriteOptions::default();
+    opts.object_streams = ObjectStreamMode::Preserve;
+    opts.deterministic_id = true;
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
+    doc.back_patch().unwrap();
+    doc.bytes
+}
+
+fn golden_preserve(stem: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(stem)
+        .join("linearize-objstm-preserve.pdf");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     if a == b {
         return None;
@@ -651,4 +681,35 @@ fn thumbnail_private_shared_objstm_byte_identical_to_qpdf() {
         "objstm-lin-thumbnail-private-shared.pdf",
         "objstm-lin-thumbnail-private-shared",
     );
+}
+
+// cap-boundary-199-bearing (flpdf-ihb.4): PRESERVE mode (qpdf
+// --object-streams=preserve) on an ObjStm-bearing input. qpdf's
+// preserveObjectStreams keeps the SOURCE document's ObjStm grouping rather than
+// repacking: 3 source containers 68/67/68, minus the erased /Catalog and /Page
+// dicts (promoted to plain indirects), yields 66/66/68 (sum 200), and
+// --check-linearization is clean. flpdf's preserve path currently re-chunks the
+// first-half greedily into 100+100 (the bug), diverging from the golden. These
+// tests pin the source-grouping behaviour (structural + strict).
+#[test]
+fn cap_boundary_199_bearing_preserve_structurally_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-cap-boundary-199-bearing.pdf";
+    let stem = "objstm-lin-cap-boundary-199-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(
+        fixture,
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "preserve structural",
+    );
+}
+
+#[test]
+fn cap_boundary_199_bearing_preserve_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-cap-boundary-199-bearing.pdf";
+    let stem = "objstm-lin-cap-boundary-199-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(fixture, &actual, &expected, "preserve strict");
 }
