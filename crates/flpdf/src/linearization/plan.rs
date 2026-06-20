@@ -34,7 +34,7 @@ use crate::linearization::renumber::RenumberMap;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm,
-    ObjectStreamMode, PlannerConfig,
+    orphaned_indirect_length_holders, ObjectStreamMode, PlannerConfig,
 };
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -530,10 +530,23 @@ impl LinearizationPlan {
         // length-calc reject them ("found unknown object"). This mirrors the
         // plain rewrite path's emission-time skip (see
         // [`crate::writer::is_source_structural_container`]).
+        // Drop indirect `/Length` holders that become orphaned once each stream's
+        // `/Length` is normalized to a direct integer (qpdf garbage-collects them;
+        // see [`orphaned_indirect_length_holders`]). Applies to EVERY linearization
+        // mode: the linearized writer always emits a direct `/Length` — re-encoded
+        // and lone-`/FlateDecode`-verbatim streams alike, and `renumber_object`
+        // substitutes a direct length for a dropped holder's dangling reference —
+        // so an indirect `/Length` edge is dead in the output regardless of the
+        // object-stream mode (flpdf-2vfg). The plain (non-linearized) full-rewrite
+        // path has the same divergence, tracked separately (flpdf-sqkq).
+        let orphan_length_holders = orphaned_indirect_length_holders(pdf)?;
         let object_refs = pdf.object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
             if r.number == 0 {
+                continue;
+            }
+            if orphan_length_holders.contains(&r) {
                 continue;
             }
             if crate::writer::is_source_structural_container(pdf.resolve_borrowed(r)?) {
@@ -584,11 +597,17 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
-        let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
+        let mut first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
             compute_closure(pdf, first_page)?
         } else {
             Vec::new()
         };
+        // A page-reachable stream's orphaned indirect /Length holder (flpdf-2vfg)
+        // enters the closure because compute_closure follows the stream dict's
+        // /Length via collect_direct_refs. qpdf garbage-collects it, so drop it
+        // from every page closure too — the all_refs filter above only removes it
+        // from the Part-4 universe and would otherwise leak it into Part 2/3.
+        first_page_closure.retain(|r| !orphan_length_holders.contains(r));
         let first_page_set: BTreeSet<ObjectRef> = first_page_closure.iter().copied().collect();
 
         // ----------------------------------------------------------------
@@ -616,7 +635,11 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref)?;
+            let mut closure = compute_closure(pdf, page_ref)?;
+            // Drop orphaned indirect /Length holders from later-page closures too
+            // (see the first-page closure above) so a page-private stream's holder
+            // is not emitted as a part7/part8 object.
+            closure.retain(|r| !orphan_length_holders.contains(r));
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -4834,6 +4857,147 @@ mod tests {
         assert!(
             set.is_empty(),
             "a non-dictionary catalog must yield no open-document objects, got {set:?}"
+        );
+    }
+
+    /// One-page PDF whose catalog `/OpenAction` reaches a JavaScript action (obj
+    /// 5) whose `/JS` stream (obj 6) has an INDIRECT `/Length` (`7 0 R`). The
+    /// holder (obj 7) is reachable only via that `/Length` edge. flpdf-2vfg.
+    fn od_indirect_length_pdf_bytes() -> Vec<u8> {
+        let bodies: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 5 >>\nstream\nBT ET\nendstream"),
+            (5, b"<< /Type /Action /S /JavaScript /JS 6 0 R >>"),
+            (
+                6,
+                b"<< /Length 7 0 R >>\nstream\napp.alert('hi');\nendstream",
+            ),
+            (7, b"16"),
+        ];
+        let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = bodies.len() as u32 + 1;
+        let mut offsets = vec![0usize; total as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    #[test]
+    fn generate_plan_drops_orphan_indirect_length_holder_and_writes() {
+        let bytes = od_indirect_length_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+        // The /Length holder (obj 7), reachable only via the OD stream's indirect
+        // /Length, must be excluded from the plan: every stream is written with a
+        // direct /Length, so the holder orphans and qpdf garbage-collects it.
+        assert!(
+            !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
+            "orphaned /Length holder must not be assigned to any linearization part"
+        );
+
+        // Writing must succeed: the now-dangling `7 0 R` /Length is direct-ized at
+        // renumber time (before this fix it errored "no entry in RenumberMap").
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut pdf2 = Pdf::open(Cursor::new(bytes)).unwrap();
+        let opts = crate::WriteOptions {
+            object_streams: crate::ObjectStreamMode::Generate,
+            deterministic_id: true,
+            newline_before_endstream: crate::NewlineBeforeEndstream::Never,
+            ..Default::default()
+        };
+        let mut doc =
+            crate::linearization::writer::write_linearized(&plan, &renumber, &mut pdf2, &opts)
+                .expect("linearized write must succeed with the orphan holder dropped");
+        doc.back_patch().expect("back-patch must succeed");
+        // No stream may carry an indirect /Length in the output: every /Length is
+        // direct, so the dropped holder is unreferenced.
+        let out = doc.bytes;
+        assert!(
+            !out.windows(b"/Length 7 0 R".len())
+                .any(|w| w == b"/Length 7 0 R"),
+            "the OD stream's /Length must be direct-ized, not left as an indirect ref"
+        );
+    }
+
+    /// Two-page PDF whose SECOND page's `/Contents` stream (obj 6) has an
+    /// indirect `/Length` (`7 0 R`); the holder (obj 7) is reachable only via
+    /// that page-2 closure edge. flpdf-2vfg / Codex review on PR #400.
+    fn page2_contents_indirect_length_pdf_bytes() -> Vec<u8> {
+        let bodies: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 2 /Kids [ 3 0 R 4 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << >> >>",
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << >> >>",
+            ),
+            (5, b"<< /Length 5 >>\nstream\nBT ET\nendstream"),
+            (6, b"<< /Length 7 0 R >>\nstream\nBT ET\nendstream"),
+            (7, b"5"),
+        ];
+        let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let total = bodies.len() as u32 + 1;
+        let mut offsets = vec![0usize; total as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = out.len();
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
+        out
+    }
+
+    #[test]
+    fn generate_plan_drops_orphan_length_holder_reached_via_later_page_closure() {
+        // The holder (obj 7) is reached only through page 2's /Contents stream
+        // /Length. It must be dropped from the later-page closure too, not just
+        // the Part-4 universe — otherwise it lands in the per-page (part7) set.
+        let mut pdf = Pdf::open(Cursor::new(page2_contents_indirect_length_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+        assert!(
+            !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
+            "a page-reachable orphaned /Length holder must not be assigned to any part"
+        );
+    }
+
+    #[test]
+    fn non_generate_plan_also_drops_orphan_indirect_length_holder() {
+        // The orphan-holder pruning is NOT gated on generate mode: the linearized
+        // writer emits a direct /Length in every object-stream mode, so qpdf GCs
+        // the holder for plain `--linearize` (preserve) and `--object-streams=
+        // disable` runs too. `use_generate_objstm = false` must still drop it.
+        let mut pdf = Pdf::open(Cursor::new(od_indirect_length_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        assert!(
+            !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
+            "orphaned /Length holder must be dropped in non-generate mode too"
         );
     }
 }

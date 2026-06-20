@@ -718,3 +718,85 @@ fn cap_boundary_199_bearing_preserve_byte_identical_to_qpdf() {
     let expected = golden_preserve(stem);
     report(fixture, &actual, &expected, "preserve strict");
 }
+
+// od-indirect-length (flpdf-2vfg): an open-document stream (catalog
+// /OpenAction → JavaScript action → /JS stream) whose /Length is an indirect
+// reference, with the holder reachable ONLY via that /Length edge. Every writer
+// normalizes a stream's /Length to a direct integer, so the holder becomes
+// orphaned; qpdf drops it via reachability GC. flpdf historically emitted it as
+// a plain second-half object (the bug). These pin flpdf's linearized output
+// byte-identical to qpdf, i.e. the orphaned /Length holder is dropped — for both
+// an uncompressed OD stream and a lone-/FlateDecode OD stream (the writer's
+// verbatim-preserve path), guarding against over-dropping a still-referenced
+// holder.
+#[test]
+fn od_indirect_length_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-od-indirect-length.pdf",
+        "objstm-lin-od-indirect-length",
+    );
+}
+
+#[test]
+fn od_indirect_length_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-od-indirect-length.pdf",
+        "objstm-lin-od-indirect-length",
+    );
+}
+
+#[test]
+fn od_indirect_length_flate_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-od-indirect-length-flate.pdf",
+        "objstm-lin-od-indirect-length-flate",
+    );
+}
+
+#[test]
+fn od_indirect_length_flate_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-od-indirect-length-flate.pdf",
+        "objstm-lin-od-indirect-length-flate",
+    );
+}
+
+// page-contents-indirect-length (flpdf-2vfg, Codex review on PR #400): the PAGE
+// /Contents stream (not an open-document stream) carries an indirect /Length
+// whose holder is reachable only via that /Length edge. The holder enters the
+// first-page closure because compute_closure follows the stream dict's /Length,
+// so the Part-4 `all_refs` filter alone is not enough — the planner must drop it
+// from the page closures too. These pin flpdf byte-identical to qpdf, i.e. the
+// orphaned holder is dropped and not leaked into Part 2/3, for both an
+// uncompressed and a lone-/FlateDecode content stream.
+#[test]
+fn page_contents_indirect_length_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-page-contents-indirect-length.pdf",
+        "objstm-lin-page-contents-indirect-length",
+    );
+}
+
+#[test]
+fn page_contents_indirect_length_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-page-contents-indirect-length.pdf",
+        "objstm-lin-page-contents-indirect-length",
+    );
+}
+
+#[test]
+fn page_contents_indirect_length_flate_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-page-contents-indirect-length-flate.pdf",
+        "objstm-lin-page-contents-indirect-length-flate",
+    );
+}
+
+#[test]
+fn page_contents_indirect_length_flate_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-page-contents-indirect-length-flate.pdf",
+        "objstm-lin-page-contents-indirect-length-flate",
+    );
+}
