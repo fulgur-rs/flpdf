@@ -1024,6 +1024,33 @@ fn linearize_generate_force_version(fixture: &str, force: &str) -> Vec<u8> {
     linearize_mode_force_version(fixture, ObjectStreamMode::Generate, force)
 }
 
+/// On an ObjStm-bearing SOURCE, a forced sub-1.5 header drops the inherited
+/// ObjStm and produces a classic linearized output identically for all three
+/// modes (qpdf 11.9.0: preserve/disable/generate are byte-identical here). This
+/// covers the INHERITED case (`three-page-objstm.pdf` carries an ObjStm + xref
+/// stream); `three-page.pdf` has no ObjStm so it cannot exercise the preserve
+/// drop. Default build — backend-independent.
+#[test]
+fn linearize_force_below_1_5_collapses_all_modes_to_classic_on_objstm_source() {
+    let fixture = "three-page-objstm.pdf";
+    let preserve = linearize_mode_force_version(fixture, ObjectStreamMode::Preserve, "1.4");
+    let disable = linearize_mode_force_version(fixture, ObjectStreamMode::Disable, "1.4");
+    let generate = linearize_mode_force_version(fixture, ObjectStreamMode::Generate, "1.4");
+    assert!(
+        preserve.starts_with(b"%PDF-1.4\n"),
+        "forced sub-1.5 header kept; got {:?}",
+        String::from_utf8_lossy(&preserve[..16.min(preserve.len())])
+    );
+    assert_eq!(
+        preserve, disable,
+        "linearize preserve+force1.4 must equal disable+force1.4 on an ObjStm source"
+    );
+    assert_eq!(
+        disable, generate,
+        "linearize disable+force1.4 must equal generate+force1.4 on an ObjStm source"
+    );
+}
+
 /// A forced sub-1.5 header suppresses object/xref-stream generation on the
 /// linearized write path too: qpdf keeps the forced header and falls back to a
 /// classic xref table (qpdf 11.9.0: `--linearize --object-streams=generate

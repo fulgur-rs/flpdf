@@ -3009,10 +3009,14 @@ fn full_rewrite_xref_stream_input_no_prev() {
 }
 
 #[test]
-fn full_rewrite_xref_stream_input_bumps_header_to_1_5_under_force_version() {
-    // PDF 1.5 introduced xref streams. Forcing the header to 1.4 while
-    // preserving the xref-stream form would emit a spec-inconsistent PDF;
-    // full_rewrite must override --force-version up to 1.5 in that case.
+fn full_rewrite_xref_stream_input_downgrades_to_classic_table_under_force_version() {
+    // qpdf treats a forced sub-1.5 header as a hard cap it will not exceed.
+    // Cross-reference streams are a PDF 1.5 feature, so qpdf does NOT clamp the
+    // header up to 1.5 to keep the inherited stream form — it keeps the forced
+    // 1.4 header and rebuilds a CLASSIC xref table. flpdf matches that (prime
+    // directive: qpdf over spec purity). This is a degenerate hand-built fixture
+    // qpdf cannot process, so the check is structural; byte-parity vs a real
+    // qpdf golden lives in the cmp_* suites.
     let source = build_minimal_pdf_with_xref_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -3024,9 +3028,19 @@ fn full_rewrite_xref_stream_input_bumps_header_to_1_5_under_force_version() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
-        output.starts_with(b"%PDF-1.5\n"),
-        "expected header '%PDF-1.5' for xref-stream output; got: {:?}",
-        std::str::from_utf8(&output[..16]).unwrap_or("<invalid utf-8>")
+        output.starts_with(b"%PDF-1.4\n"),
+        "forced sub-1.5 header must be kept (not clamped to 1.5); got: {:?}",
+        std::str::from_utf8(&output[..16.min(output.len())]).unwrap_or("<invalid utf-8>")
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("/Type /XRef"),
+        "inherited xref stream must be downgraded to a classic xref table under force<1.5"
+    );
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "downgraded output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
     );
 }
 

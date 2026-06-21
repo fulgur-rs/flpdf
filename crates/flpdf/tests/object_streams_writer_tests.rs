@@ -885,3 +885,85 @@ fn generate_force_version_below_1_5_is_byte_identical_to_disable() {
         "generate + force<1.5 must be byte-identical to disable + force<1.5"
     );
 }
+
+// ── f. --force-version below 1.5 downgrades an INHERITED xref-stream form ──────
+//
+// Complements (e): there the SOURCE was a classic table and the gate suppressed
+// newly *generated* 1.5 features. Here the SOURCE already carries an xref stream
+// (and ObjStm), and qpdf treats a forced sub-1.5 header as a hard cap: it drops
+// the inherited ObjStm and rebuilds a CLASSIC xref table at the forced header,
+// identically for preserve / disable / generate (qpdf 11.9.0: the 3 modes are
+// byte-identical on such a source). flpdf previously clamped the header up to
+// 1.5 and kept the stream form.
+
+fn build_with_mode_force(mode: ObjectStreamMode, force: &str) -> Vec<u8> {
+    let mut pdf = Pdf::open(Cursor::new(build_xref_stream_pdf_with_objstm())).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = mode;
+    options.force_version = Some(force.to_string());
+    options.static_id = true;
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+    out
+}
+
+#[test]
+fn force_below_1_5_collapses_all_modes_to_classic_on_xref_stream_source() {
+    // One assertion catches both the inherited-ObjStm drop and the xref-form
+    // downgrade: all three modes must collapse to the identical classic output
+    // (matching qpdf, whose 3 modes are byte-identical here). Default build, so
+    // backend-independent.
+    let preserve = build_with_mode_force(ObjectStreamMode::Preserve, "1.4");
+    let disable = build_with_mode_force(ObjectStreamMode::Disable, "1.4");
+    let generate = build_with_mode_force(ObjectStreamMode::Generate, "1.4");
+    assert_eq!(
+        preserve, disable,
+        "preserve+force1.4 must equal disable+force1.4 on an xref-stream source"
+    );
+    assert_eq!(
+        disable, generate,
+        "disable+force1.4 must equal generate+force1.4 on an xref-stream source"
+    );
+}
+
+#[test]
+fn force_below_1_5_preserve_downgrades_xref_stream_to_classic_table() {
+    let out = build_with_mode_force(ObjectStreamMode::Preserve, "1.4");
+    assert!(
+        out.starts_with(b"%PDF-1.4\n"),
+        "forced sub-1.5 header must be kept, not clamped to 1.5; got {:?}",
+        String::from_utf8_lossy(&out[..16.min(out.len())])
+    );
+    let text = rendered(&out);
+    assert!(
+        !text.contains("/Type /XRef"),
+        "inherited xref stream must be downgraded to a classic xref table"
+    );
+    assert!(
+        !text.contains("/Type /ObjStm"),
+        "inherited ObjStm must be dropped (cannot live in a classic table)"
+    );
+    let report = check_reader(Cursor::new(&out)).unwrap();
+    assert!(
+        report.valid,
+        "downgraded output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+#[test]
+fn force_exactly_1_5_keeps_inherited_xref_stream_form() {
+    // Boundary: 1.5 supports xref streams, so a forced 1.5 header does NOT
+    // downgrade — the inherited stream form is kept.
+    let out = build_with_mode_force(ObjectStreamMode::Preserve, "1.5");
+    assert!(
+        out.starts_with(b"%PDF-1.5\n"),
+        "force 1.5 kept; got {:?}",
+        String::from_utf8_lossy(&out[..16.min(out.len())])
+    );
+    assert!(
+        rendered(&out).contains("/Type /XRef"),
+        "at exactly 1.5 the inherited xref-stream form is preserved (no downgrade)"
+    );
+}
