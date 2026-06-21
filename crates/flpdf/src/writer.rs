@@ -2608,14 +2608,22 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // version it must not exceed (observed on qpdf 11.9.0; `--object-streams=generate
     // --force-version=1.4` is byte-identical to `--object-streams=disable
     // --force-version=1.4`). Normalize to Disable here, before the routing
-    // below, so the Generate path is skipped and the planner produces no
-    // batches; a classic-table source then keeps its classic xref form and the
-    // forced header is never clamped up to 1.5. Downgrading an *inherited*
-    // xref-stream form (preserve/disable on an xref-stream source) is a separate
-    // concern handled elsewhere; this gate only suppresses *generation*.
+    // below, so the Generate path is skipped, the planner produces no batches,
+    // AND an inherited source ObjStm is dropped; the xref-form override further
+    // below then rebuilds a classic table even from an xref-stream source. All
+    // three modes collapse to the identical classic output, matching qpdf (whose
+    // preserve/disable/generate are byte-identical under a forced sub-1.5 header).
+    //
+    // Generate is normalized for any encryption state (the shipped behaviour).
+    // Preserve is normalized only for the non-encrypted paths: `force<1.5 +
+    // encrypt` is contradictory — encryption forces its own >=1.5 floor below,
+    // so it never produces sub-1.5 output — and the encrypted ObjStm handling is
+    // left byte-for-byte unchanged.
+    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     let suppressed_options;
     let options = if force_version_below_1_5(options)
-        && matches!(options.object_streams, ObjectStreamMode::Generate)
+        && (matches!(options.object_streams, ObjectStreamMode::Generate)
+            || (!encrypting && matches!(options.object_streams, ObjectStreamMode::Preserve)))
     {
         suppressed_options = WriteOptions {
             object_streams: ObjectStreamMode::Disable,
@@ -2709,7 +2717,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+    // `encrypting` was computed once at the top (the force<1.5 gate consults it);
+    // encrypt / copy_encryption are never mutated, so it is still authoritative.
 
     if options.deterministic_id && encrypting {
         // qpdf rejects this combination: the /ID feeds the encryption key, so a
@@ -2803,10 +2812,23 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         effective_xref_form = XrefForm::Table;
     }
 
+    // A forced sub-1.5 header downgrades an inherited xref-stream form to a
+    // classic table: cross-reference streams are a PDF 1.5 feature, and qpdf
+    // keeps the forced header and rebuilds a classic xref rather than clamping
+    // the version up. Gated on the non-encrypted paths — `force<1.5 + encrypt`
+    // is contradictory (the /V floor below forces >=1.5), so the encrypted
+    // form/version selection is left untouched. Combined with the top-of-function
+    // normalization to Disable, this makes preserve/disable/generate collapse to
+    // the identical classic output under force<1.5, matching qpdf 11.9.0.
+    if force_version_below_1_5(options) && !encrypting {
+        effective_xref_form = XrefForm::Table;
+    }
+
     // PDF 1.5 introduced xref streams.  Bump the header floor to 1.5 whenever
     // the chosen xref form is `Stream`, overriding even an explicit
-    // `--force-version` lower than 1.5.  This applies both when the source
-    // was already a stream and when we just upgraded for ObjStm output.
+    // `--force-version` lower than 1.5.  (A non-encrypted sub-1.5 force has
+    // already been downgraded to Table just above, so this clamp now fires only
+    // for the encrypted paths or a >=1.5 forced/source version.)
     if matches!(effective_xref_form, XrefForm::Stream)
         && parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
     {

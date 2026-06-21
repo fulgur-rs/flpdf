@@ -2394,13 +2394,22 @@ pub fn write_linearized<R: Read + Seek>(
     // `from_pdf(.., false)` is the same call the non-suppressed disable path
     // makes; the extra walk only happens in the rare suppression case. show.rs /
     // check.rs callers pass `false` + default options, so this never fires there.
+    //
+    // Fires for Generate AND Preserve (anything but Disable): Preserve on an
+    // ObjStm SOURCE would otherwise keep the inherited ObjStm, so drop it too.
+    // For Preserve the caller already built a `use_generate=false` plan
+    // (`use_generate = mode == Generate`), so the `from_pdf(.., false)` rebuild
+    // is a no-op there — what matters is the `options -> Disable` normalization
+    // (empty batch plan -> classic Part-6 table). Linearization is plaintext
+    // only (encryption is rejected above), so there is no encrypted exception
+    // like the non-linearized rewrite path has.
     let rebuilt_plan;
     let rebuilt_renumber;
     let suppressed_options;
     let (plan, renumber, options) = if crate::writer::force_version_below_1_5(options)
-        && matches!(
+        && !matches!(
             options.object_streams,
-            crate::writer::ObjectStreamMode::Generate
+            crate::writer::ObjectStreamMode::Disable
         ) {
         rebuilt_plan = LinearizationPlan::from_pdf(pdf, false)?;
         rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);

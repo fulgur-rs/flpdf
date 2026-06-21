@@ -22,7 +22,7 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions};
+use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, WriteOptions};
 use std::path::Path;
 
 /// Full-rewrite `fixture` with the qpdf-matching option set and return the bytes.
@@ -74,6 +74,66 @@ fn assert_cmp_diff_zero(fixture: &str, stem: &str) {
         let lo = off.saturating_sub(16);
         panic!(
             "{fixture}: not byte-identical to qpdf --static-id golden \
+             (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
+/// Full-rewrite `fixture` with an explicit object-stream `mode` + forced version
+/// (qpdf-matching options).
+fn rewrite_mode_force_qpdf_equivalent(
+    fixture: &str,
+    mode: ObjectStreamMode,
+    force: &str,
+) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.object_streams = mode;
+    opts.force_version = Some(force.to_string());
+    opts.static_id = true;
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
+/// Read a named golden under `references/<stem>/`.
+fn golden_named(stem: &str, name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(stem)
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
+#[test]
+fn force_below_1_5_downgrades_xref_stream_source_byte_identical_to_qpdf() {
+    // The xref-stream -> classic-table DOWNGRADE path is new (ipc6 only ever did
+    // table -> stream UPGRADES). Anchor it to qpdf: flpdf preserve+force1.4 on an
+    // ObjStm/xref-stream source must be byte-identical to qpdf's classic-table
+    // output (qpdf --object-streams=preserve --force-version=1.4 --static-id).
+    let actual = rewrite_mode_force_qpdf_equivalent(
+        "three-page-objstm.pdf",
+        ObjectStreamMode::Preserve,
+        "1.4",
+    );
+    let expected = golden_named("three-page-objstm", "downgrade-force14.pdf");
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "xref-stream downgrade not byte-identical to qpdf golden \
              (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
              flpdf : {:?}\ngolden: {:?}",
             actual.len(),

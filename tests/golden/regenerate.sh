@@ -441,6 +441,18 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-objstm.pdf"
 echo "three-page-objstm/linearize-objstm.pdf"
 
+# Forced sub-1.5 header on an ObjStm/xref-stream SOURCE: qpdf keeps the 1.4 header
+# and DOWNGRADES the inherited xref stream + ObjStm to a classic table (it does
+# not clamp the version up). preserve/disable/generate are byte-identical here, so
+# the preserve golden anchors the whole class. Feature-gated on qpdf-zlib-compat
+# (flpdf-w35w). Non-linearized (full-rewrite) and linearized counterparts:
+qpdf --object-streams=preserve --force-version=1.4 --static-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/downgrade-force14.pdf"
+echo "three-page-objstm/downgrade-force14.pdf"
+qpdf --linearize --object-streams=preserve --force-version=1.4 --deterministic-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-downgrade-force14.pdf"
+echo "three-page-objstm/linearize-downgrade-force14.pdf"
+
 # NON-linearized --object-streams=generate (cross-reference *stream* form, header
 # floored to 1.5). --static-id keeps /ID byte-stable: /ID[0] is the preserved
 # source identifier (or the pi constant when the source has none) and /ID[1] is
