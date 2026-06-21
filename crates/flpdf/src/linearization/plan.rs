@@ -1192,6 +1192,37 @@ impl LinearizationPlan {
             .collect()
     }
 
+    /// ObjStm container new-numbers routed to part9 (Rest) by qpdf's outline
+    /// priority (QPDF_linearization.cc:1118-1122): every container carrying a
+    /// `part9_outline_objects` member.
+    ///
+    /// Such a container is placed in the second half even when the global even
+    /// split co-locates a `part4_other_pages_shared` object in it, and it is NOT
+    /// a shared object in qpdf's Shared Object Hint Table. Both
+    /// [`Self::canonical_shared_hints`] (the Part-8 main-loop guard and the
+    /// `part8_container_nums` enumeration tail) and
+    /// `SharedObjectHintTable::from_plan` (the Part-8 entry COUNT, which feeds
+    /// `first_page_entries`) must exclude it, or the table's entry list and its
+    /// header counts disagree.
+    ///
+    /// A member reachable from BOTH `/Outlines` and ≥2 non-first pages stays in
+    /// `part4_other_pages_shared` rather than `part9_outline_objects`, so a
+    /// container carrying ONLY such a member (no other `part9_outline_objects`
+    /// member) is missed here. That can only happen across a 2+-container even
+    /// split, which is blocked by the page-dict-erasure boundary divergence
+    /// (flpdf-g1eu); the robust fix (keying on the actual Rest routing) lands with
+    /// that issue's 2-container fixture. `part9_outline_objects` is small, so look
+    /// each up in `member_to_container` rather than scanning all members.
+    pub(crate) fn rest_container_nums(
+        &self,
+        member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
+    ) -> BTreeSet<u32> {
+        self.part9_outline_objects
+            .iter()
+            .filter_map(|member| member_to_container.get(member).map(|&(cnum, _)| cnum))
+            .collect()
+    }
+
     /// An empty `member_to_container` yields a clone of `shared_hints` (the
     /// no-ObjStm / classic path is unchanged).
     pub(crate) fn canonical_shared_hints(
@@ -1217,24 +1248,14 @@ impl LinearizationPlan {
             + self.part3_objects.len()
             + self.outline_first_page_members.len();
 
-        // Containers routed to part9 (Rest) by qpdf's outline priority
-        // (QPDF_linearization.cc:1118-1122). A container holding an in_outlines
-        // (!UseOutlines) member is placed in the second half even when the global
-        // even split co-locates a `part4_other_pages_shared` object in it. Such a
-        // part9 container is not a shared object in qpdf's SOHT, so it must be
-        // excluded from the Part-8 section too — the `second_half_container_nums`
-        // guard below only covers the first-page section (where ALL second-half
-        // containers are skipped). A `part4_other_pages_shared` member implies
-        // its container's page union is ≥2, so the only way such a container lands
-        // in the second half rather than part8 is this outline override; keying on
-        // `part9_outline_objects` therefore characterises exactly those containers.
-        let part9_outline_set: BTreeSet<ObjectRef> =
-            self.part9_outline_objects.iter().copied().collect();
-        let rest_container_nums: BTreeSet<u32> = member_to_container
-            .iter()
-            .filter(|(member, _)| part9_outline_set.contains(member))
-            .map(|(_, &(cnum, _))| cnum)
-            .collect();
+        // Containers routed to part9 (Rest) by qpdf's outline priority: never
+        // shared objects in the SOHT, so skip them in the Part-8 section here AND
+        // in the `part8_container_nums` enumeration tail below. The first-page
+        // section is already covered by the `second_half_container_nums` guard
+        // (it skips ALL second-half containers there); in the Part-8 section that
+        // guard cannot be reused because it would also drop legitimate part8
+        // containers. See [`Self::rest_container_nums`].
+        let rest_container_nums = self.rest_container_nums(member_to_container);
 
         // Position (index into the output list) at which each container was
         // first emitted, so later members of the same container fold into it.
@@ -1339,7 +1360,18 @@ impl LinearizationPlan {
             // when their members span multiple later pages (which would
             // otherwise qualify them as Part-8 shared containers via the
             // `container_pages.len() >= 2` criterion in `part8_container_nums`).
-            if !container_pos.contains_key(&cnum) && !open_document_container_nums.contains(&cnum) {
+            //
+            // A part9 (Rest) container routed there by outline priority must also
+            // be excluded here, not just in the main loop above. `part8_container_nums`
+            // keys on page reachability (`!has_first_page_member && shared/≥2 pages`),
+            // so when the co-located part9 container has NO ObjStm-eligible
+            // first-page member (e.g. page 0 carries no compressible private object)
+            // it satisfies that predicate and would be re-added as a Part-8 entry —
+            // re-introducing exactly the SOHT divergence the main-loop guard removes.
+            if !container_pos.contains_key(&cnum)
+                && !open_document_container_nums.contains(&cnum)
+                && !rest_container_nums.contains(&cnum)
+            {
                 out.push(SharedObjectHintEntry {
                     object_ref: ObjectRef::new(cnum, u16::MAX),
                     referencing_pages: Vec::new(), // recomputed below
@@ -4450,6 +4482,54 @@ mod tests {
             vec![2],
             "part8 container 21 must keep its folded referencing page (not be \
              dropped and re-added empty by a naive second_half-wide skip)"
+        );
+    }
+
+    /// A part9 (Rest) container with NO first-page member (e.g. page 0 carries no
+    /// ObjStm-eligible private object) is dropped by the main-loop guard, but
+    /// `part8_container_nums` (keyed on page reachability) would otherwise re-add
+    /// it in the enumeration tail. The tail's `rest_container_nums` guard must
+    /// prevent that re-add. Covers the `objstm-lin-outlines-otherpage-0-60-20`
+    /// byte fixture (flpdf-7aek, Codex P2).
+    #[test]
+    fn canonical_shared_hints_part9_container_not_re_added_by_part8_enumeration() {
+        let outline = ObjectRef::new(6, 0);
+        let shared_a = ObjectRef::new(7, 0);
+        let plan = LinearizationPlan {
+            // No part2/part3: the first page contributes no shared/private ObjStm
+            // member, so container 20 has no first-page member.
+            part4_other_pages_shared: vec![shared_a],
+            part9_outline_objects: vec![outline],
+            shared_hints: vec![SharedObjectHintEntry {
+                object_ref: shared_a,
+                referencing_pages: vec![1, 2],
+            }],
+            ..Default::default()
+        };
+
+        // Container 20 holds the in_outlines member (→ part9) and the shared font.
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(outline, (20, 0));
+        m2c.insert(shared_a, (20, 1));
+        let mut second_half: BTreeSet<u32> = BTreeSet::new();
+        second_half.insert(20);
+
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded =
+            plan.canonical_shared_hints(&m2c, &renumber, &second_half, &Default::default());
+
+        // `part8_container_nums` classifies 20 as part8 (no first-page member, has
+        // a shared member), but the enumeration-tail guard must keep it out.
+        assert!(
+            plan.part8_container_nums(&m2c).contains(&20),
+            "precondition: part8_container_nums would otherwise re-add container 20"
+        );
+        assert!(
+            folded
+                .iter()
+                .all(|e| e.object_ref != ObjectRef::new(20, u16::MAX)),
+            "part9 container 20 (no first-page member) must not be re-added by the \
+             part8 enumeration tail"
         );
     }
 
