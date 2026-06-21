@@ -313,6 +313,22 @@ fi
 #                     has no first-page member. part8_container_nums would re-add it
 #                     (enumeration tail) and over-count first_page_entries; both
 #                     canonical_shared_hints and from_plan must exclude rest containers.
+#  - outlines-otherpage-2-120-20 (flpdf-g1eu): the 2-container variant (eligible
+#                     149 > 100 cap => even-split into a part9 mixed container
+#                     (outline items + page-0 fonts + 47 shared fonts) and a part8
+#                     pure-shared-font container. The even split yields the part9
+#                     container FIRST (DFS-early outline items), but qpdf's strict
+#                     part order (part8 before part9) emits the shared container
+#                     first. Pins that second-half ObjStm containers are emitted in
+#                     part rank order, not even-split order.
+#  - outlines-otherpage-0-120-20 (flpdf-g1eu, flpdf-7aek forward flag): the
+#                     2-container variant with P0=0, so the part9 mixed container
+#                     has NO first-page member (page 0 has no ObjStm-eligible
+#                     fonts). Confirms the part-rank emission order AND that the
+#                     no-first-page-member part9 container does NOT leak into the
+#                     Shared Object Hint Table enumeration tail (the flpdf-7aek
+#                     guards + part-rank ordering already keep it byte-identical;
+#                     no extra part9 enumeration-tail guard is needed).
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
@@ -328,6 +344,8 @@ declare -A G6HB2_FIX=(
     [objstm-lin-outlines-coloc-200-20]="gen_outlines_gap.py 200 20"
     [objstm-lin-outlines-otherpage-2-60-20]="gen_outlines_otherpage_shared.py 2 60 20"
     [objstm-lin-outlines-otherpage-0-60-20]="gen_outlines_otherpage_shared.py 0 60 20"
+    [objstm-lin-outlines-otherpage-2-120-20]="gen_outlines_otherpage_shared.py 2 120 20"
+    [objstm-lin-outlines-otherpage-0-120-20]="gen_outlines_otherpage_shared.py 0 120 20"
     [objstm-lin-outline-od-shared-stream]="gen_outline_open_action_shared_stream.py"
     [objstm-lin-acroform-widget-page0-5-10]="gen_acroform_widget_page0.py 5 10"
     [objstm-lin-acroform-widget-ap-stream-page0]="gen_acroform_widget_ap_stream_page0.py"
@@ -549,6 +567,8 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-outlines-shared-page-80-80 objstm-lin-outlines-coloc-200-20 \
             objstm-lin-outlines-otherpage-2-60-20 \
             objstm-lin-outlines-otherpage-0-60-20 \
+            objstm-lin-outlines-otherpage-2-120-20 \
+            objstm-lin-outlines-otherpage-0-120-20 \
             objstm-lin-outline-od-shared-stream \
             objstm-lin-acroform-widget-page0-5-10 \
             objstm-lin-acroform-widget-ap-stream-page0 \

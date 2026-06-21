@@ -1654,7 +1654,23 @@ impl LinearizationPlan {
         // outline containers are appended last (QPDF_linearization.cc:1031-1043).
         let mut part3_regular: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part3_outlines: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
+        // Second-half containers, each tagged with its part rank so they can be
+        // emitted in qpdf's strict part order (part7, then part8, then part9 —
+        // QPDF_linearization.cc:1342). qpdf's file layout writes lc_other_page_private,
+        // lc_other_page_shared, then lc_other/lc_outlines; the even-split (DFS)
+        // order a container arrives in is NOT that order (a DFS-early /Outlines
+        // container routes to part9 yet precedes a part8 shared-font container in
+        // the split). The STABLE sort by rank reorders only ACROSS parts, leaving
+        // within-part even-split arrival order intact.
+        //
+        // For part8 that within-part order is provably qpdf's: lc_other_page_shared
+        // is a std::set keyed on container objgen, and a generate-mode container's
+        // objgen comes from makeIndirectObject in even-split order — so set order ==
+        // even-split order. part7 (page order) and part9 (pages-tree / outlines /
+        // lc_other sub-order) only have one container each in the fixtures seen so
+        // far, so their within-part multi-container order is untested (see flpdf-g1eu
+        // follow-up); if such a case ever arises a finer per-part sort may be needed.
+        let mut part4_tagged: Vec<(u8, Vec<ObjectRef>)> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
             members.sort_unstable_by_key(|r| r.number);
             match route {
@@ -1666,11 +1682,18 @@ impl LinearizationPlan {
                         part3_regular.push(members);
                     }
                 }
-                ContainerPart::OtherPagePrivate
-                | ContainerPart::OtherPageShared
-                | ContainerPart::Rest => part4_batches.push(members),
+                ContainerPart::OtherPagePrivate => part4_tagged.push((0, members)),
+                ContainerPart::OtherPageShared => part4_tagged.push((1, members)),
+                ContainerPart::Rest => part4_tagged.push((2, members)),
             }
         }
+        // Stable sort by part rank (`sort_by_key`, not `sort_unstable_by_key`) so
+        // containers with the same rank keep their even-split arrival order.
+        part4_tagged.sort_by_key(|(rank, _)| *rank);
+        let part4_batches: Vec<Vec<ObjectRef>> = part4_tagged
+            .into_iter()
+            .map(|(_, members)| members)
+            .collect();
 
         // Regular first-page containers numbered before outline containers so
         // that outline ObjStms get higher golden object numbers (matching qpdf).
