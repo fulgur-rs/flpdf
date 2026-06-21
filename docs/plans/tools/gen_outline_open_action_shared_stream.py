@@ -38,6 +38,11 @@ pages share font 12 so a first-page (part6/part3) ObjStm container coexists.
 
 import sys
 
+# /PageMode /UseOutlines routes the outline objects (and the ineligible OD+outline
+# stream) into the first-page section (qpdf part6 / lc_outlines), i.e. BEFORE /E,
+# instead of part9 (after /E). Mirrors gen_outlines_gap.py's --use-outlines flag.
+use_outlines = "--use-outlines" in sys.argv[1:]
+
 catalog = 1
 pages = 2
 page0 = 3
@@ -53,9 +58,10 @@ font = 12
 
 objs = {}
 
+page_mode = b" /PageMode /UseOutlines" if use_outlines else b""
 objs[catalog] = (
-    b"<< /Type /Catalog /OpenAction %d 0 R /Outlines %d 0 R /Pages %d 0 R >>"
-    % (od_action, outlines, pages)
+    b"<< /Type /Catalog%s /OpenAction %d 0 R /Outlines %d 0 R /Pages %d 0 R >>"
+    % (page_mode, od_action, outlines, pages)
 )
 objs[pages] = (
     b"<< /Type /Pages /Count 2 /Kids [ %d 0 R %d 0 R ] >>" % (page0, page1)

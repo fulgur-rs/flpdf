@@ -434,6 +434,10 @@ impl RenumberMap {
     ///    then the remaining first-half non-members compacted in order (type-1);
     /// 8. every first-half (Part-3 / qpdf part6) ObjStm container, batch-ordered
     ///    (type-1);
+    /// 8b. the first-half post-container plain objects in `first_half_post_plain`
+    ///    (an ineligible OD+outline stream routed to qpdf part6 under
+    ///    `/PageMode /UseOutlines`) — emitted AFTER the part6 container, mirroring
+    ///    the second half's `second_half_post_plain` (type-1);
     /// 9. the open-document (qpdf part4) ObjStm members, then the first-page
     ///    (qpdf part6) ObjStm members, batch-ordered (type-2) — qpdf numbers
     ///    part4 members before part6 (`vecs1 = {part4, part6}`).
@@ -470,6 +474,7 @@ impl RenumberMap {
         second_half_batches: &[Vec<ObjectRef>],
         second_half_anchors: &[Option<ObjectRef>],
         second_half_post_plain: &BTreeSet<ObjectRef>,
+        first_half_post_plain: &BTreeSet<ObjectRef>,
     ) -> ObjStmRelocation {
         // Fast path: nothing to place — leave the map byte-identical.
         let no_open = open_document_batches.iter().all(|b| b.is_empty());
@@ -670,6 +675,12 @@ impl RenumberMap {
         //     `part4_first_obj` … `hint_id` … `part6_first_obj` numbering.
         let mut new_hint_slot = 0u32;
         let mut open_document_emitted = false;
+        // Ineligible part6 outline streams emitted AFTER the part6 container (the
+        // first-half mirror of `post_container_plain`); see step (8b) below. The
+        // hint-index check still uses the un-filtered enumerate index because
+        // `from_plan` always places these (part6 outline objects, step 9b) after
+        // the hint slot, so collecting them here never shifts the hint position.
+        let mut first_half_post_container_plain: Vec<ObjectRef> = Vec::new();
         for (i, &original) in first_half_plain.iter().enumerate() {
             if i as u32 == hint_index_in_first_half {
                 emit_open_document_containers(
@@ -679,6 +690,10 @@ impl RenumberMap {
                 open_document_emitted = true;
                 new_hint_slot = new_by_new_number.len() as u32;
                 new_by_new_number.push(SENTINEL);
+            }
+            if first_half_post_plain.contains(&original) {
+                first_half_post_container_plain.push(original);
+                continue;
             }
             new_by_new_number.push(original);
         }
@@ -710,6 +725,14 @@ impl RenumberMap {
             let container_num = new_by_new_number.len() as u32;
             new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
             first_half_container_numbers.push(container_num);
+        }
+        // (8b) First-half post-container plain objects (ineligible part6 outline
+        //      streams): after the part6 container(s), before the compressed
+        //      members — qpdf numbers the ineligible OD+outline stream AFTER its
+        //      part6 ObjStm container (the first-half analogue of the second
+        //      half's post-container plain pass).
+        for &original in &first_half_post_container_plain {
+            new_by_new_number.push(original);
         }
         // (9) ObjStm members, batch-ordered (type-2) — last of all. qpdf numbers
         //     the part4 (open-document) members before the part6 (first-page)
@@ -1236,8 +1259,14 @@ mod tests {
             vec![ObjectRef::new(5, 0)],
             vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
         ];
-        let relocation =
-            rn.place_objstm_members_per_half(&[], &[], &second_half_batches, &[], &BTreeSet::new());
+        let relocation = rn.place_objstm_members_per_half(
+            &[],
+            &[],
+            &second_half_batches,
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -1320,8 +1349,14 @@ mod tests {
 
         // One Part-3 (first-half) batch: 5 0 R + 8 0 R (both part3_objects).
         let first_half_batches = vec![vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)]];
-        let relocation =
-            rn.place_objstm_members_per_half(&[], &first_half_batches, &[], &[], &BTreeSet::new());
+        let relocation = rn.place_objstm_members_per_half(
+            &[],
+            &first_half_batches,
+            &[],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
 
         assert_eq!(
             relocation.container_numbers.len(),
@@ -1390,6 +1425,7 @@ mod tests {
             &first_half_batches,
             &second_half_batches,
             &[],
+            &BTreeSet::new(),
             &BTreeSet::new(),
         );
 

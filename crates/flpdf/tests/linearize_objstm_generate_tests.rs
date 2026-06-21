@@ -83,6 +83,26 @@ fn first_objstm_marker_offset(bytes: &[u8]) -> Option<usize> {
     bytes.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Object number of the first `/Type /ObjStm` container, parsed from the nearest
+/// preceding `<num> 0 obj` header. (The physical emission order of a container vs
+/// a sibling plain object does not encode their object numbers, so number-order
+/// assertions must read the actual `<num> 0 obj` labels.)
+fn first_objstm_container_number(bytes: &[u8]) -> Option<u32> {
+    let marker = first_objstm_marker_offset(bytes)?;
+    let obj_kw = b" 0 obj";
+    let kw_pos = bytes[..marker]
+        .windows(obj_kw.len())
+        .rposition(|w| w == obj_kw)?;
+    let mut start = kw_pos;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    std::str::from_utf8(&bytes[start..kw_pos])
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// The first-half (Part-3) ObjStm container holding the first-page shared dicts
 /// (plus the `/Pages` tree and `/Info`) must be emitted BEFORE `/E`, and the
 /// document round-trips (every object, including compressed members, resolves).
@@ -397,6 +417,89 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
         e_off < container_off && container_off < js_off,
         "the ineligible outline stream (obj {js_number}, offset {js_off}) must follow \
          the second-half ObjStm container (offset {container_off}), both after /E ({e_off})"
+    );
+
+    // Round-trip: every object (including the outline container's members) resolves.
+    let refs = rt.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        rt.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// The `/PageMode /UseOutlines` sibling of
+/// [`outline_od_shared_stream_emits_ineligible_outline_stream_after_container`].
+///
+/// With `/UseOutlines` the outline objects (and the ineligible OD+outline `/JS`
+/// stream) route to qpdf part6 — the first-page section, BEFORE `/E` — instead of
+/// part9.  The stream is still emitted plain, and qpdf numbers it AFTER its part6
+/// ObjStm container, so it is a first-half POST-container plain object (the mirror
+/// of the second half's post-container plain pass).
+///
+/// Regression: before the first-half post-container ordering fix the ineligible
+/// stream was numbered BEFORE the part6 container (the two object numbers were
+/// swapped), diverging from qpdf by 3 bytes. The physical emission order is
+/// container-then-stream either way, so this guard asserts on the object NUMBERS.
+#[test]
+fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_container() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-useoutline-od-shared-stream.pdf");
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+    // in_outlines wins over in_open_document: the shared stream is an outline, so
+    // it must NOT be routed to the open-document pre-/O plain list.
+    assert!(
+        plan.part4_open_document_plain.is_empty(),
+        "the OD+outline stream must be classified as an outline, not open-document; \
+         part4_open_document_plain = {:?}",
+        plan.part4_open_document_plain
+    );
+
+    let bytes = linearize_generate("objstm-lin-useoutline-od-shared-stream.pdf");
+    let e_off = parse_e_offset(&bytes);
+
+    // Locate the shared /JS stream by its decoded content (deflate-independent),
+    // then find its physical object header offset.
+    let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
+    let mut js_number = None;
+    for r in rt.object_refs() {
+        if let Ok(Object::Stream(s)) = rt.resolve(r) {
+            if let Ok(decoded) = filters::decode_stream_data(&s.dict, &s.data) {
+                if decoded == b"app.alert('shared');" {
+                    js_number = Some(r.number);
+                }
+            }
+        }
+    }
+    let js_number = js_number.expect("the shared /JS stream must survive linearization");
+    let js_marker = format!("\n{js_number} 0 obj");
+    let js_off = bytes
+        .windows(js_marker.len())
+        .position(|w| w == js_marker.as_bytes())
+        .expect("shared /JS stream object header present");
+
+    // Discriminating invariant (flpdf-q9o3): qpdf numbers the part6 ObjStm
+    // container BEFORE the ineligible outline stream, so the container's object
+    // number is LESS than the stream's. The physical order is container-then-
+    // stream regardless of the fix — only the numbers swap — so this asserts on
+    // the object NUMBERS, not byte offsets.
+    let container_number =
+        first_objstm_container_number(&bytes).expect("first-half outline ObjStm container present");
+    assert!(
+        container_number < js_number,
+        "the part6 ObjStm container (obj {container_number}) must be numbered before the \
+         ineligible outline stream (obj {js_number})"
+    );
+    // Both objects live in the first-page section (before /E): UseOutlines routes
+    // the outline section into the first half, not part9 (the mirror of the
+    // no-UseOutlines case where they follow /E).
+    assert!(
+        js_off < e_off,
+        "the ineligible outline stream (obj {js_number}, offset {js_off}) must precede \
+         /E ({e_off}) — it belongs to the first-page section under UseOutlines"
     );
 
     // Round-trip: every object (including the outline container's members) resolves.

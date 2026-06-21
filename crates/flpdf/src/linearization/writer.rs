@@ -2483,6 +2483,26 @@ pub fn write_linearized<R: Read + Seek>(
                 && Some(*r) != plan.info_ref
         })
         .collect();
+    // First-half mirror of `second_half_post_plain`: under /PageMode /UseOutlines
+    // the outline objects route to qpdf part6 (first half) via
+    // `part6_outline_objects`. Eligible members ride in a first-half ObjStm batch
+    // (open-document or Part-3); an ineligible outline stream (an Object::Stream
+    // reachable from /Outlines, e.g. a shared /JS action stream) is emitted plain,
+    // and qpdf numbers it AFTER the part6 container — so it must be placed in the
+    // first-half post-container pass, not before the container.
+    let first_half_member_set: BTreeSet<ObjectRef> = resolved_batch_plan
+        .open_document_batches
+        .iter()
+        .chain(&resolved_batch_plan.part3_batches)
+        .flatten()
+        .copied()
+        .collect();
+    let first_half_post_plain: BTreeSet<ObjectRef> = plan
+        .part6_outline_objects
+        .iter()
+        .copied()
+        .filter(|r| !first_half_member_set.contains(r))
+        .collect();
     // Open-document batches are numbered FIRST in the first half (right after
     // the catalog, before the hint); Part-3 batches are numbered last within
     // the first half (qpdf packs the first-page shared dicts + /Pages tree +
@@ -2494,6 +2514,7 @@ pub fn write_linearized<R: Read + Seek>(
         &resolved_batch_plan.part4_batches,
         &second_half_anchors,
         &second_half_post_plain,
+        &first_half_post_plain,
     );
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;

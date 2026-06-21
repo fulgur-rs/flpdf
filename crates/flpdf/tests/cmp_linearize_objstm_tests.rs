@@ -666,6 +666,30 @@ fn outline_od_shared_stream_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// useoutline-od-shared-stream (flpdf-q9o3): the UseOutlines sibling of
+// outline-od-shared-stream. With /PageMode /UseOutlines the outline objects (and
+// the ineligible OD+outline JS stream) route to the FIRST-page section (qpdf
+// part6 / lc_outlines), BEFORE /E instead of part9. The ineligible outline stream
+// is still emitted plain, and qpdf numbers it AFTER its part6 ObjStm container —
+// so it is a first-half post-container plain object, the mirror of the second-half
+// post-plain set. Exercises place_objstm_members_per_half's first-half
+// post-container plain ordering.
+#[test]
+fn useoutline_od_shared_stream_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-useoutline-od-shared-stream.pdf",
+        "objstm-lin-useoutline-od-shared-stream",
+    );
+}
+
+#[test]
+fn useoutline_od_shared_stream_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-useoutline-od-shared-stream.pdf",
+        "objstm-lin-useoutline-od-shared-stream",
+    );
+}
+
 // acroform-widget-ap-stream-page0 (PR #393 Fix 1 + Fix 3): AcroForm widget with
 // an /AP /N Form XObject appearance stream (Object::Stream → ineligible for
 // ObjStm packing). The Form XObject is in open_document_set (via
