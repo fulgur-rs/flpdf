@@ -699,3 +699,189 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
             .unwrap_or_else(|e| panic!("object {r} did not resolve after rewrite: {e}"));
     }
 }
+
+// ── e. --force-version below 1.5 suppresses GENERATED object/xref streams ─────
+//
+// qpdf treats a forced sub-1.5 header as a hard cap and will not emit object
+// streams or cross-reference streams (both introduced in PDF 1.5) under it,
+// falling back to a classic xref table while keeping the forced header verbatim.
+// `--min-version` is only a floor, so it never suppresses (the 1.5 object-stream
+// floor raises above it). Boundary verified against qpdf 11.9.0 (12-case matrix):
+//   generate force=1.4            -> %PDF-1.4, no ObjStm, classic table
+//   generate force=1.5            -> %PDF-1.5, ObjStm + xref stream
+//   generate min=1.4 (no force)   -> %PDF-1.5, ObjStm + xref stream
+//   generate force=1.4 min=1.5    -> %PDF-1.4, no ObjStm, classic table
+
+/// Lossy render for substring structural checks. ObjStm / XRef dict headers are
+/// plaintext (only stream payloads are binary), so the `/Type /ObjStm` and
+/// `/Type /XRef` markers survive the lossy decode.
+fn rendered(output: &[u8]) -> String {
+    String::from_utf8_lossy(output).into_owned()
+}
+
+#[test]
+fn generate_force_version_below_1_5_suppresses_object_and_xref_streams() {
+    // The classic-table fixture's two eligible objects (Catalog + Pages) would
+    // pack into an ObjStm and upgrade to an xref stream under plain Generate
+    // (see generate_mode_on_xref_table_form_upgrades_to_xref_stream); forcing a
+    // sub-1.5 header must turn both off.
+    let source = build_xref_table_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.force_version = Some("1.4".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.4\n"),
+        "forced sub-1.5 header must be kept verbatim (not clamped to 1.5); got {:?}",
+        String::from_utf8_lossy(&output[..16.min(output.len())])
+    );
+    let text = rendered(&output);
+    assert!(
+        !text.contains("/Type /ObjStm"),
+        "force-version 1.4 must suppress object-stream generation (qpdf parity)"
+    );
+    assert!(
+        !text.contains("/Type /XRef"),
+        "force-version 1.4 must fall back to a classic xref table (no xref stream)"
+    );
+
+    // The suppressed output is still a valid, re-readable PDF.
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "suppressed output must be a valid PDF; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+#[test]
+fn generate_force_version_exactly_1_5_still_emits_object_streams() {
+    // Boundary: 1.5 is exactly the minimum object streams require, so a forced
+    // 1.5 header does NOT suppress.
+    let source = build_xref_table_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.force_version = Some("1.5".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.5\n"),
+        "force-version 1.5 is kept; got {:?}",
+        String::from_utf8_lossy(&output[..16.min(output.len())])
+    );
+    assert!(
+        rendered(&output).contains("/Type /ObjStm"),
+        "force-version 1.5 still permits object-stream generation"
+    );
+}
+
+#[test]
+fn generate_min_version_below_1_5_still_emits_object_streams() {
+    // `--min-version` is a floor, not a cap: the 1.5 object-stream floor raises
+    // above a 1.4 minimum, so object streams are emitted at header 1.5. min
+    // must NOT trigger the force-version suppression.
+    let source = build_xref_table_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.min_version = Some("1.4".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.5\n"),
+        "object-stream floor raises the header to 1.5 over a 1.4 minimum; got {:?}",
+        String::from_utf8_lossy(&output[..16.min(output.len())])
+    );
+    assert!(
+        rendered(&output).contains("/Type /ObjStm"),
+        "min-version 1.4 must NOT suppress object-stream generation"
+    );
+}
+
+#[test]
+fn generate_force_below_1_5_overrides_higher_min_version_and_suppresses() {
+    // force-version is a hard cap that wins over a higher --min-version, so the
+    // sub-1.5 force still suppresses.
+    let source = build_xref_table_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.force_version = Some("1.4".to_string());
+    options.min_version = Some("1.5".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(b"%PDF-1.4\n"),
+        "force 1.4 (hard cap) wins over min 1.5; got {:?}",
+        String::from_utf8_lossy(&output[..16.min(output.len())])
+    );
+    assert!(
+        !rendered(&output).contains("/Type /ObjStm"),
+        "force 1.4 must suppress object streams even with min-version 1.5"
+    );
+}
+
+#[test]
+fn generate_invalid_force_version_does_not_suppress_object_streams() {
+    // An unparseable --force-version is ignored (same as effective_pdf_version),
+    // so it must NOT suppress: object streams are emitted at the 1.5 floor.
+    let source = build_xref_table_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.force_version = Some("not-a-version".to_string());
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        rendered(&output).contains("/Type /ObjStm"),
+        "invalid force-version is ignored and must NOT suppress object streams"
+    );
+}
+
+#[test]
+fn generate_force_version_below_1_5_is_byte_identical_to_disable() {
+    // The suppression normalizes Generate -> Disable, so the output bytes must
+    // be EXACTLY a Disable-mode write under the same forced header. Holds on the
+    // default (miniz) build: both writes use flpdf's own deflate, so they match
+    // each other regardless of the zlib backend. `static_id` pins the trailer
+    // `/ID` so the two writes are comparable.
+    let build = |mode: ObjectStreamMode| {
+        let mut pdf = Pdf::open(Cursor::new(build_xref_table_pdf())).unwrap();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.object_streams = mode;
+        options.force_version = Some("1.4".to_string());
+        options.static_id = true;
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+        out
+    };
+    assert_eq!(
+        build(ObjectStreamMode::Generate),
+        build(ObjectStreamMode::Disable),
+        "generate + force<1.5 must be byte-identical to disable + force<1.5"
+    );
+}

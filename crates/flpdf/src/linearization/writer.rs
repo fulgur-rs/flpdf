@@ -2380,6 +2380,30 @@ pub fn write_linearized<R: Read + Seek>(
         ));
     }
 
+    // A forced sub-1.5 header suppresses object-stream generation: object and
+    // cross-reference streams are PDF 1.5 features and qpdf will not emit them
+    // under a forced version it must not exceed (observed on qpdf 11.9.0:
+    // `--linearize --object-streams=generate --force-version=1.4` yields no
+    // `/ObjStm` and a classic xref table at header 1.4). Normalize to Disable so
+    // the batch planner produces no containers and the writer takes its classic
+    // (`objstm_layout.is_empty()`) Part-6 xref-table path; the forced header is
+    // honoured by `effective_pdf_version`. Mirrors the non-linearized rewrite
+    // gate in `crate::writer::write_pdf_full_rewrite`.
+    let suppressed_options;
+    let options = if crate::writer::force_version_below_1_5(options)
+        && matches!(
+            options.object_streams,
+            crate::writer::ObjectStreamMode::Generate
+        ) {
+        suppressed_options = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Disable,
+            ..options.clone()
+        };
+        &suppressed_options
+    } else {
+        options
+    };
+
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------
