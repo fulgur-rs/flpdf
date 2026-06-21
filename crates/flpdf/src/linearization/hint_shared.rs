@@ -289,10 +289,20 @@ impl SharedObjectHintTable {
         // `canonical_shared_hints` excludes them: they live in the pre-/O
         // region (before /E), so they do not appear in the Part-8 SOHT section
         // and must not count toward `part8_entries`.
+        // part9 (Rest) containers routed there by outline priority are NOT part8
+        // shared objects; `canonical_shared_hints` excludes them from the entry
+        // list, so they must be excluded from the entry COUNT here too (otherwise
+        // `first_page_entries = shared_count - part8_entries` undercounts the
+        // first-page section, diverging from qpdf — e.g. when the first page has
+        // no ObjStm-eligible member so the part9 container has no first-page member
+        // and `part8_container_nums` would otherwise count it).
+        let rest_container_nums = plan.rest_container_nums(member_to_container);
         let part8_containers: std::collections::BTreeSet<u32> = plan
             .part8_container_nums(member_to_container)
             .into_iter()
-            .filter(|cnum| !open_document_container_nums.contains(cnum))
+            .filter(|cnum| {
+                !open_document_container_nums.contains(cnum) && !rest_container_nums.contains(cnum)
+            })
             .collect();
         let part8_plain = plan
             .part4_other_pages_shared
@@ -1027,6 +1037,65 @@ mod tests {
             table.header.first_page_entries, 2,
             "first_page_entries must stay |part2| + |part3| = 2 even when the \
              Part-8 members fold into a single container"
+        );
+    }
+
+    /// A part9 (Rest) container routed by outline priority, carrying a
+    /// `part4_other_pages_shared` member but NO first-page member, must be
+    /// excluded from the Part-8 entry COUNT — not just from the entry list.
+    /// `canonical_shared_hints` drops it from `section_entries`; if `from_plan`
+    /// still counted it via `part8_container_nums`, `first_page_entries =
+    /// section_entries - part8_entries` would undercount the first-page section
+    /// (the `objstm-lin-outlines-otherpage-0-60-20` byte divergence, flpdf-7aek).
+    #[test]
+    fn part9_outline_container_excluded_from_part8_entry_count() {
+        let page = ObjectRef::new(3, 0); // part2 first-page object (plain)
+        let outline = ObjectRef::new(6, 0); // in_outlines (part9), member of 42
+        let shared_a = ObjectRef::new(9, 0); // part4_other_pages_shared, member of 42
+        let plan = LinearizationPlan {
+            part2_objects: vec![page],
+            part4_other_pages_shared: vec![shared_a],
+            part9_outline_objects: vec![outline],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: shared_a,
+                    referencing_pages: vec![1, 2],
+                },
+            ],
+            ..Default::default()
+        };
+        let mut member_to_container: std::collections::BTreeMap<ObjectRef, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        member_to_container.insert(outline, (42, 0));
+        member_to_container.insert(shared_a, (42, 1));
+
+        // Precondition: container 42 would be counted as part8 without the guard.
+        assert!(plan
+            .part8_container_nums(&member_to_container)
+            .contains(&42));
+
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &member_to_container,
+            &Default::default(),
+            &Default::default(),
+        );
+
+        // The part9 container is excluded from BOTH the entry list and the count.
+        assert_eq!(
+            table.header.section_entries, 1,
+            "part9 container dropped from the shared entry list → only `page` remains"
+        );
+        assert_eq!(
+            table.header.first_page_entries, 1,
+            "part9 container must not be counted as a Part-8 entry → \
+             first_page_entries equals section_entries (no Part-8 section)"
         );
     }
 

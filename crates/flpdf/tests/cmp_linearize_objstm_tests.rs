@@ -593,6 +593,55 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// outlines-otherpage-2-60-20 (flpdf-7aek): a single even-split ObjStm container
+// mixes /Outlines items (in_outlines => part9 / Rest, no /PageMode /UseOutlines)
+// with other-page-shared fonts (referenced by pages 1 AND 2, NOT page 0 => part8 /
+// lc_other_page_shared). route_objstm_containers gives outline priority, so the
+// mixed container is routed to part9; its part8 fonts must NOT be emitted as part8
+// Shared Object Hint Table entries (canonical_shared_hints must guard part9
+// containers in the input_idx >= first_page_input section too). Sized so the
+// compressible set stays under the 100-object cap => one container, isolating this
+// SOHT bug from the even-split page-dict-erasure boundary divergence (flpdf-g1eu).
+#[test]
+fn outlines_otherpage_objstm_structurally_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-outlines-otherpage-2-60-20.pdf",
+        "objstm-lin-outlines-otherpage-2-60-20",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn outlines_otherpage_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-outlines-otherpage-2-60-20.pdf",
+        "objstm-lin-outlines-otherpage-2-60-20",
+    );
+}
+
+// outlines-otherpage-0-60-20 (flpdf-7aek, Codex P2): same as above but page 0 has
+// NO ObjStm-eligible private member (P0=0), so the part9 container carries no
+// first-page member. `part8_container_nums` (keyed on page reachability) would
+// re-add it as a Part-8 entry in canonical_shared_hints' enumeration tail AND
+// over-count it in SharedObjectHintTable::from_plan's `first_page_entries`. Both
+// must exclude rest containers; this pins the empty-first-page case byte-identical.
+#[test]
+fn outlines_otherpage_empty_first_page_objstm_structurally_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-outlines-otherpage-0-60-20.pdf",
+        "objstm-lin-outlines-otherpage-0-60-20",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn outlines_otherpage_empty_first_page_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-outlines-otherpage-0-60-20.pdf",
+        "objstm-lin-outlines-otherpage-0-60-20",
+    );
+}
+
 // outline-od-shared-stream: a /JS action stream reachable from BOTH the catalog's
 // /OpenAction subtree (in_open_document) AND an outline item's /A (in_outlines).
 // qpdf's canonical classification orders in_outlines ABOVE in_open_document
