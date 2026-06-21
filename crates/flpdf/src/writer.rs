@@ -432,6 +432,23 @@ pub fn parse_pdf_version(v: &str) -> Option<(u8, u8)> {
     Some((major, minor))
 }
 
+/// True when `--force-version` pins the output header below PDF 1.5.
+///
+/// Object streams and cross-reference streams were both introduced in PDF 1.5.
+/// qpdf treats a forced version as a hard cap it will not exceed, so when the
+/// forced header is below 1.5 it suppresses those features entirely and falls
+/// back to a classic xref table (observed on qpdf 11.9.0). `--min-version` is
+/// only a floor — it never triggers this, because the 1.5 object-stream floor
+/// raises above it — so this checks `force_version` specifically. An invalid
+/// (unparseable) `force_version` is ignored, matching [`effective_pdf_version`].
+pub(crate) fn force_version_below_1_5(options: &WriteOptions) -> bool {
+    options
+        .force_version
+        .as_deref()
+        .and_then(parse_pdf_version)
+        .is_some_and(|v| v < (1, 5))
+}
+
 /// Compute the effective PDF version to write given the source version, the
 /// caller-supplied options, and whether the output is linearized.
 ///
@@ -2586,6 +2603,29 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
 ) -> Result<()> {
+    // A forced sub-1.5 header suppresses object-stream generation: object
+    // streams are a PDF 1.5 feature and qpdf will not emit them under a forced
+    // version it must not exceed (observed on qpdf 11.9.0; `--object-streams=generate
+    // --force-version=1.4` is byte-identical to `--object-streams=disable
+    // --force-version=1.4`). Normalize to Disable here, before the routing
+    // below, so the Generate path is skipped and the planner produces no
+    // batches; a classic-table source then keeps its classic xref form and the
+    // forced header is never clamped up to 1.5. Downgrading an *inherited*
+    // xref-stream form (preserve/disable on an xref-stream source) is a separate
+    // concern handled elsewhere; this gate only suppresses *generation*.
+    let suppressed_options;
+    let options = if force_version_below_1_5(options)
+        && matches!(options.object_streams, ObjectStreamMode::Generate)
+    {
+        suppressed_options = WriteOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..options.clone()
+        };
+        &suppressed_options
+    } else {
+        options
+    };
+
     // ── ObjStm-routing overview ───────────────────────────────────────────────
     // 1. Run the planner to decide which objects belong in ObjStm batches.
     // 2. Build a member→(container_num, index_in_batch) lookup.

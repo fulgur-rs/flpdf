@@ -824,3 +824,52 @@ fn page_contents_indirect_length_flate_objstm_byte_identical_to_qpdf() {
         "objstm-lin-page-contents-indirect-length-flate",
     );
 }
+
+// ── flpdf-ipc6: forced sub-1.5 header suppresses object/xref-stream generation ──
+// on the linearize path too. The output is a CLASSIC linearized PDF at header
+// 1.4 (no `/ObjStm`, no `/Type /XRef`), identical to the disable path. Unlike the
+// xref-stream objstm goldens (whose strict /ID[1] is `#[ignore]`d pending pass-1
+// reconstruction), the suppressed output is classic, so the deterministic `/ID`
+// is fully reproducible and the comparison is strict (full bytes).
+
+/// Linearize `fixture` with generate + a forced version (qpdf-matching options).
+fn flpdf_linearized_objstm_force(fixture: &str, force: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+    let renumber = RenumberMap::from_plan(&plan);
+    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
+    let mut opts = WriteOptions::default();
+    opts.object_streams = ObjectStreamMode::Generate;
+    opts.deterministic_id = true;
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    opts.force_version = Some(force.to_string());
+    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
+    doc.back_patch().unwrap();
+    doc.bytes
+}
+
+/// Read a named golden under `references/<stem>/`.
+fn golden_named(stem: &str, name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(stem)
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
+#[test]
+fn three_page_linearize_generate_force_version_1_4_suppressed_is_byte_identical_to_qpdf() {
+    let actual = flpdf_linearized_objstm_force("three-page.pdf", "1.4");
+    let expected = golden_named("three-page", "linearize-objstm-force14.pdf");
+    report(
+        "three-page.pdf (linearize generate --force-version=1.4)",
+        &actual,
+        &expected,
+        "full bytes (classic linearized, suppressed)",
+    );
+}

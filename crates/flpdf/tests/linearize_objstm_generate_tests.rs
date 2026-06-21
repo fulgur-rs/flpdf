@@ -989,3 +989,110 @@ fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
+
+/// Linearize `fixture` with an explicit object-stream `mode` and forced version.
+///
+/// `use_generate` is derived from `mode`, mirroring the CLI (`main.rs`:
+/// `use_generate = options.object_streams == Generate`). This matters for the
+/// disable arm: a disable-mode write must build a disable-mode plan, otherwise
+/// the open-document object placement would differ from qpdf's classic layout.
+fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, mode == ObjectStreamMode::Generate).unwrap();
+    let renumber = RenumberMap::from_plan(&plan);
+
+    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.object_streams = mode;
+    opts.deterministic_id = true;
+    opts.force_version = Some(force.to_string());
+
+    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
+    doc.back_patch().unwrap();
+    doc.bytes
+}
+
+/// Linearize `fixture` with `--object-streams=generate` AND a forced version.
+fn linearize_generate_force_version(fixture: &str, force: &str) -> Vec<u8> {
+    linearize_mode_force_version(fixture, ObjectStreamMode::Generate, force)
+}
+
+/// A forced sub-1.5 header suppresses object/xref-stream generation on the
+/// linearized write path too: qpdf keeps the forced header and falls back to a
+/// classic xref table (qpdf 11.9.0: `--linearize --object-streams=generate
+/// --force-version=1.4` emits no `/ObjStm` and no xref stream). Without the gate
+/// `three-page.pdf` packs one first-half ObjStm container (see
+/// `three_page_generate_packs_first_half_container_before_e`).
+#[test]
+fn linearize_generate_force_version_below_1_5_suppresses_object_and_xref_streams() {
+    let bytes = linearize_generate_force_version("three-page.pdf", "1.4");
+
+    assert!(
+        bytes.starts_with(b"%PDF-1.4\n"),
+        "forced sub-1.5 header must be kept verbatim; got {:?}",
+        String::from_utf8_lossy(&bytes[..16.min(bytes.len())])
+    );
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        0,
+        "force-version 1.4 must suppress ObjStm generation on the linearize path"
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("/Type /XRef"),
+        "force-version 1.4 must fall back to a classic xref table (no xref stream)"
+    );
+
+    // The suppressed linearized output still round-trips.
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
+    let refs = pdf.object_refs();
+    assert!(
+        !refs.is_empty(),
+        "suppressed linearized doc must expose objects"
+    );
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// On the linearize path too, generate + force<1.5 must produce EXACTLY a
+/// Disable-mode linearized write under the same forced header. Holds on the
+/// default (miniz) build — both use flpdf's own deflate.
+#[test]
+fn linearize_generate_force_below_1_5_is_byte_identical_to_disable() {
+    let gen = linearize_mode_force_version("three-page.pdf", ObjectStreamMode::Generate, "1.4");
+    let dis = linearize_mode_force_version("three-page.pdf", ObjectStreamMode::Disable, "1.4");
+    assert_eq!(
+        gen, dis,
+        "linearize generate + force<1.5 must be byte-identical to disable + force<1.5"
+    );
+}
+
+/// Regression for the open-document plan-ordering leak (Codex review on PR #406):
+/// a generate-mode `LinearizationPlan` peels first-page open-document objects
+/// (here an `/AcroForm` + widget) out of Part 2/3, so suppressing only the batch
+/// plan left generate-mode ORDERING in the classic output. The fix rebuilds the
+/// plan in disable mode, so generate + force<1.5 must equal disable + force<1.5
+/// byte-for-byte on a fixture that carries such objects. `three-page.pdf` has
+/// none, which is exactly why it missed this bug class. Default build — no qpdf,
+/// no golden.
+#[test]
+fn linearize_generate_force_below_1_5_matches_disable_on_open_document_fixture() {
+    let fixture = "objstm-lin-acroform-widget-page0-5-10.pdf";
+    let gen = linearize_mode_force_version(fixture, ObjectStreamMode::Generate, "1.4");
+    let dis = linearize_mode_force_version(fixture, ObjectStreamMode::Disable, "1.4");
+    assert_eq!(
+        gen, dis,
+        "an /AcroForm fixture must linearize identically under generate+force1.4 \
+         and disable+force1.4 — the suppressed plan must be rebuilt in disable mode, \
+         not left in generate-mode ordering"
+    );
+}

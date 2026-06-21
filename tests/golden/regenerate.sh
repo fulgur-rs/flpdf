@@ -423,6 +423,15 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/linearize-objstm.pdf"
 echo "three-page/linearize-objstm.pdf"
 
+# Linearized --object-streams=generate with a forced sub-1.5 header: object and
+# cross-reference streams are suppressed (PDF 1.5 features under a forced 1.4
+# cap), so the output is a CLASSIC linearized PDF at header 1.4 — identical to
+# the disable path. Exercises the suppression gate on the linearize writer
+# (flpdf-ipc6); feature-gated on qpdf-zlib-compat.
+qpdf --linearize --object-streams=generate --force-version=1.4 --deterministic-id --warning-exit-0 \
+    "$FIX/three-page.pdf" "$REF/three-page/linearize-objstm-force14.pdf"
+echo "three-page/linearize-objstm-force14.pdf"
+
 # --- three-page-objstm: linearize an ObjStm-bearing input (flpdf-zbf9) ---
 # qpdf drops the source structural containers; this golden is qpdf's OWN
 # linearization of the ObjStm-bearing input (NOT identical to three-page's,
@@ -450,6 +459,15 @@ echo "objstm-gen-nostream-5/generate.pdf"
 qpdf --object-streams=generate --static-id --warning-exit-0 \
     "$FIX/objstm-gen-nostream-130rev.pdf" "$REF/objstm-gen-nostream-130rev/generate.pdf"
 echo "objstm-gen-nostream-130rev/generate.pdf"
+
+# --object-streams=generate with a forced sub-1.5 header: object streams and
+# cross-reference streams are PDF 1.5 features, so qpdf suppresses both under a
+# forced version it must not exceed and falls back to a classic xref table while
+# keeping the 1.4 header (i.e. generate+force1.4 == disable+force1.4). The parity
+# gate for this suppression is feature-gated on qpdf-zlib-compat (flpdf-ipc6).
+qpdf --object-streams=generate --force-version=1.4 --static-id --warning-exit-0 \
+    "$FIX/three-page.pdf" "$REF/three-page/generate-force14.pdf"
+echo "three-page/generate-force14.pdf"
 
 # --- linearized-one-page: plain only (re-linearize would be redundant) ---
 qpdf --deterministic-id --warning-exit-0 \

@@ -2380,6 +2380,39 @@ pub fn write_linearized<R: Read + Seek>(
         ));
     }
 
+    // A forced sub-1.5 header suppresses object-stream generation: object and
+    // cross-reference streams are PDF 1.5 features and qpdf will not emit them
+    // under a forced version it must not exceed (observed on qpdf 11.9.0:
+    // `--linearize --object-streams=generate --force-version=1.4` yields no
+    // `/ObjStm` and a classic xref table at header 1.4, identical to disable
+    // mode). Reconcile fully to the disable layout, not just the batch plan:
+    // the caller builds `plan`/`renumber` BEFORE calling here, and a generate
+    // -mode plan peels first-page open-document objects (e.g. `/AcroForm`,
+    // `/OpenAction`) out of Part 2/3 — a placement difference that would leak
+    // generate-mode ordering into the suppressed classic output. So rebuild the
+    // plan (and renumber) in disable mode and normalize the options to Disable.
+    // `from_pdf(.., false)` is the same call the non-suppressed disable path
+    // makes; the extra walk only happens in the rare suppression case. show.rs /
+    // check.rs callers pass `false` + default options, so this never fires there.
+    let rebuilt_plan;
+    let rebuilt_renumber;
+    let suppressed_options;
+    let (plan, renumber, options) = if crate::writer::force_version_below_1_5(options)
+        && matches!(
+            options.object_streams,
+            crate::writer::ObjectStreamMode::Generate
+        ) {
+        rebuilt_plan = LinearizationPlan::from_pdf(pdf, false)?;
+        rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);
+        suppressed_options = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Disable,
+            ..options.clone()
+        };
+        (&rebuilt_plan, &rebuilt_renumber, &suppressed_options)
+    } else {
+        (plan, renumber, options)
+    };
+
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
     // ------------------------------------------------------------------

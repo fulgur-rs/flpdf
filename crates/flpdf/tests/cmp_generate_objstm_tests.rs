@@ -106,6 +106,59 @@ fn nostream_130rev_generate_is_byte_identical_to_qpdf() {
     );
 }
 
+// ── flpdf-ipc6: generate + forced sub-1.5 header suppresses object/xref streams ─
+// A forced sub-1.5 header is a hard cap qpdf will not exceed, so object streams
+// and cross-reference streams (both PDF 1.5 features) are suppressed: qpdf keeps
+// the 1.4 header and writes a classic xref table (no `/ObjStm`, no `/Type /XRef`),
+// i.e. generate+force1.4 == disable+force1.4. flpdf must be byte-identical.
+
+/// Full-rewrite `fixture` with generate + a forced version (qpdf-matching options).
+fn generate_force_qpdf_equivalent(fixture: &str, force: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.object_streams = ObjectStreamMode::Generate;
+    opts.force_version = Some(force.to_string());
+    opts.static_id = true;
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
+/// Read a named golden under `references/<stem>/`.
+fn golden_named(stem: &str, name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(stem)
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
+#[test]
+fn three_page_generate_force_version_1_4_suppressed_is_byte_identical_to_qpdf() {
+    let actual = generate_force_qpdf_equivalent("three-page.pdf", "1.4");
+    let expected = golden_named("three-page", "generate-force14.pdf");
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "three-page generate --force-version=1.4: not byte-identical to qpdf \
+             suppressed golden (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
 // ── Step C: content streams interleaved with the ObjStm container ────────────
 // three-page fixture: the Catalog/Pages/page dicts pack into one container
 // (objs 2-9), while the content streams and font remain plain objects numbered
