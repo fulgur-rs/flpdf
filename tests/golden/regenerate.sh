@@ -301,6 +301,13 @@ fi
 #                     ineligible for ObjStm, so qpdf emits it plain in part9 AFTER
 #                     the outline container. Discriminates step-6b OD/outline
 #                     precedence and the second-half post-container plain ordering.
+#  - outlines-otherpage-2-60-20 (flpdf-7aek): one ObjStm container co-locates
+#                     /Outlines items (in_outlines => part9, no /UseOutlines) with
+#                     page-1&2-shared fonts (part8). Outline priority routes the
+#                     container to part9; its part8 fonts must NOT appear as part8
+#                     Shared Object Hint Table entries. Sized single-container
+#                     (eligible 85 < 100) to isolate the SOHT bug from the
+#                     even-split page-dict-erasure boundary divergence (flpdf-g1eu).
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
@@ -314,6 +321,7 @@ declare -A G6HB2_FIX=(
     [objstm-lin-useoutlines-80-80]="gen_outlines_gap.py 80 80 --use-outlines"
     [objstm-lin-outlines-shared-page-80-80]="gen_outlines_shared_page.py 80 80"
     [objstm-lin-outlines-coloc-200-20]="gen_outlines_gap.py 200 20"
+    [objstm-lin-outlines-otherpage-2-60-20]="gen_outlines_otherpage_shared.py 2 60 20"
     [objstm-lin-outline-od-shared-stream]="gen_outline_open_action_shared_stream.py"
     [objstm-lin-acroform-widget-page0-5-10]="gen_acroform_widget_page0.py 5 10"
     [objstm-lin-acroform-widget-ap-stream-page0]="gen_acroform_widget_ap_stream_page0.py"
@@ -503,6 +511,7 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-outlines-80-80 \
             objstm-lin-outlines-80-200 objstm-lin-useoutlines-80-80 \
             objstm-lin-outlines-shared-page-80-80 objstm-lin-outlines-coloc-200-20 \
+            objstm-lin-outlines-otherpage-2-60-20 \
             objstm-lin-outline-od-shared-stream \
             objstm-lin-acroform-widget-page0-5-10 \
             objstm-lin-acroform-widget-ap-stream-page0 \

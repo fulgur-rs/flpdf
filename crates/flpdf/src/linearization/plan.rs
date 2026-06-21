@@ -1217,6 +1217,25 @@ impl LinearizationPlan {
             + self.part3_objects.len()
             + self.outline_first_page_members.len();
 
+        // Containers routed to part9 (Rest) by qpdf's outline priority
+        // (QPDF_linearization.cc:1118-1122). A container holding an in_outlines
+        // (!UseOutlines) member is placed in the second half even when the global
+        // even split co-locates a `part4_other_pages_shared` object in it. Such a
+        // part9 container is not a shared object in qpdf's SOHT, so it must be
+        // excluded from the Part-8 section too — the `second_half_container_nums`
+        // guard below only covers the first-page section (where ALL second-half
+        // containers are skipped). A `part4_other_pages_shared` member implies
+        // its container's page union is ≥2, so the only way such a container lands
+        // in the second half rather than part8 is this outline override; keying on
+        // `part9_outline_objects` therefore characterises exactly those containers.
+        let part9_outline_set: BTreeSet<ObjectRef> =
+            self.part9_outline_objects.iter().copied().collect();
+        let rest_container_nums: BTreeSet<u32> = member_to_container
+            .iter()
+            .filter(|(member, _)| part9_outline_set.contains(member))
+            .map(|(_, &(cnum, _))| cnum)
+            .collect();
+
         // Position (index into the output list) at which each container was
         // first emitted, so later members of the same container fold into it.
         let mut container_pos: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1242,6 +1261,16 @@ impl LinearizationPlan {
                     // (outline-routed) ObjStm containers placed after /E.
                     if input_idx < first_page_input
                         && second_half_container_nums.contains(&container_num)
+                    {
+                        continue;
+                    }
+                    // Within the Part-8 section: skip part9 (Rest) containers that
+                    // qpdf's outline priority placed in the second half. The
+                    // first-page guard above cannot fire here (input_idx is past
+                    // the boundary), and `second_half_container_nums` would wrongly
+                    // also drop legitimate part8 containers — so key on the
+                    // part9-only `rest_container_nums` instead.
+                    if input_idx >= first_page_input && rest_container_nums.contains(&container_num)
                     {
                         continue;
                     }
@@ -4337,6 +4366,90 @@ mod tests {
                 .iter()
                 .all(|e| e.object_ref != ObjectRef::new(30, u16::MAX)),
             "container 30 sentinel must not appear"
+        );
+    }
+
+    /// A part9 (Rest) ObjStm container routed there by qpdf's outline priority
+    /// (it co-locates an in_outlines `!UseOutlines` member with a
+    /// `part4_other_pages_shared` member via the even split) must be skipped in
+    /// the Part-8 section of the Shared Object Hint Table — while a *legitimate*
+    /// part8 container is kept. This locks the narrow part9-only exclusion: a
+    /// naive `second_half_container_nums`-wide skip in the Part-8 section would
+    /// wrongly drop the legitimate part8 container's referencing pages too.
+    /// Mirrors the `objstm-lin-outlines-otherpage` byte fixture (flpdf-7aek).
+    #[test]
+    fn canonical_shared_hints_skips_part9_outline_container_in_part8_section() {
+        // Container A (20): a part9 container — holds an in_outlines member
+        // (`outline`, in `part9_outline_objects`), a `part4_other_pages_shared`
+        // member (`shared_a`), and a first-page-private member (`fp_priv`). The
+        // first-page member keeps A out of `part8_container_nums` (so the
+        // enumeration tail cannot re-add it), exactly as the single-container
+        // byte fixture's container carries page-0's private fonts.
+        let fp_priv = ObjectRef::new(2, 0);
+        let outline = ObjectRef::new(6, 0);
+        let shared_a = ObjectRef::new(7, 0);
+        // Container B (21): a legitimate part8 (other-page-shared) container.
+        let shared_b = ObjectRef::new(8, 0);
+        let plan = LinearizationPlan {
+            part3_objects: vec![fp_priv],
+            part4_other_pages_shared: vec![shared_a, shared_b],
+            // `outline` is routed to part9 (Rest) by the !UseOutlines priority.
+            part9_outline_objects: vec![outline],
+            shared_hints: vec![
+                // first-page section (input_idx < first_page_input = 1):
+                SharedObjectHintEntry {
+                    object_ref: fp_priv,
+                    referencing_pages: vec![],
+                },
+                // Part-8 section (input_idx >= first_page_input):
+                SharedObjectHintEntry {
+                    object_ref: shared_a,
+                    referencing_pages: vec![1],
+                },
+                SharedObjectHintEntry {
+                    object_ref: shared_b,
+                    referencing_pages: vec![2],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(fp_priv, (20, 0));
+        m2c.insert(outline, (20, 1));
+        m2c.insert(shared_a, (20, 2));
+        m2c.insert(shared_b, (21, 0));
+
+        // Both A and B are Part-4 (second-half) containers.
+        let mut second_half: BTreeSet<u32> = BTreeSet::new();
+        second_half.insert(20);
+        second_half.insert(21);
+
+        let renumber = RenumberMap::from_plan(&plan);
+        let folded =
+            plan.canonical_shared_hints(&m2c, &renumber, &second_half, &Default::default());
+
+        // Container A (20, part9) must be absent.
+        assert!(
+            folded
+                .iter()
+                .all(|e| e.object_ref != ObjectRef::new(20, u16::MAX)),
+            "part9 outline-routed container 20 must be skipped in the Part-8 section"
+        );
+        // Container B (21, part8) must be kept AND carry the pages folded from its
+        // `shared_hints` member (the union from the main loop, NOT the empty list
+        // a naive skip + enumeration re-add would leave). `all_referenced_pages`
+        // is empty here, so the recompute tail is a no-op and this distinguishes
+        // the correct fold from a naive `second_half`-wide skip.
+        let b_entry = folded
+            .iter()
+            .find(|e| e.object_ref == ObjectRef::new(21, u16::MAX))
+            .expect("legitimate part8 container 21 must be kept");
+        assert_eq!(
+            b_entry.referencing_pages,
+            vec![2],
+            "part8 container 21 must keep its folded referencing page (not be \
+             dropped and re-added empty by a naive second_half-wide skip)"
         );
     }
 
