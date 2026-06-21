@@ -991,6 +991,11 @@ fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
 }
 
 /// Linearize `fixture` with an explicit object-stream `mode` and forced version.
+///
+/// `use_generate` is derived from `mode`, mirroring the CLI (`main.rs`:
+/// `use_generate = options.object_streams == Generate`). This matters for the
+/// disable arm: a disable-mode write must build a disable-mode plan, otherwise
+/// the open-document object placement would differ from qpdf's classic layout.
 fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -998,7 +1003,7 @@ fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &s
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, mode == ObjectStreamMode::Generate).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
@@ -1058,9 +1063,9 @@ fn linearize_generate_force_version_below_1_5_suppresses_object_and_xref_streams
     }
 }
 
-/// On the linearize path too, generate + force<1.5 normalizes to Disable, so the
-/// bytes must be EXACTLY a Disable-mode linearized write under the same forced
-/// header. Holds on the default (miniz) build — both use flpdf's own deflate.
+/// On the linearize path too, generate + force<1.5 must produce EXACTLY a
+/// Disable-mode linearized write under the same forced header. Holds on the
+/// default (miniz) build — both use flpdf's own deflate.
 #[test]
 fn linearize_generate_force_below_1_5_is_byte_identical_to_disable() {
     let gen = linearize_mode_force_version("three-page.pdf", ObjectStreamMode::Generate, "1.4");
@@ -1068,5 +1073,26 @@ fn linearize_generate_force_below_1_5_is_byte_identical_to_disable() {
     assert_eq!(
         gen, dis,
         "linearize generate + force<1.5 must be byte-identical to disable + force<1.5"
+    );
+}
+
+/// Regression for the open-document plan-ordering leak (Codex review on PR #406):
+/// a generate-mode `LinearizationPlan` peels first-page open-document objects
+/// (here an `/AcroForm` + widget) out of Part 2/3, so suppressing only the batch
+/// plan left generate-mode ORDERING in the classic output. The fix rebuilds the
+/// plan in disable mode, so generate + force<1.5 must equal disable + force<1.5
+/// byte-for-byte on a fixture that carries such objects. `three-page.pdf` has
+/// none, which is exactly why it missed this bug class. Default build — no qpdf,
+/// no golden.
+#[test]
+fn linearize_generate_force_below_1_5_matches_disable_on_open_document_fixture() {
+    let fixture = "objstm-lin-acroform-widget-page0-5-10.pdf";
+    let gen = linearize_mode_force_version(fixture, ObjectStreamMode::Generate, "1.4");
+    let dis = linearize_mode_force_version(fixture, ObjectStreamMode::Disable, "1.4");
+    assert_eq!(
+        gen, dis,
+        "an /AcroForm fixture must linearize identically under generate+force1.4 \
+         and disable+force1.4 — the suppressed plan must be rebuilt in disable mode, \
+         not left in generate-mode ordering"
     );
 }
