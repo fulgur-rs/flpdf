@@ -4001,11 +4001,16 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
 ///
 /// When `decode_stream_data` returns an error — e.g. because the declared
 /// filter is `DCTDecode` or `JPXDecode` (image codecs not implemented by
-/// flpdf) or because the stream data is corrupt — the original stream is
-/// returned **unchanged** (dict + data verbatim).  This preserves readability:
-/// a PDF reader that understands the codec can still decode the stream, and we
-/// do not corrupt the data by emitting uninterpreted bytes under a wrong
-/// (or missing) filter declaration.
+/// flpdf) or because the stream data is corrupt — the stream's `/Filter`
+/// chain and data bytes are returned **verbatim**.  This preserves
+/// readability: a PDF reader that understands the codec can still decode the
+/// stream, and we do not corrupt the data by emitting uninterpreted bytes
+/// under a wrong (or missing) filter declaration.  The one normalization
+/// applied even on this path is `/Length`: qpdf writes every emitted stream's
+/// `/Length` as a direct integer (the raw byte count), never an indirect
+/// reference, so a source carrying `/Length M G R` has it directized to
+/// `data.len()` here (the data bytes are untouched, so the value is unchanged
+/// for a well-formed direct length).
 ///
 /// # Byte-vs-observable note
 ///
@@ -4021,10 +4026,22 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
         Ok(d) => d,
         Err(_) => {
-            // Decode failure (unsupported codec or corrupt data): emit verbatim.
-            // The original /Filter chain is preserved so downstream readers
-            // (e.g. image renderers) can still interpret the stream correctly.
-            return Object::Stream(stream.clone());
+            // Decode failure (unsupported codec or corrupt data): emit the data
+            // and /Filter chain verbatim so downstream readers (e.g. image
+            // renderers) can still interpret the stream correctly. qpdf, however,
+            // writes EVERY emitted stream's /Length as a direct integer, never an
+            // indirect reference; directize it here so a source carrying
+            // `/Length M G R` does not leak an indirect /Length (and a renumbered
+            // holder reference) into the output — a byte divergence from qpdf for
+            // passthrough/non-decodable streams whose length holder is kept live
+            // by another reference (flpdf-q1j2). The data bytes are untouched, so
+            // /Length equals stream.data.len().
+            let mut dict = stream.dict.clone();
+            dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
+            );
+            return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
         }
     };
 
