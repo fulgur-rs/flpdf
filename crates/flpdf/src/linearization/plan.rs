@@ -488,15 +488,20 @@ pub struct LinearizationPlan {
     /// not set or when there are no outlines.
     pub(crate) part6_outline_objects: Vec<ObjectRef>,
 
-    /// Ineligible open-document objects emitted as plain objects in the pre-/O
-    /// region (between the Catalog and the open-document ObjStm containers).
+    /// Open-document objects (qpdf part4 = `lc_open_document`) emitted as plain
+    /// indirect objects in the pre-/O region, immediately after the Catalog, in
+    /// ascending source object number order.
     ///
-    /// These are objects that are in the open-document set but cannot be packed
-    /// into an ObjStm (e.g. stream objects such as `/AP /N` appearance streams).
-    /// qpdf emits them as plain indirect objects before the hint stream, between
-    /// the Catalog and the OD ObjStm containers.
+    /// In disable/preserve mode this holds the FULL open-document set — every
+    /// object reachable from the catalog open-document keys (`/OpenAction`,
+    /// `/AcroForm`, `/PageMode`, `/Threads`, `/ViewerPreferences`) and trailer
+    /// `/Encrypt`. In generate mode it holds only the ObjStm-ineligible subset
+    /// (e.g. stream objects such as `/AP /N` appearance streams that cannot be
+    /// ObjStm members); the eligible ones are packed into the open-document ObjStm
+    /// container instead.
     ///
-    /// Empty when `use_generate_objstm` is false.
+    /// Empty only when the document has no open-document objects (or, in generate
+    /// mode, when all of them are ObjStm-eligible).
     pub part4_open_document_plain: Vec<ObjectRef>,
 }
 

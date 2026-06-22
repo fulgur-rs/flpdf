@@ -1798,14 +1798,16 @@ fn do_write_pass<R: Read + Seek>(
         catalog_emitted_early = true;
     }
 
-    // Ineligible open-document plain objects (generate mode only).
-    // Stream objects such as /AP /N appearance streams cannot be packed into
-    // an ObjStm.  qpdf emits them as plain indirect objects in the pre-/O
-    // region, between the Catalog and the OD ObjStm containers, giving them
-    // object numbers immediately after the Catalog and before the OD containers.
-    // Oracle: qpdf --linearize --object-streams=generate on a page-0 widget
-    // with /AP /N places the Form XObject before the OD ObjStm at a lower
-    // object number (e.g. obj 7 before obj 8 ObjStm).
+    // Open-document plain objects (qpdf part4 = lc_open_document).
+    // In disable/preserve mode this is every open-document object (/OpenAction,
+    // /AcroForm, … subtrees); in generate mode it is only the ObjStm-ineligible
+    // subset (e.g. /AP /N appearance streams, which cannot be ObjStm members).
+    // qpdf emits them as plain indirect objects in the pre-/O region, between the
+    // Catalog and the OD ObjStm containers (or the hint stream in disable mode),
+    // giving them object numbers immediately after the Catalog.  Oracle: qpdf
+    // --object-streams=generate on a page-0 widget with /AP /N places the Form
+    // XObject before the OD ObjStm at a lower object number (e.g. obj 7 before obj
+    // 8 ObjStm); --object-streams=disable places the whole AcroForm subtree here.
     for original_ref in &plan.part4_open_document_plain {
         // cov:ignore-start: unreachable invariant — renumber.rs step-6b inserts
         // every part4_open_document_plain ref, so new_for_original is always Some.

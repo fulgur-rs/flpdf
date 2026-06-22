@@ -408,7 +408,10 @@ fn od_indirect_length_classic_byte_identical_to_qpdf() {
 
 #[test]
 fn openaction_classic_byte_identical_to_qpdf() {
-    assert_classic_byte_identical("objstm-lin-openaction-80-80.pdf", "objstm-lin-openaction-80-80");
+    assert_classic_byte_identical(
+        "objstm-lin-openaction-80-80.pdf",
+        "objstm-lin-openaction-80-80",
+    );
 }
 
 #[test]
