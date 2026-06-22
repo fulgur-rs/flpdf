@@ -143,6 +143,66 @@ impl CatalogFirstRenumber {
     }
 }
 
+/// Compute the set of object references reachable from the trailer roots,
+/// matching qpdf's reachability garbage collection of the linearized object
+/// universe.
+///
+/// Seeds from `/Root` plus every indirect trailer entry — **including
+/// `/Encrypt`**, excluding `/Prev`, `/Size`, `/ID` (and `/Root`, already
+/// seeded) — then breadth-first walks via [`collect_refs`] (which follows every
+/// inline reference, `/Length` included). References in `excluded` (such as
+/// orphaned indirect `/Length` holders) are skipped — neither recorded nor
+/// walked — so an object reachable ONLY through a dead `/Length` edge is
+/// correctly absent.
+///
+/// Unlike [`CatalogFirstRenumber`], `/Encrypt` IS part of the seed set: the
+/// linearized object universe must retain the encryption dictionary and its
+/// closure (the plain rewrite numbers `/Encrypt` in a separate slot, hence its
+/// omission there).
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when the trailer has no `/Root` or inline
+/// nesting exceeds [`MAX_INLINE_DEPTH`] (via [`collect_refs`]), and propagates
+/// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
+/// objects during the walk.
+pub(crate) fn reachable_object_set<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    excluded: &BTreeSet<ObjectRef>,
+) -> crate::Result<BTreeSet<ObjectRef>> {
+    let root = pdf
+        .root_ref()
+        .ok_or_else(|| Error::Unsupported("reachability: trailer has no /Root".to_string()))?;
+    let mut seeds: Vec<ObjectRef> = vec![root];
+    for (key, value) in pdf.trailer().iter() {
+        // /Encrypt is intentionally NOT skipped: it is part of the live universe.
+        // /Prev, /Size, /ID, /Root are not object roots of the document graph.
+        if matches!(key, b"ID" | b"Prev" | b"Root" | b"Size") {
+            continue;
+        }
+        if let Object::Reference(r) = value {
+            seeds.push(*r);
+        }
+    }
+
+    let mut reachable: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut queue: VecDeque<ObjectRef> = VecDeque::new();
+    for seed in seeds {
+        if !excluded.contains(&seed) && reachable.insert(seed) {
+            queue.push_back(seed);
+        }
+    }
+    while let Some(cur) = queue.pop_front() {
+        let obj = pdf.resolve_borrowed(cur)?;
+        collect_refs(obj, 0, &mut |r| {
+            if !excluded.contains(&r) && reachable.insert(r) {
+                queue.push_back(r);
+            }
+        })?;
+    }
+    Ok(reachable)
+}
+
 #[cfg(test)]
 impl CatalogFirstRenumber {
     /// Build a map directly from `(old, new)` pairs (test-only). Used by writer
@@ -597,6 +657,49 @@ mod tests {
         let mut news: Vec<u32> = map.pairs().map(|(new, _)| new.number).collect();
         news.sort_unstable();
         assert_eq!(news, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn reachable_object_set_drops_source_linearization_artifacts() {
+        // linearized-one-page.pdf is a qpdf-produced linearized one-page PDF whose
+        // source objects are: 1=Pages, 2=Info, 3=/Linearized param dict, 4=Catalog,
+        // 5=primary hint stream, 6=Page, 7..9=content/resources/font. The param dict
+        // (obj 3) and the hint stream (obj 5) are UNREACHABLE from Root (4) / Info (2):
+        // /H is a byte offset, not an object reference. qpdf garbage-collects them
+        // when re-linearizing, so the reachable universe is the 7 graph objects.
+        let bytes = include_bytes!("../../../tests/fixtures/compat/linearized-one-page.pdf");
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let reachable = reachable_object_set(&mut pdf, &BTreeSet::new()).expect("walk");
+        let mut nums: Vec<u32> = reachable.iter().map(|r| r.number).collect();
+        nums.sort_unstable();
+        assert_eq!(
+            nums,
+            vec![1, 2, 4, 6, 7, 8, 9],
+            "old /Linearized dict (3) and hint stream (5) must be GC'd"
+        );
+        assert!(!reachable.contains(&ObjectRef::new(3, 0)));
+        assert!(!reachable.contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn reachable_object_set_skips_excluded_orphan_length_holder() {
+        // OD fixture: obj 7 is an indirect /Length holder reachable ONLY via the
+        // stream's /Length edge. `collect_refs` follows /Length, so the holder is
+        // reachable unless excluded; passing it in `excluded` drops it (matching the
+        // orphan-/Length-holder lifecycle the linearize universe filter relies on).
+        let bytes =
+            include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let excluded: BTreeSet<ObjectRef> = std::iter::once(ObjectRef::new(7, 0)).collect();
+        let reachable = reachable_object_set(&mut pdf, &excluded).expect("walk");
+        assert!(
+            !reachable.contains(&ObjectRef::new(7, 0)),
+            "excluded orphan /Length holder must not be reachable"
+        );
+        assert!(
+            reachable.contains(&ObjectRef::new(4, 0)),
+            "the page's /Contents stream stays live"
+        );
     }
 
     #[test]
