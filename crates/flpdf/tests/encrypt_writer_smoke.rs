@@ -13,7 +13,10 @@
 use std::fs;
 use std::io::Cursor;
 
-use flpdf::{write_pdf_with_options, EncryptParams, Object, Pdf, PdfOpenOptions, WriteOptions};
+use flpdf::{
+    write_pdf_with_options, EncryptParams, Object, Pdf, PdfOpenOptions, StreamDataMode,
+    WriteOptions,
+};
 
 fn fixture(rel: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -181,5 +184,78 @@ fn v4_aes128_rejects_qdf_combination() {
     assert!(
         display.contains("Unsupported"),
         "expected Unsupported error, got: {display}"
+    );
+}
+
+/// Resolve the JavaScript stream (catalog `/OpenAction` -> action `/JS`) in the
+/// re-opened encrypted `pdf` and return its `/Length` dictionary entry.
+fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
+    let root = pdf.root_ref().expect("/Root");
+    let catalog = pdf.resolve(root).expect("catalog");
+    let open_action = catalog
+        .as_dict()
+        .and_then(|d| d.get("OpenAction").cloned())
+        .expect("/OpenAction");
+    let action = match open_action {
+        Object::Reference(r) => pdf.resolve(r).expect("action"),
+        other => other,
+    };
+    let js_ref = action
+        .as_dict()
+        .and_then(|d| d.get("JS").cloned())
+        .expect("/JS");
+    let js = match js_ref {
+        Object::Reference(r) => pdf.resolve(r).expect("js stream"),
+        other => other,
+    };
+    js.as_stream()
+        .expect("/JS is a stream")
+        .dict
+        .get("Length")
+        .cloned()
+        .expect("/Length present")
+}
+
+/// `--stream-data=preserve` + `--encrypt` (the Codex PR #401 NOTES case): the
+/// orphan-/Length-holder drop must still fire under encryption. Before
+/// flpdf-3g8o the preserve gate (`effective_stream_policy().is_some()`) was false
+/// for preserve, so the holder survived; `encrypt_stream_payload_for_writer` then
+/// direct-ized `/Length` anyway, leaving a stale orphan emitted as a real object.
+/// The gate now keys on `!options.qdf`, so the holder is dropped and `/Length` is
+/// direct.
+///
+/// Asserted via flpdf's own reader (no garbage collection) on the live encrypted
+/// output — NOT via `qpdf --decrypt`, which would GC the stale holder and mask
+/// the bug. Pre-fix this output reopens with 8 live objects (6 logical + stale
+/// holder + /Encrypt); post-fix with 7 (6 logical + /Encrypt, holder dropped).
+/// Structural assertion only — AES IVs are random, so byte-identity is not
+/// available for AES.
+#[test]
+fn v4_aes128_preserve_drops_orphan_length_holder() {
+    let input = fixture("tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
+    let mut pdf = Pdf::open(Cursor::new(input)).expect("open plaintext input");
+    let mut out = Vec::new();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.stream_data = Some(StreamDataMode::Preserve);
+    options.encrypt = Some(EncryptParams::v4_aes128(
+        b"user-pw".to_vec(),
+        b"owner-pw".to_vec(),
+    ));
+    write_pdf_with_options(&mut pdf, &mut out, &options).expect("encrypted preserve write");
+
+    let mut pdf = open_encrypted(&out, b"user-pw");
+    // 6 logical objects (Catalog, Pages, Page, content stream, Action, JS stream)
+    // with the orphan holder dropped, plus the /Encrypt dictionary object = 7.
+    // (Pre-fix: 8, the stale holder still live.)
+    assert_eq!(
+        pdf.live_object_refs().len(),
+        7,
+        "preserve + encrypt must drop the orphaned indirect /Length holder \
+         (6 logical objects + /Encrypt = 7; the stale holder is gone)"
+    );
+    assert!(
+        matches!(js_stream_length(&mut pdf), Object::Integer(_)),
+        "preserve + encrypt must direct-ize the JS stream's /Length"
     );
 }
