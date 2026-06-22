@@ -703,6 +703,25 @@ mod tests {
     }
 
     #[test]
+    fn reachable_object_set_includes_trailer_encrypt_dict() {
+        // /Encrypt is part of the live linearized universe — unlike the plain
+        // Catalog-first numbering, which slots /Encrypt separately and omits it
+        // from its BFS seeds. Re-linearizing an encrypted input must keep the
+        // encryption dictionary (12 0 R here) and its closure (flpdf-phfu).
+        let bytes = include_bytes!("../../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let encrypt_ref = pdf
+            .trailer()
+            .get_ref("Encrypt")
+            .expect("fixture has /Encrypt");
+        let reachable = reachable_object_set(&mut pdf, &BTreeSet::new()).expect("walk");
+        assert!(
+            reachable.contains(&encrypt_ref),
+            "the trailer /Encrypt dict ({encrypt_ref}) must be in the reachable universe"
+        );
+    }
+
+    #[test]
     fn generate_build_excluding_drops_orphan_length_holder() {
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
