@@ -274,12 +274,15 @@ impl RenumberMap {
         // 6. Catalog (promoted from part4_rest).
         promote(plan.root_ref, &mut by_new_number, &mut by_original);
 
-        // 6b. Ineligible open-document plain objects (generate mode only).
-        // These objects are in the open-document set but cannot be packed into
-        // an ObjStm (e.g. stream objects such as /AP /N appearance streams).
-        // qpdf emits them as plain indirect objects between the Catalog and the
-        // OD ObjStm containers, so they occupy object numbers immediately after
-        // the Catalog and before the hint stream sentinel.
+        // 6b. Open-document plain objects (qpdf part4 = lc_open_document).
+        // In disable/preserve mode this is the FULL open-document set (every
+        // /OpenAction, /AcroForm, … subtree object is a plain indirect object);
+        // in generate mode it is only the ObjStm-ineligible subset (e.g. stream
+        // objects such as /AP /N appearance streams that cannot be ObjStm
+        // members). qpdf emits them as plain indirect objects between the Catalog
+        // and the OD ObjStm containers (generate) / hint stream (disable), so
+        // they occupy object numbers immediately after the Catalog and before the
+        // hint stream sentinel in every mode.
         for &original in &plan.part4_open_document_plain {
             push_real(original, &mut by_new_number, &mut by_original);
         }

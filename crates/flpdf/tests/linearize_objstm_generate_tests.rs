@@ -942,15 +942,21 @@ fn thumbnail_private_shared_routes_thumbs_to_part9() {
     }
 }
 
-/// Regression test: in non-generate mode the OD peeling must NOT apply.
+/// Regression test (flpdf-lubb): the open-document peeling applies in
+/// non-generate mode too.
 ///
 /// Oracle: `qpdf --linearize --object-streams=disable` on the AcroForm fixture
-/// shows Page 0 with nobjects=12 and nshared=0, meaning all first-page-closure
-/// objects (including the 5 widgets) stay in the first-page section.  When
-/// `use_generate_objstm=false`, Part 2 must contain the widgets and
-/// `page_hints[0].object_count` must equal 17 (7 Part-2 + 10 Part-3 fonts).
+/// places the AcroForm dict + 5 widgets in part4 (first half, before /O), NOT in
+/// the first-page section: Page 0 has nobjects=12 — the page dict + content + 10
+/// Fonts — and the widgets sit at object numbers 7..11 (< /O = 13). So with
+/// `use_generate_objstm=false` the widgets must be peeled out of Part 2 into
+/// `part4_open_document_plain`, and `page_hints[0].object_count` must equal 12.
+/// (The earlier expectation that the widgets stay in Part 2 was a misread of
+/// qpdf's hint table; the byte-identical golden test
+/// `acroform_widget_page0_5_10_classic_byte_identical_to_qpdf` pins the full
+/// output.)
 #[test]
-fn acroform_widget_stays_in_first_page_section_in_disable_mode() {
+fn acroform_widget_peeled_to_open_document_in_disable_mode() {
     use flpdf::ObjectRef;
     use std::collections::BTreeSet;
 
@@ -970,24 +976,39 @@ fn acroform_widget_stays_in_first_page_section_in_disable_mode() {
         .collect();
 
     let part2_set: BTreeSet<_> = plan.part2_objects.iter().copied().collect();
-    let part4_set: BTreeSet<_> = plan.part4_objects().into_iter().collect();
+    let od_plain_set: BTreeSet<_> = plan.part4_open_document_plain.iter().copied().collect();
 
     for r in &widget_refs {
         assert!(
-            part2_set.contains(r),
-            "widget {r} must be in part2 in disable mode (no OD peeling)"
+            !part2_set.contains(r),
+            "widget {r} must NOT be in part2 in disable mode (peeled to open-document)"
         );
         assert!(
-            !part4_set.contains(r),
-            "widget {r} must NOT be in part4 in disable mode (disjoint partition)"
+            od_plain_set.contains(r),
+            "widget {r} must be in part4_open_document_plain in disable mode"
         );
     }
 
-    // page0 dict(3) + content0(21) + widgets(6-10, =5) = 7 Part-2 objects,
-    // plus shared fonts 11-20 (=10) in Part-3 → total 17.
+    // qpdf part4 = [lc_root] ++ lc_open_document (ascending source number).
+    // open_document_set here = {AcroForm dict (src 5), widgets (src 6..10)}; the
+    // Catalog (src 1) is placed separately via the renumber root_ref promote, so
+    // part4_open_document_plain is exactly [5, 6, 7, 8, 9, 10] in source order.
     assert_eq!(
-        plan.page_hints[0].object_count, 17,
-        "page 0 object_count must be 17 in disable mode (widgets not peeled)"
+        plan.part4_open_document_plain,
+        (5u32..=10)
+            .map(|n| ObjectRef {
+                number: n,
+                generation: 0,
+            })
+            .collect::<Vec<_>>(),
+        "open-document objects must be ordered by ascending source number"
+    );
+
+    // page 0 first-page section = page dict + content + 10 Fonts = 12 (the
+    // widgets are peeled to part4), matching qpdf's nobjects=12.
+    assert_eq!(
+        plan.page_hints[0].object_count, 12,
+        "page 0 object_count must be 12 in disable mode (widgets peeled to part4)"
     );
 }
 
