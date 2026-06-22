@@ -2665,14 +2665,16 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         return Err(crate::Error::Missing("/Root"));
     };
 
-    // flpdf-sqkq: drop indirect `/Length` holders that orphan once each stream's
-    // `/Length` is normalized to a direct integer, matching qpdf's reachability
-    // GC. Gated on direct-ization: `effective_stream_policy` is `None` only in
-    // `--stream-data=preserve`, where flpdf keeps the indirect `/Length` and the
-    // holder stays live; qdf mode externalizes `/Length` into its own holder
-    // objects, so leave that lifecycle untouched. Normal PDFs have no such
-    // orphans, so the set is empty and renumbering is unaffected.
-    let orphan_length_holders = if effective_stream_policy(options).is_some() && !options.qdf {
+    // flpdf-sqkq / flpdf-3g8o: drop indirect `/Length` holders that orphan once
+    // each stream's `/Length` is normalized to a direct integer, matching qpdf's
+    // reachability GC. Every non-qdf mode emits a direct `/Length` — the
+    // recompress paths via `apply_stream_compress_policy`, and preserve / encrypt
+    // via `renumber_refs_in_place` direct-izing the placeholder of a dropped
+    // holder — so the orphan drop applies to all of them. Only qdf is excluded:
+    // it externalizes `/Length` into its own holder objects, so that lifecycle is
+    // left untouched. Normal PDFs have no such orphans, so the set is empty and
+    // renumbering is unaffected.
+    let orphan_length_holders = if !options.qdf {
         object_streams::orphaned_indirect_length_holders(pdf)?
     } else {
         BTreeSet::new()

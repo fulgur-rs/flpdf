@@ -109,21 +109,26 @@ fn generate_drops_orphan_holder_and_directizes_length() {
 }
 
 #[test]
-fn stream_data_preserve_keeps_indirect_length_and_holder() {
-    // `--stream-data=preserve` leaves `/Length` indirect, so the holder is still
-    // live: the gate's `effective_stream_policy` is None and nothing is dropped.
+fn stream_data_preserve_drops_orphan_holder_and_directizes_length() {
+    // `--stream-data=preserve` keeps stream bytes verbatim, but qpdf still
+    // normalizes every stream's /Length to a direct integer and garbage-collects
+    // the now-orphaned indirect holder. flpdf must match (flpdf-3g8o): the
+    // orphan-drop gate fires for every non-qdf mode, not only when streams are
+    // recompressed.
     let mut opts = base_opts();
     opts.stream_data = Some(StreamDataMode::Preserve);
     let out = rewrite(&opts);
 
-    // All seven objects survive, and the JS stream still references its holder.
+    // Six live objects (Catalog, Pages, Page, content stream, Action, JS stream)
+    // — the orphaned holder (originally obj 7) is gone, just as in the compress
+    // and generate paths.
     assert_eq!(
         object_count(&out),
-        7,
-        "preserve mode keeps the live indirect /Length holder"
+        6,
+        "preserve mode must drop the orphaned indirect /Length holder"
     );
     assert!(
-        matches!(js_stream_length(&out), Object::Reference(_)),
-        "preserve mode must keep the indirect /Length reference"
+        matches!(js_stream_length(&out), Object::Integer(_)),
+        "preserve mode must direct-ize the JS stream's /Length once the holder is dropped"
     );
 }
