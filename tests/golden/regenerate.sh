@@ -610,6 +610,27 @@ for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate; d
     echo "$stem/generate.pdf"
 done
 
+# Plain full-rewrite golden for the KEPT indirect-/Length-holder case (flpdf-q1j2),
+# the dual of the orphan OD fixtures above. The image XObject (obj 5) is a
+# /DCTDecode passthrough (flpdf cannot decode it) carrying an INDIRECT /Length
+# (6 0 R) whose holder (obj 6) is ALSO referenced by the catalog (/KeepHolder),
+# so it stays live. qpdf direct-izes /Length to the raw byte count while KEEPING
+# the holder (it has another live reference). Pinned byte-identical by
+# cmp_diff_zero_tests under qpdf-zlib-compat. NOTE: only a flat (static-id) golden
+# is committed; the linearized output for this object graph diverges from qpdf on
+# an unrelated, pre-existing object-numbering axis (flpdf-lubb-class), so no
+# linearize golden is blessed here.
+if [[ ! -f "$FIX/kept-indirect-length.pdf" ]]; then
+    echo "Generating kept-indirect-length.pdf ..."
+    python3 "$ROOT/docs/plans/tools/gen_kept_indirect_length.py" > "$FIX/kept-indirect-length.pdf"
+else
+    echo "Skipping kept-indirect-length.pdf (already exists)"
+fi
+mkdir -p "$REF/kept-indirect-length"
+qpdf --static-id --warning-exit-0 \
+    "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/static-id.pdf"
+echo "kept-indirect-length/static-id.pdf"
+
 # Linearized >cap preserve golden for the ObjStm-bearing fixture (flpdf-ihb.4).
 # Distinct filename (linearize-objstm-preserve.pdf) so it never collides with the
 # generate-mode linearize-objstm.pdf goldens. preserve keeps qpdf's source ObjStm

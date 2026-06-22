@@ -190,3 +190,16 @@ fn od_indirect_length_flate_plain_rewrite_drops_orphan_holder_byte_identical_to_
         "objstm-lin-od-indirect-length-flate",
     );
 }
+
+#[test]
+fn kept_indirect_length_plain_rewrite_directizes_length_keeps_holder_byte_identical_to_qpdf() {
+    // Dual of the orphan case (flpdf-q1j2): an image XObject (obj 5) declares
+    // /Filter /DCTDecode — which flpdf cannot decode, so it is passed through
+    // verbatim — and carries an INDIRECT /Length (6 0 R) whose holder (obj 6) is
+    // ALSO referenced by the catalog (/KeepHolder 6 0 R). qpdf direct-izes the
+    // /Length to the raw byte count (every emitted stream gets a direct /Length)
+    // while KEEPING the holder (it has another live reference). The decode-failure
+    // passthrough path used to leak the renumbered indirect /Length; this pins it
+    // byte-identical to qpdf.
+    assert_cmp_diff_zero("kept-indirect-length.pdf", "kept-indirect-length");
+}
