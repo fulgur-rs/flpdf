@@ -522,10 +522,17 @@ qpdf --object-streams=generate --force-version=1.4 --static-id --warning-exit-0 
     "$FIX/three-page.pdf" "$REF/three-page/generate-force14.pdf"
 echo "three-page/generate-force14.pdf"
 
-# --- linearized-one-page: plain only (re-linearize would be redundant) ---
+# --- linearized-one-page: plain + re-linearize ---
+# Re-linearizing an already-linearized input is NOT redundant: it pins that the
+# source's old /Linearized param dict + hint stream are reachability-GC'd rather
+# than leaked into the second half (flpdf-phfu).
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/linearized-one-page.pdf" "$REF/linearized-one-page/plain.pdf"
 echo "linearized-one-page/plain.pdf"
+
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/linearized-one-page.pdf" "$REF/linearized-one-page/linearize.pdf"
+echo "linearized-one-page/linearize.pdf"
 
 # --- encrypted-r4-three-page: plain only
 # Note: qpdf decrypts using the empty user password by default.
