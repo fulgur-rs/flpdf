@@ -601,6 +601,11 @@ done
 # direct integer it orphans and qpdf garbage-collects it. Pinned byte-identical
 # by cmp_diff_zero_tests (static-id) and cmp_generate_objstm_tests (generate)
 # under qpdf-zlib-compat.
+#
+# The preserve.pdf golden (flpdf-3g8o) pins that qpdf drops the holder and
+# direct-izes /Length even under --stream-data=preserve (it keeps stream bytes
+# verbatim but still normalizes every /Length to a direct integer). Pinned by
+# cmp_diff_zero_tests' *_preserve tests under qpdf-zlib-compat.
 for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate; do
     qpdf --static-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/static-id.pdf"
@@ -608,6 +613,9 @@ for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate; d
     qpdf --object-streams=generate --static-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/generate.pdf"
     echo "$stem/generate.pdf"
+    qpdf --stream-data=preserve --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/preserve.pdf"
+    echo "$stem/preserve.pdf"
 done
 
 # Plain full-rewrite golden for the KEPT indirect-/Length-holder case (flpdf-q1j2),
