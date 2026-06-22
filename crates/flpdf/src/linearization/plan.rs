@@ -126,7 +126,18 @@ fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> 
         }
         Object::Stream(s) => {
             // Only walk the stream dictionary; do not scan raw data bytes.
-            for (_k, v) in s.dict.iter() {
+            // Skip /Length: it only ever points to an integer holder, and qpdf
+            // directizes every emitted stream's /Length before computing the
+            // linearization object-user map, so a /Length holder is never
+            // page-reachable. Following it would pull a holder kept alive by a
+            // separate edge (e.g. a catalog reference) into the first-page
+            // closure, misrouting its ObjStm container to the first half. Other
+            // indirect stream-dict values (/ColorSpace, /SMask, /Mask,
+            // /Alternates, ...) remain genuinely reachable and are followed.
+            for (k, v) in s.dict.iter() {
+                if k == b"Length" {
+                    continue;
+                }
                 collect_direct_refs(v, depth + 1, out)?;
             }
         }
@@ -597,17 +608,17 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
-        let mut first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
+        let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
             compute_closure(pdf, first_page)?
         } else {
             Vec::new()
         };
-        // A page-reachable stream's orphaned indirect /Length holder (flpdf-2vfg)
-        // enters the closure because compute_closure follows the stream dict's
-        // /Length via collect_direct_refs. qpdf garbage-collects it, so drop it
-        // from every page closure too — the all_refs filter above only removes it
-        // from the Part-4 universe and would otherwise leak it into Part 2/3.
-        first_page_closure.retain(|r| !orphan_length_holders.contains(r));
+        // compute_closure does not follow a stream dict's /Length (qpdf directizes
+        // /Length before computing object users), so a stream's indirect /Length
+        // holder never enters a page closure: an orphan holder (referenced only via
+        // /Length) is GC'd by the all_refs filter above, and a kept holder is
+        // reached only via its other (e.g. catalog) edge and partitions from there
+        // (flpdf-hwx0 / flpdf-2vfg).
         let first_page_set: BTreeSet<ObjectRef> = first_page_closure.iter().copied().collect();
 
         // ----------------------------------------------------------------
@@ -635,11 +646,7 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let mut closure = compute_closure(pdf, page_ref)?;
-            // Drop orphaned indirect /Length holders from later-page closures too
-            // (see the first-page closure above) so a page-private stream's holder
-            // is not emitted as a part7/part8 object.
-            closure.retain(|r| !orphan_length_holders.contains(r));
+            let closure = compute_closure(pdf, page_ref)?;
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -705,6 +712,17 @@ impl LinearizationPlan {
         // source number order, not the BFS discovery order which follows dict key
         // alphabetical order). Mirror the same sort used in `fold_pages_tree_into_first_half`.
         part3_objects.sort_unstable_by_key(|r| r.number);
+        // qpdf numbers the first-page section (qpdf part6) as: the first-page
+        // object first, then the remaining first-page-private objects in
+        // ascending source object number order — NOT compute_closure's
+        // /Resources-DFS discovery order, which only coincides when resource
+        // streams are numbered below the page's content stream. Pin the page
+        // dict first (qpdf pushes the first-page object explicitly) and sort the
+        // rest by source number. Oracle: qpdf 11.9.0 on a 1-page image fixture
+        // orders Page, Contents, Image when Contents < Image by source number
+        // (and Page, Image, Contents when Image < Contents), in both generate
+        // and disable mode.
+        part2_objects.sort_unstable_by_key(|r| (Some(*r) != first_page_ref, r.number));
 
         // ----------------------------------------------------------------
         // Step 6: build Part 4 by removing Part 2 and Part 3 objects.

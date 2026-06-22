@@ -949,6 +949,25 @@ fn page_contents_indirect_length_flate_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// kept-indirect-length (flpdf-hwx0): a page /Resources image XObject (/DCTDecode
+// passthrough) carries an indirect /Length whose holder is ALSO referenced by the
+// catalog (/KeepHolder), so it stays live after /Length is directized. Two qpdf
+// parities are pinned here: (1) the kept holder must NOT be page-reachable — qpdf
+// directizes /Length before computing obj_user, so the holder + its ObjStm
+// container (with the /Pages tree) land in the second half (part9), not the
+// first-page section; and (2) the first-page section streams (content + image)
+// must be numbered in ascending source-object order, not /Resources-DFS order.
+// Both diverged before flpdf-hwx0 (object-numbering at byte 16; ordering later).
+#[test]
+fn kept_indirect_length_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("kept-indirect-length.pdf", "kept-indirect-length");
+}
+
+#[test]
+fn kept_indirect_length_objstm_byte_identical_to_qpdf() {
+    assert_strict("kept-indirect-length.pdf", "kept-indirect-length");
+}
+
 // ── flpdf-ipc6: forced sub-1.5 header suppresses object/xref-stream generation ──
 // on the linearize path too. The output is a CLASSIC linearized PDF at header
 // 1.4 (no `/ObjStm`, no `/Type /XRef`), identical to the disable path. Unlike the

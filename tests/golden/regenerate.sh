@@ -616,10 +616,11 @@ done
 # (6 0 R) whose holder (obj 6) is ALSO referenced by the catalog (/KeepHolder),
 # so it stays live. qpdf direct-izes /Length to the raw byte count while KEEPING
 # the holder (it has another live reference). Pinned byte-identical by
-# cmp_diff_zero_tests under qpdf-zlib-compat. NOTE: only a flat (static-id) golden
-# is committed; the linearized output for this object graph diverges from qpdf on
-# an unrelated, pre-existing object-numbering axis (flpdf-lubb-class), so no
-# linearize golden is blessed here.
+# cmp_diff_zero_tests under qpdf-zlib-compat. The flat (static-id) golden pins the
+# plain rewrite; the linearized generate golden (linearize-objstm.pdf) pins the
+# first-page closure + object-numbering parity (flpdf-hwx0): the image XObject's
+# indirect /Length holder must not be page-reachable (qpdf directizes /Length), and
+# the first-page section must be ordered by source object number.
 if [[ ! -f "$FIX/kept-indirect-length.pdf" ]]; then
     echo "Generating kept-indirect-length.pdf ..."
     python3 "$ROOT/docs/plans/tools/gen_kept_indirect_length.py" > "$FIX/kept-indirect-length.pdf"
@@ -630,6 +631,10 @@ mkdir -p "$REF/kept-indirect-length"
 qpdf --static-id --warning-exit-0 \
     "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/static-id.pdf"
 echo "kept-indirect-length/static-id.pdf"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/linearize-objstm.pdf"
+qpdf --check "$REF/kept-indirect-length/linearize-objstm.pdf" >/dev/null
+echo "kept-indirect-length/linearize-objstm.pdf"
 
 # Linearized >cap preserve golden for the ObjStm-bearing fixture (flpdf-ihb.4).
 # Distinct filename (linearize-objstm-preserve.pdf) so it never collides with the
