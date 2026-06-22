@@ -255,6 +255,17 @@ fn od_indirect_length_flate_preserve_drops_orphan_holder_byte_identical_to_qpdf(
 }
 
 #[test]
+fn kept_indirect_length_preserve_directizes_kept_holder_byte_identical_to_qpdf() {
+    // The dual of the orphan case: the image XObject's indirect /Length holder is
+    // ALSO referenced by the catalog (/KeepHolder), so it stays live. qpdf still
+    // direct-izes the stream's /Length even under preserve (it normalizes EVERY
+    // stream's /Length to a direct integer), keeping the holder as a now
+    // length-unreferenced live integer. flpdf must match (flpdf-3g8o).
+    let actual = rewrite_preserve_qpdf_equivalent("kept-indirect-length.pdf");
+    assert_cmp_diff_zero_named(&actual, "kept-indirect-length", "preserve.pdf");
+}
+
+#[test]
 fn kept_indirect_length_plain_rewrite_directizes_length_keeps_holder_byte_identical_to_qpdf() {
     // Dual of the orphan case (flpdf-q1j2): an image XObject (obj 5) declares
     // /Filter /DCTDecode — which flpdf cannot decode, so it is passed through

@@ -629,6 +629,12 @@ done
 # first-page closure + object-numbering parity (flpdf-hwx0): the image XObject's
 # indirect /Length holder must not be page-reachable (qpdf directizes /Length), and
 # the first-page section must be ordered by source object number.
+#
+# The preserve.pdf golden (flpdf-3g8o) pins the same direct-ization under
+# --stream-data=preserve: qpdf direct-izes the kept-holder stream's /Length even
+# when the bytes are kept verbatim, so flpdf must too (its preserve arm normalizes
+# /Length whether or not the holder then orphans). Pinned by cmp_diff_zero_tests'
+# kept_indirect_length_preserve_* test under qpdf-zlib-compat.
 if [[ ! -f "$FIX/kept-indirect-length.pdf" ]]; then
     echo "Generating kept-indirect-length.pdf ..."
     python3 "$ROOT/docs/plans/tools/gen_kept_indirect_length.py" > "$FIX/kept-indirect-length.pdf"
@@ -639,6 +645,9 @@ mkdir -p "$REF/kept-indirect-length"
 qpdf --static-id --warning-exit-0 \
     "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/static-id.pdf"
 echo "kept-indirect-length/static-id.pdf"
+qpdf --stream-data=preserve --static-id --warning-exit-0 \
+    "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/preserve.pdf"
+echo "kept-indirect-length/preserve.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/linearize-objstm.pdf"
 qpdf --check "$REF/kept-indirect-length/linearize-objstm.pdf" >/dev/null

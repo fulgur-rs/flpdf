@@ -2565,8 +2565,19 @@ fn reencode_stream_for_compress(stream: crate::Stream, options: &WriteOptions) -
             Object::Stream(stream)
         }
         Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
-        // Preserve mode: pass dict + raw bytes verbatim, no decode/re-encode.
-        None => Object::Stream(stream),
+        // Preserve mode: keep the raw bytes verbatim (no decode/re-encode), but
+        // still normalize /Length to a direct integer of the raw byte count.
+        // qpdf direct-izes EVERY stream's /Length even under --stream-data=preserve
+        // (flpdf-3g8o); a source may carry an indirect /Length. This applies
+        // regardless of whether the holder then orphans (and is dropped by the
+        // caller's reachability GC) or stays live because something else also
+        // references it — the dict entry written here is always direct.
+        None => {
+            let mut stream = stream;
+            let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
+            stream.dict.insert("Length", Object::Integer(len));
+            Object::Stream(stream)
+        }
     };
     (reencoded, source_filter_is_lone_flate)
 }
@@ -2667,13 +2678,15 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
 
     // flpdf-sqkq / flpdf-3g8o: drop indirect `/Length` holders that orphan once
     // each stream's `/Length` is normalized to a direct integer, matching qpdf's
-    // reachability GC. Every non-qdf mode emits a direct `/Length` — the
-    // recompress paths via `apply_stream_compress_policy`, and preserve / encrypt
-    // via `renumber_refs_in_place` direct-izing the placeholder of a dropped
-    // holder — so the orphan drop applies to all of them. Only qdf is excluded:
-    // it externalizes `/Length` into its own holder objects, so that lifecycle is
-    // left untouched. Normal PDFs have no such orphans, so the set is empty and
-    // renumbering is unaffected.
+    // reachability GC. Every non-qdf mode emits a direct `/Length` — the recompress
+    // paths via `apply_stream_compress_policy`, preserve via
+    // `reencode_stream_for_compress`'s preserve arm, and encrypt via the
+    // post-reencode `/Length` rewrite — so a holder reachable ONLY through a
+    // `/Length` edge always orphans and is dropped here, regardless of mode. (A
+    // holder ALSO referenced elsewhere stays live: `orphaned_indirect_length_holders`
+    // keeps it.) Only qdf is excluded: it externalizes `/Length` into its own
+    // holder objects, so that lifecycle is left untouched. Normal PDFs have no such
+    // orphans, so the set is empty and renumbering is unaffected.
     let orphan_length_holders = if !options.qdf {
         object_streams::orphaned_indirect_length_holders(pdf)?
     } else {

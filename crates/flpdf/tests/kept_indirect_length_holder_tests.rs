@@ -20,7 +20,8 @@ use std::io::Cursor;
 
 use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
 use flpdf::{
-    write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, WriteOptions,
+    write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, StreamDataMode,
+    WriteOptions,
 };
 
 /// Build a PDF whose image XObject (obj 5) declares `/Filter /DCTDecode` (which
@@ -158,6 +159,34 @@ fn flat_rewrite_directizes_kept_holder_passthrough_length() {
         image_length(&out),
         Object::Integer(IMAGE_DATA_LEN),
         "flat rewrite must directize the DCTDecode stream's /Length to the raw byte count"
+    );
+    assert!(
+        keep_holder_is_live_integer(&out),
+        "the length holder is referenced elsewhere, so it must survive directization"
+    );
+}
+
+#[test]
+fn preserve_directizes_kept_holder_passthrough_length() {
+    // --stream-data=preserve keeps the passthrough bytes verbatim, but qpdf still
+    // direct-izes every stream's /Length (flpdf-3g8o). The kept holder is
+    // referenced elsewhere (/KeepHolder), so it survives — but the stream's
+    // /Length must still become a direct integer, not the renumbered indirect
+    // reference. Guards the preserve arm of `reencode_stream_for_compress` under
+    // the default Pure-Rust deflate (byte parity lives in the gated cmp suite).
+    let mut pdf = Pdf::open(Cursor::new(build_kept_holder_pdf())).expect("open");
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.static_id = true;
+    opts.stream_data = Some(StreamDataMode::Preserve);
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &opts).expect("preserve rewrite");
+
+    assert_eq!(
+        image_length(&out),
+        Object::Integer(IMAGE_DATA_LEN),
+        "preserve must directize the DCTDecode stream's /Length to the raw byte count"
     );
     assert!(
         keep_holder_is_live_integer(&out),
