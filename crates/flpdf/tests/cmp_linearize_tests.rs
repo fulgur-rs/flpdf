@@ -453,3 +453,30 @@ fn useoutline_od_shared_stream_classic_byte_identical_to_qpdf() {
         "objstm-lin-useoutline-od-shared-stream",
     );
 }
+
+#[test]
+fn od_indirect_length_flate_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-od-indirect-length-flate.pdf",
+        "objstm-lin-od-indirect-length-flate",
+    );
+}
+
+/// Exercises the `part4_open_document_plain` source-number sort with MORE THAN
+/// ONE open-document object (multiple /OpenAction destinations), so the ordering
+/// is pinned against the qpdf oracle rather than only reasoned about.
+#[test]
+fn openaction_multi_od_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-openaction-multi-od.pdf",
+        "objstm-lin-openaction-multi-od",
+    );
+}
+
+#[test]
+fn outline_od_shared_stream_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-outline-od-shared-stream.pdf",
+        "objstm-lin-outline-od-shared-stream",
+    );
+}

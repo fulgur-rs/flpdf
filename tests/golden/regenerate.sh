@@ -666,10 +666,11 @@ done
 # carry no source ObjStm, so `qpdf --linearize` (default) == `--object-streams=disable`;
 # the classic golden pins preserve/disable-mode byte parity for the open-document
 # partition. (The generate-mode goldens live alongside as linearize-objstm.pdf.)
-for stem in objstm-lin-od-indirect-length objstm-lin-openaction-80-80 \
+for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate \
+    objstm-lin-openaction-80-80 objstm-lin-openaction-multi-od \
     objstm-lin-acroform-widget-page1-page2 objstm-lin-acroform-widget-page1-only \
     objstm-lin-acroform-widget-page0-5-10 objstm-lin-acroform-widget-ap-stream-page0 \
-    objstm-lin-useoutline-od-shared-stream; do
+    objstm-lin-useoutline-od-shared-stream objstm-lin-outline-od-shared-stream; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-classic.pdf"
