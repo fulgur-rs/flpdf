@@ -944,11 +944,14 @@ impl LinearizationPlan {
         );
 
         // qpdf builds part4 as [lc_root] ++ lc_open_document, where
-        // lc_open_document is a std::set<QPDFObjGen> — i.e. ascending source
-        // object number (QPDF_linearization.cc:1179-1182). The Catalog (lc_root)
-        // is placed separately by the renumber map's root_ref promote, so order
-        // part4_open_document_plain by ascending source number to match.
-        part4_open_document_plain.sort_unstable_by_key(|r| r.number);
+        // lc_open_document is a std::set<QPDFObjGen> — i.e. ascending
+        // (object number, generation) (QPDF_linearization.cc:1179-1182). The
+        // Catalog (lc_root) is placed separately by the renumber map's root_ref
+        // promote, so order part4_open_document_plain to match. Sort by the full
+        // ObjectRef (its derived Ord is number-then-generation, mirroring
+        // QPDFObjGen) rather than the object number alone, so refs that share an
+        // object number across generations keep qpdf's tie-break order.
+        part4_open_document_plain.sort_unstable();
 
         // ----------------------------------------------------------------
         // Step 8: build shared_hints
