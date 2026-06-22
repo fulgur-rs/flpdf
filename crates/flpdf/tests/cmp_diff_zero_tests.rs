@@ -22,7 +22,10 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, WriteOptions};
+use flpdf::{
+    write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, StreamDataMode,
+    WriteOptions,
+};
 use std::path::Path;
 
 /// Full-rewrite `fixture` with the qpdf-matching option set and return the bytes.
@@ -118,6 +121,43 @@ fn golden_named(stem: &str, name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
 }
 
+/// Full-rewrite `fixture` in `--stream-data=preserve` mode with the qpdf-matching
+/// option set (matches `qpdf --static-id --stream-data=preserve`).
+fn rewrite_preserve_qpdf_equivalent(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.static_id = true;
+    opts.stream_data = Some(StreamDataMode::Preserve);
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
+/// Assert `actual` is byte-identical to the named golden under `references/<stem>/`.
+fn assert_cmp_diff_zero_named(actual: &[u8], stem: &str, name: &str) {
+    let expected = golden_named(stem, name);
+    if let Some(off) = first_diff(actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "{stem}/{name}: not byte-identical to qpdf golden \
+             (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
 #[test]
 fn force_below_1_5_downgrades_xref_stream_source_byte_identical_to_qpdf() {
     // The xref-stream -> classic-table DOWNGRADE path is new (ipc6 only ever did
@@ -189,6 +229,40 @@ fn od_indirect_length_flate_plain_rewrite_drops_orphan_holder_byte_identical_to_
         "objstm-lin-od-indirect-length-flate.pdf",
         "objstm-lin-od-indirect-length-flate",
     );
+}
+
+#[test]
+fn od_indirect_length_preserve_drops_orphan_holder_byte_identical_to_qpdf() {
+    // --stream-data=preserve keeps the stream bytes verbatim, but qpdf still
+    // direct-izes every stream's /Length and GCs the orphaned holder (flpdf-3g8o).
+    // The orphan-drop gate must therefore fire for preserve too, not only when
+    // streams are recompressed.
+    let actual = rewrite_preserve_qpdf_equivalent("objstm-lin-od-indirect-length.pdf");
+    assert_cmp_diff_zero_named(&actual, "objstm-lin-od-indirect-length", "preserve.pdf");
+}
+
+#[test]
+fn od_indirect_length_flate_preserve_drops_orphan_holder_byte_identical_to_qpdf() {
+    // Same as above with a lone /FlateDecode JS stream: under preserve the
+    // compressed bytes are kept verbatim and /Length is direct-ized to the
+    // compressed byte count when the holder is dropped.
+    let actual = rewrite_preserve_qpdf_equivalent("objstm-lin-od-indirect-length-flate.pdf");
+    assert_cmp_diff_zero_named(
+        &actual,
+        "objstm-lin-od-indirect-length-flate",
+        "preserve.pdf",
+    );
+}
+
+#[test]
+fn kept_indirect_length_preserve_directizes_kept_holder_byte_identical_to_qpdf() {
+    // The dual of the orphan case: the image XObject's indirect /Length holder is
+    // ALSO referenced by the catalog (/KeepHolder), so it stays live. qpdf still
+    // direct-izes the stream's /Length even under preserve (it normalizes EVERY
+    // stream's /Length to a direct integer), keeping the holder as a now
+    // length-unreferenced live integer. flpdf must match (flpdf-3g8o).
+    let actual = rewrite_preserve_qpdf_equivalent("kept-indirect-length.pdf");
+    assert_cmp_diff_zero_named(&actual, "kept-indirect-length", "preserve.pdf");
 }
 
 #[test]
