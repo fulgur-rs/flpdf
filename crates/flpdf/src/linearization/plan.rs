@@ -587,15 +587,17 @@ impl LinearizationPlan {
         // here ensures Step 5 can exclude them from part2/part3 without
         // requiring the hint builders or container router to compensate.
         //
-        // In non-generate mode the peeling never runs, so we skip the catalog
-        // traversal entirely to avoid failing on broken catalog references that
-        // non-generate linearization would otherwise tolerate.
-        let (open_document_set, elig_ctx) = if use_generate_objstm {
-            let od_set = open_document_set(pdf)?;
-            let ctx = eligibility_context(pdf)?;
-            (od_set, Some(ctx))
+        // This is object-stream-mode-independent: qpdf runs the same
+        // calculateLinearizationData partition in every mode, so disable/preserve
+        // must peel these objects to part4 (first half) just like generate
+        // (otherwise they sweep into the second half and the param-dict object
+        // number, /O, and the whole layout diverge). The eligibility context is
+        // only consulted for the generate-mode ObjStm split in Step 7.
+        let open_document_set = open_document_set(pdf)?;
+        let elig_ctx = if use_generate_objstm {
+            Some(eligibility_context(pdf)?)
         } else {
-            (BTreeSet::new(), None)
+            None
         };
 
         // ----------------------------------------------------------------
@@ -682,21 +684,20 @@ impl LinearizationPlan {
         let mut part3_objects: Vec<ObjectRef> = Vec::new();
 
         for obj_ref in &first_page_closure {
-            // qpdf: in_open_document > in_first_page in ObjStm-generate mode.
-            // Objects reachable from catalog open-document keys (/AcroForm,
-            // /OpenAction, etc.) are placed in the open-document section (Part 4,
-            // first half) even if they also appear in the first-page closure.
-            // Leaving them in Part 4 lets route_objstm_containers assign their
-            // ObjStm container to ContainerPart::OpenDocument.
-            //
-            // In Disable/Preserve mode qpdf keeps these objects as plain Part
-            // 2/3 first-page objects. Oracle: `qpdf --linearize
-            // --object-streams=disable` on an AcroForm fixture shows Page 0
-            // with 12 objects and nshared=0 (all in first-page section), vs.
-            // 2 objects in generate mode (widgets peeled into ObjStm
-            // containers). The peeling is therefore gated on
-            // `use_generate_objstm`.
-            if use_generate_objstm && open_document_set.contains(obj_ref) {
+            // qpdf: in_open_document takes precedence over in_first_page in EVERY
+            // object-stream mode. Objects reachable from catalog open-document keys
+            // (/AcroForm, /OpenAction, etc.) are placed in the open-document section
+            // (part4, first half, before /O) even when they also appear in the
+            // first-page closure, so peel them out of Part 2/3 here:
+            //   - generate: eligible ones pack into the open-document ObjStm
+            //     container (route_objstm_containers -> ContainerPart::OpenDocument);
+            //     ineligible streams emit plain pre-/O (part4_open_document_plain).
+            //   - disable/preserve: all are emitted plain pre-/O.
+            // Verified against qpdf 11.9.0: acroform-widget-page0-5-10 in disable
+            // mode places the AcroForm dict + widgets in part4, NOT the first-page
+            // section (the 12 first-page objects there are the page dict + content
+            // + 10 Fonts, not the widgets).
+            if open_document_set.contains(obj_ref) {
                 continue;
             }
             if Some(*obj_ref) == first_page_ref {
@@ -797,18 +798,16 @@ impl LinearizationPlan {
                     if part2_set.contains(r) || part3_set.contains(r) {
                         return false;
                     }
-                    // In generate mode, open-document objects (AcroForm
-                    // widgets, etc.) that happen to be exclusive to one
-                    // later page must NOT be counted as page-private: qpdf
-                    // routes them to the pre-/O open-document section
-                    // (not the per-page section), so they are absent from
-                    // the second-half page objects and should not inflate
-                    // page_hints[page_idx].object_count.  Excluding them
-                    // here also keeps them out of per_page_private_objects,
-                    // so the part7 pre-pass below never captures them and
-                    // they remain available for OD routing in the
-                    // part8/part9 loop.
-                    if use_generate_objstm && open_document_set.contains(r) {
+                    // Open-document objects (AcroForm widgets, etc.) that happen
+                    // to be exclusive to one later page must NOT be counted as
+                    // page-private: qpdf routes them to the pre-/O open-document
+                    // section (not the per-page section) in every mode, so they are
+                    // absent from the second-half page objects and should not
+                    // inflate page_hints[page_idx].object_count.  Excluding them
+                    // here also keeps them out of per_page_private_objects, so the
+                    // part7 pre-pass below never captures them and they remain
+                    // available for OD routing in the part8/part9 loop.
+                    if open_document_set.contains(r) {
                         return false;
                     }
                     page_reach.get(r).copied() == Some(1)
@@ -875,55 +874,50 @@ impl LinearizationPlan {
                 continue;
             }
             let reach = page_reach.get(&r).copied().unwrap_or(0);
-            // In generate mode, eligible OD+first-page objects were peeled from
-            // Part 2/3 by Step 5. They flow to part4_rest (for ObjStm packing) or
-            // part4_open_document_plain (for pre-/O plain emission) depending on
-            // ObjStm eligibility. In non-generate mode, OD+first-page objects
-            // remain in Part 2/3 (moved) and are never present in
-            // part4_provisional; the `use_generate_objstm` guard keeps the
-            // defensive skip consistent with the Step 5 gate.
-            let in_first_page = first_page_set.contains(&r)
-                && !(use_generate_objstm && open_document_set.contains(&r));
+            // OD+first-page objects were peeled out of Part 2/3 by Step 5 in
+            // every mode, so they ARE present in part4_provisional and must not be
+            // treated as first-page here — they flow to the OD routing below. A
+            // genuine first-page object reaching this point is skipped defensively.
+            let in_first_page = first_page_set.contains(&r) && !open_document_set.contains(&r);
             if in_first_page {
                 // Should have been in Part 2 or Part 3 — skip (defensive).
                 continue;
             }
-            // In generate mode, route open-document objects by ObjStm eligibility:
-            //   eligible   → part4_rest (the ObjStm batch planner will pack them)
-            //   ineligible → part4_open_document_plain (emitted pre-/O as plain
-            //                objects, between the Catalog and the OD containers).
-            //
-            // qpdf emits ineligible OD objects (e.g. /AP /N appearance streams,
-            // which are Object::Stream and therefore cannot be ObjStm members) as
-            // plain indirect objects in the pre-/O region, NOT in [/O,/E) and NOT
-            // after /E.  Oracle: qpdf --linearize --object-streams=generate on a
-            // page-0 widget with /AP /N places the Form XObject at a lower object
-            // number than the OD ObjStm, physically before the hint stream.
+            // Route open-document objects to part4 (first half, before /O) in
+            // EVERY mode — qpdf's part4 = [lc_root] ++ lc_open_document.
             //
             // Exclude outline objects: qpdf orders `in_outlines` above
             // `in_open_document`, so an OD object also reachable from `/Outlines`
             // is an outline, not an open-document object.  Letting it fall through
             // to `part4_rest` lets the outline extraction below lift it into the
-            // outline section (part6/part9), matching qpdf's precedence.  Without
-            // this, an ineligible OD+outline stream would land in
-            // `part4_open_document_plain` (pre-/O) instead.
-            if use_generate_objstm
-                && open_document_set.contains(&r)
-                && !all_outline_refs.contains(&r)
-            {
-                let ctx = elig_ctx
-                    .as_ref()
-                    .expect("elig_ctx is Some when use_generate_objstm");
-                let obj = pdf.resolve_borrowed(r)?;
-                if is_eligible_for_objstm(r, obj, ctx) {
-                    part4_rest.push(r);
+            // outline section (part6/part9), matching qpdf's precedence.
+            if open_document_set.contains(&r) && !all_outline_refs.contains(&r) {
+                if let Some(ctx) = elig_ctx.as_ref() {
+                    // generate mode: an OD object eligible for ObjStm packing goes
+                    // to part4_rest (the batch planner packs it into the
+                    // open-document container); an ineligible stream (e.g. an /AP /N
+                    // appearance stream, which cannot be an ObjStm member) emits
+                    // plain pre-/O.  Oracle: qpdf --object-streams=generate places
+                    // such a Form XObject at a lower object number than the OD
+                    // ObjStm, physically before the hint stream.
+                    let obj = pdf.resolve_borrowed(r)?;
+                    if is_eligible_for_objstm(r, obj, ctx) {
+                        part4_rest.push(r);
+                    } else {
+                        part4_open_document_plain.push(r);
+                    }
                 } else {
+                    // disable/preserve mode: no ObjStm, so every OD object is a
+                    // plain pre-/O (part4) object emitted between the Catalog and
+                    // the hint stream.
                     part4_open_document_plain.push(r);
                 }
                 continue;
             }
-            // open_document objects in generate mode are caught above.  For
-            // non-generate mode, or for non-OD objects: use reach to partition.
+            // Non-outline open-document objects are caught above in every mode.
+            // What remains: non-OD objects, and OD+outline objects (qpdf orders
+            // in_outlines above in_open_document) which fall to part4_rest for the
+            // outline extraction below.  Partition the rest by page reach.
             if reach >= 2 && !open_document_set.contains(&r) {
                 part4_other_pages_shared.push(r);
             } else {
@@ -943,6 +937,13 @@ impl LinearizationPlan {
             part4_provisional.len(),
             "Part-4 sub-partition must preserve membership"
         );
+
+        // qpdf builds part4 as [lc_root] ++ lc_open_document, where
+        // lc_open_document is a std::set<QPDFObjGen> — i.e. ascending source
+        // object number (QPDF_linearization.cc:1179-1182). The Catalog (lc_root)
+        // is placed separately by the renumber map's root_ref promote, so order
+        // part4_open_document_plain by ascending source number to match.
+        part4_open_document_plain.sort_unstable_by_key(|r| r.number);
 
         // ----------------------------------------------------------------
         // Step 8: build shared_hints
