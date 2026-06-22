@@ -659,6 +659,24 @@ for stem in objstm-lin-outlines-80-80 objstm-lin-useoutlines-80-80; do
     echo "$stem/linearize-classic.pdf"
 done
 
+# Open-document closure fixtures (flpdf-lubb). qpdf routes objects reachable from the
+# catalog open-document keys (/OpenAction, /AcroForm, /PageMode, /Threads,
+# /ViewerPreferences) and trailer /Encrypt into part4 (first half, before /O),
+# independent of object-stream mode (QPDF_linearization.cc:1118-1182). These fixtures
+# carry no source ObjStm, so `qpdf --linearize` (default) == `--object-streams=disable`;
+# the classic golden pins preserve/disable-mode byte parity for the open-document
+# partition. (The generate-mode goldens live alongside as linearize-objstm.pdf.)
+for stem in objstm-lin-od-indirect-length objstm-lin-openaction-80-80 \
+    objstm-lin-acroform-widget-page1-page2 objstm-lin-acroform-widget-page1-only \
+    objstm-lin-acroform-widget-page0-5-10 objstm-lin-acroform-widget-ap-stream-page0 \
+    objstm-lin-useoutline-od-shared-stream; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-classic.pdf"
+    qpdf --check "$REF/$stem/linearize-classic.pdf" >/dev/null
+    echo "$stem/linearize-classic.pdf"
+done
+
 echo ""
 echo "=== All references generated ==="
 

@@ -389,3 +389,64 @@ fn useoutlines_classic_byte_identical_to_qpdf() {
         "objstm-lin-useoutlines-80-80",
     );
 }
+
+// --------------------------------------------------------------------------
+// Open-document closure (flpdf-lubb): objects reachable from the catalog
+// open-document keys (/OpenAction, /AcroForm, /PageMode, /Threads,
+// /ViewerPreferences) are placed in part4 (first half, before /O) by qpdf in
+// ALL object-stream modes. These fixtures carry no source ObjStm, so the
+// preserve/disable classic golden pins that partition byte-for-byte.
+// --------------------------------------------------------------------------
+
+#[test]
+fn od_indirect_length_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-od-indirect-length.pdf",
+        "objstm-lin-od-indirect-length",
+    );
+}
+
+#[test]
+fn openaction_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical("objstm-lin-openaction-80-80.pdf", "objstm-lin-openaction-80-80");
+}
+
+#[test]
+fn acroform_widget_page1_page2_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-acroform-widget-page1-page2.pdf",
+        "objstm-lin-acroform-widget-page1-page2",
+    );
+}
+
+#[test]
+fn acroform_widget_page1_only_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-acroform-widget-page1-only.pdf",
+        "objstm-lin-acroform-widget-page1-only",
+    );
+}
+
+#[test]
+fn acroform_widget_page0_5_10_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-acroform-widget-page0-5-10.pdf",
+        "objstm-lin-acroform-widget-page0-5-10",
+    );
+}
+
+#[test]
+fn acroform_widget_ap_stream_page0_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-acroform-widget-ap-stream-page0.pdf",
+        "objstm-lin-acroform-widget-ap-stream-page0",
+    );
+}
+
+#[test]
+fn useoutline_od_shared_stream_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-useoutline-od-shared-stream.pdf",
+        "objstm-lin-useoutline-od-shared-stream",
+    );
+}
