@@ -827,6 +827,14 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 //   multi-stream (.16.10)| overlay | three-page    | multi-stream  | -      | -     | -
 //   rotated dest (.16.10)| overlay | one-page-r90  | one-page      | -      | -     | -
 //   userunit (.16.10)   | overlay  | three-page    | userunit      | -      | -     | -
+//   swapped box (lkk7)  | overlay  | swapped-box   | one-page      | -      | -     | -
+//   swapped+r90 (lkk7)  | overlay  | swapped-r90   | swapped-r90   | -      | -     | -
+//
+// The flpdf-lkk7 rows cover reversed page boxes (llx>urx AND lly>ury): qpdf reads
+// all placement geometry through getArrayAsRectangle (min/max normalized), so the
+// swapped-box row proves the placement-rect normalization and the swapped+r90 row
+// (overlaid onto itself) additionally proves the dest tmatrix dims and the source
+// Form /Matrix dims normalize. Both fixtures are pinned to PDF 1.3.
 //
 // The rotated-source row is the matrix-transformed placement check: the source
 // page carries /Rotate 90, so its imported Form XObject gets a non-identity
@@ -1247,6 +1255,50 @@ mod byte_gate {
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-and-underlay.pdf");
+    }
+
+    #[test]
+    fn swapped_box_overlay_one_page_is_byte_identical() {
+        // dest = swapped-box-one-page (reversed /MediaBox [612 792 0 0]),
+        // source = one-page. The placement rect is read like qpdf
+        // getArrayAsRectangle, so it normalizes to [0 0 612 792] and the source
+        // places at identity; a raw rect would yield the reflected cm
+        // "-1 0 0 -1 612 792". Proves the placement-rect normalization (Edit C).
+        let mut dest = fixture("swapped-box-one-page.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "swapped-box-overlay-one-page.pdf");
+    }
+
+    #[test]
+    fn swapped_box_r90_overlay_self_is_byte_identical() {
+        // dest = source = swapped-box-r90-one-page (reversed box + /Rotate 90),
+        // overlaid onto itself. The /Rotate makes the dest inverse tmatrix and the
+        // source Form /Matrix depend on the box width/height, so this exercises the
+        // tmatrix-dim normalization (Edit B) and the source /Matrix-dim
+        // normalization (Edit A) on top of the placement rects (Edit C).
+        let mut dest = fixture("swapped-box-r90-one-page.pdf");
+        let mut source = fixture("swapped-box-r90-one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "swapped-box-r90-overlay-self.pdf");
     }
 }
 
