@@ -84,6 +84,11 @@ to stay on the signature-preserving incremental path, disable it:
 flpdf rewrite --remove-unreferenced-resources=no input.pdf output.pdf
 ```
 
+(On a plain rewrite this flag does not actually remove any `/Resources`
+entries — matching qpdf, which prunes resource entries only during page
+operations. Its only plain-rewrite effect is this full-rewrite/incremental
+toggle.)
+
 This succeeds on a signed input without emitting the "removed signatures"
 warning, because the signed byte ranges are preserved. This behaviour is
 covered by the `incremental_rewrite_of_signed_pdf_succeeds_without_warning`

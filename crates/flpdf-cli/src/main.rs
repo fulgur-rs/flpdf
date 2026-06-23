@@ -29,13 +29,11 @@ use flpdf::{
     },
     normalize_content_stream, outline, pages,
     pages::coalesce_page_contents,
-    parse_pdf_version,
-    resources::remove_unreferenced_resources,
-    write_pdf_with_options, AnnotationObjectHelper, CompressStreams, CopyEncryptionSource,
-    Dictionary, EncryptMethod, EncryptParams, FlattenMode, FormFieldObjectHelper,
-    NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PasswordMode, Pdf,
-    PdfOpenOptions, PermissionsConfig, PrintPermission, RemoveUnreferencedResources, Severity,
-    Stream, StreamDataMode, WriteOptions,
+    parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
+    CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FlattenMode,
+    FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef,
+    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PermissionsConfig, PrintPermission,
+    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -2999,22 +2997,30 @@ fn run_rewrite(
         //      passes always see a single stream per page.
         //   2. normalize_content_stream — re-tokenize the (now-unified) stream
         //      to canonical whitespace form.
-        //   3. remove_unreferenced_resources — scan the final content stream to
-        //      decide which /Resources entries are reachable, then prune the rest.
-        //   4. write (compress_streams / newline_before_endstream) — byte-emission
+        //   3. write (compress_streams / newline_before_endstream) — byte-emission
         //      policies applied by the writer, not the pre-processing step.
-        // INTENTIONAL DEFAULT (flpdf-9hc.12.7 acceptance: "defaults match
-        // qpdf documented behavior"). qpdf's defaults are
-        // `--remove-unreferenced-resources=auto` and `--compress-streams=y`,
-        // and qpdf always performs a full rewrite. flpdf mirrors this:
-        // because `remove_unref` defaults to `auto` (≠ `no`), a plain
-        // `flpdf rewrite IN OUT` takes the full-rewrite path and applies the
-        // safe `auto` pruning + default FlateDecode compression — exactly
-        // what plain `qpdf IN OUT` does. This is a deliberate, documented
-        // behavior (not an accidental regression); pass
-        // `--remove-unreferenced-resources=no` to opt out of pruning. The
-        // observable effect (qpdf-structural parity, smaller output) is
-        // captured by tests/golden/compat-matrix.md and asserted by the
+        //
+        // NOTE: a plain `rewrite` does NOT prune unreferenced /Resources entries.
+        // qpdf only prunes resource-dict entries during page-copy operations
+        // (`--pages`/`--split-pages`) — a plain `qpdf IN OUT`, even with
+        // `--remove-unreferenced-resources=yes`, keeps every /Resources entry
+        // (verified against qpdf 11.9.0). flpdf mirrors this: resource-entry
+        // pruning lives in `run_page_extraction` (the --pages path), not here.
+        // Pruning on a plain rewrite was a divergence that dropped an
+        // unreferenced image XObject (flpdf-79ef); it is the resource-entry half
+        // of flpdf-9hc.12.4/12.7, which conflated unreferenced-OBJECT GC (the
+        // renumber drops unreachable objects on every full rewrite — kept) with
+        // /Resources-ENTRY pruning (page-op-only — removed here).
+        //
+        // INTENTIONAL DEFAULT: qpdf always performs a full rewrite and defaults
+        // to `--compress-streams=y`. flpdf mirrors this — because `remove_unref`
+        // defaults to `auto` (≠ `no`), a plain `flpdf rewrite IN OUT` forces the
+        // full-rewrite path (FlateDecode compression applied), matching plain
+        // `qpdf IN OUT`. The `remove_unref != No` term below is retained for that
+        // full-rewrite-default trigger AND the documented signed-PDF opt-out:
+        // `--remove-unreferenced-resources=no` drops to the incremental path,
+        // which preserves signed byte ranges (see docs/signed-pdf.md). The
+        // full-rewrite default is asserted by the
         // `rewrite_default_is_qpdf_equivalent_full_rewrite` CLI test.
         let needs_mutation = coalesce_contents
             || normalize_content
@@ -3060,10 +3066,9 @@ fn run_rewrite(
             }
         }
 
-        // Step 3: remove unreferenced /Resources entries.
-        if remove_unref != CliRemoveUnreferencedResources::No {
-            remove_unreferenced_resources(&mut pdf, remove_unref.into())?;
-        }
+        // (No resource-entry pruning on the plain rewrite path — see the
+        // "Content mutation pass" note above. qpdf prunes /Resources entries only
+        // during page operations, which flpdf handles in run_page_extraction.)
 
         // Step 4: generate missing form-field appearance streams
         // (--generate-appearances). MUST run before --flatten-annotations so

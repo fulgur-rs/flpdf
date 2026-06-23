@@ -10,9 +10,13 @@
 //!    asserts semantic equivalence using `flpdf::normalize_content_stream`.
 //! 2. **coalesce-contents** — a page with `/Contents [2 0 R 3 0 R]` becomes a
 //!    single `/Contents` reference after rewriting.
-//! 3. **remove-unreferenced-resources=auto|yes|no** — a page with `/F2` in
-//!    `/Resources/Font` that is not referenced in its content stream has `/F2`
-//!    pruned under `auto`/`yes` and retained under `no`.
+//! 3. **remove-unreferenced-resources=auto|yes|no** — on a plain rewrite qpdf
+//!    never prunes a page's `/Resources` entries (resource-entry pruning is
+//!    page-operation-only, e.g. `--pages`/`--split-pages`), so an unused `/F2`
+//!    in `/Resources/Font` is retained under EVERY mode — verified against
+//!    `qpdf --static-id --remove-unreferenced-resources=yes`, which still keeps
+//!    it. (flpdf-79ef corrected the earlier divergence where the CLI pruned on a
+//!    plain rewrite.)
 //! 4. **compress-streams=y/n** — decoded stream bytes are preserved; the `/Filter`
 //!    key is `/FlateDecode` when `y` and absent when `n`.
 //! 5. **newline-before-endstream=y/n** — raw output bytes are inspected for the
@@ -345,16 +349,23 @@ fn collect_content_tokens(bytes: &[u8]) -> Vec<ContentToken> {
 }
 
 // ---------------------------------------------------------------------------
-// Cell 3a: remove-unreferenced-resources=auto  (prunes /F2, keeps /F1)
-// Cell 3b: remove-unreferenced-resources=yes   (prunes /F2, keeps /F1)
+// Cell 3a: remove-unreferenced-resources=auto  (keeps /F1 AND /F2 — qpdf parity)
+// Cell 3b: remove-unreferenced-resources=yes   (keeps /F1 AND /F2 — qpdf parity)
 // Cell 3c: remove-unreferenced-resources=no    (leaves /F1 and /F2)
 //
 // Input: unref-resources-one-page.pdf — single page with /Resources/Font{F1,F2};
 // content stream uses /F1 (via `Tf`) but NOT /F2.
+//
+// qpdf does NOT prune /Resources entries on a plain rewrite — neither `auto` nor
+// `yes` removes the unreferenced /F2 (verified with `qpdf --static-id
+// --remove-unreferenced-resources=yes`). Resource-entry pruning fires only on
+// page-copy operations (`--pages`), which flpdf performs in run_page_extraction,
+// not on the plain `rewrite` path. So all three modes must retain /F2 here.
+// (flpdf-79ef: the CLI previously pruned on a plain rewrite, diverging from qpdf.)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn remove_unref_resources_auto_prunes_unused_font() {
+fn remove_unref_resources_auto_keeps_unused_font_like_qpdf() {
     let tmp = tempdir().unwrap();
     let input = fixture_path("unref-resources-one-page.pdf");
     let output = tmp.path().join("unref-auto.pdf");
@@ -365,15 +376,17 @@ fn remove_unref_resources_auto_prunes_unused_font() {
         &["--full-rewrite", "--remove-unreferenced-resources=auto"],
     );
 
-    let font_keys = extract_page_font_keys(&output);
+    let font_keys = extract_page_resource_keys(&output, "Font");
     assert!(
         font_keys.contains(&b"F1".to_vec()),
         "remove-unreferenced-resources=auto: /F1 (used) must be retained; font keys: {:?}",
         font_keys
     );
     assert!(
-        !font_keys.contains(&b"F2".to_vec()),
-        "remove-unreferenced-resources=auto: /F2 (unused) must be pruned; font keys: {:?}",
+        font_keys.contains(&b"F2".to_vec()),
+        "remove-unreferenced-resources=auto: /F2 (unused) must be retained on a plain \
+         rewrite (qpdf does not prune resource entries outside page operations); \
+         font keys: {:?}",
         font_keys
     );
 
@@ -383,7 +396,7 @@ fn remove_unref_resources_auto_prunes_unused_font() {
 }
 
 #[test]
-fn remove_unref_resources_yes_prunes_unused_font() {
+fn remove_unref_resources_yes_keeps_unused_font_like_qpdf() {
     let tmp = tempdir().unwrap();
     let input = fixture_path("unref-resources-one-page.pdf");
     let output = tmp.path().join("unref-yes.pdf");
@@ -394,21 +407,65 @@ fn remove_unref_resources_yes_prunes_unused_font() {
         &["--full-rewrite", "--remove-unreferenced-resources=yes"],
     );
 
-    let font_keys = extract_page_font_keys(&output);
+    let font_keys = extract_page_resource_keys(&output, "Font");
     assert!(
         font_keys.contains(&b"F1".to_vec()),
         "remove-unreferenced-resources=yes: /F1 (used) must be retained; font keys: {:?}",
         font_keys
     );
     assert!(
-        !font_keys.contains(&b"F2".to_vec()),
-        "remove-unreferenced-resources=yes: /F2 (unused) must be pruned; font keys: {:?}",
+        font_keys.contains(&b"F2".to_vec()),
+        "remove-unreferenced-resources=yes: /F2 (unused) must be retained on a plain \
+         rewrite — qpdf --remove-unreferenced-resources=yes also keeps it; font keys: {:?}",
         font_keys
     );
 
     if !skip_if_qpdf_missing() {
         assert_qpdf_check(&output);
     }
+}
+
+#[test]
+fn kept_indirect_length_plain_rewrite_keeps_image_xobject() {
+    // flpdf-79ef regression: a page whose content (`BT ET`) references no XObject
+    // name still must NOT lose its image. The image XObject (/Im0) carries an
+    // indirect /Length whose holder is also referenced by the catalog. A plain
+    // CLI rewrite previously dropped /Im0 (empty /Resources) because it ran the
+    // page-op-only resource pruning. qpdf --static-id keeps /Im0 (6 objects,
+    // /DCTDecode); flpdf must match.
+    let tmp = tempdir().unwrap();
+    let input = fixture_path("kept-indirect-length.pdf");
+    let output = tmp.path().join("kept-indirect-length-out.pdf");
+
+    run_rewrite(&input, &output, &["--static-id"]);
+
+    let xobject_keys = extract_page_resource_keys(&output, "XObject");
+    assert!(
+        xobject_keys.contains(&b"Im0".to_vec()),
+        "plain rewrite must keep the unreferenced image XObject /Im0 (qpdf keeps it); \
+         /Resources/XObject keys: {:?}",
+        xobject_keys
+    );
+    let out_bytes = std::fs::read(&output).unwrap();
+    assert!(
+        out_bytes.windows(9).any(|w| w == b"DCTDecode"),
+        "the DCTDecode image stream must survive the rewrite"
+    );
+
+    // No assert_qpdf_check here: this fixture's image carries placeholder (non-real)
+    // JPEG bytes, so `qpdf --check` warns ("invalid jpeg data") and exits 3 on the
+    // ORIGINAL fixture AND on qpdf's own golden output — the warning is inherent to
+    // the fixture, not a defect in flpdf's rewrite. The /Im0 + /DCTDecode presence
+    // checks above are the meaningful assertions for flpdf-79ef.
+
+    // The issue also cited `--full-rewrite --static-id` as a repro; it hits the same
+    // run_rewrite path, so pin it explicitly too.
+    let output_fr = tmp.path().join("kept-indirect-length-fr.pdf");
+    run_rewrite(&input, &output_fr, &["--full-rewrite", "--static-id"]);
+    assert!(
+        extract_page_resource_keys(&output_fr, "XObject").contains(&b"Im0".to_vec()),
+        "--full-rewrite --static-id must also keep the image XObject /Im0",
+    );
 }
 
 #[test]
@@ -423,7 +480,7 @@ fn remove_unref_resources_no_retains_all_fonts() {
         &["--full-rewrite", "--remove-unreferenced-resources=no"],
     );
 
-    let font_keys = extract_page_font_keys(&output);
+    let font_keys = extract_page_resource_keys(&output, "Font");
     assert!(
         font_keys.contains(&b"F1".to_vec()),
         "remove-unreferenced-resources=no: /F1 must be retained; font keys: {:?}",
@@ -440,9 +497,10 @@ fn remove_unref_resources_no_retains_all_fonts() {
     }
 }
 
-/// Open `path` as a PDF, get page 1's /Resources/Font dict, and return the
-/// font name keys (as byte vecs).
-fn extract_page_font_keys(path: &Path) -> Vec<Vec<u8>> {
+/// Open `path` as a PDF, get page 1's `/Resources/<category>` sub-dict (e.g.
+/// `Font` or `XObject`), and return its name keys (as byte vecs). Returns an
+/// empty vec if the page has no `/Resources` or no such category sub-dict.
+fn extract_page_resource_keys(path: &Path, category: &str) -> Vec<Vec<u8>> {
     let bytes = std::fs::read(path).unwrap();
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
@@ -467,18 +525,18 @@ fn extract_page_font_keys(path: &Path) -> Vec<Vec<u8>> {
         _ => return vec![],
     };
 
-    // Resolve /Font sub-dict.
-    let font_obj = match resources_dict.get("Font").cloned() {
+    // Resolve the requested category sub-dict (e.g. /Font, /XObject).
+    let cat_obj = match resources_dict.get(category).cloned() {
         Some(Object::Reference(r)) => pdf.resolve(r).unwrap(),
         Some(obj) => obj,
         None => return vec![],
     };
-    let font_dict = match font_obj {
+    let cat_dict = match cat_obj {
         Object::Dictionary(d) => d,
         _ => return vec![],
     };
 
-    font_dict.iter().map(|(k, _)| k.to_vec()).collect()
+    cat_dict.iter().map(|(k, _)| k.to_vec()).collect()
 }
 
 // ---------------------------------------------------------------------------
