@@ -2465,9 +2465,11 @@ mod tests {
 
     /// Build a two-page PDF whose shared font is ALSO referenced by an outline
     /// item (via a non-standard `/Extra` key), reproducing flpdf-q2zw in miniature.
+    /// With `use_outlines`, the catalog also sets `/PageMode /UseOutlines` so the
+    /// outline section routes to part6 (first half) instead of part9.
     ///
     /// Object layout (extends [`two_page_shared_font_bytes`]):
-    ///   1 0 obj – Catalog  (/Pages 2 0 R, /Outlines 9 0 R)
+    ///   1 0 obj – Catalog  (/Pages 2 0 R, /Outlines 9 0 R [, /PageMode /UseOutlines])
     ///   2 0 obj – Pages node  (Kids: [3 0 R, 4 0 R])
     ///   3 0 obj – Page 1  → /Resources 5 0 R, /Contents 6 0 R
     ///   4 0 obj – Page 2  → /Resources 5 0 R, /Contents 7 0 R
@@ -2477,14 +2479,18 @@ mod tests {
     ///   8 0 obj – Font  (shared by both pages AND reached from the outline)
     ///   9 0 obj – Outlines dict  (/First 10 0 R, /Last 10 0 R)
     ///  10 0 obj – Outline item  (/Extra 8 0 R → the font)
-    fn two_page_shared_font_outline_ref_bytes() -> Vec<u8> {
+    fn two_page_shared_font_outline_ref_bytes(use_outlines: bool) -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
 
         let off1 = pdf.len() as u64;
-        pdf.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R >>\nendobj\n",
-        );
+        if use_outlines {
+            pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R /PageMode /UseOutlines >>\nendobj\n");
+        } else {
+            pdf.extend_from_slice(
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R >>\nendobj\n",
+            );
+        }
 
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(
@@ -2546,8 +2552,13 @@ mod tests {
     }
 
     fn open_two_page_shared_font_outline_ref() -> Pdf<Cursor<Vec<u8>>> {
-        let bytes = two_page_shared_font_outline_ref_bytes();
+        let bytes = two_page_shared_font_outline_ref_bytes(false);
         Pdf::open(Cursor::new(bytes)).expect("two-page outline-ref PDF should parse")
+    }
+
+    fn open_two_page_shared_font_outline_ref_use_outlines() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = two_page_shared_font_outline_ref_bytes(true);
+        Pdf::open(Cursor::new(bytes)).expect("two-page UseOutlines outline-ref PDF should parse")
     }
 
     /// Build a PDF where the page's Resources dictionary references objects in
@@ -2810,6 +2821,57 @@ mod tests {
             plan.part9_outline_objects,
             vec![outline_root, font, outline_item],
             "outline order must be [root] ++ ascending source number"
+        );
+
+        assert!(plan.parts_are_disjoint());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6c. Symmetric UseOutlines case: the same page+outline-shared font flows
+    //     through the part6 (first-half) outline branch instead of part9. qpdf
+    //     routes lc_outlines to part6 under /PageMode /UseOutlines
+    //     (QPDF_linearization.cc:1214-1216) and counts those objects toward
+    //     page 0 (line 1222). Byte parity for this combination needs a dedicated
+    //     fixture (filed as a follow-up); this pins flpdf's internal accounting.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn outline_referenced_shared_font_routes_to_part6_under_use_outlines() {
+        let mut pdf = open_two_page_shared_font_outline_ref_use_outlines();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+
+        let font = ObjectRef::new(8, 0);
+        let outline_root = ObjectRef::new(9, 0);
+        let outline_item = ObjectRef::new(10, 0);
+
+        // /UseOutlines → outline objects (including the page-shared font) move to
+        // the first-half part6 outline section, not part9.
+        assert!(
+            plan.part6_outline_objects.contains(&font),
+            "UseOutlines: outline-referenced font must be in part6_outline_objects, got {:?}",
+            plan.part6_outline_objects
+        );
+        assert!(
+            plan.part9_outline_objects.is_empty(),
+            "UseOutlines: part9 outlines must be empty"
+        );
+        assert_eq!(
+            plan.part6_outline_objects,
+            vec![outline_root, font, outline_item],
+            "UseOutlines outline order must be [root] ++ ascending source number"
+        );
+        assert!(
+            !plan.part2_objects.contains(&font) && !plan.part3_objects.contains(&font),
+            "outline-referenced font must be peeled out of the first-page section"
+        );
+
+        // part6 outline objects are emitted before /E and count toward page 0
+        // (QPDF_linearization.cc:1222): object_count = part2 + part3 + part6_outline.
+        let expected_page0 = (plan.part2_objects.len()
+            + plan.part3_objects.len()
+            + plan.part6_outline_objects.len()) as u32;
+        assert_eq!(
+            plan.page_hints[0].object_count, expected_page0,
+            "page-0 object_count must include the part6 outline objects"
         );
 
         assert!(plan.parts_are_disjoint());
