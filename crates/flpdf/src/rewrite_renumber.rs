@@ -736,6 +736,102 @@ mod tests {
     }
 
     #[test]
+    fn build_numbers_both_edges_holder_at_non_length_bfs_position() {
+        // A holder reached via BOTH a stream's /Length AND a genuine non-/Length
+        // edge is KEPT, but its object number must come from the non-/Length BFS
+        // position — qpdf removes /Length before enqueueing the stream's children,
+        // so the /Length edge never advances the number. This is the byte-identity
+        // crux: getting it wrong shifts every later object.
+        //
+        // Layout: the /Contents stream (obj 4) has `/Length 6 0 R` AND `/XObj 8 0 R`
+        // (a second, non-/Length child). The holder (obj 6) is ALSO referenced via
+        // the page's `/Tail 7 0 R` -> obj 7 `<< /Held 6 0 R >>`, reached AFTER obj 4
+        // in the BFS. Dict keys iterate in BTreeMap (lexicographic) order.
+        //
+        // BFS (seeds: /Root=1): 1,2,3 number 1,2,3. Object 3's refs in key order are
+        // /Contents(4), /Tail(7) -> 4 numbers 4, 7 numbers 5. Then object 4:
+        //   - skip_length=false: /Length(6) then /XObj(8) -> 6 numbers 6, 8 numbers 7.
+        //   - skip_length=true : only /XObj(8)            -> 8 numbers 6.
+        // Object 7's /Held(6): already-seen (false) or first-seen -> 6 numbers 7 (true).
+        // Net: obj 6 and obj 8 SWAP numbers depending on the /Length skip.
+        let stream4 = b"<< /Length 6 0 R /XObj 8 0 R >>\nstream\napp.alert('hi');\nendstream";
+        let pdf_bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Tail 7 0 R >>",
+            ),
+            (4, stream4),
+            (6, b"16"),
+            (7, b"<< /Held 6 0 R >>"),
+            (8, b"<< /Type /XObject /Subtype /Form >>"),
+        ]);
+
+        // skip_length=true (qpdf-faithful): holder kept, numbered at the late
+        // non-/Length position (7), AFTER the stream's other child obj 8 (6).
+        let mut pdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(6, 0)),
+            Some(ObjectRef::new(7, 0)),
+            "holder must be numbered via the non-/Length edge (obj 7), not the /Length edge"
+        );
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(8, 0)),
+            Some(ObjectRef::new(6, 0)),
+            "the stream's non-/Length child (obj 8) precedes the holder"
+        );
+
+        // skip_length=false (qdf): the /Length edge IS followed, so the holder and
+        // obj 8 take the OPPOSITE numbers — proving the skip actually moves the
+        // holder's position (this is the divergence qdf intentionally keeps).
+        let mut pdf_qdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let map_qdf = CatalogFirstRenumber::build(&mut pdf_qdf, false).expect("build");
+        assert_eq!(
+            map_qdf.new_for_original(ObjectRef::new(6, 0)),
+            Some(ObjectRef::new(6, 0))
+        );
+        assert_eq!(
+            map_qdf.new_for_original(ObjectRef::new(8, 0)),
+            Some(ObjectRef::new(7, 0))
+        );
+    }
+
+    #[test]
+    fn build_drops_length_holder_referenced_only_from_source_objstm() {
+        // A holder (obj 6) referenced via a non-/Length edge ONLY from a source
+        // /Type /ObjStm container (obj 7 /Aux) must still be dropped: the ObjStm
+        // container is unreachable from /Root (it is referenced by the xref, not by
+        // a graph edge), so the walk never visits it, and the holder is reachable
+        // only via the skipped /Length edge.
+        let pdf_bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (
+                4,
+                b"<< /Length 6 0 R >>\nstream\napp.alert('hi');\nendstream",
+            ),
+            (6, b"16"),
+            (
+                7,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 /Aux 6 0 R >>\nstream\n\nendstream",
+            ),
+        ]);
+        let mut pdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        assert!(
+            map.new_for_original(ObjectRef::new(6, 0)).is_none(),
+            "holder referenced only from an unreachable source ObjStm must be dropped"
+        );
+        assert!(map.new_for_original(ObjectRef::new(7, 0)).is_none());
+    }
+
+    #[test]
     fn reachable_object_set_drops_source_linearization_artifacts() {
         // linearized-one-page.pdf is a qpdf-produced linearized one-page PDF whose
         // source objects are: 1=Pages, 2=Info, 3=/Linearized param dict, 4=Catalog,
