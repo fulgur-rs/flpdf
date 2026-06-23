@@ -1720,6 +1720,32 @@ fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
         })?;
         trailer.insert(key, Object::Reference(new));
     }
+
+    // Pass 2: remap indirect references nested inside a DIRECT dict/array trailer
+    // value (e.g. a direct `/Info << /Held 5 0 R >>`). qpdf's `enqueueObjectsStandard`
+    // enqueues each trimmed-trailer value "handling direct objects recursively",
+    // so the renumber walk seeds these nested holders and the trailer must rewrite
+    // them to their new numbers too. Real trailers carry only top-level references
+    // (`/Root`, `/Info`, `/Encrypt`) and scalars (`/ID` strings, `/Size`/`/Prev`
+    // integers), so this pass is a no-op for them; it matters only for the
+    // (spec-violating) direct dict/array trailer value. Scalars are skipped here;
+    // `renumber_refs_in_place` errors on an unmapped nested reference, refusing to
+    // emit a dangling trailer reference.
+    let nested_keys: Vec<Vec<u8>> = trailer
+        .iter()
+        .filter(|(key, value)| {
+            *key != b"Root"
+                && *key != b"Encrypt"
+                && matches!(value, Object::Dictionary(_) | Object::Array(_))
+        })
+        .map(|(key, _)| key.to_vec())
+        .collect();
+    for key in nested_keys {
+        if let Some(mut value) = trailer.remove(&key) {
+            crate::rewrite_renumber::renumber_refs_in_place(&mut value, map)?;
+            trailer.insert(key, value);
+        }
+    }
     Ok(())
 }
 

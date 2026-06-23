@@ -115,9 +115,12 @@ impl CatalogFirstRenumber {
             if matches!(key, b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size") {
                 continue;
             }
-            if let Object::Reference(r) = value {
-                seeds.push(*r);
-            }
+            // qpdf's `enqueueObjectsStandard` enqueues each trimmed-trailer value,
+            // "handling direct objects recursively", so a nested indirect ref inside
+            // a DIRECT dict/array trailer value (e.g. a direct `/Info` dict) is a
+            // seed too — not just a top-level `Object::Reference`. A bare reference
+            // value yields exactly one seed, matching the previous behaviour.
+            collect_refs(value, 0, skip_length, &mut |r| seeds.push(r))?;
         }
 
         for seed in seeds {
@@ -172,9 +175,10 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
         if matches!(key, b"ID" | b"Prev" | b"Root" | b"Size") {
             continue;
         }
-        if let Object::Reference(r) = value {
-            seeds.push(*r);
-        }
+        // Recurse into direct dict/array trailer values so a nested indirect ref
+        // (e.g. inside a direct `/Info` dict) is seeded, matching qpdf's recursive
+        // trailer enqueue. A bare reference yields exactly one seed as before.
+        collect_refs(value, 0, skip_length, &mut |r| seeds.push(r))?;
     }
 
     let mut reachable: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -314,9 +318,10 @@ impl GenerateRenumber {
             if matches!(key, b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size") {
                 continue;
             }
-            if let Object::Reference(r) = value {
-                seeds.push(*r);
-            }
+            // Recurse into direct dict/array trailer values so a nested indirect
+            // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
+            // reference yields exactly one seed as before.
+            collect_refs(value, 0, skip_length, &mut |r| seeds.push(r))?;
         }
 
         for seed in seeds {

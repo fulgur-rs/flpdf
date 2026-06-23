@@ -132,3 +132,86 @@ fn stream_data_preserve_drops_orphan_holder_and_directizes_length() {
         "preserve mode must direct-ize the JS stream's /Length once the holder is dropped"
     );
 }
+
+/// Assemble a minimal classic (table-xref) PDF from `(object_number, body)`
+/// pairs plus a literal `trailer_dict` body (without the surrounding `<< >>`).
+fn build_raw_pdf(bodies: &[(u32, &[u8])], trailer_dict: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let max_num = bodies.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    let size = max_num + 1;
+    let mut offsets = vec![0usize; size as usize];
+    for (num, body) in bodies {
+        offsets[*num as usize] = out.len();
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for off in offsets.iter().skip(1) {
+        if *off == 0 {
+            out.extend_from_slice(b"0000000000 65535 f \n");
+        } else {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+    }
+    out.extend_from_slice(b"trailer\n<< ");
+    out.extend_from_slice(trailer_dict);
+    out.extend_from_slice(b" >>\n");
+    out.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+#[test]
+fn plain_rewrite_keeps_length_holder_referenced_from_direct_trailer_dict() {
+    // flpdf-jnq4 / Codex P2: obj 5 is an indirect `/Length` holder for the page
+    // /Contents stream (obj 4) AND is referenced via a nested ref inside a DIRECT
+    // `/Info << /Held 5 0 R >>` trailer dict. qpdf's `enqueueObjectsStandard`
+    // recurses into direct trailer values, so it numbers and KEEPS obj 5, and
+    // rewrites the nested ref to the holder's new number. flpdf must match: with
+    // the /Length edge skipped, the holder would otherwise be dropped and the
+    // trailer would emit a dangling `/Held` reference.
+    let pdf_bytes = build_raw_pdf(
+        &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (
+                4,
+                b"<< /Length 5 0 R >>\nstream\napp.alert('hi');\nendstream",
+            ),
+            (5, b"16"),
+        ],
+        b"/Size 6 /Root 1 0 R /Info << /Held 5 0 R >>",
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &base_opts()).expect("write");
+
+    // The holder is kept (referenced from the trailer), so the live set is the 5
+    // graph objects — none orphaned, no dangling trailer reference.
+    let mut re = Pdf::open(Cursor::new(out)).expect("re-open output");
+    let trailer_held = re
+        .trailer()
+        .get("Info")
+        .and_then(|info| info.as_dict())
+        .and_then(|d| d.get("Held"))
+        .cloned()
+        .expect("/Info /Held present");
+    let held_ref = match trailer_held {
+        Object::Reference(r) => r,
+        other => panic!("/Held must stay an indirect reference, got {other:?}"),
+    };
+    // The reference must resolve to the holder integer in the OUTPUT — i.e. it was
+    // renumbered to a live object, not left dangling at a freed/wrong slot.
+    let resolved = re.resolve(held_ref).expect("/Held target resolves");
+    assert_eq!(
+        resolved,
+        Object::Integer(16),
+        "the trailer /Held nested ref must point to the kept holder (value 16), not dangle"
+    );
+}
