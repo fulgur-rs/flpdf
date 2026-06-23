@@ -2463,6 +2463,93 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("two-page PDF should parse")
     }
 
+    /// Build a two-page PDF whose shared font is ALSO referenced by an outline
+    /// item (via a non-standard `/Extra` key), reproducing flpdf-q2zw in miniature.
+    ///
+    /// Object layout (extends [`two_page_shared_font_bytes`]):
+    ///   1 0 obj – Catalog  (/Pages 2 0 R, /Outlines 9 0 R)
+    ///   2 0 obj – Pages node  (Kids: [3 0 R, 4 0 R])
+    ///   3 0 obj – Page 1  → /Resources 5 0 R, /Contents 6 0 R
+    ///   4 0 obj – Page 2  → /Resources 5 0 R, /Contents 7 0 R
+    ///   5 0 obj – Resources  → /Font << /F1 8 0 R >>
+    ///   6 0 obj – Content stream (page 1 only)
+    ///   7 0 obj – Content stream (page 2 only)
+    ///   8 0 obj – Font  (shared by both pages AND reached from the outline)
+    ///   9 0 obj – Outlines dict  (/First 10 0 R, /Last 10 0 R)
+    ///  10 0 obj – Outline item  (/Extra 8 0 R → the font)
+    fn two_page_shared_font_outline_ref_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R >>\nendobj\n",
+        );
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 6 0 R >>\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 7 0 R >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Font << /F1 8 0 R >> >>\nendobj\n");
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
+
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(b"7 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
+
+        let off8 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"8 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let off9 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"9 0 obj\n<< /Type /Outlines /First 10 0 R /Last 10 0 R /Count 1 >>\nendobj\n",
+        );
+
+        let off10 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"10 0 obj\n<< /Title (Item) /Parent 9 0 R /Extra 8 0 R >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref_section = format!(
+            "xref\n0 11\n\
+            0000000000 65535 f \n\
+            {off1:010} 00000 n \n\
+            {off2:010} 00000 n \n\
+            {off3:010} 00000 n \n\
+            {off4:010} 00000 n \n\
+            {off5:010} 00000 n \n\
+            {off6:010} 00000 n \n\
+            {off7:010} 00000 n \n\
+            {off8:010} 00000 n \n\
+            {off9:010} 00000 n \n\
+            {off10:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref_section.as_bytes());
+
+        let trailer =
+            format!("trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",);
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        pdf
+    }
+
+    fn open_two_page_shared_font_outline_ref() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = two_page_shared_font_outline_ref_bytes();
+        Pdf::open(Cursor::new(bytes)).expect("two-page outline-ref PDF should parse")
+    }
+
     /// Build a PDF where the page's Resources dictionary references objects in
     /// a cycle: A → B → A (both are XObject-style objects hanging off /Resources).
     ///
@@ -2681,6 +2768,50 @@ mod tests {
         );
 
         // Disjoint invariant must hold.
+        assert!(plan.parts_are_disjoint());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6b. Outline-referenced shared font: in_outlines outranks in_first_page,
+    //     so a font referenced by BOTH pages AND an outline item is lc_outlines
+    //     (part9, !UseOutlines) — NOT first-page-shared (part3). qpdf
+    //     categorization QPDF_linearization.cc:1120-1126 (flpdf-q2zw).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn outline_referenced_shared_font_routes_to_outline_section_not_first_page() {
+        let mut pdf = open_two_page_shared_font_outline_ref();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+
+        let font = ObjectRef::new(8, 0);
+        let outline_root = ObjectRef::new(9, 0);
+        let outline_item = ObjectRef::new(10, 0);
+
+        // The font is reached from page 0, page 1, AND the outline. in_outlines
+        // wins, so it must be in the outline section, peeled out of the first-page
+        // section (part2/part3) and never captured as other-page-private (part7).
+        assert!(
+            plan.part9_outline_objects.contains(&font),
+            "outline-referenced font must be in part9_outline_objects, got {:?}",
+            plan.part9_outline_objects
+        );
+        assert!(
+            !plan.part2_objects.contains(&font) && !plan.part3_objects.contains(&font),
+            "outline-referenced font must be peeled out of the first-page section"
+        );
+        assert!(
+            !plan.part4_other_pages_private.contains(&font),
+            "outline-referenced font must not be captured as other-page-private"
+        );
+
+        // pushOutlinesToPart emits the root first, then the remaining outline
+        // objects in ascending source-object-number order
+        // (QPDF_linearization.cc:1426-1431): [root 9] ++ [font 8, item 10].
+        assert_eq!(
+            plan.part9_outline_objects,
+            vec![outline_root, font, outline_item],
+            "outline order must be [root] ++ ascending source number"
+        );
+
         assert!(plan.parts_are_disjoint());
     }
 
