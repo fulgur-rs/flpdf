@@ -2163,24 +2163,32 @@ fn push_hex_lower(out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// Byte length of the serialized deterministic `/ID` array value
-/// `[<id0_hex><id1_hex>]`: `[` + (`<` + 32 hex + `>`) twice + `]`.
-pub(crate) const DETERMINISTIC_ID_ARRAY_LEN: usize = 1 + (1 + 32 + 1) * 2 + 1;
+/// Byte length of the serialized deterministic `/ID` array `[<id0_hex><id1_hex>]`
+/// for an id0 of `id0_len` bytes: `[` + (`<` + 2*id0_len hex + `>`) + (`<` + 32 hex + `>`) + `]`.
+pub(crate) const fn deterministic_id_array_len(id0_len: usize) -> usize {
+    1 + (1 + 2 * id0_len + 1) + (1 + 32 + 1) + 1
+}
+/// The width for a 16-byte id0 (the common case): 70 bytes. Kept as a named
+/// alias for the many length assertions in the linearization writer's tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const DETERMINISTIC_ID_ARRAY_LEN: usize = deterministic_id_array_len(16);
 
-/// Serialize a deterministic `/ID` array of two 16-byte identifiers as the
-/// fixed-width hex form qpdf emits: `[<id0_hex><id1_hex>]`, exactly
-/// [`DETERMINISTIC_ID_ARRAY_LEN`] bytes with no inner spaces. Building the
-/// bytes by hand (rather than via [`Object::write_pdf`]) guarantees the hex
-/// form even when a digest happens to be all-printable, so the value is always
-/// the same fixed width regardless of its bytes. The classic linearized writer
-/// calls this directly to emit the final identifier at each `/ID` site in its
-/// last write pass (qpdf's 2-pass scheme); the ObjStm linearized writer uses it
-/// for both the all-zero placeholder and the patched-in final value, whose equal
-/// width leaves every later byte offset intact. (The flat write paths instead
-/// direct-write the final value via [`write_deterministic_id_inline`].)
-pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id1: &[u8; 16]) {
+/// Serialize a deterministic `/ID` array as the fixed-width hex form qpdf emits:
+/// `[<id0_hex><id1_hex>]`, with no inner spaces. The permanent identifier `id0`
+/// may be any length (qpdf preserves a source `/ID[0]` verbatim regardless of
+/// length); the changing identifier `id1` is always a 16-byte md5. The serialized
+/// length is [`deterministic_id_array_len`]`(id0.len())`. Building the bytes by
+/// hand (rather than via [`Object::write_pdf`]) guarantees the hex form even when
+/// a digest happens to be all-printable, so the value is always the same fixed
+/// width regardless of its bytes. The classic linearized writer calls this
+/// directly to emit the final identifier at each `/ID` site in its last write
+/// pass (qpdf's 2-pass scheme); the ObjStm linearized writer uses it for both the
+/// all-zero placeholder and the patched-in final value, whose equal width leaves
+/// every later byte offset intact. (The flat write paths instead direct-write the
+/// final value via [`write_deterministic_id_inline`].)
+pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &[u8; 16]) {
     out.push(b'[');
-    for id in [id0, id1] {
+    for id in [id0, &id1[..]] {
         out.push(b'<');
         push_hex_lower(out, id);
         out.push(b'>');
@@ -2188,19 +2196,18 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8; 16], id
     out.push(b']');
 }
 
-/// Extract the source trailer's permanent identifier `/ID[0]` when it is a
-/// well-formed 2-element array whose elements are both 16-byte strings.
-/// Returns `None` for any other shape (missing, wrong arity, wrong types, or a
-/// length other than 16), in which case qpdf reuses the changing identifier as
-/// the permanent one. The 16-byte constraint keeps the serialized `/ID` array
-/// at the fixed [`DETERMINISTIC_ID_ARRAY_LEN`] the linearized writer's
-/// fixed-width `/ID` emission depends on.
-pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<[u8; 16]> {
+/// Extract the source trailer's permanent identifier `/ID[0]` when `/ID` is a
+/// well-formed 2-element array whose elements are both strings.
+/// Returns `None` for any other shape (missing, wrong arity, wrong types), in
+/// which case qpdf reuses the changing identifier as the permanent one. The
+/// returned bytes are preserved verbatim at any length: qpdf's `getOriginalID1`
+/// copies `/ID[0]` unchanged regardless of its length and only regenerates the
+/// 16-byte changing identifier `/ID[1]`, so the serialized `/ID` array is
+/// [`deterministic_id_array_len`]`(id0.len())` bytes wide.
+pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
     match trailer.get("ID") {
         Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
-            (Object::String(first), Object::String(_)) => {
-                <[u8; 16]>::try_from(first.as_slice()).ok()
-            }
+            (Object::String(first), Object::String(_)) => Some(first.clone()),
             _ => None,
         },
         _ => None,
@@ -2279,13 +2286,14 @@ pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
 ///    string, whose `00xx` code units carry NUL bytes); everything from the
 ///    first NUL onward is excluded from the changing identifier exactly as qpdf
 ///    excludes it.
-/// 4. `/ID[0]` (permanent identifier) = `source_id0` when present, else `/ID[1]`.
+/// 4. `/ID[0]` (permanent identifier) = `source_id0` (verbatim, any length) when
+///    present, else a copy of `/ID[1]`.
 pub(crate) fn compute_deterministic_id(
     bytes: &[u8],
     id_array_offset: usize,
     info_suffix: &[u8],
-    source_id0: Option<[u8; 16]>,
-) -> ([u8; 16], [u8; 16]) {
+    source_id0: Option<&[u8]>,
+) -> (Vec<u8>, [u8; 16]) {
     use md5::Digest as _;
     let det_data = md5::Md5::digest(&bytes[..=id_array_offset]);
     // 32 hex chars for the 16-byte digest + " QPDF " (6) + the /Info suffix.
@@ -2298,7 +2306,9 @@ pub(crate) fn compute_deterministic_id(
     // det_data and " QPDF " are NUL-free, so a NUL can only come from /Info.
     let seed_hash_input = &seed[..seed.iter().position(|&b| b == 0).unwrap_or(seed.len())];
     let id1: [u8; 16] = md5::Md5::digest(seed_hash_input).into();
-    let id0 = source_id0.unwrap_or(id1);
+    let id0 = source_id0
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| id1.to_vec());
     (id0, id1)
 }
 
@@ -2315,12 +2325,12 @@ pub(crate) fn compute_deterministic_id(
 pub(crate) fn write_deterministic_id_inline(
     out: &mut Vec<u8>,
     info_suffix: &[u8],
-    source_id0: Option<[u8; 16]>,
+    source_id0: Option<&[u8]>,
 ) {
     out.push(b'[');
     let id_array_offset = out.len() - 1; // index of the just-pushed `[`
     let (id0, id1) = compute_deterministic_id(out, id_array_offset, info_suffix, source_id0);
-    for id in [&id0, &id1] {
+    for id in [id0.as_slice(), &id1[..]] {
         out.push(b'<');
         push_hex_lower(out, id);
         out.push(b'>');
@@ -2757,7 +2767,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // (preserved when well-formed) and the `/Info`-derived seed suffix. qpdf
     // reads these from the source trailer (`m->pdf.getTrailer()`), not the
     // remapped output trailer, so both are gathered here while `pdf` is free.
-    let (det_id_source_id0, det_id_info_suffix): (Option<[u8; 16]>, Vec<u8>) =
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
             let id0 = source_permanent_id(pdf.trailer());
             let suffix = deterministic_id_info_suffix(pdf);
@@ -3441,7 +3451,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                     // result for the same computed id, so output stays
                     // byte-for-byte equal to qpdf 11.9.0.
                     let mut id_writer = |out: &mut Vec<u8>| {
-                        write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                        write_deterministic_id_inline(
+                            out,
+                            &det_id_info_suffix,
+                            det_id_source_id0.as_deref(),
+                        )
                     };
                     write_qdf_trailer(&mut bytes, &trailer, Some(&mut id_writer));
                 } else {
@@ -3462,7 +3476,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                     // result for the same computed id, so output stays
                     // byte-for-byte equal to qpdf 11.9.0.
                     let mut id_writer = |out: &mut Vec<u8>| {
-                        write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                        write_deterministic_id_inline(
+                            out,
+                            &det_id_info_suffix,
+                            det_id_source_id0.as_deref(),
+                        )
                     };
                     trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
                 } else {
@@ -3631,7 +3649,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
             if options.deterministic_id {
                 let mut id_writer = |out: &mut Vec<u8>| {
-                    write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+                    write_deterministic_id_inline(
+                        out,
+                        &det_id_info_suffix,
+                        det_id_source_id0.as_deref(),
+                    )
                 };
                 write_stream_to_buf_with_id_writer(
                     &mut bytes,
@@ -3788,7 +3810,7 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
 
     // deterministic-/ID seed inputs, captured from the ORIGINAL trailer before
     // the emit loop borrows `pdf` (qpdf reads these from the source trailer).
-    let (det_id_source_id0, det_id_info_suffix): (Option<[u8; 16]>, Vec<u8>) =
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
             (
                 source_permanent_id(pdf.trailer()),
@@ -3939,7 +3961,7 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
             id: None,
         };
         let mut id_writer = |out: &mut Vec<u8>| {
-            write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0)
+            write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0.as_deref())
         };
         xref_stream::write_object_with_id_writer(
             &mut bytes,
@@ -4954,19 +4976,21 @@ mod tests {
         let id_array_offset = prefix.len();
         let mut legacy_buf = prefix.clone();
         write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
-        let (id0, id1) = compute_deterministic_id(&legacy_buf, id_array_offset, b"", Some(src0));
+        let (id0, id1) =
+            compute_deterministic_id(&legacy_buf, id_array_offset, b"", Some(src0.as_slice()));
         let mut expect = prefix.clone();
         write_deterministic_id_array(&mut expect, &src0, &id1);
 
         let mut inline = prefix.clone();
-        write_deterministic_id_inline(&mut inline, b"", Some(src0));
+        write_deterministic_id_inline(&mut inline, b"", Some(src0.as_slice()));
 
         assert_eq!(
             inline, expect,
             "inline write with a source id must equal placeholder+patch output"
         );
         assert_eq!(
-            id0, src0,
+            id0,
+            src0.to_vec(),
             "/ID[0] must be the supplied permanent identifier"
         );
         assert_ne!(
@@ -5393,6 +5417,40 @@ mod tests {
         };
         let write = |f: &[u8]| {
             let mut pdf = crate::Pdf::open_mem(f).expect("fixture must open");
+            let mut out = Vec::new();
+            write_pdf_with_options(&mut pdf, &mut out, &opts).expect("write");
+            out
+        };
+        let o1 = write(&fixture);
+        let o2 = write(&fixture);
+        assert_eq!(o1, o2, "xref-stream deterministic-id output must be stable");
+        let (id0, id1) = trailer_id_pair(&o1);
+        assert_eq!(
+            id1,
+            expected_changing_id(&o1, b"").to_vec(),
+            "xref-stream /ID[1] must match the two-level reconstruction"
+        );
+        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+    }
+
+    #[test]
+    fn deterministic_id_preserve_xref_stream_form_is_self_stable() {
+        // A cross-reference-stream INPUT written with --object-streams=preserve
+        // stays in `write_pdf_full_rewrite`'s `XrefForm::Stream` arm (Preserve is
+        // not delegated to the generate emitter, and a stream-form input keeps
+        // Stream form even with no ObjStm batches). The deterministic `/ID` is
+        // direct-written inline at the xref-stream dict's sorted `/ID` position;
+        // qpdf does not byte-match xref-stream form here, but the identifier must
+        // be self-stable and `/ID[1]` must equal the two-level reconstruction.
+        let fixture = build_xref_stream_fixture();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            deterministic_id: true,
+            object_streams: ObjectStreamMode::Preserve,
+            ..WriteOptions::default()
+        };
+        let write = |f: &[u8]| {
+            let mut pdf = crate::Pdf::open_mem(f).expect("xref-stream fixture must open");
             let mut out = Vec::new();
             write_pdf_with_options(&mut pdf, &mut out, &opts).expect("write");
             out

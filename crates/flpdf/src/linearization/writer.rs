@@ -939,8 +939,20 @@ struct FirstPageXrefPatch {
 fn finalize_linearized_id(options: &WriteOptions, source_trailer: &Dictionary) -> Object {
     let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
     if options.deterministic_id {
+        // Size the all-zero permanent-identifier placeholder to the source
+        // `/ID[0]` length so the serialized `/ID` array reaches its FINAL width
+        // here, before the convergence loop. qpdf preserves `/ID[0]` verbatim
+        // regardless of length; both the pass-1 digest buffer and the probe
+        // passes that measure `/L`, `/H`, the hint stream, and the xref offsets
+        // serialize this placeholder, so any width other than the final one
+        // would shift every downstream offset. `source_trailer` still carries
+        // the ORIGINAL `/ID` here (this runs before the placeholder overwrites
+        // it), so the length is read from the source.
+        let len0 = crate::writer::source_permanent_id(source_trailer)
+            .map(|v| v.len())
+            .unwrap_or(16);
         Object::Array(vec![
-            Object::String(vec![0u8; 16]),
+            Object::String(vec![0u8; len0]),
             Object::String(vec![0u8; 16]),
         ])
     } else if options.static_id {
@@ -1001,17 +1013,24 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 fn patch_linearized_deterministic_id(
     bytes: &mut [u8],
     id_ranges: &[std::ops::Range<usize>],
-    id0: &[u8; 16],
+    id0: &[u8],
     id1: &[u8; 16],
 ) {
-    use crate::writer::{write_deterministic_id_array, DETERMINISTIC_ID_ARRAY_LEN};
+    use crate::writer::{deterministic_id_array_len, write_deterministic_id_array};
 
+    // The placeholder and final value are the same width:
+    // `deterministic_id_array_len(id0.len())`, where id0 is the (possibly
+    // non-16-byte) permanent identifier preserved from the source `/ID[0]`.
+    // qpdf copies `/ID[0]` verbatim regardless of length, so the placeholder
+    // emitted at every `/ID` site (a zero id0 of the SAME length) and the final
+    // value share that width and no later byte offset shifts.
+    let len = deterministic_id_array_len(id0.len());
     // The identifier is precomputed from qpdf's pass-1 buffer (see the `det_id`
     // computation in `write_linearized`); here we only overwrite the all-zero
     // `/ID` placeholders the final pass wrote at the xref-stream dict sites.
-    let mut placeholder = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
-    write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
-    let mut final_id = Vec::with_capacity(DETERMINISTIC_ID_ARRAY_LEN);
+    let mut placeholder = Vec::with_capacity(len);
+    write_deterministic_id_array(&mut placeholder, &vec![0u8; id0.len()], &[0u8; 16]);
+    let mut final_id = Vec::with_capacity(len);
     write_deterministic_id_array(&mut final_id, id0, id1);
 
     // Patch each known `/ID` section in isolation. Body bytes outside these
@@ -1023,11 +1042,11 @@ fn patch_linearized_deterministic_id(
         let end = range.end.min(bytes.len());
         let mut patched = 0usize;
         let mut i = start;
-        while i + DETERMINISTIC_ID_ARRAY_LEN <= end {
-            if &bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN] == placeholder.as_slice() {
-                bytes[i..i + DETERMINISTIC_ID_ARRAY_LEN].copy_from_slice(&final_id);
+        while i + len <= end {
+            if &bytes[i..i + len] == placeholder.as_slice() {
+                bytes[i..i + len].copy_from_slice(&final_id);
                 patched += 1;
-                i += DETERMINISTIC_ID_ARRAY_LEN;
+                i += len;
             } else {
                 i += 1;
             }
@@ -2711,7 +2730,7 @@ pub fn write_linearized<R: Read + Seek>(
     // preserved permanent identifier and the `/Info`-derived suffix feeds the
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    let (det_id_source_id0, det_id_info_suffix): (Option<[u8; 16]>, Vec<u8>) =
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
             let id0 = crate::writer::source_permanent_id(&source_trailer);
             let suffix = crate::writer::deterministic_id_info_suffix(pdf);
@@ -2744,7 +2763,7 @@ pub fn write_linearized<R: Read + Seek>(
     // keeps the all-zero `/ID` placeholder (its trailer writers get
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
-    let classic_det_id: Option<([u8; 16], [u8; 16])> = if options.deterministic_id {
+    let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if options.deterministic_id {
         let pass1_part1 = build_pass1_part1(&part1);
         let (pass1_bytes, ..) = do_write_pass(
             plan,
@@ -2775,7 +2794,7 @@ pub fn write_linearized<R: Read + Seek>(
             &pass1_bytes,
             pass1_bytes.len() - 1,
             &det_id_info_suffix,
-            det_id_source_id0,
+            det_id_source_id0.as_deref(),
         ))
     } else {
         None
@@ -3251,8 +3270,13 @@ pub fn write_linearized<R: Read + Seek>(
             // writers ignore it), so that path's `/ID` stays an all-zero
             // placeholder and is patched afterwards.
             let mut det_id_closure;
-            let id_writer: Option<crate::object::TrailerIdWriter> = match classic_det_id {
+            let id_writer: Option<crate::object::TrailerIdWriter> = match &classic_det_id {
                 Some((id0, id1)) => {
+                    // Clone the identifier into the `move` closure so
+                    // `classic_det_id` stays available for the ObjStm patch below
+                    // (the permanent id0 is now an owned `Vec`, not `Copy`).
+                    let id0 = id0.clone();
+                    let id1 = *id1;
                     det_id_closure = move |out: &mut Vec<u8>| {
                         crate::writer::write_deterministic_id_array(out, &id0, &id1)
                     };
@@ -3317,12 +3341,12 @@ pub fn write_linearized<R: Read + Seek>(
     // qpdf's `/ID` too. The placeholders are fixed-width, so the overwrite
     // shifts no byte offset.
     // ------------------------------------------------------------------
-    if let (false, Some((id0, id1))) = (objstm_layout.is_empty(), classic_det_id) {
+    if let (false, Some((id0, id1))) = (objstm_layout.is_empty(), &classic_det_id) {
         // ObjStm / xref-stream path: the final pass wrote the all-zero `/ID`
         // placeholder at both xref-stream dict sites; overwrite them with the
         // identifier digested from qpdf's pass-1 buffer (byte-identical to qpdf's
         // value). The classic path direct-wrote it via `id_writer` already.
-        patch_linearized_deterministic_id(&mut final_bytes, &final_id_ranges, &id0, &id1);
+        patch_linearized_deterministic_id(&mut final_bytes, &final_id_ranges, id0, id1);
     }
 
     // ------------------------------------------------------------------
@@ -4485,10 +4509,10 @@ mod tests {
         let id = first_id_array(&out);
         // Array layout: '[' '<' id0_hex '>' '<' id1_hex '>' ']'
         let expected_prefix = format!("[<{}>", "aa".repeat(20));
+        let id_str = String::from_utf8_lossy(&id);
         assert!(
             id.starts_with(expected_prefix.as_bytes()),
-            "linearized /ID[0] must be the 20-byte source id preserved verbatim; got {:?}",
-            String::from_utf8_lossy(&id)
+            "linearized /ID[0] must be the 20-byte source id preserved verbatim; got {id_str:?}"
         );
     }
 
