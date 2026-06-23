@@ -4477,6 +4477,22 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_id_linearized_preserves_non_16_byte_source_id() {
+        // qpdf preserves /ID[0] verbatim regardless of length; flpdf must too.
+        // 20-byte source id0 -> 40 hex, preserved; /ID[1] is a 16-byte (32 hex) digest.
+        let id_entry = format!("/ID [<{}><{}>]", "aa".repeat(20), "bb".repeat(16));
+        let out = linearize_deterministic(&tiny_pdf_with(&id_entry, None));
+        let id = first_id_array(&out);
+        // Array layout: '[' '<' id0_hex '>' '<' id1_hex '>' ']'
+        let expected_prefix = format!("[<{}>", "aa".repeat(20));
+        assert!(
+            id.starts_with(expected_prefix.as_bytes()),
+            "linearized /ID[0] must be the 20-byte source id preserved verbatim; got {:?}",
+            String::from_utf8_lossy(&id)
+        );
+    }
+
+    #[test]
     fn deterministic_id_linearized_id0_equals_id1_without_source_id() {
         // No usable source /ID → permanent identifier falls back to the changing one.
         let out = linearize_deterministic(&tiny_pdf_with("/ID []", None));
