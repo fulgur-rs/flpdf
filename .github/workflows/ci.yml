@@ -146,6 +146,9 @@ jobs:
           cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
           # Demonstrates plain --static-id rewrite is cmp-diff-0 vs qpdf golden.
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_diff_zero_tests
+          # Pins --deterministic-id /ID byte-parity vs qpdf (two-level MD5,
+          # /Info seed, NUL truncation, and non-16-byte /ID[0] preservation).
+          cargo test -p flpdf --features qpdf-zlib-compat --test deterministic_id_qpdf_parity_tests
           # Pins NON-linearized --object-streams=generate byte-parity vs qpdf
           # goldens (incl. the orphaned-/Length-holder drop, flpdf-sqkq).
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_generate_objstm_tests
