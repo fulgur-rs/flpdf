@@ -153,6 +153,14 @@ fn three_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("three-page.pdf", "three-page");
 }
 
+#[test]
+fn relinearize_one_page_is_byte_identical_to_qpdf() {
+    // Re-linearizing an already-linearized input: the source's old /Linearized
+    // param dict and hint stream must be reachability-GC'd, not leaked into the
+    // second half, to stay byte-identical to qpdf --linearize (flpdf-phfu).
+    assert_linearize_byte_identical("linearized-one-page.pdf", "linearized-one-page");
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

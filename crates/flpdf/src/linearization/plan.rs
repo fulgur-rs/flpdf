@@ -556,6 +556,13 @@ impl LinearizationPlan {
         // object-stream mode (flpdf-2vfg). The plain (non-linearized) full-rewrite
         // path has the same divergence, tracked separately (flpdf-sqkq).
         let orphan_length_holders = orphaned_indirect_length_holders(pdf)?;
+        // qpdf garbage-collects objects unreachable from the trailer roots (it
+        // only enqueues reachable objects). The plain full-rewrite path does this
+        // via CatalogFirstRenumber's trailer-seeded BFS; the linearize universe
+        // must too, or re-linearizing an already-linearized source leaks its old
+        // /Linearized parameter dict + hint stream — both unreachable structural
+        // artifacts — into the second half (flpdf-phfu).
+        let reachable = crate::rewrite_renumber::reachable_object_set(pdf, &orphan_length_holders)?;
         let object_refs = pdf.object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
@@ -566,6 +573,10 @@ impl LinearizationPlan {
                 continue;
             }
             if crate::writer::is_source_structural_container(pdf.resolve_borrowed(r)?) {
+                continue;
+            }
+            if !reachable.contains(&r) {
+                // Unreachable from the trailer roots — qpdf drops it (flpdf-phfu).
                 continue;
             }
             all_refs.push(r);
@@ -3923,11 +3934,18 @@ mod tests {
     /// so `from_pdf` keeps them in `part4_rest`).  This is the fixture the
     /// `chunks(cap)` split path actually needs: a single source ObjStm
     /// contributing ≥2 eligible members to the *same* part.
+    ///
+    /// The members are referenced from a neutral catalog key (`/Aux`) so they
+    /// survive `from_pdf`'s reachability GC (flpdf-phfu) — `/Aux` is neither a
+    /// page nor an open-document key, so they stay out of every page closure and
+    /// land in `part4_rest`.
     fn objstm_two_part4_members_pdf_bytes() -> Vec<u8> {
         let mut bytes = b"%PDF-1.5\n".to_vec();
 
         let catalog_offset = bytes.len() as u32;
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Aux [10 0 R 11 0 R] >>\nendobj\n",
+        );
 
         let pages_offset = bytes.len() as u32;
         bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
@@ -3937,8 +3955,9 @@ mod tests {
             b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
         );
 
-        // ObjStm #7: members [10, 11] — two eligible plain dicts, referenced by
-        // nothing, so both land in part4_rest (same part, same source ObjStm).
+        // ObjStm #7: members [10, 11] — two eligible plain dicts referenced only
+        // by the catalog's neutral /Aux key, so both are reachable (survive the
+        // reachability GC) yet land in part4_rest (same part, same source ObjStm).
         let objstm_members: &[(u32, &[u8])] =
             &[(10, b"<< /Marker 10 >>"), (11, b"<< /Marker 11 >>")];
         let (stream_data, first) = build_objstm_payload_plan(objstm_members);

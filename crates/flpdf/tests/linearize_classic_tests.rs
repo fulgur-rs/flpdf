@@ -115,3 +115,21 @@ fn outlines_classic_routes_outlines_to_second_half_and_round_trips() {
          found at byte {outlines_pos}"
     );
 }
+
+// flpdf-phfu: re-linearizing an already-linearized input must not over-populate
+// the second half. qpdf garbage-collects the source's old /Linearized parameter
+// dict and old hint stream (both unreachable from Root/Info), so the plan's
+// object universe is the 7 reachable objects, NOT the source's full 9-object xref.
+#[test]
+fn relinearize_drops_source_linearization_artifacts_from_universe() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("linearized-one-page.pdf");
+    let f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+    assert_eq!(
+        plan.total_object_count, 7,
+        "re-linearize universe must drop the source's old /Linearized dict + hint stream"
+    );
+}
