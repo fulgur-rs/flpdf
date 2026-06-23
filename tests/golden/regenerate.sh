@@ -426,6 +426,12 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
 echo "one-page/linearize.pdf"
 
+# --- nonid-id0: linearize (non-16-byte /ID[0] preservation, flpdf-9hc.13.11) ---
+mkdir -p "$REF/nonid-id0"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/nonid-id0.pdf" "$REF/nonid-id0/linearize.pdf"
+echo "nonid-id0/linearize.pdf"
+
 # --- two-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/two-page.pdf" "$REF/two-page/plain.pdf"
