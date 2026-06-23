@@ -457,6 +457,15 @@ fn kept_indirect_length_plain_rewrite_keeps_image_xobject() {
     // ORIGINAL fixture AND on qpdf's own golden output — the warning is inherent to
     // the fixture, not a defect in flpdf's rewrite. The /Im0 + /DCTDecode presence
     // checks above are the meaningful assertions for flpdf-79ef.
+
+    // The issue also cited `--full-rewrite --static-id` as a repro; it hits the same
+    // run_rewrite path, so pin it explicitly too.
+    let output_fr = tmp.path().join("kept-indirect-length-fr.pdf");
+    run_rewrite(&input, &output_fr, &["--full-rewrite", "--static-id"]);
+    assert!(
+        extract_page_resource_keys(&output_fr, "XObject").contains(&b"Im0".to_vec()),
+        "--full-rewrite --static-id must also keep the image XObject /Im0",
+    );
 }
 
 #[test]
