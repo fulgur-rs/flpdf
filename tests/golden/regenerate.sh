@@ -432,6 +432,14 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/nonid-id0.pdf" "$REF/nonid-id0/linearize.pdf"
 echo "nonid-id0/linearize.pdf"
 
+# Linearized + object streams (cross-reference *stream* path; header floored to
+# 1.5). Pins the placeholder-then-patch route (patch_linearized_deterministic_id)
+# for a non-16-byte source /ID[0]: qpdf carries the 40-hex id0 verbatim at both
+# /ID sites. The byte-identity gate is feature-gated on qpdf-zlib-compat.
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/nonid-id0.pdf" "$REF/nonid-id0/linearize-objstm.pdf"
+echo "nonid-id0/linearize-objstm.pdf"
+
 # --- two-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/two-page.pdf" "$REF/two-page/plain.pdf"

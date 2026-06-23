@@ -4034,9 +4034,10 @@ mod tests {
 
     /// Collect every deterministic `/ID [...]` array that appears in linearized
     /// output. A linearized file repeats `/ID` in the Part-1 trailer, the
-    /// first-page xref dict, and the main xref dict. The deterministic array is
-    /// always the fixed [`DETERMINISTIC_ID_ARRAY_LEN`]-byte hex form starting at
-    /// the `[`, so the window is taken directly.
+    /// first-page xref dict, and the main xref dict. Each returned slice is the
+    /// full `[<id0_hex><id1_hex>]` array from `[` to its closing `]`; id0 may be
+    /// a non-16-byte permanent identifier, so the window is sized to the closing
+    /// `]` rather than the fixed 16-byte-id0 width.
     fn collect_id_arrays(bytes: &[u8]) -> Vec<Vec<u8>> {
         let needle = b"/ID [";
         let mut out = Vec::new();
@@ -4044,8 +4045,16 @@ mod tests {
         while i + needle.len() <= bytes.len() {
             if &bytes[i..i + needle.len()] == needle {
                 let open = i + needle.len() - 1; // index of '['
-                out.push(bytes[open..open + DETERMINISTIC_ID_ARRAY_LEN].to_vec());
-                i = open + DETERMINISTIC_ID_ARRAY_LEN;
+                                                 // Size the window to the closing
+                                                 // ']' (id0 may be non-16-byte),
+                                                 // not the fixed 16-byte-id0 width.
+                let close = bytes[open..]
+                    .iter()
+                    .position(|&b| b == b']')
+                    .map(|p| open + p + 1)
+                    .unwrap_or(bytes.len());
+                out.push(bytes[open..close].to_vec());
+                i = close;
             } else {
                 i += 1;
             }
@@ -4507,12 +4516,44 @@ mod tests {
         let id_entry = format!("/ID [<{}><{}>]", "aa".repeat(20), "bb".repeat(16));
         let out = linearize_deterministic(&tiny_pdf_with(&id_entry, None));
         let id = first_id_array(&out);
-        // Array layout: '[' '<' id0_hex '>' '<' id1_hex '>' ']'
-        let expected_prefix = format!("[<{}>", "aa".repeat(20));
         let id_str = String::from_utf8_lossy(&id);
-        assert!(
-            id.starts_with(expected_prefix.as_bytes()),
+        // Parse `[<id0_hex><id1_hex>]` from the actual `<`/`>` delimiters rather
+        // than the fixed 16-byte-id0 offsets (ID0_HEX/ID1_HEX only hold for a
+        // 70-byte array; this array is 78 bytes).
+        let lt0 = id.iter().position(|&b| b == b'<').expect("id0 opening '<'");
+        let gt0 = id[lt0..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| lt0 + p)
+            .expect("id0 closing '>'");
+        let id0_hex = &id[lt0 + 1..gt0];
+        let lt1 = id[gt0..]
+            .iter()
+            .position(|&b| b == b'<')
+            .map(|p| gt0 + p)
+            .expect("id1 opening '<'");
+        let gt1 = id[lt1..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| lt1 + p)
+            .expect("id1 closing '>'");
+        let id1_hex = &id[lt1 + 1..gt1];
+        // /ID[0] is the 20-byte source identifier preserved verbatim (40 hex).
+        assert_eq!(
+            id0_hex,
+            "aa".repeat(20).as_bytes(),
             "linearized /ID[0] must be the 20-byte source id preserved verbatim; got {id_str:?}"
+        );
+        // /ID[1] is always a regenerated 16-byte digest (32 hex chars).
+        assert_eq!(
+            id1_hex.len(),
+            32,
+            "linearized /ID[1] must be a 16-byte (32 hex) digest; got {id_str:?}"
+        );
+        // The permanent and changing identifiers must differ.
+        assert_ne!(
+            id0_hex, id1_hex,
+            "linearized /ID[0] and /ID[1] must differ; got {id_str:?}"
         );
     }
 
