@@ -1207,8 +1207,11 @@ fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Minimal single-page PDF with a content stream and a font resource entry.
-/// The font resource is NOT referenced in the content stream, so
-/// --remove-unreferenced-resources should prune it.
+/// `/F2` is NOT referenced in the content stream. On a plain `rewrite` flpdf
+/// keeps it — matching qpdf, which only prunes `/Resources` entries during page
+/// operations (`--pages`), not on a plain rewrite (flpdf-79ef). The tests using
+/// this fixture assert flag acceptance + structurally valid output, not pruning;
+/// the behavioral retention assertions live in `cli_optimization_matrix.rs`.
 fn one_page_pdf_with_unused_resource() -> Vec<u8> {
     let content_data = b"BT /F1 12 Tf (Hello) Tj ET";
     let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
