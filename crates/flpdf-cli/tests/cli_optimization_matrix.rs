@@ -452,9 +452,11 @@ fn kept_indirect_length_plain_rewrite_keeps_image_xobject() {
         "the DCTDecode image stream must survive the rewrite"
     );
 
-    if !skip_if_qpdf_missing() {
-        assert_qpdf_check(&output);
-    }
+    // No assert_qpdf_check here: this fixture's image carries placeholder (non-real)
+    // JPEG bytes, so `qpdf --check` warns ("invalid jpeg data") and exits 3 on the
+    // ORIGINAL fixture AND on qpdf's own golden output — the warning is inherent to
+    // the fixture, not a defect in flpdf's rewrite. The /Im0 + /DCTDecode presence
+    // checks above are the meaningful assertions for flpdf-79ef.
 }
 
 #[test]
