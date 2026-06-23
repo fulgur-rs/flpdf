@@ -206,6 +206,17 @@ fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
 }
 
+// nonid-id0 (flpdf-9hc.13.11): a non-16-byte (20-byte / 40-hex) source /ID[0] on
+// the ObjStm / xref-stream linearized path. This exercises the placeholder-then-
+// patch route (patch_linearized_deterministic_id) at a non-16-byte id0 width: the
+// 40-hex id0 must be carried verbatim at both /ID sites (first-page + main xref
+// dicts) with a 16-byte (32-hex) id1, byte-identical to
+// qpdf --linearize --object-streams=generate --deterministic-id.
+#[test]
+fn nonid_id0_linearized_objstm_is_byte_identical_to_qpdf() {
+    assert_strict("nonid-id0.pdf", "nonid-id0");
+}
+
 // ---- Phase-2 (flpdf-g6hb.2): >cap global even-split + part routing ----------
 //
 // sharedfonts-100: 104 eligible first-page-shared dicts → 2 containers (50+51),

@@ -154,6 +154,13 @@ fn three_page_linearized_is_byte_identical_to_qpdf() {
 }
 
 #[test]
+fn nonid_id0_linearized_is_byte_identical_to_qpdf() {
+    // Non-16-byte (20-byte) source /ID[0] preserved verbatim on the linearized
+    // path, byte-identical to qpdf --linearize --deterministic-id (flpdf-9hc.13.11).
+    assert_linearize_byte_identical("nonid-id0.pdf", "nonid-id0");
+}
+
+#[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
     // param dict and hint stream must be reachability-GC'd, not leaked into the

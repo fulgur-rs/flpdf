@@ -98,6 +98,41 @@ fn one_page_with_utf16_nul_info_fixture() -> Vec<u8> {
     out
 }
 
+/// A stream-free one-page classic-xref PDF whose source /ID[0] is 20 bytes
+/// (non-16). qpdf preserves /ID[0] verbatim regardless of length; only /ID[1]
+/// is regenerated. No /Info, so the seed suffix is empty.
+fn one_page_non16_id0_fixture() -> Vec<u8> {
+    let objs: [&[u8]; 3] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, obj) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(obj);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objs.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /ID [<{}><{}>] >>\nstartxref\n{xref}\n%%EOF\n",
+            objs.len() + 1,
+            "aa".repeat(20),
+            "bb".repeat(16)
+        )
+        .as_bytes(),
+    );
+    out
+}
+
 fn write_deterministic(fixture: &[u8]) -> Vec<u8> {
     let mut pdf = Pdf::open_mem(fixture).expect("fixture must open");
     let mut opts = WriteOptions::default();
@@ -258,6 +293,43 @@ fn deterministic_id_nul_info_matches_live_qpdf_when_available() {
     assert_eq!(
         flpdf_bytes, qpdf_bytes,
         "flpdf --deterministic-id output for NUL-bearing /Info must be \
+         byte-identical to qpdf 11.9.0"
+    );
+}
+// Golden /ID captured from qpdf 11.9.0 (`qpdf --deterministic-id
+// --object-streams=disable`) on `one_page_non16_id0_fixture()`. The source
+// /ID[0] is a 20-byte string (`aa` * 20). qpdf's getOriginalID1 preserves
+// /ID[0] verbatim regardless of length, so the golden /ID[0] is 40 lowercase
+// `a` hex digits; only /ID[1] is regenerated as a 16-byte md5. (det_data is
+// independent of /ID[0]'s content/length, so /ID[1] equals the value qpdf
+// would compute for any /ID[0].)
+const GOLDEN_NON16_ID0: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 40 hex = 20 bytes, preserved
+const GOLDEN_NON16_ID1: &str = "31934e8255a9535b3f842c42bdef7bfc"; // 32 hex md5
+
+#[test]
+fn deterministic_id_non16_id0_matches_qpdf_golden_id_words() {
+    let out = write_deterministic(&one_page_non16_id0_fixture());
+    let (id0, id1) = extract_id_words(&out);
+    assert_eq!(
+        id0, GOLDEN_NON16_ID0,
+        "/ID[0] (20-byte) must be preserved verbatim"
+    );
+    assert_eq!(
+        id1, GOLDEN_NON16_ID1,
+        "/ID[1] diverged from qpdf 11.9.0 golden"
+    );
+}
+
+#[test]
+fn deterministic_id_non16_id0_matches_live_qpdf_when_available() {
+    let fixture = one_page_non16_id0_fixture();
+    let Some(qpdf_bytes) = run_live_qpdf_deterministic(&fixture) else {
+        return;
+    };
+    let flpdf_bytes = write_deterministic(&fixture);
+    assert_eq!(
+        flpdf_bytes, qpdf_bytes,
+        "flpdf --deterministic-id output for a 20-byte /ID[0] must be \
          byte-identical to qpdf 11.9.0"
     );
 }
