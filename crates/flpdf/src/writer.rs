@@ -4702,18 +4702,23 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_id_ignores_non_16_byte_source_id() {
-        // A source /ID[0] that is not 16 bytes is not a usable permanent
-        // identifier (it would break the fixed-width /ID array), so qpdf reuses
-        // the changing identifier for both elements.
+    fn deterministic_id_preserves_non_16_byte_source_id() {
+        // qpdf's getOriginalID1 preserves /ID[0] verbatim regardless of length;
+        // only /ID[1] is regenerated (always a 16-byte md5).
         let src = build_det_id_source(
             &format!("/ID [<{}><{}>]", "aa".repeat(20), "bb".repeat(16)),
             &[],
         );
         let out = write_det_id(&src);
         let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(id0, id1, "non-16-byte source /ID[0] must not be preserved");
+        assert_eq!(
+            id0,
+            vec![0xAAu8; 20],
+            "/ID[0] must be preserved verbatim (20 bytes)"
+        );
+        assert_eq!(id1.len(), 16, "/ID[1] is always a 16-byte digest");
         assert_eq!(id1, expected_changing_id(&out, b"").to_vec());
+        assert_ne!(id0, id1);
     }
 
     #[test]
