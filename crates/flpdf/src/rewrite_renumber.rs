@@ -16,7 +16,11 @@
 //! - Each dequeued object is resolved and the objects it references are
 //!   enqueued, descending into dictionary entries in lexicographic byte order
 //!   of their keys and array elements in order. For streams only the stream
-//!   dictionary is walked; the data bytes are opaque.
+//!   dictionary is walked; the data bytes are opaque. A stream's indirect
+//!   `/Length` edge is not followed (qpdf removes `/Length` before enqueueing a
+//!   stream's children, since it re-emits a direct `/Length`), so a holder
+//!   reachable only through it is dropped — except in qdf mode, which keeps the
+//!   indirect holder.
 //! - The first time an object is enqueued fixes its new number; later
 //!   encounters are ignored.
 //! - New numbers are the visitation order `1..=N`, all with generation 0.
@@ -82,32 +86,20 @@ impl CatalogFirstRenumber {
 
     /// Compute the Catalog-first renumbering for `pdf`.
     ///
+    /// When `skip_length` is set, the walk does not follow a stream's indirect
+    /// `/Length` edge, so a holder reachable only through it receives no number
+    /// (matching qpdf's reachability GC of a stream whose `/Length` it directizes
+    /// — `QPDFWriter::unparseObject` removes `/Length` before enqueueing
+    /// children). Pass `false` in qdf mode, which keeps the indirect holder.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when the trailer has no `/Root` entry.
     /// Propagates [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] if an
     /// object fails to load during the walk.
-    // The production writer always goes through `build_excluding` (passing the
-    // orphaned-`/Length`-holder set); this no-exclusions wrapper is retained for
-    // the unit tests that assert the plain visitation order.
-    #[allow(dead_code)]
-    pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Self> {
-        Self::build_excluding(pdf, &BTreeSet::new())
-    }
-
-    /// Like [`Self::build`], but objects in `excluded` are skipped: they receive
-    /// no new number, and the walk does not descend into them. This drops
-    /// orphaned indirect `/Length` holders (flpdf-sqkq) — reached only via a
-    /// stream's `/Length` edge, which the writer re-emits as a direct integer —
-    /// so the remaining objects renumber contiguously, matching qpdf's
-    /// reachability garbage collection.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::build`].
-    pub(crate) fn build_excluding<R: Read + Seek>(
+    pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
-        excluded: &BTreeSet<ObjectRef>,
+        skip_length: bool,
     ) -> crate::Result<Self> {
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut order: Vec<ObjectRef> = Vec::new();
@@ -129,13 +121,13 @@ impl CatalogFirstRenumber {
         }
 
         for seed in seeds {
-            enqueue(seed, excluded, &mut old_to_new, &mut order, &mut queue);
+            enqueue(seed, &mut old_to_new, &mut order, &mut queue);
         }
 
         while let Some(cur) = queue.pop_front() {
             let obj = pdf.resolve_borrowed(cur)?;
-            collect_refs(obj, 0, &mut |r| {
-                enqueue(r, excluded, &mut old_to_new, &mut order, &mut queue);
+            collect_refs(obj, 0, skip_length, &mut |r| {
+                enqueue(r, &mut old_to_new, &mut order, &mut queue);
             })?;
         }
 
@@ -149,11 +141,11 @@ impl CatalogFirstRenumber {
 ///
 /// Seeds from `/Root` plus every indirect trailer entry — **including
 /// `/Encrypt`**, excluding `/Prev`, `/Size`, `/ID` (and `/Root`, already
-/// seeded) — then breadth-first walks via [`collect_refs`] (which follows every
-/// inline reference, `/Length` included). References in `excluded` (such as
-/// orphaned indirect `/Length` holders) are skipped — neither recorded nor
-/// walked — so an object reachable ONLY through a dead `/Length` edge is
-/// correctly absent.
+/// seeded) — then breadth-first walks via [`collect_refs`]. When `skip_length`
+/// is set (always, for linearize: the linearized writer directizes every
+/// `/Length`), a stream's indirect `/Length` edge is not followed, so an object
+/// reachable ONLY through that dead edge is correctly absent — matching qpdf's
+/// reachability GC.
 ///
 /// Unlike [`CatalogFirstRenumber`], `/Encrypt` IS part of the seed set: the
 /// linearized object universe must retain the encryption dictionary and its
@@ -168,7 +160,7 @@ impl CatalogFirstRenumber {
 /// objects during the walk.
 pub(crate) fn reachable_object_set<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    excluded: &BTreeSet<ObjectRef>,
+    skip_length: bool,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let root = pdf
         .root_ref()
@@ -188,14 +180,14 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
     let mut reachable: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut queue: VecDeque<ObjectRef> = VecDeque::new();
     for seed in seeds {
-        if !excluded.contains(&seed) && reachable.insert(seed) {
+        if reachable.insert(seed) {
             queue.push_back(seed);
         }
     }
     while let Some(cur) = queue.pop_front() {
         let obj = pdf.resolve_borrowed(cur)?;
-        collect_refs(obj, 0, &mut |r| {
-            if !excluded.contains(&r) && reachable.insert(r) {
+        collect_refs(obj, 0, skip_length, &mut |r| {
+            if reachable.insert(r) {
                 queue.push_back(r);
             }
         })?;
@@ -272,6 +264,13 @@ impl GenerateRenumber {
     /// `groups` (each inner slice is one container's members, in any order; they
     /// are numbered ascending-source within the container).
     ///
+    /// `skip_length` is always `true` here: generate mode emits a direct
+    /// `/Length` (qdf forces object streams off), so a stream's indirect
+    /// `/Length` edge is dead and a holder reachable only through it is dropped,
+    /// matching qpdf's reachability GC. An orphan holder is never an object-stream
+    /// member (members are reached via non-`/Length` edges only), so no group is
+    /// affected.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when the trailer has no `/Root`, and
@@ -279,25 +278,7 @@ impl GenerateRenumber {
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         groups: &[Vec<ObjectRef>],
-    ) -> crate::Result<Self> {
-        Self::build_excluding(pdf, groups, &BTreeSet::new())
-    }
-
-    /// Like [`Self::build`], but objects in `excluded` are skipped: they receive
-    /// no new number, and the walk does not descend into them. This drops
-    /// orphaned indirect `/Length` holders (flpdf-sqkq), so the remaining
-    /// objects renumber contiguously — matching qpdf's reachability garbage
-    /// collection. An excluded ref is never an object-stream member (members are
-    /// reached only via non-`/Length` edges in `compressible_objgens`, while an
-    /// orphan holder is reachable only via `/Length`), so no group is affected.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::build`].
-    pub(crate) fn build_excluding<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        groups: &[Vec<ObjectRef>],
-        excluded: &BTreeSet<ObjectRef>,
+        skip_length: bool,
     ) -> crate::Result<Self> {
         // member -> group index, and per-group members sorted ascending-source.
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
@@ -341,7 +322,6 @@ impl GenerateRenumber {
         for seed in seeds {
             enqueue_gen(
                 seed,
-                excluded,
                 &member_to_group,
                 &groups_sorted,
                 &mut old_to_new,
@@ -353,10 +333,9 @@ impl GenerateRenumber {
 
         while let Some(cur) = queue.pop_front() {
             let obj = pdf.resolve_borrowed(cur)?;
-            collect_refs(obj, 0, &mut |r| {
+            collect_refs(obj, 0, skip_length, &mut |r| {
                 enqueue_gen(
                     r,
-                    excluded,
                     &member_to_group,
                     &groups_sorted,
                     &mut old_to_new,
@@ -382,7 +361,6 @@ impl GenerateRenumber {
 #[allow(dead_code, clippy::too_many_arguments)]
 fn enqueue_gen(
     r: ObjectRef,
-    excluded: &BTreeSet<ObjectRef>,
     member_to_group: &HashMap<ObjectRef, usize>,
     groups_sorted: &[Vec<ObjectRef>],
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
@@ -390,9 +368,6 @@ fn enqueue_gen(
     next: &mut u32,
     queue: &mut VecDeque<ObjectRef>,
 ) {
-    if excluded.contains(&r) {
-        return;
-    }
     if old_to_new.contains_key(&r) {
         return;
     }
@@ -420,19 +395,13 @@ fn enqueue_gen(
 }
 
 /// Assign `original` a new number on first encounter and enqueue it for the BFS
-/// walk. Repeated calls for the same reference are no-ops. References in
-/// `excluded` are skipped entirely (no number, not walked) — see
-/// [`CatalogFirstRenumber::build_excluding`].
+/// walk. Repeated calls for the same reference are no-ops.
 fn enqueue(
     original: ObjectRef,
-    excluded: &BTreeSet<ObjectRef>,
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
     order: &mut Vec<ObjectRef>,
     queue: &mut VecDeque<ObjectRef>,
 ) {
-    if excluded.contains(&original) {
-        return;
-    }
     if old_to_new.contains_key(&original) {
         return;
     }
@@ -450,6 +419,14 @@ fn enqueue(
 /// ordered iteration) and array elements in order. Stream data bytes are not
 /// inspected.
 ///
+/// When `skip_length` is set, a stream's `/Length` entry is not descended into.
+/// qpdf removes `/Length` from a stream dict before enqueueing its children
+/// (`QPDFWriter::unparseObject`: `object.removeKey("/Length")`), so with direct
+/// stream lengths the indirect `/Length` edge is dead in the output and must not
+/// contribute to numbering or reachability. `skip_length` carries that
+/// `direct_stream_lengths` state — it is false only in qdf mode, which keeps the
+/// indirect holder and re-emits `/Length H 0 R`.
+///
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when inline structural nesting exceeds
@@ -457,7 +434,12 @@ fn enqueue(
 /// over-deep region uncollected, so they would never be numbered — emitting a
 /// corrupt renumbered PDF as if it succeeded. Refusing is the safe choice
 /// (real PDFs never nest inline structures that deeply).
-fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) -> crate::Result<()> {
+fn collect_refs(
+    obj: &Object,
+    depth: usize,
+    skip_length: bool,
+    f: &mut impl FnMut(ObjectRef),
+) -> crate::Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
             "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
@@ -469,17 +451,20 @@ fn collect_refs(obj: &Object, depth: usize, f: &mut impl FnMut(ObjectRef)) -> cr
         Object::Reference(r) => f(*r),
         Object::Array(elements) => {
             for element in elements {
-                collect_refs(element, depth + 1, f)?;
+                collect_refs(element, depth + 1, skip_length, f)?;
             }
         }
         Object::Dictionary(dict) => {
             for (_key, value) in dict.iter() {
-                collect_refs(value, depth + 1, f)?;
+                collect_refs(value, depth + 1, skip_length, f)?;
             }
         }
         Object::Stream(stream) => {
-            for (_key, value) in stream.dict.iter() {
-                collect_refs(value, depth + 1, f)?;
+            for (key, value) in stream.dict.iter() {
+                if skip_length && key == b"Length" {
+                    continue;
+                }
+                collect_refs(value, depth + 1, skip_length, f)?;
             }
         }
         _ => {}
@@ -586,11 +571,42 @@ mod tests {
         olds.into_iter().map(|old| type_tag(pdf, old)).collect()
     }
 
+    /// Assemble a minimal classic (table-xref) PDF from `(object_number, body)`
+    /// pairs and a `<< /Size N /Root 1 0 R >>` trailer. Object numbers may be
+    /// non-contiguous; the xref sizes itself to the highest number. Used to build
+    /// hand-crafted graphs for the renumber/reachability walks.
+    fn build_raw_pdf(bodies: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let max_num = bodies.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let size = max_num + 1;
+        let mut offsets = vec![0usize; size as usize];
+        for (num, body) in bodies {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for off in offsets.iter().skip(1) {
+            // A zero offset marks an unused slot (no object with that number);
+            // emit it as a free entry so the xref stays well-formed.
+            if *off == 0 {
+                out.extend_from_slice(b"0000000000 65535 f \n");
+            } else {
+                out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+        out
+    }
+
     #[test]
     fn one_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf).expect("build");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 7);
         assert_eq!(
             tag_sequence(&mut pdf, &map),
@@ -602,7 +618,7 @@ mod tests {
     fn two_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/two-page.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf).expect("build");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 9);
         assert_eq!(
             tag_sequence(&mut pdf, &map),
@@ -616,7 +632,7 @@ mod tests {
     fn three_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf).expect("build");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 11);
         assert_eq!(
             tag_sequence(&mut pdf, &map),
@@ -631,7 +647,7 @@ mod tests {
     fn pairs_yield_ascending_new_numbers_from_one() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf).expect("build");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         let news: Vec<u32> = map.pairs().map(|(new, _old)| new.number).collect();
         assert_eq!(news, vec![1, 2, 3, 4, 5, 6, 7]);
         assert!(map.pairs().all(|(new, _)| new.generation == 0));
@@ -642,14 +658,15 @@ mod tests {
     }
 
     #[test]
-    fn build_excluding_drops_orphan_length_holder_and_renumbers_contiguously() {
+    fn build_drops_orphan_length_holder_via_length_skip_and_renumbers_contiguously() {
         // OD fixture: the JS stream (obj 6) has an indirect /Length (7 0 R); the
-        // holder (obj 7) is reachable only via that /Length edge (flpdf-sqkq).
+        // holder (obj 7) is reachable only via that /Length edge. With
+        // `skip_length = true` the walk does not follow the edge, so the holder
+        // receives no number and the rest renumber contiguously.
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let excluded: BTreeSet<ObjectRef> = std::iter::once(ObjectRef::new(7, 0)).collect();
-        let map = CatalogFirstRenumber::build_excluding(&mut pdf, &excluded).expect("build");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
 
         // Six live objects remain (holder dropped), numbered contiguously 1..=6.
         assert_eq!(map.len(), 6);
@@ -657,6 +674,65 @@ mod tests {
         let mut news: Vec<u32> = map.pairs().map(|(new, _)| new.number).collect();
         news.sort_unstable();
         assert_eq!(news, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn build_keeps_length_holder_when_not_skipping_length() {
+        // qdf mode keeps the indirect /Length holder (qpdf `!direct_stream_lengths`
+        // reserves a holder object). With `skip_length = false` the walk follows the
+        // /Length edge, so the holder (obj 7) is numbered like any other object.
+        let bytes =
+            include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let map = CatalogFirstRenumber::build(&mut pdf, false).expect("build");
+        assert!(
+            map.new_for_original(ObjectRef::new(7, 0)).is_some(),
+            "with skip_length=false the /Length holder stays numbered"
+        );
+        assert_eq!(map.len(), 7);
+    }
+
+    #[test]
+    fn build_drops_length_holder_referenced_only_from_unreachable_object() {
+        // flpdf-orv9: the page /Contents stream (obj 4) has an indirect /Length
+        // (6 0 R). The holder (obj 6) is ALSO referenced via a non-/Length edge,
+        // but only from obj 7 — an object UNREACHABLE from /Root and the trailer.
+        // The old pre-GC orphan scan saw obj 7's reference and wrongly kept obj 6
+        // alive; skipping the /Length edge drops it (qpdf GCs obj 7 and directizes
+        // /Length).
+        let pdf_bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 6 0 R >>\nstream\nBT ET\nendstream"),
+            (6, b"16"),
+            // Unreachable plain dict: not in the page tree, not in the trailer.
+            (7, b"<< /Held 6 0 R >>"),
+        ]);
+
+        let mut pdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        assert!(
+            map.new_for_original(ObjectRef::new(6, 0)).is_none(),
+            "holder reached only via /Length plus an unreachable referrer must be dropped"
+        );
+        assert!(
+            map.new_for_original(ObjectRef::new(7, 0)).is_none(),
+            "the unreachable referrer must itself be GC'd"
+        );
+
+        // The linearize universe walk drops them the same way.
+        let mut pdf2 = Pdf::open_mem(&pdf_bytes).expect("open");
+        let reachable = reachable_object_set(&mut pdf2, true).expect("walk");
+        assert!(!reachable.contains(&ObjectRef::new(6, 0)));
+        assert!(!reachable.contains(&ObjectRef::new(7, 0)));
+        assert!(
+            reachable.contains(&ObjectRef::new(4, 0)),
+            "the page's /Contents stream stays live"
+        );
     }
 
     #[test]
@@ -669,7 +745,7 @@ mod tests {
         // when re-linearizing, so the reachable universe is the 7 graph objects.
         let bytes = include_bytes!("../../../tests/fixtures/compat/linearized-one-page.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let reachable = reachable_object_set(&mut pdf, &BTreeSet::new()).expect("walk");
+        let reachable = reachable_object_set(&mut pdf, true).expect("walk");
         let mut nums: Vec<u32> = reachable.iter().map(|r| r.number).collect();
         nums.sort_unstable();
         assert_eq!(
@@ -682,19 +758,18 @@ mod tests {
     }
 
     #[test]
-    fn reachable_object_set_skips_excluded_orphan_length_holder() {
+    fn reachable_object_set_drops_orphan_length_holder_via_length_skip() {
         // OD fixture: obj 7 is an indirect /Length holder reachable ONLY via the
-        // stream's /Length edge. `collect_refs` follows /Length, so the holder is
-        // reachable unless excluded; passing it in `excluded` drops it (matching the
-        // orphan-/Length-holder lifecycle the linearize universe filter relies on).
+        // stream's /Length edge. With `skip_length = true` the walk does not follow
+        // that edge, so the holder is absent from the reachable universe — matching
+        // the orphan-/Length-holder GC the linearize universe filter relies on.
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let excluded: BTreeSet<ObjectRef> = std::iter::once(ObjectRef::new(7, 0)).collect();
-        let reachable = reachable_object_set(&mut pdf, &excluded).expect("walk");
+        let reachable = reachable_object_set(&mut pdf, true).expect("walk");
         assert!(
             !reachable.contains(&ObjectRef::new(7, 0)),
-            "excluded orphan /Length holder must not be reachable"
+            "orphan /Length holder must not be reachable once the /Length edge is skipped"
         );
         assert!(
             reachable.contains(&ObjectRef::new(4, 0)),
@@ -714,7 +789,7 @@ mod tests {
             .trailer()
             .get_ref("Encrypt")
             .expect("fixture has /Encrypt");
-        let reachable = reachable_object_set(&mut pdf, &BTreeSet::new()).expect("walk");
+        let reachable = reachable_object_set(&mut pdf, true).expect("walk");
         assert!(
             reachable.contains(&encrypt_ref),
             "the trailer /Encrypt dict ({encrypt_ref}) must be in the reachable universe"
@@ -722,15 +797,14 @@ mod tests {
     }
 
     #[test]
-    fn generate_build_excluding_drops_orphan_length_holder() {
+    fn generate_build_drops_orphan_length_holder_via_length_skip() {
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");
-        let excluded: BTreeSet<ObjectRef> = std::iter::once(ObjectRef::new(7, 0)).collect();
         // Empty groups: every reachable object is numbered as a plain object, so
-        // this isolates the `enqueue_gen` exclusion path. The holder is dropped;
-        // the page's /Contents stream (obj 4) is still numbered.
-        let map = GenerateRenumber::build_excluding(&mut pdf, &[], &excluded).expect("build");
+        // this isolates the generate walk. With `skip_length = true` the holder
+        // (obj 7) is dropped; the page's /Contents stream (obj 4) is still numbered.
+        let map = GenerateRenumber::build(&mut pdf, &[], true).expect("build");
         assert!(map.new_for_original(ObjectRef::new(7, 0)).is_none());
         assert!(map.new_for_original(ObjectRef::new(4, 0)).is_some());
         assert_eq!(map.pairs().count(), 6);
@@ -876,7 +950,7 @@ mod tests {
             Object::Reference(ObjectRef::new(10, 0)),
             MAX_INLINE_DEPTH + 5,
         );
-        let err = collect_refs(&obj, 0, &mut |_| {}).unwrap_err();
+        let err = collect_refs(&obj, 0, true, &mut |_| {}).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)));
     }
 
@@ -887,7 +961,7 @@ mod tests {
         // normally and collected, not errored.
         let obj = nest_in_arrays(Object::Reference(ObjectRef::new(10, 0)), MAX_INLINE_DEPTH);
         let mut collected: Vec<ObjectRef> = Vec::new();
-        collect_refs(&obj, 0, &mut |r| collected.push(r)).expect("within limit");
+        collect_refs(&obj, 0, true, &mut |r| collected.push(r)).expect("within limit");
         assert_eq!(collected, vec![ObjectRef::new(10, 0)]);
     }
 }

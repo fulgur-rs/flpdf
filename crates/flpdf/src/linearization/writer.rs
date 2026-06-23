@@ -446,11 +446,11 @@ fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Res
             for (key, value) in stream.dict.iter() {
                 // A stream's `/Length` is rewritten to a direct integer at
                 // emission time. When it is an indirect reference whose holder
-                // was dropped as an orphan (flpdf-2vfg —
-                // `orphaned_indirect_length_holders`), that holder has no
-                // renumber entry; substitute a direct length (the raw stored
-                // byte count) so the dangling reference never reaches output. A
-                // holder still present in the map is renumbered normally.
+                // was dropped as an orphan (the reachability walk does not follow
+                // the dead `/Length` edge), that holder has no renumber entry;
+                // substitute a direct length (the raw stored byte count) so the
+                // dangling reference never reaches output. A holder still present
+                // in the map is renumbered normally.
                 let dropped_length_holder = key == b"Length"
                     && matches!(value, Object::Reference(r) if renumber.new_for_original(*r).is_none());
                 if dropped_length_holder {
