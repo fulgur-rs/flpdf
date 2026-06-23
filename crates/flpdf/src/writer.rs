@@ -2197,17 +2197,19 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &
 }
 
 /// Extract the source trailer's permanent identifier `/ID[0]` when `/ID` is a
-/// well-formed 2-element array whose elements are both strings.
-/// Returns `None` for any other shape (missing, wrong arity, wrong types), in
-/// which case qpdf reuses the changing identifier as the permanent one. The
-/// returned bytes are preserved verbatim at any length: qpdf's `getOriginalID1`
-/// copies `/ID[0]` unchanged regardless of its length and only regenerates the
-/// 16-byte changing identifier `/ID[1]`, so the serialized `/ID` array is
-/// [`deterministic_id_array_len`]`(id0.len())` bytes wide.
+/// well-formed 2-element array whose elements are both *non-empty* strings.
+/// Returns `None` for any other shape (missing, wrong arity, wrong types, or an
+/// empty `/ID[0]`), in which case qpdf reuses the changing identifier as the
+/// permanent one. The returned bytes are preserved verbatim at any length:
+/// qpdf's `getOriginalID1` copies `/ID[0]` unchanged regardless of its length
+/// and only regenerates the 16-byte changing identifier `/ID[1]`, so the
+/// serialized `/ID` array is [`deterministic_id_array_len`]`(id0.len())` bytes
+/// wide. An empty `/ID[0]` is treated as absent (not preserved as `""`): qpdf
+/// falls back to the changing identifier for an empty original ID string.
 pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
     match trailer.get("ID") {
         Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
-            (Object::String(first), Object::String(_)) => Some(first.clone()),
+            (Object::String(first), Object::String(_)) if !first.is_empty() => Some(first.clone()),
             _ => None,
         },
         _ => None,
@@ -4752,6 +4754,19 @@ mod tests {
         let out = write_det_id(&src);
         let (id0, id1) = trailer_id_pair(&out);
         assert_eq!(id0, id1, "non-string source /ID must not be preserved");
+        assert_eq!(id1, expected_changing_id(&out, b"").to_vec());
+    }
+
+    #[test]
+    fn deterministic_id_treats_empty_source_id0_as_absent() {
+        // An empty source /ID[0] (`<>`) is not a usable permanent identifier:
+        // qpdf falls back to the generated changing identifier (verified against
+        // qpdf 11.9.0, where /ID[0] == /ID[1] for an empty original id). It must
+        // NOT be preserved verbatim as an empty string.
+        let src = build_det_id_source(&format!("/ID [<><{}>]", "bb".repeat(16)), &[]);
+        let out = write_det_id(&src);
+        let (id0, id1) = trailer_id_pair(&out);
+        assert_eq!(id0, id1, "empty source /ID[0] must fall back to /ID[1]");
         assert_eq!(id1, expected_changing_id(&out, b"").to_vec());
     }
 

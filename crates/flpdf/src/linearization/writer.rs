@@ -936,7 +936,11 @@ struct FirstPageXrefPatch {
 ///   - default: a fresh random two-element /ID — element 1 preserved from a
 ///     well-formed source /ID on re-save, both fresh on first save
 ///     (ISO 32000-1 §14.4).
-fn finalize_linearized_id(options: &WriteOptions, source_trailer: &Dictionary) -> Object {
+fn finalize_linearized_id(
+    options: &WriteOptions,
+    source_trailer: &Dictionary,
+    det_id_source_id0: Option<&[u8]>,
+) -> Object {
     let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
     if options.deterministic_id {
         // Size the all-zero permanent-identifier placeholder to the source
@@ -945,12 +949,10 @@ fn finalize_linearized_id(options: &WriteOptions, source_trailer: &Dictionary) -
         // regardless of length; both the pass-1 digest buffer and the probe
         // passes that measure `/L`, `/H`, the hint stream, and the xref offsets
         // serialize this placeholder, so any width other than the final one
-        // would shift every downstream offset. `source_trailer` still carries
-        // the ORIGINAL `/ID` here (this runs before the placeholder overwrites
-        // it), so the length is read from the source.
-        let len0 = crate::writer::source_permanent_id(source_trailer)
-            .map(|v| v.len())
-            .unwrap_or(16);
+        // would shift every downstream offset. The length is taken from the
+        // already-captured source `/ID[0]` (`None` -> 16, the fallback changing
+        // identifier's width), which matches what the writer emits.
+        let len0 = det_id_source_id0.map(<[u8]>::len).unwrap_or(16);
         Object::Array(vec![
             Object::String(vec![0u8; len0]),
             Object::String(vec![0u8; 16]),
@@ -2739,7 +2741,8 @@ pub fn write_linearized<R: Read + Seek>(
             (None, Vec::new())
         };
 
-    let finalized_id = finalize_linearized_id(options, &source_trailer);
+    let finalized_id =
+        finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
     source_trailer.insert("ID", finalized_id);
     let source_trailer = source_trailer;
 
