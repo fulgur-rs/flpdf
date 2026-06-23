@@ -614,6 +614,21 @@ impl LinearizationPlan {
         };
 
         // ----------------------------------------------------------------
+        // Step 1c: compute the in_outlines set for qpdf precedence.
+        // ----------------------------------------------------------------
+        // qpdf's in_outlines category outranks BOTH in_open_document and
+        // in_first_page (QPDF_linearization.cc:1120-1126): an object reachable
+        // from the catalog's /Outlines entry is lc_outlines (part6 when
+        // /PageMode /UseOutlines, else part9 — both via pushOutlinesToPart) even
+        // when it is also reached by the first page or an open-document key. The
+        // generate-mode container router (`route_objstm_containers`) already
+        // applies this precedence; the classic from_pdf partition below must too,
+        // so peel outline objects out of part2/part3 / the per-page-private sets
+        // (Steps 5 and 7) and route them through part4_rest to the outline
+        // extraction (Step 8). Mode-independent, like open_document above.
+        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+
+        // ----------------------------------------------------------------
         // Step 2: collect page references.
         // Propagate page-tree errors so a malformed /Pages does not silently
         // produce an empty page_hints (which would corrupt downstream hint tables).
@@ -710,7 +725,15 @@ impl LinearizationPlan {
             // mode places the AcroForm dict + widgets in part4, NOT the first-page
             // section (the 12 first-page objects there are the page dict + content
             // + 10 Fonts, not the widgets).
-            if open_document_set.contains(obj_ref) {
+            //
+            // in_outlines outranks in_first_page the same way (and outranks
+            // in_open_document, so check it first): an object reached from both the
+            // first page and /Outlines is lc_outlines (second-half part9, or part6
+            // under /UseOutlines), never part2/part3. Peel it here so the part4
+            // outline extraction in Step 8 can place it. Verified against qpdf
+            // 11.9.0: outlines-shared-page-80-80's /Extra-referenced font is the
+            // last second-half object, not a first-page-shared object (flpdf-q2zw).
+            if all_outline_refs.contains(obj_ref) || open_document_set.contains(obj_ref) {
                 continue;
             }
             if Some(*obj_ref) == first_page_ref {
@@ -823,6 +846,13 @@ impl LinearizationPlan {
                     if open_document_set.contains(r) {
                         return false;
                     }
+                    // Outline objects (in_outlines) outrank other-page-private the
+                    // same way: keep them out of the per-page-private set so the
+                    // part7 pre-pass never claims them and they stay available for
+                    // outline routing in the part8/part9 loop (flpdf-q2zw).
+                    if all_outline_refs.contains(r) {
+                        return false;
+                    }
                     page_reach.get(r).copied() == Some(1)
                 })
                 .collect();
@@ -856,13 +886,10 @@ impl LinearizationPlan {
         //   - page_reach >= 2 → two or more other pages → part8
         //   - page_reach == 0 → no page closure → part9
         let provisional_set: BTreeSet<ObjectRef> = part4_provisional.iter().copied().collect();
-        // Objects qpdf categorizes `in_outlines`.  qpdf's canonical
-        // classification orders `in_outlines` ABOVE `in_open_document`
-        // (QPDF_linearization.cc:1368-1387: lc_outlines before lc_open_document),
-        // so an object reachable from BOTH an open-document key and `/Outlines`
-        // is an outline.  Computed here (reused below at the outline extraction)
-        // so the open-document routing can defer to it.
-        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+        // `all_outline_refs` (qpdf's `in_outlines` set) was computed in Step 1c and
+        // already peeled out of part2/part3 (Step 5) and the per-page-private sets
+        // (Step 7); the loop below routes its members to part4_rest with top
+        // precedence so the Step 8 outline extraction places them.
         let mut part4_other_pages_private: Vec<ObjectRef> = Vec::new();
         let mut part4_other_pages_shared: Vec<ObjectRef> = Vec::new();
         let mut part4_rest: Vec<ObjectRef> = Vec::new();
@@ -886,6 +913,16 @@ impl LinearizationPlan {
                 // Already in part7.
                 continue;
             }
+            // in_outlines has top precedence (QPDF_linearization.cc:1120, above
+            // in_open_document and in_first_page). Route every outline object to
+            // part4_rest so the Step 8 extraction lifts it into the outline section
+            // (part6 under /UseOutlines, else part9). They were peeled from
+            // part2/part3 (Step 5) and the per-page-private sets (Step 7), so they
+            // reach this loop via part4_provisional even when first-page-reachable.
+            if all_outline_refs.contains(&r) {
+                part4_rest.push(r);
+                continue;
+            }
             let reach = page_reach.get(&r).copied().unwrap_or(0);
             // OD+first-page objects were peeled out of Part 2/3 by Step 5 in
             // every mode, so they ARE present in part4_provisional and must not be
@@ -897,14 +934,11 @@ impl LinearizationPlan {
                 continue;
             }
             // Route open-document objects to part4 (first half, before /O) in
-            // EVERY mode — qpdf's part4 = [lc_root] ++ lc_open_document.
-            //
-            // Exclude outline objects: qpdf orders `in_outlines` above
-            // `in_open_document`, so an OD object also reachable from `/Outlines`
-            // is an outline, not an open-document object.  Letting it fall through
-            // to `part4_rest` lets the outline extraction below lift it into the
-            // outline section (part6/part9), matching qpdf's precedence.
-            if open_document_set.contains(&r) && !all_outline_refs.contains(&r) {
+            // EVERY mode — qpdf's part4 = [lc_root] ++ lc_open_document. Outline
+            // objects (which qpdf orders above in_open_document) were already
+            // routed above, so anything reaching here that is in open_document_set
+            // is a genuine lc_open_document object.
+            if open_document_set.contains(&r) {
                 if let Some(ctx) = elig_ctx.as_ref() {
                     // generate mode: an OD object eligible for ObjStm packing goes
                     // to part4_rest (the batch planner packs it into the
@@ -927,17 +961,15 @@ impl LinearizationPlan {
                 }
                 continue;
             }
-            // Non-outline open-document objects are caught above in every mode.
-            // What remains: non-OD objects, and OD+outline objects (qpdf orders
-            // in_outlines above in_open_document) which fall to part4_rest for the
-            // outline extraction below.  Partition the rest by page reach.
-            if reach >= 2 && !open_document_set.contains(&r) {
+            // What remains: non-outline, non-open-document objects. Partition by
+            // page reach (qpdf's other_pages count): two or more other pages →
+            // lc_other_page_shared (part8); otherwise lc_other (part9).
+            if reach >= 2 {
                 part4_other_pages_shared.push(r);
             } else {
-                // reach == 0 or reach == 1 but not private (shouldn't happen
-                // since per_page_private_objects captures all reach-1 non-first
-                // objects), or open_document object with reach >= 2 in non-generate
-                // mode.  Everything else goes to part9.
+                // reach == 0, or reach == 1 but not captured as private (shouldn't
+                // happen since per_page_private_objects captures all reach-1
+                // non-first objects). Everything else goes to part9.
                 part4_rest.push(r);
             }
         }
@@ -2431,6 +2463,104 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("two-page PDF should parse")
     }
 
+    /// Build a two-page PDF whose shared font is ALSO referenced by an outline
+    /// item (via a non-standard `/Extra` key), reproducing flpdf-q2zw in miniature.
+    /// With `use_outlines`, the catalog also sets `/PageMode /UseOutlines` so the
+    /// outline section routes to part6 (first half) instead of part9.
+    ///
+    /// Object layout (extends [`two_page_shared_font_bytes`]):
+    ///   1 0 obj – Catalog  (/Pages 2 0 R, /Outlines 9 0 R [, /PageMode /UseOutlines])
+    ///   2 0 obj – Pages node  (Kids: [3 0 R, 4 0 R])
+    ///   3 0 obj – Page 1  → /Resources 5 0 R, /Contents 6 0 R
+    ///   4 0 obj – Page 2  → /Resources 5 0 R, /Contents 7 0 R
+    ///   5 0 obj – Resources  → /Font << /F1 8 0 R >>
+    ///   6 0 obj – Content stream (page 1 only)
+    ///   7 0 obj – Content stream (page 2 only)
+    ///   8 0 obj – Font  (shared by both pages AND reached from the outline)
+    ///   9 0 obj – Outlines dict  (/First 10 0 R, /Last 10 0 R)
+    ///  10 0 obj – Outline item  (/Extra 8 0 R → the font)
+    fn two_page_shared_font_outline_ref_bytes(use_outlines: bool) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        if use_outlines {
+            pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R /PageMode /UseOutlines >>\nendobj\n");
+        } else {
+            pdf.extend_from_slice(
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R >>\nendobj\n",
+            );
+        }
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 6 0 R >>\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 7 0 R >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Font << /F1 8 0 R >> >>\nendobj\n");
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
+
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(b"7 0 obj\n<< /Length 5 >>\nstream\nBT ET\nendstream\nendobj\n");
+
+        let off8 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"8 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let off9 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"9 0 obj\n<< /Type /Outlines /First 10 0 R /Last 10 0 R /Count 1 >>\nendobj\n",
+        );
+
+        let off10 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"10 0 obj\n<< /Title (Item) /Parent 9 0 R /Extra 8 0 R >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref_section = format!(
+            "xref\n0 11\n\
+            0000000000 65535 f \n\
+            {off1:010} 00000 n \n\
+            {off2:010} 00000 n \n\
+            {off3:010} 00000 n \n\
+            {off4:010} 00000 n \n\
+            {off5:010} 00000 n \n\
+            {off6:010} 00000 n \n\
+            {off7:010} 00000 n \n\
+            {off8:010} 00000 n \n\
+            {off9:010} 00000 n \n\
+            {off10:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref_section.as_bytes());
+
+        let trailer =
+            format!("trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",);
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        pdf
+    }
+
+    fn open_two_page_shared_font_outline_ref() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = two_page_shared_font_outline_ref_bytes(false);
+        Pdf::open(Cursor::new(bytes)).expect("two-page outline-ref PDF should parse")
+    }
+
+    fn open_two_page_shared_font_outline_ref_use_outlines() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = two_page_shared_font_outline_ref_bytes(true);
+        Pdf::open(Cursor::new(bytes)).expect("two-page UseOutlines outline-ref PDF should parse")
+    }
+
     /// Build a PDF where the page's Resources dictionary references objects in
     /// a cycle: A → B → A (both are XObject-style objects hanging off /Resources).
     ///
@@ -2649,6 +2779,101 @@ mod tests {
         );
 
         // Disjoint invariant must hold.
+        assert!(plan.parts_are_disjoint());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6b. Outline-referenced shared font: in_outlines outranks in_first_page,
+    //     so a font referenced by BOTH pages AND an outline item is lc_outlines
+    //     (part9, !UseOutlines) — NOT first-page-shared (part3). qpdf
+    //     categorization QPDF_linearization.cc:1120-1126 (flpdf-q2zw).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn outline_referenced_shared_font_routes_to_outline_section_not_first_page() {
+        let mut pdf = open_two_page_shared_font_outline_ref();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+
+        let font = ObjectRef::new(8, 0);
+        let outline_root = ObjectRef::new(9, 0);
+        let outline_item = ObjectRef::new(10, 0);
+
+        // The font is reached from page 0, page 1, AND the outline. in_outlines
+        // wins, so it must be in the outline section, peeled out of the first-page
+        // section (part2/part3) and never captured as other-page-private (part7).
+        assert!(
+            plan.part9_outline_objects.contains(&font),
+            "outline-referenced font must be in part9_outline_objects, got {:?}",
+            plan.part9_outline_objects
+        );
+        assert!(
+            !plan.part2_objects.contains(&font) && !plan.part3_objects.contains(&font),
+            "outline-referenced font must be peeled out of the first-page section"
+        );
+        assert!(
+            !plan.part4_other_pages_private.contains(&font),
+            "outline-referenced font must not be captured as other-page-private"
+        );
+
+        // pushOutlinesToPart emits the root first, then the remaining outline
+        // objects in ascending source-object-number order
+        // (QPDF_linearization.cc:1426-1431): [root 9] ++ [font 8, item 10].
+        assert_eq!(
+            plan.part9_outline_objects,
+            vec![outline_root, font, outline_item],
+            "outline order must be [root] ++ ascending source number"
+        );
+
+        assert!(plan.parts_are_disjoint());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6c. Symmetric UseOutlines case: the same page+outline-shared font flows
+    //     through the part6 (first-half) outline branch instead of part9. qpdf
+    //     routes lc_outlines to part6 under /PageMode /UseOutlines
+    //     (QPDF_linearization.cc:1214-1216) and counts those objects toward
+    //     page 0 (line 1222). Byte parity for this combination needs a dedicated
+    //     fixture (filed as a follow-up); this pins flpdf's internal accounting.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn outline_referenced_shared_font_routes_to_part6_under_use_outlines() {
+        let mut pdf = open_two_page_shared_font_outline_ref_use_outlines();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+
+        let font = ObjectRef::new(8, 0);
+        let outline_root = ObjectRef::new(9, 0);
+        let outline_item = ObjectRef::new(10, 0);
+
+        // /UseOutlines → outline objects (including the page-shared font) move to
+        // the first-half part6 outline section, not part9.
+        assert!(
+            plan.part6_outline_objects.contains(&font),
+            "UseOutlines: outline-referenced font must be in part6_outline_objects, got {:?}",
+            plan.part6_outline_objects
+        );
+        assert!(
+            plan.part9_outline_objects.is_empty(),
+            "UseOutlines: part9 outlines must be empty"
+        );
+        assert_eq!(
+            plan.part6_outline_objects,
+            vec![outline_root, font, outline_item],
+            "UseOutlines outline order must be [root] ++ ascending source number"
+        );
+        assert!(
+            !plan.part2_objects.contains(&font) && !plan.part3_objects.contains(&font),
+            "outline-referenced font must be peeled out of the first-page section"
+        );
+
+        // part6 outline objects are emitted before /E and count toward page 0
+        // (QPDF_linearization.cc:1222): object_count = part2 + part3 + part6_outline.
+        let expected_page0 = (plan.part2_objects.len()
+            + plan.part3_objects.len()
+            + plan.part6_outline_objects.len()) as u32;
+        assert_eq!(
+            plan.page_hints[0].object_count, expected_page0,
+            "page-0 object_count must include the part6 outline objects"
+        );
+
         assert!(plan.parts_are_disjoint());
     }
 

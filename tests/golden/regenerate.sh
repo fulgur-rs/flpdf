@@ -688,8 +688,13 @@ echo "objstm-lin-cap-boundary-199-bearing/linearize-objstm-preserve.pdf"
 # Classic (non-ObjStm) linearize goldens for outline section routing (flpdf-vvjr.2).
 # outlines-80-80: outlines route to part9 (second-half, !UseOutlines).
 # useoutlines-80-80: outlines route to part6 (first-page section, UseOutlines).
+# outlines-shared-page-80-80 (flpdf-q2zw): one font is referenced by BOTH pages
+#   AND an outline item (/Extra), so qpdf's in_outlines category outranks
+#   in_first_page and that font lands in part9 (second half) — pins the classic
+#   path's outline > first-page precedence (the ObjStm path already covered it).
 # Pinned to linearize-classic.pdf to coexist with the ObjStm golden in the same dir.
-for stem in objstm-lin-outlines-80-80 objstm-lin-useoutlines-80-80; do
+for stem in objstm-lin-outlines-80-80 objstm-lin-useoutlines-80-80 \
+    objstm-lin-outlines-shared-page-80-80; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-classic.pdf"

@@ -405,6 +405,30 @@ fn useoutlines_classic_byte_identical_to_qpdf() {
     );
 }
 
+// outlines-shared-page-80-80 (flpdf-q2zw): one font (the highest-numbered outline
+// object) is referenced by BOTH pages AND an outline item via /Extra. qpdf's
+// categorization (QPDF_linearization.cc:1120) ranks in_outlines above in_first_page,
+// so that font is lc_outlines (part9, second half) while the 79 page-only fonts stay
+// lc_first_page_shared (part6, first half). The classic path previously kept it in
+// the first-page section (param dict 85 vs qpdf 86); this pins the outline >
+// first-page precedence on the non-ObjStm path. pushOutlinesToPart emits outlines
+// as [root] ++ ascending source number, so the font (max number) is the last object.
+#[test]
+fn outlines_shared_page_classic_structurally_byte_identical_to_qpdf() {
+    assert_classic_structurally_byte_identical(
+        "objstm-lin-outlines-shared-page-80-80.pdf",
+        "objstm-lin-outlines-shared-page-80-80",
+    );
+}
+
+#[test]
+fn outlines_shared_page_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-outlines-shared-page-80-80.pdf",
+        "objstm-lin-outlines-shared-page-80-80",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Open-document closure (flpdf-lubb): objects reachable from the catalog
 // open-document keys (/OpenAction, /AcroForm, /PageMode, /Threads,
