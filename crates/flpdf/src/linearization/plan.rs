@@ -614,6 +614,21 @@ impl LinearizationPlan {
         };
 
         // ----------------------------------------------------------------
+        // Step 1c: compute the in_outlines set for qpdf precedence.
+        // ----------------------------------------------------------------
+        // qpdf's in_outlines category outranks BOTH in_open_document and
+        // in_first_page (QPDF_linearization.cc:1120-1126): an object reachable
+        // from the catalog's /Outlines entry is lc_outlines (part6 when
+        // /PageMode /UseOutlines, else part9 — both via pushOutlinesToPart) even
+        // when it is also reached by the first page or an open-document key. The
+        // generate-mode container router (`route_objstm_containers`) already
+        // applies this precedence; the classic from_pdf partition below must too,
+        // so peel outline objects out of part2/part3 / the per-page-private sets
+        // (Steps 5 and 7) and route them through part4_rest to the outline
+        // extraction (Step 8). Mode-independent, like open_document above.
+        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+
+        // ----------------------------------------------------------------
         // Step 2: collect page references.
         // Propagate page-tree errors so a malformed /Pages does not silently
         // produce an empty page_hints (which would corrupt downstream hint tables).
@@ -710,7 +725,15 @@ impl LinearizationPlan {
             // mode places the AcroForm dict + widgets in part4, NOT the first-page
             // section (the 12 first-page objects there are the page dict + content
             // + 10 Fonts, not the widgets).
-            if open_document_set.contains(obj_ref) {
+            //
+            // in_outlines outranks in_first_page the same way (and outranks
+            // in_open_document, so check it first): an object reached from both the
+            // first page and /Outlines is lc_outlines (second-half part9, or part6
+            // under /UseOutlines), never part2/part3. Peel it here so the part4
+            // outline extraction in Step 8 can place it. Verified against qpdf
+            // 11.9.0: outlines-shared-page-80-80's /Extra-referenced font is the
+            // last second-half object, not a first-page-shared object (flpdf-q2zw).
+            if all_outline_refs.contains(obj_ref) || open_document_set.contains(obj_ref) {
                 continue;
             }
             if Some(*obj_ref) == first_page_ref {
@@ -823,6 +846,13 @@ impl LinearizationPlan {
                     if open_document_set.contains(r) {
                         return false;
                     }
+                    // Outline objects (in_outlines) outrank other-page-private the
+                    // same way: keep them out of the per-page-private set so the
+                    // part7 pre-pass never claims them and they stay available for
+                    // outline routing in the part8/part9 loop (flpdf-q2zw).
+                    if all_outline_refs.contains(r) {
+                        return false;
+                    }
                     page_reach.get(r).copied() == Some(1)
                 })
                 .collect();
@@ -856,13 +886,10 @@ impl LinearizationPlan {
         //   - page_reach >= 2 → two or more other pages → part8
         //   - page_reach == 0 → no page closure → part9
         let provisional_set: BTreeSet<ObjectRef> = part4_provisional.iter().copied().collect();
-        // Objects qpdf categorizes `in_outlines`.  qpdf's canonical
-        // classification orders `in_outlines` ABOVE `in_open_document`
-        // (QPDF_linearization.cc:1368-1387: lc_outlines before lc_open_document),
-        // so an object reachable from BOTH an open-document key and `/Outlines`
-        // is an outline.  Computed here (reused below at the outline extraction)
-        // so the open-document routing can defer to it.
-        let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
+        // `all_outline_refs` (qpdf's `in_outlines` set) was computed in Step 1c and
+        // already peeled out of part2/part3 (Step 5) and the per-page-private sets
+        // (Step 7); the loop below routes its members to part4_rest with top
+        // precedence so the Step 8 outline extraction places them.
         let mut part4_other_pages_private: Vec<ObjectRef> = Vec::new();
         let mut part4_other_pages_shared: Vec<ObjectRef> = Vec::new();
         let mut part4_rest: Vec<ObjectRef> = Vec::new();
@@ -886,6 +913,16 @@ impl LinearizationPlan {
                 // Already in part7.
                 continue;
             }
+            // in_outlines has top precedence (QPDF_linearization.cc:1120, above
+            // in_open_document and in_first_page). Route every outline object to
+            // part4_rest so the Step 8 extraction lifts it into the outline section
+            // (part6 under /UseOutlines, else part9). They were peeled from
+            // part2/part3 (Step 5) and the per-page-private sets (Step 7), so they
+            // reach this loop via part4_provisional even when first-page-reachable.
+            if all_outline_refs.contains(&r) {
+                part4_rest.push(r);
+                continue;
+            }
             let reach = page_reach.get(&r).copied().unwrap_or(0);
             // OD+first-page objects were peeled out of Part 2/3 by Step 5 in
             // every mode, so they ARE present in part4_provisional and must not be
@@ -897,14 +934,11 @@ impl LinearizationPlan {
                 continue;
             }
             // Route open-document objects to part4 (first half, before /O) in
-            // EVERY mode — qpdf's part4 = [lc_root] ++ lc_open_document.
-            //
-            // Exclude outline objects: qpdf orders `in_outlines` above
-            // `in_open_document`, so an OD object also reachable from `/Outlines`
-            // is an outline, not an open-document object.  Letting it fall through
-            // to `part4_rest` lets the outline extraction below lift it into the
-            // outline section (part6/part9), matching qpdf's precedence.
-            if open_document_set.contains(&r) && !all_outline_refs.contains(&r) {
+            // EVERY mode — qpdf's part4 = [lc_root] ++ lc_open_document. Outline
+            // objects (which qpdf orders above in_open_document) were already
+            // routed above, so anything reaching here that is in open_document_set
+            // is a genuine lc_open_document object.
+            if open_document_set.contains(&r) {
                 if let Some(ctx) = elig_ctx.as_ref() {
                     // generate mode: an OD object eligible for ObjStm packing goes
                     // to part4_rest (the batch planner packs it into the
@@ -927,17 +961,15 @@ impl LinearizationPlan {
                 }
                 continue;
             }
-            // Non-outline open-document objects are caught above in every mode.
-            // What remains: non-OD objects, and OD+outline objects (qpdf orders
-            // in_outlines above in_open_document) which fall to part4_rest for the
-            // outline extraction below.  Partition the rest by page reach.
-            if reach >= 2 && !open_document_set.contains(&r) {
+            // What remains: non-outline, non-open-document objects. Partition by
+            // page reach (qpdf's other_pages count): two or more other pages →
+            // lc_other_page_shared (part8); otherwise lc_other (part9).
+            if reach >= 2 {
                 part4_other_pages_shared.push(r);
             } else {
-                // reach == 0 or reach == 1 but not private (shouldn't happen
-                // since per_page_private_objects captures all reach-1 non-first
-                // objects), or open_document object with reach >= 2 in non-generate
-                // mode.  Everything else goes to part9.
+                // reach == 0, or reach == 1 but not captured as private (shouldn't
+                // happen since per_page_private_objects captures all reach-1
+                // non-first objects). Everything else goes to part9.
                 part4_rest.push(r);
             }
         }
