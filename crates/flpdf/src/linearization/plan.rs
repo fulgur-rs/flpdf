@@ -34,7 +34,7 @@ use crate::linearization::renumber::RenumberMap;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm,
-    orphaned_indirect_length_holders, ObjectStreamMode, PlannerConfig,
+    ObjectStreamMode, PlannerConfig,
 };
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -546,37 +546,34 @@ impl LinearizationPlan {
         // length-calc reject them ("found unknown object"). This mirrors the
         // plain rewrite path's emission-time skip (see
         // [`crate::writer::is_source_structural_container`]).
-        // Drop indirect `/Length` holders that become orphaned once each stream's
-        // `/Length` is normalized to a direct integer (qpdf garbage-collects them;
-        // see [`orphaned_indirect_length_holders`]). Applies to EVERY linearization
-        // mode: the linearized writer always emits a direct `/Length` — re-encoded
-        // and lone-`/FlateDecode`-verbatim streams alike, and `renumber_object`
-        // substitutes a direct length for a dropped holder's dangling reference —
-        // so an indirect `/Length` edge is dead in the output regardless of the
-        // object-stream mode (flpdf-2vfg). The plain (non-linearized) full-rewrite
-        // path has the same divergence, tracked separately (flpdf-sqkq).
-        let orphan_length_holders = orphaned_indirect_length_holders(pdf)?;
         // qpdf garbage-collects objects unreachable from the trailer roots (it
         // only enqueues reachable objects). The plain full-rewrite path does this
         // via CatalogFirstRenumber's trailer-seeded BFS; the linearize universe
         // must too, or re-linearizing an already-linearized source leaks its old
         // /Linearized parameter dict + hint stream — both unreachable structural
         // artifacts — into the second half (flpdf-phfu).
-        let reachable = crate::rewrite_renumber::reachable_object_set(pdf, &orphan_length_holders)?;
+        //
+        // `skip_length = true`: the linearized writer always emits a direct
+        // `/Length` — re-encoded and lone-`/FlateDecode`-verbatim streams alike,
+        // and `renumber_object` substitutes a direct length for a dropped holder's
+        // dangling reference — so a stream's indirect `/Length` edge is dead in the
+        // output regardless of object-stream mode. Not following it drops a holder
+        // reachable only through it, matching qpdf's reachability GC.
+        let reachable = crate::rewrite_renumber::reachable_object_set(pdf, true)?;
         let object_refs = pdf.object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
             if r.number == 0 {
                 continue;
             }
-            if orphan_length_holders.contains(&r) {
-                continue;
-            }
             if crate::writer::is_source_structural_container(pdf.resolve_borrowed(r)?) {
                 continue;
             }
             if !reachable.contains(&r) {
-                // Unreachable from the trailer roots — qpdf drops it (flpdf-phfu).
+                // Unreachable from the trailer roots — qpdf drops it. This also
+                // drops an orphaned indirect `/Length` holder: the reachability
+                // walk does not follow the dead `/Length` edge, so a holder
+                // reachable only through it is absent from `reachable`.
                 continue;
             }
             all_refs.push(r);
