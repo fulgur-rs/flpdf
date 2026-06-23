@@ -1725,25 +1725,16 @@ fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
     // value (e.g. a direct `/Info << /Held 5 0 R >>`). qpdf's `enqueueObjectsStandard`
     // enqueues each trimmed-trailer value "handling direct objects recursively",
     // so the renumber walk seeds these nested holders and the trailer must rewrite
-    // them to their new numbers too. Real trailers carry only top-level references
-    // (`/Root`, `/Info`, `/Encrypt`) and scalars (`/ID` strings, `/Size`/`/Prev`
-    // integers), so this pass is a no-op for them; it matters only for the
-    // (spec-violating) direct dict/array trailer value. Scalars are skipped here;
-    // `renumber_refs_in_place` errors on an unmapped nested reference, refusing to
-    // emit a dangling trailer reference.
-    let nested_keys: Vec<Vec<u8>> = trailer
-        .iter()
-        .filter(|(key, value)| {
-            *key != b"Root"
-                && *key != b"Encrypt"
-                && matches!(value, Object::Dictionary(_) | Object::Array(_))
-        })
-        .map(|(key, _)| key.to_vec())
-        .collect();
-    for key in nested_keys {
-        if let Some(mut value) = trailer.remove(&key) {
-            crate::rewrite_renumber::renumber_refs_in_place(&mut value, map)?;
-            trailer.insert(key, value);
+    // them to their new numbers too. Real trailers carry their references at the
+    // top level (`/Root`, `/Info`, `/Encrypt`) — already handled above and excluded
+    // here by the dict/array type filter — plus scalars (`/Size`/`/Prev` integers)
+    // and the direct `/ID` byte-string array (recursed as a no-op). Only the
+    // (spec-violating) direct dict/array trailer value carries nested references;
+    // `renumber_refs_in_place` errors on an unmapped one, refusing to emit a
+    // dangling trailer reference.
+    for value in trailer.values_mut() {
+        if matches!(value, Object::Dictionary(_) | Object::Array(_)) {
+            crate::rewrite_renumber::renumber_refs_in_place(value, map)?;
         }
     }
     Ok(())
