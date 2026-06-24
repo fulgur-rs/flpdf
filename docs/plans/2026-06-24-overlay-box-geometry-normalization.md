@@ -94,27 +94,32 @@ let media_rect = normalize_rectangle(page_box_array(&media_box));
 
 ## Task 2: Inverse-transform `tmatrix` dims normalization (Edit B)
 
+> **REVISION (during impl):** Edit B is an **output no-op** and is kept ONLY for
+> qpdf structural fidelity (mandate: reproduce qpdf's computation, do not "improve").
+> The box width/height feed only the tmatrix TRANSLATION column
+> (`transformation_matrix` puts `width*scale`/`height*scale` in positions e/f, never
+> a/b/c/d), and the placement centring (`tx = r_cx - t_cx`) absorbs that translation.
+> Verified empirically: reverting Edit B leaves all 18 byte gates green; reverting
+> Edit A (which IS serialized into the `/Matrix` array) fails the swapped+r90 gate.
+> So **no byte-gate or `/Contents`-compare test can isolate Edit B** — unlike the
+> issue's original premise. This is the inverse of the fo_bbox case: fo_bbox does an
+> *equivalent* computation (transform_bbox already min/maxes), whereas dropping Edit B
+> would make the intermediate tmatrix genuinely differ from qpdf's. Per the
+> byte-identical mandate, KEEP it and document the no-op (do not delete as dead code).
+
 **Files:**
 - Modify: `crates/flpdf/src/overlay.rs` `apply_overlays_to_page` lines ~262-263
-- Test: `crates/flpdf/src/overlay.rs` `mod tests`
 
-**Step 1: Failing test** — apply an overlay onto a dest page with a swapped TrimBox AND
-`/Rotate 90`; assert the emitted `/Fx0` placement `cm` matches the same page with a
-normalized TrimBox + `/Rotate 90` (the inverse tmatrix dims must use `|w|`,`|h|`).
-Build the two in-memory docs with `build_pdf`/`one_page_doc` helpers already in `mod
-tests`; compare the generated `/Contents` bytes.
-
-**Step 2: Run** → FAIL (raw negative dims skew the tmatrix translation column).
-
-**Step 3: Implement**
+**Step 1: Implement** — normalize the tmatrix dims (covered by existing non-gated
+`apply_*` tests for line coverage; no isolating behavioural test is possible). The
+non-gated `apply_swapped_box_with_rotate_matches_normalized` test still passes (it is
+discriminated by Edit A's `/Matrix` and Edit C's rect, not by Edit B):
 
 ```rust
 let [n_llx, n_lly, n_urx, n_ury] = normalize_rectangle(page_box_array(&trim_box));
 let trim_w = n_urx - n_llx;
 let trim_h = n_ury - n_lly;
 ```
-
-**Step 4: Run** → PASS. Commit.
 
 ---
 

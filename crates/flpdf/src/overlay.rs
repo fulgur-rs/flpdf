@@ -259,8 +259,15 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // qpdf's getMatrixForTransformations(true). Identity when the dest page has no
     // /Rotate or /UserUnit, so a non-rotated page is unaffected.
     let dest_transform = read_page_transform(dest, dest_page_ref)?;
-    // qpdf's getMatrixForTransformations reads the box through getArrayAsRectangle,
-    // so the width/height are the normalized (non-negative) extents.
+    // qpdf's getMatrixForTransformations reads the box through getArrayAsRectangle
+    // (libqpdf/QPDFPageObjectHelper.cc), so the width/height are the normalized
+    // (non-negative) extents. These dims feed ONLY the tmatrix translation column
+    // (transformation_matrix puts width*scale/height*scale in positions e/f, never
+    // the a/b/c/d rotation part), and the placement centring (tx = r_cx - t_cx)
+    // absorbs that translation -- so for a reversed box this normalization is an
+    // output no-op that no byte-gate can isolate. It is kept to reproduce qpdf's
+    // computation faithfully, NOT for an observable byte difference (do not "dead
+    // code" it away).
     let [n_llx, n_lly, n_urx, n_ury] = normalize_rectangle(page_box_array(&trim_box));
     let trim_w = n_urx - n_llx;
     let trim_h = n_ury - n_lly;
@@ -831,10 +838,14 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 //   swapped+r90 (lkk7)  | overlay  | swapped-r90   | swapped-r90   | -      | -     | -
 //
 // The flpdf-lkk7 rows cover reversed page boxes (llx>urx AND lly>ury): qpdf reads
-// all placement geometry through getArrayAsRectangle (min/max normalized), so the
-// swapped-box row proves the placement-rect normalization and the swapped+r90 row
-// (overlaid onto itself) additionally proves the dest tmatrix dims and the source
-// Form /Matrix dims normalize. Both fixtures are pinned to PDF 1.3.
+// all placement geometry through getArrayAsRectangle (min/max normalized). The
+// swapped-box row proves the placement-rect normalization (a raw rect would reflect
+// the source cm). The swapped+r90 row (overlaid onto itself) additionally proves the
+// source/dest Form /Matrix dims normalize -- the /Matrix array is serialized into
+// the output, so a raw width flips its sign. (The dest tmatrix dims are ALSO
+// normalized in code, but that is an output no-op here: their only effect is the
+// tmatrix translation, which the placement centring absorbs -- see
+// apply_overlays_to_page. So no gate isolates it.) Both fixtures are pinned to 1.3.
 //
 // The rotated-source row is the matrix-transformed placement check: the source
 // page carries /Rotate 90, so its imported Form XObject gets a non-identity
@@ -1282,10 +1293,12 @@ mod byte_gate {
     #[test]
     fn swapped_box_r90_overlay_self_is_byte_identical() {
         // dest = source = swapped-box-r90-one-page (reversed box + /Rotate 90),
-        // overlaid onto itself. The /Rotate makes the dest inverse tmatrix and the
-        // source Form /Matrix depend on the box width/height, so this exercises the
-        // tmatrix-dim normalization (Edit B) and the source /Matrix-dim
-        // normalization (Edit A) on top of the placement rects (Edit C).
+        // overlaid onto itself. The /Rotate makes the source/dest Form /Matrix
+        // depend on the box width/height, and that /Matrix array is serialized, so
+        // this proves the /Matrix-dim normalization (Edit A) on top of the placement
+        // rects (Edit C). (The dest tmatrix dims are normalized too, but their effect
+        // -- the tmatrix translation -- is absorbed by the placement centring, so it
+        // is an output no-op this gate cannot isolate.)
         let mut dest = fixture("swapped-box-r90-one-page.pdf");
         let mut source = fixture("swapped-box-r90-one-page.pdf");
         apply_overlay_spec(
