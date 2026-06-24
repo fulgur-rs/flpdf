@@ -1738,25 +1738,15 @@ impl LinearizationPlan {
         _ctx: &crate::writer::object_streams::EligibilityContext,
         _length_exclusions: &BTreeSet<ObjectRef>,
     ) -> crate::Result<ObjStmBatchPlan> {
-        // `objstm_membership_linearized` derives its containers from
-        // `compressible_objgens`, a trailer-graph traversal that pushes every
-        // non-stream/non-signature/non-encryption ref it reaches — including a
-        // missing or trailer-only ref (e.g. `/Info 99 0 R` with no xref entry)
-        // that `resolve_borrowed` returns as `Null`. Such a ref has no renumber
-        // slot, so batching it would make `place_objstm_members_per_half`
-        // panic. Drop members outside the plan's renumber-assigned set (and any
-        // container left wholly unplanned) before routing — mirroring the
-        // preserve path's "eligible but no RenumberMap entry → leave plain"
-        // gate. For a well-formed PDF every member is assigned, so the filter is
-        // a no-op and the batches stay byte-identical.
+        // `objstm_membership_linearized` filters its containers to the plan's
+        // renumber-assigned set BEFORE the even split, so a missing or
+        // trailer-only ref (e.g. `/Info 99 0 R` with no xref entry, which
+        // `compressible_objgens` admits as `Null`) neither inflates the split
+        // boundary nor reaches `place_objstm_members_per_half` without a slot
+        // (which would panic). For a well-formed PDF every member is assigned,
+        // so the filter is a no-op and the batches stay byte-identical.
         let assigned = self.renumber_assigned_refs();
-        let containers: Vec<Vec<ObjectRef>> = objstm_membership_linearized(pdf)?
-            .into_iter()
-            .filter_map(|mut members| {
-                members.retain(|r| assigned.contains(r));
-                (!members.is_empty()).then_some(members)
-            })
-            .collect();
+        let containers = objstm_membership_linearized(pdf, &assigned)?;
         let routes = route_objstm_containers(pdf, &containers)?;
 
         let outline_set = &self.outline_first_page_members;
@@ -2043,14 +2033,28 @@ pub(crate) enum ContainerPart {
 /// one container's surviving members in even-split (DFS) order. A container left
 /// empty by the erasure is dropped.
 ///
+/// `assigned` is the set of refs that receive a renumber slot
+/// ([`LinearizationPlan::renumber_assigned_refs`]). Refs outside it — a missing
+/// or trailer-only ref that
+/// [`compressible_objgens`](crate::writer::object_streams::compressible_objgens)
+/// admits because `resolve_borrowed` returns it as `Null` — are dropped
+/// **before** the even split, so they cannot inflate the split boundary and
+/// scatter real members across separate ObjStms (qpdf never adds a non-existent
+/// object to its compressible set). The page dictionaries and root Catalog are
+/// in `assigned`, so they still consume split positions and are erased
+/// afterwards, exactly as qpdf does.
+///
 /// # Errors
 ///
 /// Propagates reader errors from the compressible-set traversal or the page-tree
 /// walk used to build the erase set.
 pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    assigned: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<Vec<ObjectRef>>> {
-    let eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    let mut eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    // Drop refs without a renumber slot before the split (see doc above).
+    eligible.retain(|r| assigned.contains(r));
     let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
 
     // Erase set: every page dictionary plus the root Catalog. qpdf cannot place
@@ -5040,7 +5044,10 @@ mod tests {
         // gen_mixed_shared 60 70: 135 eligible => 2 streams (68 + 67); erase
         // Catalog + Page0 + Page1 (all in stream 0) => 65 + 67 members.
         let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
-        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let assigned = LinearizationPlan::from_pdf(&mut pdf, true)
+            .unwrap()
+            .renumber_assigned_refs();
+        let containers = objstm_membership_linearized(&mut pdf, &assigned).unwrap();
         assert_eq!(
             containers.len(),
             2,
@@ -5070,7 +5077,10 @@ mod tests {
         // qpdf measured: stream 0 (shared fonts + Pages + Info) => part6;
         // stream 1 (page-1-only fonts) => part7.
         let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
-        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let assigned = LinearizationPlan::from_pdf(&mut pdf, true)
+            .unwrap()
+            .renumber_assigned_refs();
+        let containers = objstm_membership_linearized(&mut pdf, &assigned).unwrap();
         let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
         assert_eq!(
             routes,
@@ -5083,7 +5093,10 @@ mod tests {
         // qpdf measured: stream 0 (page-0-private fonts + Pages + Info) => part6;
         // stream 1 (fonts shared by pages 1 & 2, reach {1,2}) => part8.
         let mut pdf = Pdf::open(Cursor::new(three_page_shared_pdf_bytes(2, 120))).unwrap();
-        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let assigned = LinearizationPlan::from_pdf(&mut pdf, true)
+            .unwrap()
+            .renumber_assigned_refs();
+        let containers = objstm_membership_linearized(&mut pdf, &assigned).unwrap();
         let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
         assert_eq!(
             routes,
@@ -5579,36 +5592,38 @@ mod tests {
         pdf
     }
 
-    /// Single-page PDF whose Catalog carries a `/Junk` array of `n` missing
-    /// indirect refs (objects `10..10+n`, none with an xref entry). With enough
-    /// of them the compressible set spans two even-split containers, one of
-    /// which holds only missing refs — exercising the "container left wholly
-    /// unplanned" drop in `objstm_batches_generate`.
-    fn catalog_with_missing_refs_pdf_bytes(n: u32) -> Vec<u8> {
+    /// Single-page PDF with a real `/Info` (obj 4) whose trailer also carries `n`
+    /// missing `/Junk` refs (objects `10..10+n`, none with an xref entry). With
+    /// `n` large enough the *unfiltered* compressible set crosses the 100-member
+    /// even-split boundary, scattering the two real ObjStm members (the `/Info`
+    /// dict and the `/Pages` tree) into separate containers. Filtering the
+    /// missing refs before the split keeps both in one container, as qpdf does
+    /// (Codex review on PR #421). Byte-identical to `tests/fixtures/compat/
+    /// objstm-lin-split-boundary.pdf`.
+    fn info_and_missing_junk_pdf_bytes(n: u32) -> Vec<u8> {
         let mut junk = String::new();
         for i in 0..n {
-            junk.push_str(&format!("{} 0 R ", 10 + i));
+            junk.push_str(&format!("/J{i} {} 0 R ", 10 + i));
         }
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len() as u64;
-        pdf.extend_from_slice(
-            format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Junk [ {junk}] >>\nendobj\n")
-                .as_bytes(),
-        );
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
         let off3 = pdf.len() as u64;
         pdf.extend_from_slice(
             b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
         );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Producer (flpdf-test) >>\nendobj\n");
         let xref_start = pdf.len() as u64;
         let xref = format!(
-            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n",
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n",
         );
         pdf.extend_from_slice(xref.as_bytes());
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            format!("trailer\n<< /Size 110 /Root 1 0 R /Info 4 0 R {junk}>>\nstartxref\n{xref_start}\n%%EOF\n")
                 .as_bytes(),
         );
         pdf
@@ -5663,47 +5678,36 @@ mod tests {
         write_linearized_generate(&bytes);
     }
 
-    /// When a whole even-split container holds only unplanned refs, the generate
-    /// planner drops the container entirely (the `kept.is_empty()` arm of the
-    /// membership filter). 100 missing `/Junk` refs split the compressible set
-    /// into two containers, one of which carries no planned member.
-    ///
-    /// This stays at the planner level: routing such a `/Junk` ref through the
-    /// writer is a *different* failure mode (the live Catalog still holds the
-    /// dangling `10 0 R`, which the renumber walk rejects with a graceful
-    /// `Unsupported` error, not a panic — tracked separately). The end-to-end
-    /// no-panic guarantee for unplanned refs is covered by
-    /// `objstm_batches_generate_drops_missing_trailer_only_ref`.
+    /// 100 missing `/Junk` refs must not inflate the even split. Dropping them
+    /// from membership BEFORE the split keeps the two real members — the `/Info`
+    /// dict (obj 4) and the `/Pages` tree (obj 2) — in a SINGLE container, the
+    /// way qpdf does (one `/N 2` ObjStm). Filtering only AFTER the split would
+    /// leave the inflated boundary in place and scatter them into two `/N 1`
+    /// ObjStms (Codex review on PR #421).
     #[test]
-    fn objstm_batches_generate_drops_wholly_unplanned_container() {
-        let bytes = catalog_with_missing_refs_pdf_bytes(100);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+    fn objstm_membership_keeps_real_members_together_despite_missing_refs() {
+        let mut pdf = Pdf::open(Cursor::new(info_and_missing_junk_pdf_bytes(100))).unwrap();
+        let assigned = LinearizationPlan::from_pdf(&mut pdf, true)
+            .unwrap()
+            .renumber_assigned_refs();
 
-        // The compressible membership must span more than one even-split
-        // container, and at least one container must be wholly unplanned so the
-        // `kept.is_empty()` drop arm is exercised.
-        let assigned = plan.renumber_assigned_refs();
-        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        let containers = objstm_membership_linearized(&mut pdf, &assigned).unwrap();
+
+        let info = ObjectRef::new(4, 0);
+        let pages = ObjectRef::new(2, 0);
+        assert_eq!(
+            containers.len(),
+            1,
+            "missing /Junk refs must not split the two real members across containers"
+        );
+        let members = &containers[0];
         assert!(
-            containers.len() >= 2,
-            "fixture must produce multiple even-split containers"
+            members.contains(&info) && members.contains(&pages),
+            "the single container must hold both real members (/Info + /Pages)"
         );
         assert!(
-            containers
-                .iter()
-                .any(|c| c.iter().all(|r| !assigned.contains(r))),
-            "fixture must yield a wholly-unplanned container to exercise the drop arm"
+            !members.iter().any(|r| (10..110).contains(&r.number)),
+            "no missing /Junk ref may survive into membership"
         );
-
-        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
-        let any_junk = batch_plan
-            .open_document_batches
-            .iter()
-            .chain(&batch_plan.part3_batches)
-            .chain(&batch_plan.part4_batches)
-            .flatten()
-            .any(|r| (10..110).contains(&r.number));
-        assert!(!any_junk, "missing /Junk refs must not be batched");
     }
 }

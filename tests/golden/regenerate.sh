@@ -183,6 +183,32 @@ else
     echo "Skipping missing-trailer-info.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/objstm-lin-split-boundary.pdf" ]]; then
+    echo "Generating objstm-lin-split-boundary.pdf ..."
+    # flpdf-4vpi / PR #421 Codex review: a real /Info (obj 4) plus 100 missing
+    # /Junk trailer refs. The missing refs push the compressible set across the
+    # 100-member even-split boundary, so an after-split filter would scatter the
+    # two real members (/Info + /Pages) into two ObjStms; qpdf drops the missing
+    # refs first and emits one /N 2 ObjStm. Malformed => qpdf warns (--warning-exit-0).
+    python3 - "$FIX/objstm-lin-split-boundary.pdf" <<'PY'
+import sys
+junk = "".join("/J%d %d 0 R " % (i, 10 + i) for i in range(100))
+body = b"%PDF-1.4\n"; offs = {}
+for n, d in ((1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+             (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+             (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+             (4, b"<< /Producer (flpdf-test) >>")):
+    offs[n] = len(body); body += b"%d 0 obj\n" % n + d + b"\nendobj\n"
+xref = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for n in (1, 2, 3, 4): body += b"%010d 00000 n \n" % offs[n]
+body += ("trailer\n<< /Size 110 /Root 1 0 R /Info 4 0 R %s>>\nstartxref\n%d\n%%%%EOF\n" % (junk, xref)).encode()
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping objstm-lin-split-boundary.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
     echo "Generating one-page-enc-u.pdf ..."
     # AES-256 (R6) encrypted source for the overlay --password path. AES key
@@ -517,6 +543,13 @@ mkdir -p "$REF/missing-trailer-info"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/missing-trailer-info.pdf" "$REF/missing-trailer-info/linearize-objstm.pdf"
 echo "missing-trailer-info/linearize-objstm.pdf"
+
+# --- objstm-lin-split-boundary: missing refs must not inflate the even split
+# (flpdf-4vpi / PR #421). qpdf emits one /N 2 ObjStm. ---
+mkdir -p "$REF/objstm-lin-split-boundary"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-split-boundary.pdf" "$REF/objstm-lin-split-boundary/linearize-objstm.pdf"
+echo "objstm-lin-split-boundary/linearize-objstm.pdf"
 
 # --- two-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
