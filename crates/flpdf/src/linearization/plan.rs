@@ -1406,10 +1406,23 @@ impl LinearizationPlan {
             if e.object_ref.generation == u16::MAX {
                 e.object_ref.number
             } else {
+                // A malformed source can carry a reserved/dangling reference
+                // (object number 0, any generation) into the first-page closure
+                // and thus into `shared_hints`; `place_objstm_members_per_half`
+                // rebuilds the forward renumber index while dropping object
+                // number 0 (it doubles as the reserved-slot sentinel), so such an
+                // entry has no mapping here. Sort it deterministically last
+                // instead of panicking — the writer's shared-hint back-patch
+                // (`new_for_original(..).ok_or_else(Err)`, gated only on a
+                // non-empty `shared_hints` and run before any output) then
+                // surfaces the planner/renumber inconsistency as a structured
+                // error. For a well-formed PDF every shared-hint object has a
+                // mapping, so this fallback never triggers and the order is
+                // unchanged. Mirrors `SharedObjectHintTable::from_plan`'s
+                // `new_for_original(..).map_or(0, ..)` graceful handling.
                 renumber
                     .new_for_original(e.object_ref)
-                    .expect("shared hint object must exist in RenumberMap")
-                    .number
+                    .map_or(u32::MAX, |r| r.number)
             }
         };
         out[..boundary].sort_unstable_by_key(&new_number);
@@ -4527,6 +4540,72 @@ mod tests {
             vec![1, 2],
             "container entry must union both members' referencing pages"
         );
+    }
+
+    /// A shared-hint entry with no `RenumberMap` mapping must not panic the
+    /// first-page sort. A malformed source can carry a reserved/dangling ref
+    /// (object number 0, any generation) into the first-page closure and thus
+    /// into `shared_hints`; `place_objstm_members_per_half` rebuilds the forward
+    /// index while dropping object number 0 (it doubles as the reserved-slot
+    /// sentinel), so such an entry has no mapping here. The sort must place it
+    /// deterministically last instead of aborting — the writer's shared-hint
+    /// back-patch then reports the planner/renumber inconsistency as a
+    /// structured error before any bytes are emitted.
+    #[test]
+    fn canonical_shared_hints_missing_renumber_entry_sorts_last_without_panic() {
+        let page = ObjectRef::new(3, 0);
+        let missing = ObjectRef::new(0, 0);
+        let font_dict = ObjectRef::new(1, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![page, missing],
+            part3_objects: vec![font_dict],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: missing,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: page,
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: font_dict,
+                    referencing_pages: vec![1],
+                },
+            ],
+            ..Default::default()
+        };
+
+        // font_dict packs into a first-half ObjStm container; `missing` and
+        // `page` stay plain. The container is folded to one entry numbered 12.
+        let mut m2c: BTreeMap<ObjectRef, (u32, u32)> = BTreeMap::new();
+        m2c.insert(font_dict, (12, 0));
+
+        let mut renumber = RenumberMap::from_plan(&plan);
+        renumber.place_objstm_members_per_half(
+            &[],
+            &[vec![font_dict]],
+            &[],
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        // Relocation drops object number 0 from the forward index, so the
+        // reserved ref has no mapping — the precondition for the regression.
+        assert!(
+            renumber.new_for_original(missing).is_none(),
+            "ObjStm relocation must drop object number 0 from the renumber map"
+        );
+
+        let folded =
+            plan.canonical_shared_hints(&m2c, &renumber, &Default::default(), &Default::default());
+
+        // No panic, and the unmapped entry sorts last (key u32::MAX) behind the
+        // real page object and the folded container (new #12, sentinel gen).
+        assert_eq!(folded.len(), 3);
+        assert_eq!(folded[0].object_ref, page);
+        assert_eq!(folded[1].object_ref, ObjectRef::new(12, u16::MAX));
+        assert_eq!(folded[2].object_ref, missing);
     }
 
     /// With an empty member-to-container map (no ObjStm packing) the folded list
