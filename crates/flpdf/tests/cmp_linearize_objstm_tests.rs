@@ -201,6 +201,39 @@ fn objstm_bearing_input_byte_identical_to_qpdf() {
     assert_strict("three-page-objstm.pdf", "three-page-objstm");
 }
 
+// flpdf-4vpi: a malformed input whose trailer references a missing indirect
+// object (`/Info 99 0 R`, no xref entry). qpdf resolves the dangling ref to
+// null, drops /Info, and linearizes the remaining objects; flpdf's generate
+// planner must drop the unplanned `99 0 R` from ObjStm membership (rather than
+// panic at place_objstm_members_per_half) and produce the same layout. This
+// pins the post-fix output to qpdf's own oracle so the panic fix did not just
+// stop crashing but stayed byte-parity.
+#[test]
+fn missing_trailer_info_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("missing-trailer-info.pdf", "missing-trailer-info");
+}
+
+#[test]
+fn missing_trailer_info_objstm_byte_identical_to_qpdf() {
+    assert_strict("missing-trailer-info.pdf", "missing-trailer-info");
+}
+
+// flpdf-4vpi / PR #421 Codex review: 100 missing `/Junk` trailer refs whose
+// even-split positions would otherwise scatter the two real ObjStm members
+// (the `/Info` dict and the `/Pages` tree) across separate containers. qpdf
+// drops the missing refs before splitting, emitting ONE `/N 2` ObjStm; flpdf
+// must match. Filtering the unplanned refs only AFTER the split produced two
+// `/N 1` ObjStms (≈119 extra bytes) and broke byte-parity for this input class.
+#[test]
+fn split_boundary_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("objstm-lin-split-boundary.pdf", "objstm-lin-split-boundary");
+}
+
+#[test]
+fn split_boundary_objstm_byte_identical_to_qpdf() {
+    assert_strict("objstm-lin-split-boundary.pdf", "objstm-lin-split-boundary");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

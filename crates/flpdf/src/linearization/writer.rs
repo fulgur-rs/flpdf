@@ -2608,7 +2608,9 @@ pub fn write_linearized<R: Read + Seek>(
             .map(|(i, c)| (c.container_new_num, i as u32))
             .collect(),
         _ => {
-            let membership = crate::linearization::plan::objstm_membership_linearized(pdf)?;
+            use crate::linearization::plan::objstm_membership_linearized;
+            let assigned = plan.renumber_assigned_refs();
+            let membership = objstm_membership_linearized(pdf, &assigned)?;
             let mut rank = std::collections::BTreeMap::new();
             for (split_index, members) in membership.iter().enumerate() {
                 // `objstm_membership_linearized` drops empty containers, so
