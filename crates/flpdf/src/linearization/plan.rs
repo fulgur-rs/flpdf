@@ -1752,12 +1752,9 @@ impl LinearizationPlan {
         let assigned = self.renumber_assigned_refs();
         let containers: Vec<Vec<ObjectRef>> = objstm_membership_linearized(pdf)?
             .into_iter()
-            .filter_map(|members| {
-                let kept: Vec<ObjectRef> = members
-                    .into_iter()
-                    .filter(|r| assigned.contains(r))
-                    .collect();
-                (!kept.is_empty()).then_some(kept)
+            .filter_map(|mut members| {
+                members.retain(|r| assigned.contains(r));
+                (!members.is_empty()).then_some(members)
             })
             .collect();
         let routes = route_objstm_containers(pdf, &containers)?;
