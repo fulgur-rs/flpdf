@@ -716,7 +716,11 @@ qpdf --stream-data=preserve --static-id --warning-exit-0 \
 echo "kept-indirect-length/preserve.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/kept-indirect-length.pdf" "$REF/kept-indirect-length/linearize-objstm.pdf"
-qpdf --check "$REF/kept-indirect-length/linearize-objstm.pdf" >/dev/null
+# --warning-exit-0: obj 5 is a deliberate placeholder DCTDecode stream (see the
+# fixture note above — qpdf cannot decode it), so --check emits a stream-decode
+# WARNING (exit 3) that would otherwise abort the whole run under `set -e`. The
+# flag zeroes warnings only; a real structural error still exits 2 and aborts.
+qpdf --check --warning-exit-0 "$REF/kept-indirect-length/linearize-objstm.pdf" >/dev/null
 echo "kept-indirect-length/linearize-objstm.pdf"
 
 # Linearized >cap preserve golden for the ObjStm-bearing fixture (flpdf-ihb.4).
