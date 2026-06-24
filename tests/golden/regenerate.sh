@@ -158,6 +158,31 @@ else
     echo "Skipping shared-stream-objstm.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/missing-trailer-info.pdf" ]]; then
+    echo "Generating missing-trailer-info.pdf ..."
+    # flpdf-4vpi: malformed single-page input whose trailer references a missing
+    # indirect object (/Info 99 0 R, no xref entry, /Size deliberately 100).
+    # compressible_objgens admits the Null-resolving ref into the linearized
+    # ObjStm membership; the generate planner must drop it instead of panicking.
+    # qpdf processes it with warnings, so its golden is generated with
+    # --warning-exit-0 below.
+    python3 - "$FIX/missing-trailer-info.pdf" <<'PY'
+import sys
+body = b"%PDF-1.4\n"; offs = []
+for n, d in ((1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+             (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+             (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>")):
+    offs.append(len(body)); body += b"%d 0 obj\n" % n + d + b"\nendobj\n"
+xref = len(body)
+body += b"xref\n0 4\n0000000000 65535 f \n"
+for off in offs: body += b"%010d 00000 n \n" % off
+body += b"trailer\n<< /Size 100 /Root 1 0 R /Info 99 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping missing-trailer-info.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
     echo "Generating one-page-enc-u.pdf ..."
     # AES-256 (R6) encrypted source for the overlay --password path. AES key
@@ -484,6 +509,14 @@ echo "nonid-id0/linearize.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/nonid-id0.pdf" "$REF/nonid-id0/linearize-objstm.pdf"
 echo "nonid-id0/linearize-objstm.pdf"
+
+# --- missing-trailer-info: dangling /Info 99 0 R dropped, then linearized
+# (flpdf-4vpi). Malformed input → qpdf warns, so --warning-exit-0. Pins the
+# generate planner's unplanned-ref drop to qpdf's own oracle. ---
+mkdir -p "$REF/missing-trailer-info"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/missing-trailer-info.pdf" "$REF/missing-trailer-info/linearize-objstm.pdf"
+echo "missing-trailer-info/linearize-objstm.pdf"
 
 # --- two-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \

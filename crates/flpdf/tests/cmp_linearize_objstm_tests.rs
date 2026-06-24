@@ -201,6 +201,23 @@ fn objstm_bearing_input_byte_identical_to_qpdf() {
     assert_strict("three-page-objstm.pdf", "three-page-objstm");
 }
 
+// flpdf-4vpi: a malformed input whose trailer references a missing indirect
+// object (`/Info 99 0 R`, no xref entry). qpdf resolves the dangling ref to
+// null, drops /Info, and linearizes the remaining objects; flpdf's generate
+// planner must drop the unplanned `99 0 R` from ObjStm membership (rather than
+// panic at place_objstm_members_per_half) and produce the same layout. This
+// pins the post-fix output to qpdf's own oracle so the panic fix did not just
+// stop crashing but stayed byte-parity.
+#[test]
+fn missing_trailer_info_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("missing-trailer-info.pdf", "missing-trailer-info");
+}
+
+#[test]
+fn missing_trailer_info_objstm_byte_identical_to_qpdf() {
+    assert_strict("missing-trailer-info.pdf", "missing-trailer-info");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
