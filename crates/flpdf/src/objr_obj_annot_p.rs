@@ -242,6 +242,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
+            ..Default::default()
         }
     }
 
@@ -298,6 +299,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(7, 0)],
             ref_map,
+            ..Default::default()
         };
         drop_objr_obj_annot_dangling_p(&mut pdf, &result, &[ObjectRef::new(30, 0)]).expect("drop");
         assert!(
@@ -380,6 +382,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(7, 0)],
             ref_map,
+            ..Default::default()
         };
         drop_objr_obj_annot_dangling_p(
             &mut pdf,
@@ -418,6 +421,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(7, 0)],
             ref_map,
+            ..Default::default()
         };
         drop_objr_obj_annot_dangling_p(
             &mut pdf,

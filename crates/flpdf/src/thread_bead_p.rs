@@ -403,6 +403,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
+            ..Default::default()
         }
     }
 
@@ -471,6 +472,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(7, 0), ObjectRef::new(5, 0)],
             ref_map,
+            ..Default::default()
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("bead /P remap");
@@ -513,6 +515,7 @@ mod tests {
                 ObjectRef::new(5, 0),
             ],
             ref_map,
+            ..Default::default()
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("duplicate-page bead /P");
@@ -557,6 +560,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(6, 0)],
             ref_map,
+            ..Default::default()
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("all-dangling drop");
@@ -977,6 +981,7 @@ mod tests {
                 ObjectRef::new(5, 0),
             ],
             ref_map,
+            ..Default::default()
         };
 
         drop_thread_bead_dangling_p(&mut pdf, &result).expect("dedup");
