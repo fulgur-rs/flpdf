@@ -259,8 +259,18 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // qpdf's getMatrixForTransformations(true). Identity when the dest page has no
     // /Rotate or /UserUnit, so a non-rotated page is unaffected.
     let dest_transform = read_page_transform(dest, dest_page_ref)?;
-    let trim_w = trim_box.urx - trim_box.llx;
-    let trim_h = trim_box.ury - trim_box.lly;
+    // qpdf's getMatrixForTransformations reads the box through getArrayAsRectangle
+    // (libqpdf/QPDFPageObjectHelper.cc), so the width/height are the normalized
+    // (non-negative) extents. These dims feed ONLY the tmatrix translation column
+    // (transformation_matrix puts width*scale/height*scale in positions e/f, never
+    // the a/b/c/d rotation part), and the placement centring (tx = r_cx - t_cx)
+    // absorbs that translation -- so for a reversed box this normalization is an
+    // output no-op that no byte-gate can isolate. It is kept to reproduce qpdf's
+    // computation faithfully, NOT for an observable byte difference (do not "dead
+    // code" it away).
+    let [n_llx, n_lly, n_urx, n_ury] = normalize_rectangle(page_box_array(&trim_box));
+    let trim_w = n_urx - n_llx;
+    let trim_h = n_ury - n_lly;
     let tmatrix = transformation_matrix(&dest_transform, trim_w, trim_h, true);
 
     // 1. Convert the destination page itself to Form XObject /Fx0.
@@ -292,8 +302,10 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     //    allow_shrink=true; /Fx0 places into the page /MediaBox with
     //    allow_shrink=false (qpdf's doUnderOverlayForPage flag split). Every
     //    placement folds in the dest inverse transform `tmatrix`.
-    let trim_rect = page_box_array(&trim_box);
-    let media_rect = page_box_array(&media_box);
+    // Placement rects mirror qpdf's getTrimBox()/getMediaBox().getArrayAsRectangle()
+    // in doUnderOverlayForPage: corners normalized before scaling/centring.
+    let trim_rect = normalize_rectangle(page_box_array(&trim_box));
+    let media_rect = normalize_rectangle(page_box_array(&media_box));
     let mut content = String::new();
     for (name, xref) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
@@ -660,6 +672,16 @@ fn page_box_array(b: &PageBox) -> [f64; 4] {
     [b.llx, b.lly, b.urx, b.ury]
 }
 
+/// Normalize a rectangle's corners the way qpdf's
+/// `QPDFObjectHandle::getArrayAsRectangle` does: `llx = min(x0, x2)`,
+/// `lly = min(x1, x3)`, `urx = max(x0, x2)`, `ury = max(x1, x3)`. qpdf reads all
+/// box geometry for placement through this accessor, so a page with a reversed box
+/// (`llx > urx` or `lly > ury`) still yields a non-negative width/height and places
+/// identically to its ordered form.
+fn normalize_rectangle([x0, x1, x2, x3]: [f64; 4]) -> [f64; 4] {
+    [x0.min(x2), x1.min(x3), x0.max(x2), x1.max(x3)]
+}
+
 /// Coerce a PDF numeric object to `f64`, matching qpdf's numeric coercion
 /// (non-numeric values, including indirect references, contribute `0.0`).
 fn as_f64(o: &Object) -> f64 {
@@ -812,6 +834,18 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 //   multi-stream (.16.10)| overlay | three-page    | multi-stream  | -      | -     | -
 //   rotated dest (.16.10)| overlay | one-page-r90  | one-page      | -      | -     | -
 //   userunit (.16.10)   | overlay  | three-page    | userunit      | -      | -     | -
+//   swapped box (lkk7)  | overlay  | swapped-box   | one-page      | -      | -     | -
+//   swapped+r90 (lkk7)  | overlay  | swapped-r90   | swapped-r90   | -      | -     | -
+//
+// The flpdf-lkk7 rows cover reversed page boxes (llx>urx AND lly>ury): qpdf reads
+// all placement geometry through getArrayAsRectangle (min/max normalized). The
+// swapped-box row proves the placement-rect normalization (a raw rect would reflect
+// the source cm). The swapped+r90 row (overlaid onto itself) additionally proves the
+// source/dest Form /Matrix dims normalize -- the /Matrix array is serialized into
+// the output, so a raw width flips its sign. (The dest tmatrix dims are ALSO
+// normalized in code, but that is an output no-op here: their only effect is the
+// tmatrix translation, which the placement centring absorbs -- see
+// apply_overlays_to_page. So no gate isolates it.) Both fixtures are pinned to 1.3.
 //
 // The rotated-source row is the matrix-transformed placement check: the source
 // page carries /Rotate 90, so its imported Form XObject gets a non-identity
@@ -1233,6 +1267,52 @@ mod byte_gate {
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-and-underlay.pdf");
     }
+
+    #[test]
+    fn swapped_box_overlay_one_page_is_byte_identical() {
+        // dest = swapped-box-one-page (reversed /MediaBox [612 792 0 0]),
+        // source = one-page. The placement rect is read like qpdf
+        // getArrayAsRectangle, so it normalizes to [0 0 612 792] and the source
+        // places at identity; a raw rect would yield the reflected cm
+        // "-1 0 0 -1 612 792". Proves the placement-rect normalization (Edit C).
+        let mut dest = fixture("swapped-box-one-page.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "swapped-box-overlay-one-page.pdf");
+    }
+
+    #[test]
+    fn swapped_box_r90_overlay_self_is_byte_identical() {
+        // dest = source = swapped-box-r90-one-page (reversed box + /Rotate 90),
+        // overlaid onto itself. The /Rotate makes the source/dest Form /Matrix
+        // depend on the box width/height, and that /Matrix array is serialized, so
+        // this proves the /Matrix-dim normalization (Edit A) on top of the placement
+        // rects (Edit C). (The dest tmatrix dims are normalized too, but their effect
+        // -- the tmatrix translation -- is absorbed by the placement centring, so it
+        // is an output no-op this gate cannot isolate.)
+        let mut dest = fixture("swapped-box-r90-one-page.pdf");
+        let mut source = fixture("swapped-box-r90-one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_static_id(&mut dest);
+        assert_byte_identical(&actual, "swapped-box-r90-overlay-self.pdf");
+    }
 }
 
 #[cfg(test)]
@@ -1424,6 +1504,20 @@ mod tests {
             "Fx0",
         );
         assert_eq!(frag, "q\n0 1 -1 0 612 0 cm\n/Fx0 Do\nQ\n");
+    }
+
+    #[test]
+    fn normalize_rectangle_orders_swapped_corners() {
+        // Reversed box [612 792 0 0] -> [0 0 612 792]; an already-ordered box is
+        // unchanged (qpdf getArrayAsRectangle = min/max of paired corners).
+        assert_eq!(
+            normalize_rectangle([612.0, 792.0, 0.0, 0.0]),
+            [0.0, 0.0, 612.0, 792.0]
+        );
+        assert_eq!(
+            normalize_rectangle([0.0, 0.0, 612.0, 792.0]),
+            [0.0, 0.0, 612.0, 792.0]
+        );
     }
 
     // ---- apply_overlays_to_page ------------------------------------------
@@ -1688,6 +1782,77 @@ mod tests {
             text.contains("q\n1 0 0 1 135 245 cm\n/Fx1 Do\nQ\n"),
             "source must place into the dest TrimBox: {text:?}"
         );
+    }
+
+    /// Overlay a fixed 100x100 source onto a one-page dest with the given
+    /// `/MediaBox` array literal and optional `/Rotate` entry, returning the
+    /// rewritten page `/Contents` bytes. Used to prove a reversed box places
+    /// identically to its ordered (normalized) form.
+    fn overlay_contents(media_box: &str, rotate: &str) -> Vec<u8> {
+        let page = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox {media_box} {rotate} \
+             /Resources << >> /Contents 4 0 R >>"
+        );
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, &page),
+                (4, "<< /Length 1 >>\nstream\nx\nendstream"),
+            ],
+            1,
+        ));
+        let page_ref = ObjectRef::new(3, 0);
+        let src = insert_form_xobject(&mut pdf, [0, 0, 100, 100], b"src");
+        apply_overlays_to_page(
+            &mut pdf,
+            page_ref,
+            &[OverlaySource {
+                kind: OverlayKind::Overlay,
+                xobject_ref: src,
+            }],
+        )
+        .unwrap();
+        let contents_ref = match pdf
+            .resolve(page_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("Contents")
+        {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
+        };
+        pdf.resolve(contents_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap()
+            .data
+    }
+
+    #[test]
+    fn apply_swapped_mediabox_normalizes_placement_rect() {
+        // Dest /MediaBox is reversed ([612 792 0 0]); qpdf reads it through
+        // getArrayAsRectangle, so the placement rect normalizes to [0 0 612 792].
+        // A 100x100 source then centres into the normalized rect: scale clamps to 1
+        // (no expand), tx = 306-50 = 256, ty = 396-50 = 346. A raw (un-normalized)
+        // rect would yield a negative width and a wildly different cm.
+        let text = String::from_utf8(overlay_contents("[612 792 0 0]", "")).unwrap();
+        assert!(
+            text.contains("q\n1 0 0 1 256 346 cm\n/Fx1 Do\nQ\n"),
+            "source must place into the normalized MediaBox: {text:?}"
+        );
+    }
+
+    #[test]
+    fn apply_swapped_box_with_rotate_matches_normalized() {
+        // With /Rotate 90 the dest inverse tmatrix and the page-as-/Fx0 /Matrix both
+        // depend on the box width/height. Reading the box through getArrayAsRectangle
+        // makes a reversed box place identically to its ordered form, so every cm in
+        // the rewritten /Contents is byte-identical between the two.
+        let swapped = overlay_contents("[612 792 0 0]", "/Rotate 90");
+        let normalized = overlay_contents("[0 0 612 792]", "/Rotate 90");
+        assert_eq!(swapped, normalized);
     }
 
     #[test]

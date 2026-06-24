@@ -350,8 +350,13 @@ fn resolve_rect_array<R: Read + Seek>(
     Ok(Some(arr))
 }
 
-/// Compute `(width, height)` of a rectangle array as `urx-llx`, `ury-lly`,
-/// coercing each numeric element to `f64`. Non-numeric elements contribute 0.0.
+/// Compute the normalized `(width, height)` of a rectangle array, coercing each
+/// numeric element to `f64`. Non-numeric elements contribute 0.0.
+///
+/// qpdf reads box geometry through `QPDFObjectHandle::getArrayAsRectangle`, which
+/// normalizes corners with min/max, so the extents are always non-negative even for
+/// a reversed box (`urx < llx` or `ury < lly`): `width = |urx - llx|`,
+/// `height = |ury - lly|`.
 fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
     let n = |o: &Object| -> f64 {
         match o {
@@ -364,7 +369,7 @@ fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
     let lly = n(&arr[1]);
     let urx = n(&arr[2]);
     let ury = n(&arr[3]);
-    (urx - llx, ury - lly)
+    ((urx - llx).abs(), (ury - lly).abs())
 }
 
 /// A page's `/Rotate` and `/UserUnit` attributes as qpdf's
@@ -882,6 +887,27 @@ mod tests {
         // Matrix is identity (rotate 0), so the non-numeric width is irrelevant.
         let matrix = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(matrix), vec![1, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn rectangle_dimensions_normalizes_swapped_box() {
+        // qpdf reads box geometry through getArrayAsRectangle, so a reversed box
+        // ([612 792 0 0]) yields non-negative width/height; an ordered box is
+        // unchanged.
+        let swapped = [
+            Object::Integer(612),
+            Object::Integer(792),
+            Object::Integer(0),
+            Object::Integer(0),
+        ];
+        assert_eq!(rectangle_dimensions(&swapped), (612.0, 792.0));
+        let ordered = [
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ];
+        assert_eq!(rectangle_dimensions(&ordered), (612.0, 792.0));
     }
 
     #[test]

@@ -251,6 +251,51 @@ else
     echo "Skipping multi-stream-one-page.pdf (already exists)"
 fi
 
+# Swapped-box overlay fixtures (flpdf-lkk7). A reversed page box (llx>urx AND
+# lly>ury) must be read like qpdf getArrayAsRectangle (min/max normalized) for all
+# placement geometry. qpdf preserves the reversed /MediaBox array verbatim through a
+# rewrite (it only normalizes at the getArrayAsRectangle read sites), so forcing the
+# fixture to PDF 1.3 (== one-page.pdf source) keeps the reversed box intact while
+# pinning the output version. Two fixtures:
+#   - swapped-box-one-page.pdf:     reversed box, no /Rotate (exercises the placement
+#     rect normalization when overlaid).
+#   - swapped-box-r90-one-page.pdf: reversed box + /Rotate 90 (adds the dest inverse
+#     tmatrix dims and, when used as the source, the Form /Matrix dims).
+for swap_spec in "swapped-box-one-page.pdf:" "swapped-box-r90-one-page.pdf:/Rotate 90 "; do
+    swap_name="${swap_spec%%:*}"
+    swap_rotate="${swap_spec#*:}"
+    if [[ ! -f "$FIX/$swap_name" ]]; then
+        echo "Generating $swap_name ..."
+        python3 - "$FIX/$swap_name" "$swap_rotate" <<'PY'
+import subprocess, sys, tempfile, os
+rotate = sys.argv[2].encode()
+objs = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [612 792 0 0] " + rotate +
+    b"/Resources << /ProcSet [/PDF] >> /Contents 4 0 R >>",
+]
+content = b"0.5 g 100 100 200 200 re f"
+objs.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content))
+out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+offs = []
+for i, body in enumerate(objs, 1):
+    offs.append(len(out)); out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+xs = len(out); n = len(objs) + 1
+out += b"xref\n0 %d\n0000000000 65535 f \n" % n
+for o in offs: out += b"%010d 00000 n \n" % o
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xs)
+with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as t:
+    t.write(out); rough = t.name
+subprocess.run(["qpdf", "--static-id", "--force-version=1.3", "--warning-exit-0",
+                rough, sys.argv[1]], check=True)
+os.unlink(rough)
+PY
+    else
+        echo "Skipping $swap_name (already exists)"
+    fi
+done
+
 # No-stream multipage fixtures for NON-linearized --object-streams=generate
 # byte-parity (flpdf-g6hb.1). Every reachable object is an ObjStm-eligible dict
 # (no content streams), so the output body is just the ObjStm container(s) plus
@@ -822,6 +867,21 @@ qpdf --static-id --warning-exit-0 \
     "$FIX/three-page.pdf" --overlay "$FIX/userunit-one-page.pdf" -- \
     "$REF/overlay/three-page-overlay-userunit.pdf"
 echo "overlay/three-page-overlay-userunit.pdf"
+
+# Swapped-box parity (flpdf-lkk7): a reversed page box must place like its
+# normalized form (qpdf getArrayAsRectangle).
+#  - swapped dest, plain source: the placement rect normalizes (Edit C).
+#  - swapped+/Rotate dest AND source (overlaid onto itself): the dest inverse
+#    tmatrix dims (Edit B) and the source Form /Matrix dims (Edit A) normalize too.
+qpdf --static-id --warning-exit-0 \
+    "$FIX/swapped-box-one-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    "$REF/overlay/swapped-box-overlay-one-page.pdf"
+echo "overlay/swapped-box-overlay-one-page.pdf"
+
+qpdf --static-id --warning-exit-0 \
+    "$FIX/swapped-box-r90-one-page.pdf" --overlay "$FIX/swapped-box-r90-one-page.pdf" -- \
+    "$REF/overlay/swapped-box-r90-overlay-self.pdf"
+echo "overlay/swapped-box-r90-overlay-self.pdf"
 
 
 echo ""
