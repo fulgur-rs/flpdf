@@ -1502,6 +1502,35 @@ impl LinearizationPlan {
             .collect()
     }
 
+    /// The refs that [`RenumberMap::from_plan`] assigns a renumber slot
+    /// (`by_original` key set).
+    ///
+    /// This is the exact union of the parts `from_plan` walks
+    /// (`crates/flpdf/src/linearization/renumber.rs`): part2, part3, the two
+    /// Part-4 page sets, part4_rest (which subsumes the promoted pages-tree /
+    /// info / catalog refs), the two outline sets, and the open-document plain
+    /// set. `part1_objects` is deliberately excluded — `from_plan` never maps
+    /// it (and it is always empty today).
+    ///
+    /// A generated ObjStm may only batch members drawn from this set: an
+    /// ObjStm member that lacks a renumber slot makes
+    /// [`RenumberMap::place_objstm_members_per_half`] panic. The
+    /// `renumber_assigned_refs_match_from_plan` test pins this set to
+    /// `from_plan`'s `by_original` keys so the two cannot drift apart.
+    pub(crate) fn renumber_assigned_refs(&self) -> BTreeSet<ObjectRef> {
+        self.part2_objects
+            .iter()
+            .chain(&self.part3_objects)
+            .chain(&self.part4_other_pages_private)
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
+            .chain(&self.part6_outline_objects)
+            .chain(&self.part9_outline_objects)
+            .chain(&self.part4_open_document_plain)
+            .copied()
+            .collect()
+    }
+
     /// Return `true` if every object appears in **at most** one part.
     /// Uses the three fine-grained Part-4 sub-partitions as the canonical
     /// source of truth.
@@ -1709,7 +1738,28 @@ impl LinearizationPlan {
         _ctx: &crate::writer::object_streams::EligibilityContext,
         _length_exclusions: &BTreeSet<ObjectRef>,
     ) -> crate::Result<ObjStmBatchPlan> {
-        let containers = objstm_membership_linearized(pdf)?;
+        // `objstm_membership_linearized` derives its containers from
+        // `compressible_objgens`, a trailer-graph traversal that pushes every
+        // non-stream/non-signature/non-encryption ref it reaches — including a
+        // missing or trailer-only ref (e.g. `/Info 99 0 R` with no xref entry)
+        // that `resolve_borrowed` returns as `Null`. Such a ref has no renumber
+        // slot, so batching it would make `place_objstm_members_per_half`
+        // panic. Drop members outside the plan's renumber-assigned set (and any
+        // container left wholly unplanned) before routing — mirroring the
+        // preserve path's "eligible but no RenumberMap entry → leave plain"
+        // gate. For a well-formed PDF every member is assigned, so the filter is
+        // a no-op and the batches stay byte-identical.
+        let assigned = self.renumber_assigned_refs();
+        let containers: Vec<Vec<ObjectRef>> = objstm_membership_linearized(pdf)?
+            .into_iter()
+            .filter_map(|members| {
+                let kept: Vec<ObjectRef> = members
+                    .into_iter()
+                    .filter(|r| assigned.contains(r))
+                    .collect();
+                (!kept.is_empty()).then_some(kept)
+            })
+            .collect();
         let routes = route_objstm_containers(pdf, &containers)?;
 
         let outline_set = &self.outline_first_page_members;
@@ -5501,5 +5551,162 @@ mod tests {
             !plan.all_assigned_refs().contains(&ObjectRef::new(7, 0)),
             "orphaned /Length holder must be dropped in non-generate mode too"
         );
+    }
+
+    /// Single-page PDF whose trailer references a missing `/Info` object
+    /// (`99 0 R`, no xref entry). `resolve_borrowed` returns that ref as `Null`,
+    /// so `compressible_objgens` admits it into the linearized membership even
+    /// though it has no renumber slot. Mirrors the Codex Security PoC
+    /// (`flpdf-4vpi`).
+    fn missing_trailer_info_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        // /Info 99 0 R has no object 99 in the body or xref.
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 100 /Root 1 0 R /Info 99 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// Single-page PDF whose Catalog carries a `/Junk` array of `n` missing
+    /// indirect refs (objects `10..10+n`, none with an xref entry). With enough
+    /// of them the compressible set spans two even-split containers, one of
+    /// which holds only missing refs — exercising the "container left wholly
+    /// unplanned" drop in `objstm_batches_generate`.
+    fn catalog_with_missing_refs_pdf_bytes(n: u32) -> Vec<u8> {
+        let mut junk = String::new();
+        for i in 0..n {
+            junk.push_str(&format!("{} 0 R ", 10 + i));
+        }
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Junk [ {junk}] >>\nendobj\n")
+                .as_bytes(),
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// Drive a linearized generate write end-to-end and return the back-patched
+    /// bytes, asserting neither the planner nor the writer panics.
+    fn write_linearized_generate(bytes: &[u8]) -> Vec<u8> {
+        let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = crate::WriteOptions {
+            object_streams: crate::ObjectStreamMode::Generate,
+            deterministic_id: true,
+            newline_before_endstream: crate::NewlineBeforeEndstream::Never,
+            ..Default::default()
+        };
+        let mut doc =
+            crate::linearization::writer::write_linearized(&plan, &renumber, &mut pdf, &opts)
+                .expect("linearized generate write must not panic on unplanned refs");
+        doc.back_patch().expect("back-patch must succeed");
+        doc.bytes
+    }
+
+    /// A missing trailer-only `/Info 99 0 R` is admitted into the compressible
+    /// membership but has no renumber slot, so the generate planner must drop it
+    /// rather than batch it into an ObjStm — otherwise `write_linearized` panics
+    /// at `place_objstm_members_per_half` (Codex Security `flpdf-4vpi`).
+    #[test]
+    fn objstm_batches_generate_drops_missing_trailer_only_ref() {
+        let bytes = missing_trailer_info_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+        let missing = ObjectRef::new(99, 0);
+        assert!(
+            !plan.renumber_assigned_refs().contains(&missing),
+            "missing /Info 99 0 R must not receive a renumber slot"
+        );
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+        assert!(
+            !batch_plan
+                .open_document_batches
+                .iter()
+                .chain(&batch_plan.part3_batches)
+                .chain(&batch_plan.part4_batches)
+                .any(|batch| batch.contains(&missing)),
+            "missing /Info 99 0 R must not be batched into a generated ObjStm"
+        );
+
+        // End-to-end: previously panicked at renumber.rs:place_objstm_members_per_half.
+        write_linearized_generate(&bytes);
+    }
+
+    /// When a whole even-split container holds only unplanned refs, the generate
+    /// planner drops the container entirely (the `kept.is_empty()` arm of the
+    /// membership filter). 100 missing `/Junk` refs split the compressible set
+    /// into two containers, one of which carries no planned member.
+    ///
+    /// This stays at the planner level: routing such a `/Junk` ref through the
+    /// writer is a *different* failure mode (the live Catalog still holds the
+    /// dangling `10 0 R`, which the renumber walk rejects with a graceful
+    /// `Unsupported` error, not a panic — tracked separately). The end-to-end
+    /// no-panic guarantee for unplanned refs is covered by
+    /// `objstm_batches_generate_drops_missing_trailer_only_ref`.
+    #[test]
+    fn objstm_batches_generate_drops_wholly_unplanned_container() {
+        let bytes = catalog_with_missing_refs_pdf_bytes(100);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+
+        // The compressible membership must span more than one even-split
+        // container, and at least one container must be wholly unplanned so the
+        // `kept.is_empty()` drop arm is exercised.
+        let assigned = plan.renumber_assigned_refs();
+        let containers = objstm_membership_linearized(&mut pdf).unwrap();
+        assert!(
+            containers.len() >= 2,
+            "fixture must produce multiple even-split containers"
+        );
+        assert!(
+            containers
+                .iter()
+                .any(|c| c.iter().all(|r| !assigned.contains(r))),
+            "fixture must yield a wholly-unplanned container to exercise the drop arm"
+        );
+
+        let batch_plan = plan.objstm_batches(&mut pdf, &generate_config()).unwrap();
+        let any_junk = batch_plan
+            .open_document_batches
+            .iter()
+            .chain(&batch_plan.part3_batches)
+            .chain(&batch_plan.part4_batches)
+            .flatten()
+            .any(|r| (10..110).contains(&r.number));
+        assert!(!any_junk, "missing /Junk refs must not be batched");
     }
 }

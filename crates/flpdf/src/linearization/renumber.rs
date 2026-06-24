@@ -1444,4 +1444,39 @@ mod tests {
         assert!(rn.new_for_original(ObjectRef::new(5, 0)).is_some());
         assert!(rn.new_for_original(ObjectRef::new(4, 0)).is_some());
     }
+
+    /// `LinearizationPlan::renumber_assigned_refs` exists so the generate-mode
+    /// ObjStm planner can drop members that `from_plan` never assigns a slot
+    /// (the `flpdf-4vpi` panic). It hand-mirrors the parts `from_plan` walks, so
+    /// pin it to `from_plan`'s actual `by_original` key set in BOTH directions:
+    /// a missing part would let an unplanned member slip through (re-introducing
+    /// the panic), an extra part would drop a legitimate member (byte drift).
+    #[test]
+    fn renumber_assigned_refs_match_from_plan() {
+        // Disjoint refs across every part `from_plan` consumes (part1 stays
+        // empty — it is never mapped). Promotion targets are left `None` so the
+        // mapped set is exactly the union of the part vectors.
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(20, 0), ObjectRef::new(21, 0)],
+            part3_objects: vec![ObjectRef::new(30, 0), ObjectRef::new(31, 0)],
+            part4_other_pages_private: vec![ObjectRef::new(40, 0), ObjectRef::new(41, 0)],
+            part4_other_pages_shared: vec![ObjectRef::new(50, 0), ObjectRef::new(51, 0)],
+            part4_rest: vec![ObjectRef::new(60, 0), ObjectRef::new(61, 0)],
+            part6_outline_objects: vec![ObjectRef::new(70, 0), ObjectRef::new(71, 0)],
+            part9_outline_objects: vec![ObjectRef::new(80, 0), ObjectRef::new(81, 0)],
+            part4_open_document_plain: vec![ObjectRef::new(90, 0), ObjectRef::new(91, 0)],
+            ..Default::default()
+        };
+
+        let helper: BTreeSet<ObjectRef> = plan.renumber_assigned_refs();
+        let mapped: BTreeSet<ObjectRef> = RenumberMap::from_plan(&plan)
+            .by_original
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(
+            helper, mapped,
+            "renumber_assigned_refs must equal from_plan's by_original key set"
+        );
+    }
 }
