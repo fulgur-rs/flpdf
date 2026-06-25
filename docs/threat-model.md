@@ -81,9 +81,13 @@ of the following:
   compression bomb) are out of scope per §4, not security bugs.
 - **Non-termination** — an infinite loop while parsing or traversing.
   qpdf precedent: CVE-2017-9209 / CVE-2017-9210.
-- **A violation of the signed-PDF integrity policy**
-  ([signed-pdf.md](signed-pdf.md)): an edit that silently invalidates or
-  strips signature protection without the documented opt-in.
+- **Silent removal of signature evidence**
+  ([signed-pdf.md](signed-pdf.md)): an operation that silently *strips* or
+  *nulls* signature objects without the documented `--remove-restrictions`
+  opt-in. (Pre-v1.0, *invalidating* a signature by a full rewrite is **not** a
+  violation — flpdf matches qpdf, which proceeds and leaves the signature
+  present-but-invalid; a preserve-by-default refusal is a deferred post-v1.0
+  improvement, `flpdf-hn1g.14`.)
 - **Accepting a wrong password as valid** (authentication bypass in the
   standard security handler).
 
@@ -148,7 +152,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
 | Weak-crypto write gate: RC4 output and deprecated R=5 (AES-256) output both require the explicit `--allow-weak-crypto` opt-in | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the write; the reader's parallel refusal on the open path is `Error::Encrypted(WeakCryptoNotAllowed)` |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `security/` |
-| Signed-PDF preserve-by-default policy (edits that would invalidate signatures are rejected unless explicitly opted in) | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
+| Signed-PDF qpdf-compatible handling (full rewrite proceeds, leaving signatures present-but-invalid like qpdf; signatures are stripped only via the explicit `--remove-restrictions` opt-in, never silently). A preserve-by-default *refusal* is a deferred post-v1.0 improvement (`flpdf-hn1g.14`). | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Traversal boundaries on page closures: stop at other `Page`/`Catalog` dicts and skip `/Kids` on `/Pages` nodes; `/Parent` is intentionally followed upward for inherited resources, bounded by the `Page`/`Catalog` stop; no brute-force scans of all live objects | `page_closure.rs`, [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
 
 ## 6. Verification

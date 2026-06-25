@@ -123,7 +123,14 @@ fn full_rewrite_and_linearize_are_mutually_exclusive() {
 }
 
 #[test]
-fn full_rewrite_of_signed_pdf_prints_actionable_diagnostic() {
+fn full_rewrite_of_signed_pdf_proceeds_qpdf_compatible() {
+    // qpdf does NOT refuse a full rewrite of a signed PDF — it proceeds, leaving
+    // signatures present-but-invalid (verified, qpdf 11.9.0: exit 0, no warning).
+    // flpdf matches pre-v1.0: the signed-full-rewrite refusal was removed
+    // (flpdf-hn1g.13; signed preserve-by-default protection deferred post-v1.0,
+    // flpdf-hn1g.14). So a plain `rewrite --full-rewrite` of a signed PDF exits 0
+    // and preserves the signature objects (not stripped — that needs the explicit
+    // --remove-restrictions opt-in, covered separately below).
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("signed.pdf");
     let output = temp.path().join("out.pdf");
@@ -137,17 +144,18 @@ fn full_rewrite_of_signed_pdf_prints_actionable_diagnostic() {
         output.to_str().unwrap(),
     ])
     .assert()
-    .failure()
-    .stderr(predicate::str::contains(
-        "refusing full rewrite of signed PDF",
-    ))
-    .stderr(predicate::str::contains("Signed"))
-    .stderr(predicate::str::contains("--remove-restrictions"))
-    .stderr(predicate::str::contains("incremental rewrite"))
-    // The dedicated Error::Signed CLI mapping prints the diagnostic message
-    // directly, without the redundant "signed PDF:" Display prefix that the
-    // generic error fallback would otherwise add.
-    .stderr(predicate::str::contains("signed PDF: refusing").not());
+    .success();
+
+    assert!(output.exists());
+    // The signature objects survive the full rewrite (present-but-invalid),
+    // matching qpdf — they are not stripped without --remove-restrictions.
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
+        "signature /ByteRange must be preserved by the full rewrite"
+    );
 }
 
 #[test]
@@ -200,13 +208,49 @@ fn remove_restrictions_allows_signed_linearized_rewrite() {
 }
 
 #[test]
+fn signed_pages_extraction_proceeds_qpdf_compatible() {
+    // Direct regression for flpdf-hn1g.13: a signed `--pages` extraction (always
+    // a full rewrite) used to be REFUSED (exit 2) when the signature field was a
+    // retained-page widget. qpdf does not refuse — it proceeds, leaving the
+    // signature present-but-invalid. flpdf now matches: exit 0, signature objects
+    // preserved. (build_signed_acroform_pdf's sig field is a widget on page 1.)
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, build_signed_acroform_pdf()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        input.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        "--",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("refusing full rewrite").not());
+
+    assert!(output.exists());
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
+        "signed --pages must preserve the signature /ByteRange (qpdf-compatible)"
+    );
+}
+
+#[test]
 fn incremental_rewrite_of_signed_pdf_succeeds_without_warning() {
-    // AC (flpdf-9hc.22.7): the incremental-update path preserves signed byte
-    // ranges, so a signed input is neither refused nor stripped — it succeeds
-    // silently. `--remove-unreferenced-resources=no` is the documented way to
-    // stay on the incremental path (a plain `rewrite` defaults to `auto`, which
-    // forces the full rewrite that *would* refuse). No --remove-restrictions, so
-    // no signatures are removed and no warning is emitted.
+    // The incremental-update path appends to the source bytes verbatim, so a
+    // signed input's byte ranges stay intact — the signature is preserved and
+    // still valid, with no warning. `--remove-unreferenced-resources=no` stays on
+    // the incremental path (a plain `rewrite` defaults to `auto`, which forces a
+    // full rewrite — that now proceeds qpdf-compatibly, but it shifts byte
+    // positions and so invalidates the signature, hence this test pins the
+    // incremental path). No --remove-restrictions, so no signatures are stripped.
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("signed.pdf");
     let output = temp.path().join("out.pdf");
