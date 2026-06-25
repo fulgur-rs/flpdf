@@ -119,6 +119,35 @@ fn build_shared_kids_signature_pdf(depth: u32) -> Vec<u8> {
     build_pdf(&borrowed)
 }
 
+fn build_shared_child_mixed_ft_pdf() -> Vec<u8> {
+    // AcroForm where the same leaf field (obj 7) is a child of both a /Sig
+    // parent (obj 5) and a non-/Sig parent (obj 6).  The leaf has no /FT of
+    // its own, so whether it looks like a signature field depends entirely on
+    // which parent's inherited_ft reaches it first.
+    //
+    // /Fields [5 0 R, 6 0 R]
+    //   5: /FT /Sig  /Kids [7 0 R]
+    //   6: (no /FT)  /Kids [7 0 R]
+    //   7: (no /FT)  /V 8 0 R   ← signature dict
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [5 0 R 6 0 R] /SigFlags 3 >>"),
+        (5, b"<< /FT /Sig /Kids [7 0 R] >>"),
+        (6, b"<< /Kids [7 0 R] >>"),
+        (7, b"<< /V 8 0 R >>"),
+        (
+            8,
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+    ];
+    build_pdf(&objects)
+}
+
 fn build_unsigned_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -133,6 +162,23 @@ fn build_unsigned_pdf() -> Vec<u8> {
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
+}
+
+#[test]
+fn rewrite_impact_detects_sig_via_sig_parent_when_non_sig_parent_visited_first() {
+    // Regression: keying the seen set only on ObjectRef caused a false negative
+    // when the same leaf (no /FT) is a child of both a /Sig parent and a
+    // non-/Sig parent.  The non-/Sig path visits the leaf first (inserting its
+    // ref into seen), then the /Sig path skips it → /V never collected →
+    // incremental rewrite reported as preserving signatures when it shouldn't.
+    let mut pdf = open(build_shared_child_mixed_ft_pdf());
+
+    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
+
+    assert!(
+        impact.has_signatures,
+        "signature leaf reachable only via /Sig parent must be detected even if non-/Sig parent visited first"
+    );
 }
 
 #[test]

@@ -499,7 +499,7 @@ fn collect_acroform_signatures<R: Read + Seek>(
     let Some(fields) = acroform.get("Fields").cloned() else {
         return Ok(());
     };
-    let mut seen = BTreeSet::new();
+    let mut seen: BTreeSet<(ObjectRef, bool)> = BTreeSet::new();
     for field in resolve_array(pdf, fields)? {
         if let Object::Reference(field_ref) = field {
             walk_signature_rewrite_field(pdf, field_ref, None, 0, info, &mut seen)?;
@@ -593,9 +593,13 @@ fn walk_signature_rewrite_field<R: Read + Seek>(
     inherited_ft: Option<Vec<u8>>,
     depth: usize,
     info: &mut SignatureRewriteInfo,
-    seen: &mut BTreeSet<ObjectRef>,
+    seen: &mut BTreeSet<(ObjectRef, bool)>,
 ) -> Result<()> {
-    if !seen.insert(field_ref) {
+    // Key on (ref, inherited_is_sig) so a node shared between a /Sig parent
+    // and a non-/Sig parent is visited once per distinct inheritance context.
+    // Each ref appears at most twice → traversal stays linear.
+    let inherited_is_sig = inherited_ft.as_deref() == Some(b"Sig");
+    if !seen.insert((field_ref, inherited_is_sig)) {
         return Ok(());
     }
     if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
