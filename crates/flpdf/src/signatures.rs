@@ -499,9 +499,10 @@ fn collect_acroform_signatures<R: Read + Seek>(
     let Some(fields) = acroform.get("Fields").cloned() else {
         return Ok(());
     };
+    let mut seen = BTreeSet::new();
     for field in resolve_array(pdf, fields)? {
         if let Object::Reference(field_ref) = field {
-            walk_signature_rewrite_field(pdf, field_ref, None, 0, info)?;
+            walk_signature_rewrite_field(pdf, field_ref, None, 0, info, &mut seen)?;
         }
     }
     Ok(())
@@ -592,11 +593,15 @@ fn walk_signature_rewrite_field<R: Read + Seek>(
     inherited_ft: Option<Vec<u8>>,
     depth: usize,
     info: &mut SignatureRewriteInfo,
+    seen: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "signature field-tree depth limit {DEFAULT_MAX_SIGNATURE_FIELD_DEPTH} exceeded at {field_ref}"
         )));
+    }
+    if !seen.insert(field_ref) {
+        return Ok(());
     }
 
     let Object::Dictionary(dict) = pdf.resolve(field_ref)? else {
@@ -623,7 +628,14 @@ fn walk_signature_rewrite_field<R: Read + Seek>(
     if let Some(kids) = dict.get("Kids").cloned() {
         for kid in resolve_array(pdf, kids)? {
             if let Object::Reference(kid_ref) = kid {
-                walk_signature_rewrite_field(pdf, kid_ref, field_type.clone(), depth + 1, info)?;
+                walk_signature_rewrite_field(
+                    pdf,
+                    kid_ref,
+                    field_type.clone(),
+                    depth + 1,
+                    info,
+                    seen,
+                )?;
             }
         }
     }

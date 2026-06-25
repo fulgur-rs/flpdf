@@ -78,6 +78,47 @@ fn build_signed_acroform_indirect_ft_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+fn build_shared_kids_signature_pdf(depth: u32) -> Vec<u8> {
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>".to_vec()),
+    ];
+
+    for level in 0..depth {
+        let object_num = 5 + level;
+        let next_num = object_num + 1;
+        objects.push((
+            object_num,
+            format!("<< /FT /Sig /Kids [{next_num} 0 R {next_num} 0 R] >>").into_bytes(),
+        ));
+    }
+
+    let leaf_num = 5 + depth;
+    let sig_num = leaf_num + 1;
+    objects.push((
+        leaf_num,
+        format!("<< /FT /Sig /V {sig_num} 0 R >>").into_bytes(),
+    ));
+    objects.push((
+        sig_num,
+        b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+    ));
+
+    let borrowed: Vec<(u32, &[u8])> = objects
+        .iter()
+        .map(|(object_num, bytes)| (*object_num, bytes.as_slice()))
+        .collect();
+    build_pdf(&borrowed)
+}
+
 fn build_unsigned_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -92,6 +133,23 @@ fn build_unsigned_pdf() -> Vec<u8> {
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
+}
+
+#[test]
+fn rewrite_impact_deduplicates_shared_acroform_kids() {
+    // Regression: walk_signature_rewrite_field lacked a seen-set, so a shared
+    // /Kids graph (each node's /Kids lists the same child twice) caused
+    // exponential traversal. Depth 24 timed out before the fix.
+    let mut pdf = open(build_shared_kids_signature_pdf(24));
+
+    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
+
+    assert!(impact.has_signatures);
+    assert!(impact.invalidates_signatures);
+    assert_eq!(impact.reason, SignatureRewriteReason::FullRewrite);
+    // leaf field obj (5 + 24 = 29) and its /V sig dict (30) must be collected
+    assert!(impact.signed_object_refs.contains(&ObjectRef::new(29, 0)));
+    assert!(impact.signed_object_refs.contains(&ObjectRef::new(30, 0)));
 }
 
 #[test]
