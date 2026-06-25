@@ -63,9 +63,12 @@
 //! [`crate::page_split`]. They do not affect output validity.
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
-use crate::pages::{resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::pages::{
+    page_refs_with_max_depth, resolve_inherited_resources_with_max_depth,
+    DEFAULT_MAX_PAGE_TREE_DEPTH,
+};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -85,12 +88,23 @@ use std::io::{Read, Seek};
 ///   look up `ref_map[old]` and remap to the first element (qpdf-equivalent:
 ///   destinations resolve to the first occurrence of a duplicated page).
 /// - **8.11** (AcroForm): widget `/P` back-pointers follow the same rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RebuildResult {
     /// The rebuilt root `/Pages` `/Kids`, in selection order.
     pub new_kids: Vec<ObjectRef>,
     /// Source page ref → every new leaf ref derived from it (selection order).
     pub ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>>,
+    /// Every original page-tree leaf that the rebuild dropped: the source page
+    /// leaves (qpdf `getAllPages`) that are absent from `ref_map`.
+    ///
+    /// This is the exact set qpdf nulls during `--pages` (`QPDFJob` enumerates
+    /// the original page tree and replaces each unselected `/Page` object with
+    /// `null`). Downstream null-out (8.10 outline / named-destination remap)
+    /// keys on membership here so a destination is only allowed to null a
+    /// genuine removed page — never an arbitrary non-page object it happens to
+    /// reference. Membership is captured from the **original** tree before the
+    /// rebuild reparents leaves, so it cannot be reconstructed afterwards.
+    pub removed_pages: BTreeSet<ObjectRef>,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +249,12 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     };
     let pages_root_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
 
+    // Enumerate the original page-tree leaves (qpdf `getAllPages`) BEFORE the
+    // loop reparents leaves and rewrites the root /Kids — afterwards the
+    // original membership is unrecoverable. Any leaf absent from the final
+    // `ref_map` is a removed page; this is the exact set qpdf nulls.
+    let original_pages: Vec<ObjectRef> = page_refs_with_max_depth(pdf, max_depth)?;
+
     // Next free object number, for cloning duplicate-selection leaves.
     let mut next_num: u32 = pdf
         .object_refs()
@@ -349,7 +369,19 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     root_dict.remove("Parent");
     pdf.set_object(pages_root_ref, Object::Dictionary(root_dict));
 
-    Ok(RebuildResult { new_kids, ref_map })
+    // A removed page is an original leaf that no selection kept (absent from
+    // `ref_map`). New refs minted for duplicate selections are fresh object
+    // numbers, never original leaves, so they are correctly excluded.
+    let removed_pages: BTreeSet<ObjectRef> = original_pages
+        .into_iter()
+        .filter(|p| !ref_map.contains_key(p))
+        .collect();
+
+    Ok(RebuildResult {
+        new_kids,
+        ref_map,
+        removed_pages,
+    })
 }
 
 // ---------------------------------------------------------------------------

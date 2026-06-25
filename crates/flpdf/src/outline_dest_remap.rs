@@ -13,11 +13,19 @@
 //! - A destination whose target page **survived** is remapped to its new
 //!   `ObjectRef` (the first element of `ref_map[old_ref]`, matching qpdf's rule
 //!   that a destination resolves to the first occurrence of a duplicated page).
-//! - A destination whose target page was **removed** is left verbatim, and the
-//!   target page object is replaced with `null` in place. The subsequent subset
-//!   sweep ([`crate::subset_prune`]) keeps that null object only while a surviving
-//!   destination still references it; a removed page referenced by nothing is
-//!   garbage-collected entirely.
+//! - Every **removed** original page leaf is replaced with `null` in place, up
+//!   front and independent of how it is referenced — qpdf enumerates the
+//!   original page tree and `replaceObject`s each unselected `/Page`. A
+//!   destination targeting a removed page is left verbatim, now resolving to
+//!   that `null`. The subsequent subset sweep ([`crate::subset_prune`]) keeps
+//!   the null object only while a surviving destination still references it; a
+//!   removed page referenced by nothing is garbage-collected entirely. Nulling
+//!   the page object — rather than whatever a destination's (possibly indirect,
+//!   possibly non-page) first element points at — means a removed page reached
+//!   only through a reference holder or a non-page wrapper dictionary is still
+//!   severed, so excluded page contents cannot leak into the output, while a
+//!   non-page object a malformed destination happens to reference is never
+//!   touched.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
@@ -29,11 +37,12 @@
 //! `/Limits` unchanged. A removed page referenced by no surviving destination is
 //! absent from the output. This module reproduces that behaviour.
 //!
-//! The same null-out also applies to a removed page reached only through a
-//! surviving page's link annotation (`/Dest`, or `/A /GoTo /D`) or the catalog
-//! `/OpenAction`: qpdf keeps the destination reference verbatim and replaces the
-//! target page object with `null`. An annotation is structurally identical to an
-//! outline item for destination purposes, so the same remap/null logic is reused.
+//! The removed-page null-out is page-driven, so it also covers a removed page
+//! reached only through a surviving page's link annotation (`/Dest`, or
+//! `/A /GoTo /D`) or the catalog `/OpenAction`: qpdf keeps the destination
+//! reference verbatim and the target page object is already `null`. An
+//! annotation is structurally identical to an outline item for the *remap* of a
+//! surviving-page destination, so that remap logic is reused.
 //! (A removed page reached only through a structure element's `/Pg` belongs to a
 //! different, drop-and-garbage-collect family handled by
 //! [`crate::struct_tree_pg`]; a thread bead's `/P` is in the same drop family
@@ -96,7 +105,6 @@ impl Surviving {
 
     /// Whether `page_ref` denotes a surviving page: either a surviving source
     /// ref (a remap key) or a rebuilt output ref (an already-remapped target).
-    /// The null-pass nulls only a page ref for which this is `false`.
     fn is_surviving_target(&self, page_ref: ObjectRef) -> bool {
         self.map.contains_key(&page_ref) || self.new_refs.contains(&page_ref)
     }
@@ -106,18 +114,23 @@ impl Surviving {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Remap outline items and named destinations after a page-tree rebuild,
-/// nulling removed-page targets (qpdf `--pages` parity).
+/// Null removed pages and remap surviving-page destinations after a page-tree
+/// rebuild (qpdf `--pages` parity).
 ///
 /// `result` is the [`RebuildResult`] returned by
 /// [`crate::page_tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
-/// old → new page reference mapping: a page absent from the map was removed;
-/// a page present maps to `ref_map[old][0]` (first new occurrence).
+/// old → new page reference mapping (a page absent from the map was removed; a
+/// page present maps to `ref_map[old][0]`, the first new occurrence), and
+/// `removed_pages` is the set of dropped original page leaves.
 ///
-/// Every outline item and named destination is kept: a surviving-page target is
-/// remapped, a removed-page target is replaced with `null` in place. The
-/// function mutates `pdf` in place (same convention as `rebuild_page_tree`) and
-/// succeeds silently when there is no `/Outlines` or named-destination structure.
+/// First, every removed page leaf in `removed_pages` is replaced with `null` in
+/// place (qpdf enumerates the original page tree and nulls each unselected
+/// `/Page`, regardless of how it is referenced). Then every outline item and
+/// named destination is kept and a surviving-page target is remapped to its new
+/// ref; a destination targeting a removed page is left verbatim, now resolving
+/// to that `null`. The function mutates `pdf` in place (same convention as
+/// `rebuild_page_tree`) and remaps no navigation when there is no `/Outlines` or
+/// named-destination structure (it still nulls removed pages).
 ///
 /// # Errors
 ///
@@ -143,10 +156,20 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     result: &RebuildResult,
     max_depth: usize,
 ) -> Result<()> {
+    // Step 0: null every removed original page leaf in place (qpdf null-out).
+    // qpdf's `--pages` enumerates the original page tree and `replaceObject`s
+    // each unselected `/Page` with `null`, independent of how the page is
+    // referenced. Doing this up front — rather than nulling whatever a
+    // destination's first element resolves to — severs a removed page reached
+    // only through a reference holder or a non-page wrapper dictionary, so its
+    // contents cannot leak, while never touching a non-page object a malformed
+    // destination happens to reference.
+    null_removed_pages(pdf, result);
+
     // Step 1: build the surviving-page map (first new ref per surviving source)
     // together with the set of all rebuilt output refs, so a destination already
     // remapped to a surviving page's new ref is never mistaken for a removed
-    // target by the null-pass.
+    // target by the remap-pass.
     let surviving = Surviving::from_rebuild(result);
 
     // Locate the catalog.
@@ -161,12 +184,12 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
     let outlines_ref = catalog.get_ref("Outlines");
 
-    // --- Step 2: Remap named destinations (qpdf null-out) -----------------
+    // --- Step 2: Remap named destinations -------------------------------------
     // qpdf keeps every named destination: a surviving-page dest is remapped to
-    // its new page ref; a removed-page dest is left verbatim and its target
-    // page object is replaced with `null` (an unreferenced removed page is then
-    // garbage-collected by the later subset sweep). /Names and /Dests are never
-    // removed from the catalog, and /Limits is never recomputed.
+    // its new page ref; a removed-page dest is left verbatim (its target page
+    // object was already nulled in Step 0, and an unreferenced removed page is
+    // then garbage-collected by the later subset sweep). /Names and /Dests are
+    // never removed from the catalog, and /Limits is never recomputed.
 
     // /Names may be an indirect reference OR a direct dictionary on the catalog;
     // /Dests inside it likewise.
@@ -232,10 +255,11 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         _ => {}
     }
 
-    // --- Step 3: Remap the outline tree (qpdf null-out) -------------------
-    // Every outline item is kept; only its destination page ref is remapped (or
-    // nulled when the target page was removed). Sibling links, /Count, and the
-    // /Outlines catalog entry are all left unchanged.
+    // --- Step 3: Remap the outline tree -----------------------------------
+    // Every outline item is kept; only its destination page ref is remapped when
+    // the target page survived (a removed target was already nulled in Step 0 and
+    // is left referenced verbatim). Sibling links, /Count, and the /Outlines
+    // catalog entry are all left unchanged.
     if let Some(outlines_obj_ref) = outlines_ref {
         let first_ref = {
             let outline_root_obj = pdf.resolve_borrowed(outlines_obj_ref)?;
@@ -249,31 +273,31 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     }
 
     // --- Step 4: Link-annotation and /OpenAction destinations -------------
-    // qpdf nulls a removed page reached only via a surviving page's link
-    // annotation (/Dest or /A /GoTo /D) or the catalog /OpenAction, keeping the
-    // destination reference verbatim — the same null-out family as outlines and
-    // named destinations. (A removed page reached only via a thread-bead /P or a
-    // struct element /Pg is a different, drop-and-GC family; struct elem /Pg is
-    // handled by crate::struct_tree_pg, after this pass in the pipeline.)
+    // Remap a surviving-page destination reached via a surviving page's link
+    // annotation (/Dest or /A /GoTo /D) or the catalog /OpenAction. A removed
+    // page reached only this way was already nulled in Step 0 (the destination
+    // reference is kept verbatim). (A removed page reached only via a thread-bead
+    // /P or a struct element /Pg is a different, drop-and-GC family; struct elem
+    // /Pg is handled by crate::struct_tree_pg, after this pass in the pipeline.)
     remap_annot_dests(pdf, result, &surviving)?;
     remap_open_action_dest(pdf, catalog_ref, &surviving)?;
 
     Ok(())
 }
 
-/// Null/remap link-annotation destinations on every surviving page (qpdf
-/// `--pages` parity). An annotation is structurally identical to an outline
-/// item for destination purposes (`/Dest` and `/A /GoTo /D`): a removed target
-/// page is replaced with `null` (its `/Dest`/`/D` reference kept verbatim), a
-/// surviving target is remapped to its new ref. qpdf applies this to both
-/// indirect annotations and inline (direct-dict) annotations stored in
-/// `/Annots`, so both forms are handled here.
+/// Remap link-annotation destinations on every surviving page (qpdf `--pages`
+/// parity). An annotation is structurally identical to an outline item for
+/// destination purposes (`/Dest` and `/A /GoTo /D`): a surviving target is
+/// remapped to its new ref, while a removed target needs no action — the page
+/// object was already replaced with `null` by [`null_removed_pages`] and the
+/// `/Dest`/`/D` reference is kept verbatim. qpdf applies this to both indirect
+/// annotations and inline (direct-dict) annotations stored in `/Annots`, so both
+/// forms are handled here.
 ///
-/// An *indirect* annotation is rewritten in place via the shared
-/// [`null_removed_item_targets`] + [`remap_item_dest`] pair. An *inline*
-/// (direct-dict) annotation has no object identity, so it is remapped on the
-/// array element and the updated `/Annots` array written back (to the page dict
-/// for an inline array, or to the array object for an indirect array).
+/// An *indirect* annotation is remapped in place via [`remap_item_dest`]. An
+/// *inline* (direct-dict) annotation has no object identity, so it is remapped on
+/// the array element and the updated `/Annots` array written back (to the page
+/// dict for an inline array, or to the array object for an indirect array).
 ///
 /// A duplicate-page selection (e.g. `--pages . 1,1`) produces several surviving
 /// pages that share the same indirect annotation object, so the same annotation
@@ -283,8 +307,9 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 /// object — exactly once, so a shared destination is not re-remapped on a later
 /// pass (avoiding redundant rewrites). Correctness does not rest on the dedup
 /// alone: a destination already pointing at a rebuilt output ref is recognised as
-/// a surviving target by [`Surviving::is_surviving_target`] and is never nulled,
-/// so even a re-resolved already-remapped `/Dest` cannot null a surviving page.
+/// a surviving target by [`Surviving::is_surviving_target`], so a re-resolved
+/// already-remapped `/Dest` is a no-op (`remap_dest_value` returns `None`) rather
+/// than being remapped a second time.
 /// An *inline* `/Annots` array lives in a single page dict and cannot be shared
 /// by reference, so it needs no dedup.
 fn remap_annot_dests<R: Read + Seek>(
@@ -344,7 +369,7 @@ fn remap_annot_dests<R: Read + Seek>(
     Ok(())
 }
 
-/// Process every element of an `/Annots` array for destination null-out/remap.
+/// Process every element of an `/Annots` array for destination remap.
 ///
 /// An indirect annotation (`Object::Reference`) is rewritten in place by the
 /// shared item helpers (deduplicated across duplicated pages via `visited`); an
@@ -367,13 +392,12 @@ fn remap_annot_array<R: Read + Seek>(
                 // A shared indirect annot reachable from several duplicated
                 // pages must be processed once (see remap_annot_dests).
                 if visited.insert(r) {
-                    null_removed_item_targets(pdf, r, surviving)?;
                     remap_item_dest(pdf, r, surviving)?;
                 }
                 out.push(Object::Reference(r));
             }
             Object::Dictionary(annot) => {
-                let (new_annot, ch) = remap_or_null_inline_annot(pdf, annot, surviving)?;
+                let (new_annot, ch) = remap_inline_annot(pdf, annot, surviving)?;
                 changed |= ch;
                 out.push(Object::Dictionary(new_annot));
             }
@@ -383,16 +407,16 @@ fn remap_annot_array<R: Read + Seek>(
     Ok(if changed { Some(out) } else { None })
 }
 
-/// Remap/null an inline (direct-dict) annotation's destinations.
+/// Remap an inline (direct-dict) annotation's destinations.
 ///
 /// An inline annotation has no object identity, so its `/Dest` and `/A` are
-/// handled directly: a removed target page is nulled (the destination value
-/// kept verbatim), a surviving target is remapped. `/Dest` is a destination
-/// value handled by [`remap_or_null_dest`]; `/A` is an action, processed by
-/// [`remap_or_null_action_dest`] so that only a `/S /GoTo` action's `/D` is
+/// handled directly: a surviving target is remapped, a removed target is left
+/// verbatim (its page object was already nulled by [`null_removed_pages`]).
+/// `/Dest` is a destination value handled by [`remap_dest`]; `/A` is an action,
+/// processed by [`remap_action_dest`] so that only a `/S /GoTo` action's `/D` is
 /// treated as a local page destination. Returns the (possibly updated) dict and
 /// whether a destination key was present and processed.
-fn remap_or_null_inline_annot<R: Read + Seek>(
+fn remap_inline_annot<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut annot: crate::Dictionary,
     surviving: &Surviving,
@@ -401,22 +425,23 @@ fn remap_or_null_inline_annot<R: Read + Seek>(
     // `annot` is owned: take each value by `remove` and re-insert the processed
     // result (no inner clone of the destination).
     if let Some(dest) = annot.remove("Dest") {
-        annot.insert("Dest", remap_or_null_dest(pdf, dest, surviving)?);
+        annot.insert("Dest", remap_dest(pdf, dest, surviving)?);
         changed = true;
     }
     if let Some(action) = annot.remove("A") {
-        annot.insert("A", remap_or_null_action_dest(pdf, action, surviving)?);
+        annot.insert("A", remap_action_dest(pdf, action, surviving)?);
         changed = true;
     }
     Ok((annot, changed))
 }
 
-/// Null/remap the catalog `/OpenAction` destination (qpdf `--pages` parity).
+/// Remap the catalog `/OpenAction` destination (qpdf `--pages` parity).
 /// `/OpenAction` is either a destination array `[page /Fit ...]` or an action
-/// dict (possibly indirect). [`remap_or_null_action_dest`] handles both: a
+/// dict (possibly indirect). [`remap_action_dest`] handles both: a
 /// `/S /GoTo` action's `/D` — or a bare destination array/dict — targeting a
-/// surviving page is remapped and a removed target is nulled, while a non-GoTo
-/// action is kept verbatim (its `/D` is not a local page destination).
+/// surviving page is remapped (a removed target is left verbatim, its page
+/// already nulled), while a non-GoTo action is kept verbatim (its `/D` is not a
+/// local page destination).
 fn remap_open_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     catalog_ref: ObjectRef,
@@ -437,7 +462,7 @@ fn remap_open_action_dest<R: Read + Seek>(
     // comes back changed. Only rewrite the catalog when the value actually
     // changed, so an unchanged (or in-place-updated indirect) /OpenAction does
     // not needlessly mark the catalog dirty.
-    let updated = remap_or_null_action_dest(pdf, oa.clone(), surviving)?;
+    let updated = remap_action_dest(pdf, oa.clone(), surviving)?;
     if updated != oa {
         let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
         if let Some(mut catalog) = catalog_obj.as_dict().cloned() {
@@ -448,23 +473,22 @@ fn remap_open_action_dest<R: Read + Seek>(
     Ok(())
 }
 
-/// Remap/null a GoTo destination carried by an action value (`/A` or
-/// `/OpenAction`).
+/// Remap a GoTo destination carried by an action value (`/A` or `/OpenAction`).
 ///
 /// Only a `/S /GoTo` action's `/D` is a local page destination, so a non-GoTo
 /// action (e.g. `/GoToR`, `/URI`, `/Launch`) is kept verbatim — its `/D`, when
 /// present, targets a remote or named destination and must never be mistaken
 /// for a local page ref. A bare destination value (an array `[page /Fit]` or a
-/// `<< /D … >>` dict with no `/S`) is passed through to [`remap_or_null_dest`].
+/// `<< /D … >>` dict with no `/S`) is passed through to [`remap_dest`].
 /// This mirrors the `/S /GoTo` check the indirect-annotation path performs in
 /// [`remap_item_dest`].
-fn remap_or_null_action_dest<R: Read + Seek>(
+fn remap_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
     surviving: &Surviving,
 ) -> Result<Object> {
     // Resolve to inspect /S without losing the original value form for the
-    // write-back (remap_or_null_dest handles an indirect value in place).
+    // write-back (remap_dest handles an indirect value in place).
     let (concrete, _) = resolve_ref_chain(pdf, &value)?;
     if let Some(dict) = concrete.as_dict() {
         // A non-GoTo action: keep verbatim (its /D is not a local destination).
@@ -472,24 +496,36 @@ fn remap_or_null_action_dest<R: Read + Seek>(
             return Ok(value);
         }
     }
-    remap_or_null_dest(pdf, value, surviving)
+    remap_dest(pdf, value, surviving)
 }
 
 // ---------------------------------------------------------------------------
-// qpdf null-out helpers: keep every entry, remap surviving-page dests, and
-// replace a removed page object with `null`.
+// qpdf null-out: replace every removed original page leaf with `null` in place,
+// independent of how it is referenced. Destination remap (surviving pages) is
+// handled separately below.
 // ---------------------------------------------------------------------------
 
-/// Replace a removed page object with `null` in place (qpdf null-out).
-/// Idempotent: a page already nulled (e.g. referenced by several dests) stays
-/// null. The later subset sweep drops it iff nothing references it.
-fn null_page<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) {
-    pdf.set_object(page_ref, Object::Null);
+/// Replace every removed original page leaf with `null` in place (qpdf null-out).
+///
+/// `result.removed_pages` is the set of original page-tree leaves the rebuild
+/// dropped — exactly the objects qpdf's `--pages` nulls (`QPDFJob` enumerates
+/// the original page tree and `replaceObject`s each unselected `/Page`). This is
+/// page-driven, never destination-driven: a removed page reached only through a
+/// reference holder (`[40 0 R]` with `40 0 obj` = `4 0 R`) or a non-page wrapper
+/// dictionary (`40 0 obj` = `<< /X 4 0 R >>`) is still severed, so its contents
+/// cannot leak; a non-page object a malformed destination happens to reference
+/// is never in this set and is left untouched. The subsequent subset sweep
+/// drops any nulled page that no surviving destination still references.
+fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) {
+    for &removed in &result.removed_pages {
+        pdf.set_object(removed, Object::Null);
+    }
 }
 
 /// Remap a `/Names`-leaf name tree (or descend its `/Kids`) in place, keeping
 /// every entry. A surviving-page dest is remapped; a removed-page dest is left
-/// verbatim and its target page is nulled. `/Limits` is never recomputed.
+/// verbatim (its target page object was already nulled by [`null_removed_pages`]).
+/// `/Limits` is never recomputed.
 fn remap_name_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
@@ -558,8 +594,9 @@ fn remap_name_tree_node_dict<R: Read + Seek>(
 }
 
 /// Keep every `(name, dest)` pair of a flat name-pairs array, remapping a
-/// surviving-page dest and nulling a removed-page target. Returns the rebuilt
-/// array (same order as the input; a trailing odd orphan key is dropped).
+/// surviving-page dest (a removed-page dest is left verbatim, its page already
+/// nulled). Returns the rebuilt array (same order as the input; a trailing odd
+/// orphan key is dropped).
 fn remap_name_pairs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pairs: Vec<Object>,
@@ -572,33 +609,34 @@ fn remap_name_pairs<R: Read + Seek>(
         let dest_obj = pairs[i + 1].clone();
         i += 2;
         result.push(name_obj);
-        result.push(remap_or_null_dest(pdf, dest_obj, surviving)?);
+        result.push(remap_dest(pdf, dest_obj, surviving)?);
     }
     Ok(result)
 }
 
-/// Remap a single dest value, or null its target page if the page was removed.
-/// Returns the dest value to store back. Indirect dests are rewritten in place
-/// by [`remap_dest_value`], so the original value is returned unchanged.
-fn remap_or_null_dest<R: Read + Seek>(
+/// Remap a single dest value to its surviving target's new ref, or keep it
+/// verbatim. Returns the dest value to store back. Indirect dests are rewritten
+/// in place by [`remap_dest_value`], so the original value is returned unchanged.
+///
+/// A removed-page target needs no action here: the page object was already
+/// replaced with `null` by [`null_removed_pages`], so the destination simply
+/// resolves to that `null`. A non-page or named/external target likewise stays
+/// verbatim.
+fn remap_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dest_obj: Object,
     surviving: &Surviving,
 ) -> Result<Object> {
     match dest_page_ref_resolved(pdf, &dest_obj)? {
-        Some(page_ref) => {
-            if surviving.is_surviving_target(page_ref) {
-                // A surviving source ref is remapped to its new ref; a ref that
-                // is already a rebuilt output ref stays verbatim (remap is a
-                // no-op, so `remap_dest_value` returns `None`).
-                Ok(remap_dest_value(pdf, &dest_obj, surviving)?.unwrap_or(dest_obj))
-            } else {
-                null_page(pdf, page_ref);
-                Ok(dest_obj)
-            }
+        // A surviving source ref is remapped to its new ref; a ref that is
+        // already a rebuilt output ref stays verbatim (remap is a no-op, so
+        // `remap_dest_value` returns `None`).
+        Some(page_ref) if surviving.is_surviving_target(page_ref) => {
+            Ok(remap_dest_value(pdf, &dest_obj, surviving)?.unwrap_or(dest_obj))
         }
-        // No resolvable page ref (named/external/malformed) — keep verbatim.
-        None => Ok(dest_obj),
+        // Removed page (already nulled), non-page object, or named/external
+        // dest — keep the destination value verbatim.
+        _ => Ok(dest_obj),
     }
 }
 
@@ -618,7 +656,8 @@ fn remap_legacy_dests<R: Read + Seek>(
 }
 
 /// Keep every entry of a legacy `/Dests` dictionary, remapping surviving-page
-/// dests and nulling removed-page targets. Returns the rebuilt dictionary.
+/// dests (a removed-page dest is left verbatim, its page already nulled).
+/// Returns the rebuilt dictionary.
 fn remap_dests_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dests: crate::Dictionary,
@@ -630,16 +669,17 @@ fn remap_dests_dict<R: Read + Seek>(
         let Some(val) = dests.get(&key).cloned() else {
             continue;
         };
-        let updated = remap_or_null_dest(pdf, val, surviving)?;
+        let updated = remap_dest(pdf, val, surviving)?;
         new_dests.insert(key, updated);
     }
     Ok(new_dests)
 }
 
 /// Walk the outline sibling chain from `first_ref`, recursing into children,
-/// keeping every item: remap each item's `/Dest` and `/A /GoTo /D`, nulling any
-/// removed target page. Sibling links and `/Count` are left unchanged. Bounded
-/// by `depth`/`max_depth` and a shared `visited` set (hostile-PDF guards).
+/// keeping every item: remap each item's `/Dest` and `/A /GoTo /D` to its
+/// surviving target's new ref (a removed target is left verbatim, its page
+/// already nulled). Sibling links and `/Count` are left unchanged. Bounded by
+/// `depth`/`max_depth` and a shared `visited` set (hostile-PDF guards).
 fn remap_outline_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     first_ref: ObjectRef,
@@ -666,62 +706,15 @@ fn remap_outline_tree<R: Read + Seek>(
             (item.get_ref("Next"), item.get_ref("First"))
         };
 
-        // Null any removed target page reached via /Dest or /A /GoTo /D, then
-        // remap surviving-page refs in place. The two operate on disjoint sets
-        // (removed vs surviving), so order is immaterial.
-        null_removed_item_targets(pdf, item_ref, surviving)?;
+        // Remap surviving-page refs in place. Removed target pages need no
+        // action here — they were already replaced with `null` by
+        // [`null_removed_pages`] (the destination reference is kept verbatim).
         remap_item_dest(pdf, item_ref, surviving)?;
 
         if let Some(child_first) = first_child {
             remap_outline_tree(pdf, child_first, depth + 1, max_depth, surviving, visited)?;
         }
         current = next_ref;
-    }
-    Ok(())
-}
-
-/// Null the target page of an outline item's `/Dest` and `/A /GoTo /D` when the
-/// page was removed (not in `surviving`). Surviving targets are left for
-/// [`remap_item_dest`] to remap.
-fn null_removed_item_targets<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    item_ref: ObjectRef,
-    surviving: &Surviving,
-) -> Result<()> {
-    let (dest_val, action_val) = {
-        let item_obj = pdf.resolve_borrowed(item_ref)?;
-        let Some(item) = item_obj.as_dict() else {
-            return Ok(());
-        };
-        (item.get("Dest").cloned(), item.get("A").cloned())
-    };
-    if let Some(dest) = dest_val {
-        null_removed_dest_target(pdf, &dest, surviving)?;
-    }
-    if let Some(action) = action_val {
-        let (resolved, _) = resolve_ref_chain(pdf, &action)?;
-        if let Some(a) = resolved.as_dict() {
-            let is_goto = matches!(a.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-            if is_goto {
-                if let Some(d) = a.get("D").cloned() {
-                    null_removed_dest_target(pdf, &d, surviving)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// If `dest` resolves to an explicit (removed) page ref, null that page.
-fn null_removed_dest_target<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dest: &Object,
-    surviving: &Surviving,
-) -> Result<()> {
-    if let Some(page_ref) = dest_page_ref_resolved(pdf, dest)? {
-        if !surviving.is_surviving_target(page_ref) {
-            null_page(pdf, page_ref);
-        }
     }
     Ok(())
 }
@@ -1069,6 +1062,32 @@ mod tests {
         d.get_ref(key)
     }
 
+    /// Build a synthetic [`RebuildResult`] for a test PDF whose page tree is
+    /// still intact (no real rebuild ran). `removed_pages` is every original
+    /// page-tree leaf (`pages::page_refs`) that is not a surviving target —
+    /// i.e. neither a `ref_map` key nor a `new_kids` member, mirroring
+    /// [`Surviving::is_surviving_target`]. (In a real rebuild every `new_kids`
+    /// member is also a `ref_map` key, so this equals `page_refs − ref_map.keys()`;
+    /// the extra `new_kids` exclusion only matters for hand-built results whose
+    /// surviving output ref is not itself a `ref_map` key.)
+    fn synthetic_result(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        new_kids: Vec<ObjectRef>,
+        ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>>,
+    ) -> RebuildResult {
+        let new_set: BTreeSet<ObjectRef> = new_kids.iter().copied().collect();
+        let removed_pages = crate::pages::page_refs(pdf)
+            .unwrap()
+            .into_iter()
+            .filter(|p| !ref_map.contains_key(p) && !new_set.contains(p))
+            .collect();
+        RebuildResult {
+            new_kids,
+            ref_map,
+            removed_pages,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test: all pages survive → pure remap
     // -----------------------------------------------------------------------
@@ -1229,12 +1248,10 @@ mod tests {
         // null-out keeps /Outlines and every outline item; all referenced page
         // objects (obj3,4,5,6) are nulled in place.
         let mut pdf = open(build_outline_pdf());
-        let result = RebuildResult {
-            // No page survives, so the rebuilt /Pages tree is empty too (a page
-            // present in `new_kids` would, by definition, have survived).
-            new_kids: vec![],
-            ref_map: BTreeMap::new(), // empty -> no old page survives
-        };
+        // No page survives, so the rebuilt /Pages tree is empty too (a page
+        // present in `new_kids` would, by definition, have survived); every
+        // original leaf is therefore a removed page.
+        let result = synthetic_result(&mut pdf, vec![], BTreeMap::new());
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         // /Outlines is RETAINED on the catalog.
@@ -1442,11 +1459,9 @@ mod tests {
         // entries; /Names and /Dests stay on the catalog; every target page obj
         // is nulled.
         let mut pdf = open(build_outline_pdf());
-        let result = RebuildResult {
-            // No page survives, so the rebuilt /Pages tree is empty too.
-            new_kids: vec![],
-            ref_map: BTreeMap::new(), // all pages removed
-        };
+        // No page survives, so the rebuilt /Pages tree is empty too; all pages
+        // removed.
+        let result = synthetic_result(&mut pdf, vec![], BTreeMap::new());
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
@@ -1618,6 +1633,220 @@ mod tests {
         assert!(
             matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
             "page 2 (obj4) nulled, holder obj41 untouched"
+        );
+    }
+
+    #[test]
+    fn malformed_named_dest_to_non_page_dict_is_not_nulled() {
+        // An attacker-controlled named destination points its first array
+        // element at a signature field (obj7, a non-page object); a second entry
+        // points at the genuinely removed page (obj4). qpdf nulls only removed
+        // PAGE objects, so obj7 must survive intact while obj4 is still nulled.
+        let bytes = build_min_pdf(
+            &[
+                (
+                    1,
+                    "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R /AcroForm 6 0 R >>",
+                ),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (6, "<< /Fields [7 0 R] /SigFlags 3 >>"),
+                (7, "<< /FT /Sig /T (sig) /V 8 0 R >>"),
+                (8, "<< /Type /Sig /Filter /Adobe.PPKLite >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (
+                    30,
+                    "<< /Names [(evil) [7 0 R /Fit] (removed) [4 0 R /Fit]] >>",
+                ),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // The signature field object survives intact — it is not a page.
+        let sig_field = dict_of(&mut pdf, ObjectRef::new(7, 0));
+        assert_eq!(sig_field.get("FT"), Some(&Object::Name(b"Sig".to_vec())));
+        // The genuinely removed page (obj4) is still nulled.
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page obj4 is still nulled"
+        );
+    }
+
+    #[test]
+    fn malformed_outline_dest_to_non_page_dict_is_not_nulled() {
+        // Same boundary via an outline item's /Dest: item 20 targets a non-page
+        // object (obj7), item 21 targets the removed page (obj4). obj7 survives;
+        // obj4 is nulled.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (7, "<< /FT /Sig /T (sig) /V 8 0 R >>"),
+                (8, "<< /Type /Sig /Filter /Adobe.PPKLite >>"),
+                (
+                    10,
+                    "<< /Type /Outlines /First 20 0 R /Last 21 0 R /Count 2 >>",
+                ),
+                (
+                    20,
+                    "<< /Title (evil) /Parent 10 0 R /Next 21 0 R /Dest [7 0 R /Fit] >>",
+                ),
+                (
+                    21,
+                    "<< /Title (removed) /Parent 10 0 R /Prev 20 0 R /Dest [4 0 R /Fit] >>",
+                ),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        let sig_field = dict_of(&mut pdf, ObjectRef::new(7, 0));
+        assert_eq!(sig_field.get("FT"), Some(&Object::Name(b"Sig".to_vec())));
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page obj4 is still nulled"
+        );
+    }
+
+    #[test]
+    fn malformed_dest_to_fake_type_page_outside_tree_is_not_nulled() {
+        // The hostile object (obj7) forges /Type /Page but was never a leaf of
+        // the source page tree (absent from /Pages /Kids). qpdf nulls only
+        // original page-tree members, so obj7 must survive — a /Type-only check
+        // would wrongly null it, leaving the signature-evidence bypass open.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (7, "<< /FT /Sig /Type /Page /T (sig) /V 8 0 R >>"),
+                (8, "<< /Type /Sig /Filter /Adobe.PPKLite >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (
+                    30,
+                    "<< /Names [(evil) [7 0 R /Fit] (removed) [4 0 R /Fit]] >>",
+                ),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // The forged-/Type/Page object survives — it was never a page-tree leaf.
+        let forged = dict_of(&mut pdf, ObjectRef::new(7, 0));
+        assert_eq!(forged.get("FT"), Some(&Object::Name(b"Sig".to_vec())));
+        // The genuine removed page (obj4, an actual tree leaf) is still nulled.
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page obj4 is still nulled"
+        );
+    }
+
+    #[test]
+    fn removed_page_behind_reference_holder_is_nulled() {
+        // A named dest reaches the removed page through a reference *holder*
+        // (`40 0 obj` = `4 0 R`), not by pointing at obj4 directly. qpdf nulls
+        // the page leaf (obj4) regardless of how it is referenced, so its
+        // contents cannot leak; the holder (obj40, not a page) is untouched.
+        // Regression for the Codex finding that the destination-following guard
+        // left obj4 live behind the holder.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Secret (S4) >>",
+                ),
+                (11, "<< /Dests 30 0 R >>"),
+                (30, "<< /Names [(evil) [40 0 R /Fit]] >>"),
+                (40, "4 0 R"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page obj4 reached only through a reference holder must be nulled"
+        );
+    }
+
+    #[test]
+    fn removed_page_behind_non_page_wrapper_is_nulled() {
+        // A named dest reaches the removed page through a NON-PAGE wrapper dict
+        // (`40 0 obj` = `<< /X 4 0 R >>`). qpdf nulls the page leaf (obj4)
+        // directly; the wrapper (not a page) is left untouched and now points at
+        // the null. Regression for the Codex finding that the wrapper kept the
+        // removed page reachable through the subset sweep.
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Secret (S4) >>",
+                ),
+                (11, "<< /Dests 30 0 R >>"),
+                (30, "<< /Names [(evil) [40 0 R /Fit]] >>"),
+                (40, "<< /X 4 0 R >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+        assert!(
+            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            "removed page obj4 reached only through a non-page wrapper must be nulled"
+        );
+        // The wrapper itself is a non-page object and is left untouched.
+        let wrapper = dict_of(&mut pdf, ObjectRef::new(40, 0));
+        assert_eq!(
+            wrapper.get("X"),
+            Some(&Object::Reference(ObjectRef::new(4, 0)))
+        );
+    }
+
+    #[test]
+    fn malformed_dest_to_non_dict_object_is_not_nulled() {
+        // The first dest-array element references a non-dictionary object (an
+        // integer). It is neither a page nor null, so null-out leaves it intact
+        // (exercises the non-dict arm of `is_nullable_removed_page`).
+        let bytes = build_min_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Names 11 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (9, "42"),
+                (11, "<< /Dests 30 0 R >>"),
+                (30, "<< /Names [(evil) [9 0 R /Fit]] >>"),
+            ],
+            "",
+        );
+        let mut pdf = open(bytes);
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        // obj9 (the integer) is untouched — not nulled.
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(9, 0)).unwrap(),
+            Object::Integer(42),
+            "non-dict dest target obj9 is left untouched",
         );
     }
 
@@ -2525,10 +2754,7 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(3, 0)],
-            ref_map,
-        };
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(3, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert_eq!(
@@ -2586,10 +2812,7 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(3, 0)],
-            ref_map,
-        };
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(3, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         let page = dict_of(&mut pdf, ObjectRef::new(3, 0));
@@ -2641,10 +2864,11 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(3, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(3, 0)],
+        let result = synthetic_result(
+            &mut pdf,
+            vec![ObjectRef::new(3, 0), ObjectRef::new(3, 0)],
             ref_map,
-        };
+        );
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
@@ -2660,7 +2884,7 @@ mod tests {
     fn open_action_goto_to_surviving_page_is_remapped() {
         // catalog /OpenAction << /S /GoTo /D [5 0 R /Fit] >> -> page3, which
         // SURVIVES. The only case where remap_open_action_dest's catalog
-        // re-store actually changes the document: remap_or_null_dest returns a
+        // re-store actually changes the document: remap_dest returns a
         // modified action dict and catalog.insert("OpenAction", ..) applies it.
         // As in annot_dest_to_surviving_page_is_remapped, a hand-built
         // RebuildResult maps obj5 -> a fresh ref (obj99) to exercise a genuine
@@ -2672,10 +2896,7 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(3, 0)],
-            ref_map,
-        };
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(3, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         // /OpenAction is a GoTo action dict; descend to /D and check its first
@@ -2702,43 +2923,69 @@ mod tests {
     fn inline_annot_non_goto_action_d_is_not_treated_as_dest() {
         // An inline annot whose /A is a NON-GoTo action (/S /Launch) carrying a
         // page-ref-shaped /D must NOT be treated as a local GoTo destination:
-        // only /S /GoTo carries a local /D. The removed target page (obj4) is
-        // therefore left untouched by Step 4 (a dict, not nulled).
+        // only /S /GoTo carries a local /D. With a synthetic non-identity remap
+        // obj5 -> obj99, the /A /D must stay [5 0 R] verbatim (a /S /GoTo /D
+        // would be remapped to [99 0 R]). obj5 survives, so it is not nulled;
+        // the null-out (Step 0) is page-driven, not reached through this /D.
         let mut pdf = open(build_inline_annot_pdf(
             "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] \
-             /A << /S /Launch /D [4 0 R /Fit] >> >>",
+             /A << /S /Launch /D [5 0 R /Fit] >> >>",
             "",
         ));
-        let result =
-            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(3, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
-        assert!(
-            pdf.resolve(ObjectRef::new(4, 0))
-                .unwrap()
-                .as_dict()
-                .is_some(),
-            "obj4 reached only via a non-GoTo action /D must not be nulled by Step 4"
+
+        let page = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        let d_first = page
+            .get("Annots")
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .and_then(Object::as_dict)
+            .and_then(|annot| annot.get("A"))
+            .and_then(Object::as_dict)
+            .and_then(|a| a.get("D"))
+            .and_then(Object::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(Object::as_ref_id)
+            .expect("inline annot /A /D array first ref");
+        assert_eq!(
+            d_first,
+            ObjectRef::new(5, 0),
+            "a non-GoTo inline-annot /A /D must be left verbatim (not remapped)"
         );
     }
 
     #[test]
     fn open_action_non_goto_d_is_not_treated_as_dest() {
-        // catalog /OpenAction << /S /Launch /D [4 0 R /Fit] >>: a non-GoTo
-        // action's /D is not a local destination, so page2 (obj4) is not nulled.
+        // catalog /OpenAction << /S /Launch /D [5 0 R /Fit] >>: a non-GoTo
+        // action's /D is not a local destination, so it must NOT be remapped.
+        // With a synthetic non-identity remap obj5 -> obj99, the /D stays
+        // [5 0 R] verbatim (a /S /GoTo /D would be remapped to [99 0 R]).
         let mut pdf = open(build_annot_pdf(
             "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
-            "/OpenAction << /S /Launch /D [4 0 R /Fit] >>",
+            "/OpenAction << /S /Launch /D [5 0 R /Fit] >>",
             &[],
         ));
-        let result =
-            rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]).unwrap();
+        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(99, 0)]);
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(3, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
-        assert!(
-            pdf.resolve(ObjectRef::new(4, 0))
-                .unwrap()
-                .as_dict()
-                .is_some(),
-            "obj4 reached only via a non-GoTo /OpenAction /D must not be nulled"
+
+        let catalog = dict_of(&mut pdf, ObjectRef::new(1, 0));
+        let d_first = catalog
+            .get("OpenAction")
+            .and_then(Object::as_dict)
+            .and_then(|oa| oa.get("D"))
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .and_then(Object::as_ref_id)
+            .expect("/OpenAction /D array first ref");
+        assert_eq!(
+            d_first,
+            ObjectRef::new(5, 0),
+            "a non-GoTo /OpenAction /D must be left verbatim (not remapped)"
         );
     }
 
@@ -2762,12 +3009,13 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(5, 0), vec![ObjectRef::new(3, 0)]);
-        let result = RebuildResult {
-            // Same surviving page listed twice, so the shared annot obj50 is
-            // reached from both clones (duplicate-page selection).
-            new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(3, 0)],
+        // Same surviving page listed twice, so the shared annot obj50 is
+        // reached from both clones (duplicate-page selection).
+        let result = synthetic_result(
+            &mut pdf,
+            vec![ObjectRef::new(3, 0), ObjectRef::new(3, 0)],
             ref_map,
-        };
+        );
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
@@ -2819,10 +3067,7 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(99, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(99, 0)],
-            ref_map,
-        };
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(99, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
@@ -2841,13 +3086,13 @@ mod tests {
         // The surviving-target guard must not over-skip: a destination whose
         // target page is neither a surviving source ref (a remap key) nor a
         // rebuilt output ref (a `new_kids` member) is genuinely removed and must
-        // still be nulled. obj99 survives (identity remap) and obj7 is referenced
-        // only by an outline item; obj7 is absent from both the ref_map keys and
-        // new_kids, so it is nulled in place while obj99 is untouched.
+        // still be nulled. obj99 survives (identity remap) and obj7 is a real
+        // page in the original page tree (both objs are in /Kids) but absent
+        // from ref_map → a removed page → must be nulled. obj99 is untouched.
         let mut pdf = open(build_min_pdf(
             &[
                 (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>"),
-                (2, "<< /Type /Pages /Kids [99 0 R] /Count 1 >>"),
+                (2, "<< /Type /Pages /Kids [99 0 R 7 0 R] /Count 2 >>"),
                 (
                     99,
                     "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
@@ -2866,10 +3111,7 @@ mod tests {
         ));
         let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
         ref_map.insert(ObjectRef::new(99, 0), vec![ObjectRef::new(99, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(99, 0)],
-            ref_map,
-        };
+        let result = synthetic_result(&mut pdf, vec![ObjectRef::new(99, 0)], ref_map);
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
