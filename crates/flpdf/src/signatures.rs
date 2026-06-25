@@ -595,13 +595,13 @@ fn walk_signature_rewrite_field<R: Read + Seek>(
     info: &mut SignatureRewriteInfo,
     seen: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
+    if !seen.insert(field_ref) {
+        return Ok(());
+    }
     if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "signature field-tree depth limit {DEFAULT_MAX_SIGNATURE_FIELD_DEPTH} exceeded at {field_ref}"
         )));
-    }
-    if !seen.insert(field_ref) {
-        return Ok(());
     }
 
     let Object::Dictionary(dict) = pdf.resolve(field_ref)? else {
