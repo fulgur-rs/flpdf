@@ -1,6 +1,6 @@
 use flpdf::{
     signature_rewrite_impact, signatures, would_rewrite_invalidate_signatures, write_pdf,
-    write_pdf_with_options, Error, ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode,
+    write_pdf_with_options, ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode,
     WriteOptions,
 };
 use std::collections::BTreeMap;
@@ -123,48 +123,37 @@ fn full_rewrite_invalidates_signed_pdf_with_indirect_ft() {
 }
 
 #[test]
-fn full_rewrite_of_signed_pdf_returns_structured_signed_error() {
+fn full_rewrite_of_signed_pdf_proceeds_and_preserves_signatures() {
+    // qpdf does NOT refuse a full rewrite of a signed PDF — it proceeds, leaving
+    // the signature objects present-but-invalid (verified, qpdf 11.9.0: both
+    // `qpdf signed.pdf out.pdf` and `qpdf signed.pdf --pages signed.pdf 1 -- out`
+    // exit 0 with /FT /Sig + /ByteRange preserved, no stderr warning). flpdf
+    // matches this pre-v1.0 (the signed-full-rewrite refusal was removed; signed
+    // preserve-by-default protection is deferred post-v1.0 — flpdf-hn1g.13/.14).
     let mut pdf = open(build_signed_acroform_pdf());
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
-
-    let err = write_pdf_with_options(&mut pdf, Vec::new(), &options)
-        .expect_err("full rewrite should refuse signed PDFs");
-
-    let Error::Signed { fields, message } = err else {
-        panic!("expected Error::Signed, got {err:?}");
-    };
-    assert_eq!(fields, vec!["Signed"]);
-    assert!(
-        message.contains("refusing full rewrite of signed PDF"),
-        "unexpected message: {message}",
-    );
-    assert!(
-        message.contains("--remove-restrictions"),
-        "diagnostic should mention the override flag: {message}",
-    );
-    assert!(
-        message.contains("incremental rewrite"),
-        "diagnostic should suggest incremental rewrite: {message}",
-    );
-}
-
-#[test]
-fn allow_signed_full_rewrite_option_bypasses_refusal() {
-    let mut pdf = open(build_signed_acroform_pdf());
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.allow_signed_full_rewrite = true;
 
     let mut out = Vec::new();
     write_pdf_with_options(&mut pdf, &mut out, &options)
-        .expect("explicit opt-in should allow destructive signed rewrite");
+        .expect("signed full rewrite proceeds (qpdf-compatible, no refusal)");
 
-    assert!(!out.is_empty());
+    // Reopen the output: the signature is still detectable, i.e. the /FT /Sig
+    // field and its /ByteRange signature dict were preserved (not stripped, not
+    // nulled) — matching qpdf's posture.
+    let mut re = open(out);
+    let sigs = signatures(&mut re).expect("inspect signatures in output");
+    assert_eq!(
+        sigs.len(),
+        1,
+        "signature object must be preserved by the full rewrite, not stripped"
+    );
 }
 
 #[test]
-fn full_rewrite_refusal_survives_malformed_signature_details() {
+fn full_rewrite_of_signed_pdf_with_malformed_signature_proceeds() {
+    // Even with malformed signature details (a non-numeric /ByteRange), the
+    // full-rewrite path proceeds (qpdf-compatible: no refusal).
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
         (
@@ -186,19 +175,10 @@ fn full_rewrite_refusal_survives_malformed_signature_details() {
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
 
-    let err = write_pdf_with_options(&mut pdf, Vec::new(), &options)
-        .expect_err("full rewrite should refuse before destructive output");
-
-    let Error::Signed { fields, message } = err else {
-        panic!("expected Error::Signed, got {err:?}");
-    };
-    assert!(
-        fields
-            .iter()
-            .any(|field| field == "5 0 R" || field == "6 0 R"),
-        "expected object-ref fallback fields, got {fields:?}",
-    );
-    assert!(message.contains("refusing full rewrite of signed PDF"));
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &options)
+        .expect("signed full rewrite proceeds even with malformed signature details");
+    assert!(!out.is_empty());
 }
 
 #[test]
@@ -223,39 +203,6 @@ fn full_rewrite_without_signatures_is_not_refused_by_writer() {
         .expect("unsigned full rewrite should not trip signed-PDF preflight");
 
     assert!(!out.is_empty());
-}
-
-#[test]
-fn full_rewrite_refusal_uses_object_ref_for_unnamed_signature_field() {
-    let objects: Vec<(u32, &[u8])> = vec![
-        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
-        (
-            2,
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
-        ),
-        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
-        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
-        (
-            5,
-            b"<< /Type /Annot /Subtype /Widget /FT /Sig /V 6 0 R /P 3 0 R /Rect [0 0 10 10] >>",
-        ),
-        (
-            6,
-            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
-        ),
-    ];
-    let mut pdf = open(build_pdf(&objects));
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-
-    let err = write_pdf_with_options(&mut pdf, Vec::new(), &options)
-        .expect_err("full rewrite should refuse signed PDFs");
-
-    let Error::Signed { fields, message } = err else {
-        panic!("expected Error::Signed, got {err:?}");
-    };
-    assert_eq!(fields, vec!["5 0 R"]);
-    assert!(message.contains("5 0 R"));
 }
 
 #[test]

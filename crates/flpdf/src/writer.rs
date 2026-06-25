@@ -3,7 +3,6 @@ pub(crate) mod object_streams;
 pub use object_streams::ObjectStreamMode;
 
 use crate::parser::Parser;
-use crate::signatures::{signature_rewrite_impact, SignatureWriteMode};
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
@@ -261,14 +260,6 @@ pub struct WriteOptions {
     /// When `false` (the default) the existing incremental-update write path is
     /// used, preserving the source bytes verbatim.
     pub full_rewrite: bool,
-
-    /// Allow the full-rewrite path to proceed even when it invalidates existing
-    /// signed byte ranges.
-    ///
-    /// The default `false` refuses signed PDFs with [`crate::Error::Signed`].
-    /// Set this only when the caller is explicitly performing a destructive
-    /// rewrite and accepts that existing signatures will no longer validate.
-    pub allow_signed_full_rewrite: bool,
 
     /// Object stream emission policy for the output.
     ///
@@ -603,9 +594,6 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 /// # Errors
 ///
 /// - [`crate::Error::Missing`] if the input has no `/Root`.
-/// - [`crate::Error::Signed`] when the full-rewrite path
-///   (`options.full_rewrite == true`) would invalidate existing signatures and
-///   `options.allow_signed_full_rewrite` is not set.
 /// - [`crate::Error::Unsupported`] when `options.encrypt` and
 ///   `options.copy_encryption` are both set (mutually exclusive), when
 ///   encryption is combined with `options.qdf`, or when the OS CSPRNG
@@ -1778,9 +1766,6 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
 /// # Errors
 ///
 /// - [`crate::Error::Missing`] if the input has no `/Root`.
-/// - [`crate::Error::Signed`] when rewriting would invalidate existing
-///   signatures (this entry point always uses the full-rewrite path and does
-///   not set `allow_signed_full_rewrite`).
 /// - Propagates I/O errors and structural PDF errors from the underlying
 ///   full-rewrite writer.
 ///
@@ -1839,53 +1824,6 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 ///
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above attached to its function.
-
-fn refuse_signed_full_rewrite<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    options: &WriteOptions,
-) -> Result<()> {
-    if options.allow_signed_full_rewrite {
-        return Ok(());
-    }
-
-    let impact = signature_rewrite_impact(pdf, SignatureWriteMode::FullRewrite)?;
-    if !impact.invalidates_signatures {
-        return Ok(());
-    }
-
-    let mut fields: Vec<String> = match pdf.signatures() {
-        Ok(signatures) => signatures
-            .into_iter()
-            .map(|signature| {
-                if signature.field_name.is_empty() {
-                    format!("{}", signature.field_ref)
-                } else {
-                    signature.field_name
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    fields.sort();
-    fields.dedup();
-
-    if fields.is_empty() {
-        fields = impact
-            .signed_object_refs
-            .into_iter()
-            .map(|object_ref| format!("{object_ref}"))
-            .collect();
-    }
-
-    let field_list = fields.join(", ");
-    let message = format!(
-        "refusing full rewrite of signed PDF because it would invalidate signature field(s): \
-         {field_list}. Use --remove-restrictions to explicitly allow invalidating signatures, \
-         or use an incremental rewrite that preserves signed byte ranges."
-    );
-
-    Err(crate::Error::Signed { fields, message })
-}
 
 // ── Encryption context (flpdf-9hc.4.9) ───────────────────────────────────────
 
@@ -2723,8 +2661,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let new_root = renumber
         .new_for_original(root_ref)
         .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
-
-    refuse_signed_full_rewrite(pdf, options)?;
 
     if options.deterministic_id && options.static_id {
         return Err(crate::Error::Unsupported(
@@ -3721,7 +3657,6 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     // `ok_or` (eager) keeps the error construction on the covered happy path;
     // `Error::Missing` is a cheap `&'static str` variant, so no `or_fun_call`.
     let root_ref = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
-    refuse_signed_full_rewrite(pdf, options)?;
 
     // ── object-stream assignment + generate-mode numbering ───────────────────
     // 1. getCompressibleObjGens DFS from the trailer => eligible list, ordered.

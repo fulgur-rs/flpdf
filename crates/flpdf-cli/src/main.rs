@@ -1771,17 +1771,6 @@ fn main() {
             }
             std::process::exit(exit_err.code.as_i32());
         }
-        // Signed-PDF refusal (default full-rewrite path): emit the actionable
-        // diagnostic directly. `Error::Signed`'s own message already explains
-        // the refusal and names the affected signature field(s), so printing
-        // the `message` field avoids the redundant "signed PDF:" Display prefix
-        // (`flpdf: signed PDF: refusing full rewrite of signed PDF ...`) that
-        // the generic fallback below would produce. Exit 2 matches qpdf's
-        // "error" convention (same code the fallback uses).
-        if let Some(flpdf::Error::Signed { message, .. }) = error.downcast_ref::<flpdf::Error>() {
-            eprintln!("{}: {message}", progname());
-            std::process::exit(2);
-        }
         eprintln!("{}: {error}", progname());
         std::process::exit(2);
     }
@@ -2973,13 +2962,9 @@ fn run_rewrite(
         }
         if had_signatures {
             options.full_rewrite = true;
-            // --remove-restrictions intentionally invalidates signatures, so
-            // opt in to the writer's signed full-rewrite path explicitly.
-            // strip_signature_values removes each field's /V but preserves the
-            // /FT /Sig field dictionary, which signature_rewrite_impact still
-            // counts as signed in FullRewrite mode — so without this flag the
-            // writer would refuse with Error::Signed even after stripping.
-            options.allow_signed_full_rewrite = true;
+            // --remove-restrictions intentionally clears signature protection:
+            // strip_signature_values removes each field's /V (preserving the
+            // /FT /Sig field dictionary) and clear_sig_flags clears /SigFlags.
             clear_sig_flags(&mut pdf)?;
             strip_signature_values(&mut pdf)?;
         }
