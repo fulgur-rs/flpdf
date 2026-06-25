@@ -1,7 +1,7 @@
 use flpdf::{
     signature_rewrite_impact, signatures, would_rewrite_invalidate_signatures, write_pdf,
     write_pdf_with_options, ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode,
-    WriteOptions,
+    WriteOptions, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -78,6 +78,108 @@ fn build_signed_acroform_indirect_ft_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+fn build_shared_kids_signature_pdf(depth: u32) -> Vec<u8> {
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>".to_vec()),
+    ];
+
+    for level in 0..depth {
+        let object_num = 5 + level;
+        let next_num = object_num + 1;
+        objects.push((
+            object_num,
+            format!("<< /FT /Sig /Kids [{next_num} 0 R {next_num} 0 R] >>").into_bytes(),
+        ));
+    }
+
+    let leaf_num = 5 + depth;
+    let sig_num = leaf_num + 1;
+    objects.push((
+        leaf_num,
+        format!("<< /FT /Sig /V {sig_num} 0 R >>").into_bytes(),
+    ));
+    objects.push((
+        sig_num,
+        b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+    ));
+
+    let borrowed: Vec<(u32, &[u8])> = objects
+        .iter()
+        .map(|(object_num, bytes)| (*object_num, bytes.as_slice()))
+        .collect();
+    build_pdf(&borrowed)
+}
+
+fn build_shared_child_mixed_ft_pdf() -> Vec<u8> {
+    // AcroForm where the same leaf field (obj 7) is a child of both a /Sig
+    // parent (obj 5) and a non-/Sig parent (obj 6).  The leaf has no /FT of
+    // its own, so whether it looks like a signature field depends entirely on
+    // which parent's inherited_ft reaches it first.
+    //
+    // /Fields [5 0 R, 6 0 R]
+    //   5: /FT /Sig  /Kids [7 0 R]
+    //   6: (no /FT)  /Kids [7 0 R]
+    //   7: (no /FT)  /V 8 0 R   ← signature dict
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [5 0 R 6 0 R] /SigFlags 3 >>"),
+        (5, b"<< /FT /Sig /Kids [7 0 R] >>"),
+        (6, b"<< /Kids [7 0 R] >>"),
+        (7, b"<< /V 8 0 R >>"),
+        (
+            8,
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>",
+        ),
+    ];
+    build_pdf(&objects)
+}
+
+fn build_deep_signature_chain_pdf(depth: u32) -> Vec<u8> {
+    // A linear chain of `depth` unique intermediate fields (no /FT) leading to
+    // a /Sig leaf. Unique nodes mean the seen-set never short-circuits, so the
+    // depth counter reaches the limit and the error arm of `?` fires.
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>".to_vec()),
+    ];
+    for level in 0..depth {
+        let obj = 5 + level;
+        let next = obj + 1;
+        objects.push((obj, format!("<< /Kids [{next} 0 R] >>").into_bytes()));
+    }
+    let leaf = 5 + depth;
+    let sig = leaf + 1;
+    objects.push((leaf, format!("<< /FT /Sig /V {sig} 0 R >>").into_bytes()));
+    objects.push((
+        sig,
+        b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+    ));
+    let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+    build_pdf(&borrowed)
+}
+
 fn build_unsigned_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -92,6 +194,50 @@ fn build_unsigned_pdf() -> Vec<u8> {
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
+}
+
+#[test]
+fn rewrite_impact_errors_on_signature_field_depth_exceeded() {
+    // A chain of unique nodes longer than the depth limit triggers the Err arm
+    // inside walk_signature_rewrite_field (and the `?` propagation path).
+    let depth = (DEFAULT_MAX_SIGNATURE_FIELD_DEPTH + 1) as u32;
+    let mut pdf = open(build_deep_signature_chain_pdf(depth));
+    let result = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite);
+    assert!(result.is_err(), "depth-exceeded chain must return Err");
+}
+
+#[test]
+fn rewrite_impact_detects_sig_via_sig_parent_when_non_sig_parent_visited_first() {
+    // Regression: keying the seen set only on ObjectRef caused a false negative
+    // when the same leaf (no /FT) is a child of both a /Sig parent and a
+    // non-/Sig parent.  The non-/Sig path visits the leaf first (inserting its
+    // ref into seen), then the /Sig path skips it → /V never collected →
+    // incremental rewrite reported as preserving signatures when it shouldn't.
+    let mut pdf = open(build_shared_child_mixed_ft_pdf());
+
+    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
+
+    assert!(
+        impact.has_signatures,
+        "signature leaf reachable only via /Sig parent must be detected even if non-/Sig parent visited first"
+    );
+}
+
+#[test]
+fn rewrite_impact_deduplicates_shared_acroform_kids() {
+    // Regression: walk_signature_rewrite_field lacked a seen-set, so a shared
+    // /Kids graph (each node's /Kids lists the same child twice) caused
+    // exponential traversal. Depth 24 timed out before the fix.
+    let mut pdf = open(build_shared_kids_signature_pdf(24));
+
+    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
+
+    assert!(impact.has_signatures);
+    assert!(impact.invalidates_signatures);
+    assert_eq!(impact.reason, SignatureRewriteReason::FullRewrite);
+    // leaf field obj (5 + 24 = 29) and its /V sig dict (30) must be collected
+    assert!(impact.signed_object_refs.contains(&ObjectRef::new(29, 0)));
+    assert!(impact.signed_object_refs.contains(&ObjectRef::new(30, 0)));
 }
 
 #[test]
