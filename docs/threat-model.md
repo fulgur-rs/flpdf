@@ -81,13 +81,17 @@ of the following:
   compression bomb) are out of scope per §4, not security bugs.
 - **Non-termination** — an infinite loop while parsing or traversing.
   qpdf precedent: CVE-2017-9209 / CVE-2017-9210.
-- **Silent removal of signature evidence**
-  ([signed-pdf.md](signed-pdf.md)): an operation that silently *strips* or
-  *nulls* signature objects without the documented `--remove-restrictions`
-  opt-in. (Pre-v1.0, *invalidating* a signature by a full rewrite is **not** a
-  violation — flpdf matches qpdf, which proceeds and leaves the signature
-  present-but-invalid; a preserve-by-default refusal is a deferred post-v1.0
-  improvement, `flpdf-hn1g.14`.)
+- **Silent removal of signature evidence *beyond what qpdf does***
+  ([signed-pdf.md](signed-pdf.md)): flpdf-specific logic that strips or nulls a
+  signature object qpdf would keep (e.g. the destination null-out that nulled an
+  arbitrary referenced object, `flpdf-hn1g.11`), without the documented
+  `--remove-restrictions` opt-in. Scoped against qpdf: behaviours qpdf also
+  performs are **not** violations pre-v1.0 — *invalidating* a signature by a
+  full rewrite (qpdf proceeds, leaving it present-but-invalid), and
+  *garbage-collecting* a signature field that a `--pages` selection orphaned by
+  dropping its page (qpdf drops it too, with no warning), both match qpdf. A
+  preserve-by-default refusal/warning is a deferred post-v1.0 improvement,
+  `flpdf-hn1g.14`.
 - **Accepting a wrong password as valid** (authentication bypass in the
   standard security handler).
 
