@@ -1,7 +1,7 @@
 use flpdf::{
     signature_rewrite_impact, signatures, would_rewrite_invalidate_signatures, write_pdf,
     write_pdf_with_options, ObjectRef, Pdf, SignatureRewriteReason, SignatureWriteMode,
-    WriteOptions,
+    WriteOptions, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -148,6 +148,38 @@ fn build_shared_child_mixed_ft_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+fn build_deep_signature_chain_pdf(depth: u32) -> Vec<u8> {
+    // A linear chain of `depth` unique intermediate fields (no /FT) leading to
+    // a /Sig leaf. Unique nodes mean the seen-set never short-circuits, so the
+    // depth counter reaches the limit and the error arm of `?` fires.
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>".to_vec()),
+    ];
+    for level in 0..depth {
+        let obj = 5 + level;
+        let next = obj + 1;
+        objects.push((obj, format!("<< /Kids [{next} 0 R] >>").into_bytes()));
+    }
+    let leaf = 5 + depth;
+    let sig = leaf + 1;
+    objects.push((leaf, format!("<< /FT /Sig /V {sig} 0 R >>").into_bytes()));
+    objects.push((
+        sig,
+        b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+    ));
+    let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+    build_pdf(&borrowed)
+}
+
 fn build_unsigned_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -162,6 +194,16 @@ fn build_unsigned_pdf() -> Vec<u8> {
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
+}
+
+#[test]
+fn rewrite_impact_errors_on_signature_field_depth_exceeded() {
+    // A chain of unique nodes longer than the depth limit triggers the Err arm
+    // inside walk_signature_rewrite_field (and the `?` propagation path).
+    let depth = (DEFAULT_MAX_SIGNATURE_FIELD_DEPTH + 1) as u32;
+    let mut pdf = open(build_deep_signature_chain_pdf(depth));
+    let result = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite);
+    assert!(result.is_err(), "depth-exceeded chain must return Err");
 }
 
 #[test]
