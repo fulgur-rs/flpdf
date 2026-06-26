@@ -1752,12 +1752,13 @@ impl LinearizationPlan {
         _length_exclusions: &BTreeSet<ObjectRef>,
     ) -> crate::Result<ObjStmBatchPlan> {
         // `objstm_membership_linearized` filters its containers to the plan's
-        // renumber-assigned set BEFORE the even split, so a missing or
-        // trailer-only ref (e.g. `/Info 99 0 R` with no xref entry, which
-        // `compressible_objgens` admits as `Null`) neither inflates the split
-        // boundary nor reaches `place_objstm_members_per_half` without a slot
-        // (which would panic). For a well-formed PDF every member is assigned,
-        // so the filter is a no-op and the batches stay byte-identical.
+        // renumber-assigned set BEFORE the even split, so a trailer-only ref with
+        // no slot neither inflates the split boundary nor reaches
+        // `place_objstm_members_per_half` without a slot (which would panic).
+        // Dangling/missing refs (e.g. `/Info 99 0 R` with no xref entry) are
+        // already excluded upstream by `compressible_objgens`. For a well-formed
+        // PDF every member is assigned, so the filter is a no-op and the batches
+        // stay byte-identical.
         let assigned = self.renumber_assigned_refs();
         let containers = objstm_membership_linearized(pdf, &assigned)?;
         let routes = route_objstm_containers(pdf, &containers)?;
@@ -2047,15 +2048,15 @@ pub(crate) enum ContainerPart {
 /// empty by the erasure is dropped.
 ///
 /// `assigned` is the set of refs that receive a renumber slot
-/// ([`LinearizationPlan::renumber_assigned_refs`]). Refs outside it — a missing
-/// or trailer-only ref that
+/// ([`LinearizationPlan::renumber_assigned_refs`]). A live, reachable object that
 /// [`compressible_objgens`](crate::writer::object_streams::compressible_objgens)
-/// admits because `resolve_borrowed` returns it as `Null` — are dropped
-/// **before** the even split, so they cannot inflate the split boundary and
-/// scatter real members across separate ObjStms (qpdf never adds a non-existent
-/// object to its compressible set). The page dictionaries and root Catalog are
-/// in `assigned`, so they still consume split positions and are erased
-/// afterwards, exactly as qpdf does.
+/// admits but the linearization plan places in no part — a trailer-only object
+/// with no slot — is dropped **before** the even split, so it cannot inflate the
+/// split boundary and scatter real members across separate ObjStms. (Dangling /
+/// missing refs are already excluded upstream by `compressible_objgens`, which
+/// qpdf treats as null, so they never reach this retain.) The page dictionaries
+/// and root Catalog are in `assigned`, so they still consume split positions and
+/// are erased afterwards, exactly as qpdf does.
 ///
 /// # Errors
 ///
@@ -5643,10 +5644,10 @@ mod tests {
     }
 
     /// Single-page PDF whose trailer references a missing `/Info` object
-    /// (`99 0 R`, no xref entry). `resolve_borrowed` returns that ref as `Null`,
-    /// so `compressible_objgens` admits it into the linearized membership even
-    /// though it has no renumber slot. Mirrors the Codex Security PoC
-    /// (`flpdf-4vpi`).
+    /// (`99 0 R`, no xref entry). `compressible_objgens` excludes the dangling
+    /// ref from the compressible set (qpdf treats a missing ref as null), so it
+    /// never reaches the linearized ObjStm membership or the generate renumber
+    /// walk. Mirrors the Codex Security PoC (`flpdf-4vpi`).
     fn missing_trailer_info_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -5672,13 +5673,14 @@ mod tests {
     }
 
     /// Single-page PDF with a real `/Info` (obj 4) whose trailer also carries `n`
-    /// missing `/Junk` refs (objects `10..10+n`, none with an xref entry). With
-    /// `n` large enough the *unfiltered* compressible set crosses the 100-member
-    /// even-split boundary, scattering the two real ObjStm members (the `/Info`
-    /// dict and the `/Pages` tree) into separate containers. Filtering the
-    /// missing refs before the split keeps both in one container, as qpdf does
-    /// (Codex review on PR #421). Byte-identical to `tests/fixtures/compat/
-    /// objstm-lin-split-boundary.pdf`.
+    /// missing `/Junk` refs (objects `10..10+n`, none with an xref entry). qpdf
+    /// drops each dangling ref before it can enter the compressible set, so it
+    /// emits one ObjStm holding only the real members. `compressible_objgens`
+    /// excludes the missing refs the same way: were they admitted, with `n` large
+    /// enough they would cross the 100-member even-split boundary and scatter the
+    /// two real members (the `/Info` dict and the `/Pages` tree) into separate
+    /// containers (Codex review on PR #421). Byte-identical to
+    /// `tests/fixtures/compat/objstm-lin-split-boundary.pdf`.
     fn info_and_missing_junk_pdf_bytes(n: u32) -> Vec<u8> {
         let mut junk = String::new();
         for i in 0..n {
@@ -5727,10 +5729,11 @@ mod tests {
         doc.bytes
     }
 
-    /// A missing trailer-only `/Info 99 0 R` is admitted into the compressible
-    /// membership but has no renumber slot, so the generate planner must drop it
-    /// rather than batch it into an ObjStm — otherwise `write_linearized` panics
-    /// at `place_objstm_members_per_half` (Codex Security `flpdf-4vpi`).
+    /// A missing trailer-only `/Info 99 0 R` must not receive a renumber slot or
+    /// be batched into an ObjStm: `compressible_objgens` excludes the dangling
+    /// ref, so it never reaches `place_objstm_members_per_half` without a slot
+    /// (which would panic). End-to-end guard for the Codex Security PoC
+    /// (`flpdf-4vpi`).
     #[test]
     fn objstm_batches_generate_drops_missing_trailer_only_ref() {
         let bytes = missing_trailer_info_pdf_bytes();

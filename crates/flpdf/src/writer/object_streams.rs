@@ -195,12 +195,23 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 /// in a generated object stream when more than one container is needed, so the
 /// port must reproduce it exactly.
 ///
-/// Returns each reachable indirect object's reference in first-visit order.
+/// Returns each reachable indirect object's reference in first-visit order. A
+/// reference with no live cross-reference entry (a dangling/missing ref that
+/// resolves to `Null` only because the object is absent) is excluded: qpdf
+/// treats such a ref as null, so it never enters the compressible set.
 pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
+    // Live xref entries only (excludes Missing / Deleted / Reserved). A reached
+    // ref outside this set is a dangling reference qpdf would treat as null, so
+    // it is dropped. A *live* object that resolves to null (a real
+    // `n 0 obj null endobj`) stays eligible here — flpdf keeps it as an ObjStm
+    // member, whereas qpdf drops every null-resolving object. That residual
+    // divergence is out of scope for this filter (which targets only
+    // missing/dangling refs) and is tracked separately (flpdf-v58c).
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
     // plain indirect object so the rest of the file can be decrypted. Read it
@@ -231,6 +242,7 @@ pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
                 if !matches!(resolved, Object::Stream(_))
                     && !is_signature_dict(resolved)
                     && Some(r) != encrypt_ref
+                    && live.contains(&r)
                 {
                     result.push(r);
                 }

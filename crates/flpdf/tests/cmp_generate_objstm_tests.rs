@@ -192,3 +192,16 @@ fn od_indirect_length_flate_generate_drops_orphan_holder_byte_identical_to_qpdf(
         "objstm-lin-od-indirect-length-flate",
     );
 }
+
+// ── flpdf-ndjy: missing/dangling trailer refs are dropped, not compressed ─────
+// A real /Info (obj 4) plus 100 dangling /Junk trailer refs (objects 10..109,
+// no xref entry). qpdf treats each missing ref as null: it never enters the
+// compressible set, consumes no object number, and is dropped from the trailer.
+// Result is ONE /N 4 ObjStm (Catalog/Pages/Page/Info) + the xref stream, /Size 7.
+// Before the fix flpdf admitted the Null-resolving refs and emitted two /N 52
+// ObjStms (104 members incl 100 nulls). Malformed => qpdf warns; the golden is
+// generated with --warning-exit-0.
+#[test]
+fn generate_drops_missing_trailer_refs_byte_identical_to_qpdf() {
+    assert_cmp_diff_zero("objstm-lin-split-boundary.pdf", "objstm-lin-split-boundary");
+}

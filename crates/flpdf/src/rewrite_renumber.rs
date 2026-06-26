@@ -301,6 +301,14 @@ impl GenerateRenumber {
         let mut next: u32 = 1;
         let mut queue: VecDeque<ObjectRef> = VecDeque::new();
 
+        // Live xref entries only (excludes Missing / Deleted / Reserved). A
+        // trailer or nested reference to a non-live object is a dangling ref qpdf
+        // treats as null: it receives no object number and no body. Skipping it
+        // here keeps the generate numbering dense and drops the missing ref from
+        // the output, matching qpdf. A real null object (present in the xref) is
+        // live and is numbered normally.
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+
         // Seeds match the plain Catalog-first walk: `/Root` first, then the
         // remaining indirect trailer entries in lexicographic key order. The
         // skipped keys mirror qpdf's `getTrimmedTrailer` (QPDFWriter.cc), which
@@ -325,22 +333,9 @@ impl GenerateRenumber {
         }
 
         for seed in seeds {
-            enqueue_gen(
-                seed,
-                &member_to_group,
-                &groups_sorted,
-                &mut old_to_new,
-                &mut container_new,
-                &mut next,
-                &mut queue,
-            );
-        }
-
-        while let Some(cur) = queue.pop_front() {
-            let obj = pdf.resolve_borrowed(cur)?;
-            collect_refs(obj, 0, skip_length, &mut |r| {
+            if live.contains(&seed) {
                 enqueue_gen(
-                    r,
+                    seed,
                     &member_to_group,
                     &groups_sorted,
                     &mut old_to_new,
@@ -348,6 +343,23 @@ impl GenerateRenumber {
                     &mut next,
                     &mut queue,
                 );
+            }
+        }
+
+        while let Some(cur) = queue.pop_front() {
+            let obj = pdf.resolve_borrowed(cur)?;
+            collect_refs(obj, 0, skip_length, &mut |r| {
+                if live.contains(&r) {
+                    enqueue_gen(
+                        r,
+                        &member_to_group,
+                        &groups_sorted,
+                        &mut old_to_new,
+                        &mut container_new,
+                        &mut next,
+                        &mut queue,
+                    );
+                }
             })?;
         }
 
