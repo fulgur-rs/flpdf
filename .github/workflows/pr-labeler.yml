@@ -8,7 +8,9 @@ name: PR Labeler
 
 on:
   pull_request_target:
-    types: [opened, edited]
+    # `reopened` is included so a title edited while the PR was closed (which the
+    # open-state guard skips) gets reconciled when the PR becomes open again.
+    types: [opened, edited, reopened]
 
 permissions:
   pull-requests: write
