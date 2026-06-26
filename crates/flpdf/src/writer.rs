@@ -3886,7 +3886,7 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     // key. Fold those into the remap skip-set alongside genuinely deleted objects
     // so the remap drops the key instead of failing on the absent renumber slot.
     let mut skip_refs = pdf.deleted_object_refs();
-    let live = pdf.live_object_refs();
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     for (_key, value) in pdf.trailer().iter() {
         if let Object::Reference(r) = value {
             if !live.contains(r) && !skip_refs.contains(r) {
