@@ -1327,7 +1327,11 @@ mod tests {
         // `0` is divisible by any nonzero `row_bytes`, so an empty stream with a
         // crafted huge row width must return before `vec![0u8; row_bytes]` and
         // not attempt a gigabyte allocation for zero rows.
-        let huge_row_bytes = 1usize << 60;
+        // `usize::MAX / 2`, not `1 << 60`: the latter is a compile-time overflow
+        // on 32-bit targets (shift >= type width). This stays huge on both
+        // widths (~9.2e18 on 64-bit, ~2 GiB on 32-bit) so a broken guard still
+        // aborts on the allocation.
+        let huge_row_bytes = usize::MAX / 2;
         let encoded = encode_png_predictor(&[], huge_row_bytes, 1, 10).unwrap();
         assert!(encoded.is_empty(), "empty input encodes to zero rows");
     }
@@ -1335,7 +1339,11 @@ mod tests {
     #[test]
     fn decode_png_predictor_empty_input_skips_huge_row_allocation() {
         // Same guard on the untrusted decode path.
-        let huge_row_bytes = 1usize << 60;
+        // `usize::MAX / 2`, not `1 << 60`: the latter is a compile-time overflow
+        // on 32-bit targets (shift >= type width). This stays huge on both
+        // widths (~9.2e18 on 64-bit, ~2 GiB on 32-bit) so a broken guard still
+        // aborts on the allocation.
+        let huge_row_bytes = usize::MAX / 2;
         let decoded = decode_png_predictor(&[], huge_row_bytes, 1).unwrap();
         assert!(decoded.is_empty(), "empty input decodes to zero rows");
     }
@@ -1350,7 +1358,11 @@ mod tests {
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         let mut parms = Dictionary::new();
         parms.insert("Predictor", Object::Integer(10));
-        parms.insert("Columns", Object::Integer(i64::MAX));
+        // `i32::MAX`, not `i64::MAX`: on 32-bit targets `usize::try_from(i64::MAX)`
+        // fails, so /Columns would be rejected before the allocation path and the
+        // test would panic for the wrong reason. This value still parses on both
+        // widths and yields a large row width.
+        parms.insert("Columns", Object::Integer(i32::MAX as i64));
         parms.insert("BitsPerComponent", Object::Integer(1));
         dict.insert("DecodeParms", Object::Dictionary(parms));
 
