@@ -407,6 +407,15 @@ fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) 
         ));
     }
 
+    // Empty input decodes to zero rows; return before allocating the per-row
+    // buffer. `0` is divisible by any nonzero `row_size`, so without this guard
+    // a crafted /DecodeParms with a huge /Columns would force the
+    // `vec![0u8; row_bytes]` allocation below to take gigabytes for an empty
+    // stream (allocation-abort DoS on the untrusted decode path).
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let row_count = bytes.len() / row_size;
     let mut decoded = Vec::with_capacity(row_count * row_bytes);
     let mut previous_row = vec![0u8; row_bytes];
@@ -511,6 +520,17 @@ fn encode_png_predictor(
         return Err(Error::Unsupported(
             "raw data not divisible by row_bytes".to_string(),
         ));
+    }
+
+    // Empty input is zero rows: there is nothing to filter, so return before
+    // allocating the per-row buffer. `0` is divisible by any nonzero
+    // `row_bytes`, so without this guard a crafted /DecodeParms with a huge
+    // /Columns would force `vec![0u8; row_bytes]` to allocate gigabytes for a
+    // stream that produces no output (allocation-abort DoS). Non-empty input is
+    // already bounded: `len % row_bytes == 0` with `len > 0` implies
+    // `row_bytes <= len`.
+    if bytes.is_empty() {
+        return Ok(Vec::new());
     }
 
     let row_count = bytes.len() / row_bytes;
@@ -1300,6 +1320,60 @@ mod tests {
         let encoded = encode_stream_data(&dict, &raw).unwrap();
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
         assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn encode_png_predictor_empty_input_skips_huge_row_allocation() {
+        // `0` is divisible by any nonzero `row_bytes`, so an empty stream with a
+        // crafted huge row width must return before `vec![0u8; row_bytes]` and
+        // not attempt a gigabyte allocation for zero rows.
+        // `usize::MAX / 2`, not `1 << 60`: the latter is a compile-time overflow
+        // on 32-bit targets (shift >= type width). This stays huge on both
+        // widths (~9.2e18 on 64-bit, ~2 GiB on 32-bit) so a broken guard still
+        // aborts on the allocation.
+        let huge_row_bytes = usize::MAX / 2;
+        let encoded = encode_png_predictor(&[], huge_row_bytes, 1, 10).unwrap();
+        assert!(encoded.is_empty(), "empty input encodes to zero rows");
+    }
+
+    #[test]
+    fn decode_png_predictor_empty_input_skips_huge_row_allocation() {
+        // Same guard on the untrusted decode path.
+        // `usize::MAX / 2`, not `1 << 60`: the latter is a compile-time overflow
+        // on 32-bit targets (shift >= type width). This stays huge on both
+        // widths (~9.2e18 on 64-bit, ~2 GiB on 32-bit) so a broken guard still
+        // aborts on the allocation.
+        let huge_row_bytes = usize::MAX / 2;
+        let decoded = decode_png_predictor(&[], huge_row_bytes, 1).unwrap();
+        assert!(decoded.is_empty(), "empty input decodes to zero rows");
+    }
+
+    #[test]
+    fn encode_stream_data_png_predictor_empty_input_round_trips_without_oom() {
+        // Mirrors the reported DoS: empty stream data plus a PNG predictor with a
+        // huge /Columns. Encoding must succeed (Flate-wrapping the empty
+        // predictor output) instead of aborting on an enormous allocation, and
+        // the result must round-trip back to the empty input.
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(10));
+        // `i32::MAX`, not `i64::MAX`: on 32-bit targets `usize::try_from(i64::MAX)`
+        // fails, so /Columns would be rejected before the allocation path and the
+        // test would panic for the wrong reason. This value still parses on both
+        // widths and yields a large row width.
+        parms.insert("Columns", Object::Integer(i32::MAX as i64));
+        parms.insert("BitsPerComponent", Object::Integer(1));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        let encoded = encode_stream_data(&dict, &[]).unwrap();
+        assert!(
+            !encoded.is_empty(),
+            "empty raw input is still Flate-wrapped, so the stream is non-empty"
+        );
+
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+        assert!(decoded.is_empty(), "round-trips back to the empty input");
     }
 
     // ----- passthrough_codec_label tests (flpdf-9hc.7.4) -----
