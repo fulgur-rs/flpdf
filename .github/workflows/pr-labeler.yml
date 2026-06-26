@@ -14,6 +14,13 @@ permissions:
   pull-requests: write
   contents: read
 
+# Serialize runs per PR so a slow `opened` run can't finish after a later
+# `edited` run and re-apply a label derived from the stale title. Cancel the
+# in-flight run; the survivor reconciles to the current title's label.
+concurrency:
+  group: pr-labeler-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   label:
     if: github.event.pull_request.state == 'open'
@@ -38,17 +45,11 @@ jobs:
             const labels = pr.labels.map(l => l.name);
             const existing = labels.filter(l => l.startsWith('release-notes:'));
 
+            // `release:` PRs are managed manually; never touch their labels.
             if (/^release:/i.test(title)) {
               core.info(`PR #${pr.number} has release: prefix, skipping.`);
               return;
             }
-
-            const m = title.match(/^([a-zA-Z]+)(?:\([^)]+\))?!?:/);
-            if (!m) {
-              core.info(`PR #${pr.number} has no conventional commits prefix: ${title}`);
-              return;
-            }
-            const type = m[1].toLowerCase();
 
             const map = {
               feat: 'release-notes:feature',
@@ -63,24 +64,37 @@ jobs:
               perf: 'release-notes:internal',
             };
 
-            const desired = map[type];
-            if (!desired) {
-              core.info(`PR #${pr.number} has unmapped type "${type}", skipping.`);
+            // Classify. `desired` is null when the title has no conventional
+            // prefix or an unmapped one (e.g. `revert:`, `deps:`).
+            let desired = null;
+            const m = title.match(/^([a-zA-Z]+)(?:\([^)]+\))?!?:/);
+            if (m) {
+              desired = map[m[1].toLowerCase()] ?? null;
+            } else {
+              core.info(`PR #${pr.number} has no conventional commits prefix: ${title}`);
+            }
+
+            // Reconcile to exactly `desired` (or no release-notes:* label when
+            // desired is null). Removing stale labels even when desired is null
+            // fixes the case where a title is corrected from a mapped prefix to
+            // an unmapped one, which would otherwise leave the old category.
+            const alreadyCorrect =
+              existing.length === (desired ? 1 : 0) &&
+              (!desired || existing[0] === desired);
+            if (alreadyCorrect) {
+              core.info(`PR #${pr.number} already reconciled (${desired ?? 'none'}), skipping.`);
               return;
             }
 
-            if (existing.length === 1 && existing[0] === desired) {
-              core.info(`PR #${pr.number} already has ${desired}, skipping.`);
-              return;
+            if (desired && !existing.includes(desired)) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: [desired],
+              });
+              core.info(`Added ${desired} to PR #${pr.number}`);
             }
-
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              labels: [desired],
-            });
-            core.info(`Added ${desired} to PR #${pr.number}`);
 
             for (const stale of existing) {
               if (stale === desired) continue;
