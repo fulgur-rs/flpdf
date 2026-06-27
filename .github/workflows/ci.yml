@@ -192,6 +192,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          # Full history so scripts/patch-coverage.sh can find git merge-base
+          fetch-depth: 0
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
@@ -209,22 +212,29 @@ jobs:
       - name: Install qpdf
         run: sudo apt-get update && sudo apt-get install -y qpdf
 
-      # Coverage measures the workspace once; the strict ordered script in the
-      # `test` job remains the authoritative correctness gate.
+      # Output to target/ (gitignored) so the working tree stays clean for the
+      # patch-coverage gate's dirty-tree check.
       - name: Run tests with coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --lcov --output-path target/patch-cov.lcov
+
+      # Authoritative changed-line coverage gate: 100% for crates/flpdf/src/,
+      # report-only for crates/flpdf-cli/src/.  Understands // cov:ignore markers
+      # for genuinely-untestable defensive branches; Codecov upload below is for
+      # visibility only (codecov/patch is informational per codecov.yml).
+      - name: Patch coverage gate
+        run: scripts/patch-coverage.sh --lcov target/patch-cov.lcov
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lcov
-          path: lcov.info
+          path: target/patch-cov.lcov
           if-no-files-found: error
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
-          files: lcov.info
+          files: target/patch-cov.lcov
           use_oidc: true
           fail_ci_if_error: false
 
