@@ -826,14 +826,14 @@ fn indirect_length_holder_generation_must_match() {
     );
 }
 
-// ── flpdf-rnnr: object numbers must form the complete set 1..N ─────────────
+// ── flpdf-rnnr / flpdf-o10m: object numbers must be 1..N in file order ──────
 // fix_qdf sizes the regenerated xref from the object COUNT, never the maximum
-// object number, so a sparse/huge number cannot amplify the table. Completeness
-// (no gaps, no duplicates, nothing out of range) is enforced — this closes the
-// dense-xref amplification DoS and the `max_num + 1` overflow. Ordering is NOT
-// required: flpdf's own writer can emit objects out of ascending file order
-// (see `repairs_flpdf_own_out_of_order_qdf`), so a complete-but-unordered
-// numbering is repaired, not rejected.
+// object number, so a sparse/huge number cannot amplify the table. It requires
+// objects numbered exactly 1..N in ascending file order (qpdf's
+// QdfFixer::checkObjId), which closes the dense-xref amplification DoS and the
+// `max_num + 1` overflow AND matches qpdf byte-for-byte. flpdf's own writer
+// emits objects in ascending file order (flpdf-abu3 / PR #430), so this rejects
+// nothing the writer produces — see `writer_indirect_length_qdf_round_trips`.
 
 /// A sparse high object number (the second object is `1_000_000`, not `2`) is
 /// rejected — it would otherwise drive a multi-megabyte dense xref table.
@@ -846,7 +846,7 @@ fn sparse_high_object_number_is_rejected() {
         "expected Parse error for sparse high object number, got {err:?}"
     );
     assert!(
-        format!("{err}").contains("not a complete 1..N set"),
+        format!("{err}").contains("non-sequential object numbering"),
         "unexpected error: {err}"
     );
 }
@@ -858,26 +858,27 @@ fn max_u32_object_number_is_rejected_without_overflow() {
     let pdf = two_object_qdf_with_second_number(u32::MAX);
     let err = flpdf::fix_qdf(&pdf).expect_err("u32::MAX object number must be rejected");
     assert!(
-        format!("{err}").contains("not a complete 1..N set"),
+        format!("{err}").contains("non-sequential object numbering"),
         "unexpected error: {err}"
     );
 }
 
-/// A duplicate object number (two `1 0 obj`) is rejected rather than silently
-/// collapsed into one xref entry (the prior HashMap form was last-writer-wins).
+/// A duplicate object number (two `1 0 obj`) is rejected: the second object's
+/// number is 1 where 2 is expected, so it fails the sequential 1..N check.
 #[test]
 fn duplicate_object_number_is_rejected() {
     let pdf = two_object_qdf_with_second_number(1);
     let err = flpdf::fix_qdf(&pdf).expect_err("duplicate object number must be rejected");
     assert!(
-        format!("{err}").contains("not a complete 1..N set"),
+        format!("{err}").contains("non-sequential object numbering"),
         "unexpected error: {err}"
     );
 }
 
 /// Build a minimal QDF whose first object is `1 0 obj` and whose second object
-/// is `{second} 0 obj`. `second == 2` is the only complete numbering; a huge
-/// value is the sparse/overflow attack shape and `1` makes a duplicate.
+/// is `{second} 0 obj`. `second == 2` is the only valid numbering; a huge value
+/// is the sparse/overflow attack shape and `1` makes a duplicate — both
+/// non-sequential.
 fn two_object_qdf_with_second_number(second: u32) -> Vec<u8> {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
@@ -888,21 +889,20 @@ fn two_object_qdf_with_second_number(second: u32) -> Vec<u8> {
     pdf
 }
 
-/// fix_qdf must repair flpdf's OWN QDF even when the writer numbers objects
-/// completely (`1..N`) but emits them out of ascending file order: the writer
-/// collects reused indirect `/Length` holders and emits them after the main
-/// objects (here the source yields header order `1 2 3 4 5 7 6 8`). qpdf's
-/// fix-qdf rejects such ordering, but flpdf's must accept it — the completeness
-/// check (not file order) is what guards the DoS. Regression guard so a future
-/// "qpdf parity" tightening can't silently re-break this loop.
+/// flpdf's QDF writer emits each indirect `/Length` holder inline after its
+/// stream (flpdf-abu3 / PR #430), so even an indirect-length source — which used
+/// to produce out-of-order numbering (`1 2 3 4 5 7 6 8`) — now emits objects in
+/// ascending file order `1..N`. Because fix_qdf requires that order, its
+/// acceptance here *proves* the writer output is qpdf-canonical; and on the
+/// writer's already-correct output it must be a strict no-op. This is the
+/// writer↔fix_qdf mesh guard for an indirect-length source (flpdf-o10m: it would
+/// regress to a hard error if the writer ever re-emitted holders out of order).
 #[test]
-fn repairs_flpdf_own_out_of_order_qdf() {
+fn writer_indirect_length_qdf_round_trips() {
     use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
     use std::io::Cursor;
 
-    // A source with an indirect /Length whose holder the writer reuses and
-    // re-emits after the main objects, producing complete-but-unordered
-    // numbering. (Streams are clean Flate so `qpdf --check` stays warning-free.)
+    // Streams are clean Flate so `qpdf --check` stays warning-free.
     let source = read("../compat/objstm-lin-od-indirect-length-flate.pdf");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
     let mut opts = WriteOptions::default();
@@ -912,29 +912,19 @@ fn repairs_flpdf_own_out_of_order_qdf() {
     let mut qdf = Vec::new();
     write_pdf_with_options(&mut pdf, &mut qdf, &opts).unwrap();
 
-    // Sanity: the writer really did emit headers out of ascending file order
-    // (otherwise this test would not exercise the order-tolerant path).
-    let order = object_header_numbers(&qdf);
-    assert!(
-        order.windows(2).any(|w| w[0] > w[1]),
-        "expected out-of-order object headers from the writer, got {order:?}"
-    );
-
-    // The writer already emits a correct, ascending xref (entries by number,
-    // independent of the out-of-order object bodies), so fix_qdf must be a
-    // strict no-op here — it does NOT reject the out-of-order numbering and
-    // reproduces the same bytes. A tighter contract than `qpdf --check`: it
-    // would catch any future offset/emission drift on the order-tolerant path.
-    let fixed = flpdf::fix_qdf(&qdf).expect("fix_qdf must repair flpdf's own out-of-order QDF");
+    // fix_qdf accepts only ascending 1..N file order, so a successful repair
+    // proves the writer emitted this indirect-length source qpdf-canonically;
+    // and on already-correct writer output it must be a strict no-op.
+    let fixed = flpdf::fix_qdf(&qdf).expect("fix_qdf must repair flpdf's own indirect-length QDF");
     assert_eq!(
         fixed, qdf,
-        "fix_qdf must be a no-op on flpdf's own complete-but-out-of-order QDF"
+        "fix_qdf must be a no-op on flpdf's own (ascending) indirect-length QDF"
     );
 
-    // qpdf must accept the repaired output.
+    // qpdf must accept the result.
     if Command::new("qpdf").arg("--version").output().is_ok() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let tmp = dir.path().join("out-of-order.pdf");
+        let tmp = dir.path().join("indirect-length.pdf");
         fs::write(&tmp, &fixed).unwrap();
         let out = Command::new("qpdf")
             .arg("--check")
@@ -943,30 +933,17 @@ fn repairs_flpdf_own_out_of_order_qdf() {
             .expect("run qpdf --check");
         assert!(
             out.status.success(),
-            "qpdf --check failed on repaired out-of-order QDF:\n{}",
+            "qpdf --check failed on repaired indirect-length QDF:\n{}",
             String::from_utf8_lossy(&out.stdout)
         );
     } else {
-        eprintln!("qpdf not available; skipping qpdf --check in out-of-order repair test");
+        eprintln!("qpdf not available; skipping qpdf --check in indirect-length round-trip test");
     }
 
     // Idempotent on its own repaired output.
     let again = flpdf::fix_qdf(&fixed).expect("fix_qdf idempotent");
     assert_eq!(
         again, fixed,
-        "fix_qdf must be idempotent on repaired out-of-order QDF"
+        "fix_qdf must be idempotent on repaired indirect-length QDF"
     );
-}
-
-/// Leading object number of every line-anchored `N G obj` header (tests only).
-fn object_header_numbers(qdf: &[u8]) -> Vec<u32> {
-    qdf.split(|&b| b == b'\n')
-        .filter_map(|line| {
-            let line = std::str::from_utf8(line).ok()?;
-            let mut it = line.split_ascii_whitespace();
-            let num: u32 = it.next()?.parse().ok()?;
-            let _gen: u32 = it.next()?.parse().ok()?;
-            (it.next()? == "obj" && it.next().is_none()).then_some(num)
-        })
-        .collect()
 }
