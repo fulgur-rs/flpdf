@@ -290,11 +290,11 @@ fn qdf_mode_length_matches_decoded_bytes() {
         raw.len(),
         "actual stream data length must also equal the decoded byte count"
     );
-    // The holder number must be strictly above the source-object max.
-    assert!(
-        s.length_holder > max_original_object_number(&output),
-        "length-holder {} must be allocated above the original object max",
-        s.length_holder
+    // The holder must be numbered immediately after its stream in emission order.
+    assert_eq!(
+        s.length_holder,
+        metadata_stream_number(&output) + 1,
+        "length-holder must immediately follow its stream in emission order"
     );
     // The holder must NOT carry a source-id comment (it is synthetic).
     holder_has_no_original_id_comment(&output, s.length_holder);
@@ -825,11 +825,14 @@ fn qdf_original_object_id_comments_emitted_when_flag_false() {
     };
 
     // Verify all 3 reachable objects. The Catalog-first walk maps the input
-    // (Catalog 1, Pages 2, /Metadata stream 3) to new numbers Catalog->1,
-    // stream->2 (lexicographic /Metadata < /Pages), Pages->3.
+    // (Catalog 1, Pages 2, /Metadata stream 3) to CF numbers Catalog->1,
+    // stream->2 (lexicographic /Metadata < /Pages), Pages->3. In QDF mode
+    // the emission pre-scan interleaves a length-holder immediately after
+    // the stream, so emission numbers are: Catalog->1, stream->2,
+    // holder->3 (synthetic, no comment), Pages->4.
     check_pair(1, 1, 0); // Catalog
     check_pair(3, 2, 0); // /Metadata stream
-    check_pair(2, 3, 0); // Pages
+    check_pair(2, 4, 0); // Pages (emission 4; holder occupies emission 3)
 
     // The output must still be a valid PDF (xref offsets point at "N G obj").
     let report = check_reader(Cursor::new(&output)).unwrap();
@@ -1232,18 +1235,27 @@ fn read_length_holder(bytes: &[u8], holder: u32) -> i64 {
     body.trim().parse().expect("holder body is a bare integer")
 }
 
-/// Assert no `%% Original object ID:` comment immediately precedes `H 0 obj`.
+/// Assert no `%% Original object ID:` comment is on the line immediately
+/// before `H 0 obj`. Synthetic holders never carry the source-id comment;
+/// only the line directly preceding the header matters (the comment for any
+/// nearby source object is on that object's own header line, not the holder's).
 fn holder_has_no_original_id_comment(bytes: &[u8], holder: u32) {
     let header = format!("\n{holder} 0 obj\n");
     let hpos = find_subslice(bytes, header.as_bytes()).expect("holder header");
-    // The 200 bytes preceding the header must not contain the comment for
-    // this holder. (Synthetic objects never carry the source-id comment.)
-    let lo = hpos.saturating_sub(200);
-    let preceding = &bytes[lo..hpos];
-    let needle = format!("%% Original object ID: {holder} 0");
+    // hpos points at the '\n' that opens the header.  The line BEFORE that '\n'
+    // ends at hpos; find its start by scanning backwards for the previous '\n'.
+    let prev_line_end = hpos;
+    let prev_line_start = bytes[..prev_line_end]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let prev_line = std::str::from_utf8(&bytes[prev_line_start..prev_line_end]).unwrap_or("");
     assert!(
-        find_subslice(preceding, needle.as_bytes()).is_none(),
-        "length-holder {holder} must NOT have a %% Original object ID comment"
+        !prev_line.starts_with("%% Original object ID:"),
+        "length-holder {holder} must NOT have a %% Original object ID comment \
+         (preceding line: {:?})",
+        prev_line
     );
 }
 
@@ -1505,10 +1517,11 @@ fn qdf_rewrite_is_deterministic() {
          (deterministic holder allocation)"
     );
     // Sanity: the output really uses the indirect-length holder structure.
-    let s = parse_qdf_stream(&a, 9);
-    assert!(
-        s.length_holder > max_original_object_number(&a),
-        "holder must be allocated above the original object max"
+    // three-page.pdf: first content stream (src 9) → emission 7, holder → emission 8.
+    let s = parse_qdf_stream(&a, 7);
+    assert_eq!(
+        s.length_holder, 8,
+        "holder must immediately follow its stream in emission order"
     );
     holder_has_no_original_id_comment(&a, s.length_holder);
 }

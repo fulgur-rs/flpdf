@@ -2648,15 +2648,13 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // byte-identical to `qpdf --static-id`. `build` borrows `pdf` mutably (lazy
     // load) and returns an owned map, releasing the borrow before the loop.
     //
-    // `skip_length = !options.qdf` mirrors qpdf's `direct_stream_lengths`: every
-    // non-qdf mode emits a direct `/Length`, so qpdf removes `/Length` before
-    // enqueueing a stream's children and a holder reachable ONLY through that
-    // edge is garbage-collected. The walk reproduces this by not following the
-    // `/Length` edge, so the holder receives no number and renumbering stays
-    // contiguous. qdf keeps the indirect holder (it re-emits `/Length H 0 R`),
-    // so it must still follow the edge.
+    // Always use `skip_length = true`: in QDF mode the holder objects are
+    // freshly assigned sequential emission numbers by the pre-scan below (not
+    // reused from the source), so a prior-QDF-pass holder reachable only via a
+    // /Length edge is NOT numbered here and disappears cleanly from `renumbered`.
+    // In non-QDF mode this is the same behaviour as before.
     use crate::rewrite_renumber::CatalogFirstRenumber;
-    let renumber = CatalogFirstRenumber::build(pdf, !options.qdf)?;
+    let renumber = CatalogFirstRenumber::build(pdf, true)?;
     // The new /Root reference (always seeded first by the walk, so present).
     let new_root = renumber
         .new_for_original(root_ref)
@@ -2923,51 +2921,93 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         None
     };
 
-    // ── QDF length-holder pre-pass (flpdf-9hc.6.12) ──────────────────────────
-    // In qdf mode every real stream's /Length is emitted as an INDIRECT
-    // reference `/Length H 0 R` plus a separate bare-integer holder object,
-    // matching qpdf 11.9.0 --qdf and the flpdf::fix_qdf oracle (qdf_fix.rs).
-    // A direct `/Length <n>` in a stream dict is something flpdf::fix_qdf
-    // never rewrites, so without this the "edit then fix" use case breaks.
+    // ── QDF emission pre-scan ─────────────────────────────────────────────────
+    // qpdf --qdf emits each stream's /Length holder IMMEDIATELY after that
+    // stream object (numbered in emission order), so file positions are strictly
+    // ascending 1..N with holders interleaved. Build:
+    //   • qdf_emission_renumber: old_ref → emission ObjectRef (replaces CF
+    //     renumber in QDF mode for renumber_refs_in_place and remap_trailer_refs)
+    //   • qdf_holder_map: emission_stream_num → emission_holder_num
+    // Prior-QDF-pass holder objects (bare integers reachable only via /Length
+    // edges) were excluded from the CF renumber by skip_length=true; they do
+    // not appear in `renumbered` and are not in qdf_emission_renumber, so the
+    // main loop naturally skips them. Idempotence is achieved because every
+    // pass produces the same emission ordering from the same graph structure.
     //
-    // Idempotence: a qdf output fed back through this path already carries
-    // `/Length H 0 R` plus a leaf-integer holder object H. We detect those
-    // holders here so we (a) skip re-emitting them as ordinary objects in
-    // the main loop and (b) REUSE their number H rather than allocating a
-    // fresh one — making `flpdf --qdf` of its own qdf output byte-stable.
-    use std::collections::HashSet;
-    // Holder numbers found here are recorded in NEW-number space, because the
-    // /Length reference inside each stream is rewritten by
-    // `renumber_refs_in_place` before it is consulted in the main loop. We
-    // resolve via the ORIGINAL ref (`old_ref`) but map the holder's old number
-    // through `renumber` to the new number used downstream.
-    let mut existing_holders: HashSet<u32> = HashSet::new();
+    // `skip_refs` is also declared here (before the pre-scan) because the
+    // pre-scan applies the same skip conditions as the main loop.
+    let skip_refs = pdf.deleted_object_refs();
+
+    let mut qdf_emission_renumber: HashMap<ObjectRef, ObjectRef> = HashMap::new();
+    let mut qdf_holder_map: HashMap<u32, u32> = HashMap::new();
+
     if options.qdf {
-        for (_new_ref, old_ref) in &renumbered {
-            // `pdf.encryption_ref()` and `member_to_batch` are original-space.
-            if Some(*old_ref) == pdf.encryption_ref() || member_to_batch.contains_key(old_ref) {
+        let mut next_emission: u32 = 0;
+        for (cf_ref, old_ref) in &renumbered {
+            if Some(*old_ref) == pdf.encryption_ref() {
                 continue;
             }
-            if let Ok(Object::Stream(s)) = pdf.resolve_borrowed(*old_ref) {
-                if let Some(Object::Reference(r)) = s.dict.get("Length") {
-                    if let Some(new_holder) = renumber.new_for_original(*r) {
-                        existing_holders.insert(new_holder.number);
+            if old_ref.number == 0 || skip_refs.contains(old_ref) {
+                continue;
+            }
+            if member_to_batch.contains_key(old_ref) {
+                continue;
+            }
+            // Determine whether this object is a real stream (needs a holder),
+            // a non-stream object (no holder), or a structural stream that the
+            // main loop skips (XRef / ObjStm).
+            let is_real_stream = match pdf.resolve_borrowed(*old_ref) {
+                Ok(Object::Stream(s)) => {
+                    let ty = s.dict.get("Type");
+                    let is_structural = matches!(ty, Some(Object::Name(n))
+                        if n.as_slice() == b"XRef" || n.as_slice() == b"ObjStm");
+                    if is_structural {
+                        None
+                    } else {
+                        Some(true)
                     }
                 }
+                Ok(_) => Some(false),
+                Err(_) => None,
+            };
+            let Some(is_stream) = is_real_stream else {
+                continue;
+            };
+
+            next_emission = next_emission.checked_add(1).ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "full-rewrite: QDF emission number overflows u32".to_string(),
+                )
+            })?;
+            let emission_num = next_emission;
+            qdf_emission_renumber.insert(*old_ref, ObjectRef::new(emission_num, cf_ref.generation));
+
+            if is_stream {
+                next_emission = next_emission.checked_add(1).ok_or_else(|| {
+                    crate::Error::Unsupported(
+                        "full-rewrite: QDF holder number overflows u32".to_string(),
+                    )
+                })?;
+                qdf_holder_map.insert(emission_num, next_emission);
             }
         }
     }
 
-    // Holders to emit after the last original object, ascending by number:
-    // holder_object_number -> decoded_length_value. A BTreeMap keeps them
-    // unique and key-sorted; a reused holder number with a *conflicting*
-    // length is an explicit error (a plain Vec + dedup_by_key would silently
-    // drop the conflict and emit a wrong `/Length H 0 R`).
-    let mut length_holders: BTreeMap<u32, i64> = BTreeMap::new();
-    // Running counter for freshly allocated holder numbers (above existing_max
-    // and above any ObjStm container numbers). Mirrors the `existing_max + i`
-    // container-allocation pattern at the top of this function.
-    let mut next_holder_offset: u32 = plan.batches.len() as u32;
+    // In QDF mode, /Root's ref in the trailer is in emission-space; rebind
+    // new_root from the qdf_emission_renumber map so remap_trailer_refs and the
+    // explicit trailer.insert("Root", ...) both use the same emission number.
+    let new_root = if options.qdf {
+        qdf_emission_renumber
+            .get(&root_ref)
+            .copied()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "QDF emission: /Root absent from emission map".to_string(),
+                )
+            })?
+    } else {
+        new_root
+    };
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
@@ -2978,22 +3018,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     }
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
-
-    // qpdf never emits a body object for object 0 (the xref free-list head) or
-    // for any free/deleted entry — in any mode (plain rewrite, --qdf, or
-    // object-stream output). Those entries exist only as `f` rows in the
-    // regenerated xref table. flpdf's `object_refs()` includes the free head
-    // (0 65535) and any deleted refs, so we suppress them here unconditionally.
-    // (flpdf-9hc.6.10 first added this on the qdf path; flpdf-9hc.31 extended
-    // it to the plain path — qpdf parity requires it in every mode, and without
-    // it the plain rewrite leaks `0 65535 obj null` as a body object, shifting
-    // every subsequent offset and blocking bytes-identical output.)
-    //
-    // Kept as the `Vec` `deleted_object_refs()` returns rather than collected
-    // into a `HashSet`: deleted objects are typically zero or a handful, so a
-    // linear `contains` over a contiguous slice beats hashing plus a heap
-    // allocation for that size.
-    let skip_refs = pdf.deleted_object_refs();
 
     for (new_ref, old_ref) in &renumbered {
         // `pdf.encryption_ref()`, `skip_refs` (deleted_object_refs), and
@@ -3016,36 +3040,43 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             continue;
         }
 
-        // QDF length-holder objects from a prior qdf pass are reconstructed
-        // (with the recomputed length) below; do not re-emit them here as
-        // ordinary integer objects, or idempotence breaks. `existing_holders`
-        // is in NEW-number space, so compare against `new_ref`.
-        if options.qdf && existing_holders.contains(&new_ref.number) {
-            continue;
-        }
+        // In QDF mode, look up the emission-space ObjectRef. Objects absent
+        // from qdf_emission_renumber (prior-QDF-pass holders excluded by
+        // skip_length=true in CF renumber) are skipped here, ensuring
+        // idempotence. In non-QDF mode emit_ref == *new_ref.
+        let emit_ref = if options.qdf {
+            match qdf_emission_renumber.get(old_ref) {
+                Some(&r) => r,
+                None => continue,
+            }
+        } else {
+            *new_ref
+        };
 
         // Resolve the object via its ORIGINAL ref; propagate the error so
         // callers see corrupt input rather than a silent success with missing
         // /Root descendants.
         let mut object = pdf.resolve(*old_ref)?;
 
-        // Rewrite every internal reference to its new number BEFORE any
-        // string-encryption or stream policy looks at the object, so all
-        // downstream code sees new-number space.
-        crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
+        // Rewrite every internal reference to its emission number BEFORE any
+        // string-encryption or stream policy looks at the object. In QDF mode
+        // use qdf_emission_renumber (old→emission); otherwise use the CF renumber.
+        if options.qdf {
+            crate::rewrite_renumber::renumber_refs_in_place(&mut object, &qdf_emission_renumber)?;
+        } else {
+            crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
+        }
 
         // flpdf-9hc.4.9: encrypt every string inside this object's resolved
         // graph. Stream PAYLOAD encryption happens later (after the compress
         // policy reencode), and the /Encrypt dict object itself is exempt per
         // PDF 1.7 §7.6.1 ("strings and streams inside the encryption
         // dictionary are not encrypted").
-        // `ctx.encrypt_ref` is the freshly-allocated output /Encrypt slot (above
-        // the new max), so it lives in NEW-number space — compare and key the
-        // per-object encryption against `new_ref`, NOT `old_ref`. The encryption
-        // key derives from the object number, so it MUST be the new number.
+        // The encryption key derives from the emitted object number (`emit_ref`),
+        // which is what the file header records for this object.
         if let Some(ctx) = &encrypt_ctx {
-            if *new_ref != ctx.encrypt_ref {
-                encrypt_strings_in_object_for_writer(*new_ref, &mut object, ctx)?;
+            if emit_ref != ctx.encrypt_ref {
+                encrypt_strings_in_object_for_writer(emit_ref, &mut object, ctx)?;
             }
         }
 
@@ -3067,12 +3098,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             }
         }
 
-        // Duplicate detection (same contract as write_qdf). `offsets` is keyed
-        // on the emitted (NEW) number.
-        if offsets.contains_key(&new_ref.number) {
+        // Duplicate detection: `offsets` is keyed on the emitted number.
+        if offsets.contains_key(&emit_ref.number) {
             return Err(crate::Error::Unsupported(format!(
                 "duplicate object number {} in xref table",
-                new_ref.number
+                emit_ref.number
             )));
         }
 
@@ -3094,25 +3124,20 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             );
         }
 
-        // The body header uses the emitted (NEW) number.
+        // The body header uses the emitted number.
         let emit_offset = bytes.len();
         bytes.extend_from_slice(
-            format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes(),
+            format!("{} {} obj\n", emit_ref.number, emit_ref.generation).as_bytes(),
         );
+
+        // Will be set to Some((holder_num, len_value)) for QDF streams so we
+        // can emit the holder immediately after the stream's endobj.
+        let mut qdf_holder_to_emit: Option<(u32, i64)> = None;
 
         if let Object::Stream(stream) = object {
             // Determine the effective stream policy.
             // QDF always wins (decoded), and effective_stream_policy handles
             // that; None means preserve mode: emit the stream verbatim.
-            // Capture the pre-policy /Length form so an existing indirect
-            // holder (from a prior qdf pass) can be reused for byte-stable
-            // idempotence instead of allocating a new number.
-            let prior_holder = match stream.dict.get("Length") {
-                Some(Object::Reference(r)) if existing_holders.contains(&r.number) => {
-                    Some(r.number)
-                }
-                _ => None,
-            };
             // qpdf re-filters (decode + re-encode to a single /FlateDecode, and
             // emits /Length before the regenerated /Filter) only for streams
             // whose source filter chain is NOT already a lone /FlateDecode. An
@@ -3132,13 +3157,11 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // /Length is updated to the encrypted byte count (AES-CBC adds a
             // 16-byte IV prefix and PKCS#7 padding). Skip for the /Encrypt
             // object itself.
-            // `ctx.encrypt_ref` is the output /Encrypt slot (NEW space) and the
-            // payload key derives from the object number, so both the skip-check
-            // and the key use `new_ref`. `ctx.metadata_ref` comes from
-            // `resolve_metadata_stream_ref`, an ORIGINAL ref, so it is compared
-            // against `old_ref`.
+            // The encryption key derives from emit_ref (the number the file
+            // header records). ctx.metadata_ref is an ORIGINAL ref, compared
+            // against old_ref.
             if let Some(ctx) = &encrypt_ctx {
-                if *new_ref != ctx.encrypt_ref {
+                if emit_ref != ctx.encrypt_ref {
                     if let Object::Stream(ref mut s) = reencoded {
                         if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*old_ref) {
                             // --cleartext-metadata: leave the /Metadata XMP
@@ -3150,7 +3173,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                                 b"Identity",
                             );
                         } else {
-                            encrypt_stream_payload_for_writer(*new_ref, s, ctx)?;
+                            encrypt_stream_payload_for_writer(emit_ref, s, ctx)?;
                         }
                     }
                 }
@@ -3178,38 +3201,24 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                     ))
                     .unwrap_or(i64::MAX);
-                    let holder = match prior_holder {
-                        Some(h) => h,
-                        None => {
-                            next_holder_offset =
-                                next_holder_offset.checked_add(1).ok_or_else(|| {
-                                    crate::Error::Unsupported(
-                                        "full-rewrite: QDF length-holder number overflows u32"
-                                            .to_string(),
-                                    )
-                                })?;
-                            existing_max
-                                .checked_add(next_holder_offset)
-                                .ok_or_else(|| {
-                                    crate::Error::Unsupported(
-                                        "full-rewrite: QDF length-holder number overflows u32"
-                                            .to_string(),
-                                    )
-                                })?
-                        }
-                    };
-                    if let Some(prev) = length_holders.insert(holder, len_value) {
-                        if prev != len_value {
-                            return Err(crate::Error::Unsupported(format!(
-                                "full-rewrite: QDF length-holder {holder} reused with conflicting lengths ({prev} vs {len_value})"
-                            )));
-                        }
-                    }
+                    // The holder number was assigned by the QDF emission pre-scan
+                    // as the slot immediately following this stream's emission slot.
+                    let holder_num =
+                        qdf_holder_map
+                            .get(&emit_ref.number)
+                            .copied()
+                            .ok_or_else(|| {
+                                crate::Error::Unsupported(format!(
+                                    "full-rewrite: QDF holder not found for stream at emission {}",
+                                    emit_ref.number
+                                ))
+                            })?;
+                    qdf_holder_to_emit = Some((holder_num, len_value));
 
                     let mut holder_stream = s.clone();
                     holder_stream
                         .dict
-                        .insert("Length", Object::Reference(ObjectRef::new(holder, 0)));
+                        .insert("Length", Object::Reference(ObjectRef::new(holder_num, 0)));
                     write_stream_to_buf_qdf(
                         &mut bytes,
                         &holder_stream,
@@ -3249,7 +3258,19 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         if options.qdf {
             bytes.push(b'\n');
         }
-        offsets.insert(new_ref.number, (new_ref.generation, emit_offset));
+        offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
+
+        // QDF: emit the length-holder object IMMEDIATELY after its stream's
+        // endobj + blank line, numbered in sequential emission order so that
+        // object file positions are strictly ascending 1..N (qpdf 11.9.0
+        // behaviour). No "%% Original object ID:" comment for holder objects
+        // (they are synthetic; qpdf only emits that comment for source objects).
+        if let Some((hnum, hlen)) = qdf_holder_to_emit {
+            let h_offset = bytes.len();
+            bytes.extend_from_slice(format!("{hnum} 0 obj\n{hlen}\nendobj\n").as_bytes());
+            bytes.push(b'\n'); // QDF inter-object blank line
+            offsets.insert(hnum, (0, h_offset));
+        }
     }
 
     // ── Step 5: emit each ObjStm container ───────────────────────────────────
@@ -3288,36 +3309,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(container_ref.number, (0, emit_offset));
-    }
-
-    // ── Step 5b: emit QDF length-holder objects (flpdf-9hc.6.12) ─────────────
-    // Each real stream's /Length was rewritten to `/Length H 0 R` above.
-    // Emit the holders here, AFTER the last original object (and any ObjStm
-    // container — empty in qdf mode per 6.2), ascending by object number,
-    // with NO `%% Original object ID:` comment (they are synthetic; qpdf
-    // 11.9.0 --qdf only emits that comment for source objects). The holder
-    // body is the decoded byte count as a bare decimal integer on its own
-    // line with no zero padding — identical framing to qpdf and to what
-    // flpdf::fix_qdf (qdf_fix.rs) rewrites. The same `endobj` framing the
-    // main loop uses keeps offsets and xref consistent.
-    // `length_holders` is a BTreeMap: already unique and ascending by holder
-    // number, with conflicting-length reuse rejected at insert time above.
-    for (holder, len_value) in &length_holders {
-        if offsets.contains_key(holder) {
-            return Err(crate::Error::Unsupported(format!(
-                "full-rewrite: QDF length-holder number {holder} collides with an existing object"
-            )));
-        }
-        let emit_offset = bytes.len();
-        bytes.extend_from_slice(format!("{holder} 0 obj\n{len_value}\nendobj\n").as_bytes());
-        // QDF inter-object blank-line separator (flpdf-9hc.6.10): a blank line
-        // between holders and before the `xref` keyword, matching qpdf which
-        // separates every object. length_holders is only populated on the qdf
-        // path, but gate explicitly for clarity.
-        if options.qdf {
-            bytes.push(b'\n');
-        }
-        offsets.insert(*holder, (0, emit_offset));
     }
 
     // ── flpdf-9hc.4.9: emit the /Encrypt dictionary as a plaintext indirect
@@ -3364,10 +3355,14 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // Trailer — start from the document trailer, strip incremental keys.
             let mut trailer = pdf.trailer().clone();
             strip_incremental_trailer_keys(&mut trailer);
-            // Remap surviving indirect trailer refs (notably /Info) to NEW
+            // Remap surviving indirect trailer refs (notably /Info) to emission
             // numbers. /Root is overwritten explicitly with new_root below, and
             // /Encrypt is handled by apply_encrypt_trailer_entries, so skip both.
-            remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
+            if options.qdf {
+                remap_trailer_refs(&mut trailer, &qdf_emission_renumber, &skip_refs)?;
+            } else {
+                remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
+            }
             trailer.insert("Size", Object::Integer(object_count as i64));
             trailer.insert("Root", Object::Reference(new_root));
             apply_encrypt_trailer_entries(

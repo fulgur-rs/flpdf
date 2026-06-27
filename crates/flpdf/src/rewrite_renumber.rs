@@ -57,6 +57,12 @@ impl NewNumberLookup for GenerateRenumber {
     }
 }
 
+impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
+    fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
+        self.get(&original).copied()
+    }
+}
+
 /// A map from original object references to their qpdf-style Catalog-first
 /// numbers, plus the visitation order that produced them.
 pub(crate) struct CatalogFirstRenumber {
