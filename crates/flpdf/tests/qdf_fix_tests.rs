@@ -177,25 +177,25 @@ fn objstm_input_is_unsupported() {
 fn ignores_xref_and_stream_inside_object_body() {
     // obj 1: stream whose dict has a string containing the word "stream" and
     // whose decompressed content contains a line `xref`. /Length is indirect
-    // (held by obj 4). Initial xref offsets are intentionally bogus zeros —
+    // (held by obj 3). Initial xref offsets are intentionally bogus zeros —
     // fix_qdf must regenerate them and still pick the real table at the tail.
+    // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
-    pdf.extend_from_slice(b"<<\n  /Length 4 0 R\n  /Note (the word stream appears here)\n>>\n");
+    pdf.extend_from_slice(b"<<\n  /Length 3 0 R\n  /Note (the word stream appears here)\n>>\n");
     pdf.extend_from_slice(b"stream\nline one\nxref\nendstream\nendobj\n\n");
     pdf.extend_from_slice(
         b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    pdf.extend_from_slice(b"%% Original object ID: 4 0\n4 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 3 0\n3 0 obj\n0\nendobj\n\n");
     // Real (tail) xref table with deliberately wrong offsets.
-    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"0000000000 00000 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
     let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed");
     let s = &fixed;
@@ -207,16 +207,16 @@ fn ignores_xref_and_stream_inside_object_body() {
     );
 
     // Exactly ONE regenerated cross-reference table: a line-anchored `xref`
-    // immediately followed by the `0 5` subsection header.
+    // immediately followed by the `0 4` subsection header.
     assert!(
-        find(s, b"\nxref\n0 5\n").is_some(),
+        find(s, b"\nxref\n0 4\n").is_some(),
         "real xref table must be regenerated at the tail"
     );
 
-    // /Length holder (obj 4) recomputed to the verbatim content byte count:
+    // /Length holder (obj 3) recomputed to the verbatim content byte count:
     // "line one\nxref\n" == 14 bytes (after `stream`+EOL, up to line `endstream`).
     assert!(
-        find(s, b"4 0 obj\n14\nendobj").is_some(),
+        find(s, b"3 0 obj\n14\nendobj").is_some(),
         "indirect /Length holder must be recomputed to 14, got:\n{}",
         String::from_utf8_lossy(s)
     );
@@ -240,11 +240,12 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     // obj 1: stream whose decompressed body contains BOTH a line `endobj` and
     // a line `xref` — the canonical regression case for roborev 991.
-    // /Length is indirect (held by obj 4). xref offsets are bogus zeros.
+    // /Length is indirect (held by obj 3). xref offsets are bogus zeros.
+    // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
-    pdf.extend_from_slice(b"<<\n  /Length 4 0 R\n>>\n");
+    pdf.extend_from_slice(b"<<\n  /Length 3 0 R\n>>\n");
     // Stream body contains both `endobj` and `xref` on their own lines.
     pdf.extend_from_slice(
         b"stream\nsome content\nendobj\nmore content\nxref\nfinal line\nendstream\nendobj\n\n",
@@ -252,15 +253,14 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     pdf.extend_from_slice(
         b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    pdf.extend_from_slice(b"%% Original object ID: 4 0\n4 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 3 0\n3 0 obj\n0\nendobj\n\n");
     // Real (tail) xref table with deliberately wrong offsets.
-    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"0000000000 00000 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
     let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed on stream-body-endobj input");
 
@@ -278,14 +278,14 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
 
     // Exactly one regenerated xref table at the tail (the one we emitted).
     assert!(
-        find(&fixed, b"\nxref\n0 5\n").is_some(),
+        find(&fixed, b"\nxref\n0 4\n").is_some(),
         "real xref table must be regenerated at the tail"
     );
 
-    // /Length holder (obj 4) recomputed to the verbatim content byte count:
+    // /Length holder (obj 3) recomputed to the verbatim content byte count:
     // "some content\nendobj\nmore content\nxref\nfinal line\n" = 50 bytes.
     let expected_len = b"some content\nendobj\nmore content\nxref\nfinal line\n".len();
-    let expected_holder = format!("4 0 obj\n{expected_len}\nendobj");
+    let expected_holder = format!("3 0 obj\n{expected_len}\nendobj");
     assert!(
         find(&fixed, expected_holder.as_bytes()).is_some(),
         "indirect /Length holder must be recomputed to {expected_len};\ngot:\n{}",
@@ -306,32 +306,32 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
 ///   fix_qdf must locate and recompute the REAL indirect length holder H.
 #[test]
 fn length1_not_mistaken_for_indirect_length() {
-    // obj 1: stream with `/Length1 999` before the real `/Length 4 0 R`.
-    // obj 4 is the length holder. Bogus xref offsets.
+    // obj 1: stream with `/Length1 999` before the real `/Length 3 0 R`.
+    // obj 3 is the length holder. Bogus xref offsets.
+    // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n");
     // /Length1 appears BEFORE /Length — the false-match scenario.
-    pdf.extend_from_slice(b"<<\n  /Length1 999\n  /Length 4 0 R\n>>\n");
+    pdf.extend_from_slice(b"<<\n  /Length1 999\n  /Length 3 0 R\n>>\n");
     pdf.extend_from_slice(b"stream\nhello world\nendstream\nendobj\n\n");
     pdf.extend_from_slice(
         b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    pdf.extend_from_slice(b"%% Original object ID: 4 0\n4 0 obj\n0\nendobj\n\n");
-    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"%% Original object ID: 3 0\n3 0 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 4\n");
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"0000000000 00000 f \n");
     pdf.extend_from_slice(b"0000000000 00000 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 5\n>>\nstartxref\n0\n%%EOF\n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
 
     let fixed = flpdf::fix_qdf(&pdf).expect("fix_qdf must succeed with /Length1 in dict");
 
-    // /Length holder obj 4 must be recomputed to the stream body byte count:
+    // /Length holder obj 3 must be recomputed to the stream body byte count:
     // "hello world\n" = 12 bytes.
     let expected_len = b"hello world\n".len();
-    let expected_holder = format!("4 0 obj\n{expected_len}\nendobj");
+    let expected_holder = format!("3 0 obj\n{expected_len}\nendobj");
     assert!(
         find(&fixed, expected_holder.as_bytes()).is_some(),
         "indirect /Length holder must be recomputed to {expected_len} (not fooled by /Length1);\ngot:\n{}",
@@ -344,7 +344,7 @@ fn length1_not_mistaken_for_indirect_length() {
     // already proves we didn't pick /Length1. Assert the stale holder (0) is
     // gone and the correct value is present.
     assert!(
-        find(&fixed, b"4 0 obj\n0\nendobj").is_none(),
+        find(&fixed, b"3 0 obj\n0\nendobj").is_none(),
         "stale holder value 0 must have been replaced"
     );
 
@@ -802,25 +802,171 @@ fn nonzero_generation_indirect_length_holder_is_rejected() {
     );
 }
 
-/// flpdf-9hc.25 (roborev #199 follow-up): an indirect `/Length 7 0 R` whose
-/// only object numbered 7 is `7 1 obj` (generation 1, NOT the gen-0 holder
+/// flpdf-9hc.25 (roborev #199 follow-up): an indirect `/Length 3 0 R` whose
+/// only object numbered 3 is `3 1 obj` (generation 1, NOT the gen-0 holder
 /// the reference points at) must be rejected — number-only matching would
-/// wrongly accept it and rewrite the wrong-generation object.
+/// wrongly accept it and rewrite the wrong-generation object. (Numbering stays
+/// contiguous 1..3 so the gen mismatch — not a number gap — is what trips it.)
 #[test]
 fn indirect_length_holder_generation_must_match() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
-    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 7 0 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
+    pdf.extend_from_slice(b"%% Original object ID: 1 0\n1 0 obj\n<<\n  /Length 3 0 R\n>>\nstream\nhello\nendstream\nendobj\n\n");
     pdf.extend_from_slice(
         b"%% Original object ID: 2 0\n2 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n",
     );
-    // Only `7 1 obj` exists — the `7 0` holder the /Length points at is absent.
-    pdf.extend_from_slice(b"7 1 obj\n0\nendobj\n\n");
-    pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00000 f \n0000000000 00000 f \n0000000000 00000 f \n0000000000 00000 f \n0000000000 00001 n \n");
-    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 8\n>>\nstartxref\n0\n%%EOF\n");
+    // Only `3 1 obj` exists — the `3 0` holder the /Length points at is absent.
+    pdf.extend_from_slice(b"3 1 obj\n0\nendobj\n\n");
+    pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n0000000000 00000 n \n0000000000 00000 n \n0000000000 00001 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 4\n>>\nstartxref\n0\n%%EOF\n");
     let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
         format!("{err}").contains("holder object (M 0) is missing"),
-        "a /Length 7 0 R with only 7 1 obj must be rejected, got: {err}"
+        "a /Length 3 0 R with only 3 1 obj must be rejected, got: {err}"
     );
+}
+
+// ── flpdf-rnnr: object numbers must form the complete set 1..N ─────────────
+// fix_qdf sizes the regenerated xref from the object COUNT, never the maximum
+// object number, so a sparse/huge number cannot amplify the table. Completeness
+// (no gaps, no duplicates, nothing out of range) is enforced — this closes the
+// dense-xref amplification DoS and the `max_num + 1` overflow. Ordering is NOT
+// required: flpdf's own writer can emit objects out of ascending file order
+// (see `repairs_flpdf_own_out_of_order_qdf`), so a complete-but-unordered
+// numbering is repaired, not rejected.
+
+/// A sparse high object number (the second object is `1_000_000`, not `2`) is
+/// rejected — it would otherwise drive a multi-megabyte dense xref table.
+#[test]
+fn sparse_high_object_number_is_rejected() {
+    let pdf = two_object_qdf_with_second_number(1_000_000);
+    let err = flpdf::fix_qdf(&pdf).expect_err("sparse high object number must be rejected");
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "expected Parse error for sparse high object number, got {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("not a complete 1..N set"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `u32::MAX` as an object number is rejected with a normal error, never
+/// overflowing `max_num + 1` (debug panic) or wrapping `/Size` (release build).
+#[test]
+fn max_u32_object_number_is_rejected_without_overflow() {
+    let pdf = two_object_qdf_with_second_number(u32::MAX);
+    let err = flpdf::fix_qdf(&pdf).expect_err("u32::MAX object number must be rejected");
+    assert!(
+        format!("{err}").contains("not a complete 1..N set"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A duplicate object number (two `1 0 obj`) is rejected rather than silently
+/// collapsed into one xref entry (the prior HashMap form was last-writer-wins).
+#[test]
+fn duplicate_object_number_is_rejected() {
+    let pdf = two_object_qdf_with_second_number(1);
+    let err = flpdf::fix_qdf(&pdf).expect_err("duplicate object number must be rejected");
+    assert!(
+        format!("{err}").contains("not a complete 1..N set"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Build a minimal QDF whose first object is `1 0 obj` and whose second object
+/// is `{second} 0 obj`. `second == 2` is the only complete numbering; a huge
+/// value is the sparse/overflow attack shape and `1` makes a duplicate.
+fn two_object_qdf_with_second_number(second: u32) -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"1 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(format!("{second} 0 obj\n<<\n>>\nendobj\n\n").as_bytes());
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+    pdf
+}
+
+/// fix_qdf must repair flpdf's OWN QDF even when the writer numbers objects
+/// completely (`1..N`) but emits them out of ascending file order: the writer
+/// collects reused indirect `/Length` holders and emits them after the main
+/// objects (here the source yields header order `1 2 3 4 5 7 6 8`). qpdf's
+/// fix-qdf rejects such ordering, but flpdf's must accept it — the completeness
+/// check (not file order) is what guards the DoS. Regression guard so a future
+/// "qpdf parity" tightening can't silently re-break this loop.
+#[test]
+fn repairs_flpdf_own_out_of_order_qdf() {
+    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+    use std::io::Cursor;
+
+    // A source with an indirect /Length whose holder the writer reuses and
+    // re-emits after the main objects, producing complete-but-unordered
+    // numbering. (Streams are clean Flate so `qpdf --check` stays warning-free.)
+    let source = read("../compat/objstm-lin-od-indirect-length-flate.pdf");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.qdf = true;
+    opts.static_id = true;
+    let mut qdf = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut qdf, &opts).unwrap();
+
+    // Sanity: the writer really did emit headers out of ascending file order
+    // (otherwise this test would not exercise the order-tolerant path).
+    let order = object_header_numbers(&qdf);
+    assert!(
+        order.windows(2).any(|w| w[0] > w[1]),
+        "expected out-of-order object headers from the writer, got {order:?}"
+    );
+
+    // The writer already emits a correct, ascending xref (entries by number,
+    // independent of the out-of-order object bodies), so fix_qdf must be a
+    // strict no-op here — it does NOT reject the out-of-order numbering and
+    // reproduces the same bytes. A tighter contract than `qpdf --check`: it
+    // would catch any future offset/emission drift on the order-tolerant path.
+    let fixed = flpdf::fix_qdf(&qdf).expect("fix_qdf must repair flpdf's own out-of-order QDF");
+    assert_eq!(
+        fixed, qdf,
+        "fix_qdf must be a no-op on flpdf's own complete-but-out-of-order QDF"
+    );
+
+    // qpdf must accept the repaired output.
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tmp = dir.path().join("out-of-order.pdf");
+        fs::write(&tmp, &fixed).unwrap();
+        let out = Command::new("qpdf")
+            .arg("--check")
+            .arg(&tmp)
+            .output()
+            .expect("run qpdf --check");
+        assert!(
+            out.status.success(),
+            "qpdf --check failed on repaired out-of-order QDF:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    } else {
+        eprintln!("qpdf not available; skipping qpdf --check in out-of-order repair test");
+    }
+
+    // Idempotent on its own repaired output.
+    let again = flpdf::fix_qdf(&fixed).expect("fix_qdf idempotent");
+    assert_eq!(
+        again, fixed,
+        "fix_qdf must be idempotent on repaired out-of-order QDF"
+    );
+}
+
+/// Leading object number of every line-anchored `N G obj` header (tests only).
+fn object_header_numbers(qdf: &[u8]) -> Vec<u32> {
+    qdf.split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let line = std::str::from_utf8(line).ok()?;
+            let mut it = line.split_ascii_whitespace();
+            let num: u32 = it.next()?.parse().ok()?;
+            let _gen: u32 = it.next()?.parse().ok()?;
+            (it.next()? == "obj" && it.next().is_none()).then_some(num)
+        })
+        .collect()
 }
