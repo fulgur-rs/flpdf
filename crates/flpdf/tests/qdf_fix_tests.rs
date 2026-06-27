@@ -920,12 +920,15 @@ fn repairs_flpdf_own_out_of_order_qdf() {
         "expected out-of-order object headers from the writer, got {order:?}"
     );
 
-    // fix_qdf must repair (here: be a no-op on) its own writer output, not
-    // reject it; the regenerated xref lists entries in ascending number order.
+    // The writer already emits a correct, ascending xref (entries by number,
+    // independent of the out-of-order object bodies), so fix_qdf must be a
+    // strict no-op here — it does NOT reject the out-of-order numbering and
+    // reproduces the same bytes. A tighter contract than `qpdf --check`: it
+    // would catch any future offset/emission drift on the order-tolerant path.
     let fixed = flpdf::fix_qdf(&qdf).expect("fix_qdf must repair flpdf's own out-of-order QDF");
-    assert!(
-        find(&fixed, b"\nxref\n0 ").is_some(),
-        "a real xref table must be regenerated"
+    assert_eq!(
+        fixed, qdf,
+        "fix_qdf must be a no-op on flpdf's own complete-but-out-of-order QDF"
     );
 
     // qpdf must accept the repaired output.
