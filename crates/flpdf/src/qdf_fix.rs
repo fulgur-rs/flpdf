@@ -544,7 +544,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     out.extend_from_slice(format!("0 {size}\n").as_bytes());
     // Object 0 is the free-list head, exactly as qpdf fix-qdf emits it.
     out.extend_from_slice(b"0000000000 65535 f \n");
-    for &(_num, gen, off) in &new_offsets {
+    for &(_, gen, off) in &new_offsets {
         out.extend_from_slice(format!("{off:010} {gen:05} n \n").as_bytes());
     }
 
