@@ -2956,8 +2956,8 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
             // Determine whether this object is a real stream (needs a holder),
             // a non-stream object (no holder), or a structural stream that the
             // main loop skips (XRef / ObjStm).
-            let is_real_stream = match pdf.resolve_borrowed(*old_ref) {
-                Ok(Object::Stream(s)) => {
+            let is_real_stream = match pdf.resolve_borrowed(*old_ref)? {
+                Object::Stream(s) => {
                     let ty = s.dict.get("Type");
                     let is_structural = matches!(ty, Some(Object::Name(n))
                         if n.as_slice() == b"XRef" || n.as_slice() == b"ObjStm"); // cov:ignore: guard evaluated only when /Type is Name; XRef/ObjStm excluded upstream
@@ -2967,11 +2967,10 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                         Some(true)
                     }
                 }
-                Ok(_) => Some(false),
-                Err(_) => None, // cov:ignore: resolve error on renumbered ref is a malformed-input bug
+                _ => Some(false),
             };
             let Some(is_stream) = is_real_stream else {
-                continue; // cov:ignore: None cases above are defensive/unreachable in valid PDFs
+                continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
             };
 
             next_emission = next_emission.checked_add(1).ok_or_else(|| {

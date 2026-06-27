@@ -1259,22 +1259,6 @@ fn holder_has_no_original_id_comment(bytes: &[u8], holder: u32) {
     );
 }
 
-/// Highest original object number actually emitted with a
-/// `%% Original object ID:` comment (i.e. the source-object max).
-fn max_original_object_number(bytes: &[u8]) -> u32 {
-    let text = String::from_utf8_lossy(bytes);
-    let mut max = 0u32;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("%% Original object ID: ") {
-            if let Some(n) = rest.split_whitespace().next() {
-                if let Ok(v) = n.parse::<u32>() {
-                    max = max.max(v);
-                }
-            }
-        }
-    }
-    max
-}
 
 /// Trailer `/Size` value from qdf bytes.
 fn trailer_size(bytes: &[u8]) -> i64 {
