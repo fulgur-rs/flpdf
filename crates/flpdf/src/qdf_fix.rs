@@ -441,7 +441,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // `/Length` holder inline after its stream (flpdf-abu3 / PR #430), so this
     // rejects nothing the writer (or qpdf `--qdf`) produces.
     for (i, obj) in objects.iter().enumerate() {
-        if u64::from(obj.num) != i as u64 + 1 {
+        if obj.num as usize != i + 1 {
             return Err(Error::parse(
                 obj.obj_line_start,
                 "fix_qdf: non-sequential object numbering \
