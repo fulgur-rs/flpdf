@@ -19,9 +19,12 @@
 //!   preceded by a `%% Original object ID: N G` comment line (the offset always
 //!   points at the `N G obj` line, **not** the comment — verified against the
 //!   `fix-qdf` oracle);
-//! * object numbers are contiguous, numbered `1..N` in file order — qpdf's
-//!   `fix-qdf` requires this (it aborts on the first out-of-sequence object)
-//!   and [`fix_qdf`] rejects non-sequential numbering the same way;
+//! * object numbers form the complete set `1..N` (no gaps, no duplicates) —
+//!   [`fix_qdf`] rejects any other numbering. (qpdf's `fix-qdf` is stricter
+//!   still: it also requires ascending *file* order. [`fix_qdf`] tolerates a
+//!   complete-but-unordered numbering because flpdf's own QDF writer can emit a
+//!   reused indirect `/Length` holder out of file order, and `fix_qdf` must be
+//!   able to repair its own output.);
 //! * stream lengths are stored as an *indirect* reference `/Length M G R`, with
 //!   the length itself living in a standalone `M G obj` whose body is a single
 //!   integer (qpdf canonical QDF never inlines a direct `/Length <n>` for an
@@ -308,7 +311,7 @@ fn detect_objstm(body: &[u8]) -> bool {
 ///   (QDF mode disables object streams, so this should not occur in practice).
 /// * [`Error::Parse`] if the input does not look like a QDF file (no `xref`
 ///   table, malformed trailer, an indirect `/Length` whose holder object is
-///   missing, or object numbers that are not contiguous `1..N` in file order).
+///   missing, or object numbers that do not form the complete set `1..N`).
 pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // ---- 1. Locate the xref / trailer / startxref region. ---------------
     // We rebuild everything from the real `xref` table (the LAST line-anchored
@@ -430,21 +433,35 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::parse(0, "fix_qdf: no objects found before xref"));
     }
 
-    // qpdf's fix-qdf requires objects to be numbered exactly 1..N in file order
-    // (QdfFixer::checkObjId fatals on `stoi(id) != ++last_obj`), and the
-    // regenerated table holds one in-use entry per object — never a dense table
-    // sized by the maximum object number. Enforce the same numbering: it keeps
-    // the output identical for canonical (contiguous) QDF while rejecting a
-    // sparse or huge object number that would otherwise drive `/Size` and the
-    // xref length far beyond the actual object count (the gap-tolerant
-    // `0..max_num+1` form diverged from qpdf and let a tiny input force a
-    // multi-gigabyte table / overflow `max_num + 1`).
-    for (i, obj) in objects.iter().enumerate() {
-        if u64::from(obj.num) != i as u64 + 1 {
+    // The object numbers must form the COMPLETE set `1..N` — every number in
+    // `1..=objects.len()` present exactly once, no gaps, no duplicates, nothing
+    // out of range. This is the security-relevant invariant: it bounds the
+    // regenerated xref to the object count, so a sparse or huge object number
+    // can no longer drive `/Size` and the table length far beyond the actual
+    // object count (the previous `0..max_num+1` dense form let a tiny input with
+    // one huge number force a multi-gigabyte table and overflow `max_num + 1`).
+    //
+    // We deliberately do NOT additionally require qpdf's *file order* here.
+    // qpdf's fix-qdf is stricter (QdfFixer::checkObjId fatals unless objects
+    // appear in ascending file order), but flpdf's own QDF writer may emit a
+    // reused indirect `/Length` holder out of ascending file order (holders are
+    // collected and emitted after the main objects), producing a complete but
+    // unordered numbering. fix_qdf must still repair its own writer's output, so
+    // order-tolerance is retained and the xref below is emitted in ascending
+    // object-number order regardless of input order. Strict qpdf file-order
+    // parity is deferred until the writer emits holders in qpdf's position.
+    let n = objects.len();
+    let mut seen = vec![false; n];
+    for obj in &objects {
+        let num = obj.num as usize;
+        // Short-circuit keeps `seen[num - 1]` in bounds: it is only indexed when
+        // `1 <= num <= n`. `replace` returns the prior flag — `true` means this
+        // number already appeared (a duplicate).
+        if num == 0 || num > n || std::mem::replace(&mut seen[num - 1], true) {
             return Err(Error::parse(
                 obj.obj_line_start,
-                "fix_qdf: non-sequential object numbering \
-                 (canonical QDF numbers objects 1..N in order)",
+                "fix_qdf: object numbers are not a complete 1..N set \
+                 (gap, duplicate, or out-of-range object number)",
             ));
         }
     }
@@ -530,20 +547,28 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
 
     // ---- 5. Emit the regenerated xref table. ----------------------------
     // qpdf's fix-qdf (QdfFixer::st_at_xref) writes a `0 <1+n>` subsection header,
-    // the free-list head, then one in-use entry per object by iterating its xref
-    // vector in order. Object numbering was validated as contiguous 1..N, so
-    // `new_offsets` is already in object-number order and `/Size` is exactly
-    // `objects.len() + 1` (qpdf's `1 + xref.size()`). Sizing from the object
+    // the free-list head, then one in-use entry per object. `/Size` is exactly
+    // `objects.len() + 1` (qpdf's `1 + xref.size()`); sizing from the object
     // count — not the maximum object number — is what bounds the table and
     // avoids any `max_num + 1` overflow.
+    //
+    // Entries are emitted in ascending object-number order. A `BTreeMap` keyed
+    // by object number makes that independent of the order the objects appeared
+    // in the file: numbering was validated as the complete set `1..N`, but it
+    // may be unordered (flpdf's writer can emit a reused /Length holder out of
+    // file order), and an xref subsection must list its entries by number.
     let startxref_value = out.len();
     let size = objects.len() + 1;
+    let by_num: std::collections::BTreeMap<u32, (u32, usize)> = new_offsets
+        .iter()
+        .map(|&(num, gen, off)| (num, (gen, off)))
+        .collect();
 
     out.extend_from_slice(b"xref\n");
     out.extend_from_slice(format!("0 {size}\n").as_bytes());
     // Object 0 is the free-list head, exactly as qpdf fix-qdf emits it.
     out.extend_from_slice(b"0000000000 65535 f \n");
-    for &(_num, gen, off) in &new_offsets {
+    for (gen, off) in by_num.values() {
         out.extend_from_slice(format!("{off:010} {gen:05} n \n").as_bytes());
     }
 
