@@ -1,0 +1,18 @@
+# Codecov configuration.
+#
+# The authoritative patch-coverage gate for this project is
+# scripts/patch-coverage.sh (run in the Coverage CI job), which
+# understands the project's `// cov:ignore` convention for
+# genuinely-untestable defensive branches (overflow guards, bug-detection
+# asserts, etc.).  Codecov sees those same lines as uncovered because it
+# reads the raw LCOV report; making codecov/patch a hard PR gate would
+# therefore produce false failures on otherwise fully-covered PRs.
+#
+# Setting informational: true keeps the Codecov patch-coverage comment and
+# status visible in PRs without blocking merges — Codecov as a reporting
+# tool, scripts/patch-coverage.sh as the enforcement gate.
+coverage:
+  status:
+    patch:
+      default:
+        informational: true
