@@ -967,3 +967,164 @@ fn force_exactly_1_5_keeps_inherited_xref_stream_form() {
         "at exactly 1.5 the inherited xref-stream form is preserved (no downgrade)"
     );
 }
+
+// ── Missing/dangling trailer refs are dropped in generate mode (qpdf parity) ──
+
+/// Single-page PDF with a real `/Info` (obj 4) whose trailer also carries `n`
+/// dangling `/Junk` refs (objects `10..10+n`, none with an xref entry). qpdf's
+/// `--object-streams=generate` treats each missing ref as null: it never enters
+/// the compressible set, consumes no object number, and is dropped from the
+/// output trailer. Byte-identical to `tests/fixtures/compat/
+/// objstm-lin-split-boundary.pdf` at `n = 100`.
+fn info_and_missing_junk_pdf(n: u32) -> Vec<u8> {
+    let mut junk = String::new();
+    for i in 0..n {
+        junk.push_str(&format!("/J{i} {} 0 R ", 10 + i));
+    }
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(b"4 0 obj\n<< /Producer (flpdf-test) >>\nendobj\n");
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n",
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 110 /Root 1 0 R /Info 4 0 R {junk}>>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
+    // flpdf-ndjy: the NON-linearized generate path fed `compressible_objgens`
+    // (which admits Null-resolving missing refs) straight into the even split,
+    // so 100 dangling /Junk trailer refs became null ObjStm members (two /N 52
+    // containers). qpdf emits ONE /N 4 ObjStm holding only the four real objects
+    // (Catalog/Pages/Page/Info), no null body objects, and /Size 7 — the missing
+    // refs consume no object numbers and are dropped from the trailer.
+    let source = info_and_missing_junk_pdf(100);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.static_id = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut objstm_ns: Vec<i64> = Vec::new();
+    let mut null_objects = 0usize;
+    for obj_ref in reopened.object_refs() {
+        // Object 0 is the cross-reference free-list head and always resolves to
+        // Null; it is not a surviving missing ref.
+        if obj_ref.number == 0 {
+            continue;
+        }
+        match reopened.resolve(obj_ref).unwrap() {
+            Object::Stream(s) => {
+                if matches!(
+                    s.dict.get("Type"),
+                    Some(Object::Name(t)) if t.as_slice() == b"ObjStm"
+                ) {
+                    if let Some(Object::Integer(n)) = s.dict.get("N") {
+                        objstm_ns.push(*n);
+                    }
+                }
+            }
+            Object::Null => null_objects += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        objstm_ns,
+        vec![4],
+        "exactly one ObjStm holding only the 4 real objects; got /N list {objstm_ns:?}"
+    );
+    assert_eq!(
+        null_objects, 0,
+        "no missing ref may survive as a null object (ObjStm member or plain body)"
+    );
+    assert_eq!(
+        reopened.trailer().get("Size"),
+        Some(&Object::Integer(7)),
+        "missing refs consume no object numbers: /Size is 7 (0..=6), matching qpdf"
+    );
+}
+
+/// Single-page PDF whose Catalog dict and trailer are interpolated, so a dangling
+/// (no-xref-entry) ref can be planted in a live object's body, in a direct trailer
+/// dict/array value, or in an array — exercising every placement other than a
+/// top-level trailer reference.
+fn single_page_with(catalog_extra: &str, trailer_extra: &str) -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R{catalog_extra} >>\nendobj\n").as_bytes(),
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(b"4 0 obj\n<< /Producer (flpdf-test) >>\nendobj\n");
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n",
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 100 /Root 1 0 R /Info 4 0 R{trailer_extra} >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    pdf
+}
+
+// flpdf-ndjy regression guard (Codex review on PR #429): the missing-ref drop is
+// limited to *top-level* trailer references. A dangling ref reached any other way
+// — in a live object's body, nested in a direct trailer dict/array value, or in an
+// array — is still numbered and renumbered in place, so `--object-streams=generate`
+// must not abort with "absent from renumber map" on these malformed inputs (it did
+// previously rewrite them; qpdf drops the refs entirely, tracked as flpdf-v58c).
+#[test]
+fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
+    for (name, catalog_extra, trailer_extra) in [
+        ("live-object body child", " /Junk 99 0 R", ""),
+        (
+            "nested in a direct trailer dict value",
+            "",
+            " /Custom << /Held 99 0 R >>",
+        ),
+        ("array element", " /Arr [99 0 R 98 0 R]", ""),
+    ] {
+        let source = single_page_with(catalog_extra, trailer_extra);
+        let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.object_streams = ObjectStreamMode::Generate;
+        options.static_id = true;
+        let mut output = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut output, &options)
+            .unwrap_or_else(|e| panic!("dangling ref ({name}) must not abort generate: {e:?}"));
+        // The output must reopen and still resolve the four real objects.
+        let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+        let root = reopened.root_ref().expect("trailer must have /Root");
+        assert!(
+            matches!(reopened.resolve(root), Ok(Object::Dictionary(_))),
+            "dangling ref ({name}): output Catalog must still resolve"
+        );
+    }
+}

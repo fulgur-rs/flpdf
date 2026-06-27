@@ -3880,7 +3880,20 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     // Trailer-derived dict entries: /Info (remapped to its new number) and the
     // two-element /ID. /Root is the renumbered catalog. qpdf omits /Index on a
     // single full-range xref stream.
-    let skip_refs = pdf.deleted_object_refs();
+    //
+    // A trailer reference to a non-live object (a dangling/missing ref with no
+    // xref entry) has no body in the output: qpdf treats it as null and drops the
+    // key. Fold those into the remap skip-set alongside genuinely deleted objects
+    // so the remap drops the key instead of failing on the absent renumber slot.
+    let mut skip_refs = pdf.deleted_object_refs();
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    for (_key, value) in pdf.trailer().iter() {
+        if let Object::Reference(r) = value {
+            if !live.contains(r) && !skip_refs.contains(r) {
+                skip_refs.push(*r);
+            }
+        }
+    }
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
     remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;

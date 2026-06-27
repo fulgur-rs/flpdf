@@ -301,6 +301,18 @@ impl GenerateRenumber {
         let mut next: u32 = 1;
         let mut queue: VecDeque<ObjectRef> = VecDeque::new();
 
+        // Live xref entries only (excludes Missing / Deleted / Reserved). Used to
+        // drop a *top-level* trailer reference to a non-live (dangling) object
+        // from the seeds below: qpdf rebuilds the generate trailer (so the key
+        // vanishes) and the ref consumes no object number. The exclusion is
+        // deliberately limited to top-level trailer refs — a dangling ref nested
+        // inside a direct dict/array trailer value, or reached from a live
+        // object's body, is still numbered and renumbered in place, so a
+        // malformed body dangling ref does not abort the rewrite. (qpdf drops
+        // those too; flpdf keeps them as plain null objects — tracked in
+        // flpdf-v58c.)
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+
         // Seeds match the plain Catalog-first walk: `/Root` first, then the
         // remaining indirect trailer entries in lexicographic key order. The
         // skipped keys mirror qpdf's `getTrimmedTrailer` (QPDFWriter.cc), which
@@ -317,6 +329,13 @@ impl GenerateRenumber {
         for (key, value) in pdf.trailer().iter() {
             if matches!(key, b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size") {
                 continue;
+            }
+            // A top-level trailer reference to a non-live (dangling) object is
+            // dropped, not numbered (see `live` above).
+            if let Object::Reference(r) = value {
+                if !live.contains(r) {
+                    continue;
+                }
             }
             // Recurse into direct dict/array trailer values so a nested indirect
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare

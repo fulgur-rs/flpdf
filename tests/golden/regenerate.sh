@@ -551,6 +551,13 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-split-boundary.pdf" "$REF/objstm-lin-split-boundary/linearize-objstm.pdf"
 echo "objstm-lin-split-boundary/linearize-objstm.pdf"
 
+# NON-linearized --object-streams=generate on the same fixture (flpdf-ndjy): the
+# missing /Junk refs must be dropped, not stored as null ObjStm members. qpdf
+# emits one /N 4 ObjStm + the xref stream, /Size 7.
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/objstm-lin-split-boundary.pdf" "$REF/objstm-lin-split-boundary/generate.pdf"
+echo "objstm-lin-split-boundary/generate.pdf"
+
 # --- two-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/two-page.pdf" "$REF/two-page/plain.pdf"
