@@ -1259,7 +1259,6 @@ fn holder_has_no_original_id_comment(bytes: &[u8], holder: u32) {
     );
 }
 
-
 /// Trailer `/Size` value from qdf bytes.
 fn trailer_size(bytes: &[u8]) -> i64 {
     let text = String::from_utf8_lossy(bytes);
