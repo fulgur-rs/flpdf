@@ -168,6 +168,16 @@ fn relinearize_one_page_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("linearized-one-page.pdf", "linearized-one-page");
 }
 
+// flpdf-5apf: a live body object (the Catalog) carrying null-resolving indirect
+// refs. qpdf drops the null-valued dict keys (/Bad 0 0 R, /Junk 99 0 R, the
+// nested /Inner 99 0 R) and inlines `null` for the object-0 array element
+// (/ArrZero [0 0 R 2 0 R] -> [null <font>]); flpdf must reproduce that byte for
+// byte rather than exit 2 or keep the dead refs.
+#[test]
+fn dangling_body_refs_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("dangling-body-one-page.pdf", "dangling-body-one-page");
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

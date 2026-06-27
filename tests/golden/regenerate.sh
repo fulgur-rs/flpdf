@@ -209,6 +209,45 @@ else
     echo "Skipping objstm-lin-split-boundary.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/dangling-body-one-page.pdf" ]]; then
+    echo "Generating dangling-body-one-page.pdf ..."
+    # flpdf-5apf: one-page.pdf re-serialised with null-resolving indirect refs
+    # injected into a LIVE body object on BOTH halves so both code paths are
+    # byte-pinned: the first page (obj 3, exercises the compute_closure skip —
+    # /N, page-offset hints, /E /O /T) AND the Catalog (obj 4, exercises the
+    # renumber_object emission drop). object-0 (0 0 R) and missing-xref (99 0 R,
+    # /Size 8) refs: qpdf drops the null-valued dict keys and inlines `null` for
+    # the object-0 array element. /ArrZero references ONLY object 0 (no live
+    # first-page object) to avoid the orthogonal shared-object reorder (flpdf-8891).
+    python3 - "$FIX/one-page.pdf" "$FIX/dangling-body-one-page.pdf" <<'PY'
+import sys, re
+src = open(sys.argv[1], "rb").read()
+hdrs = {n: re.search(rb"\n%d 0 obj\n" % n, src).start() + 1 for n in range(1, 8)}
+bodies = {}
+for n in range(1, 8):
+    end = src.index(b"\nendobj\n", hdrs[n])
+    bodies[n] = src[hdrs[n]:end]
+bodies[3] = (b"3 0 obj\n<<\n/Contents 7 0 R /MediaBox [ 0 0 612 792 ] /Parent 6 0 R "
+             b"/Resources <<\n/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]\n>> "
+             b"/Rotate 0 /Bad 0 0 R /Junk 99 0 R\n  /Type /Page\n>>")
+bodies[4] = (b"4 0 obj\n<<\n/PageMode /UseNone /Pages 6 0 R /Type /Catalog "
+             b"/Bad 0 0 R /Junk 99 0 R /Nested << /Inner 99 0 R >> /ArrZero [ 0 0 R ]\n>>")
+out = bytearray(b"%PDF-1.3\n%\xe2\xe3\xcf\xd3\n")
+offs = {}
+for n in range(1, 8):
+    offs[n] = len(out)
+    out += bodies[n] + b"\nendobj\n"
+xo = len(out)
+out += b"xref\n0 8\n0000000000 65535 f \n"
+for n in range(1, 8):
+    out += b"%010d 00000 n \n" % offs[n]
+out += b"trailer\n<< /Root 4 0 R /Info 5 0 R /Size 8 >>\nstartxref\n%d\n%%%%EOF\n" % xo
+open(sys.argv[2], "wb").write(out)
+PY
+else
+    echo "Skipping dangling-body-one-page.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
     echo "Generating one-page-enc-u.pdf ..."
     # AES-256 (R6) encrypted source for the overlay --password path. AES key
@@ -550,6 +589,18 @@ mkdir -p "$REF/objstm-lin-split-boundary"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-split-boundary.pdf" "$REF/objstm-lin-split-boundary/linearize-objstm.pdf"
 echo "objstm-lin-split-boundary/linearize-objstm.pdf"
+
+# --- dangling-body-one-page: null-resolving body refs (object-0 / missing-xref)
+# in the first page AND the Catalog. qpdf drops the null-valued dict keys and
+# inlines `null` for the object-0 array element, then linearizes (flpdf-5apf).
+# Malformed input → qpdf warns, so --warning-exit-0. ---
+mkdir -p "$REF/dangling-body-one-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/dangling-body-one-page.pdf" "$REF/dangling-body-one-page/linearize.pdf"
+echo "dangling-body-one-page/linearize.pdf"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/dangling-body-one-page.pdf" "$REF/dangling-body-one-page/linearize-objstm.pdf"
+echo "dangling-body-one-page/linearize-objstm.pdf"
 
 # NON-linearized --object-streams=generate on the same fixture (flpdf-ndjy): the
 # missing /Junk refs must be dropped, not stored as null ObjStm members. qpdf

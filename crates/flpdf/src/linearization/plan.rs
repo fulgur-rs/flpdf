@@ -182,8 +182,21 @@ fn compute_closure<R: Read + Seek>(
     let mut order: Vec<ObjectRef> = Vec::new();
     let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
 
+    // A reference to object 0 (free-list head / null singleton, ISO 32000-1
+    // §7.3.10) or to a missing-xref object resolves to null. qpdf admits no body
+    // object for such a reference (the holding dict key is dropped / the array
+    // element is inlined as `null` at emission), so it must never receive an
+    // object number here. Keeping it in `visited` but out of `order` mirrors
+    // that: a numbered stray null object would diverge from qpdf and inflate the
+    // first-page object count.
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    let admits_body_object = |r: ObjectRef| -> bool { r.number != 0 && live.contains(&r) };
+
     while let Some(current) = queue.pop_front() {
         if !visited.insert(current) {
+            continue;
+        }
+        if !admits_body_object(current) {
             continue;
         }
         order.push(current);
@@ -235,6 +248,11 @@ fn compute_closure<R: Read + Seek>(
                             // into it nor pull the boundary node itself into
                             // Part 2/3.
                             if is_page_tree_node(&child) {
+                                continue;
+                            }
+                            if !admits_body_object(r) {
+                                // Null-resolving resource ref (object 0 / missing
+                                // xref): no body object, same as the main loop.
                                 continue;
                             }
                             order.push(r);
