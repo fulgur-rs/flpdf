@@ -301,12 +301,16 @@ impl GenerateRenumber {
         let mut next: u32 = 1;
         let mut queue: VecDeque<ObjectRef> = VecDeque::new();
 
-        // Live xref entries only (excludes Missing / Deleted / Reserved). A
-        // trailer or nested reference to a non-live object is a dangling ref qpdf
-        // treats as null: it receives no object number and no body. Skipping it
-        // here keeps the generate numbering dense and drops the missing ref from
-        // the output, matching qpdf. A real null object (present in the xref) is
-        // live and is numbered normally.
+        // Live xref entries only (excludes Missing / Deleted / Reserved). Used to
+        // drop a *top-level* trailer reference to a non-live (dangling) object
+        // from the seeds below: qpdf rebuilds the generate trailer (so the key
+        // vanishes) and the ref consumes no object number. The exclusion is
+        // deliberately limited to top-level trailer refs — a dangling ref nested
+        // inside a direct dict/array trailer value, or reached from a live
+        // object's body, is still numbered and renumbered in place, so a
+        // malformed body dangling ref does not abort the rewrite. (qpdf drops
+        // those too; flpdf keeps them as plain null objects — tracked in
+        // flpdf-v58c.)
         let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
 
         // Seeds match the plain Catalog-first walk: `/Root` first, then the
@@ -326,6 +330,13 @@ impl GenerateRenumber {
             if matches!(key, b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size") {
                 continue;
             }
+            // A top-level trailer reference to a non-live (dangling) object is
+            // dropped, not numbered (see `live` above).
+            if let Object::Reference(r) = value {
+                if !live.contains(r) {
+                    continue;
+                }
+            }
             // Recurse into direct dict/array trailer values so a nested indirect
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
             // reference yields exactly one seed as before.
@@ -333,9 +344,22 @@ impl GenerateRenumber {
         }
 
         for seed in seeds {
-            if live.contains(&seed) {
+            enqueue_gen(
+                seed,
+                &member_to_group,
+                &groups_sorted,
+                &mut old_to_new,
+                &mut container_new,
+                &mut next,
+                &mut queue,
+            );
+        }
+
+        while let Some(cur) = queue.pop_front() {
+            let obj = pdf.resolve_borrowed(cur)?;
+            collect_refs(obj, 0, skip_length, &mut |r| {
                 enqueue_gen(
-                    seed,
+                    r,
                     &member_to_group,
                     &groups_sorted,
                     &mut old_to_new,
@@ -343,23 +367,6 @@ impl GenerateRenumber {
                     &mut next,
                     &mut queue,
                 );
-            }
-        }
-
-        while let Some(cur) = queue.pop_front() {
-            let obj = pdf.resolve_borrowed(cur)?;
-            collect_refs(obj, 0, skip_length, &mut |r| {
-                if live.contains(&r) {
-                    enqueue_gen(
-                        r,
-                        &member_to_group,
-                        &groups_sorted,
-                        &mut old_to_new,
-                        &mut container_new,
-                        &mut next,
-                        &mut queue,
-                    );
-                }
             })?;
         }
 
