@@ -2960,7 +2960,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 Ok(Object::Stream(s)) => {
                     let ty = s.dict.get("Type");
                     let is_structural = matches!(ty, Some(Object::Name(n))
-                        if n.as_slice() == b"XRef" || n.as_slice() == b"ObjStm");
+                        if n.as_slice() == b"XRef" || n.as_slice() == b"ObjStm"); // cov:ignore: guard evaluated only when /Type is Name; XRef/ObjStm excluded upstream
                     if is_structural {
                         None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
                     } else {
@@ -2979,8 +2979,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 crate::Error::Unsupported(
                     "full-rewrite: QDF emission number overflows u32".to_string(),
                 )
-                // cov:ignore-end
-            })?;
+            })?; // cov:ignore-end
             let emission_num = next_emission;
             qdf_emission_renumber.insert(*old_ref, ObjectRef::new(emission_num, cf_ref.generation));
 
@@ -2990,8 +2989,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                     crate::Error::Unsupported(
                         "full-rewrite: QDF holder number overflows u32".to_string(),
                     )
-                    // cov:ignore-end
-                })?;
+                })?; // cov:ignore-end
                 qdf_holder_map.insert(emission_num, next_emission);
             }
         }
@@ -3010,8 +3008,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                 crate::Error::Unsupported(
                     "QDF emission: /Root absent from emission map".to_string(),
                 )
-                // cov:ignore-end
-            })?
+            })? // cov:ignore-end
     } else {
         new_root
     };
@@ -3225,8 +3222,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
                                     "full-rewrite: QDF holder not found for stream at emission {}",
                                     emit_ref.number
                                 ))
-                                // cov:ignore-end
-                            })?;
+                            })?; // cov:ignore-end
                     qdf_holder_to_emit = Some((holder_num, len_value));
 
                     let mut holder_stream = s.clone();
