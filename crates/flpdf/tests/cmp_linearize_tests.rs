@@ -208,6 +208,21 @@ fn catalog_firstpage_shared_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-8891 (non-degenerate shape): two pages share font 6 (other_pages) while
+// page 1's private font 7 is referenced by the Catalog /Ref2 (others). Both
+// sharing signals land in part6's shared group; qpdf orders the first-page
+// section Page, Content, Font6, Font7 (private before shared, shared by source
+// number). On `main` this diverges at byte 56; the fix makes it byte-identical.
+// (Generate mode for this multi-page shape has a separate, pre-existing ObjStm
+// layout divergence, so only the classic layout is pinned here.)
+#[test]
+fn catalog_firstpage_shared_two_page_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "catalog-firstpage-shared-two-page.pdf",
+        "catalog-firstpage-shared-two-page",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
