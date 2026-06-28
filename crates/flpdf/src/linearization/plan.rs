@@ -2917,6 +2917,78 @@ mod tests {
         }
     }
 
+    /// One-page PDF whose Catalog references a first-page object (the Font, obj
+    /// 5) via a non-open-document key (/Ref2), mirroring the
+    /// `catalog-firstpage-shared-one-page.pdf` byte fixture. The page reaches the
+    /// same Font through /Resources -> obj 4 -> /F1.
+    fn catalog_firstpage_shared_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0u64; 7];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(&mut pdf, 1, "<< /Type /Catalog /Pages 2 0 R /Ref2 5 0 R >>");
+        push(&mut pdf, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font 4 0 R >> /Contents 6 0 R >>",
+        );
+        push(&mut pdf, 4, "<< /F1 5 0 R >>");
+        push(
+            &mut pdf,
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        );
+        push(&mut pdf, 6, "<< /Length 2 >>\nstream\nBT\nendstream");
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 7\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    // Non-gated integration guard for the Step-5 document-`others` route: the
+    // Font reached from the Catalog /Ref2 key must land in Part 3 (shared), not
+    // Part 2 (private), so it sorts after the first-page-private Content. This
+    // pins the classification independently of the qpdf-zlib-compat byte tests.
+    #[test]
+    fn document_other_ref_routes_first_page_object_to_part3() {
+        let mut pdf = Pdf::open(Cursor::new(catalog_firstpage_shared_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        let font = ObjectRef::new(5, 0); // shared via Catalog /Ref2
+        assert!(
+            plan.part3_objects.contains(&font),
+            "Font reached via Catalog /Ref2 must be Part 3 (lc_first_page_shared); part3={:?}",
+            plan.part3_objects
+        );
+        assert!(
+            !plan.part2_objects.contains(&font),
+            "the shared Font must not also be in Part 2"
+        );
+        // The page dict, its /Resources Font dict (obj 4), and the Content stream
+        // (obj 6) stay first-page-private (Part 2).
+        for r in [
+            ObjectRef::new(3, 0),
+            ObjectRef::new(4, 0),
+            ObjectRef::new(6, 0),
+        ] {
+            assert!(
+                plan.part2_objects.contains(&r),
+                "first-page-private object {r:?} must be in Part 2"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 4. Part 4 receives objects not in Part 2 or 3
     // -----------------------------------------------------------------------
