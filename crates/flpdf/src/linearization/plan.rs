@@ -2249,15 +2249,14 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
 /// increments `others`. A first-page object that also appears here is therefore
 /// `lc_first_page_shared` (QPDF_linearization.cc:1124-1127), not
 /// `lc_first_page_private`, and so sorts after the private objects in part 6.
-/// The `/Page`-boundary traversal matches [`open_document_set`].
 ///
-/// `/Pages` is excluded deliberately: the linearize write path runs
-/// `optimize(allow_changes=true)` (QPDFWriter.cc:2553), whose
-/// `pushInheritedAttributesToPage` strips inherited `/Resources`, `/MediaBox`,
-/// etc. from interior `/Pages` nodes BEFORE the object-user maps are built, so
-/// `ou_root_key("/Pages")` never reaches a first-page object — the page tree
-/// contributes no first-page `others`. Cross-page sharing is already handled by
-/// the per-page closures (`shared_page_indices`).
+/// `/Pages` IS seeded (qpdf records `ou_root_key("/Pages")` like any other root
+/// key), so a first-page object reached via a custom extension key on a `/Pages`
+/// node is correctly `others`. [`closure_from_seeds`] reproduces qpdf's
+/// post-`pushInheritedAttributesToPage` tree by skipping the inherited
+/// attributes on `/Pages` nodes, so the page tree's `/Resources` etc. do NOT
+/// over-classify first-page resources. Cross-page sharing is still handled
+/// separately by the per-page closures (`shared_page_indices`).
 ///
 /// # Errors
 ///
@@ -2275,15 +2274,17 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
             }
         }
     }
-    // Catalog keys except the open-document keys (in_open_document), /Outlines
-    // (in_outlines), and /Pages (the page tree; see the doc comment).
+    // Catalog keys except the open-document keys (in_open_document) and
+    // /Outlines (in_outlines). /Pages IS included: closure_from_seeds skips the
+    // inherited attributes qpdf strips from /Pages nodes, so only genuine custom
+    // keys on the page tree contribute `others`.
     let catalog = pdf
         .root_ref()
         .map(|root| pdf.resolve_borrowed(root))
         .transpose()?;
     if let Some(Object::Dictionary(catalog)) = catalog {
         for (key, v) in catalog.iter() {
-            if !OPEN_DOCUMENT_CATALOG_KEYS.contains(&key) && key != b"Outlines" && key != b"Pages" {
+            if !OPEN_DOCUMENT_CATALOG_KEYS.contains(&key) && key != b"Outlines" {
                 collect_direct_refs(v, 0, &mut seeds)?;
             }
         }
@@ -2292,14 +2293,31 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     closure_from_seeds(pdf, seeds)
 }
 
+/// The inheritable page attributes (ISO 32000-1 Table 30) that qpdf's
+/// `pushInheritedAttributesToPage` (QPDF_optimization.cc:165-205) removes from
+/// interior `/Pages` nodes before the object-user maps are built.
+/// [`closure_from_seeds`] skips them so an object reached ONLY through an
+/// inherited attribute on a `/Pages` node is not recorded as a document-level
+/// user (it would already be reached, post-push, from its `/Page` leaf instead).
+const INHERITABLE_PAGE_KEYS: [&[u8]; 4] = [b"MediaBox", b"CropBox", b"Resources", b"Rotate"];
+
 /// Transitive closure of indirect objects reachable from `seeds`, stopping at
-/// `/Page` leaves.
+/// `/Page` leaves and skipping inherited attributes on `/Pages` nodes.
 ///
 /// Mirrors qpdf's `updateObjectMapsInternal` (QPDF_optimization.cc:271-337) used
-/// to record a document-level key's object users: it records every indirect
-/// object it reaches but neither records nor descends a non-top `/Page` leaf (a
-/// page boundary), so a destination like `[page /Fit]` drops the page. A single
-/// shared `visited` set suffices because the result is the union over all seeds.
+/// to record a document-level key's object users, run on the tree AFTER
+/// `pushInheritedAttributesToPage` (QPDFWriter calls `optimize(allow_changes=true)`):
+/// it records every indirect object it reaches but
+/// - neither records nor descends a non-top `/Page` leaf (a page boundary), so a
+///   destination like `[page /Fit]` drops the page; and
+/// - on an interior `/Pages` node, skips the [`INHERITABLE_PAGE_KEYS`] (which
+///   qpdf has stripped) while still following `/Kids` and any custom keys, so a
+///   first-page resource reached only via an inherited `/Resources` on a `/Pages`
+///   node is NOT mistaken for a document-level user, whereas a genuine custom
+///   extension key on a `/Pages` node still is.
+///
+/// A single shared `visited` set suffices because the result is the union over
+/// all seeds.
 ///
 /// # Errors
 ///
@@ -2316,15 +2334,26 @@ fn closure_from_seeds<R: Read + Seek>(
             continue;
         }
         let obj = pdf.resolve_borrowed(r)?;
-        // Page boundary: qpdf neither records nor descends a non-top `/Page`
-        // leaf reached while tracing a document-level key.
-        if matches!(obj, Object::Dictionary(d)
-            if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page"))
-        {
-            continue;
-        }
         let mut children = Vec::new();
-        collect_direct_refs(obj, 0, &mut children)?;
+        match obj {
+            // Page boundary: qpdf neither records nor descends a non-top `/Page`
+            // leaf reached while tracing a document-level key.
+            Object::Dictionary(d) if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page") =>
+            {
+                continue;
+            }
+            // Interior `/Pages` node: skip the inherited attributes qpdf has
+            // already stripped, but follow `/Kids` (→ the `/Page` leaves above)
+            // and any custom extension keys.
+            Object::Dictionary(d) if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages") => {
+                for (k, v) in d.iter() {
+                    if !INHERITABLE_PAGE_KEYS.contains(&k) {
+                        collect_direct_refs(v, 0, &mut children)?;
+                    }
+                }
+            }
+            _ => collect_direct_refs(obj, 0, &mut children)?,
+        }
         out.insert(r);
         for cr in children {
             if !visited.contains(&cr) {
@@ -5478,28 +5507,35 @@ mod tests {
         );
     }
 
-    /// A catalog whose keys span every [`document_other_set`] branch: included
-    /// keys (`/Names`, `/Custom`), excluded keys (`/Pages`, `/Outlines`,
-    /// `/OpenAction`), a key pointing straight at a `/Page` leaf (`/PageRef`,
-    /// dropped at the boundary), and a trailer `/Info`. `/Custom` references one
-    /// object twice to exercise the `visited` dedup.
+    /// A catalog whose keys span every [`document_other_set`] / [`closure_from_seeds`]
+    /// branch: included keys (`/Names`, `/Custom`), excluded keys (`/Outlines`,
+    /// `/OpenAction`), the `/Pages` tree, and a trailer `/Info`. The `/Pages` node
+    /// carries an inherited `/Resources` (obj 10, must be SKIPPED like qpdf's
+    /// stripped tree) AND a custom `/Ext` key (obj 11, must be FOLLOWED). `/Custom`
+    /// references one object twice to exercise the `visited` dedup.
     fn document_other_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.5\n");
-        let mut offs = [0u64; 10];
+        let mut offs = [0u64; 12];
         let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
             offs[n] = pdf.len() as u64;
             pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
         };
-        // /Pages, /Outlines, /OpenAction are excluded; /Names, /Custom are
-        // `others`; /PageRef points at a page leaf (dropped at the boundary).
+        // /Outlines, /OpenAction are excluded; /Names, /Custom and the /Pages
+        // custom key are `others`.
         push(
             &mut pdf,
             1,
             "<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R /OpenAction 8 0 R \
-             /Names 4 0 R /Custom 5 0 R /PageRef 3 0 R >>",
+             /Names 4 0 R /Custom 5 0 R >>",
         );
-        push(&mut pdf, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        // /Pages node: inherited /Resources (-> 10, skipped) + custom /Ext (-> 11,
+        // followed); /Kids reaches the page leaf (dropped at the boundary).
+        push(
+            &mut pdf,
+            2,
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Inh 10 0 R >> /Ext 11 0 R >>",
+        );
         push(
             &mut pdf,
             3,
@@ -5511,15 +5547,17 @@ mod tests {
         push(&mut pdf, 7, "<< /Type /Outlines >>"); // excluded (/Outlines)
         push(&mut pdf, 8, "<< /Type /Action /S /GoTo /D [3 0 R /Fit] >>"); // excluded (open-doc)
         push(&mut pdf, 9, "<< /Producer (x) >>"); // trailer /Info -> included
+        push(&mut pdf, 10, "<< /InheritedResource true >>"); // /Pages /Resources -> SKIPPED
+        push(&mut pdf, 11, "<< /CustomExtension true >>"); // /Pages /Ext -> FOLLOWED
         let xref_start = pdf.len() as u64;
-        let mut xref = String::from("xref\n0 10\n0000000000 65535 f \n");
+        let mut xref = String::from("xref\n0 12\n0000000000 65535 f \n");
         for off in offs.iter().skip(1) {
             xref.push_str(&format!("{off:010} 00000 n \n"));
         }
         pdf.extend_from_slice(xref.as_bytes());
         pdf.extend_from_slice(
             format!(
-                "trailer\n<< /Size 10 /Root 1 0 R /Info 9 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+                "trailer\n<< /Size 12 /Root 1 0 R /Info 9 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
             )
             .as_bytes(),
         );
@@ -5531,16 +5569,19 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(document_other_pdf_bytes())).unwrap();
         let set = document_other_set(&mut pdf).unwrap();
         let r = |n: u32| ObjectRef::new(n, 0);
-        // Included: /Names (4) + its target (6), /Custom (5) + the same target
-        // (6, recorded once), trailer /Info (9). Excluded: the /Pages tree (2, 3),
-        // /Outlines (7), /OpenAction (8), the catalog itself (1, the /Root key),
-        // and the page leaf reached via /PageRef (3, dropped at the boundary).
+        // Included: /Names (4) + target (6), /Custom (5) + the same target (6,
+        // recorded once), trailer /Info (9), the /Pages node itself (2, an
+        // ou_root_key("/Pages") user), and its custom /Ext target (11). Excluded:
+        // /Outlines (7), /OpenAction (8), the catalog/Root (1), the page leaf (3,
+        // dropped at the boundary), and the /Pages node's inherited /Resources
+        // target (10, skipped like qpdf's stripped tree).
         assert_eq!(
             set,
-            [r(4), r(5), r(6), r(9)]
+            [r(2), r(4), r(5), r(6), r(9), r(11)]
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
-            "others = {{/Names tree, /Custom tree, /Info}}; doc keys + page tree excluded"
+            "others = {{/Names, /Custom, /Info, /Pages node + custom /Ext}}; \
+             inherited /Resources (10), page leaf (3), and doc keys excluded"
         );
     }
 

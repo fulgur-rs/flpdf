@@ -325,6 +325,44 @@ else
     echo "Skipping catalog-firstpage-shared-two-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/pages-ext-firstpage-shared-one-page.pdf" ]]; then
+    echo "Generating pages-ext-firstpage-shared-one-page.pdf ..."
+    # flpdf-8891 (page-tree custom key): the interior /Pages node carries a custom
+    # extension key /Ext -> the first-page Font (obj 2), which the page also
+    # reaches via /Resources. qpdf keeps non-inheritable custom keys on /Pages
+    # nodes through pushInheritedAttributesToPage, so ou_root_key("/Pages")
+    # reaches the Font => lc_first_page_shared. The Font has a LOWER source number
+    # (2) than the Content (5), so the private-before-shared rule is what orders
+    # the section (Page, Content, Font); a source-number-only sort would emit Font
+    # first and diverge.
+    python3 - "$FIX/pages-ext-firstpage-shared-one-page.pdf" <<'PY'
+import sys
+objs = {
+    1: b"<< /Type /Catalog /Pages 4 0 R >>",
+    2: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Name /F1 >>",
+    4: b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Ext 2 0 R >>",
+    3: b"<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 5 0 R >>",
+}
+c = b"BT /F1 12 Tf 72 720 Td (P1) Tj ET"
+objs[5] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+order = [1, 2, 3, 4, 5]
+out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+offs = {}
+for n in order:
+    offs[n] = len(out)
+    out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
+xo = len(out)
+size = 6
+out += b"xref\n0 %d\n" % size + b"0000000000 65535 f \n"
+for n in range(1, size):
+    out += (b"%010d 00000 n \n" % offs[n]) if n in offs else b"0000000000 65535 f \n"
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xo)
+open(sys.argv[1], "wb").write(out)
+PY
+else
+    echo "Skipping pages-ext-firstpage-shared-one-page.pdf (already exists)"
+fi
+
 # flpdf-0gyq: a null-resolving ref as an ARRAY element is resurrected by qpdf as
 # an indirect null body object (NOT dropped, NOT inlined). Two equal-shape 1-page
 # docs whose Catalog has /Arr [<ref> 8 0 R]: the FREE variant references obj 9
@@ -746,6 +784,15 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/catalog-firstpage-shared-two-page.pdf" \
     "$REF/catalog-firstpage-shared-two-page/linearize.pdf"
 echo "catalog-firstpage-shared-two-page/linearize.pdf"
+
+# --- pages-ext-firstpage-shared-one-page: a custom extension key on an interior
+# /Pages node references a first-page object, which qpdf keeps (non-inheritable)
+# so the object is first-page shared (flpdf-8891). CLASSIC ONLY. ---
+mkdir -p "$REF/pages-ext-firstpage-shared-one-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/pages-ext-firstpage-shared-one-page.pdf" \
+    "$REF/pages-ext-firstpage-shared-one-page/linearize.pdf"
+echo "pages-ext-firstpage-shared-one-page/linearize.pdf"
 
 # --- resurrect-{free,missing}-one-page: a null-resolving ARRAY ref is resurrected
 # as an indirect null body object (flpdf-0gyq). disable -> null body; generate ->

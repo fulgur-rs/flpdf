@@ -223,6 +223,20 @@ fn catalog_firstpage_shared_two_page_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-8891 (page-tree custom key): a custom extension key on an interior
+// /Pages node references the first-page Font. qpdf keeps non-inheritable custom
+// keys on /Pages nodes (only the inheritable /Resources,/MediaBox,/CropBox,
+// /Rotate are stripped), so ou_root_key("/Pages") still reaches the Font ->
+// first-page shared. The Font's source number (2) is below the Content's (5), so
+// only the private-before-shared rule yields qpdf's order (Page, Content, Font).
+#[test]
+fn pages_ext_firstpage_shared_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "pages-ext-firstpage-shared-one-page.pdf",
+        "pages-ext-firstpage-shared-one-page",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
