@@ -297,6 +297,16 @@ fn resurrect_missing_array_ref_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-o9im: when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
+// the resurrected null must land in the first-page section in generate mode too.
+#[test]
+fn resurrect_missing_page_arr_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "resurrect-missing-page-arr.pdf",
+        "resurrect-missing-page-arr",
+    );
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

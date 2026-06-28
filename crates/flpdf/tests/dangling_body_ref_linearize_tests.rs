@@ -366,7 +366,11 @@ fn first_page_dict_missing_array_ref_resurrected_both_modes() {
             Object::Array(a) => a.clone(),
             other => panic!("/Arr not an array: {other:?}"),
         };
-        assert_eq!(arr.len(), 2, "array length preserved (generate={use_generate})");
+        assert_eq!(
+            arr.len(),
+            2,
+            "array length preserved (generate={use_generate})"
+        );
         let resurrected = match arr[0] {
             Object::Reference(r) => r,
             ref other => {
@@ -398,7 +402,12 @@ fn resources_dict_missing_array_ref_resurrected_both_modes() {
         });
         let mut pdf = Pdf::open(Cursor::new(out)).expect("round-trips");
         let page = first_page(&mut pdf);
-        let resources_ref = match page.as_dict().unwrap().get("Resources").expect("/Resources") {
+        let resources_ref = match page
+            .as_dict()
+            .unwrap()
+            .get("Resources")
+            .expect("/Resources")
+        {
             Object::Reference(r) => *r,
             other => panic!("/Resources not an indirect ref: {other:?}"),
         };
@@ -420,7 +429,9 @@ fn resources_dict_missing_array_ref_resurrected_both_modes() {
             }
         };
         assert!(
-            pdf.resolve(resurrected).expect("resurrected resolves").is_null(),
+            pdf.resolve(resurrected)
+                .expect("resurrected resolves")
+                .is_null(),
             "resources missing-xref array slot must be a null body (generate={use_generate})"
         );
     }
