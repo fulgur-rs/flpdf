@@ -232,6 +232,14 @@ fn compute_closure<R: Read + Seek>(
     // surviving array slot — matching qpdf's object-user classification, which
     // excludes dict-value edges that the writer drops entirely.
     let mut queue: VecDeque<(ObjectRef, bool)> = VecDeque::from([(root, false)]);
+    // Resurrectable refs that were not admissible at dequeue time (seen_as_array
+    // did not yet contain them — the live object holding the array edge had not
+    // been expanded yet).  After the full BFS completes, seen_as_array is
+    // exhaustive; we then admit each deferred ref that appears there.  This
+    // handles the "revorder" case: resurrectable ref number < live descendant
+    // number, so sort-at-enqueue puts the resurrectable ref in the queue before
+    // the live object that would reveal the array edge.
+    let mut deferred_resurrect: BTreeSet<ObjectRef> = BTreeSet::new();
     // Tracks every ref that has been enqueued (or pushed to the Resources DFS
     // stack) via an array-element edge within this closure walk.  A resurrectable
     // ref that appears in *both* a dict-value slot (dropped by the writer) and an
@@ -272,8 +280,14 @@ fn compute_closure<R: Read + Seek>(
             // where the same ref appears in both a dict-value slot and an array
             // slot in the same closure (the dict-value tuple may be dequeued first,
             // but the array edge was already recorded at enqueue time).
+            // `deferred_resurrect` handles the "revorder" case: resurrectable ref
+            // number < live descendant number, so the resurrectable ref is dequeued
+            // before seen_as_array is populated.  Deferred refs are re-checked
+            // after the full BFS completes.
             if via_array || seen_as_array.contains(&current) {
                 order.push(current);
+            } else {
+                deferred_resurrect.insert(current);
             }
             continue;
         }
@@ -327,8 +341,12 @@ fn compute_closure<R: Read + Seek>(
                             if resurrectable.contains(&r) {
                                 // Same edge-type rule as the main BFS: admit the
                                 // null body object only when an array edge exists.
+                                // Defer if seen_as_array not yet populated (revorder
+                                // case); the post-BFS pass will re-check.
                                 if via_array || seen_as_array.contains(&r) {
                                     order.push(r);
+                                } else {
+                                    deferred_resurrect.insert(r); // cov:ignore: fires when a resurrectable ref is reachable via dict-value in the Resources subtree before the array edge in the same subtree is discovered; requires two resource objects cross-referencing the same xref-absent object via different edge types, which is extremely contrived
                                 }
                                 continue;
                             }
@@ -485,6 +503,20 @@ fn compute_closure<R: Read + Seek>(
             }
         }
     }
+
+    // Deferred resurrectable refs: now that the full BFS is complete and
+    // seen_as_array is exhaustive, admit those that turned out to be reachable
+    // via an array edge (i.e. they appear in seen_as_array).
+    for r in deferred_resurrect {
+        if seen_as_array.contains(&r) {
+            order.push(r);
+        }
+    }
+    // Sort the closure by original object number.  qpdf emits first-page section
+    // objects in ascending original-number order (confirmed by discriminator
+    // fixtures: Resources-DFS-first order and sort-at-enqueue are both subsumed
+    // by this global sort).
+    order.sort_by_key(|r| r.number);
 
     Ok(order)
 }

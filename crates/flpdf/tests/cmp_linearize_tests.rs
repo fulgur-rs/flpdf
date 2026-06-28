@@ -301,6 +301,18 @@ fn else_branch_children_ordered_by_original_object_number() {
     );
 }
 
+// flpdf-hsjh: revorder case — resurrectable ref (orig 99) has a LOWER original
+// number than the live descendant (orig 100) that holds the array edge
+// ([99 0 R]). Sort-at-enqueue puts 99 in the queue before 100 is expanded,
+// so seen_as_array is empty when 99 is dequeued → deferred. After the full
+// BFS, 100 has populated seen_as_array with 99, so the post-BFS pass admits
+// it. The final global sort by original object number puts null(99) before
+// IntermediateDict(100) in the first-page section.
+#[test]
+fn revorder_resurrect_null_in_first_page_section() {
+    assert_linearize_byte_identical("revorder-resurrect.pdf", "revorder-resurrect");
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

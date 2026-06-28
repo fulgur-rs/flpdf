@@ -348,6 +348,15 @@ fn else_branch_children_ordered_by_original_object_number_objstm() {
     );
 }
 
+// flpdf-hsjh: revorder case in generate mode — resurrectable ref (orig 99)
+// lower-numbered than the live descendant (orig 100) holding the array edge.
+// Deferred admission + global sort must place the null correctly in ObjStm
+// output too.
+#[test]
+fn revorder_resurrect_null_in_first_page_section_objstm() {
+    assert_strict("revorder-resurrect.pdf", "revorder-resurrect");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
