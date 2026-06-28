@@ -346,8 +346,9 @@ fn compute_closure<R: Read + Seek>(
                                 if via_array || seen_as_array.contains(&r) {
                                     order.push(r);
                                 } else {
-                                    deferred_resurrect.insert(r); // cov:ignore: fires when a resurrectable ref is reachable via dict-value in the Resources subtree before the array edge in the same subtree is discovered; requires two resource objects cross-referencing the same xref-absent object via different edge types, which is extremely contrived
-                                }
+                                    // cov:ignore-start: fires when a resurrectable ref is reachable via dict-value in the Resources subtree before the array edge in the same subtree is discovered; requires two resource objects cross-referencing the same xref-absent object via different edge types, which is extremely contrived
+                                    deferred_resurrect.insert(r);
+                                } // cov:ignore-end
                                 continue;
                             }
                             if !admits_body_object(r) {
