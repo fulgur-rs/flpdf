@@ -273,6 +273,21 @@ fn resurrect_both_edges_same_page_null_in_first_page_section() {
     );
 }
 
+// flpdf-891f: cross-object case — Page 1 references resurrectable ref 99 via a
+// dict-value edge (/Bad 99 0 R) AND via an array element in a live descendant
+// (/Other 4 0 R where obj 4 = << /Good [99 0 R] >>). The dict-value tuple is
+// dequeued before the descendant is expanded, but sorting page-dict refs by
+// original object number ensures obj 4 (live) is expanded before obj 99
+// (resurrectable) is dequeued, so seen_as_array already contains 99 and the
+// null is admitted into the first-page section.
+#[test]
+fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section() {
+    assert_linearize_byte_identical(
+        "resurrect-crossobj-arr-via-live-desc.pdf",
+        "resurrect-crossobj-arr-via-live-desc",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

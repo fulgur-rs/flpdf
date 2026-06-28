@@ -365,6 +365,7 @@ fn compute_closure<R: Read + Seek>(
                         }
                     }
                 } // cov:ignore: llvm-cov attributes 0 to this `if is_page_leaf` closing brace; the block body (the /Resources DFS) runs and is covered above.
+                let mut refs_raw: Vec<(ObjectRef, bool)> = Vec::new();
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
                         // Pages → sibling pages — never follow.
@@ -448,15 +449,20 @@ fn compute_closure<R: Read + Seek>(
                         }
                         continue;
                     }
-                    let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
-                    collect_direct_refs_with_context(v, 0, false, &mut refs)?;
-                    for (r, va) in refs {
-                        if va {
-                            seen_as_array.insert(r);
-                        }
-                        if !visited.contains(&r) {
-                            queue.push_back((r, va));
-                        }
+                    collect_direct_refs_with_context(v, 0, false, &mut refs_raw)?;
+                }
+                for &(r, va) in &refs_raw {
+                    if va {
+                        seen_as_array.insert(r);
+                    }
+                }
+                // Sort by original object number: qpdf assigns first-page slots in
+                // ascending original-number order regardless of dict key alphabetical
+                // order (empirically verified; see discriminator-fixture analysis).
+                refs_raw.sort_by_key(|(r, _)| r.number);
+                for (r, va) in refs_raw {
+                    if !visited.contains(&r) {
+                        queue.push_back((r, va));
                     }
                 }
             }

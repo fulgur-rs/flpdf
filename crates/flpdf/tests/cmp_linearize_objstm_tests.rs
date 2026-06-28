@@ -328,6 +328,16 @@ fn resurrect_both_edges_same_page_null_in_first_page_section_objstm() {
     );
 }
 
+// flpdf-891f: cross-object case — null must land in first-page section in
+// generate mode too (same original-number sort fix applies).
+#[test]
+fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section_objstm() {
+    assert_strict(
+        "resurrect-crossobj-arr-via-live-desc.pdf",
+        "resurrect-crossobj-arr-via-live-desc",
+    );
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
