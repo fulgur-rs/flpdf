@@ -606,11 +606,13 @@ impl LinearizationPlan {
         // object the array points at (verified byte-identical, /ID masked). The
         // set is drop-aware (a null ref reached only as a dict value is omitted),
         // so a dict-only missing ref stays dropped, not resurrected.
-        let already: BTreeSet<ObjectRef> = all_refs.iter().copied().collect();
+        // `all_refs` is sorted (it filters the sorted `object_refs()` in order),
+        // so a binary search rejects the already-admitted (free) refs without
+        // allocating a temporary set.
         let mut resurrected: Vec<ObjectRef> =
             crate::rewrite_renumber::resurrectable_null_refs(pdf)?
                 .into_iter()
-                .filter(|r| !already.contains(r))
+                .filter(|r| all_refs.binary_search(r).is_err())
                 .collect();
         if !resurrected.is_empty() {
             all_refs.append(&mut resurrected);
