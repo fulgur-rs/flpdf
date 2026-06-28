@@ -237,6 +237,18 @@ fn pages_ext_firstpage_shared_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-o9im: when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
+// the resurrected null must be classified in the first-page section (Part 2) and
+// receive a HIGH object number — not land in part4_rest with a LOW number.
+// Oracle: qpdf 11.9.0 assigns obj 9 = null, /Size 10 for this fixture.
+#[test]
+fn resurrect_missing_page_arr_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "resurrect-missing-page-arr.pdf",
+        "resurrect-missing-page-arr",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

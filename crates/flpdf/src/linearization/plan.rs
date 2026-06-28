@@ -178,6 +178,7 @@ fn compute_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root: ObjectRef,
     live: &BTreeSet<ObjectRef>,
+    resurrectable: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
@@ -191,10 +192,25 @@ fn compute_closure<R: Read + Seek>(
     // that: a numbered stray null object would diverge from qpdf and inflate the
     // first-page object count. `live` is computed once by the caller — the
     // per-page closure loop would otherwise re-scan the whole xref table O(pages).
+    //
+    // Exception: missing-xref refs reached via a surviving array edge in this
+    // page's object graph are resurrectable (see `resurrectable_null_refs`). qpdf
+    // classifies them as first-page users when reached from a first-page object,
+    // giving them HIGH object numbers inside Part 2. A missing-xref ref reached
+    // only via a dict value is dropped (not resurrectable), so it stays excluded.
     let admits_body_object = |r: ObjectRef| -> bool { r.number != 0 && live.contains(&r) };
 
     while let Some(current) = queue.pop_front() {
         if !visited.insert(current) {
+            continue;
+        }
+        if resurrectable.contains(&current) {
+            // Missing-xref ref reached via a surviving array edge: add the null
+            // body object to the closure without resolving or expanding it (a null
+            // body has no edges). This mirrors qpdf's classification, which places
+            // such refs in the first-page section (Part 2) when reached from a
+            // first-page object, giving them a HIGH object number.
+            order.push(current);
             continue;
         }
         if !admits_body_object(current) {
@@ -239,6 +255,18 @@ fn compute_closure<R: Read + Seek>(
                             if !visited.insert(r) {
                                 continue;
                             }
+                            if resurrectable.contains(&r) {
+                                // Missing-xref ref via a surviving array edge inside
+                                // the /Resources subtree: add the null body object
+                                // without resolving (same as the main BFS loop).
+                                order.push(r);
+                                continue;
+                            }
+                            if !admits_body_object(r) {
+                                // Null-resolving resource ref (object 0 / missing
+                                // xref): no body object, same as the main loop.
+                                continue;
+                            }
                             let child = pdf.resolve(r)?;
                             // Stop at a page-tree boundary BEFORE adding `r` to
                             // the closure: a resource that malformedly cross-links
@@ -249,11 +277,6 @@ fn compute_closure<R: Read + Seek>(
                             // into it nor pull the boundary node itself into
                             // Part 2/3.
                             if is_page_tree_node(&child) {
-                                continue;
-                            }
-                            if !admits_body_object(r) {
-                                // Null-resolving resource ref (object 0 / missing
-                                // xref): no body object, same as the main loop.
                                 continue;
                             }
                             order.push(r);
@@ -609,11 +632,18 @@ impl LinearizationPlan {
         // `all_refs` is sorted (it filters the sorted `object_refs()` in order),
         // so a binary search rejects the already-admitted (free) refs without
         // allocating a temporary set.
-        let mut resurrected: Vec<ObjectRef> =
-            crate::rewrite_renumber::resurrectable_null_refs(pdf)?
-                .into_iter()
-                .filter(|r| all_refs.binary_search(r).is_err())
-                .collect();
+        //
+        // `resurrectable` is kept alive to pass to `compute_closure`, which
+        // includes these refs in the page closure they're first reached from.
+        // qpdf classifies them as first-page section objects (Part 2) when reached
+        // from the first page, giving them HIGH object numbers. Without this, they
+        // land in part4_rest with LOW numbers (flpdf-o9im).
+        let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
+        let mut resurrected: Vec<ObjectRef> = resurrectable
+            .iter()
+            .filter(|r| all_refs.binary_search(r).is_err())
+            .copied()
+            .collect();
         if !resurrected.is_empty() {
             all_refs.append(&mut resurrected);
             // Keep source-object-number order (object_refs() is already sorted);
@@ -699,7 +729,7 @@ impl LinearizationPlan {
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
         let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
-            compute_closure(pdf, first_page, &live)?
+            compute_closure(pdf, first_page, &live, &resurrectable)?
         } else {
             Vec::new()
         };
@@ -736,7 +766,7 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref, &live)?;
+            let closure = compute_closure(pdf, page_ref, &live, &resurrectable)?;
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -2539,9 +2569,10 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     // Computed once and shared across every per-page closure below (the loop
     // would otherwise re-scan the whole xref table O(pages) times).
     let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
 
     let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
-        Some(&first_page) => compute_closure(pdf, first_page, &live)?
+        Some(&first_page) => compute_closure(pdf, first_page, &live, &resurrectable)?
             .into_iter()
             .collect(),
         // A linearizable document always has at least one page, so the page-less
@@ -2555,7 +2586,7 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
         referenced_pages.entry(r).or_default().insert(0);
     }
     for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-        for r in compute_closure(pdf, page_ref, &live)? {
+        for r in compute_closure(pdf, page_ref, &live, &resurrectable)? {
             referenced_pages
                 .entry(r)
                 .or_default()
