@@ -5916,48 +5916,41 @@ mod tests {
         );
     }
 
-    /// A page tree with a nested `/Pages` node, a `/Page` leaf under each, and a
-    /// malformed non-dictionary `/Kids` entry. [`page_tree_node_refs`] must
-    /// collect the interior `/Pages` nodes only.
+    /// A page tree exercising every [`page_tree_node_refs`] branch: a `/Page`
+    /// leaf (3), a nested childless `/Pages` node listed TWICE (4 — queued twice,
+    /// so the second pop hits the `visited` short-circuit, and it has no `/Kids`
+    /// so the `if let Some(kids)` is skipped), and a malformed non-dictionary
+    /// `/Kids` entry (5).
     fn nested_page_tree_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.5\n");
-        let mut offs = [0u64; 7];
+        let mut offs = [0u64; 6];
         let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
             offs[n] = pdf.len() as u64;
             pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
         };
         push(&mut pdf, 1, "<< /Type /Catalog /Pages 2 0 R >>");
-        // Root /Pages: /Kids = [page leaf (3), nested /Pages (4), non-dict (5)].
+        // Root /Pages /Kids: leaf (3), nested /Pages (4) listed twice, non-dict (5).
         push(
             &mut pdf,
             2,
-            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 2 >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 4 0 R 5 0 R] /Count 1 >>",
         );
         push(
             &mut pdf,
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
         );
-        push(
-            &mut pdf,
-            4,
-            "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 >>",
-        );
+        push(&mut pdf, 4, "<< /Type /Pages /Parent 2 0 R /Count 0 >>"); // no /Kids
         push(&mut pdf, 5, "42"); // malformed non-dictionary /Kids entry -> skipped
-        push(
-            &mut pdf,
-            6,
-            "<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>",
-        );
         let xref_start = pdf.len() as u64;
-        let mut xref = String::from("xref\n0 7\n0000000000 65535 f \n");
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
         for off in offs.iter().skip(1) {
             xref.push_str(&format!("{off:010} 00000 n \n"));
         }
         pdf.extend_from_slice(xref.as_bytes());
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
                 .as_bytes(),
         );
         pdf
@@ -5968,12 +5961,13 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(nested_page_tree_pdf_bytes())).unwrap();
         let set = page_tree_node_refs(&mut pdf).unwrap();
         let r = |n: u32| ObjectRef::new(n, 0);
-        // The two interior /Pages nodes (2, 4); the /Page leaves (3, 6) and the
-        // non-dictionary /Kids entry (5) are excluded.
+        // The two interior /Pages nodes (2, 4); the /Page leaf (3) and the
+        // non-dictionary /Kids entry (5) are excluded. Node 4 is listed twice but
+        // recorded once.
         assert_eq!(
             set,
             [r(2), r(4)].into_iter().collect::<BTreeSet<_>>(),
-            "page tree = interior /Pages nodes only (leaves + non-dict kids excluded)"
+            "page tree = interior /Pages nodes only (leaf + non-dict kid excluded)"
         );
     }
 
