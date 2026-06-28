@@ -2724,6 +2724,18 @@ mod tests {
         assert_eq!(out, vec![ObjectRef::new(4, 0)]);
     }
 
+    #[test]
+    fn collect_direct_refs_with_context_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_refs_with_context(
+            &nested_arrays(MAX_INLINE_DEPTH + 5),
+            0,
+            false,
+            &mut out,
+        );
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
     // -----------------------------------------------------------------------
     // Fixture builders
     // -----------------------------------------------------------------------
