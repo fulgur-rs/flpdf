@@ -469,10 +469,16 @@ fn compute_closure<R: Read + Seek>(
         } else {
             let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
             collect_direct_refs_with_context(&obj, 0, false, &mut refs)?;
-            for (r, va) in refs {
+            for &(r, va) in &refs {
                 if va {
-                    seen_as_array.insert(r); // cov:ignore: fires when a non-page/pages live BFS object has array-element refs; same tracking pattern as line 454 (page dict key loop, which is covered); exercising this path requires a non-page live object with an inline array containing a live ref
+                    seen_as_array.insert(r);
                 }
+            }
+            // Same number-ordering rule as the page-dict loop above: qpdf enqueues
+            // a non-page object's children in ascending original-object-number order,
+            // not in dict-key (alphabetical) order.
+            refs.sort_by_key(|(r, _)| r.number);
+            for (r, va) in refs {
                 if !visited.contains(&r) {
                     queue.push_back((r, va));
                 }

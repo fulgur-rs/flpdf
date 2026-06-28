@@ -288,6 +288,19 @@ fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section() {
     );
 }
 
+// flpdf-891f: else-branch ordering — a live non-page object's children must be
+// enqueued in ascending original-object-number order, not dict-key (alphabetical)
+// order. The fixture has an intermediate dict with /AA→orig6 and /ZZ→orig5;
+// alphabetical ordering would emit orig6 before orig5, but qpdf emits orig5
+// first (number order).
+#[test]
+fn else_branch_children_ordered_by_original_object_number() {
+    assert_linearize_byte_identical(
+        "else-branch-obj-number-order.pdf",
+        "else-branch-obj-number-order",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

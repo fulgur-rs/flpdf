@@ -338,6 +338,16 @@ fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section_objstm() {
     );
 }
 
+// flpdf-891f: else-branch ordering in generate mode — same number-order rule
+// applies when ObjStm generation is enabled.
+#[test]
+fn else_branch_children_ordered_by_original_object_number_objstm() {
+    assert_strict(
+        "else-branch-obj-number-order.pdf",
+        "else-branch-obj-number-order",
+    );
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
