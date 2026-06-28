@@ -306,11 +306,23 @@ fn else_branch_children_ordered_by_original_object_number() {
 // ([99 0 R]). Sort-at-enqueue puts 99 in the queue before 100 is expanded,
 // so seen_as_array is empty when 99 is dequeued → deferred. After the full
 // BFS, 100 has populated seen_as_array with 99, so the post-BFS pass admits
-// it. The final global sort by original object number puts null(99) before
-// IntermediateDict(100) in the first-page section.
+// it and inserts it at the correct position in the sorted non-page tail.
 #[test]
 fn revorder_resurrect_null_in_first_page_section() {
     assert_linearize_byte_identical("revorder-resurrect.pdf", "revorder-resurrect");
+}
+
+// flpdf-hsjh (discriminator): Page leaf at a HIGH original-object-number (10)
+// with its content stream at a LOWER original-object-number (3). A naive
+// fully-global sort by original number would misplace the Page (renumber it
+// higher than its content stream), but qpdf keeps the Page first in its
+// closure. flpdf must pin the Page at order[0] and sort only order[1..].
+#[test]
+fn page_highnum_content_lownum_page_before_content() {
+    assert_linearize_byte_identical(
+        "page-highnum-content-lownum.pdf",
+        "page-highnum-content-lownum",
+    );
 }
 
 // --------------------------------------------------------------------------

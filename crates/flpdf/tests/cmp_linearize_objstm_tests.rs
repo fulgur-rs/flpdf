@@ -350,11 +350,22 @@ fn else_branch_children_ordered_by_original_object_number_objstm() {
 
 // flpdf-hsjh: revorder case in generate mode — resurrectable ref (orig 99)
 // lower-numbered than the live descendant (orig 100) holding the array edge.
-// Deferred admission + global sort must place the null correctly in ObjStm
-// output too.
+// Deferred admission + sorted-tail insertion must place the null correctly in
+// ObjStm output too.
 #[test]
 fn revorder_resurrect_null_in_first_page_section_objstm() {
     assert_strict("revorder-resurrect.pdf", "revorder-resurrect");
+}
+
+// flpdf-hsjh (discriminator): Page at high original number (10), content
+// stream at low original number (3). Sorted-tail (non-page) ensures Page
+// stays first in the closure even when its original number exceeds descendants.
+#[test]
+fn page_highnum_content_lownum_page_before_content_objstm() {
+    assert_strict(
+        "page-highnum-content-lownum.pdf",
+        "page-highnum-content-lownum",
+    );
 }
 
 #[test]

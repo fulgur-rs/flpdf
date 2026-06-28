@@ -505,19 +505,30 @@ fn compute_closure<R: Read + Seek>(
         }
     }
 
+    // Sort the non-page tail (order[1..]) by original object number.  qpdf emits
+    // first-page objects in ascending original-number order, with the Page leaf
+    // always in the first slot.  Two discriminator fixtures confirm this:
+    // (a) Resources(5)/Font(6) at higher numbers than Content(4) → numeric order
+    //     wins over Resources-DFS-first order;
+    // (b) Page(orig 10) with Content(orig 3) → Page stays first despite having a
+    //     higher original number, so a fully-global sort would misplace it.
+    // Sorting only order[1..] satisfies both invariants simultaneously.
+    if order.len() > 1 {
+        order[1..].sort_by_key(|r| r.number);
+    }
     // Deferred resurrectable refs: now that the full BFS is complete and
-    // seen_as_array is exhaustive, admit those that turned out to be reachable
-    // via an array edge (i.e. they appear in seen_as_array).
+    // seen_as_array is exhaustive, admit those that turn out to be reachable
+    // via an array edge (i.e. they appear in seen_as_array).  Insert each at
+    // the numerically correct position in the already-sorted non-page tail so
+    // the Page leaf remains first and the overall tail ordering stays ascending.
+    // BTreeSet iterates in ascending order, so each insertion preserves the
+    // invariant for subsequent entries.
     for r in deferred_resurrect {
         if seen_as_array.contains(&r) {
-            order.push(r);
+            let tail_pos = order[1..].partition_point(|existing| existing.number < r.number);
+            order.insert(1 + tail_pos, r);
         }
     }
-    // Sort the closure by original object number.  qpdf emits first-page section
-    // objects in ascending original-number order (confirmed by discriminator
-    // fixtures: Resources-DFS-first order and sort-at-enqueue are both subsumed
-    // by this global sort).
-    order.sort_by_key(|r| r.number);
 
     Ok(order)
 }
