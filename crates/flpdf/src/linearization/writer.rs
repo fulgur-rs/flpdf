@@ -1682,6 +1682,11 @@ fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
+    // Live object set (object 0 / missing-xref refs excluded); computed once by
+    // the caller and shared across all probe + final passes, since the source
+    // document is immutable here. Threaded into `renumber_object` so it can drop
+    // null-resolving dict keys / inline `null` array elements.
+    live: &BTreeSet<ObjectRef>,
     part1: &Part1Bytes,
     catalog_new_ref: ObjectRef,
     hint_stream_new_num: u32,
@@ -1710,12 +1715,6 @@ fn do_write_pass<R: Read + Seek>(
 )> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
-
-    // Live object set: used by `renumber_object` to distinguish a reference that
-    // resolves to null (object 0 / a missing-xref object — drop the key or inline
-    // `null`) from a reference to a live object that is unexpectedly absent from
-    // the renumber map (a planner inconsistency that must still error loudly).
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
 
     // The classic path emits `/ID` at two sites (Part-1 and main trailers).
     // A `&mut dyn FnMut` cannot be moved into both calls, so reborrow it for the
@@ -1856,7 +1855,7 @@ fn do_write_pass<R: Read + Seek>(
             "planner invariant: /Catalog is never an ObjStm member"
         );
         let object = pdf.resolve_borrowed(catalog_orig)?;
-        let renumbered = renumber_object(object, 0, renumber, &live)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
@@ -1882,7 +1881,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         // cov:ignore-end
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, &live)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1895,7 +1894,7 @@ fn do_write_pass<R: Read + Seek>(
     // indirect object; its compressed members are emitted nowhere else (skipped
     // in every plain loop via `member_to_container`).
     for container in &objstm_layout.open_document {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, &live)?;
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -1945,7 +1944,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, &live)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1974,7 +1973,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, &live)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1984,7 +1983,7 @@ fn do_write_pass<R: Read + Seek>(
     // qpdf 11.9 /E placement, which includes the Part-3 ObjStm) stays
     // consistent.  The container itself is a plain indirect object.
     for container in &objstm_layout.part3 {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, &live)?;
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -2006,7 +2005,7 @@ fn do_write_pass<R: Read + Seek>(
             // cov:ignore-end
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, &live)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2070,13 +2069,13 @@ fn do_write_pass<R: Read + Seek>(
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
                 let object = pdf.resolve_borrowed(*original_ref)?;
-                let renumbered = renumber_object(object, 0, renumber, &live)?;
+                let renumbered = renumber_object(object, 0, renumber, live)?;
                 let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
                 let offset =
-                    append_objstm_container_object(&mut bytes, container, renumber, pdf, &live)?;
+                    append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
                 xref_offsets.insert(container.container_new_num, offset);
             }
         }
@@ -2446,6 +2445,12 @@ pub fn write_linearized<R: Read + Seek>(
             "the deterministic-id option is incompatible with encrypted output files".to_string(),
         ));
     }
+
+    // Live object set (object 0 / missing-xref refs excluded). The source
+    // document is immutable across the probe + final passes, so compute it once
+    // here and share it with every `do_write_pass` rather than re-scanning the
+    // whole xref table on each pass.
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
 
     // A forced sub-1.5 header suppresses object-stream generation: object and
     // cross-reference streams are PDF 1.5 features and qpdf will not emit them
@@ -2818,6 +2823,7 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             pdf,
+            &live,
             &pass1_part1,
             catalog_new_ref,
             hint_stream_new_num,
@@ -2878,6 +2884,7 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             pdf,
+            &live,
             &part1,
             catalog_new_ref,
             hint_stream_new_num,
@@ -3347,6 +3354,7 @@ pub fn write_linearized<R: Read + Seek>(
                 plan,
                 renumber,
                 pdf,
+                &live,
                 &part1,
                 catalog_new_ref,
                 hint_stream_new_num,
