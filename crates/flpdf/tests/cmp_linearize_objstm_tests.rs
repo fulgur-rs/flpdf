@@ -368,6 +368,14 @@ fn page_highnum_content_lownum_page_before_content_objstm() {
     );
 }
 
+// flpdf-hsjh (Codex P2): resurrectable null also reachable via Catalog
+// dict-value (/OpenAction 99 0 R, dropped) AND first-page array (/Arr [99 0 R]).
+// closure_from_seeds must skip Object::Null so the null stays lc_first_page.
+#[test]
+fn od_null_also_in_first_page_arr_byte_identical_to_qpdf_objstm() {
+    assert_strict("od-null-page-arr.pdf", "od-null-page-arr");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

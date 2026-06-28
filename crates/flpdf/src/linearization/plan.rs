@@ -2571,6 +2571,15 @@ fn closure_from_seeds<R: Read + Seek>(
             {
                 continue;
             }
+            // Null-resolving ref (xref-absent or object-0): qpdf's object-user
+            // analysis records only live body objects. A null-resolving ref reached
+            // via a dict-value edge produces no body object (the writer drops the
+            // key); a null reached via an array edge is a resurrectable null handled
+            // separately by `compute_closure`, not by document-level sets.  Including
+            // it here would incorrectly shadow the first-page classification at
+            // line 1167 (`in_first_page = … && !open_document_set.contains(r)`)
+            // and route the resurrected null to Part 4 instead of Part 2.
+            Object::Null => continue,
             // Page-tree interior `/Pages` node: skip the inherited attributes
             // qpdf has stripped, but follow `/Kids` (→ the `/Page` leaves above)
             // and any custom extension keys. Restricted to `page_tree` — a

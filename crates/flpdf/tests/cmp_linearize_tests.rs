@@ -325,6 +325,19 @@ fn page_highnum_content_lownum_page_before_content() {
     );
 }
 
+// flpdf-hsjh (Codex P2): resurrectable null (orig 99) is reachable via BOTH
+// a Catalog dict-value edge (/OpenAction 99 0 R, dropped by writer) and a
+// first-page array edge (/Arr [99 0 R], produces a null body object). Before
+// this fix, closure_from_seeds admitted the null-resolving ref into
+// open_document_set, causing the null to be misrouted to the open-document
+// section (Part 4) with a LOW renumbered number, diverging from qpdf which
+// classifies the null as lc_first_page (Part 2, last in the first-page
+// section with /O=5, /E=900). The fix skips Object::Null in closure_from_seeds.
+#[test]
+fn od_null_also_in_first_page_arr_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("od-null-page-arr.pdf", "od-null-page-arr");
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
