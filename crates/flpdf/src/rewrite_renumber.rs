@@ -802,6 +802,35 @@ mod tests {
     }
 
     #[test]
+    fn resurrectable_errors_on_excessive_array_nesting() {
+        // A `/Deep` value nested deeper than MAX_INLINE_DEPTH must make the
+        // drop-aware walk refuse rather than silently stop (leaving refs in the
+        // over-deep region uncollected).
+        let mut deep = b"99 0 R".to_vec();
+        for _ in 0..(MAX_INLINE_DEPTH + 2) {
+            let mut wrapped = b"[ ".to_vec();
+            wrapped.extend_from_slice(&deep);
+            wrapped.extend_from_slice(b" ]");
+            deep = wrapped;
+        }
+        let cat = [
+            b"<< /Type /Catalog /Pages 2 0 R /Deep ".to_vec(),
+            deep,
+            b" >>".to_vec(),
+        ]
+        .concat();
+        let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
+        let bytes = build_raw_pdf(&[(1, &cat), (2, pages), (3, page)]);
+        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let got = resurrectable_null_refs(&mut pdf);
+        assert!(
+            matches!(got, Err(crate::Error::Unsupported(_))),
+            "over-deep nesting must error, not silently truncate"
+        );
+    }
+
+    #[test]
     fn two_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/two-page.pdf");
         let mut pdf = Pdf::open_mem(bytes).expect("open");

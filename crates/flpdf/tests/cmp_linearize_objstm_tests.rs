@@ -249,6 +249,35 @@ fn dangling_body_refs_objstm_byte_identical_to_qpdf() {
     assert_strict("dangling-body-one-page.pdf", "dangling-body-one-page");
 }
 
+// flpdf-0gyq: under --object-streams=generate the resurrected null body object is
+// compressed as the TRAILING ObjStm member (qpdf compresses it last). free and
+// missing variants must both match.
+#[test]
+fn resurrect_free_array_ref_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("resurrect-free-one-page.pdf", "resurrect-free-one-page");
+}
+
+#[test]
+fn resurrect_free_array_ref_objstm_byte_identical_to_qpdf() {
+    assert_strict("resurrect-free-one-page.pdf", "resurrect-free-one-page");
+}
+
+#[test]
+fn resurrect_missing_array_ref_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "resurrect-missing-one-page.pdf",
+        "resurrect-missing-one-page",
+    );
+}
+
+#[test]
+fn resurrect_missing_array_ref_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "resurrect-missing-one-page.pdf",
+        "resurrect-missing-one-page",
+    );
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
