@@ -318,6 +318,16 @@ fn resurrect_page2_arr_page1_dictval_not_in_first_page_section_objstm() {
     );
 }
 
+// flpdf-891f: both edges on same page — null must land in first-page section
+// in generate mode too.
+#[test]
+fn resurrect_both_edges_same_page_null_in_first_page_section_objstm() {
+    assert_strict(
+        "resurrect-both-edges-same-page.pdf",
+        "resurrect-both-edges-same-page",
+    );
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

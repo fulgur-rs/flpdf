@@ -261,6 +261,18 @@ fn resurrect_page2_arr_page1_dictval_not_in_first_page_section() {
     );
 }
 
+// flpdf-891f: when Page 1 holds BOTH /Bad 99 0 R (dict value, dropped by
+// writer) AND /Good [99 0 R] (array element, resurrected null), the null must
+// land in the FIRST-PAGE section — the array edge wins even though the
+// dict-value edge is enqueued first (alphabetical key order).
+#[test]
+fn resurrect_both_edges_same_page_null_in_first_page_section() {
+    assert_linearize_byte_identical(
+        "resurrect-both-edges-same-page.pdf",
+        "resurrect-both-edges-same-page",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

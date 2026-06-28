@@ -232,6 +232,14 @@ fn compute_closure<R: Read + Seek>(
     // surviving array slot — matching qpdf's object-user classification, which
     // excludes dict-value edges that the writer drops entirely.
     let mut queue: VecDeque<(ObjectRef, bool)> = VecDeque::from([(root, false)]);
+    // Tracks every ref that has been enqueued (or pushed to the Resources DFS
+    // stack) via an array-element edge within this closure walk.  A resurrectable
+    // ref that appears in *both* a dict-value slot (dropped by the writer) and an
+    // array slot (survives as null) within the same page's closure must still be
+    // admitted: the dict-value tuple (r, false) may be dequeued before the
+    // array-edge tuple (r, true), but `seen_as_array` lets the dequeue check
+    // consult all edges discovered so far, not just the one in the current tuple.
+    let mut seen_as_array: BTreeSet<ObjectRef> = BTreeSet::new();
 
     // A reference to object 0 (free-list head / null singleton, ISO 32000-1
     // §7.3.10) or to a missing-xref object resolves to null. qpdf admits no body
@@ -256,11 +264,15 @@ fn compute_closure<R: Read + Seek>(
         if resurrectable.contains(&current) {
             // Missing-xref ref: the writer survives array-element slots as null
             // but drops dict-value slots (the key is omitted entirely).  Only
-            // admit to the closure when via_array is true — a ref reached solely
-            // via a dict-value edge from this page has no surviving body object
-            // in the first-page section, matching qpdf's object-user map which
-            // does not count dropped dict-value edges as page uses.
-            if via_array {
+            // admit to the closure when an array edge exists — a ref reached
+            // solely via dict-value edges has no surviving body object in the
+            // first-page section, matching qpdf's object-user map which does not
+            // count dropped dict-value edges as page uses.
+            // `via_array` covers the common case; `seen_as_array` covers the case
+            // where the same ref appears in both a dict-value slot and an array
+            // slot in the same closure (the dict-value tuple may be dequeued first,
+            // but the array edge was already recorded at enqueue time).
+            if via_array || seen_as_array.contains(&current) {
                 order.push(current);
             }
             continue;
@@ -297,6 +309,11 @@ fn compute_closure<R: Read + Seek>(
                     if let Some(resources) = dict.get("Resources") {
                         let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
                         collect_direct_refs_with_context(resources, 0, false, &mut seeds)?;
+                        for &(r, va) in &seeds {
+                            if va {
+                                seen_as_array.insert(r);
+                            }
+                        }
                         // DFS via an explicit stack (no recursion) so deeply
                         // nested resource graphs cannot overflow the stack.
                         // The visited set bounds cycles; `is_page_tree_node`
@@ -309,9 +326,8 @@ fn compute_closure<R: Read + Seek>(
                             }
                             if resurrectable.contains(&r) {
                                 // Same edge-type rule as the main BFS: admit the
-                                // null body object only when the reaching edge is a
-                                // surviving array slot (via_array=true).
-                                if via_array {
+                                // null body object only when an array edge exists.
+                                if via_array || seen_as_array.contains(&r) {
                                     order.push(r);
                                 }
                                 continue;
@@ -339,6 +355,9 @@ fn compute_closure<R: Read + Seek>(
                             // Push in reverse so the first reference is popped
                             // first, preserving left-to-right discovery order.
                             for cr in child_refs.into_iter().rev() {
+                                if cr.1 {
+                                    seen_as_array.insert(cr.0);
+                                }
                                 if !visited.contains(&cr.0) {
                                     stack.push(cr);
                                 }
@@ -418,6 +437,9 @@ fn compute_closure<R: Read + Seek>(
                                 let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
                                 collect_direct_refs_with_context(pv, 0, false, &mut refs)?;
                                 for (r, va) in refs {
+                                    if va {
+                                        seen_as_array.insert(r);
+                                    }
                                     if !visited.contains(&r) {
                                         queue.push_back((r, va));
                                     }
@@ -429,6 +451,9 @@ fn compute_closure<R: Read + Seek>(
                     let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
                     collect_direct_refs_with_context(v, 0, false, &mut refs)?;
                     for (r, va) in refs {
+                        if va {
+                            seen_as_array.insert(r);
+                        }
                         if !visited.contains(&r) {
                             queue.push_back((r, va));
                         }
@@ -439,6 +464,9 @@ fn compute_closure<R: Read + Seek>(
             let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
             collect_direct_refs_with_context(&obj, 0, false, &mut refs)?;
             for (r, va) in refs {
+                if va {
+                    seen_as_array.insert(r);
+                }
                 if !visited.contains(&r) {
                     queue.push_back((r, va));
                 }
