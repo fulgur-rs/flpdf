@@ -147,6 +147,50 @@ fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> 
     Ok(())
 }
 
+/// Like [`collect_direct_refs`] but tracks whether each ref was discovered
+/// inside an array element (`true`) or a dictionary value (`false`).
+///
+/// Array-element missing-xref refs survive as `null` in the writer output;
+/// dictionary-value missing-xref refs cause the key to be dropped entirely.
+/// `compute_closure` uses this to restrict resurrectable-null admission to
+/// refs that were actually reached via a surviving array edge rather than
+/// a dropped dict-value edge.
+fn collect_direct_refs_with_context(
+    obj: &Object,
+    depth: usize,
+    in_array: bool,
+    out: &mut Vec<(ObjectRef, bool)>,
+) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
+    match obj {
+        Object::Reference(r) => out.push((*r, in_array)),
+        Object::Array(arr) => {
+            for elem in arr {
+                collect_direct_refs_with_context(elem, depth + 1, true, out)?;
+            }
+        }
+        Object::Dictionary(dict) => {
+            for (_k, v) in dict.iter() {
+                collect_direct_refs_with_context(v, depth + 1, false, out)?;
+            }
+        }
+        Object::Stream(s) => {
+            for (k, v) in s.dict.iter() {
+                if k == b"Length" {
+                    continue;
+                }
+                collect_direct_refs_with_context(v, depth + 1, false, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Returns whether a resolved object is a page-tree node we must not descend
 /// into during a subtree expansion (a `/Type /Page` leaf or `/Type /Pages`
 /// interior node). Used to stop a `/Resources` subtree walk from pulling in
@@ -182,7 +226,12 @@ fn compute_closure<R: Read + Seek>(
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
-    let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
+    // Each entry carries (ref, via_array): whether the ref was enqueued via an
+    // array element (true) or a dictionary value (false).  Used at dequeue time
+    // to admit resurrectable null refs only when the reaching edge is a
+    // surviving array slot — matching qpdf's object-user classification, which
+    // excludes dict-value edges that the writer drops entirely.
+    let mut queue: VecDeque<(ObjectRef, bool)> = VecDeque::from([(root, false)]);
 
     // A reference to object 0 (free-list head / null singleton, ISO 32000-1
     // §7.3.10) or to a missing-xref object resolves to null. qpdf admits no body
@@ -200,17 +249,20 @@ fn compute_closure<R: Read + Seek>(
     // only via a dict value is dropped (not resurrectable), so it stays excluded.
     let admits_body_object = |r: ObjectRef| -> bool { r.number != 0 && live.contains(&r) };
 
-    while let Some(current) = queue.pop_front() {
+    while let Some((current, via_array)) = queue.pop_front() {
         if !visited.insert(current) {
             continue;
         }
         if resurrectable.contains(&current) {
-            // Missing-xref ref reached via a surviving array edge: add the null
-            // body object to the closure without resolving or expanding it (a null
-            // body has no edges). This mirrors qpdf's classification, which places
-            // such refs in the first-page section (Part 2) when reached from a
-            // first-page object, giving them a HIGH object number.
-            order.push(current);
+            // Missing-xref ref: the writer survives array-element slots as null
+            // but drops dict-value slots (the key is omitted entirely).  Only
+            // admit to the closure when via_array is true — a ref reached solely
+            // via a dict-value edge from this page has no surviving body object
+            // in the first-page section, matching qpdf's object-user map which
+            // does not count dropped dict-value edges as page uses.
+            if via_array {
+                order.push(current);
+            }
             continue;
         }
         if !admits_body_object(current) {
@@ -243,23 +295,26 @@ fn compute_closure<R: Read + Seek>(
                 // pass would otherwise emit the content stream first.
                 if is_page_leaf {
                     if let Some(resources) = dict.get("Resources") {
-                        let mut seeds = Vec::new();
-                        collect_direct_refs(resources, 0, &mut seeds)?;
+                        let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
+                        collect_direct_refs_with_context(resources, 0, false, &mut seeds)?;
                         // DFS via an explicit stack (no recursion) so deeply
                         // nested resource graphs cannot overflow the stack.
                         // The visited set bounds cycles; `is_page_tree_node`
                         // stops the walk if a resource value cross-links back
                         // into the page tree, so we never pull in sibling pages.
-                        let mut stack: Vec<ObjectRef> = seeds.into_iter().rev().collect();
-                        while let Some(r) = stack.pop() {
+                        let mut stack: Vec<(ObjectRef, bool)> =
+                            seeds.into_iter().rev().collect();
+                        while let Some((r, via_array)) = stack.pop() {
                             if !visited.insert(r) {
                                 continue;
                             }
                             if resurrectable.contains(&r) {
-                                // Missing-xref ref via a surviving array edge inside
-                                // the /Resources subtree: add the null body object
-                                // without resolving (same as the main BFS loop).
-                                order.push(r);
+                                // Same edge-type rule as the main BFS: admit the
+                                // null body object only when the reaching edge is a
+                                // surviving array slot (via_array=true).
+                                if via_array {
+                                    order.push(r);
+                                }
                                 continue;
                             }
                             if !admits_body_object(r) {
@@ -280,12 +335,12 @@ fn compute_closure<R: Read + Seek>(
                                 continue;
                             }
                             order.push(r);
-                            let mut child_refs = Vec::new();
-                            collect_direct_refs(&child, 0, &mut child_refs)?;
+                            let mut child_refs: Vec<(ObjectRef, bool)> = Vec::new();
+                            collect_direct_refs_with_context(&child, 0, false, &mut child_refs)?;
                             // Push in reverse so the first reference is popped
                             // first, preserving left-to-right discovery order.
                             for cr in child_refs.into_iter().rev() {
-                                if !visited.contains(&cr) {
+                                if !visited.contains(&cr.0) {
                                     stack.push(cr);
                                 }
                             }
@@ -361,32 +416,32 @@ fn compute_closure<R: Read + Seek>(
                                     collect_direct_refs(pv, 0, &mut to_visit)?;
                                     continue;
                                 }
-                                let mut refs = Vec::new();
-                                collect_direct_refs(pv, 0, &mut refs)?;
-                                for r in refs {
+                                let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
+                                collect_direct_refs_with_context(pv, 0, false, &mut refs)?;
+                                for (r, va) in refs {
                                     if !visited.contains(&r) {
-                                        queue.push_back(r);
+                                        queue.push_back((r, va));
                                     }
                                 }
                             }
                         }
                         continue;
                     }
-                    let mut refs = Vec::new();
-                    collect_direct_refs(v, 0, &mut refs)?;
-                    for r in refs {
+                    let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
+                    collect_direct_refs_with_context(v, 0, false, &mut refs)?;
+                    for (r, va) in refs {
                         if !visited.contains(&r) {
-                            queue.push_back(r);
+                            queue.push_back((r, va));
                         }
                     }
                 }
             }
         } else {
-            let mut refs = Vec::new();
-            collect_direct_refs(&obj, 0, &mut refs)?;
-            for r in refs {
+            let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
+            collect_direct_refs_with_context(&obj, 0, false, &mut refs)?;
+            for (r, va) in refs {
                 if !visited.contains(&r) {
-                    queue.push_back(r);
+                    queue.push_back((r, va));
                 }
             }
         }

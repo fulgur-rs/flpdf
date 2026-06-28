@@ -249,6 +249,18 @@ fn resurrect_missing_page_arr_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-891f: when Page 1 holds /Bad 99 0 R (dict value → dropped by writer)
+// and Page 2 holds /Arr [99 0 R] (array element → resurrected null), the null
+// must land in the SECOND-HALF section (low object number) — NOT in Part 2.
+// Oracle: qpdf 11.9.0 assigns obj 2 = null in the second-half for this fixture.
+#[test]
+fn resurrect_page2_arr_page1_dictval_not_in_first_page_section() {
+    assert_linearize_byte_identical(
+        "resurrect-missing-page1-dictval-page2-arr.pdf",
+        "resurrect-missing-page1-dictval-page2-arr",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

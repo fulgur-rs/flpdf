@@ -307,6 +307,17 @@ fn resurrect_missing_page_arr_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-891f: when Page 1 holds /Bad 99 0 R (dict value) and Page 2 holds
+// /Arr [99 0 R] (array element), the resurrected null must land in the
+// second-half section (low object number) in generate mode too.
+#[test]
+fn resurrect_page2_arr_page1_dictval_not_in_first_page_section_objstm() {
+    assert_strict(
+        "resurrect-missing-page1-dictval-page2-arr.pdf",
+        "resurrect-missing-page1-dictval-page2-arr",
+    );
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
