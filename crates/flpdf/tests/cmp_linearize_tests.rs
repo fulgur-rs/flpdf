@@ -195,6 +195,48 @@ fn resurrect_missing_array_ref_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-8891: a document-level (Catalog) reference to a first-page object marks
+// it lc_first_page_shared, so qpdf orders the first-page section private-then-
+// shared (Page, Resources, Content, Font) rather than by source number alone.
+// Without the document-`others` signal flpdf left the Font in part2 (private)
+// and emitted Font before Content (first divergence at byte 353).
+#[test]
+fn catalog_firstpage_shared_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "catalog-firstpage-shared-one-page.pdf",
+        "catalog-firstpage-shared-one-page",
+    );
+}
+
+// flpdf-8891 (non-degenerate shape): two pages share font 6 (other_pages) while
+// page 1's private font 7 is referenced by the Catalog /Ref2 (others). Both
+// sharing signals land in part6's shared group; qpdf orders the first-page
+// section Page, Content, Font6, Font7 (private before shared, shared by source
+// number). On `main` this diverges at byte 56; the fix makes it byte-identical.
+// (Generate mode for this multi-page shape has a separate, pre-existing ObjStm
+// layout divergence, so only the classic layout is pinned here.)
+#[test]
+fn catalog_firstpage_shared_two_page_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "catalog-firstpage-shared-two-page.pdf",
+        "catalog-firstpage-shared-two-page",
+    );
+}
+
+// flpdf-8891 (page-tree custom key): a custom extension key on an interior
+// /Pages node references the first-page Font. qpdf keeps non-inheritable custom
+// keys on /Pages nodes (only the inheritable /Resources,/MediaBox,/CropBox,
+// /Rotate are stripped), so ou_root_key("/Pages") still reaches the Font ->
+// first-page shared. The Font's source number (2) is below the Content's (5), so
+// only the private-before-shared rule yields qpdf's order (Page, Content, Font).
+#[test]
+fn pages_ext_firstpage_shared_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "pages-ext-firstpage-shared-one-page.pdf",
+        "pages-ext-firstpage-shared-one-page",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
