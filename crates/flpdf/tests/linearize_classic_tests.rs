@@ -116,6 +116,33 @@ fn outlines_classic_routes_outlines_to_second_half_and_round_trips() {
     );
 }
 
+// flpdf-891f: cross-object array edge — a live non-page object (/Other 4 0 R)
+// has an array-element ref to a resurrectable null ([99 0 R]), so the null must
+// land in the first-page section (before /E). Exercises the else-branch
+// seen_as_array tracking path in compute_closure.
+#[test]
+fn crossobj_arr_ref_in_nonpage_obj_places_null_before_first_page_end() {
+    let bytes = linearize_classic("resurrect-crossobj-arr-via-live-desc.pdf");
+
+    // Verify the output is valid and all objects resolve.
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // The null (resurrected from xref-absent ref 99) must appear before /E.
+    let e_offset = parse_e_offset(&bytes);
+    let null_pos = find(&bytes, b"\nnull\nendobj\n")
+        .expect("null object must be written into the linearized output");
+    assert!(
+        null_pos < e_offset,
+        "null (resurrected ref 99) must be in first-page section (before /E={e_offset}); \
+         found at byte {null_pos}"
+    );
+}
+
 // flpdf-phfu: re-linearizing an already-linearized input must not over-populate
 // the second half. qpdf garbage-collects the source's old /Linearized parameter
 // dict and old hint stream (both unreachable from Root/Info), so the plan's
