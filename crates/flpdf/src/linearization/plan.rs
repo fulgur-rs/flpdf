@@ -5714,6 +5714,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn document_other_set_empty_for_non_dictionary_catalog() {
+        // /Root resolves to an integer (not a dict), so the catalog-key arm is
+        // skipped; the trailer has only /Root and /Size, so no `others` seeds.
+        let mut pdf = Pdf::open(Cursor::new(non_dictionary_root_pdf_bytes())).unwrap();
+        let set = document_other_set(&mut pdf).unwrap();
+        assert!(
+            set.is_empty(),
+            "a non-dictionary catalog must yield no document-other objects, got {set:?}"
+        );
+    }
+
     /// One-page PDF whose catalog `/OpenAction` reaches a JavaScript action (obj
     /// 5) whose `/JS` stream (obj 6) has an INDIRECT `/Length` (`7 0 R`). The
     /// holder (obj 7) is reachable only via that `/Length` edge. flpdf-2vfg.
