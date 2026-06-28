@@ -248,6 +248,51 @@ else
     echo "Skipping dangling-body-one-page.pdf (already exists)"
 fi
 
+# flpdf-0gyq: a null-resolving ref as an ARRAY element is resurrected by qpdf as
+# an indirect null body object (NOT dropped, NOT inlined). Two equal-shape 1-page
+# docs whose Catalog has /Arr [<ref> 8 0 R]: the FREE variant references obj 9
+# (an explicit '0..0 00000 f' xref row, within /Size 10); the MISSING variant
+# references obj 99 (beyond /Size, no row). qpdf's outputs are byte-identical
+# (modulo the source ref number, normalised away) — both resurrect a null object.
+for variant in free missing; do
+    out="$FIX/resurrect-$variant-one-page.pdf"
+    if [[ ! -f "$out" ]]; then
+        echo "Generating resurrect-$variant-one-page.pdf ..."
+        python3 - "$out" "$variant" <<'PY'
+import sys
+variant = sys.argv[2]
+ref = b"9 0 R" if variant == "free" else b"99 0 R"
+objs = {
+    1: b"<< /Type /Catalog /Pages 2 0 R /Arr [ %s 8 0 R ] >>" % ref,
+    2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 5 0 R /Contents 6 0 R >>",
+    5: b"<< /Font << /F1 8 0 R >> >>",
+    8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+}
+c = b"BT /F1 12 Tf 72 720 Td (P1) Tj ET"
+objs[6] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+offs = {}
+for n in [1, 2, 3, 5, 6, 8]:
+    offs[n] = len(out)
+    out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
+xo = len(out); size = 10
+out += b"xref\n0 %d\n" % size + b"0000000000 65535 f \n"
+for n in range(1, size):
+    if n in offs:
+        out += b"%010d 00000 n \n" % offs[n]
+    elif n == 9 and variant == "free":
+        out += b"0000000000 00000 f \n"
+    else:
+        out += b"0000000000 65535 f \n"
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xo)
+open(sys.argv[1], "wb").write(out)
+PY
+    else
+        echo "Skipping resurrect-$variant-one-page.pdf (already exists)"
+    fi
+done
+
 if [[ ! -f "$FIX/one-page-enc-u.pdf" ]]; then
     echo "Generating one-page-enc-u.pdf ..."
     # AES-256 (R6) encrypted source for the overlay --password path. AES key
@@ -601,6 +646,20 @@ echo "dangling-body-one-page/linearize.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/dangling-body-one-page.pdf" "$REF/dangling-body-one-page/linearize-objstm.pdf"
 echo "dangling-body-one-page/linearize-objstm.pdf"
+
+# --- resurrect-{free,missing}-one-page: a null-resolving ARRAY ref is resurrected
+# as an indirect null body object (flpdf-0gyq). disable -> null body; generate ->
+# the null object is the trailing ObjStm member. Malformed -> qpdf warns. ---
+for variant in free missing; do
+    mkdir -p "$REF/resurrect-$variant-one-page"
+    qpdf --linearize --deterministic-id --warning-exit-0 \
+        "$FIX/resurrect-$variant-one-page.pdf" "$REF/resurrect-$variant-one-page/linearize.pdf"
+    echo "resurrect-$variant-one-page/linearize.pdf"
+    qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+        "$FIX/resurrect-$variant-one-page.pdf" \
+        "$REF/resurrect-$variant-one-page/linearize-objstm.pdf"
+    echo "resurrect-$variant-one-page/linearize-objstm.pdf"
+done
 
 # NON-linearized --object-streams=generate on the same fixture (flpdf-ndjy): the
 # missing /Junk refs must be dropped, not stored as null ObjStm members. qpdf

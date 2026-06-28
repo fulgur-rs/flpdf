@@ -598,6 +598,29 @@ impl LinearizationPlan {
             all_refs.push(r);
         }
 
+        // Resurrect null-resolving references reached via a surviving (array)
+        // edge that have NO xref entry (truly missing). Free entries are already
+        // admitted above — they are in `object_refs()` (CacheEntry::Deleted) and
+        // pass the `reachable` filter — so add only the missing ones. qpdf treats
+        // a missing array ref exactly like a free one: a renumbered `null` body
+        // object the array points at (verified byte-identical, /ID masked). The
+        // set is drop-aware (a null ref reached only as a dict value is omitted),
+        // so a dict-only missing ref stays dropped, not resurrected.
+        // `all_refs` is sorted (it filters the sorted `object_refs()` in order),
+        // so a binary search rejects the already-admitted (free) refs without
+        // allocating a temporary set.
+        let mut resurrected: Vec<ObjectRef> =
+            crate::rewrite_renumber::resurrectable_null_refs(pdf)?
+                .into_iter()
+                .filter(|r| all_refs.binary_search(r).is_err())
+                .collect();
+        if !resurrected.is_empty() {
+            all_refs.append(&mut resurrected);
+            // Keep source-object-number order (object_refs() is already sorted);
+            // the resurrected refs slot in at their numeric position.
+            all_refs.sort();
+        }
+
         let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();
         let info_ref = pdf.trailer().get_ref("Info");
@@ -2091,6 +2114,13 @@ pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
     assigned: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<Vec<ObjectRef>>> {
     let mut eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    // Resurrected null-resolving array refs (flpdf-0gyq): `compressible_objgens`
+    // filters to live objects, so it excludes these free/missing refs — but qpdf
+    // compresses them as the TRAILING members of the ObjStm. Append them after the
+    // live members (in source-object-number order). They have renumber slots from
+    // the plan's all_refs admission, so they survive the `assigned` retain below.
+    let resurrected = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
+    eligible.extend(resurrected);
     // Drop refs without a renumber slot before the split (see doc above).
     eligible.retain(|r| assigned.contains(r));
     let streams = crate::writer::object_streams::even_split_into_streams(&eligible);

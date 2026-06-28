@@ -178,6 +178,23 @@ fn dangling_body_refs_classic_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("dangling-body-one-page.pdf", "dangling-body-one-page");
 }
 
+// flpdf-0gyq: a null-resolving ARRAY ref (/Arr [<null-ref> 8 0 R]) is resurrected
+// as an indirect null body object the array points at. The FREE variant (obj 9, a
+// free xref row) already worked; the MISSING variant (obj 99, no row) must produce
+// the identical layout — qpdf treats the two the same.
+#[test]
+fn resurrect_free_array_ref_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("resurrect-free-one-page.pdf", "resurrect-free-one-page");
+}
+
+#[test]
+fn resurrect_missing_array_ref_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "resurrect-missing-one-page.pdf",
+        "resurrect-missing-one-page",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

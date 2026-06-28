@@ -203,21 +203,26 @@ fn nested_dict_dangling_value_dropped_keeps_outer() {
     assert!(nested.get("Keep").is_some(), "live /Keep must survive");
 }
 
-// --- Case 4: dangling in an ARRAY -> inline null, length preserved ---------
+// --- Case 4: dangling in an ARRAY, length preserved -----------------------
 // `/Arr [0 0 R 8 0 R 99 0 R]`: object-0, a live font, and a missing-xref ref.
-// qpdf keeps the array length; dead slots are null (object-0 inline; missing-xref
-// inline for Layer A — flpdf-0gyq resurrects a null object there).
+// qpdf keeps the array length. Object 0 inlines as direct `null`; the live font
+// stays a reference; the missing-xref slot is RESURRECTED as an indirect ref to
+// a fresh `null` body object (flpdf-0gyq — qpdf treats it like a free entry).
 
 #[test]
-fn dangling_array_elements_become_inline_null_both_modes() {
+fn dangling_array_elements_resurrect_or_inline_both_modes() {
     let src = two_page(" /Arr [0 0 R 8 0 R 99 0 R]", "");
     for use_generate in [false, true] {
         let out = linearize(&src, use_generate).unwrap_or_else(|e| {
             panic!("dangling array must not crash (generate={use_generate}): {e}")
         });
         let mut pdf = Pdf::open(Cursor::new(out)).expect("round-trips");
-        let cat = catalog(&mut pdf);
-        let arr = match cat.as_dict().unwrap().get("Arr").expect("/Arr kept") {
+        let arr = match catalog(&mut pdf)
+            .as_dict()
+            .unwrap()
+            .get("Arr")
+            .expect("/Arr kept")
+        {
             Object::Array(a) => a.clone(),
             other => panic!("/Arr not an array: {other:?}"),
         };
@@ -230,13 +235,17 @@ fn dangling_array_elements_become_inline_null_both_modes() {
             matches!(arr[0], Object::Null),
             "object-0 slot -> inline null"
         );
+        assert!(matches!(arr[1], Object::Reference(_)), "live font ref kept");
+        // missing-xref slot -> indirect ref to a resurrected null body object.
+        let resurrected = match arr[2] {
+            Object::Reference(r) => r,
+            ref other => panic!("missing-xref slot must resurrect to a ref, got {other:?}"),
+        };
         assert!(
-            matches!(arr[1], Object::Reference(_)),
-            "live font ref kept as a reference"
-        );
-        assert!(
-            matches!(arr[2], Object::Null),
-            "missing-xref slot -> inline null"
+            pdf.resolve(resurrected)
+                .expect("resurrected resolves")
+                .is_null(),
+            "the resurrected array slot must point at a null body object"
         );
     }
 }

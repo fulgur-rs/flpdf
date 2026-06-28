@@ -205,6 +205,119 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
     Ok(reachable)
 }
 
+/// Indirect references that qpdf "resurrects" as `null` body objects rather than
+/// dropping: a reference that resolves to null (a missing-xref or free object,
+/// `number > 0`) **reached through a surviving edge** — i.e. as an ARRAY element,
+/// or nested inside a non-null dict/array value.
+///
+/// This is the array half of qpdf's null-resolving normalization (the dict-value
+/// half drops the key). The walk is **drop-aware**: a null-resolving reference
+/// reached ONLY as a dictionary value is omitted (qpdf drops that key, so the
+/// object becomes unreachable and is garbage-collected, not resurrected). Object
+/// 0 (`0 0 R`) is excluded — qpdf inlines it as a direct `null`, not an indirect
+/// null object.
+///
+/// # Errors
+///
+/// Propagates resolve errors and the [`MAX_INLINE_DEPTH`] guard from the walk.
+pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> crate::Result<BTreeSet<ObjectRef>> {
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    let root = pdf
+        .root_ref()
+        .ok_or_else(|| Error::Unsupported("resurrectable: trailer has no /Root".to_string()))?;
+
+    let mut result: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
+
+    // Seed from the trailer (dict context): live roots are followed; a
+    // null-resolving trailer ref is a dropped key, not resurrected.
+    for (key, value) in pdf.trailer().iter() {
+        if matches!(key, b"ID" | b"Prev" | b"Root" | b"Size") {
+            continue;
+        }
+        let mut follow: Vec<ObjectRef> = Vec::new();
+        walk_surviving(value, 0, false, &live, &mut follow, &mut result)?;
+        queue.extend(follow);
+    }
+
+    while let Some(cur) = queue.pop_front() {
+        if !visited.insert(cur) {
+            continue;
+        }
+        let obj = pdf.resolve_borrowed(cur)?;
+        let mut follow: Vec<ObjectRef> = Vec::new();
+        walk_surviving(obj, 0, false, &live, &mut follow, &mut result)?;
+        for r in follow {
+            if !visited.contains(&r) {
+                queue.push_back(r);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Drop-aware structural walk for [`resurrectable_null_refs`]. Distinguishes
+/// array position (`in_array`) from dict-value position: a null-resolving
+/// reference (`number > 0`, not in `live`) is collected into `result` only when
+/// it sits in an array (a surviving edge); a dict/stream value that is
+/// null-resolving is skipped entirely (qpdf drops that key). Live references are
+/// pushed to `follow` for the BFS to continue. Object 0 is ignored.
+fn walk_surviving(
+    obj: &Object,
+    depth: usize,
+    in_array: bool,
+    live: &BTreeSet<ObjectRef>,
+    follow: &mut Vec<ObjectRef>,
+    result: &mut BTreeSet<ObjectRef>,
+) -> crate::Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(
+            "linearization: inline nesting exceeds MAX_INLINE_DEPTH during resurrectable walk"
+                .to_string(),
+        ));
+    }
+    let is_null_resolving = |r: &ObjectRef| r.number > 0 && !live.contains(r);
+    match obj {
+        Object::Reference(r) => {
+            if is_null_resolving(r) {
+                // Reached here only via an array element (dict/stream branches
+                // skip null-resolving values before recursing).
+                if in_array {
+                    result.insert(*r);
+                }
+            } else if live.contains(r) {
+                follow.push(*r);
+            }
+        }
+        Object::Array(elements) => {
+            for e in elements {
+                walk_surviving(e, depth + 1, true, live, follow, result)?;
+            }
+        }
+        Object::Dictionary(dict) => {
+            for (_key, value) in dict.iter() {
+                if matches!(value, Object::Reference(r) if is_null_resolving(r)) {
+                    continue; // dropped key
+                }
+                walk_surviving(value, depth + 1, false, live, follow, result)?;
+            }
+        }
+        Object::Stream(stream) => {
+            for (_key, value) in stream.dict.iter() {
+                if matches!(value, Object::Reference(r) if is_null_resolving(r)) {
+                    continue;
+                }
+                walk_surviving(value, depth + 1, false, live, follow, result)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl CatalogFirstRenumber {
     /// Build a map directly from `(old, new)` pairs (test-only). Used by writer
@@ -641,6 +754,79 @@ mod tests {
         assert_eq!(
             tag_sequence(&mut pdf, &map),
             vec!["/Catalog", "dict", "/Pages", "/Page", "stream", "dict", "/Font"]
+        );
+    }
+
+    #[test]
+    fn resurrectable_collects_array_nulls_not_dict_or_object_zero() {
+        // Catalog references, against null-resolving / live / object-0 targets:
+        //   /Arr  [98 0 R 2 0 R 0 0 R]  98 missing (array) -> resurrectable;
+        //                                2 live Pages (array) -> NOT; 0 0 R -> NOT
+        //   /Held 99 0 R                 dict value missing -> dropped, NOT
+        //   /Nest << /Inner 97 0 R >>    nested dict value missing -> NOT
+        //   /Free [5 0 R]                5 free-within-/Size (array) -> resurrectable
+        // Object 10 (a stray, unreferenced) only bumps /Size so 5 is a free gap
+        // (<=10) while 97/98/99 are missing (beyond /Size).
+        let cat = b"<< /Type /Catalog /Pages 2 0 R /Arr [ 98 0 R 2 0 R 0 0 R ] \
+                    /Held 99 0 R /Nest << /Inner 97 0 R >> /Free [ 5 0 R ] >>";
+        let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
+        let bytes = build_raw_pdf(&[(1, cat), (2, pages), (3, page), (10, b"<< >>")]);
+        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let got = resurrectable_null_refs(&mut pdf).expect("resurrectable");
+        let nums: BTreeSet<u32> = got.iter().map(|r| r.number).collect();
+        assert!(
+            nums.contains(&98),
+            "missing array element 98 must be resurrectable"
+        );
+        assert!(
+            nums.contains(&5),
+            "free array element 5 must be resurrectable"
+        );
+        assert!(
+            !nums.contains(&99),
+            "dict-only missing 99 must NOT be resurrectable"
+        );
+        assert!(
+            !nums.contains(&97),
+            "nested dict-value missing 97 must NOT be resurrectable"
+        );
+        assert!(
+            !nums.contains(&2),
+            "live Pages ref must NOT be resurrectable"
+        );
+        assert!(
+            !nums.contains(&0),
+            "object 0 must NOT be resurrectable (inline null)"
+        );
+    }
+
+    #[test]
+    fn resurrectable_errors_on_excessive_array_nesting() {
+        // A `/Deep` value nested deeper than MAX_INLINE_DEPTH must make the
+        // drop-aware walk refuse rather than silently stop (leaving refs in the
+        // over-deep region uncollected).
+        let mut deep = b"99 0 R".to_vec();
+        for _ in 0..(MAX_INLINE_DEPTH + 2) {
+            let mut wrapped = b"[ ".to_vec();
+            wrapped.extend_from_slice(&deep);
+            wrapped.extend_from_slice(b" ]");
+            deep = wrapped;
+        }
+        let cat = [
+            b"<< /Type /Catalog /Pages 2 0 R /Deep ".to_vec(),
+            deep,
+            b" >>".to_vec(),
+        ]
+        .concat();
+        let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
+        let bytes = build_raw_pdf(&[(1, &cat), (2, pages), (3, page)]);
+        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let got = resurrectable_null_refs(&mut pdf);
+        assert!(
+            matches!(got, Err(crate::Error::Unsupported(_))),
+            "over-deep nesting must error, not silently truncate"
         );
     }
 
