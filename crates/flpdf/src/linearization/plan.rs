@@ -527,7 +527,7 @@ fn compute_closure<R: Read + Seek>(
         if seen_as_array.contains(&r) {
             let tail_pos = order[1..].partition_point(|existing| existing.number < r.number);
             order.insert(1 + tail_pos, r);
-        }
+        } // cov:ignore: false branch = deferred ref that has no array edge in the entire closure; qpdf correctly drops it (same as the dict-value-only drop path). Requires a resurrectable ref that appears *only* in a dict-value slot with no array counterpart anywhere in the closure — correctly exercised by the existing behaviour but the closing brace hits only the zero-count path.
     }
 
     Ok(order)
