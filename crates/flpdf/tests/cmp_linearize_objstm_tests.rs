@@ -249,6 +249,25 @@ fn dangling_body_refs_objstm_byte_identical_to_qpdf() {
     assert_strict("dangling-body-one-page.pdf", "dangling-body-one-page");
 }
 
+// flpdf-8891: the first-page private/shared split (Step 5) is object-stream-mode
+// independent, so the Catalog /Ref2 edge that makes the Font lc_first_page_shared
+// must reorder the generate-mode first-page ObjStm members too.
+#[test]
+fn catalog_firstpage_shared_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "catalog-firstpage-shared-one-page.pdf",
+        "catalog-firstpage-shared-one-page",
+    );
+}
+
+#[test]
+fn catalog_firstpage_shared_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "catalog-firstpage-shared-one-page.pdf",
+        "catalog-firstpage-shared-one-page",
+    );
+}
+
 // flpdf-0gyq: under --object-streams=generate the resurrected null body object is
 // compressed as the TRAILING ObjStm member (qpdf compresses it last). free and
 // missing variants must both match.

@@ -671,6 +671,19 @@ impl LinearizationPlan {
         let all_outline_refs: BTreeSet<ObjectRef> = outlines_set(pdf)?;
 
         // ----------------------------------------------------------------
+        // Step 1d: compute the document-level `others` set for the first-page
+        // private/shared split.
+        // ----------------------------------------------------------------
+        // qpdf marks a first-page object as lc_first_page_shared (not private)
+        // when it also has a non-zero `others` count — i.e. it is reachable from
+        // a catalog key outside {open-document keys, /Outlines, /Pages} or a
+        // trailer key outside {/Root, /Encrypt} (QPDF_linearization.cc:1124-1127).
+        // Step 5 uses this to route such objects to Part 3 so they sort after the
+        // first-page-private objects, matching qpdf's part6 order. Like
+        // open_document/outlines above, this is object-stream-mode-independent.
+        let document_other_set = document_other_set(pdf)?;
+
+        // ----------------------------------------------------------------
         // Step 2: collect page references.
         // Propagate page-tree errors so a malformed /Pages does not silently
         // produce an empty page_hints (which would corrupt downstream hint tables).
@@ -785,7 +798,15 @@ impl LinearizationPlan {
             }
             if Some(*obj_ref) == first_page_ref {
                 part2_objects.push(*obj_ref);
-            } else if shared_page_indices.contains_key(obj_ref) {
+            } else if shared_page_indices.contains_key(obj_ref)
+                || document_other_set.contains(obj_ref)
+            {
+                // lc_first_page_shared: in_first_page AND (other_pages>0 ||
+                // others>0). `shared_page_indices` supplies other_pages (another
+                // page's closure); `document_other_set` supplies others (a
+                // document-level reference such as a Catalog key). Either makes
+                // the object shared (QPDF_linearization.cc:1124-1127), so it
+                // sorts after the first-page-private objects in part 6.
                 part3_objects.push(*obj_ref);
             } else {
                 part2_objects.push(*obj_ref);
@@ -2145,6 +2166,21 @@ pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
         .collect())
 }
 
+/// Catalog keys qpdf treats as `open_document_keys` in
+/// `calculateLinearizationData` (QPDF_linearization.cc:1045-1050): a catalog
+/// reference through one of these is `in_open_document`, while a reference
+/// through any OTHER catalog key (except `/Outlines`) increments `others`.
+/// Shared by [`open_document_set`] (which collects them) and
+/// [`document_other_set`] (which collects the complement) so the partition
+/// stays a single source of truth.
+const OPEN_DOCUMENT_CATALOG_KEYS: [&[u8]; 5] = [
+    b"ViewerPreferences",
+    b"PageMode",
+    b"Threads",
+    b"OpenAction",
+    b"AcroForm",
+];
+
 /// Compute the set of objects qpdf categorizes `in_open_document`.
 ///
 /// Mirrors qpdf's `optimize()` open-document object users
@@ -2190,14 +2226,64 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
         .map(|root| pdf.resolve_borrowed(root))
         .transpose()?;
     if let Some(Object::Dictionary(catalog)) = catalog {
-        for key in [
-            b"ViewerPreferences".as_slice(),
-            b"PageMode",
-            b"Threads",
-            b"OpenAction",
-            b"AcroForm",
-        ] {
+        for key in OPEN_DOCUMENT_CATALOG_KEYS {
             if let Some(v) = catalog.get(key) {
+                collect_direct_refs(v, 0, &mut seeds)?;
+            }
+        }
+    }
+
+    closure_from_seeds(pdf, seeds)
+}
+
+/// Compute the set of objects qpdf categorizes with a non-zero `others` count:
+/// objects reachable from a document-level reference that is neither an
+/// open-document key, `/Outlines`, the page tree, nor the trailer `/Root` /
+/// `/Encrypt`.
+///
+/// Mirrors qpdf's `optimize()` `ou_trailer_key` / `ou_root_key` users
+/// (QPDF_optimization.cc:92-110) and the `++others` arms of
+/// `calculateLinearizationData` (QPDF_linearization.cc:1077-1096): a catalog key
+/// other than [`OPEN_DOCUMENT_CATALOG_KEYS`] and `/Outlines`, or a trailer key
+/// other than `/Root` (`ou_root`) and `/Encrypt` (`in_open_document`),
+/// increments `others`. A first-page object that also appears here is therefore
+/// `lc_first_page_shared` (QPDF_linearization.cc:1124-1127), not
+/// `lc_first_page_private`, and so sorts after the private objects in part 6.
+/// The `/Page`-boundary traversal matches [`open_document_set`].
+///
+/// `/Pages` is excluded deliberately: the linearize write path runs
+/// `optimize(allow_changes=true)` (QPDFWriter.cc:2553), whose
+/// `pushInheritedAttributesToPage` strips inherited `/Resources`, `/MediaBox`,
+/// etc. from interior `/Pages` nodes BEFORE the object-user maps are built, so
+/// `ou_root_key("/Pages")` never reaches a first-page object — the page tree
+/// contributes no first-page `others`. Cross-page sharing is already handled by
+/// the per-page closures (`shared_page_indices`).
+///
+/// # Errors
+///
+/// Propagates reader errors from resolving the catalog, the trailer values, or
+/// any reached object.
+fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
+    let mut seeds: Vec<ObjectRef> = Vec::new();
+    // Trailer keys except /Root (ou_root, the catalog) and /Encrypt
+    // (in_open_document, already seeded by open_document_set).
+    {
+        let trailer = pdf.trailer();
+        for (key, v) in trailer.iter() {
+            if key != b"Root" && key != b"Encrypt" {
+                collect_direct_refs(v, 0, &mut seeds)?;
+            }
+        }
+    }
+    // Catalog keys except the open-document keys (in_open_document), /Outlines
+    // (in_outlines), and /Pages (the page tree; see the doc comment).
+    let catalog = pdf
+        .root_ref()
+        .map(|root| pdf.resolve_borrowed(root))
+        .transpose()?;
+    if let Some(Object::Dictionary(catalog)) = catalog {
+        for (key, v) in catalog.iter() {
+            if !OPEN_DOCUMENT_CATALOG_KEYS.contains(&key) && key != b"Outlines" && key != b"Pages" {
                 collect_direct_refs(v, 0, &mut seeds)?;
             }
         }
@@ -5317,6 +5403,72 @@ mod tests {
             set,
             [r(4), r(5), r(6)].into_iter().collect::<BTreeSet<_>>(),
             "open-document set = {{action, /Next dict, leaf}}; page leaf dropped"
+        );
+    }
+
+    /// A catalog whose keys span every [`document_other_set`] branch: included
+    /// keys (`/Names`, `/Custom`), excluded keys (`/Pages`, `/Outlines`,
+    /// `/OpenAction`), a key pointing straight at a `/Page` leaf (`/PageRef`,
+    /// dropped at the boundary), and a trailer `/Info`. `/Custom` references one
+    /// object twice to exercise the `visited` dedup.
+    fn document_other_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let mut offs = [0u64; 10];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        // /Pages, /Outlines, /OpenAction are excluded; /Names, /Custom are
+        // `others`; /PageRef points at a page leaf (dropped at the boundary).
+        push(
+            &mut pdf,
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R /OpenAction 8 0 R \
+             /Names 4 0 R /Custom 5 0 R /PageRef 3 0 R >>",
+        );
+        push(&mut pdf, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+        push(&mut pdf, 4, "<< /X 6 0 R >>"); // /Names target -> 6
+        push(&mut pdf, 5, "<< /A 6 0 R /B 6 0 R >>"); // /Custom target -> 6 twice
+        push(&mut pdf, 6, "<< /Leaf true >>");
+        push(&mut pdf, 7, "<< /Type /Outlines >>"); // excluded (/Outlines)
+        push(&mut pdf, 8, "<< /Type /Action /S /GoTo /D [3 0 R /Fit] >>"); // excluded (open-doc)
+        push(&mut pdf, 9, "<< /Producer (x) >>"); // trailer /Info -> included
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 10\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 10 /Root 1 0 R /Info 9 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn document_other_set_excludes_doc_keys_and_stops_at_page() {
+        let mut pdf = Pdf::open(Cursor::new(document_other_pdf_bytes())).unwrap();
+        let set = document_other_set(&mut pdf).unwrap();
+        let r = |n: u32| ObjectRef::new(n, 0);
+        // Included: /Names (4) + its target (6), /Custom (5) + the same target
+        // (6, recorded once), trailer /Info (9). Excluded: the /Pages tree (2, 3),
+        // /Outlines (7), /OpenAction (8), the catalog itself (1, the /Root key),
+        // and the page leaf reached via /PageRef (3, dropped at the boundary).
+        assert_eq!(
+            set,
+            [r(4), r(5), r(6), r(9)]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "others = {{/Names tree, /Custom tree, /Info}}; doc keys + page tree excluded"
         );
     }
 

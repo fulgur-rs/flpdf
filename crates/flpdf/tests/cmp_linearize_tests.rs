@@ -195,6 +195,19 @@ fn resurrect_missing_array_ref_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-8891: a document-level (Catalog) reference to a first-page object marks
+// it lc_first_page_shared, so qpdf orders the first-page section private-then-
+// shared (Page, Resources, Content, Font) rather than by source number alone.
+// Without the document-`others` signal flpdf left the Font in part2 (private)
+// and emitted Font before Content (first divergence at byte 353).
+#[test]
+fn catalog_firstpage_shared_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "catalog-firstpage-shared-one-page.pdf",
+        "catalog-firstpage-shared-one-page",
+    );
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
