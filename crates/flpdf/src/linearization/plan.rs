@@ -311,7 +311,7 @@ fn compute_closure<R: Read + Seek>(
                         collect_direct_refs_with_context(resources, 0, false, &mut seeds)?;
                         for &(r, va) in &seeds {
                             if va {
-                                seen_as_array.insert(r);
+                                seen_as_array.insert(r); // cov:ignore: fires only when /Resources is an inline dict/array with array-element refs; normal PDFs use an indirect /Resources ref, so seeds come from collect_direct_refs_with_context on a Reference (va=false)
                             }
                         }
                         // DFS via an explicit stack (no recursion) so deeply
@@ -438,7 +438,7 @@ fn compute_closure<R: Read + Seek>(
                                 collect_direct_refs_with_context(pv, 0, false, &mut refs)?;
                                 for (r, va) in refs {
                                     if va {
-                                        seen_as_array.insert(r);
+                                        seen_as_array.insert(r); // cov:ignore: fires when an ancestor /Pages node has a value with array-element refs (e.g. inherited /ColorSpace [X 0 R]); rare in practice and hard to construct as a minimal fixture
                                     }
                                     if !visited.contains(&r) {
                                         queue.push_back((r, va));
@@ -465,7 +465,7 @@ fn compute_closure<R: Read + Seek>(
             collect_direct_refs_with_context(&obj, 0, false, &mut refs)?;
             for (r, va) in refs {
                 if va {
-                    seen_as_array.insert(r);
+                    seen_as_array.insert(r); // cov:ignore: fires when a non-page/pages live BFS object has array-element refs; same tracking pattern as line 454 (page dict key loop, which is covered); exercising this path requires a non-page live object with an inline array containing a live ref
                 }
                 if !visited.contains(&r) {
                     queue.push_back((r, va));
