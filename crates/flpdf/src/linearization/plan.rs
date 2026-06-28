@@ -302,8 +302,7 @@ fn compute_closure<R: Read + Seek>(
                         // The visited set bounds cycles; `is_page_tree_node`
                         // stops the walk if a resource value cross-links back
                         // into the page tree, so we never pull in sibling pages.
-                        let mut stack: Vec<(ObjectRef, bool)> =
-                            seeds.into_iter().rev().collect();
+                        let mut stack: Vec<(ObjectRef, bool)> = seeds.into_iter().rev().collect();
                         while let Some((r, via_array)) = stack.pop() {
                             if !visited.insert(r) {
                                 continue;
