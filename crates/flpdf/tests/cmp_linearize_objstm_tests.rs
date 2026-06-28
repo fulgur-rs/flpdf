@@ -234,6 +234,21 @@ fn split_boundary_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-split-boundary.pdf", "objstm-lin-split-boundary");
 }
 
+// flpdf-5apf: null-resolving body refs in the Catalog under --object-streams=
+// generate. qpdf drops the null-valued dict keys and inlines `null` for the
+// object-0 array element, then compresses the surviving objects; flpdf must
+// match. (The missing-xref *array* resurrection case is out of scope here — see
+// flpdf-0gyq — so this fixture deliberately uses only object-0 in the array.)
+#[test]
+fn dangling_body_refs_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural("dangling-body-one-page.pdf", "dangling-body-one-page");
+}
+
+#[test]
+fn dangling_body_refs_objstm_byte_identical_to_qpdf() {
+    assert_strict("dangling-body-one-page.pdf", "dangling-body-one-page");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

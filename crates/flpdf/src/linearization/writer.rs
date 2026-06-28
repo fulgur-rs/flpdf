@@ -275,11 +275,12 @@ fn append_objstm_container_object<R: Read + Seek>(
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
+    live: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
         let object = pdf.resolve_borrowed(orig)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         resolved.push((new_ref, renumbered));
     }
     let body = emit_objstm_body_from_resolved(&resolved)?;
@@ -411,7 +412,12 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 /// describe, silently corrupting the linearized output.
 ///
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
-fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Result<Object> {
+fn renumber_object(
+    object: &Object,
+    depth: usize,
+    renumber: &RenumberMap,
+    live: &BTreeSet<ObjectRef>,
+) -> Result<Object> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization writer: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
@@ -420,6 +426,14 @@ fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Res
     match object {
         Object::Reference(r) => match renumber.new_for_original(*r) {
             Some(new_ref) => Ok(Object::Reference(new_ref)),
+            None if is_null_resolving_ref(*r, live) => {
+                // A reference to object 0 (free-list head / null singleton,
+                // ISO 32000-1 §7.3.10) or to a missing-xref object resolves to
+                // null and receives no body object. Reached here as an array
+                // element (or a bare-ref body); qpdf inlines `null` in that
+                // position. Dict/stream values are dropped one level up.
+                Ok(Object::Null)
+            }
             None => Err(crate::Error::Unsupported(format!(
                 "linearization writer: reference {r} has no entry in RenumberMap \
                  (planner / renumber inconsistency — would emit mixed old/new \
@@ -429,14 +443,19 @@ fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Res
         Object::Array(elements) => {
             let mut renumbered = Vec::with_capacity(elements.len());
             for e in elements {
-                renumbered.push(renumber_object(e, depth + 1, renumber)?);
+                renumbered.push(renumber_object(e, depth + 1, renumber, live)?);
             }
             Ok(Object::Array(renumbered))
         }
         Object::Dictionary(dict) => {
             let mut new_dict = Dictionary::new();
             for (key, value) in dict.iter() {
-                new_dict.insert(key, renumber_object(value, depth + 1, renumber)?);
+                if is_null_resolving_value(value, live) {
+                    // qpdf treats a dict key whose value resolves to null as
+                    // absent (ISO 32000-1 §7.3.7), so the key is dropped.
+                    continue;
+                }
+                new_dict.insert(key, renumber_object(value, depth + 1, renumber, live)?);
             }
             Ok(Object::Dictionary(new_dict))
         }
@@ -455,8 +474,11 @@ fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Res
                     && matches!(value, Object::Reference(r) if renumber.new_for_original(*r).is_none());
                 if dropped_length_holder {
                     new_dict.insert(key, Object::Integer(stream.data.len() as i64));
+                } else if is_null_resolving_value(value, live) {
+                    // Same null-valued-key elision as plain dictionaries.
+                    continue;
                 } else {
-                    new_dict.insert(key, renumber_object(value, depth + 1, renumber)?);
+                    new_dict.insert(key, renumber_object(value, depth + 1, renumber, live)?);
                 }
             }
             Ok(Object::Stream(Stream::new(new_dict, stream.data.clone())))
@@ -464,6 +486,21 @@ fn renumber_object(object: &Object, depth: usize, renumber: &RenumberMap) -> Res
         // Scalar types contain no references — clone unchanged.
         _ => Ok(object.clone()),
     }
+}
+
+/// A reference resolves to null — so it receives no body object — when it
+/// targets object 0 (free-list head / null singleton, ISO 32000-1 §7.3.10) or a
+/// missing-xref object absent from the live set (referenced but never written to
+/// any cross-reference section).
+fn is_null_resolving_ref(r: ObjectRef, live: &BTreeSet<ObjectRef>) -> bool {
+    r.number == 0 || !live.contains(&r)
+}
+
+/// A dict/stream value whose presence qpdf elides: an indirect reference that
+/// resolves to null (see [`is_null_resolving_ref`]). A real direct `null`
+/// literal is left untouched — that is a distinct concern from a dangling ref.
+fn is_null_resolving_value(value: &Object, live: &BTreeSet<ObjectRef>) -> bool {
+    matches!(value, Object::Reference(r) if is_null_resolving_ref(*r, live))
 }
 
 /// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
@@ -1645,6 +1682,11 @@ fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
+    // Live object set (object 0 / missing-xref refs excluded); computed once by
+    // the caller and shared across all probe + final passes, since the source
+    // document is immutable here. Threaded into `renumber_object` so it can drop
+    // null-resolving dict keys / inline `null` array elements.
+    live: &BTreeSet<ObjectRef>,
     part1: &Part1Bytes,
     catalog_new_ref: ObjectRef,
     hint_stream_new_num: u32,
@@ -1813,7 +1855,7 @@ fn do_write_pass<R: Read + Seek>(
             "planner invariant: /Catalog is never an ObjStm member"
         );
         let object = pdf.resolve_borrowed(catalog_orig)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
@@ -1839,7 +1881,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         // cov:ignore-end
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1852,7 +1894,7 @@ fn do_write_pass<R: Read + Seek>(
     // indirect object; its compressed members are emitted nowhere else (skipped
     // in every plain loop via `member_to_container`).
     for container in &objstm_layout.open_document {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -1902,7 +1944,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1931,7 +1973,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1941,7 +1983,7 @@ fn do_write_pass<R: Read + Seek>(
     // qpdf 11.9 /E placement, which includes the Part-3 ObjStm) stays
     // consistent.  The container itself is a plain indirect object.
     for container in &objstm_layout.part3 {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
+        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -1963,7 +2005,7 @@ fn do_write_pass<R: Read + Seek>(
             // cov:ignore-end
         };
         let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber)?;
+        let renumbered = renumber_object(object, 0, renumber, live)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2027,12 +2069,13 @@ fn do_write_pass<R: Read + Seek>(
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
                 let object = pdf.resolve_borrowed(*original_ref)?;
-                let renumbered = renumber_object(object, 0, renumber)?;
+                let renumbered = renumber_object(object, 0, renumber, live)?;
                 let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
-                let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf)?;
+                let offset =
+                    append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
                 xref_offsets.insert(container.container_new_num, offset);
             }
         }
@@ -2402,6 +2445,12 @@ pub fn write_linearized<R: Read + Seek>(
             "the deterministic-id option is incompatible with encrypted output files".to_string(),
         ));
     }
+
+    // Live object set (object 0 / missing-xref refs excluded). The source
+    // document is immutable across the probe + final passes, so compute it once
+    // here and share it with every `do_write_pass` rather than re-scanning the
+    // whole xref table on each pass.
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
 
     // A forced sub-1.5 header suppresses object-stream generation: object and
     // cross-reference streams are PDF 1.5 features and qpdf will not emit them
@@ -2774,6 +2823,7 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             pdf,
+            &live,
             &pass1_part1,
             catalog_new_ref,
             hint_stream_new_num,
@@ -2834,6 +2884,7 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             pdf,
+            &live,
             &part1,
             catalog_new_ref,
             hint_stream_new_num,
@@ -3303,6 +3354,7 @@ pub fn write_linearized<R: Read + Seek>(
                 plan,
                 renumber,
                 pdf,
+                &live,
                 &part1,
                 catalog_new_ref,
                 hint_stream_new_num,
@@ -4702,7 +4754,9 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
-        let err = renumber_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber);
+        // No references, so the live set is never consulted (empty is fine).
+        let live = BTreeSet::new();
+        let err = renumber_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber, &live);
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
@@ -4725,7 +4779,11 @@ mod tests {
         for _ in 0..(MAX_INLINE_DEPTH - 1) {
             obj = Object::Array(vec![obj]);
         }
-        let out = renumber_object(&obj, 0, &renumber).expect("in-limit nesting must succeed");
+        // The buried reference (1 0 R) is in the plan, so it is renumbered via the
+        // map before the live set is consulted; an empty live set is fine here.
+        let live = BTreeSet::new();
+        let out =
+            renumber_object(&obj, 0, &renumber, &live).expect("in-limit nesting must succeed");
 
         // Unwrap the nested arrays down to the deepest element and confirm the
         // in-limit Reference was renumbered to its mapped target.
@@ -4739,6 +4797,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn renumber_object_errors_on_live_ref_absent_from_map() {
+        // Safety net: a reference to a LIVE object that the planner failed to map
+        // is a real inconsistency (it would emit a mixed old/new number), so it
+        // must error — NOT be silently dropped like a dangling/object-0 ref.
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        let ghost = ObjectRef::new(99, 0);
+        assert!(
+            renumber.new_for_original(ghost).is_none(),
+            "test premise: ghost is not in the map"
+        );
+        let mut live = BTreeSet::new();
+        live.insert(ghost); // declared live but unmapped
+        let obj = Object::Array(vec![Object::Reference(ghost)]);
+        let err = renumber_object(&obj, 0, &renumber, &live);
+        assert!(
+            matches!(err, Err(crate::Error::Unsupported(_))),
+            "a live, unmapped reference must error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn renumber_object_inlines_null_for_missing_ref_in_array() {
+        // Boundary opposite the safety net: a non-live (missing-xref) reference in
+        // an array becomes inline `null` rather than erroring.
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        let missing = ObjectRef::new(99, 0);
+        let live = BTreeSet::new(); // `missing` is absent => not live
+        let obj = Object::Array(vec![Object::Reference(missing)]);
+        let out = renumber_object(&obj, 0, &renumber, &live);
+        assert!(
+            matches!(&out, Ok(Object::Array(items)) if matches!(items.as_slice(), [Object::Null])),
+            "missing-xref array element must inline null, got {out:?}"
+        );
     }
 
     /// Linearize `source_bytes` in the given write mode with the supplied

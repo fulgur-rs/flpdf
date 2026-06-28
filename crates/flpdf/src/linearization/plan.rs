@@ -177,13 +177,27 @@ fn is_page_tree_node(obj: &Object) -> bool {
 fn compute_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root: ObjectRef,
+    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
     let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
 
+    // A reference to object 0 (free-list head / null singleton, ISO 32000-1
+    // §7.3.10) or to a missing-xref object resolves to null. qpdf admits no body
+    // object for such a reference (the holding dict key is dropped / the array
+    // element is inlined as `null` at emission), so it must never receive an
+    // object number here. Keeping it in `visited` but out of `order` mirrors
+    // that: a numbered stray null object would diverge from qpdf and inflate the
+    // first-page object count. `live` is computed once by the caller — the
+    // per-page closure loop would otherwise re-scan the whole xref table O(pages).
+    let admits_body_object = |r: ObjectRef| -> bool { r.number != 0 && live.contains(&r) };
+
     while let Some(current) = queue.pop_front() {
         if !visited.insert(current) {
+            continue;
+        }
+        if !admits_body_object(current) {
             continue;
         }
         order.push(current);
@@ -235,6 +249,11 @@ fn compute_closure<R: Read + Seek>(
                             // into it nor pull the boundary node itself into
                             // Part 2/3.
                             if is_page_tree_node(&child) {
+                                continue;
+                            }
+                            if !admits_body_object(r) {
+                                // Null-resolving resource ref (object 0 / missing
+                                // xref): no body object, same as the main loop.
                                 continue;
                             }
                             order.push(r);
@@ -635,11 +654,16 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
 
+        // The live object set is invariant across every page's closure; compute it
+        // once so the per-page `compute_closure` calls below do not each re-scan
+        // the whole xref table (which would be O(pages × objects)).
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+
         // ----------------------------------------------------------------
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
         let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
-            compute_closure(pdf, first_page)?
+            compute_closure(pdf, first_page, &live)?
         } else {
             Vec::new()
         };
@@ -676,7 +700,7 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref)?;
+            let closure = compute_closure(pdf, page_ref, &live)?;
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -2303,8 +2327,14 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
 
     let page_refs = crate::pages::page_refs(pdf)?;
 
+    // Computed once and shared across every per-page closure below (the loop
+    // would otherwise re-scan the whole xref table O(pages) times).
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+
     let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
-        Some(&first_page) => compute_closure(pdf, first_page)?.into_iter().collect(),
+        Some(&first_page) => compute_closure(pdf, first_page, &live)?
+            .into_iter()
+            .collect(),
         // A linearizable document always has at least one page, so the page-less
         // branch never fires on the generate-mode call path.
         None => BTreeSet::new(), // cov:ignore: page-less catalog unreachable here
@@ -2316,7 +2346,7 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
         referenced_pages.entry(r).or_default().insert(0);
     }
     for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-        for r in compute_closure(pdf, page_ref)? {
+        for r in compute_closure(pdf, page_ref, &live)? {
             referenced_pages
                 .entry(r)
                 .or_default()
