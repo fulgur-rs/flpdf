@@ -147,6 +147,50 @@ fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> 
     Ok(())
 }
 
+/// Like [`collect_direct_refs`] but tracks whether each ref was discovered
+/// inside an array element (`true`) or a dictionary value (`false`).
+///
+/// Array-element missing-xref refs survive as `null` in the writer output;
+/// dictionary-value missing-xref refs cause the key to be dropped entirely.
+/// `compute_closure` uses this to restrict resurrectable-null admission to
+/// refs that were actually reached via a surviving array edge rather than
+/// a dropped dict-value edge.
+fn collect_direct_refs_with_context(
+    obj: &Object,
+    depth: usize,
+    in_array: bool,
+    out: &mut Vec<(ObjectRef, bool)>,
+) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
+    match obj {
+        Object::Reference(r) => out.push((*r, in_array)),
+        Object::Array(arr) => {
+            for elem in arr {
+                collect_direct_refs_with_context(elem, depth + 1, true, out)?;
+            }
+        }
+        Object::Dictionary(dict) => {
+            for (_k, v) in dict.iter() {
+                collect_direct_refs_with_context(v, depth + 1, false, out)?;
+            }
+        }
+        Object::Stream(s) => {
+            for (k, v) in s.dict.iter() {
+                if k == b"Length" {
+                    continue;
+                }
+                collect_direct_refs_with_context(v, depth + 1, false, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Returns whether a resolved object is a page-tree node we must not descend
 /// into during a subtree expansion (a `/Type /Page` leaf or `/Type /Pages`
 /// interior node). Used to stop a `/Resources` subtree walk from pulling in
@@ -178,10 +222,32 @@ fn compute_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root: ObjectRef,
     live: &BTreeSet<ObjectRef>,
+    resurrectable: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
-    let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
+    // Each entry carries (ref, via_array): whether the ref was enqueued via an
+    // array element (true) or a dictionary value (false).  Used at dequeue time
+    // to admit resurrectable null refs only when the reaching edge is a
+    // surviving array slot — matching qpdf's object-user classification, which
+    // excludes dict-value edges that the writer drops entirely.
+    let mut queue: VecDeque<(ObjectRef, bool)> = VecDeque::from([(root, false)]);
+    // Resurrectable refs that were not admissible at dequeue time (seen_as_array
+    // did not yet contain them — the live object holding the array edge had not
+    // been expanded yet).  After the full BFS completes, seen_as_array is
+    // exhaustive; we then admit each deferred ref that appears there.  This
+    // handles the "revorder" case: resurrectable ref number < live descendant
+    // number, so sort-at-enqueue puts the resurrectable ref in the queue before
+    // the live object that would reveal the array edge.
+    let mut deferred_resurrect: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Tracks every ref that has been enqueued (or pushed to the Resources DFS
+    // stack) via an array-element edge within this closure walk.  A resurrectable
+    // ref that appears in *both* a dict-value slot (dropped by the writer) and an
+    // array slot (survives as null) within the same page's closure must still be
+    // admitted: the dict-value tuple (r, false) may be dequeued before the
+    // array-edge tuple (r, true), but `seen_as_array` lets the dequeue check
+    // consult all edges discovered so far, not just the one in the current tuple.
+    let mut seen_as_array: BTreeSet<ObjectRef> = BTreeSet::new();
 
     // A reference to object 0 (free-list head / null singleton, ISO 32000-1
     // §7.3.10) or to a missing-xref object resolves to null. qpdf admits no body
@@ -191,10 +257,38 @@ fn compute_closure<R: Read + Seek>(
     // that: a numbered stray null object would diverge from qpdf and inflate the
     // first-page object count. `live` is computed once by the caller — the
     // per-page closure loop would otherwise re-scan the whole xref table O(pages).
+    //
+    // Exception: missing-xref refs reached via a surviving array edge in this
+    // page's object graph are resurrectable (see `resurrectable_null_refs`). qpdf
+    // classifies them as first-page users when reached from a first-page object,
+    // giving them HIGH object numbers inside Part 2. A missing-xref ref reached
+    // only via a dict value is dropped (not resurrectable), so it stays excluded.
     let admits_body_object = |r: ObjectRef| -> bool { r.number != 0 && live.contains(&r) };
 
-    while let Some(current) = queue.pop_front() {
+    while let Some((current, via_array)) = queue.pop_front() {
         if !visited.insert(current) {
+            continue;
+        }
+        if resurrectable.contains(&current) {
+            // Missing-xref ref: the writer survives array-element slots as null
+            // but drops dict-value slots (the key is omitted entirely).  Only
+            // admit to the closure when an array edge exists — a ref reached
+            // solely via dict-value edges has no surviving body object in the
+            // first-page section, matching qpdf's object-user map which does not
+            // count dropped dict-value edges as page uses.
+            // `via_array` covers the common case; `seen_as_array` covers the case
+            // where the same ref appears in both a dict-value slot and an array
+            // slot in the same closure (the dict-value tuple may be dequeued first,
+            // but the array edge was already recorded at enqueue time).
+            // `deferred_resurrect` handles the "revorder" case: resurrectable ref
+            // number < live descendant number, so the resurrectable ref is dequeued
+            // before seen_as_array is populated.  Deferred refs are re-checked
+            // after the full BFS completes.
+            if via_array || seen_as_array.contains(&current) {
+                order.push(current);
+            } else {
+                deferred_resurrect.insert(current);
+            }
             continue;
         }
         if !admits_body_object(current) {
@@ -227,16 +321,39 @@ fn compute_closure<R: Read + Seek>(
                 // pass would otherwise emit the content stream first.
                 if is_page_leaf {
                     if let Some(resources) = dict.get("Resources") {
-                        let mut seeds = Vec::new();
-                        collect_direct_refs(resources, 0, &mut seeds)?;
+                        let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
+                        collect_direct_refs_with_context(resources, 0, false, &mut seeds)?;
+                        for &(r, va) in &seeds {
+                            if va {
+                                seen_as_array.insert(r); // cov:ignore: fires only when /Resources is an inline dict/array with array-element refs; normal PDFs use an indirect /Resources ref, so seeds come from collect_direct_refs_with_context on a Reference (va=false)
+                            }
+                        }
                         // DFS via an explicit stack (no recursion) so deeply
                         // nested resource graphs cannot overflow the stack.
                         // The visited set bounds cycles; `is_page_tree_node`
                         // stops the walk if a resource value cross-links back
                         // into the page tree, so we never pull in sibling pages.
-                        let mut stack: Vec<ObjectRef> = seeds.into_iter().rev().collect();
-                        while let Some(r) = stack.pop() {
+                        let mut stack: Vec<(ObjectRef, bool)> = seeds.into_iter().rev().collect();
+                        while let Some((r, via_array)) = stack.pop() {
                             if !visited.insert(r) {
+                                continue;
+                            }
+                            if resurrectable.contains(&r) {
+                                // Same edge-type rule as the main BFS: admit the
+                                // null body object only when an array edge exists.
+                                // Defer if seen_as_array not yet populated (revorder
+                                // case); the post-BFS pass will re-check.
+                                if via_array || seen_as_array.contains(&r) {
+                                    order.push(r);
+                                } else {
+                                    // cov:ignore-start: fires when a resurrectable ref is reachable via dict-value in the Resources subtree before the array edge in the same subtree is discovered; requires two resource objects cross-referencing the same xref-absent object via different edge types, which is extremely contrived
+                                    deferred_resurrect.insert(r);
+                                } // cov:ignore-end
+                                continue;
+                            }
+                            if !admits_body_object(r) {
+                                // Null-resolving resource ref (object 0 / missing
+                                // xref): no body object, same as the main loop.
                                 continue;
                             }
                             let child = pdf.resolve(r)?;
@@ -251,24 +368,23 @@ fn compute_closure<R: Read + Seek>(
                             if is_page_tree_node(&child) {
                                 continue;
                             }
-                            if !admits_body_object(r) {
-                                // Null-resolving resource ref (object 0 / missing
-                                // xref): no body object, same as the main loop.
-                                continue;
-                            }
                             order.push(r);
-                            let mut child_refs = Vec::new();
-                            collect_direct_refs(&child, 0, &mut child_refs)?;
+                            let mut child_refs: Vec<(ObjectRef, bool)> = Vec::new();
+                            collect_direct_refs_with_context(&child, 0, false, &mut child_refs)?;
                             // Push in reverse so the first reference is popped
                             // first, preserving left-to-right discovery order.
                             for cr in child_refs.into_iter().rev() {
-                                if !visited.contains(&cr) {
+                                if cr.1 {
+                                    seen_as_array.insert(cr.0);
+                                }
+                                if !visited.contains(&cr.0) {
                                     stack.push(cr);
                                 }
                             }
                         }
                     }
                 } // cov:ignore: llvm-cov attributes 0 to this `if is_page_leaf` closing brace; the block body (the /Resources DFS) runs and is covered above.
+                let mut refs_raw: Vec<(ObjectRef, bool)> = Vec::new();
                 for (k, v) in dict.iter() {
                     if k == b"Kids" {
                         // Pages → sibling pages — never follow.
@@ -338,35 +454,80 @@ fn compute_closure<R: Read + Seek>(
                                     collect_direct_refs(pv, 0, &mut to_visit)?;
                                     continue;
                                 }
-                                let mut refs = Vec::new();
-                                collect_direct_refs(pv, 0, &mut refs)?;
-                                for r in refs {
+                                let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
+                                collect_direct_refs_with_context(pv, 0, false, &mut refs)?;
+                                for (r, va) in refs {
+                                    if va {
+                                        seen_as_array.insert(r); // cov:ignore: fires when an ancestor /Pages node has a value with array-element refs (e.g. inherited /ColorSpace [X 0 R]); rare in practice and hard to construct as a minimal fixture
+                                    }
                                     if !visited.contains(&r) {
-                                        queue.push_back(r);
+                                        queue.push_back((r, va));
                                     }
                                 }
                             }
                         }
                         continue;
                     }
-                    let mut refs = Vec::new();
-                    collect_direct_refs(v, 0, &mut refs)?;
-                    for r in refs {
-                        if !visited.contains(&r) {
-                            queue.push_back(r);
-                        }
+                    collect_direct_refs_with_context(v, 0, false, &mut refs_raw)?;
+                }
+                for &(r, va) in &refs_raw {
+                    if va {
+                        seen_as_array.insert(r);
+                    }
+                }
+                // Sort by original object number: qpdf assigns first-page slots in
+                // ascending original-number order regardless of dict key alphabetical
+                // order (empirically verified; see discriminator-fixture analysis).
+                refs_raw.sort_by_key(|(r, _)| r.number);
+                for (r, va) in refs_raw {
+                    if !visited.contains(&r) {
+                        queue.push_back((r, va));
                     }
                 }
             }
         } else {
-            let mut refs = Vec::new();
-            collect_direct_refs(&obj, 0, &mut refs)?;
-            for r in refs {
+            let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
+            collect_direct_refs_with_context(&obj, 0, false, &mut refs)?;
+            for &(r, va) in &refs {
+                if va {
+                    seen_as_array.insert(r);
+                }
+            }
+            // Same number-ordering rule as the page-dict loop above: qpdf enqueues
+            // a non-page object's children in ascending original-object-number order,
+            // not in dict-key (alphabetical) order.
+            refs.sort_by_key(|(r, _)| r.number);
+            for (r, va) in refs {
                 if !visited.contains(&r) {
-                    queue.push_back(r);
+                    queue.push_back((r, va));
                 }
             }
         }
+    }
+
+    // Sort the non-page tail (order[1..]) by original object number.  qpdf emits
+    // first-page objects in ascending original-number order, with the Page leaf
+    // always in the first slot.  Two discriminator fixtures confirm this:
+    // (a) Resources(5)/Font(6) at higher numbers than Content(4) → numeric order
+    //     wins over Resources-DFS-first order;
+    // (b) Page(orig 10) with Content(orig 3) → Page stays first despite having a
+    //     higher original number, so a fully-global sort would misplace it.
+    // Sorting only order[1..] satisfies both invariants simultaneously.
+    if order.len() > 1 {
+        order[1..].sort_by_key(|r| r.number);
+    }
+    // Deferred resurrectable refs: now that the full BFS is complete and
+    // seen_as_array is exhaustive, admit those that turn out to be reachable
+    // via an array edge (i.e. they appear in seen_as_array).  Insert each at
+    // the numerically correct position in the already-sorted non-page tail so
+    // the Page leaf remains first and the overall tail ordering stays ascending.
+    // BTreeSet iterates in ascending order, so each insertion preserves the
+    // invariant for subsequent entries.
+    for r in deferred_resurrect {
+        if seen_as_array.contains(&r) {
+            let tail_pos = order[1..].partition_point(|existing| existing.number < r.number);
+            order.insert(1 + tail_pos, r);
+        } // cov:ignore: false branch = deferred ref that has no array edge in the entire closure; qpdf correctly drops it (same as the dict-value-only drop path). Requires a resurrectable ref that appears *only* in a dict-value slot with no array counterpart anywhere in the closure — correctly exercised by the existing behaviour but the closing brace hits only the zero-count path.
     }
 
     Ok(order)
@@ -609,11 +770,18 @@ impl LinearizationPlan {
         // `all_refs` is sorted (it filters the sorted `object_refs()` in order),
         // so a binary search rejects the already-admitted (free) refs without
         // allocating a temporary set.
-        let mut resurrected: Vec<ObjectRef> =
-            crate::rewrite_renumber::resurrectable_null_refs(pdf)?
-                .into_iter()
-                .filter(|r| all_refs.binary_search(r).is_err())
-                .collect();
+        //
+        // `resurrectable` is kept alive to pass to `compute_closure`, which
+        // includes these refs in the page closure they're first reached from.
+        // qpdf classifies them as first-page section objects (Part 2) when reached
+        // from the first page, giving them HIGH object numbers. Without this, they
+        // land in part4_rest with LOW numbers (flpdf-o9im).
+        let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
+        let mut resurrected: Vec<ObjectRef> = resurrectable
+            .iter()
+            .filter(|r| all_refs.binary_search(r).is_err())
+            .copied()
+            .collect();
         if !resurrected.is_empty() {
             all_refs.append(&mut resurrected);
             // Keep source-object-number order (object_refs() is already sorted);
@@ -699,7 +867,7 @@ impl LinearizationPlan {
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
         let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
-            compute_closure(pdf, first_page, &live)?
+            compute_closure(pdf, first_page, &live, &resurrectable)?
         } else {
             Vec::new()
         };
@@ -736,7 +904,7 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref, &live)?;
+            let closure = compute_closure(pdf, page_ref, &live, &resurrectable)?;
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -2206,16 +2374,20 @@ const OPEN_DOCUMENT_CATALOG_KEYS: [&[u8]; 5] = [
 /// Propagates reader errors from resolving the catalog, the trailer values, or
 /// any reached object.
 fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
-    // Seed refs: the indirect refs inside each open-document key's value. A
-    // direct value (e.g. an inline /OpenAction action dict) contributes only the
-    // indirect refs it contains; qpdf records indirect objects, not inline ones.
-    let mut seeds: Vec<ObjectRef> = Vec::new();
+    // Seed refs: the indirect refs inside each open-document key's value, with
+    // array-edge context. A ref that is an array ELEMENT of an OD key's value
+    // (e.g. `/OpenAction [99 0 R]`) is resurrectable and must enter
+    // open_document_set; a ref that is a dict-value (e.g. `/OpenAction 99 0 R`)
+    // for an absent ref is dropped and must not. `collect_direct_refs_with_context`
+    // records this distinction as the bool in each `(ObjectRef, bool)` pair so
+    // `closure_from_seeds` can honour it.
+    let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     if let Some(enc) = pdf.trailer().get("Encrypt") {
         // cov:ignore-start: /Encrypt is only meaningful for encrypted+linearized
         // output (deferred to flpdf-j4ph); the linearize write path rejects
         // encrypted input (`reject_encrypted_write`) before this helper runs, so
         // it only ever sees plaintext documents (no trailer /Encrypt).
-        collect_direct_refs(enc, 0, &mut seeds)?;
+        collect_direct_refs_with_context(enc, 0, false, &mut seeds)?;
         // cov:ignore-end
     }
     // Resolve the catalog, propagating real read errors. `Pdf::open` guarantees
@@ -2228,7 +2400,7 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
     if let Some(Object::Dictionary(catalog)) = catalog {
         for key in OPEN_DOCUMENT_CATALOG_KEYS {
             if let Some(v) = catalog.get(key) {
-                collect_direct_refs(v, 0, &mut seeds)?;
+                collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
             }
         }
     }
@@ -2264,14 +2436,14 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
 /// Propagates reader errors from resolving the catalog, the trailer values, or
 /// any reached object.
 fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
-    let mut seeds: Vec<ObjectRef> = Vec::new();
+    let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     // Trailer keys except /Root (ou_root, the catalog) and /Encrypt
     // (in_open_document, already seeded by open_document_set).
     {
         let trailer = pdf.trailer();
         for (key, v) in trailer.iter() {
             if key != b"Root" && key != b"Encrypt" {
-                collect_direct_refs(v, 0, &mut seeds)?;
+                collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
             }
         }
     }
@@ -2286,7 +2458,7 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     if let Some(Object::Dictionary(catalog)) = catalog {
         for (key, v) in catalog.iter() {
             if !OPEN_DOCUMENT_CATALOG_KEYS.contains(&key) && key != b"Outlines" {
-                collect_direct_refs(v, 0, &mut seeds)?;
+                collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
             }
         }
     }
@@ -2384,24 +2556,58 @@ fn page_tree_node_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeS
 /// Propagates reader errors from resolving any reached object.
 fn closure_from_seeds<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    seeds: Vec<ObjectRef>,
+    seeds: Vec<(ObjectRef, bool)>,
     page_tree: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
+    // Live set is built once upfront so the Object::Null guard below can
+    // distinguish xref-absent refs from real live null bodies.
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut queue: VecDeque<ObjectRef> = seeds.into_iter().collect();
+    // Xref-absent nulls added tentatively to `out`; the post-BFS pass below
+    // removes those never reached via any array edge.
+    let mut tentative_absent_nulls: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Every xref-absent ref reached via at least one array edge. Updated
+    // unconditionally (even for already-visited refs) so BFS ordering does not
+    // affect which nulls are admitted — a dict-value edge may be traversed before
+    // the array edge from a later parent, and `visited` would block re-processing.
+    let mut seen_as_array: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Pre-populate seen_as_array from seeds that arrive via array edges. This
+    // covers the case where an xref-absent null IS a direct seed (e.g. Catalog
+    // `/OpenAction [99 0 R]` → ref 99 is an array element of the OD key's value).
+    // Because the null has no children, the in-BFS seen_as_array update would
+    // never fire for it; seeding here ensures the post-BFS cull honours the edge
+    // type recorded when the value was traversed by the caller.
+    for (r, via_array) in &seeds {
+        if *via_array && !live.contains(r) {
+            seen_as_array.insert(*r);
+        }
+    }
+    let mut queue: VecDeque<ObjectRef> = seeds.into_iter().map(|(r, _)| r).collect();
     while let Some(r) = queue.pop_front() {
         if !visited.insert(r) {
             continue;
         }
         let obj = pdf.resolve_borrowed(r)?;
-        let mut children = Vec::new();
+        let mut children: Vec<(ObjectRef, bool)> = Vec::new();
         match obj {
             // Page boundary: qpdf neither records nor descends a non-top `/Page`
             // leaf reached while tracing a document-level key.
             Object::Dictionary(d) if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page") =>
             {
                 continue;
+            }
+            // Xref-absent ref: resolves to null but has no live body object.
+            // Dict-value keys whose value is an absent ref are dropped by the
+            // writer, so those must NOT enter open_document_set.  Array elements
+            // whose value is an absent ref ARE kept (resurrectable): the writer
+            // emits a null body, so those MUST enter open_document_set.
+            // Tentatively add the ref to `out`; the post-BFS pass removes it
+            // unless `seen_as_array` records at least one array edge to this ref.
+            // A live null body (`99 0 obj null endobj`) falls through to `out.insert`.
+            Object::Null if !live.contains(&r) => {
+                tentative_absent_nulls.insert(r);
+                // Null has no children; fall through to out.insert.
             }
             // Page-tree interior `/Pages` node: skip the inherited attributes
             // qpdf has stripped, but follow `/Kids` (→ the `/Page` leaves above)
@@ -2411,17 +2617,30 @@ fn closure_from_seeds<R: Read + Seek>(
             Object::Dictionary(d) if page_tree.contains(&r) => {
                 for (k, v) in d.iter() {
                     if !INHERITABLE_PAGE_KEYS.contains(&k) {
-                        collect_direct_refs(v, 0, &mut children)?;
+                        collect_direct_refs_with_context(v, 0, false, &mut children)?;
                     }
                 }
             }
-            _ => collect_direct_refs(obj, 0, &mut children)?,
+            _ => collect_direct_refs_with_context(obj, 0, false, &mut children)?,
         }
         out.insert(r);
-        for cr in children {
+        for (cr, via_array) in children {
+            // Record array-edge reach unconditionally so BFS ordering does not
+            // decide which xref-absent nulls are admitted to open_document_set.
+            if via_array && !live.contains(&cr) {
+                seen_as_array.insert(cr);
+            }
             if !visited.contains(&cr) {
                 queue.push_back(cr);
             }
+        }
+    }
+    // Remove xref-absent nulls that were reached only via dict-value edges: the
+    // writer drops those keys, so qpdf records no object user for them and they
+    // must not appear in open_document_set / document_other_set.
+    for r in &tentative_absent_nulls {
+        if !seen_as_array.contains(r) {
+            out.remove(r);
         }
     }
     Ok(out)
@@ -2442,14 +2661,14 @@ fn closure_from_seeds<R: Read + Seek>(
 ///
 /// Propagates reader errors from resolving the catalog or any reached object.
 pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
-    let mut seeds: Vec<ObjectRef> = Vec::new();
+    let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     let catalog = pdf
         .root_ref()
         .map(|root| pdf.resolve_borrowed(root))
         .transpose()?;
     if let Some(Object::Dictionary(catalog)) = catalog {
         if let Some(v) = catalog.get("Outlines") {
-            collect_direct_refs(v, 0, &mut seeds)?;
+            collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
         }
     }
     let page_tree = page_tree_node_refs(pdf)?;
@@ -2539,9 +2758,10 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     // Computed once and shared across every per-page closure below (the loop
     // would otherwise re-scan the whole xref table O(pages) times).
     let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
 
     let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
-        Some(&first_page) => compute_closure(pdf, first_page, &live)?
+        Some(&first_page) => compute_closure(pdf, first_page, &live, &resurrectable)?
             .into_iter()
             .collect(),
         // A linearizable document always has at least one page, so the page-less
@@ -2555,7 +2775,7 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
         referenced_pages.entry(r).or_default().insert(0);
     }
     for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-        for r in compute_closure(pdf, page_ref, &live)? {
+        for r in compute_closure(pdf, page_ref, &live, &resurrectable)? {
             referenced_pages
                 .entry(r)
                 .or_default()
@@ -2637,6 +2857,18 @@ mod tests {
         }
         collect_direct_refs(&o, 0, &mut out).unwrap();
         assert_eq!(out, vec![ObjectRef::new(4, 0)]);
+    }
+
+    #[test]
+    fn collect_direct_refs_with_context_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_refs_with_context(
+            &nested_arrays(MAX_INLINE_DEPTH + 5),
+            0,
+            false,
+            &mut out,
+        );
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
     // -----------------------------------------------------------------------

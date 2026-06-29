@@ -297,6 +297,93 @@ fn resurrect_missing_array_ref_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-o9im: when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
+// the resurrected null must land in the first-page section in generate mode too.
+#[test]
+fn resurrect_missing_page_arr_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "resurrect-missing-page-arr.pdf",
+        "resurrect-missing-page-arr",
+    );
+}
+
+// flpdf-891f: when Page 1 holds /Bad 99 0 R (dict value) and Page 2 holds
+// /Arr [99 0 R] (array element), the resurrected null must land in the
+// second-half section (low object number) in generate mode too.
+#[test]
+fn resurrect_page2_arr_page1_dictval_not_in_first_page_section_objstm() {
+    assert_strict(
+        "resurrect-missing-page1-dictval-page2-arr.pdf",
+        "resurrect-missing-page1-dictval-page2-arr",
+    );
+}
+
+// flpdf-891f: both edges on same page — null must land in first-page section
+// in generate mode too.
+#[test]
+fn resurrect_both_edges_same_page_null_in_first_page_section_objstm() {
+    assert_strict(
+        "resurrect-both-edges-same-page.pdf",
+        "resurrect-both-edges-same-page",
+    );
+}
+
+// flpdf-891f: cross-object case — null must land in first-page section in
+// generate mode too (same original-number sort fix applies).
+#[test]
+fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section_objstm() {
+    assert_strict(
+        "resurrect-crossobj-arr-via-live-desc.pdf",
+        "resurrect-crossobj-arr-via-live-desc",
+    );
+}
+
+// flpdf-891f: else-branch ordering in generate mode — same number-order rule
+// applies when ObjStm generation is enabled.
+#[test]
+fn else_branch_children_ordered_by_original_object_number_objstm() {
+    assert_strict(
+        "else-branch-obj-number-order.pdf",
+        "else-branch-obj-number-order",
+    );
+}
+
+// flpdf-hsjh: revorder case in generate mode — resurrectable ref (orig 99)
+// lower-numbered than the live descendant (orig 100) holding the array edge.
+// Deferred admission + sorted-tail insertion must place the null correctly in
+// ObjStm output too.
+#[test]
+fn revorder_resurrect_null_in_first_page_section_objstm() {
+    assert_strict("revorder-resurrect.pdf", "revorder-resurrect");
+}
+
+// flpdf-hsjh (discriminator): Page at high original number (10), content
+// stream at low original number (3). Sorted-tail (non-page) ensures Page
+// stays first in the closure even when its original number exceeds descendants.
+#[test]
+fn page_highnum_content_lownum_page_before_content_objstm() {
+    assert_strict(
+        "page-highnum-content-lownum.pdf",
+        "page-highnum-content-lownum",
+    );
+}
+
+// flpdf-hsjh (Codex P2): resurrectable null also reachable via Catalog
+// dict-value (/OpenAction 99 0 R, dropped) AND first-page array (/Arr [99 0 R]).
+// closure_from_seeds must skip Object::Null so the null stays lc_first_page.
+#[test]
+fn od_null_also_in_first_page_arr_byte_identical_to_qpdf_objstm() {
+    assert_strict("od-null-page-arr.pdf", "od-null-page-arr");
+}
+
+// flpdf-hsjh (Codex P2): Catalog ARRAY edge (/OpenAction [99 0 R]) to
+// xref-absent null — null must land in OD section (open_document_set), not
+// first-page.  closure_from_seeds tracks array vs dict-value edges.
+#[test]
+fn od_catalog_arr_null_byte_identical_to_qpdf_objstm() {
+    assert_strict("od-arr-null.pdf", "od-arr-null");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

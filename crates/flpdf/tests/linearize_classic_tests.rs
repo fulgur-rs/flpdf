@@ -116,6 +116,119 @@ fn outlines_classic_routes_outlines_to_second_half_and_round_trips() {
     );
 }
 
+// flpdf-891f: cross-object array edge — a live non-page object (/Other 4 0 R)
+// has an array-element ref to a resurrectable null ([99 0 R]), so the null must
+// land in the first-page section (before /E). Exercises the else-branch
+// seen_as_array tracking path in compute_closure.
+#[test]
+fn crossobj_arr_ref_in_nonpage_obj_places_null_before_first_page_end() {
+    let bytes = linearize_classic("resurrect-crossobj-arr-via-live-desc.pdf");
+
+    // Verify the output is valid and all objects resolve.
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // The null (resurrected from xref-absent ref 99) must appear before /E.
+    let e_offset = parse_e_offset(&bytes);
+    let null_pos = find(&bytes, b"\nnull\nendobj\n")
+        .expect("null object must be written into the linearized output");
+    assert!(
+        null_pos < e_offset,
+        "null (resurrected ref 99) must be in first-page section (before /E={e_offset}); \
+         found at byte {null_pos}"
+    );
+}
+
+// flpdf-hsjh: revorder case — resurrectable null ref (orig 99) has a LOWER
+// original-object-number than the live descendant (orig 100) holding the array
+// edge ([99 0 R]). Sort-at-enqueue puts 99 in the queue before 100 is expanded,
+// so seen_as_array is empty when 99 is dequeued → deferred. After the full BFS,
+// the post-BFS pass admits 99 (seen_as_array populated by 100). The final global
+// sort by original number places null(99) before IntermediateDict(100).
+// Exercises: deferred_resurrect in main BFS, post-BFS admission, order global sort.
+#[test]
+fn revorder_resurrect_deferred_null_before_first_page_end() {
+    let bytes = linearize_classic("revorder-resurrect.pdf");
+
+    // Verify the output is valid and all objects resolve.
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // The null (resurrected from xref-absent ref 99) must appear before /E.
+    let e_offset = parse_e_offset(&bytes);
+    let null_pos = find(&bytes, b"\nnull\nendobj\n")
+        .expect("null object must be written into the linearized output");
+    assert!(
+        null_pos < e_offset,
+        "null (resurrected ref 99) must be in first-page section (before /E={e_offset}); \
+         found at byte {null_pos}"
+    );
+    // Additionally verify null(99) appears before IntermediateDict(100):
+    // global sort must place them in ascending original-number order.
+    let intermediate_pos =
+        find(&bytes, b"/Good").expect("/Good key from obj 100 must appear in output");
+    assert!(
+        null_pos < intermediate_pos,
+        "null(orig 99) must come before IntermediateDict(orig 100) in the output; \
+         null@{null_pos}, /Good@{intermediate_pos}"
+    );
+}
+
+// flpdf-hsjh (discriminator): Page leaf at high original-object-number (10)
+// with its content stream at low original-object-number (3).  A naive
+// fully-global sort would move Page to a higher renumbered number than the
+// content stream, reversing their order in the output.  The fix pins the Page
+// leaf at order[0] and sorts only the non-page tail.
+#[test]
+fn page_highnum_content_lownum_page_before_content() {
+    let bytes = linearize_classic("page-highnum-content-lownum.pdf");
+
+    // Output must round-trip cleanly.
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // /Type /Page must appear before /E (first-page section check).
+    let e_offset = parse_e_offset(&bytes);
+    let page_pos = find(&bytes, b"/Type /Page").expect("/Type /Page in output");
+    assert!(
+        page_pos < e_offset,
+        "/Type /Page must be in first-page section (before /E={e_offset}); found at {page_pos}"
+    );
+
+    // The Page leaf (/Type /Page) must come BEFORE the content stream.
+    // The content stream is the FlateDecode object that follows the Page dict in
+    // the first-page section; its presence is confirmed by /Contents in the Page.
+    // We detect it as the last `stream\r\n` or `stream\n` before /E.
+    let content_marker = b"\nstream\n";
+    let mut last_stream_before_e = None;
+    let mut pos = 0;
+    while let Some(p) = find(&bytes[pos..], content_marker) {
+        let abs = pos + p;
+        if abs < e_offset {
+            last_stream_before_e = Some(abs);
+        }
+        pos = abs + 1;
+    }
+    let stream_pos = last_stream_before_e.expect("content stream (\\nstream\\n) present before /E");
+    assert!(
+        page_pos < stream_pos,
+        "/Type /Page (at {page_pos}) must appear before content stream (at {stream_pos}); \
+         a fully-global sort by original-number would place the Page last"
+    );
+}
+
 // flpdf-phfu: re-linearizing an already-linearized input must not over-populate
 // the second half. qpdf garbage-collects the source's old /Linearized parameter
 // dict and old hint stream (both unreachable from Root/Info), so the plan's
@@ -131,5 +244,31 @@ fn relinearize_drops_source_linearization_artifacts_from_universe() {
     assert_eq!(
         plan.total_object_count, 7,
         "re-linearize universe must drop the source's old /Linearized dict + hint stream"
+    );
+}
+
+// flpdf-hsjh (Codex P2): Catalog DICT-value edge (/OpenAction 5 0 R) to live OD
+// obj 5, which itself holds /Arr [99 0 R] (xref-absent null 99).
+// BFS-interior seen_as_array.insert fires when expanding obj 5's children.
+// Null must land in OD section, i.e. BEFORE /E (first-page section end).
+#[test]
+fn od_live_arr_null_lands_in_od_section() {
+    let bytes = linearize_classic("od-live-arr-null.pdf");
+
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // The null (resurrected ref 99) must appear BEFORE /E (OD section).
+    let e_offset = parse_e_offset(&bytes);
+    let null_pos = find(&bytes, b"\nnull\nendobj\n")
+        .expect("null object must be written into the linearized output");
+    assert!(
+        null_pos < e_offset,
+        "null (resurrected ref 99 via live OD obj 5 array) must be in OD section \
+         (before /E={e_offset}); found at byte {null_pos}"
     );
 }

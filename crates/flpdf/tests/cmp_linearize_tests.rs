@@ -237,6 +237,120 @@ fn pages_ext_firstpage_shared_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-o9im: when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
+// the resurrected null must be classified in the first-page section (Part 2) and
+// receive a HIGH object number — not land in part4_rest with a LOW number.
+// Oracle: qpdf 11.9.0 assigns obj 9 = null, /Size 10 for this fixture.
+#[test]
+fn resurrect_missing_page_arr_classic_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "resurrect-missing-page-arr.pdf",
+        "resurrect-missing-page-arr",
+    );
+}
+
+// flpdf-891f: when Page 1 holds /Bad 99 0 R (dict value → dropped by writer)
+// and Page 2 holds /Arr [99 0 R] (array element → resurrected null), the null
+// must land in the SECOND-HALF section (low object number) — NOT in Part 2.
+// Oracle: qpdf 11.9.0 assigns obj 2 = null in the second-half for this fixture.
+#[test]
+fn resurrect_page2_arr_page1_dictval_not_in_first_page_section() {
+    assert_linearize_byte_identical(
+        "resurrect-missing-page1-dictval-page2-arr.pdf",
+        "resurrect-missing-page1-dictval-page2-arr",
+    );
+}
+
+// flpdf-891f: when Page 1 holds BOTH /Bad 99 0 R (dict value, dropped by
+// writer) AND /Good [99 0 R] (array element, resurrected null), the null must
+// land in the FIRST-PAGE section — the array edge wins even though the
+// dict-value edge is enqueued first (alphabetical key order).
+#[test]
+fn resurrect_both_edges_same_page_null_in_first_page_section() {
+    assert_linearize_byte_identical(
+        "resurrect-both-edges-same-page.pdf",
+        "resurrect-both-edges-same-page",
+    );
+}
+
+// flpdf-891f: cross-object case — Page 1 references resurrectable ref 99 via a
+// dict-value edge (/Bad 99 0 R) AND via an array element in a live descendant
+// (/Other 4 0 R where obj 4 = << /Good [99 0 R] >>). The dict-value tuple is
+// dequeued before the descendant is expanded, but sorting page-dict refs by
+// original object number ensures obj 4 (live) is expanded before obj 99
+// (resurrectable) is dequeued, so seen_as_array already contains 99 and the
+// null is admitted into the first-page section.
+#[test]
+fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section() {
+    assert_linearize_byte_identical(
+        "resurrect-crossobj-arr-via-live-desc.pdf",
+        "resurrect-crossobj-arr-via-live-desc",
+    );
+}
+
+// flpdf-891f: else-branch ordering — a live non-page object's children must be
+// enqueued in ascending original-object-number order, not dict-key (alphabetical)
+// order. The fixture has an intermediate dict with /AA→orig6 and /ZZ→orig5;
+// alphabetical ordering would emit orig6 before orig5, but qpdf emits orig5
+// first (number order).
+#[test]
+fn else_branch_children_ordered_by_original_object_number() {
+    assert_linearize_byte_identical(
+        "else-branch-obj-number-order.pdf",
+        "else-branch-obj-number-order",
+    );
+}
+
+// flpdf-hsjh: revorder case — resurrectable ref (orig 99) has a LOWER original
+// number than the live descendant (orig 100) that holds the array edge
+// ([99 0 R]). Sort-at-enqueue puts 99 in the queue before 100 is expanded,
+// so seen_as_array is empty when 99 is dequeued → deferred. After the full
+// BFS, 100 has populated seen_as_array with 99, so the post-BFS pass admits
+// it and inserts it at the correct position in the sorted non-page tail.
+#[test]
+fn revorder_resurrect_null_in_first_page_section() {
+    assert_linearize_byte_identical("revorder-resurrect.pdf", "revorder-resurrect");
+}
+
+// flpdf-hsjh (discriminator): Page leaf at a HIGH original-object-number (10)
+// with its content stream at a LOWER original-object-number (3). A naive
+// fully-global sort by original number would misplace the Page (renumber it
+// higher than its content stream), but qpdf keeps the Page first in its
+// closure. flpdf must pin the Page at order[0] and sort only order[1..].
+#[test]
+fn page_highnum_content_lownum_page_before_content() {
+    assert_linearize_byte_identical(
+        "page-highnum-content-lownum.pdf",
+        "page-highnum-content-lownum",
+    );
+}
+
+// flpdf-hsjh (Codex P2): resurrectable null (orig 99) is reachable via BOTH
+// a Catalog dict-value edge (/OpenAction 99 0 R, dropped by writer) and a
+// first-page array edge (/Arr [99 0 R], produces a null body object). Before
+// this fix, closure_from_seeds admitted the null-resolving ref into
+// open_document_set, causing the null to be misrouted to the open-document
+// section (Part 4) with a LOW renumbered number, diverging from qpdf which
+// classifies the null as lc_first_page (Part 2, last in the first-page
+// section with /O=5, /E=900). The fix skips Object::Null in closure_from_seeds.
+#[test]
+fn od_null_also_in_first_page_arr_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("od-null-page-arr.pdf", "od-null-page-arr");
+}
+
+// flpdf-hsjh (Codex P2): resurrectable null (orig 99) reached via a Catalog
+// ARRAY edge (/OpenAction [99 0 R]) — qpdf classifies this as open_document
+// (lc_open_document) because the null body IS emitted for the surviving array
+// slot.  The null must land in the OD section (pre-/O, before the hint stream)
+// not in the first-page section.  The fix tracks array vs dict-value edge type
+// in closure_from_seeds via collect_direct_refs_with_context so that
+// array-reached xref-absent nulls are admitted to open_document_set while
+// dict-value-only nulls are excluded.
+#[test]
+fn od_catalog_arr_null_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("od-arr-null.pdf", "od-arr-null");
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by

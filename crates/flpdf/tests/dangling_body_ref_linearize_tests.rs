@@ -346,3 +346,93 @@ fn dangling_ref_in_stream_dict_dropped() {
     );
     assert_no_stray_null(out);
 }
+
+// --- Case 8: missing-xref array ref DIRECTLY on the FIRST-PAGE DICT --------
+// flpdf-o9im: compute_closure must include the resurrectable ref in the
+// first-page closure (Part 2) so it receives a HIGH object number — not fall
+// into part4_rest with a LOW one. Exercises plan.rs lines 213-214 (main BFS
+// loop resurrectable path).
+
+#[test]
+fn first_page_dict_missing_array_ref_resurrected_both_modes() {
+    let src = two_page("", " /Arr [99 0 R 8 0 R]");
+    for use_generate in [false, true] {
+        let out = linearize(&src, use_generate).unwrap_or_else(|e| {
+            panic!("first-page missing array ref must not crash (generate={use_generate}): {e}")
+        });
+        let mut pdf = Pdf::open(Cursor::new(out)).expect("round-trips");
+        let page = first_page(&mut pdf);
+        let arr = match page.as_dict().unwrap().get("Arr").expect("/Arr kept") {
+            Object::Array(a) => a.clone(),
+            other => panic!("/Arr not an array: {other:?}"),
+        };
+        assert_eq!(
+            arr.len(),
+            2,
+            "array length preserved (generate={use_generate})"
+        );
+        let resurrected = match arr[0] {
+            Object::Reference(r) => r,
+            ref other => {
+                panic!("missing-xref slot must resurrect to a ref (generate={use_generate}), got {other:?}")
+            }
+        };
+        assert!(
+            pdf.resolve(resurrected).expect("resurrected resolves").is_null(),
+            "first-page missing-xref array slot must be a null body object (generate={use_generate})"
+        );
+        assert!(
+            matches!(arr[1], Object::Reference(_)),
+            "live font ref kept (generate={use_generate})"
+        );
+    }
+}
+
+// --- Case 9: missing-xref array ref INSIDE the /Resources DFS subtree ------
+// Exercises plan.rs lines 262-263 (the /Resources DFS resurrectable path).
+// A resource-dict inline array with a missing-xref element triggers the DFS
+// stack branch rather than the main BFS queue.
+
+#[test]
+fn resources_dict_missing_array_ref_resurrected_both_modes() {
+    let src = two_page_with(" /Arr [99 0 R]", "");
+    for use_generate in [false, true] {
+        let out = linearize(&src, use_generate).unwrap_or_else(|e| {
+            panic!("resources missing array ref must not crash (generate={use_generate}): {e}")
+        });
+        let mut pdf = Pdf::open(Cursor::new(out)).expect("round-trips");
+        let page = first_page(&mut pdf);
+        let resources_ref = match page
+            .as_dict()
+            .unwrap()
+            .get("Resources")
+            .expect("/Resources")
+        {
+            Object::Reference(r) => *r,
+            other => panic!("/Resources not an indirect ref: {other:?}"),
+        };
+        let resources = pdf.resolve(resources_ref).expect("resources resolves");
+        let arr = match resources.as_dict().unwrap().get("Arr") {
+            Some(Object::Array(a)) => a.clone(),
+            Some(other) => panic!("/Arr not an array (generate={use_generate}): {other:?}"),
+            None => panic!("/Arr missing from resources (generate={use_generate})"),
+        };
+        assert_eq!(
+            arr.len(),
+            1,
+            "resources /Arr length preserved (generate={use_generate})"
+        );
+        let resurrected = match arr[0] {
+            Object::Reference(r) => r,
+            ref other => {
+                panic!("resources missing-xref slot must resurrect to a ref (generate={use_generate}), got {other:?}")
+            }
+        };
+        assert!(
+            pdf.resolve(resurrected)
+                .expect("resurrected resolves")
+                .is_null(),
+            "resources missing-xref array slot must be a null body (generate={use_generate})"
+        );
+    }
+}
