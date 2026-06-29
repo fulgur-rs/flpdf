@@ -2555,6 +2555,9 @@ fn closure_from_seeds<R: Read + Seek>(
     seeds: Vec<ObjectRef>,
     page_tree: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
+    // Live set is built once upfront so the Object::Null guard below can
+    // distinguish xref-absent refs from real live null bodies.
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut queue: VecDeque<ObjectRef> = seeds.into_iter().collect();
@@ -2571,15 +2574,15 @@ fn closure_from_seeds<R: Read + Seek>(
             {
                 continue;
             }
-            // Null-resolving ref (xref-absent or object-0): qpdf's object-user
-            // analysis records only live body objects. A null-resolving ref reached
-            // via a dict-value edge produces no body object (the writer drops the
-            // key); a null reached via an array edge is a resurrectable null handled
-            // separately by `compute_closure`, not by document-level sets.  Including
-            // it here would incorrectly shadow the first-page classification at
-            // line 1167 (`in_first_page = … && !open_document_set.contains(r)`)
-            // and route the resurrected null to Part 4 instead of Part 2.
-            Object::Null => continue,
+            // Xref-absent ref: resolves to null but has no live body object.
+            // The writer drops any dict-value key whose value is an absent ref,
+            // so it must NOT enter open_document_set / document_other_set —
+            // doing so would shadow the first-page classification at
+            // `in_first_page = … && !open_document_set.contains(r)` and misroute
+            // a resurrectable null to Part 4 instead of Part 2.
+            // A live null body (`99 0 obj null endobj`) IS a real object; the guard
+            // `!live.contains(&r)` ensures it falls through to `out.insert` below.
+            Object::Null if !live.contains(&r) => continue,
             // Page-tree interior `/Pages` node: skip the inherited attributes
             // qpdf has stripped, but follow `/Kids` (→ the `/Page` leaves above)
             // and any custom extension keys. Restricted to `page_tree` — a
