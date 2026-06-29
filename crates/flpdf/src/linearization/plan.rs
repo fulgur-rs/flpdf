@@ -2374,16 +2374,20 @@ const OPEN_DOCUMENT_CATALOG_KEYS: [&[u8]; 5] = [
 /// Propagates reader errors from resolving the catalog, the trailer values, or
 /// any reached object.
 fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
-    // Seed refs: the indirect refs inside each open-document key's value. A
-    // direct value (e.g. an inline /OpenAction action dict) contributes only the
-    // indirect refs it contains; qpdf records indirect objects, not inline ones.
-    let mut seeds: Vec<ObjectRef> = Vec::new();
+    // Seed refs: the indirect refs inside each open-document key's value, with
+    // array-edge context. A ref that is an array ELEMENT of an OD key's value
+    // (e.g. `/OpenAction [99 0 R]`) is resurrectable and must enter
+    // open_document_set; a ref that is a dict-value (e.g. `/OpenAction 99 0 R`)
+    // for an absent ref is dropped and must not. `collect_direct_refs_with_context`
+    // records this distinction as the bool in each `(ObjectRef, bool)` pair so
+    // `closure_from_seeds` can honour it.
+    let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     if let Some(enc) = pdf.trailer().get("Encrypt") {
         // cov:ignore-start: /Encrypt is only meaningful for encrypted+linearized
         // output (deferred to flpdf-j4ph); the linearize write path rejects
         // encrypted input (`reject_encrypted_write`) before this helper runs, so
         // it only ever sees plaintext documents (no trailer /Encrypt).
-        collect_direct_refs(enc, 0, &mut seeds)?;
+        collect_direct_refs_with_context(enc, 0, false, &mut seeds)?;
         // cov:ignore-end
     }
     // Resolve the catalog, propagating real read errors. `Pdf::open` guarantees
@@ -2396,7 +2400,7 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
     if let Some(Object::Dictionary(catalog)) = catalog {
         for key in OPEN_DOCUMENT_CATALOG_KEYS {
             if let Some(v) = catalog.get(key) {
-                collect_direct_refs(v, 0, &mut seeds)?;
+                collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
             }
         }
     }
@@ -2432,14 +2436,14 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
 /// Propagates reader errors from resolving the catalog, the trailer values, or
 /// any reached object.
 fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
-    let mut seeds: Vec<ObjectRef> = Vec::new();
+    let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     // Trailer keys except /Root (ou_root, the catalog) and /Encrypt
     // (in_open_document, already seeded by open_document_set).
     {
         let trailer = pdf.trailer();
         for (key, v) in trailer.iter() {
             if key != b"Root" && key != b"Encrypt" {
-                collect_direct_refs(v, 0, &mut seeds)?;
+                collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
             }
         }
     }
@@ -2454,7 +2458,7 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     if let Some(Object::Dictionary(catalog)) = catalog {
         for (key, v) in catalog.iter() {
             if !OPEN_DOCUMENT_CATALOG_KEYS.contains(&key) && key != b"Outlines" {
-                collect_direct_refs(v, 0, &mut seeds)?;
+                collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
             }
         }
     }
@@ -2552,7 +2556,7 @@ fn page_tree_node_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeS
 /// Propagates reader errors from resolving any reached object.
 fn closure_from_seeds<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    seeds: Vec<ObjectRef>,
+    seeds: Vec<(ObjectRef, bool)>,
     page_tree: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     // Live set is built once upfront so the Object::Null guard below can
@@ -2560,13 +2564,32 @@ fn closure_from_seeds<R: Read + Seek>(
     let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut queue: VecDeque<ObjectRef> = seeds.into_iter().collect();
+    // Xref-absent nulls added tentatively to `out`; the post-BFS pass below
+    // removes those never reached via any array edge.
+    let mut tentative_absent_nulls: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Every xref-absent ref reached via at least one array edge. Updated
+    // unconditionally (even for already-visited refs) so BFS ordering does not
+    // affect which nulls are admitted — a dict-value edge may be traversed before
+    // the array edge from a later parent, and `visited` would block re-processing.
+    let mut seen_as_array: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Pre-populate seen_as_array from seeds that arrive via array edges. This
+    // covers the case where an xref-absent null IS a direct seed (e.g. Catalog
+    // `/OpenAction [99 0 R]` → ref 99 is an array element of the OD key's value).
+    // Because the null has no children, the in-BFS seen_as_array update would
+    // never fire for it; seeding here ensures the post-BFS cull honours the edge
+    // type recorded when the value was traversed by the caller.
+    for (r, via_array) in &seeds {
+        if *via_array && !live.contains(r) {
+            seen_as_array.insert(*r);
+        }
+    }
+    let mut queue: VecDeque<ObjectRef> = seeds.into_iter().map(|(r, _)| r).collect();
     while let Some(r) = queue.pop_front() {
         if !visited.insert(r) {
             continue;
         }
         let obj = pdf.resolve_borrowed(r)?;
-        let mut children = Vec::new();
+        let mut children: Vec<(ObjectRef, bool)> = Vec::new();
         match obj {
             // Page boundary: qpdf neither records nor descends a non-top `/Page`
             // leaf reached while tracing a document-level key.
@@ -2575,14 +2598,17 @@ fn closure_from_seeds<R: Read + Seek>(
                 continue;
             }
             // Xref-absent ref: resolves to null but has no live body object.
-            // The writer drops any dict-value key whose value is an absent ref,
-            // so it must NOT enter open_document_set / document_other_set —
-            // doing so would shadow the first-page classification at
-            // `in_first_page = … && !open_document_set.contains(r)` and misroute
-            // a resurrectable null to Part 4 instead of Part 2.
-            // A live null body (`99 0 obj null endobj`) IS a real object; the guard
-            // `!live.contains(&r)` ensures it falls through to `out.insert` below.
-            Object::Null if !live.contains(&r) => continue,
+            // Dict-value keys whose value is an absent ref are dropped by the
+            // writer, so those must NOT enter open_document_set.  Array elements
+            // whose value is an absent ref ARE kept (resurrectable): the writer
+            // emits a null body, so those MUST enter open_document_set.
+            // Tentatively add the ref to `out`; the post-BFS pass removes it
+            // unless `seen_as_array` records at least one array edge to this ref.
+            // A live null body (`99 0 obj null endobj`) falls through to `out.insert`.
+            Object::Null if !live.contains(&r) => {
+                tentative_absent_nulls.insert(r);
+                // Null has no children; fall through to out.insert.
+            }
             // Page-tree interior `/Pages` node: skip the inherited attributes
             // qpdf has stripped, but follow `/Kids` (→ the `/Page` leaves above)
             // and any custom extension keys. Restricted to `page_tree` — a
@@ -2591,17 +2617,30 @@ fn closure_from_seeds<R: Read + Seek>(
             Object::Dictionary(d) if page_tree.contains(&r) => {
                 for (k, v) in d.iter() {
                     if !INHERITABLE_PAGE_KEYS.contains(&k) {
-                        collect_direct_refs(v, 0, &mut children)?;
+                        collect_direct_refs_with_context(v, 0, false, &mut children)?;
                     }
                 }
             }
-            _ => collect_direct_refs(obj, 0, &mut children)?,
+            _ => collect_direct_refs_with_context(obj, 0, false, &mut children)?,
         }
         out.insert(r);
-        for cr in children {
+        for (cr, via_array) in children {
+            // Record array-edge reach unconditionally so BFS ordering does not
+            // decide which xref-absent nulls are admitted to open_document_set.
+            if via_array && !live.contains(&cr) {
+                seen_as_array.insert(cr);
+            }
             if !visited.contains(&cr) {
                 queue.push_back(cr);
             }
+        }
+    }
+    // Remove xref-absent nulls that were reached only via dict-value edges: the
+    // writer drops those keys, so qpdf records no object user for them and they
+    // must not appear in open_document_set / document_other_set.
+    for r in &tentative_absent_nulls {
+        if !seen_as_array.contains(r) {
+            out.remove(r);
         }
     }
     Ok(out)
@@ -2622,14 +2661,14 @@ fn closure_from_seeds<R: Read + Seek>(
 ///
 /// Propagates reader errors from resolving the catalog or any reached object.
 pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
-    let mut seeds: Vec<ObjectRef> = Vec::new();
+    let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     let catalog = pdf
         .root_ref()
         .map(|root| pdf.resolve_borrowed(root))
         .transpose()?;
     if let Some(Object::Dictionary(catalog)) = catalog {
         if let Some(v) = catalog.get("Outlines") {
-            collect_direct_refs(v, 0, &mut seeds)?;
+            collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
         }
     }
     let page_tree = page_tree_node_refs(pdf)?;

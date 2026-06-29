@@ -376,6 +376,14 @@ fn od_null_also_in_first_page_arr_byte_identical_to_qpdf_objstm() {
     assert_strict("od-null-page-arr.pdf", "od-null-page-arr");
 }
 
+// flpdf-hsjh (Codex P2): Catalog ARRAY edge (/OpenAction [99 0 R]) to
+// xref-absent null — null must land in OD section (open_document_set), not
+// first-page.  closure_from_seeds tracks array vs dict-value edges.
+#[test]
+fn od_catalog_arr_null_byte_identical_to_qpdf_objstm() {
+    assert_strict("od-arr-null.pdf", "od-arr-null");
+}
+
 #[test]
 fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");

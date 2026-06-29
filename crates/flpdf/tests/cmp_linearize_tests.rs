@@ -338,6 +338,19 @@ fn od_null_also_in_first_page_arr_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("od-null-page-arr.pdf", "od-null-page-arr");
 }
 
+// flpdf-hsjh (Codex P2): resurrectable null (orig 99) reached via a Catalog
+// ARRAY edge (/OpenAction [99 0 R]) — qpdf classifies this as open_document
+// (lc_open_document) because the null body IS emitted for the surviving array
+// slot.  The null must land in the OD section (pre-/O, before the hint stream)
+// not in the first-page section.  The fix tracks array vs dict-value edge type
+// in closure_from_seeds via collect_direct_refs_with_context so that
+// array-reached xref-absent nulls are admitted to open_document_set while
+// dict-value-only nulls are excluded.
+#[test]
+fn od_catalog_arr_null_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("od-arr-null.pdf", "od-arr-null");
+}
+
 // --------------------------------------------------------------------------
 // Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
