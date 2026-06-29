@@ -246,3 +246,29 @@ fn relinearize_drops_source_linearization_artifacts_from_universe() {
         "re-linearize universe must drop the source's old /Linearized dict + hint stream"
     );
 }
+
+// flpdf-hsjh (Codex P2): Catalog DICT-value edge (/OpenAction 5 0 R) to live OD
+// obj 5, which itself holds /Arr [99 0 R] (xref-absent null 99).
+// BFS-interior seen_as_array.insert fires when expanding obj 5's children.
+// Null must land in OD section, i.e. BEFORE /E (first-page section end).
+#[test]
+fn od_live_arr_null_lands_in_od_section() {
+    let bytes = linearize_classic("od-live-arr-null.pdf");
+
+    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+
+    // The null (resurrected ref 99) must appear BEFORE /E (OD section).
+    let e_offset = parse_e_offset(&bytes);
+    let null_pos = find(&bytes, b"\nnull\nendobj\n")
+        .expect("null object must be written into the linearized output");
+    assert!(
+        null_pos < e_offset,
+        "null (resurrected ref 99 via live OD obj 5 array) must be in OD section \
+         (before /E={e_offset}); found at byte {null_pos}"
+    );
+}
