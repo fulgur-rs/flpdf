@@ -84,6 +84,56 @@ fn resolves_indirect_object_on_access() {
     assert_eq!(pdf.resolved_count(), 1);
 }
 
+/// Resolving an object must read only up to the next object, not to end-of-file.
+/// This fixture is a damaged document whose root references many recovered
+/// `i 0 obj (` headers whose literal strings all close near EOF, so an unbounded
+/// read-to-end per object would re-scan the same suffix for every reference —
+/// the quadratic CPU attack. The bounded read (plus a capped fallback) keeps it
+/// linear, so this test completes; under the pre-fix resolver it hangs.
+#[test]
+fn resolving_many_eof_running_objects_stays_bounded() {
+    const N: u32 = 20_000;
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let refs: String = (3..3 + N).map(|i| format!("{i} 0 R ")).collect();
+    bytes.extend_from_slice(
+        format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Junk [{refs}] >>\nendobj\n").as_bytes(),
+    );
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    for i in 3..3 + N {
+        bytes.extend_from_slice(format!("\n{i} 0 obj (").as_bytes());
+    }
+    // Balanced closing parens near EOF so each object's literal string is a
+    // *valid* (terminated) object: resolution succeeds, so a fallback would run
+    // to EOF for every reference were it not capped.
+    bytes.push(b'\n');
+    bytes.extend(std::iter::repeat_n(b')', N as usize + 2));
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"\nzref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open_with_repair(std::io::Cursor::new(bytes)).unwrap();
+    // Resolve every referenced object. The cap means only a bounded number of
+    // EOF-running bodies actually resolve; the rest fail fast. Either way the
+    // loop must complete without rescanning the file once per object.
+    let mut resolved = 0usize;
+    for i in 3..3 + N {
+        if pdf.resolve(ObjectRef::new(i, 0)).is_ok() {
+            resolved += 1;
+        }
+    }
+    // The fallback cap bounds how many EOF-running objects resolve (a small
+    // constant, plus the final object whose window is end-of-file); the rest
+    // fail fast. The point is the loop terminates and resolves nowhere near all
+    // N references — under the pre-fix read-to-end resolver it would instead read
+    // the whole tail once per reference (quadratic) and hang.
+    assert!(
+        resolved < 200,
+        "EOF-running resolutions must stay bounded, got {resolved} of {N}"
+    );
+}
+
 #[test]
 fn resolve_borrowed_returns_reference_to_cached_object() {
     let file = File::open(minimal_fixture_path()).unwrap();
